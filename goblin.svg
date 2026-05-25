@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" aria-hidden="true">
+  <defs>
+    <radialGradient id="gob-glow" cx="50%" cy="55%" r="55%">
+      <stop offset="0%" stop-color="#7cff5a" stop-opacity="0.35"/>
+      <stop offset="65%" stop-color="#7cff5a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="gob-skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3a6a28"/>
+      <stop offset="100%" stop-color="#1a3d12"/>
+    </linearGradient>
+  </defs>
+  <circle cx="60" cy="62" r="52" fill="url(#gob-glow)"/>
+  <path d="M60 12 L88 32 L96 60 L84 90 L60 102 L36 90 L24 60 L32 32 Z"
+        fill="url(#gob-skin)" stroke="#7cff5a" stroke-width="1.2" stroke-opacity="0.35"/>
+  <path d="M22 50 L4 56 L20 66 Z" fill="#274d1c" stroke="#7cff5a" stroke-width="1" stroke-opacity="0.4"/>
+  <path d="M98 50 L116 56 L100 66 Z" fill="#274d1c" stroke="#7cff5a" stroke-width="1" stroke-opacity="0.4"/>
+  <circle cx="10" cy="58" r="1.4" fill="#7cff5a"/>
+  <circle cx="110" cy="58" r="1.4" fill="#7cff5a"/>
+  <path d="M34 44 L52 40 M68 40 L86 44" stroke="#0a0d08" stroke-width="3" stroke-linecap="round"/>
+  <ellipse cx="44" cy="56" rx="9" ry="9" fill="#0a0d08"/>
+  <ellipse cx="76" cy="56" rx="9" ry="9" fill="#0a0d08"/>
+  <circle cx="44" cy="56" r="3.5" fill="#7cff5a"/>
+  <circle cx="76" cy="56" r="3.5" fill="#7cff5a"/>
+  <circle cx="45.5" cy="54.5" r="1.2" fill="#e8ffd9"/>
+  <circle cx="77.5" cy="54.5" r="1.2" fill="#e8ffd9"/>
+  <path d="M58 64 L62 64 L60 76 Z" fill="#0a0d08" opacity="0.55"/>
+  <path d="M40 84 Q60 90 80 84" stroke="#0a0d08" stroke-width="2.5" fill="none"/>
+  <polygon points="46,84 49,90 52,84" fill="#e8ffd9"/>
+  <polygon points="56,84 60,92 64,84" fill="#e8ffd9"/>
+  <polygon points="68,84 71,90 74,84" fill="#e8ffd9"/>
+</svg>

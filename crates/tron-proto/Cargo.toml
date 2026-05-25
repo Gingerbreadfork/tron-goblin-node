@@ -1,0 +1,19 @@
+[package]
+name = "tron-proto"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Protobuf-generated message types for the TRON protocol. Wire-compatible with java-tron."
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+hex-literal.workspace = true
+tron-crypto = { path = "../tron-crypto" }

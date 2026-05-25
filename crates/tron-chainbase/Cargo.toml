@@ -1,0 +1,21 @@
+[package]
+name = "tron-chainbase"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Storage layer: per-store key/value codecs over a pluggable KV backend. Mirrors java-tron's chainbase module."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+prost.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+rocksdb.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+prost-types.workspace = true

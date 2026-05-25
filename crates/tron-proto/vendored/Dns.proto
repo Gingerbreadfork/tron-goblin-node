@@ -1,0 +1,38 @@
+// TRON DNS-discovery proto messages.
+//
+// Mirrors tronprotocol/libp2p `Discover.proto`'s `DnsRoot` + `EndPoints`
+// messages, which java-tron's mainnet `Discover.proto` does NOT include
+// (because DNS discovery lives in the libp2p submodule, not core).
+//
+// `tree-root-v1:` TXT records contain a base64-encoded `DnsRoot`.
+// `nodes:` TXT records contain a base64-encoded `EndPoints`.
+//
+// References:
+//   * tronprotocol/libp2p/src/main/protos/Discover.proto
+//   * tronprotocol/libp2p/src/main/java/org/tron/p2p/dns/tree/RootEntry.java
+
+syntax = "proto3";
+
+package protocol;
+
+option java_package = "org.tron.protos";
+
+import "core/Discover.proto";
+
+// Root TXT record payload (`tree-root-v1:{base64(DnsRoot)}`).
+// `signature` is base64-encoded 65-byte secp256k1 [R||S||V] over the
+// Java protobuf textFormat of the inner `treeRoot`.
+message DnsRoot {
+  message TreeRoot {
+    bytes eRoot = 1;
+    bytes lRoot = 2;
+    int32 seq = 3;
+  }
+  TreeRoot treeRoot = 1;
+  bytes signature = 2;
+}
+
+// Leaf-node payload (`nodes:{base64(EndPoints)}`).
+message EndPoints {
+  repeated Endpoint nodes = 1;
+}

@@ -1,0 +1,38 @@
+[package]
+name = "tron-tvm"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TRON-specific precompiles + energy model. Phase 1 of the TVM port — provides the consensus-critical precompile registry that a future EVM-interpreter integration plugs into."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+sha2.workspace = true
+sha3.workspace = true
+ripemd.workspace = true
+k256.workspace = true
+thiserror.workspace = true
+revm.workspace = true
+sapling-crypto.workspace = true
+bls12_381.workspace = true
+jubjub.workspace = true
+group = "0.13"
+bellman = { version = "0.14", default-features = false, features = ["groth16"] }
+pairing = "0.23"
+ff = "0.13"
+redjubjub = { version = "0.8", default-features = false }
+subtle = "2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+
+[dev-dependencies]
+hex.workspace = true
+hex-literal.workspace = true
+
+[[bin]]
+name = "extract_sapling_vk"
+path = "src/bin/extract_sapling_vk.rs"
+required-features = []

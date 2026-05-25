@@ -1,0 +1,81 @@
+// Vendored from https://github.com/tronprotocol/libp2p
+// (src/main/protos/Connect.proto). This is the connection-level
+// protocol that wraps the application-level protocol — every TRON peer
+// expects a `HelloMessage` of this type before any application
+// message will be accepted.
+//
+// `Endpoint` is defined in java-tron's Discover.proto; we re-use that
+// import path (`tron.proto.Endpoint`) so messages cross-deserialize
+// against java-tron's own types.
+syntax = "proto3";
+
+package tron.libp2p;
+
+import "core/Discover.proto";
+
+message KeepAliveMessage {
+  int64 timestamp = 1;
+}
+
+message ConnectHelloMessage {
+  protocol.Endpoint from = 1;
+  int32 network_id = 2;
+  int32 code = 3;
+  int64 timestamp = 4;
+  int32 version = 5;
+}
+
+message StatusMessage {
+  protocol.Endpoint from = 1;
+  int32 version = 2;
+  int32 network_id = 3;
+  int32 maxConnections = 4;
+  int32 currentConnections = 5;
+  int64 timestamp = 6;
+}
+
+// Mirrors tronprotocol/libp2p `DisconnectReason` enum in
+// `src/main/protos/Connect.proto`. This is what `P2pDisconnectMessage.reason`
+// carries on the wire. DO NOT confuse with `DisconnectCode.java`
+// (a separate enum with overlapping names, used as the `code` field of
+// `HelloMessage` — values are different).
+enum DisconnectReasonCode {
+  PEER_QUITING = 0x00;
+  BAD_PROTOCOL = 0x01;
+  TOO_MANY_PEERS = 0x02;
+  DUPLICATE_PEER = 0x03;
+  DIFFERENT_VERSION = 0x04;
+  RANDOM_ELIMINATION = 0x05;
+  EMPTY_MESSAGE = 0x06;
+  PING_TIMEOUT = 0x07;
+  DISCOVER_MODE = 0x08;
+  NO_SUCH_MESSAGE = 0x0A;
+  BAD_MESSAGE = 0x0B;
+  TOO_MANY_PEERS_WITH_SAME_IP = 0x0C;
+  RECENT_DISCONNECT = 0x0D;
+  DUP_HANDSHAKE = 0x0E;
+  UNKNOWN = 0xFF;
+}
+
+message P2pDisconnectMessage {
+  DisconnectReasonCode reason = 1;
+}
+
+// Post-handshake wire wrapper. tronprotocol/libp2p's
+// `UpgradeController.decodeReceiveData` parses every incoming frame
+// (after libp2p handshake completes) as a `CompressMessage`,
+// extracts the inner app-level bytes via `ProtoUtil.uncompressMessage`,
+// then dispatches by `data[0]`. The send side wraps in
+// `UpgradeController.codeSendData` (sic).
+//
+// `data` carries the actual app-level frame: `[type_byte][payload]`.
+// `type = uncompress (0)` means `data` is raw; `type = snappy (1)`
+// means `data` is snappy-compressed.
+message CompressMessage {
+  enum CompressType {
+    uncompress = 0;
+    snappy = 1;
+  }
+  CompressType type = 1;
+  bytes data = 2;
+}

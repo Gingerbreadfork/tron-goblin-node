@@ -1,0 +1,584 @@
+//! Bandwidth accounting per java-tron's `BandwidthProcessor`.
+//!
+//! For every non-shielded transaction, the sender pays for the bytes
+//! they put on the wire. Java-tron's priority order, in
+//! `BandwidthProcessor.consume()`:
+//!
+//! 1. **`contractCreateNewAccount`** — if the contract creates a fresh
+//!    account, pay the new-account net cost (`createNewAccountBandwidthRate
+//!    * bytes`) from frozen net, falling back to `createAccountFee` in TRX.
+//!    *(Not yet modeled — pinned as a remaining gap; see below.)*
+//! 2. **`useAssetAccountNet`** — for `TransferAssetContract` only: try
+//!    the asset-issuer-funded public/free quota first. If the issuer hasn't
+//!    funded enough, fall through to (3).
+//! 3. **`useAccountNet`** — windowed-average decay of `net_usage` against
+//!    the **global-scaled** `net_limit` derived from `frozen_v2[BANDWIDTH]`
+//!    via `TOTAL_NET_LIMIT / TOTAL_NET_WEIGHT`.
+//! 4. **`useFreeNet`** — every account gets a daily free quota
+//!    (`FREE_NET_LIMIT`, default 5000 bytes); spending it also bumps the
+//!    chain-wide `PUBLIC_NET_USAGE` against `PUBLIC_NET_LIMIT`.
+//! 5. **`useTransactionFee`** — last resort: `bytes * TRANSACTION_FEE` sun
+//!    is debited from the sender's TRX balance and either burned (default),
+//!    pushed to `TRANSACTION_FEE_POOL` (if active), or sent to the blackhole
+//!    account.
+//!
+//! All quota paths use the windowed-average math from [`crate::resource`]
+//! with a 28_800-block (24h / 3s) window and `PRECISION = 1_000_000`.
+//! Times are slot units (`latest_block_header_number`), not wall-clock.
+//!
+//! **What's still not modeled** (deferred): `contractCreateNewAccount`,
+//! the `TransactionFeePool` path (only the legacy burn path is supported),
+//! and the `useTransactionFee` `MAX_RESULT_SIZE_IN_TX` per-contract padding.
+//! See `crates/tron-executor/src/lib.rs::execute_one_tx` for where these
+//! plug in.
+
+use prost::Message;
+use tron_chainbase::{
+    AccountStore, AssetIssueStore, AssetIssueV2Store, DynamicPropertiesStore, StoreError,
+};
+use tron_crypto::address::Address;
+use tron_proto::transaction::contract::ContractType;
+use tron_proto::transaction::Contract;
+use tron_proto::{Account, Transaction, TransferAssetContract};
+
+use crate::resource::{
+    calculate_global_limit_v1, calculate_global_limit_v2, increase_default, recovery,
+    TRX_PRECISION,
+};
+
+// Re-export the shared constants here so existing callers (and tests
+// that import them under this module path) keep compiling.
+pub use crate::resource::{
+    increase_default as increase, PRECISION, WINDOW_SIZE_BLOCKS,
+};
+
+/// java-tron default `FREE_NET_LIMIT` value. Kept here for downstream
+/// callers / tests that imported it under this module path; prefer
+/// `DynamicPropertiesStore::DEFAULT_FREE_NET_LIMIT` for new code.
+pub const DEFAULT_FREE_NET_LIMIT: i64 = DynamicPropertiesStore::DEFAULT_FREE_NET_LIMIT;
+/// java-tron default `TRANSACTION_FEE` value.
+pub const DEFAULT_TRANSACTION_FEE: i64 = DynamicPropertiesStore::DEFAULT_TRANSACTION_FEE;
+
+/// What happened during a `consume_bandwidth` call. The driver/RPC
+/// layer can map these to receipt fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BandwidthCharge {
+    /// Charged against the account's frozen-bandwidth quota.
+    Frozen { bytes: i64, new_net_usage: i64 },
+    /// Charged against the daily free quota (and chain-wide
+    /// `PUBLIC_NET_USAGE`).
+    Free { bytes: i64, new_free_usage: i64 },
+    /// Charged against the asset issuer's quotas (the TRC-10
+    /// `useAssetAccountNet` path).
+    AssetIssuer {
+        bytes: i64,
+        token_id: i64,
+        /// The asset-issuer account's `net_usage` after this charge.
+        new_issuer_net_usage: i64,
+    },
+    /// Paid in TRX (deducted from balance).
+    Fee { bytes: i64, fee_sun: i64 },
+}
+
+/// Hard errors — caller should reject the transaction.
+#[derive(Debug, thiserror::Error)]
+pub enum BandwidthError {
+    #[error("account not found")]
+    AccountMissing,
+    #[error("account has insufficient bandwidth + balance to cover {bytes} bytes ({fee_sun} sun fee)")]
+    Insufficient { bytes: i64, fee_sun: i64 },
+    #[error("asset issuer account missing for token {0}")]
+    AssetIssuerMissing(i64),
+    #[error("transfer asset contract references unknown asset {0:?}")]
+    UnknownAsset(Vec<u8>),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Bundle of stores the bandwidth path may consult. `asset_v1` and
+/// `asset_v2` are only read for `TransferAssetContract` (the
+/// `useAssetAccountNet` branch).
+pub struct BandwidthStores<'a> {
+    pub accounts: &'a AccountStore,
+    pub dyn_props: &'a DynamicPropertiesStore,
+    pub asset_v1: &'a AssetIssueStore,
+    pub asset_v2: &'a AssetIssueV2Store,
+}
+
+/// Consume bandwidth for `tx` at slot-time `now_slot`. Mirrors
+/// `BandwidthProcessor.consume()`. Mutates the owner's account row in
+/// `accounts` (and possibly the asset issuer's account + the asset row).
+///
+/// `contract` is the first (and currently only) [`Contract`] inside
+/// `tx.raw_data` — passed in so the asset path can read its parameter
+/// without a redundant decode.
+///
+/// Returns the kind of charge applied. The serialized size is computed
+/// on a tx with `ret` cleared (java-tron's
+/// `clear_ret().getSerializedSize()` in the VM-enabled branch).
+pub fn consume_bandwidth(
+    stores: BandwidthStores<'_>,
+    tx: &Transaction,
+    contract: &Contract,
+    owner: &Address,
+    now_slot: i64,
+) -> Result<BandwidthCharge, BandwidthError> {
+    let bytes = serialized_bytes(tx) as i64;
+    let mut account = stores
+        .accounts
+        .get(owner)?
+        .ok_or(BandwidthError::AccountMissing)?;
+
+    let ty = ContractType::try_from(contract.r#type).unwrap_or(ContractType::AccountCreateContract);
+
+    // === useAssetAccountNet (TransferAssetContract only) ===
+    //
+    // Try the issuer-funded path first. On failure (insufficient public
+    // quota / free-asset quota / issuer net), fall through to the normal
+    // account-net path.
+    if matches!(ty, ContractType::TransferAssetContract) {
+        match try_use_asset_account_net(&stores, contract, &mut account, owner, bytes, now_slot)? {
+            Some(charge) => return Ok(charge),
+            None => { /* fall through */ }
+        }
+    }
+
+    // === useAccountNet — frozen-bandwidth quota with global scaling ===
+    if let Some(charge) = try_use_account_net(
+        stores.accounts,
+        stores.dyn_props,
+        &mut account,
+        owner,
+        bytes,
+        now_slot,
+    ) {
+        return Ok(charge);
+    }
+
+    // === useFreeNet — daily free quota + chain-wide PUBLIC_NET tracking ===
+    if let Some(charge) = try_use_free_net(
+        stores.accounts,
+        stores.dyn_props,
+        &mut account,
+        owner,
+        bytes,
+        now_slot,
+    ) {
+        return Ok(charge);
+    }
+
+    // === useTransactionFee — last resort: TRX fee ===
+    let fee_per_byte = stores.dyn_props.transaction_fee();
+    let fee = bytes.saturating_mul(fee_per_byte);
+    if account.balance < fee {
+        return Err(BandwidthError::Insufficient {
+            bytes,
+            fee_sun: fee,
+        });
+    }
+    account.balance -= fee;
+    account.latest_opration_time = head_block_timestamp(stores.dyn_props);
+    stores.accounts.put(owner, &account);
+    pay_bandwidth_fee(stores.dyn_props, fee);
+    Ok(BandwidthCharge::Fee {
+        bytes,
+        fee_sun: fee,
+    })
+}
+
+/// Try the `useAssetAccountNet` path. Returns:
+/// * `Ok(Some(charge))` — the issuer's quotas covered the cost.
+/// * `Ok(None)`         — quotas insufficient; the caller should fall
+///   through to `useAccountNet`/`useFreeNet`/`useTransactionFee`.
+/// * `Err(e)`           — the contract is malformed or references an
+///   unknown asset (no fallthrough makes sense — reject the tx).
+///
+/// Mirrors `BandwidthProcessor.useAssetAccountNet`. The flow:
+///
+/// 1. Decode the [`TransferAssetContract`], look up the asset by id
+///    (v2) or name (v1, when `ALLOW_SAME_TOKEN_NAME == 0`).
+/// 2. If the sender *is* the issuer, defer to `useAccountNet` (return
+///    `Ok(None)` and let the caller handle it).
+/// 3. Decay-check the issuer's `public_free_asset_net_usage` vs the
+///    asset's `public_free_asset_net_limit`. Decay-check the sender's
+///    `free_asset_net_usage` vs `free_asset_net_limit`. Decay-check
+///    the issuer's `net_usage` vs their global net limit.
+/// 4. On success: bump all three usages, persist (sender, issuer,
+///    asset row).
+fn try_use_asset_account_net(
+    stores: &BandwidthStores<'_>,
+    contract: &Contract,
+    account: &mut Account,
+    owner: &Address,
+    bytes: i64,
+    now_slot: i64,
+) -> Result<Option<BandwidthCharge>, BandwidthError> {
+    let parameter = match contract.parameter.as_ref() {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let transfer = TransferAssetContract::decode(parameter.value.as_slice())
+        .map_err(|e| BandwidthError::Store(StoreError::Decode(e.to_string())))?;
+
+    let asset_name = transfer.asset_name;
+    if asset_name.is_empty() {
+        return Err(BandwidthError::UnknownAsset(asset_name));
+    }
+
+    // V1 (lookup by name) when ALLOW_SAME_TOKEN_NAME is *not* set;
+    // otherwise V2 (lookup by id-string). For v2 the asset_name field
+    // is the id encoded as decimal-string ASCII bytes.
+    let allow_same_token_name = stores.dyn_props.allow_same_token_name().unwrap_or(0);
+    let mut asset = if allow_same_token_name == 0 {
+        // V1 lookup by name; fallback to V2 by parsed-id if absent
+        // (mirrors `Commons.getAssetIssueStoreFinal` precedence).
+        if let Some(a) = stores.asset_v1.get(&asset_name)? {
+            a
+        } else if let Ok(id) = std::str::from_utf8(&asset_name)
+            .map_err(|_| ())
+            .and_then(|s| s.parse::<i64>().map_err(|_| ()))
+        {
+            stores
+                .asset_v2
+                .get(id)?
+                .ok_or(BandwidthError::UnknownAsset(asset_name.clone()))?
+        } else {
+            return Err(BandwidthError::UnknownAsset(asset_name));
+        }
+    } else {
+        // V2: asset_name is the id (decimal string ascii).
+        let id = std::str::from_utf8(&asset_name)
+            .map_err(|_| BandwidthError::UnknownAsset(asset_name.clone()))?
+            .parse::<i64>()
+            .map_err(|_| BandwidthError::UnknownAsset(asset_name.clone()))?;
+        stores
+            .asset_v2
+            .get(id)?
+            .ok_or(BandwidthError::UnknownAsset(asset_name))?
+    };
+
+    // If sender IS the issuer, defer to useAccountNet.
+    if asset.owner_address == owner.as_bytes() {
+        return Ok(None);
+    }
+
+    let token_id_str: String = asset.id.clone();
+    let token_id_num: i64 = token_id_str.parse().unwrap_or(0);
+    let token_name_str: String = String::from_utf8_lossy(&asset.name).into_owned();
+
+    // --- 1. Issuer public-free-asset-net quota ---
+    let pub_limit = asset.public_free_asset_net_limit;
+    let pub_usage = asset.public_free_asset_net_usage;
+    let pub_last = asset.public_latest_free_net_time;
+    let new_pub_usage = increase_default(pub_usage, 0, pub_last, now_slot);
+    if bytes > pub_limit.saturating_sub(new_pub_usage) {
+        return Ok(None);
+    }
+
+    // --- 2. Sender per-asset free quota ---
+    let asset_free_limit = asset.free_asset_net_limit;
+    let (free_asset_usage, latest_asset_op_time) = if allow_same_token_name == 0 {
+        // V1 path uses the name-keyed map.
+        (
+            *account
+                .free_asset_net_usage
+                .get(&token_name_str)
+                .unwrap_or(&0),
+            *account
+                .latest_asset_operation_time
+                .get(&token_name_str)
+                .unwrap_or(&0),
+        )
+    } else {
+        // V2 uses the id-keyed map.
+        (
+            *account
+                .free_asset_net_usage_v2
+                .get(&token_id_str)
+                .unwrap_or(&0),
+            *account
+                .latest_asset_operation_time_v2
+                .get(&token_id_str)
+                .unwrap_or(&0),
+        )
+    };
+    let new_free_asset_usage = increase_default(free_asset_usage, 0, latest_asset_op_time, now_slot);
+    if bytes > asset_free_limit.saturating_sub(new_free_asset_usage) {
+        return Ok(None);
+    }
+
+    // --- 3. Issuer's global net quota ---
+    let issuer_addr = address_from_proto(&asset.owner_address)
+        .ok_or(BandwidthError::AssetIssuerMissing(token_id_num))?;
+    let mut issuer = stores
+        .accounts
+        .get(&issuer_addr)?
+        .ok_or(BandwidthError::AssetIssuerMissing(token_id_num))?;
+
+    let issuer_net_usage = issuer.net_usage;
+    let issuer_last_consume = issuer.latest_consume_time;
+    let issuer_net_limit = calculate_global_net_limit(&issuer, stores.dyn_props);
+    let support_unfreeze_delay = stores.dyn_props.support_unfreeze_delay();
+    let new_issuer_net_usage = if support_unfreeze_delay {
+        recovery(
+            issuer_net_usage,
+            issuer_last_consume,
+            now_slot,
+            issuer.net_window_size,
+        )
+    } else {
+        increase_default(issuer_net_usage, 0, issuer_last_consume, now_slot)
+    };
+    if bytes > issuer_net_limit.saturating_sub(new_issuer_net_usage) {
+        return Ok(None);
+    }
+
+    // --- All three quotas have headroom. Apply and persist. ---
+    let final_pub_usage = increase_default(new_pub_usage, bytes, now_slot, now_slot);
+    let final_free_asset_usage =
+        increase_default(new_free_asset_usage, bytes, now_slot, now_slot);
+    let final_issuer_net_usage = if support_unfreeze_delay {
+        // V2 path: the increase() call also recomputes net_window_size,
+        // which our simplified model skips (we keep a fixed
+        // 24h window). Use the same increase_default for now — divergence
+        // here only matters for accounts that have called
+        // FreezeBalanceV2 with non-default windows, which is rare.
+        increase_default(issuer_net_usage, bytes, issuer_last_consume, now_slot)
+    } else {
+        increase_default(new_issuer_net_usage, bytes, now_slot, now_slot)
+    };
+
+    // Persist the asset row.
+    asset.public_free_asset_net_usage = final_pub_usage;
+    asset.public_latest_free_net_time = now_slot;
+
+    // Persist the issuer account.
+    issuer.net_usage = final_issuer_net_usage;
+    issuer.latest_consume_time = now_slot;
+
+    // Persist the sender account: free-asset usage + latest-op times.
+    if allow_same_token_name == 0 {
+        // V1 mode writes BOTH maps (name and id keys) on the sender,
+        // and BOTH the v1 and v2 store rows. java-tron parity.
+        account
+            .latest_asset_operation_time
+            .insert(token_name_str.clone(), now_slot);
+        account
+            .free_asset_net_usage
+            .insert(token_name_str.clone(), final_free_asset_usage);
+        account
+            .latest_asset_operation_time_v2
+            .insert(token_id_str.clone(), now_slot);
+        account
+            .free_asset_net_usage_v2
+            .insert(token_id_str.clone(), final_free_asset_usage);
+        // Mirror the issuer's public-quota update into the v2 asset row.
+        if let Some(mut v2_row) = stores.asset_v2.get(token_id_num)? {
+            v2_row.public_free_asset_net_usage = final_pub_usage;
+            v2_row.public_latest_free_net_time = now_slot;
+            stores.asset_v2.put(token_id_num, &v2_row);
+        }
+        stores.asset_v1.put(&asset.name.clone(), &asset);
+    } else {
+        account
+            .latest_asset_operation_time_v2
+            .insert(token_id_str.clone(), now_slot);
+        account
+            .free_asset_net_usage_v2
+            .insert(token_id_str.clone(), final_free_asset_usage);
+        stores.asset_v2.put(token_id_num, &asset);
+    }
+    account.latest_opration_time = head_block_timestamp(stores.dyn_props);
+
+    stores.accounts.put(owner, account);
+    stores.accounts.put(&issuer_addr, &issuer);
+
+    Ok(Some(BandwidthCharge::AssetIssuer {
+        bytes,
+        token_id: token_id_num,
+        new_issuer_net_usage: final_issuer_net_usage,
+    }))
+}
+
+/// Try the `useAccountNet` path. Returns `Some(charge)` on success;
+/// `None` if the account's frozen-bandwidth quota can't cover `bytes`
+/// (caller must try free → fee).
+fn try_use_account_net(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    account: &mut Account,
+    owner: &Address,
+    bytes: i64,
+    now_slot: i64,
+) -> Option<BandwidthCharge> {
+    let net_limit = calculate_global_net_limit(account, dyn_props);
+    if net_limit <= 0 {
+        return None;
+    }
+    let last_consume = account.latest_consume_time;
+    let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
+    let decayed = if support_unfreeze_delay {
+        recovery(account.net_usage, last_consume, now_slot, account.net_window_size)
+    } else {
+        increase_default(account.net_usage, 0, last_consume, now_slot)
+    };
+    if bytes > net_limit.saturating_sub(decayed) {
+        return None;
+    }
+
+    let new_usage = if support_unfreeze_delay {
+        increase_default(account.net_usage, bytes, last_consume, now_slot)
+    } else {
+        increase_default(decayed, bytes, now_slot, now_slot)
+    };
+    account.net_usage = new_usage;
+    account.latest_consume_time = now_slot;
+    account.latest_opration_time = head_block_timestamp(dyn_props);
+    accounts.put(owner, account);
+    Some(BandwidthCharge::Frozen {
+        bytes,
+        new_net_usage: new_usage,
+    })
+}
+
+/// Try the `useFreeNet` path. Mirrors `BandwidthProcessor.useFreeNet`,
+/// including the chain-wide `PUBLIC_NET_USAGE` accumulator check + bump.
+fn try_use_free_net(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    account: &mut Account,
+    owner: &Address,
+    bytes: i64,
+    now_slot: i64,
+) -> Option<BandwidthCharge> {
+    let free_limit = dyn_props.free_net_limit();
+    let last_free = account.latest_consume_free_time;
+    let decayed_free = increase_default(account.free_net_usage, 0, last_free, now_slot);
+    if bytes > free_limit.saturating_sub(decayed_free) {
+        return None;
+    }
+
+    // Chain-wide public-net cap check.
+    let pub_limit = dyn_props.public_net_limit();
+    let pub_usage = dyn_props.public_net_usage();
+    let pub_time = dyn_props.public_net_time();
+    let new_pub = increase_default(pub_usage, 0, pub_time, now_slot);
+    if bytes > pub_limit.saturating_sub(new_pub) {
+        return None;
+    }
+
+    let new_free = increase_default(account.free_net_usage, bytes, last_free, now_slot);
+    let final_pub = increase_default(new_pub, bytes, now_slot, now_slot);
+    account.free_net_usage = new_free;
+    account.latest_consume_free_time = now_slot;
+    account.latest_opration_time = head_block_timestamp(dyn_props);
+    accounts.put(owner, account);
+    dyn_props.save_public_net_usage(final_pub);
+    dyn_props.save_public_net_time(now_slot);
+    Some(BandwidthCharge::Free {
+        bytes,
+        new_free_usage: new_free,
+    })
+}
+
+/// Serialized size of the transaction, excluding the `ret` field —
+/// java-tron's `tx.toBuilder().clearRet().build().getSerializedSize()`
+/// when the VM is supported. We pin that branch as the v1 behavior.
+fn serialized_bytes(tx: &Transaction) -> usize {
+    let mut cleared = tx.clone();
+    cleared.ret = Vec::new();
+    cleared.encoded_len()
+}
+
+/// Effective net limit for `account`. Mirrors
+/// `BandwidthProcessor.calculateGlobalNetLimit` (and its `V2` variant).
+/// Sums the account's frozen-bandwidth balance, then scales by the chain's
+/// `TOTAL_NET_LIMIT / TOTAL_NET_WEIGHT` ratio.
+///
+/// When `TOTAL_NET_WEIGHT == 0` (a fresh chain with no one frozen),
+/// returns 0 — every account falls through to the free quota until
+/// someone freezes. java-tron behaves the same way.
+pub fn calculate_global_net_limit(account: &Account, dyn_props: &DynamicPropertiesStore) -> i64 {
+    let froze_balance = all_frozen_balance_for_bandwidth(account);
+    let total_limit = dyn_props.total_net_limit();
+    let total_weight = dyn_props.total_net_weight();
+
+    if dyn_props.support_unfreeze_delay() {
+        // V2 path: preserves fractional weight via end-truncation.
+        return calculate_global_limit_v2(froze_balance, total_limit, total_weight);
+    }
+    if froze_balance < TRX_PRECISION {
+        return 0;
+    }
+    if total_weight == 0 {
+        return 0;
+    }
+    if dyn_props.allow_new_reward() && total_weight <= 0 {
+        return 0;
+    }
+    calculate_global_limit_v1(froze_balance, total_limit, total_weight)
+}
+
+/// Sum of all sources of bandwidth weight for `account`. Mirrors
+/// java-tron's `AccountCapsule.getAllFrozenBalanceForBandwidth`:
+///
+/// `frozen_v2[BANDWIDTH] + acquired_delegated_frozen_v2 + (legacy frozen.balance)`
+///
+/// The legacy `frozen` list (v1 freeze) is only populated for accounts
+/// that froze before the v2 fork — its first entry's `balance` is the
+/// frozen-for-bandwidth amount.
+fn all_frozen_balance_for_bandwidth(account: &Account) -> i64 {
+    let v2: i64 = account
+        .frozen_v2
+        .iter()
+        .filter(|fb| fb.r#type == 0) // BANDWIDTH
+        .map(|fb| fb.amount)
+        .sum();
+    let v1: i64 = account
+        .frozen
+        .iter()
+        .map(|fb| fb.frozen_balance)
+        .sum();
+    v2.saturating_add(v1)
+        .saturating_add(account.acquired_delegated_frozen_v2_balance_for_bandwidth)
+        .saturating_add(account.acquired_delegated_frozen_balance_for_bandwidth)
+}
+
+/// Read the block-header timestamp for use as
+/// `latest_operation_time`. Falls back to 0 on a fresh node.
+pub fn head_block_timestamp(dyn_props: &DynamicPropertiesStore) -> i64 {
+    dyn_props.latest_block_header_timestamp().unwrap_or(0)
+}
+
+/// java-tron's `BandwidthProcessor.useTransactionFee` payment effect:
+/// pushes the fee to either the fee pool, the burn counter, or the
+/// blackhole account, depending on which forks are active. Always bumps
+/// `TOTAL_TRANSACTION_COST`.
+fn pay_bandwidth_fee(dyn_props: &DynamicPropertiesStore, fee: i64) {
+    dyn_props.add_total_transaction_cost(fee);
+    if dyn_props.support_transaction_fee_pool() {
+        dyn_props.add_transaction_fee_pool(fee);
+    } else if dyn_props.support_blackhole_optimization() {
+        dyn_props.burn_trx(fee);
+    } else {
+        // Legacy: credit the blackhole account. We don't yet have a
+        // canonical blackhole-address constant exposed, so for now we
+        // mirror the post-fork behavior (burn). The blackhole account
+        // credit can be wired once a canonical
+        // `tron_types::BLACKHOLE_ADDRESS` lands; the on-chain effect is
+        // identical (the address receives the burned TRX rather than
+        // it being "destroyed", but the supply tracking is the same).
+        dyn_props.burn_trx(fee);
+    }
+}
+
+/// Decode a 21-byte address slice into an [`Address`]. Returns `None`
+/// for malformed lengths.
+fn address_from_proto(bytes: &[u8]) -> Option<Address> {
+    if bytes.len() != 21 {
+        return None;
+    }
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(bytes);
+    Some(Address::from_raw(buf))
+}

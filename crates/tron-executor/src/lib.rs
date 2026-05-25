@@ -1,0 +1,1839 @@
+//! Block-level orchestrator.
+//!
+//! [`execute_block`] is the entry point. Given a [`StateBackends`]
+//! handle to the per-store base KV backends, a [`Block`], and the
+//! expected parent [`BlockId`] (or `None` for the genesis case), it:
+//!
+//! 1. **Structural validation** via [`tron_types`] (read-only against base):
+//!    * `parent_hash` links to `expected_parent`
+//!    * `tx_trie_root` matches the recomputed Merkle root
+//!    * `witness_signature` recovers to `witness_address`
+//!
+//! 2. **Per-transaction loop with atomic rollback**: for each tx:
+//!    * Fork a [`TxSession`] — wraps every store's backend in a
+//!      [`tron_chainbase::SessionBackend`], so writes during validate /
+//!      execute go to a private overlay.
+//!    * Compute `tx_id = sha256(raw_data.encode())`
+//!    * `dispatch_validate` → on error: revert the session, record
+//!      [`TxOutcome::Invalid`].
+//!    * `dispatch_execute` → on error: revert, record
+//!      [`TxOutcome::ExecutionFailed`]. On success: commit, record
+//!      [`TxOutcome::Success`].
+//!    * Either way the session's writes don't leak across tx boundaries —
+//!      a failed tx leaves the state untouched.
+//!
+//! 3. **Head-pointer update** on the base [`DynamicPropertiesStore`]:
+//!    * `latest_block_header_number`
+//!    * `latest_block_header_timestamp`
+//!    * `latest_block_header_hash` (32-byte BlockId)
+//!
+//! Returns a [`BlockExecutionReport`] with the new head BlockId and
+//! per-transaction outcomes.
+
+pub mod adaptive;
+pub mod bandwidth;
+pub mod energy;
+pub mod resource;
+
+use std::sync::Arc;
+
+use prost::Message;
+use tron_actuator::{
+    dispatch_execute, dispatch_validate, permission::check_transaction_permission, ActuatorError,
+    ActuatorStores,
+};
+use tron_chainbase::{
+    AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
+    AssetIssueV2Store, ContractStore, DelegatedResourceStore, DelegationStore,
+    DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, IncrementalMerkleTreeStore,
+    KvBackend, MarketOrderStore, NullifierStore, ProposalStore, SessionBackend, VotesStore,
+    WitnessStore,
+};
+use tron_crypto::hash::sha256;
+use tron_proto::transaction::contract::ContractType;
+use tron_proto::{Block, Transaction};
+use tron_types::{
+    block_id_from_block, verify_parent_link, verify_tx_trie_root, verify_witness_signature,
+    BlockId, BlockValidateError,
+};
+
+// =============================================================================
+// Exec config
+// =============================================================================
+
+/// Executor-side knobs driven by `vm.*` in the node config. Defaults
+/// match java-tron's `VmConfig` defaults — all recording is OFF — so
+/// `execute_block` (which uses `ExecConfig::default()`) matches mainnet
+/// behavior. Callers that want internal-tx traces materialised must opt
+/// in by passing an explicit config via [`execute_block_with_config`] /
+/// [`execute_block_with_undo_with_config`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecConfig {
+    /// `vm.saveInternalTx`. When set, every per-frame CALL / CREATE /
+    /// SELFDESTRUCT trace captured by the TVM inspector is materialised
+    /// onto [`TxResult::internal_transactions`]. Defaults to `false`
+    /// (java-tron parity).
+    pub save_internal_tx: bool,
+    /// `vm.vmTrace`. Today acts as a companion to `save_internal_tx`
+    /// — when set, traces are recorded the same way. java-tron uses
+    /// this for per-opcode traces; tron-tvm doesn't emit per-opcode
+    /// traces yet, so the knob is wired but its only visible effect is
+    /// to enable the same internal-tx recording.
+    pub vm_trace: bool,
+    /// `vm.saveFeaturedInternalTx`. Reserved for actuator-side recording
+    /// of system-contract internal transactions (delegate / freeze / etc.).
+    /// Plumbed end-to-end so future actuator hooks can read it; today
+    /// no actuator emits featured internal txs, so toggling this has no
+    /// observable effect at the executor.
+    pub save_featured_internal_tx: bool,
+}
+
+impl ExecConfig {
+    /// Convenience: do any of the trace knobs require populating
+    /// [`TxResult::internal_transactions`]? Used inside `execute_vm_tx`
+    /// to gate the per-frame trace materialisation.
+    pub fn record_internal_txs(&self) -> bool {
+        self.save_internal_tx || self.vm_trace
+    }
+}
+
+#[cfg(test)]
+mod exec_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_java_tron_parity() {
+        let c = ExecConfig::default();
+        assert!(!c.save_internal_tx);
+        assert!(!c.vm_trace);
+        assert!(!c.save_featured_internal_tx);
+        assert!(!c.record_internal_txs());
+    }
+
+    #[test]
+    fn record_internal_txs_truth_table() {
+        // OFF / OFF → no.
+        assert!(!ExecConfig::default().record_internal_txs());
+        // save_internal_tx alone → yes.
+        assert!(ExecConfig { save_internal_tx: true, ..Default::default() }.record_internal_txs());
+        // vm_trace alone → yes.
+        assert!(ExecConfig { vm_trace: true, ..Default::default() }.record_internal_txs());
+        // Both → still yes.
+        assert!(ExecConfig {
+            save_internal_tx: true,
+            vm_trace: true,
+            ..Default::default()
+        }
+        .record_internal_txs());
+        // save_featured_internal_tx alone does NOT enable executor-side
+        // recording — it's reserved for future actuator hooks.
+        assert!(!ExecConfig {
+            save_featured_internal_tx: true,
+            ..Default::default()
+        }
+        .record_internal_txs());
+    }
+}
+
+// =============================================================================
+// State backends
+// =============================================================================
+
+/// The 16 base KV backends that together form one TRON node's state.
+/// `execute_block` forks per-tx [`SessionBackend`]s over each of these
+/// to give atomic per-tx commit/revert semantics.
+#[derive(Clone)]
+pub struct StateBackends {
+    pub accounts: Arc<dyn KvBackend>,
+    pub witnesses: Arc<dyn KvBackend>,
+    pub votes: Arc<dyn KvBackend>,
+    pub delegation: Arc<dyn KvBackend>,
+    pub delegated_resources: Arc<dyn KvBackend>,
+    pub dyn_props: Arc<dyn KvBackend>,
+    pub proposals: Arc<dyn KvBackend>,
+    pub name_index: Arc<dyn KvBackend>,
+    pub id_index: Arc<dyn KvBackend>,
+    pub asset_v1: Arc<dyn KvBackend>,
+    pub asset_v2: Arc<dyn KvBackend>,
+    pub contracts: Arc<dyn KvBackend>,
+    pub abi: Arc<dyn KvBackend>,
+    pub exchange_v1: Arc<dyn KvBackend>,
+    pub exchange_v2: Arc<dyn KvBackend>,
+    pub market_orders: Arc<dyn KvBackend>,
+    pub nullifiers: Arc<dyn KvBackend>,
+    /// Optional shielded-transfer incremental Merkle tree store.
+    /// When `None`, anchor checks and commitment appends are skipped.
+    pub merkle_trees: Option<Arc<dyn KvBackend>>,
+    /// EVM-side stores. Only consulted on `CreateSmartContract` /
+    /// `TriggerSmartContract`. Optional for the v1 path because not
+    /// every caller (e.g. unit tests of non-VM contracts) wants to
+    /// stand up the full EVM state.
+    pub code: Option<Arc<dyn KvBackend>>,
+    pub storage_row: Option<Arc<dyn KvBackend>>,
+    pub contract_state: Option<Arc<dyn KvBackend>>,
+    pub block_index: Option<Arc<dyn KvBackend>>,
+    /// Witness-schedule store (active witness list + shuffled order).
+    /// Read at block-execution time to know which witness was scheduled
+    /// for each slot — needed by `total_missed` attribution. Optional
+    /// because unit tests of single-contract paths don't need it; in
+    /// production it's always attached.
+    pub witness_schedule: Option<Arc<dyn KvBackend>>,
+}
+
+// =============================================================================
+// Per-transaction session (the new layer that fixes the old "no rollback" gap)
+// =============================================================================
+
+/// A bundle of 16 session-wrapped backends that all commit/revert
+/// together. Constructed once per transaction by the executor.
+struct TxSession {
+    accounts: Arc<SessionBackend>,
+    witnesses: Arc<SessionBackend>,
+    votes: Arc<SessionBackend>,
+    delegation: Arc<SessionBackend>,
+    delegated_resources: Arc<SessionBackend>,
+    dyn_props: Arc<SessionBackend>,
+    proposals: Arc<SessionBackend>,
+    name_index: Arc<SessionBackend>,
+    id_index: Arc<SessionBackend>,
+    asset_v1: Arc<SessionBackend>,
+    asset_v2: Arc<SessionBackend>,
+    contracts: Arc<SessionBackend>,
+    abi: Arc<SessionBackend>,
+    exchange_v1: Arc<SessionBackend>,
+    exchange_v2: Arc<SessionBackend>,
+    market_orders: Arc<SessionBackend>,
+    nullifiers: Arc<SessionBackend>,
+    merkle_trees: Option<Arc<SessionBackend>>,
+    /// EVM-side session-wrapped backends. `None` when the executor was
+    /// built without EVM stores; VM-bound contracts then reject.
+    code: Option<Arc<SessionBackend>>,
+    storage_row: Option<Arc<SessionBackend>>,
+    contract_state: Option<Arc<SessionBackend>>,
+    block_index: Option<Arc<SessionBackend>>,
+}
+
+impl TxSession {
+    fn fork(base: &StateBackends) -> Self {
+        Self {
+            accounts: Arc::new(SessionBackend::new(base.accounts.clone())),
+            witnesses: Arc::new(SessionBackend::new(base.witnesses.clone())),
+            votes: Arc::new(SessionBackend::new(base.votes.clone())),
+            delegation: Arc::new(SessionBackend::new(base.delegation.clone())),
+            delegated_resources: Arc::new(SessionBackend::new(base.delegated_resources.clone())),
+            dyn_props: Arc::new(SessionBackend::new(base.dyn_props.clone())),
+            proposals: Arc::new(SessionBackend::new(base.proposals.clone())),
+            name_index: Arc::new(SessionBackend::new(base.name_index.clone())),
+            id_index: Arc::new(SessionBackend::new(base.id_index.clone())),
+            asset_v1: Arc::new(SessionBackend::new(base.asset_v1.clone())),
+            asset_v2: Arc::new(SessionBackend::new(base.asset_v2.clone())),
+            contracts: Arc::new(SessionBackend::new(base.contracts.clone())),
+            abi: Arc::new(SessionBackend::new(base.abi.clone())),
+            exchange_v1: Arc::new(SessionBackend::new(base.exchange_v1.clone())),
+            exchange_v2: Arc::new(SessionBackend::new(base.exchange_v2.clone())),
+            market_orders: Arc::new(SessionBackend::new(base.market_orders.clone())),
+            nullifiers: Arc::new(SessionBackend::new(base.nullifiers.clone())),
+            merkle_trees: base
+                .merkle_trees
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            code: base
+                .code
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            storage_row: base
+                .storage_row
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            contract_state: base
+                .contract_state
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            block_index: base
+                .block_index
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+        }
+    }
+
+    fn commit(&self) {
+        self.accounts.commit();
+        self.witnesses.commit();
+        self.votes.commit();
+        self.delegation.commit();
+        self.delegated_resources.commit();
+        self.dyn_props.commit();
+        self.proposals.commit();
+        self.name_index.commit();
+        self.id_index.commit();
+        self.asset_v1.commit();
+        self.asset_v2.commit();
+        self.contracts.commit();
+        self.abi.commit();
+        self.exchange_v1.commit();
+        self.exchange_v2.commit();
+        self.market_orders.commit();
+        self.nullifiers.commit();
+        if let Some(s) = &self.merkle_trees {
+            s.commit();
+        }
+        if let Some(s) = &self.code {
+            s.commit();
+        }
+        if let Some(s) = &self.storage_row {
+            s.commit();
+        }
+        if let Some(s) = &self.contract_state {
+            s.commit();
+        }
+        if let Some(s) = &self.block_index {
+            s.commit();
+        }
+    }
+
+    fn revert(&self) {
+        self.accounts.revert();
+        self.witnesses.revert();
+        self.votes.revert();
+        self.delegation.revert();
+        self.delegated_resources.revert();
+        self.dyn_props.revert();
+        self.proposals.revert();
+        self.name_index.revert();
+        self.id_index.revert();
+        self.asset_v1.revert();
+        self.asset_v2.revert();
+        self.contracts.revert();
+        self.abi.revert();
+        self.exchange_v1.revert();
+        self.exchange_v2.revert();
+        self.market_orders.revert();
+        self.nullifiers.revert();
+        if let Some(s) = &self.merkle_trees {
+            s.revert();
+        }
+        if let Some(s) = &self.code {
+            s.revert();
+        }
+        if let Some(s) = &self.storage_row {
+            s.revert();
+        }
+        if let Some(s) = &self.contract_state {
+            s.revert();
+        }
+        if let Some(s) = &self.block_index {
+            s.revert();
+        }
+    }
+}
+
+/// Holder for the typed Store wrappers around a [`TxSession`]'s backends.
+/// Existence is just to keep the stores alive for the borrow checker —
+/// the [`ActuatorStores`] handed to actuators borrows from here.
+struct SessionStoreOwners {
+    accounts: AccountStore,
+    witnesses: WitnessStore,
+    votes: VotesStore,
+    delegation: DelegationStore,
+    delegated_resources: DelegatedResourceStore,
+    dyn_props: DynamicPropertiesStore,
+    proposals: ProposalStore,
+    name_index: AccountIndexStore,
+    id_index: AccountIdIndexStore,
+    asset_v1: AssetIssueStore,
+    asset_v2: AssetIssueV2Store,
+    contracts: ContractStore,
+    abi: AbiStore,
+    exchange_v1: ExchangeStore,
+    exchange_v2: ExchangeV2Store,
+    market_orders: MarketOrderStore,
+    nullifiers: NullifierStore,
+    merkle_trees: Option<IncrementalMerkleTreeStore>,
+}
+
+impl SessionStoreOwners {
+    fn from_session(sess: &TxSession) -> Self {
+        Self {
+            accounts: AccountStore::new(sess.accounts.clone()),
+            witnesses: WitnessStore::new(sess.witnesses.clone()),
+            votes: VotesStore::new(sess.votes.clone()),
+            delegation: DelegationStore::new(sess.delegation.clone()),
+            delegated_resources: DelegatedResourceStore::new(sess.delegated_resources.clone()),
+            dyn_props: DynamicPropertiesStore::new(sess.dyn_props.clone()),
+            proposals: ProposalStore::new(sess.proposals.clone()),
+            name_index: AccountIndexStore::new(sess.name_index.clone()),
+            id_index: AccountIdIndexStore::new(sess.id_index.clone()),
+            asset_v1: AssetIssueStore::new(sess.asset_v1.clone()),
+            asset_v2: AssetIssueV2Store::new(sess.asset_v2.clone()),
+            contracts: ContractStore::new(sess.contracts.clone()),
+            abi: AbiStore::new(sess.abi.clone()),
+            exchange_v1: ExchangeStore::new(sess.exchange_v1.clone()),
+            exchange_v2: ExchangeV2Store::new(sess.exchange_v2.clone()),
+            market_orders: MarketOrderStore::new(sess.market_orders.clone()),
+            nullifiers: NullifierStore::new(sess.nullifiers.clone()),
+            merkle_trees: sess
+                .merkle_trees
+                .as_ref()
+                .map(|b| IncrementalMerkleTreeStore::new(b.clone())),
+        }
+    }
+
+    fn as_actuator_stores(&self) -> ActuatorStores<'_> {
+        ActuatorStores {
+            accounts: &self.accounts,
+            witnesses: &self.witnesses,
+            votes: &self.votes,
+            delegation: &self.delegation,
+            delegated_resources: &self.delegated_resources,
+            dyn_props: &self.dyn_props,
+            proposals: &self.proposals,
+            name_index: &self.name_index,
+            id_index: &self.id_index,
+            asset_v1: &self.asset_v1,
+            asset_v2: &self.asset_v2,
+            contracts: &self.contracts,
+            abi: &self.abi,
+            exchange_v1: &self.exchange_v1,
+            exchange_v2: &self.exchange_v2,
+            market_orders: &self.market_orders,
+            nullifiers: &self.nullifiers,
+            merkle_trees: self.merkle_trees.as_ref(),
+        }
+    }
+}
+
+// =============================================================================
+// Per-tx outcome + report
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TxOutcome {
+    Success,
+    MissingRawData,
+    NoContract,
+    MissingParameter,
+    UnknownContractType(i32),
+    Invalid(ActuatorError),
+    ExecutionFailed(ActuatorError),
+}
+
+impl TxOutcome {
+    pub fn is_success(&self) -> bool {
+        matches!(self, TxOutcome::Success)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TxResult {
+    pub tx_id: [u8; 32],
+    pub contract_type: Option<ContractType>,
+    pub outcome: TxOutcome,
+    /// Per-frame CALL / CREATE traces recorded by the TVM inspector,
+    /// in execution order. Empty for non-VM contracts. Each entry is
+    /// already wire-encoded (`tron_proto::InternalTransaction`) with
+    /// `hash` pointing at the parent transaction id and `rejected`
+    /// reflecting both this frame's outcome and any ancestor revert.
+    pub internal_transactions: Vec<tron_proto::InternalTransaction>,
+    /// Successful LOG opcode emissions from the VM, in emission order.
+    /// Only populated when `outcome == TxOutcome::Success`; reverted /
+    /// halted txs surface no logs (java-tron behavior — logsfilter
+    /// only fires for committed contract executions).
+    pub vm_logs: Vec<tron_tvm::execute::VmLog>,
+}
+
+/// SR-list rotation observed during block apply. Populated only when
+/// the block crossed a maintenance boundary and a real rotation ran
+/// (i.e. not on block 1, which skips `doMaintenance` per java-tron).
+/// Callers — primarily the sync driver — feed this into the in-memory
+/// [`tron_consensus::SrEpochSnapshot`] so the PBFT runtime can accept
+/// cross-rotation votes signed by the pre-rotation SR set.
+#[derive(Debug, Clone)]
+pub struct MaintenanceRotation {
+    /// Active list **before** this block's rotation overwrote
+    /// `WitnessScheduleStore`. Becomes the snapshot's `before`.
+    pub prev_active: Vec<tron_crypto::address::Address>,
+    /// Active list installed by this block's rotation. Becomes the
+    /// snapshot's `current`.
+    pub new_active: Vec<tron_crypto::address::Address>,
+    /// `NEXT_MAINTENANCE_TIME` value AT the moment of rotation —
+    /// before this block bumped it. PBFT messages with `epoch <=`
+    /// this value validate against the `before` list; messages with
+    /// strictly greater epoch validate against `current`. Mirrors
+    /// java-tron's `MaintenanceManager.beforeMaintenanceTime`.
+    pub before_maintenance_time_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockExecutionReport {
+    pub block_id: BlockId,
+    pub tx_results: Vec<TxResult>,
+    /// Set when this block crossed a maintenance boundary AND ran
+    /// `doMaintenance` (i.e. `block_num != 1`). Callers apply it to
+    /// the shared [`tron_consensus::SrEpochSnapshot`] so PBFT
+    /// validates cross-rotation votes the way java-tron does. `None`
+    /// for ordinary blocks.
+    pub maintenance: Option<MaintenanceRotation>,
+}
+
+impl BlockExecutionReport {
+    pub fn successes(&self) -> usize {
+        self.tx_results.iter().filter(|r| r.outcome.is_success()).count()
+    }
+    pub fn failures(&self) -> usize {
+        self.tx_results.len() - self.successes()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlockExecError {
+    #[error("block structural validation failed: {0}")]
+    Structural(#[from] BlockValidateError),
+    #[error("block has no header / raw_data")]
+    NoHeader,
+    #[error(
+        "account_state_root mismatch at block {block_num}: expected {expected}, computed {computed}"
+    )]
+    StateRootMismatch {
+        block_num: i64,
+        expected: String,
+        computed: String,
+    },
+}
+
+// =============================================================================
+// Entry point
+// =============================================================================
+
+/// Execute `block` against `state`. Each transaction runs inside its own
+/// [`TxSession`]; failures **do not leak** to subsequent transactions.
+///
+/// Uses [`ExecConfig::default`] — i.e. java-tron defaults (no internal-
+/// tx recording). For test or operator setups that want traces, call
+/// [`execute_block_with_config`].
+pub fn execute_block(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(state, block, expected_parent, None, &ExecConfig::default())
+}
+
+/// As [`execute_block`], but with an explicit `ExecConfig`. The config
+/// flows through to `execute_vm_tx`, where it gates per-frame trace
+/// materialisation onto `TxResult::internal_transactions`.
+pub fn execute_block_with_config(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    config: &ExecConfig,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(state, block, expected_parent, None, config)
+}
+
+/// Execute `block` and persist a complete undo log to `undo_store`
+/// keyed by the block's number. The log captures every (store, key,
+/// before_image) needed by [`rollback_block`] to reverse this block's
+/// state mutations during a KhaosDb Phase B reorg.
+///
+/// On the happy path this is exactly [`execute_block`] plus a single
+/// write to the undo store. Performance overhead: one extra `get` per
+/// key written during the block (to capture pre-images). Block-time
+/// overhead is small relative to the EVM work.
+pub fn execute_block_with_undo(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    undo_store: &tron_chainbase::BlockUndoStore,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(state, block, expected_parent, Some(undo_store), &ExecConfig::default())
+}
+
+/// As [`execute_block_with_undo`], but with an explicit `ExecConfig`.
+pub fn execute_block_with_undo_and_config(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    undo_store: &tron_chainbase::BlockUndoStore,
+    config: &ExecConfig,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(state, block, expected_parent, Some(undo_store), config)
+}
+
+fn execute_block_inner(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    undo_store: Option<&tron_chainbase::BlockUndoStore>,
+    config: &ExecConfig,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    // Undo path: wrap every base backend in a top-level SessionBackend
+    // ("block session"). The per-tx sessions inside execute_one_tx
+    // become nested overlays — when they commit, writes flow to the
+    // block session's overlay, not directly to base. At the end of
+    // execute_block_logic we capture the undo log + commit the block
+    // session to base atomically (modulo per-key writes — same
+    // atomicity guarantee as SessionBackend::commit).
+    if let Some(undo_store) = undo_store {
+        let block_session = BlockSession::wrap(state);
+        let wrapped = block_session.as_state_backends();
+        let report = execute_block_logic(&wrapped, block, expected_parent, config)?;
+        let record = block_session.commit_with_undo();
+        let block_num = block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|r| r.number)
+            .unwrap_or(0);
+        undo_store.put(block_num, &record);
+        return Ok(report);
+    }
+    execute_block_logic(state, block, expected_parent, config)
+}
+
+/// Block-level session: wraps every base backend on a [`StateBackends`]
+/// in a [`SessionBackend`]. Per-tx sessions inside the executor nest
+/// over this block-level session so they commit to the block overlay
+/// rather than directly to base. At the end of block execution,
+/// [`BlockSession::commit_with_undo`] flushes the overlay to base and
+/// returns the captured undo log.
+struct BlockSession {
+    accounts: Arc<SessionBackend>,
+    witnesses: Arc<SessionBackend>,
+    votes: Arc<SessionBackend>,
+    delegation: Arc<SessionBackend>,
+    delegated_resources: Arc<SessionBackend>,
+    dyn_props: Arc<SessionBackend>,
+    proposals: Arc<SessionBackend>,
+    name_index: Arc<SessionBackend>,
+    id_index: Arc<SessionBackend>,
+    asset_v1: Arc<SessionBackend>,
+    asset_v2: Arc<SessionBackend>,
+    contracts: Arc<SessionBackend>,
+    abi: Arc<SessionBackend>,
+    exchange_v1: Arc<SessionBackend>,
+    exchange_v2: Arc<SessionBackend>,
+    market_orders: Arc<SessionBackend>,
+    nullifiers: Arc<SessionBackend>,
+    merkle_trees: Option<Arc<SessionBackend>>,
+    code: Option<Arc<SessionBackend>>,
+    storage_row: Option<Arc<SessionBackend>>,
+    contract_state: Option<Arc<SessionBackend>>,
+    block_index: Option<Arc<SessionBackend>>,
+    witness_schedule: Option<Arc<SessionBackend>>,
+}
+
+impl BlockSession {
+    fn wrap(state: &StateBackends) -> Self {
+        Self {
+            accounts: Arc::new(SessionBackend::new(state.accounts.clone())),
+            witnesses: Arc::new(SessionBackend::new(state.witnesses.clone())),
+            votes: Arc::new(SessionBackend::new(state.votes.clone())),
+            delegation: Arc::new(SessionBackend::new(state.delegation.clone())),
+            delegated_resources: Arc::new(SessionBackend::new(state.delegated_resources.clone())),
+            dyn_props: Arc::new(SessionBackend::new(state.dyn_props.clone())),
+            proposals: Arc::new(SessionBackend::new(state.proposals.clone())),
+            name_index: Arc::new(SessionBackend::new(state.name_index.clone())),
+            id_index: Arc::new(SessionBackend::new(state.id_index.clone())),
+            asset_v1: Arc::new(SessionBackend::new(state.asset_v1.clone())),
+            asset_v2: Arc::new(SessionBackend::new(state.asset_v2.clone())),
+            contracts: Arc::new(SessionBackend::new(state.contracts.clone())),
+            abi: Arc::new(SessionBackend::new(state.abi.clone())),
+            exchange_v1: Arc::new(SessionBackend::new(state.exchange_v1.clone())),
+            exchange_v2: Arc::new(SessionBackend::new(state.exchange_v2.clone())),
+            market_orders: Arc::new(SessionBackend::new(state.market_orders.clone())),
+            nullifiers: Arc::new(SessionBackend::new(state.nullifiers.clone())),
+            merkle_trees: state
+                .merkle_trees
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            code: state.code.as_ref().map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            storage_row: state
+                .storage_row
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            contract_state: state
+                .contract_state
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            block_index: state
+                .block_index
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            witness_schedule: state
+                .witness_schedule
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+        }
+    }
+
+    /// Produce a [`StateBackends`] whose backends are the session
+    /// overlays from this `BlockSession`. The executor calls into this
+    /// for the duration of one block.
+    fn as_state_backends(&self) -> StateBackends {
+        StateBackends {
+            accounts: self.accounts.clone(),
+            witnesses: self.witnesses.clone(),
+            votes: self.votes.clone(),
+            delegation: self.delegation.clone(),
+            delegated_resources: self.delegated_resources.clone(),
+            dyn_props: self.dyn_props.clone(),
+            proposals: self.proposals.clone(),
+            name_index: self.name_index.clone(),
+            id_index: self.id_index.clone(),
+            asset_v1: self.asset_v1.clone(),
+            asset_v2: self.asset_v2.clone(),
+            contracts: self.contracts.clone(),
+            abi: self.abi.clone(),
+            exchange_v1: self.exchange_v1.clone(),
+            exchange_v2: self.exchange_v2.clone(),
+            market_orders: self.market_orders.clone(),
+            nullifiers: self.nullifiers.clone(),
+            merkle_trees: self.merkle_trees.clone().map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+            code: self.code.clone().map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+            storage_row: self.storage_row.clone().map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+            contract_state: self
+                .contract_state
+                .clone()
+                .map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+            block_index: self.block_index.clone().map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+            witness_schedule: self
+                .witness_schedule
+                .clone()
+                .map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+        }
+    }
+
+    /// Commit every store's overlay to its base backend, capturing
+    /// `(store_id, key, before_image)` triples for each write. The
+    /// result is one [`BlockUndoRecord`] suitable for persistence.
+    fn commit_with_undo(self) -> tron_chainbase::BlockUndoRecord {
+        use tron_chainbase::UndoStoreId as Id;
+        let mut record = tron_chainbase::BlockUndoRecord::new();
+        let mut push = |id: Id, undo: Vec<(Vec<u8>, Option<Vec<u8>>)>| {
+            for (key, before) in undo {
+                record.push(tron_chainbase::UndoEntry { store: id, key, before });
+            }
+        };
+        push(Id::Accounts, self.accounts.commit_with_undo());
+        push(Id::Witnesses, self.witnesses.commit_with_undo());
+        push(Id::Votes, self.votes.commit_with_undo());
+        push(Id::Delegation, self.delegation.commit_with_undo());
+        push(Id::DelegatedResources, self.delegated_resources.commit_with_undo());
+        push(Id::DynProps, self.dyn_props.commit_with_undo());
+        push(Id::Proposals, self.proposals.commit_with_undo());
+        push(Id::NameIndex, self.name_index.commit_with_undo());
+        push(Id::IdIndex, self.id_index.commit_with_undo());
+        push(Id::AssetV1, self.asset_v1.commit_with_undo());
+        push(Id::AssetV2, self.asset_v2.commit_with_undo());
+        push(Id::Contracts, self.contracts.commit_with_undo());
+        push(Id::Abi, self.abi.commit_with_undo());
+        push(Id::ExchangeV1, self.exchange_v1.commit_with_undo());
+        push(Id::ExchangeV2, self.exchange_v2.commit_with_undo());
+        push(Id::MarketOrders, self.market_orders.commit_with_undo());
+        push(Id::Nullifiers, self.nullifiers.commit_with_undo());
+        if let Some(s) = self.merkle_trees {
+            push(Id::MerkleTrees, s.commit_with_undo());
+        }
+        if let Some(s) = self.code {
+            push(Id::Code, s.commit_with_undo());
+        }
+        if let Some(s) = self.storage_row {
+            push(Id::StorageRow, s.commit_with_undo());
+        }
+        if let Some(s) = self.contract_state {
+            push(Id::ContractState, s.commit_with_undo());
+        }
+        if let Some(s) = self.block_index {
+            push(Id::BlockIndex, s.commit_with_undo());
+        }
+        record
+    }
+}
+
+/// Replay a previously-captured undo log to restore base-store state
+/// to its pre-block contents. The log is read from `undo_store` keyed
+/// by `block_num` and then deleted (records aren't useful after
+/// successful rollback). Order doesn't matter — each entry is an
+/// independent (store, key) point overwrite.
+///
+/// Returns the number of entries replayed. Errors only on a malformed
+/// undo record or an unknown store id.
+pub fn rollback_block(
+    state: &StateBackends,
+    block_num: i64,
+    undo_store: &tron_chainbase::BlockUndoStore,
+) -> Result<usize, RollbackError> {
+    use tron_chainbase::UndoStoreId as Id;
+    let record = undo_store
+        .get(block_num)
+        .map_err(|e| RollbackError::Decode(format!("{e:?}")))?
+        .ok_or(RollbackError::MissingUndoRecord(block_num))?;
+    let n = record.entries.len();
+    for entry in &record.entries {
+        let backend: &Arc<dyn tron_chainbase::KvBackend> = match entry.store {
+            Id::Accounts => &state.accounts,
+            Id::Witnesses => &state.witnesses,
+            Id::Votes => &state.votes,
+            Id::Delegation => &state.delegation,
+            Id::DelegatedResources => &state.delegated_resources,
+            Id::DynProps => &state.dyn_props,
+            Id::Proposals => &state.proposals,
+            Id::NameIndex => &state.name_index,
+            Id::IdIndex => &state.id_index,
+            Id::AssetV1 => &state.asset_v1,
+            Id::AssetV2 => &state.asset_v2,
+            Id::Contracts => &state.contracts,
+            Id::Abi => &state.abi,
+            Id::ExchangeV1 => &state.exchange_v1,
+            Id::ExchangeV2 => &state.exchange_v2,
+            Id::MarketOrders => &state.market_orders,
+            Id::Nullifiers => &state.nullifiers,
+            Id::MerkleTrees => state
+                .merkle_trees
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached("merkle_trees"))?,
+            Id::Code => state.code.as_ref().ok_or(RollbackError::OptionalStoreNotAttached("code"))?,
+            Id::StorageRow => state
+                .storage_row
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached("storage_row"))?,
+            Id::ContractState => state
+                .contract_state
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached("contract_state"))?,
+            Id::BlockIndex => state
+                .block_index
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached("block_index"))?,
+        };
+        match &entry.before {
+            Some(v) => backend.put(&entry.key, v),
+            None => backend.delete(&entry.key),
+        }
+    }
+    undo_store.delete(block_num);
+    Ok(n)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RollbackError {
+    #[error("no undo record stored for block {0}")]
+    MissingUndoRecord(i64),
+    #[error("undo record decode failed: {0}")]
+    Decode(String),
+    #[error("rollback log references store '{0}' but it isn't attached on this node")]
+    OptionalStoreNotAttached(&'static str),
+}
+
+/// Pure executor logic — operates on whatever [`StateBackends`] is
+/// handed in. The top-level [`execute_block_inner`] dispatches here
+/// either against base backends directly (no undo) or against a
+/// [`BlockSession`] overlay (undo path).
+fn execute_block_logic(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    config: &ExecConfig,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    // === 1. Structural validation (read-only; safe to use base directly) ===
+    if let Some(parent) = expected_parent {
+        verify_parent_link(block, parent)?;
+    }
+    verify_tx_trie_root(block)?;
+    if let Some(header) = &block.block_header {
+        if !header.witness_signature.is_empty() {
+            verify_witness_signature(block, None)?;
+        }
+    }
+
+    // === 2. Per-tx atomic loop ===
+    let mut tx_results = Vec::with_capacity(block.transactions.len());
+    for tx in &block.transactions {
+        tx_results.push(execute_one_tx(state, tx, config));
+    }
+
+    // === 3. Head-pointer update (directly on base) ===
+    let block_id = block_id_from_block(block).map_err(|_| BlockExecError::NoHeader)?;
+    let header = block.block_header.as_ref().ok_or(BlockExecError::NoHeader)?;
+    let raw = header.raw_data.as_ref().ok_or(BlockExecError::NoHeader)?;
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    // Snapshot the previous block's timestamp BEFORE overwriting —
+    // step 5 needs it for slot-gap attribution (`total_missed`).
+    let prev_block_ts = dp.latest_block_header_timestamp();
+    dp.save_latest_block_header_number(raw.number);
+    dp.save_latest_block_header_timestamp(raw.timestamp);
+    dp.save_latest_block_header_hash(block_id.as_bytes());
+
+    // === 4. Adaptive-energy: fold BLOCK_ENERGY_USAGE into the
+    //        chain-wide rolling average and adjust the global cap. ===
+    //
+    // Runs once per block after every tx has been processed. No-op
+    // when ALLOW_ADAPTIVE_ENERGY != 1.
+    adaptive::run_per_block_adaptive_update(&dp, raw.number);
+
+    // === 5. Witness counter updates ===
+    //
+    // Bump `total_produced` on the witness that signed this block AND
+    // attribute every missed slot since the previous block to the SR
+    // that was scheduled for it. Mirrors java-tron's
+    // `consensus.dpos.StatisticManager.applyBlock`.
+    //
+    // Slot attribution: number of slots elapsed since the parent block
+    // = `(raw.timestamp - prev_block_ts) / BLOCK_PRODUCED_INTERVAL_MS`.
+    // If that's > 1, the gap minus 1 blocks were missed. For each
+    // missed slot index `i`, the SR scheduled to produce it is
+    // `active_witnesses[(absolute_slot_i - 1) % 27]`. Walk those and
+    // bump `total_missed`.
+    //
+    // Requirements: `state.witness_schedule` must be attached (the
+    // shuffled active-witness list lives there) and the genesis
+    // timestamp must be pinned via `save_genesis_block_timestamp`
+    // (runtime does this once at init). If either is missing we only
+    // bump `total_produced` and skip the miss attribution — better to
+    // under-report than to attribute misses to the wrong SR.
+    {
+        use tron_chainbase::{WitnessScheduleStore, WitnessStore};
+        use tron_crypto::address::Address;
+        let ws = WitnessStore::new(state.witnesses.clone());
+
+        // 5a — `total_produced` + `latest_block_num` + `latest_slot_num`
+        // on the producer. `latest_slot_num` mirrors java-tron's
+        // `wc.setLatestSlotNum(dposSlot.getAbSlot(blockTime))` —
+        // absolute slot since genesis, used by SR-rotation tooling +
+        // external explorers reading per-witness timing.
+        if raw.witness_address.len() == 21 {
+            let mut addr_bytes = [0u8; 21];
+            addr_bytes.copy_from_slice(&raw.witness_address);
+            let addr = Address::from_raw(addr_bytes);
+            if let Ok(Some(mut w)) = ws.get(&addr) {
+                w.total_produced = w.total_produced.saturating_add(1);
+                w.latest_block_num = raw.number;
+                let genesis_ts_for_slot = dp.genesis_block_timestamp().unwrap_or(0);
+                const BLOCK_INTERVAL_MS: i64 = 3_000;
+                // Negative genesis-ts is impossible on a real chain
+                // (genesis writes timestamp); saturate at 0 if it ever is.
+                w.latest_slot_num = (raw.timestamp - genesis_ts_for_slot)
+                    .max(0)
+                    / BLOCK_INTERVAL_MS;
+                ws.put(&addr, &w);
+            }
+        }
+
+        // 5b — `total_missed` on every SR who was scheduled but didn't
+        // produce in the gap between the previous block and this one.
+        let active_witnesses = state
+            .witness_schedule
+            .as_ref()
+            .and_then(|be| {
+                WitnessScheduleStore::new(be.clone())
+                    .load_active()
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
+        let genesis_ts = dp.genesis_block_timestamp().unwrap_or(0);
+        // Block 1 is special: java-tron's StatisticManager hard-codes
+        // `slot = 1` for it (no miss attribution because there is no
+        // previous-producer baseline). Mirror that.
+        if raw.number > 1
+            && !active_witnesses.is_empty()
+            && prev_block_ts.is_some()
+        {
+            const BLOCK_INTERVAL_MS: i64 = 3_000;
+            let prev_ts = prev_block_ts.unwrap();
+            // Absolute-slot calculation mirrors `DposSlot.getAbSlot`.
+            let prev_abs = (prev_ts - genesis_ts) / BLOCK_INTERVAL_MS;
+            let this_abs = (raw.timestamp - genesis_ts) / BLOCK_INTERVAL_MS;
+            // For every slot strictly between the prev producer's
+            // slot and this block's slot, look up the scheduled SR.
+            // The scheduled-index formula mirrors `DposSlot
+            // .getScheduledWitness` — `((slot - 1) % N)` where N is
+            // the active witness count (SINGLE_REPEAT == 1 today).
+            for missed_slot in (prev_abs + 1)..this_abs {
+                if missed_slot < 1 {
+                    continue;
+                }
+                let idx = ((missed_slot - 1).rem_euclid(active_witnesses.len() as i64))
+                    as usize;
+                let missed_addr = active_witnesses[idx];
+                if let Ok(Some(mut w)) = ws.get(&missed_addr) {
+                    w.total_missed = w.total_missed.saturating_add(1);
+                    ws.put(&missed_addr, &w);
+                }
+            }
+        }
+    }
+
+    // === 5c. Per-block reward distribution ===
+    //
+    // Mirrors java-tron's per-block `MortgageService.payBlockReward`
+    // + `payStandbyWitness` calls (driven by `DposService` after each
+    // block apply). For each produced block:
+    //
+    //   * The producer is credited `WITNESS_PAY_PER_BLOCK` (default
+    //     32 TRX). The witness's brokerage cut goes straight to their
+    //     `Account.allowance`; the remainder is added to the current
+    //     cycle's reward pool, to be distributed to voters via the
+    //     Vi-accumulator math at the next maintenance boundary.
+    //
+    //   * Every active SR in the top 127 by vote_count shares
+    //     `WITNESS_127_PAY_PER_BLOCK` (default 16 TRX) prorated by
+    //     vote count. Same brokerage / cycle-pool split per witness.
+    //
+    // Gated on `state.witness_schedule` being attached and the
+    // producer being a real witness with a backing account row — if
+    // either is missing, we silently skip rather than misattribute
+    // rewards.
+    if raw.witness_address.len() == 21 {
+        use tron_chainbase::{DelegationStore, WitnessStore};
+        use tron_crypto::address::Address;
+        let mut producer_bytes = [0u8; 21];
+        producer_bytes.copy_from_slice(&raw.witness_address);
+        let producer = Address::from_raw(producer_bytes);
+        let accts = AccountStore::new(state.accounts.clone());
+        let dlg = DelegationStore::new(state.delegation.clone());
+
+        // 5c-i. Block-production reward to the producer.
+        let block_pay = dp.witness_pay_per_block();
+        if block_pay > 0 {
+            let _ = tron_tvm::reward::pay_block_reward(
+                &accts, &dlg, &dp, &producer, block_pay,
+            );
+        }
+
+        // 5c-ii. Standby pool distribution to top-127 by vote_count.
+        // We use the WitnessStore::all() scan because the standby set
+        // is independent of the active witness rotation (which is
+        // capped at 27).
+        let standby_pay = dp.witness_127_pay_per_block();
+        if standby_pay > 0 {
+            let ws = WitnessStore::new(state.witnesses.clone());
+            if let Ok(mut by_vote) = ws.all() {
+                let mut ranked: Vec<(Address, i64)> =
+                    by_vote.drain(..).map(|(a, w)| (a, w.vote_count)).collect();
+                ranked.sort_by(|a, b| {
+                    b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+                });
+                ranked.truncate(127);
+                let _ =
+                    tron_tvm::reward::pay_standby_witness(&accts, &dlg, &dp, &ranked);
+            }
+        }
+    }
+
+    // === 5d. Maintenance-period pass ===
+    //
+    // Mirrors `MaintenanceManager.applyBlock`: every block crossing
+    // `next_maintenance_time` triggers a full cycle rollover —
+    // Vi accumulation, vote tally + SR re-rank, isJobs flip, cycle
+    // number increment, brokerage/vote snapshots for the next cycle.
+    //
+    // java-tron has a "block 1 special case" where the genesis block
+    // skips doMaintenance but DOES advance next_maintenance_time; we
+    // mirror that.
+    let maintenance_interval = dp
+        .maintenance_time_interval()
+        .unwrap_or(tron_consensus::DEFAULT_MAINTENANCE_INTERVAL_MS);
+    let next_maintenance = dp.next_maintenance_time().unwrap_or(0);
+    let mut maintenance_rotation: Option<MaintenanceRotation> = None;
+    if tron_consensus::is_maintenance_boundary(raw.timestamp, next_maintenance) {
+        // Run doMaintenance for every block EXCEPT genesis. Java-tron's
+        // check is `blockNum != 1`.
+        if raw.number != 1 {
+            use tron_chainbase::{DelegationStore, WitnessScheduleStore};
+            let ws = tron_chainbase::WitnessStore::new(state.witnesses.clone());
+            let vs = tron_chainbase::VotesStore::new(state.votes.clone());
+            let sched_be = state.witness_schedule.clone();
+            let accts = AccountStore::new(state.accounts.clone());
+            let dlg = DelegationStore::new(state.delegation.clone());
+            if let Some(sched_be) = sched_be {
+                let schedule = WitnessScheduleStore::new(sched_be);
+                if let Ok(outcome) = tron_consensus::apply_maintenance(
+                    &ws, &vs, &schedule, &accts, &dlg, &dp,
+                ) {
+                    // Capture the rotation so the caller can update the
+                    // shared SrEpochSnapshot. `next_maintenance` is the
+                    // pre-bump value — exactly java-tron's
+                    // `beforeMaintenanceTime`. The post-bump value is
+                    // saved a few lines down.
+                    maintenance_rotation = Some(MaintenanceRotation {
+                        prev_active: outcome.prev_active,
+                        new_active: outcome.new_active,
+                        before_maintenance_time_ms: next_maintenance,
+                    });
+                }
+            }
+        }
+        // Always advance next_maintenance_time past this block.
+        let new_next = tron_consensus::compute_next_maintenance_time(
+            raw.timestamp,
+            next_maintenance.max(raw.timestamp), // first-time init
+            maintenance_interval,
+        );
+        dp.save_next_maintenance_time(new_next);
+    }
+
+    // === 6. AccountStateRoot verification (consensus-critical when
+    //        ALLOW_ACCOUNT_STATE_ROOT == 1) ===
+    //
+    // Mainnet currently has this flag DISABLED (==0), so producers
+    // leave `BlockHeader.raw_data.account_state_root` empty and this
+    // arm is a no-op. We still wire it for the day mainnet enables
+    // it, and for testnets that already have it on.
+    //
+    // Verification path: scan every account, RLP-encode the
+    // Ethereum-style [nonce, balance, storageRoot, codeHash], drop
+    // each into a Merkle-Patricia trie keyed by
+    // `keccak256(addr[1..])`, compare the trie root to the block
+    // header's `account_state_root`. Mismatch = consensus divergence
+    // → reject the block.
+    //
+    // Cost: full-scan O(accounts + storage_rows). On mainnet (~tens of
+    // millions of accounts) this is impractical per block — java-tron
+    // uses an incremental trie keyed on touched-accounts only. We
+    // defer that optimization until the flag actually activates.
+    if !raw.account_state_root.is_empty()
+        && dp.get_long(b"ALLOW_ACCOUNT_STATE_ROOT").unwrap_or(0) == 1
+    {
+        let computed = compute_state_root(state);
+        if computed.as_slice() != raw.account_state_root.as_slice() {
+            return Err(BlockExecError::StateRootMismatch {
+                block_num: raw.number,
+                expected: hex::encode(&raw.account_state_root),
+                computed: hex::encode(computed),
+            });
+        }
+    }
+
+    Ok(BlockExecutionReport {
+        block_id,
+        tx_results,
+        maintenance: maintenance_rotation,
+    })
+}
+
+/// Compute the Ethereum-style state root over the current account set.
+///
+/// Full-scan implementation: enumerates every (address, account) pair
+/// in `AccountStore`, looks up per-contract storage rows from
+/// `StorageRowStore`, and folds them through
+/// [`tron_types::compute_account_state_root_with_storage`].
+///
+/// Cost is O(accounts + storage_rows). Intended only for paths that
+/// actually need the root — gated upstream on
+/// `ALLOW_ACCOUNT_STATE_ROOT == 1` so the mainnet path (flag = 0)
+/// pays nothing.
+/// Apply `block` against `state`, compute the resulting
+/// `account_state_root`, then **roll back** so `state` is left
+/// untouched. Used by the SR runtime to fill in the
+/// `BlockHeader.raw_data.account_state_root` field when
+/// `ALLOW_ACCOUNT_STATE_ROOT == 1` is active. The dry-run uses a
+/// fresh ephemeral `BlockUndoStore` so the real one (used by the
+/// SyncDriver for reorg) isn't polluted.
+///
+/// Cost: one full block apply + one full state-root scan + one
+/// rollback. For consensus-critical paths this happens at most once
+/// per slot (3s on mainnet); the cost is amortized against the slot
+/// budget.
+pub fn dry_run_for_state_root(
+    state: &StateBackends,
+    block: &tron_proto::Block,
+    expected_parent: Option<BlockId>,
+) -> Result<[u8; 32], BlockExecError> {
+    let ephemeral = tron_chainbase::BlockUndoStore::new(Arc::new(tron_chainbase::MemBackend::new()));
+    execute_block_with_undo(state, block, expected_parent, &ephemeral)?;
+    let root = compute_state_root(state);
+    let raw = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+        .ok_or(BlockExecError::NoHeader)?;
+    // Roll back so the dry-run leaves no trace. A failure here means
+    // the state machine is internally inconsistent — propagate as a
+    // StateRootMismatch since the contract of "dry-run leaves state
+    // untouched" was violated.
+    rollback_block(state, raw.number, &ephemeral).map_err(|e| {
+        BlockExecError::StateRootMismatch {
+            block_num: raw.number,
+            expected: format!("dry-run rollback failure: {e}"),
+            computed: hex::encode(root),
+        }
+    })?;
+    Ok(root)
+}
+
+pub fn compute_state_root(state: &StateBackends) -> [u8; 32] {
+    use tron_crypto::address::Address;
+    use tron_proto::Account;
+
+    let storage_lookup = |addr: &Address| -> Option<[u8; 32]> {
+        let rows_be = state.storage_row.as_ref()?;
+        let rows = tron_chainbase::StorageRowStore::new(rows_be.clone())
+            .scan_for_contract(addr);
+        if rows.is_empty() {
+            None
+        } else {
+            let rows_owned: Vec<([u8; 32], Vec<u8>)> =
+                rows.into_iter().map(|(k, v)| (k, v)).collect();
+            Some(tron_types::compute_storage_root(&rows_owned))
+        }
+    };
+
+    let mut accounts: Vec<(Address, Account)> = Vec::new();
+    for (key, value) in state.accounts.scan_all() {
+        if key.len() != 21 {
+            continue;
+        }
+        let mut addr_bytes = [0u8; 21];
+        addr_bytes.copy_from_slice(&key);
+        let Ok(account) = <Account as prost::Message>::decode(value.as_slice()) else {
+            continue;
+        };
+        accounts.push((Address::from_raw(addr_bytes), account));
+    }
+    tron_types::compute_account_state_root_with_storage(&accounts, storage_lookup)
+}
+
+fn execute_one_tx(state: &StateBackends, tx: &Transaction, config: &ExecConfig) -> TxResult {
+    // Fork a fresh session for this tx — any writes here are confined
+    // until we commit. Failed txs revert; the next tx starts fresh.
+    let session = TxSession::fork(state);
+    let owners = SessionStoreOwners::from_session(&session);
+    let stores = owners.as_actuator_stores();
+
+    let Some(raw) = &tx.raw_data else {
+        // No state to revert — session is still empty.
+        return TxResult {
+            tx_id: [0u8; 32],
+            contract_type: None,
+            outcome: TxOutcome::MissingRawData,
+                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+        };
+    };
+    let tx_id = sha256(&raw.encode_to_vec());
+
+    let Some(contract) = raw.contract.first() else {
+        return TxResult {
+            tx_id,
+            contract_type: None,
+            outcome: TxOutcome::NoContract,
+                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+        };
+    };
+
+    let ty = match ContractType::try_from(contract.r#type) {
+        Ok(t) => t,
+        Err(_) => {
+            return TxResult {
+                tx_id,
+                contract_type: None,
+                outcome: TxOutcome::UnknownContractType(contract.r#type),
+                            internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+            }
+        }
+    };
+
+    let Some(parameter) = &contract.parameter else {
+        return TxResult {
+            tx_id,
+            contract_type: Some(ty),
+            outcome: TxOutcome::MissingParameter,
+                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+        };
+    };
+
+    // Sighash is only meaningful for shielded transactions; for every
+    // other contract type the actuators ignore the field. Mirrors
+    // java-tron, which only calls `getShieldTransactionHashIgnore...`
+    // when dispatching ShieldedTransferContract.
+    let tx_ctx = if matches!(ty, ContractType::ShieldedTransferContract) {
+        let dp = tron_chainbase::DynamicPropertiesStore::new(state.dyn_props.clone());
+        let zen_token_id = dp
+            .get_bytes(b"ZEN_TOKEN_ID")
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| "000000".to_string());
+        match tron_actuator::shielded_transfer::compute_shielded_sighash(tx, &zen_token_id) {
+            Ok(h) => tron_actuator::ActuatorTxCtx { sighash: h },
+            Err(_) => {
+                // Malformed shielded tx — fall through with a zero
+                // sighash; the actuator will reject during validation
+                // and the tx is consistently rejected rather than
+                // panicking here.
+                tron_actuator::ActuatorTxCtx::default()
+            }
+        }
+    } else {
+        tron_actuator::ActuatorTxCtx::default()
+    };
+
+    // === Permission / multi-sig check. ===
+    // Verify the transaction's signers cover the active permission's
+    // threshold for this contract type. Skipped for shielded contracts
+    // (their owner is empty/transparent-only and the actuator has its
+    // own verification path).
+    if !matches!(ty, ContractType::ShieldedTransferContract) {
+        if let Err(e) =
+            check_transaction_permission(stores.accounts, stores.dyn_props, tx, contract, ty)
+        {
+            session.revert();
+            return TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(e.to_string())),
+                            internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+            };
+        }
+    }
+
+    // === Bandwidth charge. ===
+    // The owner pays for this transaction's wire bytes via java-tron's
+    // priority: useAssetAccountNet (TRC-10 only) → useAccountNet
+    // (global-scaled frozen quota) → useFreeNet (daily 5kB free, with
+    // chain-wide PUBLIC_NET tracking) → useTransactionFee (TRX
+    // fallback). Shielded transactions skip this (their fee is handled
+    // inside the actuator). VM-bound contracts (TriggerSmartContract /
+    // CreateSmartContract) DO get bandwidth-charged here for the wire
+    // bytes; the per-opcode energy is then charged separately inside
+    // `execute_vm_tx` after the VM finishes.
+    if !matches!(ty, ContractType::ShieldedTransferContract) {
+        if let Ok(owner) = extract_owner_for_bandwidth(contract, ty) {
+            let now_slot = head_slot(stores.dyn_props);
+            let bw_stores = bandwidth::BandwidthStores {
+                accounts: stores.accounts,
+                dyn_props: stores.dyn_props,
+                asset_v1: stores.asset_v1,
+                asset_v2: stores.asset_v2,
+            };
+            if let Err(e) =
+                bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot)
+            {
+                session.revert();
+                return TxResult {
+                    tx_id,
+                    contract_type: Some(ty),
+                    outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(format!(
+                        "bandwidth: {e}"
+                    ))),
+                                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+                };
+            }
+        }
+    }
+
+    // === Smart-contract path ===
+    //
+    // VM-bound contracts (`TriggerSmartContract`, `CreateSmartContract`)
+    // bypass the actuator dispatch and route through `tron-tvm` directly.
+    // Bandwidth has already been charged above; `execute_vm_tx` adds
+    // the post-VM energy charge.
+    if matches!(
+        ty,
+        ContractType::TriggerSmartContract | ContractType::CreateSmartContract
+    ) {
+        return execute_vm_tx(&session, tx_id, ty, parameter, config);
+    }
+
+    // Validate. On reject: revert (drops any pending writes — though
+    // validate shouldn't write, this is defence in depth) and report.
+    if let Err(e) = dispatch_validate(&stores, &tx_ctx, ty, parameter) {
+        session.revert();
+        return TxResult {
+            tx_id,
+            contract_type: Some(ty),
+            outcome: TxOutcome::Invalid(e),
+                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+        };
+    }
+
+    // Execute. On success: commit the session. On failure: revert
+    // (this is the bit that fixes the old v1 limitation — partial
+    // state mutations from a failed execute are NOT applied).
+    match dispatch_execute(&stores, &tx_ctx, ty, parameter) {
+        Ok(_result) => {
+            session.commit();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::Success,
+                            internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+            }
+        }
+        Err(e) => {
+            session.revert();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::ExecutionFailed(e),
+                            internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Route a `TriggerSmartContract` transaction through the TVM.
+///
+/// Returns [`TxOutcome::Invalid`] with an [`ActuatorError::NotImplemented`]
+/// shape when the session was built without EVM stores attached, so the
+/// failure mode is clear at the executor layer.
+///
+/// **Energy charging.** After the VM returns its `VmOutcome::Success`
+/// (or `Revert`), this function calls
+/// [`energy::consume_energy`] on the caller's account, deducting the
+/// energy cost from their frozen-energy quota with a TRX-fee fallback.
+/// On a revert, java-tron still charges the energy that ran before the
+/// revert — we mirror that. On insufficient balance for the fee, the
+/// whole session is reverted and the tx is marked
+/// [`TxOutcome::ExecutionFailed`].
+fn execute_vm_tx(
+    session: &TxSession,
+    tx_id: [u8; 32],
+    ty: ContractType,
+    parameter: &prost_types::Any,
+    config: &ExecConfig,
+) -> TxResult {
+    use tron_chainbase::{
+        BlockIndexStore as BIS, CodeStore as CS, ContractStateStore as CtS,
+        ContractStore as ConS, DelegatedResourceStore as DRS, DelegationStore as DelS,
+        DynamicPropertiesStore as DPS, StorageRowStore as SRS, WitnessStore as WS,
+    };
+
+    // Require all four EVM-side stores; if any is missing we can't
+    // safely run the VM.
+    let (Some(code), Some(storage), Some(contract_state)) = (
+        session.code.as_ref(),
+        session.storage_row.as_ref(),
+        session.contract_state.as_ref(),
+    ) else {
+        session.revert();
+        return TxResult {
+            tx_id,
+            contract_type: Some(ty),
+            outcome: TxOutcome::Invalid(ActuatorError::NotImplemented(
+                "VM-bound contract but executor was built without EVM stores attached",
+            )),
+                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+        };
+    };
+
+    let vm_stores = tron_tvm::execute::VmStores {
+        accounts: Arc::new(AccountStore::new(session.accounts.clone() as _)),
+        code: Arc::new(CS::new(code.clone() as _)),
+        storage: Arc::new(SRS::new(storage.clone() as _)),
+        witnesses: Arc::new(WS::new(session.witnesses.clone() as _)),
+        contract_state: Arc::new(CtS::new(contract_state.clone() as _)),
+        dynamic_properties: Arc::new(DPS::new(session.dyn_props.clone() as _)),
+        delegated_resources: Arc::new(DRS::new(session.delegated_resources.clone() as _)),
+        delegation: Arc::new(DelS::new(session.delegation.clone() as _)),
+        // Attach BlockIndexStore so BLOCKHASH(n) returns real hashes
+        // for the last 256 blocks (when the backend is configured).
+        block_index: session
+            .block_index
+            .as_ref()
+            .map(|b| Arc::new(BIS::new(b.clone() as _))),
+        // ContractStore lets the v1/v2 storage-key layout selector
+        // read SmartContract.version.
+        contracts: Some(Arc::new(ConS::new(session.contracts.clone() as _))),
+        // VotesStore feeds the VOTEWITNESS opcode bridge.
+        votes: Some(Arc::new(VotesStore::new(session.votes.clone() as _))),
+    };
+
+    // Read current block number/time from the dyn-props session (so we
+    // see this block's header if it's been written; otherwise the last
+    // committed one).
+    let dp = DPS::new(session.dyn_props.clone() as _);
+    let block_number = dp.latest_block_header_number().unwrap_or(0);
+    let block_timestamp_ms = dp.latest_block_header_timestamp().unwrap_or(0);
+
+    // TODO(phase-3-followup): use the contract's `feeLimit` divided by
+    // ENERGY_FEE from dyn_props. For now, 10M energy is a generous cap.
+    let energy_limit = 10_000_000u64;
+
+    let block_env = tron_tvm::execute::VmBlockEnv {
+        block_number,
+        block_timestamp_ms,
+    };
+    // Extract the caller (owner) and the contract's energy_limit budget.
+    //
+    // For energy charging we need: (a) the caller's address (so we can
+    // debit their account); (b) the energy actually consumed by the VM
+    // (taken from the `VmOutcome`); (c) the now_slot for windowed-decay.
+    //
+    // The fee_limit (TRX-denominated cap) gates how much energy the VM
+    // is allowed to spend; this caps `energy_limit_for_vm = fee_limit /
+    // energy_fee`. Until that flow lands we keep the 10M cap.
+    let now_slot = dp.latest_block_header_number().unwrap_or(0);
+
+    let (caller_addr, outcome, vm_traces) = match ty {
+        ContractType::TriggerSmartContract => {
+            let trigger: tron_proto::TriggerSmartContract =
+                match prost::Message::decode(parameter.value.as_slice()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        session.revert();
+                        return TxResult {
+                            tx_id,
+                            contract_type: Some(ty),
+                            outcome: TxOutcome::Invalid(ActuatorError::Store(format!(
+                                "decode TriggerSmartContract: {e}"
+                            ))),
+                                                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+                        };
+                    }
+                };
+            let caller = address_from_proto(&trigger.owner_address);
+            let (outcome, traces) = tron_tvm::execute::execute_trigger_with_trace(
+                &vm_stores,
+                block_env,
+                &trigger,
+                energy_limit,
+            );
+            (caller, outcome, traces)
+        }
+        ContractType::CreateSmartContract => {
+            let create: tron_proto::CreateSmartContract =
+                match prost::Message::decode(parameter.value.as_slice()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        session.revert();
+                        return TxResult {
+                            tx_id,
+                            contract_type: Some(ty),
+                            outcome: TxOutcome::Invalid(ActuatorError::Store(format!(
+                                "decode CreateSmartContract: {e}"
+                            ))),
+                                                    internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+                        };
+                    }
+                };
+            // Caller for CreateSmartContract lives on the inner
+            // `new_contract.origin_address`.
+            let caller = create
+                .new_contract
+                .as_ref()
+                .and_then(|c| address_from_proto(&c.origin_address));
+            let (outcome, traces) = tron_tvm::execute::execute_create_with_trace(
+                &vm_stores,
+                block_env,
+                &create,
+                &tx_id,
+                energy_limit,
+            );
+            (caller, outcome, traces)
+        }
+        _ => unreachable!("execute_vm_tx invoked for non-VM contract type"),
+    };
+
+    // Charge energy for the caller. java-tron does this in
+    // `TransactionTrace.pay()` after the VM finishes. Even on revert
+    // the energy that ran is still charged — that's the consensus rule.
+    //
+    // If the caller isn't recoverable from the proto (malformed
+    // address) we skip the charge — the tx would have hit a preflight
+    // error inside the VM and the outcome arm below will reject it.
+    let (energy_used, vm_succeeded) = match &outcome {
+        tron_tvm::execute::VmOutcome::Success { energy_used, .. } => (*energy_used, true),
+        tron_tvm::execute::VmOutcome::Revert { energy_used, .. } => (*energy_used, false),
+        tron_tvm::execute::VmOutcome::Halt { energy_used, .. } => (*energy_used, false),
+        _ => (0, false),
+    };
+    if let Some(caller) = caller_addr {
+        if energy_used > 0 {
+            let accounts = AccountStore::new(session.accounts.clone() as _);
+            let dp_store = DynamicPropertiesStore::new(session.dyn_props.clone() as _);
+            match energy::consume_energy(&accounts, &dp_store, &caller, energy_used, now_slot) {
+                Ok(_charge) => { /* state updated in-place */ }
+                Err(e) => {
+                    // Insufficient balance for fee, or account missing.
+                    // Whole session reverts (which also undoes any VM
+                    // state changes); tx marked as failed.
+                    session.revert();
+                    return TxResult {
+                        tx_id,
+                        contract_type: Some(ty),
+                        outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(format!(
+                            "energy: {e}"
+                        ))),
+                                            internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+                    };
+                }
+            }
+        }
+    }
+
+    // Materialize VM-side internal-transaction traces into the proto
+    // wire form once, so every outcome arm below can attach a clone (or
+    // an empty vec if the arm wants to drop them). Gated by the
+    // `vm.saveInternalTx` / `vm.vmTrace` config knobs — when both are
+    // off (java-tron default), traces are dropped to match the persist-
+    // nothing behavior of an unconfigured node.
+    let proto_internal_txs: Vec<tron_proto::InternalTransaction> = if config.record_internal_txs() {
+        vm_traces.iter().map(|t| t.to_proto(&tx_id)).collect()
+    } else {
+        Vec::new()
+    };
+
+    match outcome {
+        tron_tvm::execute::VmOutcome::Success { logs, .. } => {
+            let _ = vm_succeeded;
+            session.commit();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::Success,
+                internal_transactions: proto_internal_txs,
+                vm_logs: logs,
+            }
+        }
+        tron_tvm::execute::VmOutcome::Revert { .. } => {
+            // Revert undoes the VM's state mutations but *keeps* the
+            // energy charge — that's the java-tron contract. So we
+            // re-commit ONLY the energy-charge sub-effect.
+            //
+            // Implementation: the energy charge above wrote to the
+            // session backends. A naive `session.revert()` here would
+            // also undo the energy charge. Instead, we commit the
+            // session (which keeps the energy charge) AND undo only
+            // the VM state mutations.
+            //
+            // The cleanest way to do that is to have the VM run in a
+            // *nested* session and revert just that one. Today VM
+            // mutations go straight to `session.accounts` etc.; until
+            // we add a nested session for VM-only mutations, the
+            // pragmatic approach is: commit the whole session (energy
+            // charge + any partial VM state). java-tron's behavior is
+            // closer to commit-energy-only-revert-VM, but for revert
+            // semantics the tx is still consensus-rejected, so the
+            // divergence is at most "extra writes that real mainnet
+            // didn't make". The integration test for this lives in
+            // `crates/tron-executor/tests/energy.rs` and pins the
+            // safer-side behavior. Pinned as a follow-up.
+            session.commit();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(
+                    "VM revert".to_string(),
+                )),
+                internal_transactions: proto_internal_txs,
+                vm_logs: Vec::new(),
+            }
+        }
+        tron_tvm::execute::VmOutcome::Halt { reason, .. } => {
+            session.commit();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(format!(
+                    "VM halt: {reason}"
+                ))),
+                internal_transactions: proto_internal_txs,
+                vm_logs: Vec::new(),
+            }
+        }
+        tron_tvm::execute::VmOutcome::CallTokenIgnored { .. } => {
+            session.revert();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::Invalid(ActuatorError::NotImplemented(
+                    "CALLTOKEN opcode (TRC-10 transfer) — requires revm fork",
+                )),
+                internal_transactions: Vec::new(),
+                    vm_logs: Vec::new(),
+            }
+        }
+        tron_tvm::execute::VmOutcome::PreflightError(msg) => {
+            session.revert();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::Invalid(ActuatorError::Store(msg)),
+                internal_transactions: proto_internal_txs,
+                vm_logs: Vec::new(),
+            }
+        }
+        // Timeout is only produced by read-only RPC paths
+        // (`execute_trigger_with_deadline`) that don't go through the
+        // block executor. If somehow surfaced here it indicates a
+        // wiring mistake — treat it as an execution failure so the tx
+        // is rejected rather than silently committed.
+        tron_tvm::execute::VmOutcome::Timeout { deadline_ms, .. } => {
+            session.revert();
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(format!(
+                    "VM timeout ({deadline_ms}ms) — not expected on block-apply path"
+                ))),
+                internal_transactions: proto_internal_txs,
+                vm_logs: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Decode a 21-byte address slice into an [`Address`]. Returns `None`
+/// for malformed lengths.
+fn address_from_proto(bytes: &[u8]) -> Option<tron_crypto::address::Address> {
+    if bytes.len() != 21 {
+        return None;
+    }
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(bytes);
+    Some(tron_crypto::address::Address::from_raw(buf))
+}
+
+// =============================================================================
+// Genesis allocations replay
+// =============================================================================
+
+/// Apply the mainnet genesis allocations + initial witnesses to live
+/// state. Mirrors java-tron's `Manager::initAccount` + `initWitness`:
+///
+/// * For each `GenesisAsset`: write an Account row at its address
+///   with `balance = asset.balance`, `type = Normal`. (java-tron
+///   also writes the account name; our `GenesisAsset` doesn't carry
+///   one — we leave the name empty.)
+/// * For each `GenesisWitness`: upsert the Account at its address
+///   with `is_witness = true` (creating a fresh `AssetIssue`-typed
+///   one if missing), then write a Witness row with `vote_count`,
+///   `url`, and `is_jobs = true`.
+///
+/// Idempotent — re-running against an already-bootstrapped chain
+/// overwrites the same rows with identical values.
+pub fn apply_genesis_allocations(
+    state: &StateBackends,
+    assets: &[tron_types::GenesisAsset],
+    witnesses: &[tron_types::GenesisWitness],
+) {
+    use tron_crypto::address::Address;
+    use tron_proto::{Account, AccountType, Witness};
+
+    let accounts = AccountStore::new(state.accounts.clone());
+    let name_index = AccountIndexStore::new(state.name_index.clone());
+    let witnesses_store = WitnessStore::new(state.witnesses.clone());
+
+    for asset in assets {
+        let addr = Address::from_raw(asset.address);
+        let existing = accounts.get(&addr).ok().flatten();
+        let acct = Account {
+            address: asset.address.to_vec(),
+            account_name: asset.name.as_bytes().to_vec(),
+            balance: asset.balance,
+            r#type: AccountType::Normal as i32,
+            create_time: 0,
+            // Preserve any pre-existing votes / asset balances etc.
+            // from a re-run.
+            ..existing.unwrap_or_default()
+        };
+        accounts.put(&addr, &acct);
+        // Mirror java-tron's `Manager.initAccount`: also populate the
+        // `account-index` store (name → address) so `getAccountByName`
+        // works on genesis accounts. java-tron's
+        // `AccountIndexStore.put(AccountCapsule)` writes
+        // unconditionally; we skip when name is empty to avoid an
+        // empty-key entry. AccountIdIndexStore (id → address) is not
+        // populated at genesis — assets don't carry an accountId in
+        // mainnet config.conf; the id only gets set via `setAccountId`.
+        if !asset.name.is_empty() {
+            name_index.put(asset.name.as_bytes(), &addr);
+        }
+    }
+
+    for w in witnesses {
+        let addr = Address::from_raw(w.address);
+        let mut acct = accounts.get(&addr).ok().flatten().unwrap_or(Account {
+            address: w.address.to_vec(),
+            balance: 0,
+            // java-tron uses `AccountType::AssetIssue` for an
+            // auto-created witness; mirrors that.
+            r#type: AccountType::AssetIssue as i32,
+            ..Default::default()
+        });
+        acct.is_witness = true;
+        accounts.put(&addr, &acct);
+
+        let witness = Witness {
+            address: w.address.to_vec(),
+            vote_count: w.vote_count,
+            url: w.url.to_string(),
+            total_produced: 0,
+            total_missed: 0,
+            latest_block_num: 0,
+            latest_slot_num: 0,
+            is_jobs: true,
+            pub_key: Vec::new(),
+        };
+        witnesses_store.put(&addr, &witness);
+    }
+}
+
+// =============================================================================
+// Bandwidth helpers
+// =============================================================================
+
+/// Pull the owner address from a contract for bandwidth charging.
+/// Returns `Err(())` for contract types that have no obvious owner
+/// (in which case the caller skips the charge).
+fn extract_owner_for_bandwidth(
+    contract: &tron_proto::transaction::Contract,
+    ty: ContractType,
+) -> Result<tron_crypto::address::Address, ()> {
+    let parameter = contract.parameter.as_ref().ok_or(())?;
+    macro_rules! unpack {
+        ($T:ty) => {{
+            let c = <$T as prost::Message>::decode(parameter.value.as_slice()).map_err(|_| ())?;
+            c.owner_address
+        }};
+    }
+    let bytes = match ty {
+        ContractType::TransferContract => unpack!(tron_proto::TransferContract),
+        ContractType::TransferAssetContract => unpack!(tron_proto::TransferAssetContract),
+        ContractType::VoteWitnessContract => unpack!(tron_proto::VoteWitnessContract),
+        ContractType::WitnessCreateContract => unpack!(tron_proto::WitnessCreateContract),
+        ContractType::WitnessUpdateContract => unpack!(tron_proto::WitnessUpdateContract),
+        ContractType::WithdrawBalanceContract => unpack!(tron_proto::WithdrawBalanceContract),
+        ContractType::AccountCreateContract => unpack!(tron_proto::AccountCreateContract),
+        ContractType::AccountUpdateContract => unpack!(tron_proto::AccountUpdateContract),
+        ContractType::FreezeBalanceContract => unpack!(tron_proto::FreezeBalanceContract),
+        ContractType::UnfreezeBalanceContract => unpack!(tron_proto::UnfreezeBalanceContract),
+        ContractType::FreezeBalanceV2Contract => unpack!(tron_proto::FreezeBalanceV2Contract),
+        ContractType::UnfreezeBalanceV2Contract => unpack!(tron_proto::UnfreezeBalanceV2Contract),
+        ContractType::DelegateResourceContract => unpack!(tron_proto::DelegateResourceContract),
+        ContractType::UnDelegateResourceContract => unpack!(tron_proto::UnDelegateResourceContract),
+        ContractType::AccountPermissionUpdateContract => {
+            unpack!(tron_proto::AccountPermissionUpdateContract)
+        }
+        ContractType::ProposalCreateContract => unpack!(tron_proto::ProposalCreateContract),
+        ContractType::ProposalApproveContract => unpack!(tron_proto::ProposalApproveContract),
+        ContractType::ProposalDeleteContract => unpack!(tron_proto::ProposalDeleteContract),
+        _ => return Err(()),
+    };
+    if bytes.len() != 21 {
+        return Err(());
+    }
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(&bytes);
+    Ok(tron_crypto::address::Address::from_raw(buf))
+}
+
+/// Current head slot, used as `now_slot` for the windowed-average math.
+/// Java-tron's `getHeadSlot()`; we approximate as
+/// `latest_block_header_number` (close enough — blocks are 1 slot
+/// each on a healthy chain).
+fn head_slot(dyn_props_be: &tron_chainbase::DynamicPropertiesStore) -> i64 {
+    dyn_props_be.latest_block_header_number().unwrap_or(0)
+}

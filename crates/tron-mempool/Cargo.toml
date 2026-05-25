@@ -1,0 +1,22 @@
+[package]
+name = "tron-mempool"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Validating transaction mempool: decode + signer recovery + dedup + expiration eviction + broadcast channel."
+
+[dependencies]
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-crypto = { path = "../tron-crypto" }
+tron-rpc = { path = "../tron-rpc" }
+tron-chainbase = { path = "../tron-chainbase" }
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+prost-types.workspace = true

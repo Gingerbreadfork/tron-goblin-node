@@ -1,0 +1,53 @@
+[package]
+name = "tron-wallet"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Key management + transaction signing CLI for TRON. Reads java-tron-compatible v3 JSON keystores, signs unsigned transactions, broadcasts via JSON-RPC."
+
+[[bin]]
+name = "tron-wallet"
+path = "src/bin/tron-wallet.rs"
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+getrandom = "0.2"
+# Keystore crypto: scrypt KDF + AES-128-CTR cipher + Keccak MAC. The
+# scrypt + aes + ctr crates compose into the EIP-2335 / Web3 Secret
+# Storage v3 spec that java-tron's `Wallet.java` implements.
+scrypt = { version = "0.11", default-features = false, features = ["std"] }
+pbkdf2 = { version = "0.12", default-features = false }
+sha2 = "0.10"
+aes = "0.8"
+ctr = "0.9"
+uuid = { version = "1", features = ["v4"] }
+# Hides input on TTY so a typed password doesn't echo back. Used by
+# `resolve_password` as the final fallback when neither `--password`
+# nor `TRON_WALLET_PASSWORD` is set.
+rpassword = "7"
+# BIP-39 mnemonic — generate / import 12/24-word English phrases,
+# derive the 64-byte seed (with optional passphrase) that BIP-32 HD
+# derivation feeds on. Same format every TRON wallet (TronLink,
+# wallet-cli) uses.
+bip39 = { version = "2", default-features = false, features = ["std"] }
+# BIP-32 hierarchical deterministic key derivation. TRON's coin type is
+# 195 → standard path is m/44'/195'/account'/0/index. Uses k256
+# (pure-Rust secp256k1) under the hood — same curve our crypto crate
+# already depends on.
+bip32 = { version = "0.5", default-features = false, features = ["secp256k1", "alloc"] }
+# Blocking HTTP client for `tron-wallet send` (POST JSON-RPC). Pulled
+# in via tokio's runtime; we use the synchronous `block_on` pattern in
+# the CLI so the binary stays small and predictable.
+tokio = { workspace = true, features = ["net", "rt", "io-util", "macros"] }
+
+[dev-dependencies]
+hex-literal.workspace = true
+prost-types.workspace = true

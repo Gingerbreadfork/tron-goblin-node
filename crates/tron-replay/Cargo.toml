@@ -1,0 +1,40 @@
+[package]
+name = "tron-replay"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI for generating and validating length-delimited TRON block streams. Exercises the crypto + proto + types stack end-to-end."
+
+[lib]
+name = "tron_replay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tron-replay"
+path = "src/main.rs"
+
+[dev-dependencies]
+tron-chainbase = { path = "../tron-chainbase" }
+tron-types = { path = "../tron-types" }
+tron-proto = { path = "../tron-proto" }
+tron-net = { path = "../tron-net" }
+tron-executor = { path = "../tron-executor" }
+prost.workspace = true
+hex.workspace = true
+tokio.workspace = true
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+tron-actuator = { path = "../tron-actuator" }
+tron-executor = { path = "../tron-executor" }
+tron-net = { path = "../tron-net" }
+prost.workspace = true
+prost-types.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+k256.workspace = true
+tokio.workspace = true

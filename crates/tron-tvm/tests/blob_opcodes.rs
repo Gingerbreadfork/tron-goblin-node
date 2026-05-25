@@ -1,0 +1,175 @@
+//! Regression tests for BLOBHASH (0x49) + BLOBBASEFEE (0x4a) gating.
+//!
+//! revm installs both opcodes when the spec is CANCUN or later. In
+//! java-tron, however, these are gated by a separate `ALLOW_TVM_BLOB`
+//! proposal (not `ALLOW_TVM_CANCUN`). The fork-gating layer in
+//! `tron-tvm/src/proposals.rs` + `evm.rs::install_tron_opcode_stubs`
+//! reconciles the split: when CANCUN is on but BLOB is off, we
+//! override both opcodes to `OpcodeNotFound`.
+//!
+//! Cases covered:
+//! 1. No proposals at all → BYZANTIUM spec → halt.
+//! 2. `ALLOW_TVM_CANCUN` on, `ALLOW_TVM_BLOB` off → CANCUN spec but
+//!    BLOBHASH/BLOBBASEFEE halt via the override.
+//! 3. Both flags on → opcodes execute cleanly.
+
+use std::sync::Arc;
+
+use tron_chainbase::{
+    AccountStore, CodeStore, ContractStateStore, DelegatedResourceStore, DelegationStore,
+    DynamicPropertiesStore, KvBackend, MemBackend, StorageRowStore, WitnessStore,
+};
+use tron_crypto::address::Address;
+use tron_proto::{Account, TriggerSmartContract};
+use tron_tvm::database::code_hash;
+use tron_tvm::execute::{execute_trigger, VmBlockEnv, VmOutcome, VmStores};
+
+fn mem() -> Arc<dyn KvBackend> {
+    Arc::new(MemBackend::new())
+}
+
+fn fresh_stores() -> VmStores {
+    VmStores {
+        accounts: Arc::new(AccountStore::new(mem())),
+        code: Arc::new(CodeStore::new(mem())),
+        storage: Arc::new(StorageRowStore::new(mem())),
+        witnesses: Arc::new(WitnessStore::new(mem())),
+        contract_state: Arc::new(ContractStateStore::new(mem())),
+        dynamic_properties: Arc::new(DynamicPropertiesStore::new(mem())),
+        delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
+        delegation: Arc::new(DelegationStore::new(mem())),
+        block_index: None,
+        contracts: None,
+        votes: None,
+    }
+}
+
+fn tron_addr(byte: u8) -> [u8; 21] {
+    let mut a = [0u8; 21];
+    a[0] = 0x41;
+    a[1..].fill(byte);
+    a
+}
+
+fn install_caller(stores: &VmStores) -> [u8; 21] {
+    let caller = tron_addr(0xa0);
+    stores.accounts.put(
+        &Address::from_raw(caller),
+        &Account {
+            address: caller.to_vec(),
+            balance: 1_000_000_000,
+            ..Default::default()
+        },
+    );
+    caller
+}
+
+fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
+    let hash = code_hash(&bytecode);
+    stores.code.put(hash.as_slice(), &bytecode);
+    stores.accounts.put(
+        &Address::from_raw(addr),
+        &Account {
+            address: addr.to_vec(),
+            balance: 0,
+            code: bytecode,
+            code_hash: hash.as_slice().to_vec(),
+            ..Default::default()
+        },
+    );
+}
+
+fn run(stores: &VmStores, caller: [u8; 21], contract: [u8; 21]) -> VmOutcome {
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+        },
+        &trigger,
+        500_000,
+    )
+}
+
+// BLOBHASH bytecode: PUSH1 0 ; BLOBHASH ; PUSH1 0 ; SSTORE ; STOP
+const BLOBHASH_BC: &[u8] = &[0x60, 0x00, 0x49, 0x60, 0x00, 0x55, 0x00];
+// BLOBBASEFEE bytecode: BLOBBASEFEE ; PUSH1 0 ; SSTORE ; STOP
+const BLOBBASEFEE_BC: &[u8] = &[0x4a, 0x60, 0x00, 0x55, 0x00];
+
+fn was_halted(outcome: VmOutcome) -> bool {
+    matches!(outcome, VmOutcome::Halt { .. })
+}
+
+fn was_success(outcome: VmOutcome) -> bool {
+    matches!(outcome, VmOutcome::Success { .. })
+}
+
+#[test]
+fn blob_opcodes_halt_when_no_proposals_active() {
+    // Default spec is BYZANTIUM — BLOBHASH (Cancun feature) halts.
+    let stores = fresh_stores();
+    let caller = install_caller(&stores);
+    let c1 = tron_addr(0xc1);
+    install_contract(&stores, c1, BLOBHASH_BC.to_vec());
+    assert!(
+        was_halted(run(&stores, caller, c1)),
+        "BLOBHASH must halt under Byzantium"
+    );
+    let c2 = tron_addr(0xc2);
+    install_contract(&stores, c2, BLOBBASEFEE_BC.to_vec());
+    assert!(
+        was_halted(run(&stores, caller, c2)),
+        "BLOBBASEFEE must halt under Byzantium"
+    );
+}
+
+#[test]
+fn blob_opcodes_halt_when_cancun_on_but_blob_off() {
+    // CANCUN spec is active (TLOAD/TSTORE/MCOPY would work) but the
+    // BLOB gate is off — BLOBHASH / BLOBBASEFEE must halt via the
+    // 0x49 / 0x4a override installed by `install_tron_opcode_stubs`.
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_CANCUN", 1);
+    // ALLOW_TVM_BLOB deliberately omitted.
+    let caller = install_caller(&stores);
+    let c1 = tron_addr(0xc1);
+    install_contract(&stores, c1, BLOBHASH_BC.to_vec());
+    assert!(
+        was_halted(run(&stores, caller, c1)),
+        "BLOBHASH must halt when ALLOW_TVM_BLOB is off"
+    );
+    let c2 = tron_addr(0xc2);
+    install_contract(&stores, c2, BLOBBASEFEE_BC.to_vec());
+    assert!(
+        was_halted(run(&stores, caller, c2)),
+        "BLOBBASEFEE must halt when ALLOW_TVM_BLOB is off"
+    );
+}
+
+#[test]
+fn blob_opcodes_execute_when_cancun_and_blob_on() {
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_CANCUN", 1);
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_BLOB", 1);
+    let caller = install_caller(&stores);
+    let c1 = tron_addr(0xc1);
+    install_contract(&stores, c1, BLOBHASH_BC.to_vec());
+    assert!(
+        was_success(run(&stores, caller, c1)),
+        "BLOBHASH must succeed with CANCUN + BLOB on"
+    );
+    let c2 = tron_addr(0xc2);
+    install_contract(&stores, c2, BLOBBASEFEE_BC.to_vec());
+    assert!(
+        was_success(run(&stores, caller, c2)),
+        "BLOBBASEFEE must succeed with CANCUN + BLOB on"
+    );
+}

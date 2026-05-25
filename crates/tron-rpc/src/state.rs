@@ -1,0 +1,351 @@
+//! Shared state for RPC handlers — typed references to the relevant
+//! chainbase stores plus the chain-id constant. Built once at server
+//! startup and cloned cheaply (interior Arcs) into each request.
+
+use std::sync::Arc;
+
+use tron_chainbase::{
+    AbiStore, AccountIdIndexStore, AccountStore, AssetIssueStore, AssetIssueV2Store,
+    BalanceTraceStore, NullifierStore,
+    BlockIndexStore, BlockStore, CodeStore, ContractStore, DelegatedResourceAccountIndexStore,
+    DelegatedResourceStore, DelegationStore, DynamicPropertiesStore, ExchangeV2Store, KvBackend,
+    MarketAccountStore, MarketOrderStore, MarketPairPriceToOrderStore, MarketPairToPriceStore,
+    ProposalStore, StorageRowStore, TransactionHistoryStore, TransactionStore, WitnessStore,
+};
+
+/// Handle passed to every RPC method.
+#[derive(Clone)]
+pub struct RpcState {
+    pub accounts: Arc<AccountStore>,
+    pub blocks: Arc<BlockStore>,
+    pub block_index: Arc<BlockIndexStore>,
+    pub transactions: Arc<TransactionStore>,
+    pub dyn_props: Arc<DynamicPropertiesStore>,
+    /// Smart-contract bytecode lookup. Optional because a non-EVM
+    /// configuration of the node may not stand up these stores.
+    pub code: Option<Arc<CodeStore>>,
+    /// Smart-contract storage-slot lookup.
+    pub storage: Option<Arc<StorageRowStore>>,
+    /// Optional governance/reward stores — required for the TRON-style
+    /// methods (`listWitnesses`, `getReward`, `getDelegatedResource`,
+    /// etc.). Absent in minimal Ethereum-compat configurations.
+    pub witnesses: Option<Arc<WitnessStore>>,
+    pub delegation: Option<Arc<DelegationStore>>,
+    pub delegated_resources: Option<Arc<DelegatedResourceStore>>,
+    pub proposals: Option<Arc<ProposalStore>>,
+    pub assets_v2: Option<Arc<AssetIssueV2Store>>,
+    /// Asset-issue store keyed by ASSET NAME (v1 layout). Needed by
+    /// `getAssetIssueByName` / `getAssetIssueListByName`. Distinct from
+    /// `assets_v2` (id-keyed) — when `ALLOW_SAME_TOKEN_NAME == 0`
+    /// java-tron writes to both stores so the same row is reachable
+    /// by either key.
+    pub assets_v1: Option<Arc<AssetIssueStore>>,
+    /// Shielded nullifier set — populated by ShieldedTransferActuator
+    /// at apply-time. Needed by `is_spend` and the shielded TRC-20
+    /// spent-check helpers. Absent on non-shielded configurations.
+    pub nullifiers: Option<Arc<NullifierStore>>,
+    pub exchanges_v2: Option<Arc<ExchangeV2Store>>,
+    /// Raw backends for executing read-only EVM calls (`eth_call`).
+    /// Cloned and wrapped in a `SessionBackend` per request so any
+    /// state mutations are discarded on revert. `None` means
+    /// `eth_call` returns `not supported`.
+    pub eth_call_backends: Option<EthCallBackends>,
+    /// Per-tx receipts / logs index.
+    pub tx_history: Option<Arc<TransactionHistoryStore>>,
+    /// Per-account id index — needed for `getAccountById`.
+    pub account_id_index: Option<Arc<AccountIdIndexStore>>,
+    /// Smart contract metadata store — needed for `getContract` /
+    /// `getContractInfo`.
+    pub contracts: Option<Arc<ContractStore>>,
+    /// Contract ABI store — populated alongside `contracts`.
+    pub abis: Option<Arc<AbiStore>>,
+    /// Delegated-resource per-account index — needed for the v1/v2
+    /// `getDelegatedResourceAccountIndex` family.
+    pub delegated_resource_account_index: Option<Arc<DelegatedResourceAccountIndexStore>>,
+    /// Market (DEX) stores. All four are needed for the
+    /// `getMarketOrder*` / `getMarketPair*` family; passing them
+    /// independently lets a non-DEX node leave them unattached.
+    pub market_orders: Option<Arc<MarketOrderStore>>,
+    pub market_accounts: Option<Arc<MarketAccountStore>>,
+    pub market_pair_to_price: Option<Arc<MarketPairToPriceStore>>,
+    pub market_pair_price_to_order: Option<Arc<MarketPairPriceToOrderStore>>,
+    /// Per-block balance-change trace. Populated by the executor when
+    /// trace-recording is on; absent during read-only bringup until
+    /// the executor-side write path lands.
+    pub balance_trace: Option<Arc<BalanceTraceStore>>,
+    /// Optional metrics sink. When attached, [`crate::server::dispatch`]
+    /// records per-method request/error counters into it.
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// Shared filter registry for the `eth_newFilter` family. Built
+    /// once at server start; each handler reads/mutates through `Arc`.
+    pub filters: Arc<crate::filters::FilterRegistry>,
+    /// Optional handle to a transaction mempool. When attached,
+    /// `eth_sendRawTransaction` and `broadcastTransaction` accept
+    /// incoming transactions; otherwise both endpoints return an
+    /// "unsupported" error.
+    pub mempool: Option<Arc<dyn crate::mempool::Mempool>>,
+    pub chain_id: u64,
+    /// `eth_call` / `eth_estimateGas` per-call gas cap. Defaults to
+    /// 50M — the soft ceiling for heavy read-only calls (DEX
+    /// simulations, big multi-hop swaps). Operators can lower this
+    /// for public-facing nodes via the TOML `rpc.eth_call_gas_cap`
+    /// field. Plumbed into revm's `CfgEnv::tx_gas_limit_cap` per
+    /// call so anything above the cap returns `TxGasLimitGreaterThanCap`.
+    pub eth_call_gas_cap: u64,
+    /// `vm.supportConstant` java-tron gate. When `false`, the
+    /// `triggerConstantContract` RPC returns an error rather than
+    /// running. Operators that don't expose constant calls publicly
+    /// keep this off (default). `eth_call` is always on — only the
+    /// TRON-shape RPC consults this flag.
+    pub support_constant: bool,
+    /// `vm.constantCallTimeoutMs`. Wall-clock budget (milliseconds)
+    /// allowed for a single read-only EVM call (`eth_call`,
+    /// `eth_estimateGas`, `triggerConstantContract`). `0` means no
+    /// limit. java-tron interrupts the VM thread mid-execution; this
+    /// port checks the elapsed time after the VM returns and surfaces
+    /// a timeout error to the client. A separate session will install
+    /// a deadline inspector to enable mid-execution preemption — until
+    /// then, this gate is best-effort.
+    pub constant_call_timeout_ms: i64,
+    /// Optional WebSocket pubsub broker for `eth_subscribe`. When
+    /// attached the WS handler is mounted on the HTTP router and
+    /// the SyncDriver / SrRuntime / mempool fan events into it.
+    /// When unset, WS connections are rejected with 404 — same shape
+    /// as a node where the operator didn't enable subscriptions.
+    pub pubsub: Option<Arc<crate::pubsub::PubSubBroker>>,
+}
+
+/// Bag of raw backends the read-only EVM call path wraps in a
+/// `SessionBackend` per request. Stored alongside the typed stores so
+/// the RPC handler doesn't need to invert the type erasure.
+#[derive(Clone)]
+pub struct EthCallBackends {
+    pub accounts: Arc<dyn KvBackend>,
+    pub code: Arc<dyn KvBackend>,
+    pub storage: Arc<dyn KvBackend>,
+    pub witnesses: Arc<dyn KvBackend>,
+    pub contract_state: Arc<dyn KvBackend>,
+    pub dyn_props: Arc<dyn KvBackend>,
+    pub delegated_resources: Arc<dyn KvBackend>,
+    pub delegation: Arc<dyn KvBackend>,
+    pub contracts: Arc<dyn KvBackend>,
+    pub block_index: Option<Arc<dyn KvBackend>>,
+}
+
+impl RpcState {
+    /// Build from raw backends. Each store is wrapped once; the result
+    /// is `Clone` for use in axum's typed-state extractor.
+    pub fn new(
+        accounts: Arc<dyn KvBackend>,
+        blocks: Arc<dyn KvBackend>,
+        block_index: Arc<dyn KvBackend>,
+        transactions: Arc<dyn KvBackend>,
+        dyn_props: Arc<dyn KvBackend>,
+        chain_id: u64,
+    ) -> Self {
+        Self {
+            accounts: Arc::new(AccountStore::new(accounts)),
+            blocks: Arc::new(BlockStore::new(blocks)),
+            block_index: Arc::new(BlockIndexStore::new(block_index)),
+            transactions: Arc::new(TransactionStore::new(transactions)),
+            dyn_props: Arc::new(DynamicPropertiesStore::new(dyn_props)),
+            code: None,
+            storage: None,
+            witnesses: None,
+            delegation: None,
+            delegated_resources: None,
+            proposals: None,
+            assets_v2: None,
+            assets_v1: None,
+            nullifiers: None,
+            exchanges_v2: None,
+            eth_call_backends: None,
+            tx_history: None,
+            account_id_index: None,
+            filters: crate::filters::FilterRegistry::new(),
+            mempool: None,
+            chain_id,
+            eth_call_gas_cap: 50_000_000,
+            support_constant: false,
+            constant_call_timeout_ms: 0,
+            pubsub: None,
+            contracts: None,
+            abis: None,
+            delegated_resource_account_index: None,
+            market_orders: None,
+            market_accounts: None,
+            market_pair_to_price: None,
+            market_pair_price_to_order: None,
+            balance_trace: None,
+            metrics: None,
+        }
+    }
+
+    /// Attach the metrics sink. When set, the RPC dispatch table
+    /// records per-method request and error counts into it.
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_mempool(mut self, mempool: Arc<dyn crate::mempool::Mempool>) -> Self {
+        self.mempool = Some(mempool);
+        self
+    }
+
+    pub fn with_tx_history(mut self, tx_history: Arc<dyn KvBackend>) -> Self {
+        self.tx_history = Some(Arc::new(TransactionHistoryStore::new(tx_history)));
+        self
+    }
+
+    pub fn with_account_id_index(mut self, idx: Arc<dyn KvBackend>) -> Self {
+        self.account_id_index = Some(Arc::new(AccountIdIndexStore::new(idx)));
+        self
+    }
+
+    pub fn with_eth_call_backends(mut self, backends: EthCallBackends) -> Self {
+        self.eth_call_backends = Some(backends);
+        self
+    }
+
+    /// Attach the EVM-side stores. Required for `eth_getCode` and
+    /// `eth_getStorageAt`.
+    pub fn with_evm_stores(
+        mut self,
+        code: Arc<dyn KvBackend>,
+        storage: Arc<dyn KvBackend>,
+    ) -> Self {
+        self.code = Some(Arc::new(CodeStore::new(code)));
+        self.storage = Some(Arc::new(StorageRowStore::new(storage)));
+        self
+    }
+
+    /// Attach governance/reward stores. Required for the TRON-style
+    /// `listWitnesses`, `getReward`, `getDelegatedResource`,
+    /// `listProposals`, `getAssetIssueById`, and `listExchanges`
+    /// methods.
+    pub fn with_governance_stores(
+        mut self,
+        witnesses: Arc<dyn KvBackend>,
+        delegation: Arc<dyn KvBackend>,
+        delegated_resources: Arc<dyn KvBackend>,
+        proposals: Arc<dyn KvBackend>,
+        assets_v2: Arc<dyn KvBackend>,
+        exchanges_v2: Arc<dyn KvBackend>,
+    ) -> Self {
+        self.witnesses = Some(Arc::new(WitnessStore::new(witnesses)));
+        self.delegation = Some(Arc::new(DelegationStore::new(delegation)));
+        self.delegated_resources = Some(Arc::new(DelegatedResourceStore::new(delegated_resources)));
+        self.proposals = Some(Arc::new(ProposalStore::new(proposals)));
+        self.assets_v2 = Some(Arc::new(AssetIssueV2Store::new(assets_v2)));
+        self.exchanges_v2 = Some(Arc::new(ExchangeV2Store::new(exchanges_v2)));
+        self
+    }
+
+    /// Override the `eth_call_gas_cap` from its 50M default. Set
+    /// lower for public-facing nodes that want to throttle heavy
+    /// read-only calls; set higher (up to whatever revm accepts) if
+    /// internal-only.
+    pub fn with_eth_call_gas_cap(mut self, cap: u64) -> Self {
+        self.eth_call_gas_cap = cap;
+        self
+    }
+
+    /// Toggle the `triggerConstantContract` RPC. When `false` the
+    /// method returns an "unsupported" error matching java-tron's
+    /// `Args.supportConstant=false` behavior. Independent of
+    /// `eth_call`.
+    pub fn with_support_constant(mut self, enabled: bool) -> Self {
+        self.support_constant = enabled;
+        self
+    }
+
+    /// Set the constant-call wall-clock budget. `0` (default) means no
+    /// timeout. Non-zero values cause `eth_call` / `eth_estimateGas` /
+    /// `triggerConstantContract` to return an error to the client when
+    /// the VM run takes longer than the limit. java-tron's
+    /// `vm.constantCallTimeoutMs`.
+    pub fn with_constant_call_timeout_ms(mut self, ms: i64) -> Self {
+        self.constant_call_timeout_ms = ms;
+        self
+    }
+
+    /// Attach a WebSocket pubsub broker. With this attached, the
+    /// server router exposes a `/ws` endpoint serving
+    /// `eth_subscribe` over JSON-RPC. The runtime is responsible
+    /// for feeding the broker — `pubsub::PubSubBroker::publish_*`
+    /// from the block-apply path, mempool subscription bridge, etc.
+    pub fn with_pubsub(mut self, broker: Arc<crate::pubsub::PubSubBroker>) -> Self {
+        self.pubsub = Some(broker);
+        self
+    }
+
+    /// Attach the contract metadata + ABI stores. Required for
+    /// `getContract`, `getContractInfo`, and rich receipt formatting.
+    pub fn with_contract_stores(
+        mut self,
+        contracts: Arc<dyn KvBackend>,
+        abis: Arc<dyn KvBackend>,
+    ) -> Self {
+        self.contracts = Some(Arc::new(ContractStore::new(contracts)));
+        self.abis = Some(Arc::new(AbiStore::new(abis)));
+        self
+    }
+
+    /// Attach the per-account delegate index. Required for the
+    /// `getDelegatedResourceAccountIndex` family.
+    pub fn with_delegated_resource_account_index(
+        mut self,
+        idx: Arc<dyn KvBackend>,
+    ) -> Self {
+        self.delegated_resource_account_index =
+            Some(Arc::new(DelegatedResourceAccountIndexStore::new(idx)));
+        self
+    }
+
+    /// Attach all four market (DEX) stores. Required for the
+    /// `getMarket*` family.
+    pub fn with_market_stores(
+        mut self,
+        market_orders: Arc<dyn KvBackend>,
+        market_accounts: Arc<dyn KvBackend>,
+        market_pair_to_price: Arc<dyn KvBackend>,
+        market_pair_price_to_order: Arc<dyn KvBackend>,
+    ) -> Self {
+        self.market_orders = Some(Arc::new(MarketOrderStore::new(market_orders)));
+        self.market_accounts = Some(Arc::new(MarketAccountStore::new(market_accounts)));
+        self.market_pair_to_price = Some(Arc::new(MarketPairToPriceStore::new(market_pair_to_price)));
+        self.market_pair_price_to_order =
+            Some(Arc::new(MarketPairPriceToOrderStore::new(market_pair_price_to_order)));
+        self
+    }
+
+    /// Attach the per-block balance-trace store. Required for
+    /// `getBlockBalanceTrace`. When unattached the RPC method returns
+    /// `Null`; when attached but empty (no executor writes), returns
+    /// a zero-trace object.
+    pub fn with_balance_trace(mut self, backend: Arc<dyn KvBackend>) -> Self {
+        self.balance_trace = Some(Arc::new(BalanceTraceStore::new(backend)));
+        self
+    }
+
+    /// Attach the asset-by-name (v1) store so
+    /// `getAssetIssueByName` / `getAssetIssueListByName` can resolve.
+    /// java-tron writes both v1 (name-keyed) and v2 (id-keyed) entries
+    /// for every issue, so name lookups work even on
+    /// `ALLOW_SAME_TOKEN_NAME == 1` chains for assets created before
+    /// that proposal activated.
+    pub fn with_assets_v1(mut self, backend: Arc<dyn KvBackend>) -> Self {
+        self.assets_v1 = Some(Arc::new(AssetIssueStore::new(backend)));
+        self
+    }
+
+    /// Attach the nullifier set so shielded `isSpend` /
+    /// `isShieldedTrc20ContractNoteSpent` can resolve. The store is
+    /// write-side by ShieldedTransferActuator during block apply;
+    /// reads are membership checks.
+    pub fn with_nullifiers(mut self, backend: Arc<dyn KvBackend>) -> Self {
+        self.nullifiers = Some(Arc::new(NullifierStore::new(backend)));
+        self
+    }
+}

@@ -1,0 +1,320 @@
+//! End-to-end test for the CALLTOKEN opcode (0xd0).
+//!
+//! Deploys a contract whose bytecode invokes CALLTOKEN to send TRC-10
+//! tokens to another address, then verifies:
+//! 1. The caller's `Account.asset_v2[tokenId]` got debited.
+//! 2. The target's `Account.asset_v2[tokenId]` got credited.
+//! 3. The callee's bytecode read the right token id / value via
+//!    CALLTOKENID / CALLTOKENVALUE.
+//!
+//! Also exercises the revert path: a CALLTOKEN whose callee REVERTs
+//! must roll back the asset_v2 transfer.
+
+use std::sync::Arc;
+
+use tron_chainbase::{
+    AccountStore, CodeStore, ContractStateStore, DelegatedResourceStore, DelegationStore,
+    DynamicPropertiesStore, KvBackend, MemBackend, StorageRowStore, WitnessStore,
+};
+use tron_crypto::address::Address;
+use tron_proto::{Account, TriggerSmartContract};
+use tron_tvm::database::code_hash;
+use tron_tvm::execute::{execute_trigger, VmBlockEnv, VmOutcome, VmStores};
+
+fn mem() -> Arc<dyn KvBackend> {
+    Arc::new(MemBackend::new())
+}
+
+fn fresh_stores() -> VmStores {
+    let dynamic_properties = Arc::new(DynamicPropertiesStore::new(mem()));
+    // CALLTOKEN / TOKENBALANCE / CALLTOKENVALUE / CALLTOKENID are gated
+    // on ALLOW_TVM_TRANSFER_TRC10 — every test in this file exercises
+    // the family, so enable it once at fixture construction.
+    dynamic_properties.put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
+    VmStores {
+        accounts: Arc::new(AccountStore::new(mem())),
+        code: Arc::new(CodeStore::new(mem())),
+        storage: Arc::new(StorageRowStore::new(mem())),
+        witnesses: Arc::new(WitnessStore::new(mem())),
+        contract_state: Arc::new(ContractStateStore::new(mem())),
+        dynamic_properties,
+        delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
+        delegation: Arc::new(DelegationStore::new(mem())),
+        block_index: None,
+        contracts: None,
+        votes: None,
+    }
+}
+
+fn tron_addr(byte: u8) -> [u8; 21] {
+    let mut a = [0u8; 21];
+    a[0] = 0x41;
+    a[1..].fill(byte);
+    a
+}
+
+fn install_contract_with_balance(
+    stores: &VmStores,
+    addr: [u8; 21],
+    bytecode: &[u8],
+    asset_id: i64,
+    asset_balance: i64,
+) {
+    let mut acct = Account {
+        address: addr.to_vec(),
+        balance: 0,
+        ..Default::default()
+    };
+    if !bytecode.is_empty() {
+        let hash = code_hash(bytecode);
+        stores.code.put(hash.as_slice(), bytecode);
+        acct.code = bytecode.to_vec();
+        acct.code_hash = hash.as_slice().to_vec();
+    }
+    if asset_id != 0 {
+        acct.asset_v2.insert(asset_id.to_string(), asset_balance);
+    }
+    stores.accounts.put(&Address::from_raw(addr), &acct);
+}
+
+/// Push a U256 onto the EVM stack: PUSH32 followed by 32 bytes.
+fn push_u256_bytecode(value: u128) -> Vec<u8> {
+    let mut out = Vec::with_capacity(33);
+    out.push(0x7f); // PUSH32
+    let mut buf = [0u8; 32];
+    let be = value.to_be_bytes();
+    buf[16..].copy_from_slice(&be);
+    out.extend_from_slice(&buf);
+    out
+}
+
+fn push1(value: u8) -> Vec<u8> {
+    vec![0x60, value]
+}
+
+/// Build a contract that issues CALLTOKEN to `target` with `token_id`/
+/// `token_value`. Stack order (top first) per java-tron:
+///   [gas, to, callValue, tokenValue, tokenId, inOffset, inSize, outOffset, outSize]
+///
+/// Bytecode strategy:
+///   * Push outSize=0, outOffset=0, inSize=0, inOffset=0
+///   * Push tokenId, tokenValue, callValue=0, target_address, gas=large
+///   * Emit CALLTOKEN (0xd0)
+///   * STOP
+fn build_calltoken_caller(target: [u8; 21], token_id: i64, token_value: i64) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend(push1(0));       // outSize = 0
+    bc.extend(push1(0));       // outOffset = 0
+    bc.extend(push1(0));       // inSize = 0
+    bc.extend(push1(0));       // inOffset = 0
+    bc.extend(push_u256_bytecode(token_id as u128)); // tokenId
+    bc.extend(push_u256_bytecode(token_value as u128)); // tokenValue
+    bc.extend(push1(0));       // callValue (TRX) = 0
+    // Push target address (20 bytes of the 21 — strip 0x41 prefix).
+    bc.push(0x73); // PUSH20
+    bc.extend_from_slice(&target[1..]);
+    bc.extend(push_u256_bytecode(100_000)); // gas
+    bc.push(0xd0); // CALLTOKEN
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// Build a "receiver" contract that:
+///   * Reads CALLTOKENVALUE via opcode 0xd2 and stores at slot 0
+///   * Reads CALLTOKENID via opcode 0xd3 and stores at slot 1
+///   * STOP
+fn build_calltoken_receiver() -> Vec<u8> {
+    vec![
+        0xd2, 0x60, 0x00, 0x55, // CALLTOKENVALUE PUSH1 0 SSTORE
+        0xd3, 0x60, 0x01, 0x55, // CALLTOKENID    PUSH1 1 SSTORE
+        0x00,                    // STOP
+    ]
+}
+
+#[test]
+fn calltoken_transfers_trc10_and_callee_reads_token_data() {
+    let stores = fresh_stores();
+    let token_id = 1_000_001i64;
+    let transfer_amount = 250i64;
+    let initial_balance = 10_000i64;
+
+    let caller_user = tron_addr(0xa0);
+    let caller_contract = tron_addr(0xc0);
+    let receiver_contract = tron_addr(0xc1);
+
+    // Caller-user has 1B TRX + initial asset balance.
+    let mut acct = Account {
+        address: caller_user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    acct.asset_v2.insert(token_id.to_string(), initial_balance);
+    stores
+        .accounts
+        .put(&Address::from_raw(caller_user), &acct);
+
+    install_contract_with_balance(
+        &stores,
+        caller_contract,
+        &build_calltoken_caller(receiver_contract, token_id, transfer_amount),
+        token_id,
+        initial_balance,
+    );
+    install_contract_with_balance(
+        &stores,
+        receiver_contract,
+        &build_calltoken_receiver(),
+        0,
+        0,
+    );
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: caller_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0, // tx-level (we want to use CALLTOKEN from bytecode, not tx)
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+        },
+        &trigger,
+        500_000,
+    );
+    match outcome {
+        VmOutcome::Success { .. } => {}
+        other => panic!("expected Success, got {other:?}"),
+    }
+
+    // Assert asset_v2 balances: caller_contract debited, receiver_contract credited.
+    let caller_acct = stores
+        .accounts
+        .get(&Address::from_raw(caller_contract))
+        .unwrap()
+        .unwrap();
+    let receiver_acct = stores
+        .accounts
+        .get(&Address::from_raw(receiver_contract))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        caller_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(initial_balance - transfer_amount),
+        "caller's TRC-10 balance must be debited"
+    );
+    assert_eq!(
+        receiver_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(transfer_amount),
+        "receiver's TRC-10 balance must be credited"
+    );
+
+    // Assert receiver's storage: slot 0 = transfer_amount (from CALLTOKENVALUE),
+    // slot 1 = token_id (from CALLTOKENID).
+    let slot0_key = StorageRowStore::compose_key(&Address::from_raw(receiver_contract), &[0u8; 32]);
+    let slot1_bytes = {
+        let mut k = [0u8; 32];
+        k[31] = 1;
+        k
+    };
+    let slot1_key = StorageRowStore::compose_key(&Address::from_raw(receiver_contract), &slot1_bytes);
+
+    let slot0 = stores.storage.get(&slot0_key).expect("slot 0 missing");
+    let slot1 = stores.storage.get(&slot1_key).expect("slot 1 missing");
+
+    let mut expected_value = [0u8; 32];
+    expected_value[24..].copy_from_slice(&(transfer_amount as u64).to_be_bytes());
+    assert_eq!(
+        slot0, expected_value,
+        "CALLTOKENVALUE inside callee should equal transferred amount"
+    );
+
+    let mut expected_id = [0u8; 32];
+    expected_id[24..].copy_from_slice(&(token_id as u64).to_be_bytes());
+    assert_eq!(
+        slot1, expected_id,
+        "CALLTOKENID inside callee should equal token id"
+    );
+}
+
+/// Build a receiver that always REVERTs. Stack: PUSH1 0 PUSH1 0 REVERT.
+fn build_reverter() -> Vec<u8> {
+    vec![0x60, 0x00, 0x60, 0x00, 0xfd]
+}
+
+#[test]
+fn calltoken_unwinds_trc10_transfer_when_callee_reverts() {
+    let stores = fresh_stores();
+    let token_id = 7777i64;
+    let transfer_amount = 100i64;
+    let initial_balance = 1_000i64;
+
+    let caller_user = tron_addr(0xa1);
+    let caller_contract = tron_addr(0xb1);
+    let receiver_contract = tron_addr(0xb2);
+
+    let mut acct = Account {
+        address: caller_user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    acct.asset_v2.insert(token_id.to_string(), initial_balance);
+    stores.accounts.put(&Address::from_raw(caller_user), &acct);
+
+    install_contract_with_balance(
+        &stores,
+        caller_contract,
+        &build_calltoken_caller(receiver_contract, token_id, transfer_amount),
+        token_id,
+        initial_balance,
+    );
+    install_contract_with_balance(&stores, receiver_contract, &build_reverter(), 0, 0);
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: caller_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+        },
+        &trigger,
+        500_000,
+    );
+    // Outer contract's STOP runs even though callee reverted (CALL/CALLTOKEN
+    // doesn't propagate the inner revert; it just returns 0 on the stack).
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+
+    // The inspector's call_end on the inner revert should have restored
+    // the asset_v2 balances.
+    let caller_acct = stores
+        .accounts
+        .get(&Address::from_raw(caller_contract))
+        .unwrap()
+        .unwrap();
+    let receiver_acct = stores
+        .accounts
+        .get(&Address::from_raw(receiver_contract))
+        .unwrap();
+
+    assert_eq!(
+        caller_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(initial_balance),
+        "caller's TRC-10 balance must be restored after inner revert"
+    );
+    if let Some(r) = receiver_acct {
+        assert!(
+            !r.asset_v2.contains_key(&token_id.to_string()),
+            "receiver must not retain the credit after inner revert"
+        );
+    }
+}

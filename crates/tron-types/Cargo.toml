@@ -1,0 +1,19 @@
+[package]
+name = "tron-types"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Domain types and capsule wrappers over tron-proto. Encodes java-tron's hash, id, and merkle-root conventions."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+prost.workspace = true
+prost-types.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+eth_trie.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true

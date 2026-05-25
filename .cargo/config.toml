@@ -1,0 +1,17 @@
+# clang-sys (a transitive dep of `rocksdb` via `librocksdb-sys` → `bindgen`)
+# wants a file literally named `libclang.so` (or `.dylib` on macOS), but
+# most distros only ship versioned variants like `libclang.so.21.1`.
+#
+# `scripts/setup-libclang.sh` auto-detects the highest-versioned libclang
+# on the host and creates the symlink at the path resolved below — run
+# once per checkout:
+#
+#     ./scripts/setup-libclang.sh
+#
+# `relative = true` resolves the value against the workspace root (the
+# parent of `.cargo/`), so `.cargo/libclang-shim` lands the shim dir
+# alongside this config file. The shim dir is gitignored.
+[env.LIBCLANG_PATH]
+value = ".cargo/libclang-shim"
+relative = true
+force = true

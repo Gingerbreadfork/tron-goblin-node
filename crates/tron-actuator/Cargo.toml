@@ -1,0 +1,21 @@
+[package]
+name = "tron-actuator"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transaction-execution layer. One actuator per contract type; each pair of (validate, execute) functions reproduces java-tron's actuator semantics."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+tron-tvm = { path = "../tron-tvm" }
+prost.workspace = true
+prost-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+hex-literal.workspace = true

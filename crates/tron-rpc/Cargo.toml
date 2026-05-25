@@ -1,0 +1,44 @@
+[package]
+name = "tron-rpc"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ethereum-compatible JSON-RPC server backed by the tron-chainbase state."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+tron-tvm = { path = "../tron-tvm" }
+tron-executor = { path = "../tron-executor" }
+tron-actuator = { path = "../tron-actuator" }
+getrandom = "0.2"
+sapling-crypto.workspace = true
+jubjub.workspace = true
+group = "0.13"
+blake2s_simd = "1"
+tracing.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures-util = "0.3"
+alloy-dyn-abi = "1.6"
+alloy-primitives = "1.6"
+
+[dev-dependencies]
+hex-literal.workspace = true
+prost-types.workspace = true
+sapling-crypto.workspace = true
+hex.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tron-mempool = { path = "../tron-mempool" }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

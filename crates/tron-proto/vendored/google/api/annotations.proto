@@ -1,0 +1,10 @@
+// Vendored STUB of google/api/annotations.proto.
+//
+// java-tron's `api/api.proto` imports this file but never uses any of
+// its types or options (no `option (google.api.http)` annotations).
+// We provide an empty stub so prost-build / tonic-build don't error
+// on the unresolved import. The real annotations are in Google's
+// `googleapis` repo and would be unnecessary bytes here.
+syntax = "proto3";
+
+package google.api;

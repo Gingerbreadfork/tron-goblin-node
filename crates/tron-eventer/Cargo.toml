@@ -1,0 +1,22 @@
+[package]
+name = "tron-eventer"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Event subscribe / logsfilter: emits per-block, per-tx, per-contract-event/log triggers in java-tron's logsfilter shape so external analytics consumers (Kafka, MongoDB, in-process) can subscribe without translating types."
+
+[dependencies]
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+prost = { workspace = true }
+prost-types.workspace = true

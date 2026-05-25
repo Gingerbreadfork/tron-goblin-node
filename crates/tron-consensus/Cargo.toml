@@ -1,0 +1,19 @@
+[package]
+name = "tron-consensus"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DPoS slot scheduling, witness validation, maintenance period, fork choice."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+thiserror.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+hex-literal.workspace = true

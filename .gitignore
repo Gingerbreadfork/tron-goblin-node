@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------------------
+# Rust / cargo build artefacts
+# ---------------------------------------------------------------------------
+/target
+target/
+**/*.rs.bk
+# Cargo's normalised manifest left behind by `cargo vendor` / unpacking
+# vendored crates. The "real" manifest is the one without `.orig`.
+*.orig
+*.rej
+# More `cargo vendor` artefacts inside the vendored revm-* crates. The
+# workspace uses the root Cargo.lock; per-crate lockfiles inside a
+# vendored crate are dead weight, and .cargo-ok / .cargo_vcs_info.json
+# are extractor markers — none of these are load-bearing.
+crates/revm-*/Cargo.lock
+crates/revm-*/.cargo-ok
+crates/revm-*/.cargo_vcs_info.json
+# Coverage / profiling output
+*.profraw
+*.profdata
+tarpaulin-report.*
+coverage/
+flamegraph.svg
+perf.data
+perf.data.old
+
+# ---------------------------------------------------------------------------
+# Toolchain shims set up by ./scripts/setup-libclang.sh
+# ---------------------------------------------------------------------------
+.cargo/libclang-shim/
+
+# ---------------------------------------------------------------------------
+# Editor / IDE state
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*.swn
+*~
+
+# ---------------------------------------------------------------------------
+# AI tooling — deliberately NOT in the public repo. Covers per-tool
+# state directories AND shared project-instruction files (CLAUDE.md,
+# AGENTS.md, .cursorrules, etc.). If you want any of these locally,
+# create them after cloning.
+# ---------------------------------------------------------------------------
+.claude*
+CLAUDE.md
+.cursor*
+AGENTS.md
+.aider*
+.continue/
+.github/copilot-*
+.windsurfrules
+.codeium/
+.tabnine/
+.cody/
+.openhands/
+.openai/
+.gemini/
+.copilot/
+.devin/
+.replit/
+.zed/
+
+# ---------------------------------------------------------------------------
+# OS-generated cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---------------------------------------------------------------------------
+# Secrets / credentials — defence in depth; nothing should match today.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+secrets/
+secrets.*
+
+# ---------------------------------------------------------------------------
+# Runtime data — never commit chain state. Cheap to reproduce, expensive
+# (and sometimes consensus-sensitive) to ship.
+# ---------------------------------------------------------------------------
+mainnet-data/
+testnet-data/
+nile-data/
+shasta-data/
+data/
+db/
+snapshots/
+
+# ---------------------------------------------------------------------------
+# Local logs / debug dumps
+# ---------------------------------------------------------------------------
+*.log
+logs/
+core
+core.*
+*.coredump
+
+# ---------------------------------------------------------------------------
+# Reference repositories cloned for grep / parity work. Not vendored — clone
+# them yourself if you want them locally. See README's "Reference
+# implementation" section.
+# ---------------------------------------------------------------------------
+java-tron/
+tronprotocol/

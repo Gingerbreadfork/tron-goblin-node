@@ -1,0 +1,508 @@
+//! Host interface for external blockchain state access.
+
+use crate::{
+    cfg::GasParams,
+    context::{SStoreResult, SelfDestructResult, StateLoad},
+    journaled_state::{AccountInfoLoad, AccountLoad},
+};
+use auto_impl::auto_impl;
+use primitives::{hardfork::SpecId, Address, Bytes, Log, StorageKey, StorageValue, B256, U256};
+use state::Bytecode;
+
+/// Error that can happen when loading account info.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LoadError {
+    /// Cold load skipped.
+    ColdLoadSkipped,
+    /// Database error.
+    DBError,
+}
+
+/// Host trait with all methods that are needed by the Interpreter.
+///
+/// This trait is implemented for all types that have `ContextTr` trait.
+///
+/// There are few groups of functions which are Block, Transaction, Config, Database and Journal functions.
+#[auto_impl(&mut, Box)]
+pub trait Host {
+    /* Block */
+
+    /// Block basefee, calls ContextTr::block().basefee()
+    fn basefee(&self) -> U256;
+    /// Block blob gasprice, calls `ContextTr::block().blob_gasprice()`
+    fn blob_gasprice(&self) -> U256;
+    /// Block gas limit, calls ContextTr::block().gas_limit()
+    fn gas_limit(&self) -> U256;
+    /// Block difficulty, calls ContextTr::block().difficulty()
+    fn difficulty(&self) -> U256;
+    /// Block prevrandao, calls ContextTr::block().prevrandao()
+    fn prevrandao(&self) -> Option<U256>;
+    /// Block number, calls ContextTr::block().number()
+    fn block_number(&self) -> U256;
+    /// Block timestamp, calls ContextTr::block().timestamp()
+    fn timestamp(&self) -> U256;
+    /// Block beneficiary, calls ContextTr::block().beneficiary()
+    fn beneficiary(&self) -> Address;
+    /// Block slot number, calls ContextTr::block().slot_num()
+    fn slot_num(&self) -> U256;
+    /// Chain id, calls ContextTr::cfg().chain_id()
+    fn chain_id(&self) -> U256;
+
+    /* Transaction */
+
+    /// Transaction effective gas price, calls `ContextTr::tx().effective_gas_price(basefee as u128)`
+    fn effective_gas_price(&self) -> U256;
+    /// Transaction caller, calls `ContextTr::tx().caller()`
+    fn caller(&self) -> Address;
+    /// Transaction blob hash, calls `ContextTr::tx().blob_hash(number)`
+    fn blob_hash(&self, number: usize) -> Option<U256>;
+
+    /* Config */
+
+    /// Max initcode size, calls `ContextTr::cfg().max_code_size().saturating_mul(2)`
+    fn max_initcode_size(&self) -> usize;
+
+    /// Gas params contains the dynamic gas constants for the EVM.
+    fn gas_params(&self) -> &GasParams;
+
+    /// Returns whether state gas (EIP-8037) is enabled.
+    fn is_amsterdam_eip8037_enabled(&self) -> bool;
+
+    /// Returns the EIP-8037 `cost_per_state_byte` for the current transaction.
+    ///
+    /// Reads the cached value set on the local context at transaction start
+    /// (via `cfg.cpsb()`, honoring `cpsb_override`). Returns
+    /// `0` when EIP-8037 is not enabled.
+    fn cpsb(&self) -> u64;
+
+    /* Database */
+
+    /// Block hash, calls `ContextTr::journal_mut().db().block_hash(number)`
+    fn block_hash(&mut self, number: u64) -> Option<B256>;
+
+    /* Journal */
+
+    /// Selfdestruct account, calls `ContextTr::journal_mut().selfdestruct(address, target)`
+    fn selfdestruct(
+        &mut self,
+        address: Address,
+        target: Address,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<SelfDestructResult>, LoadError>;
+
+    /// Log, calls `ContextTr::journal_mut().log(log)`
+    fn log(&mut self, log: Log);
+
+    /// Sstore with optional fetch from database. Return none if the value is cold or if there is db error.
+    fn sstore_skip_cold_load(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        value: StorageValue,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<SStoreResult>, LoadError>;
+
+    /// Sstore, calls `ContextTr::journal_mut().sstore(address, key, value)`
+    fn sstore(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        value: StorageValue,
+    ) -> Option<StateLoad<SStoreResult>> {
+        self.sstore_skip_cold_load(address, key, value, false).ok()
+    }
+
+    /// Sload with optional fetch from database. Return none if the value is cold or if there is db error.
+    fn sload_skip_cold_load(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        skip_cold_load: bool,
+    ) -> Result<StateLoad<StorageValue>, LoadError>;
+
+    /// Sload, calls `ContextTr::journal_mut().sload(address, key)`
+    fn sload(&mut self, address: Address, key: StorageKey) -> Option<StateLoad<StorageValue>> {
+        self.sload_skip_cold_load(address, key, false).ok()
+    }
+
+    /// Tstore, calls `ContextTr::journal_mut().tstore(address, key, value)`
+    fn tstore(&mut self, address: Address, key: StorageKey, value: StorageValue);
+
+    /// Tload, calls `ContextTr::journal_mut().tload(address, key)`
+    fn tload(&mut self, address: Address, key: StorageKey) -> StorageValue;
+
+    /// Main function to load account info.
+    ///
+    /// If load_code is true, it will load the code fetching it from the database if not done before.
+    ///
+    /// If skip_cold_load is true, it will not load the account if it is cold. This is needed to short circuit
+    /// the load if there is not enough gas.
+    ///
+    /// Returns AccountInfo, is_cold and is_empty.
+    fn load_account_info_skip_cold_load(
+        &mut self,
+        address: Address,
+        load_code: bool,
+        skip_cold_load: bool,
+    ) -> Result<AccountInfoLoad<'_>, LoadError>;
+
+    /// Balance, calls `ContextTr::journal_mut().load_account(address)`
+    #[inline]
+    fn balance(&mut self, address: Address) -> Option<StateLoad<U256>> {
+        self.load_account_info_skip_cold_load(address, false, false)
+            .ok()
+            .map(|load| load.into_state_load(|i| i.balance))
+    }
+
+    /// Load account delegated, calls `ContextTr::journal_mut().load_account_delegated(address)`
+    #[inline]
+    fn load_account_delegated(&mut self, address: Address) -> Option<StateLoad<AccountLoad>> {
+        let account = self
+            .load_account_info_skip_cold_load(address, true, false)
+            .ok()?;
+
+        let mut account_load = StateLoad::new(
+            AccountLoad {
+                is_delegate_account_cold: None,
+                is_empty: account.is_empty,
+            },
+            account.is_cold,
+        );
+
+        // load delegate code if account is EIP-7702
+        if let Some(address) = account.code.as_ref().and_then(Bytecode::eip7702_address) {
+            let delegate_account = self
+                .load_account_info_skip_cold_load(address, true, false)
+                .ok()?;
+            account_load.data.is_delegate_account_cold = Some(delegate_account.is_cold);
+            account_load.data.is_empty = delegate_account.is_empty;
+        }
+
+        Some(account_load)
+    }
+
+    /// Load account code, calls [`Host::load_account_info_skip_cold_load`] with `load_code` set to false.
+    #[inline]
+    fn load_account_code(&mut self, address: Address) -> Option<StateLoad<Bytes>> {
+        self.load_account_info_skip_cold_load(address, true, false)
+            .ok()
+            .map(|load| {
+                load.into_state_load(|i| {
+                    i.code
+                        .as_ref()
+                        .map(|b| b.original_bytes())
+                        .unwrap_or_default()
+                })
+            })
+    }
+
+    /// Load account code hash, calls [`Host::load_account_info_skip_cold_load`] with `load_code` set to false.
+    #[inline]
+    fn load_account_code_hash(&mut self, address: Address) -> Option<StateLoad<B256>> {
+        self.load_account_info_skip_cold_load(address, false, false)
+            .ok()
+            .map(|load| {
+                load.into_state_load(|i| {
+                    if i.is_empty() {
+                        B256::ZERO
+                    } else {
+                        i.code_hash
+                    }
+                })
+            })
+    }
+
+    // ====================================================================
+    // TRON fork extension methods.
+    //
+    // Defaults return 0/false so a plain Ethereum Host doesn't have to
+    // implement TRON semantics. The orphan rule blocks `tron-tvm` from
+    // adding a Context override (Context lives in revm-context, not in
+    // our fork — see `tron-tvm/src/tron_host.rs` for the trait+ext
+    // infrastructure that's ready to plug in once either revm-context
+    // is forked or a TronContext newtype is introduced).
+    //
+    // Today, every Host-read TRON opcode (TOKENBALANCE, ISCONTRACT,
+    // FREEZEEXPIRETIME, and the 10 newly-added stake opcodes' read
+    // sides if any) returns the default. CALLTOKEN-family writes work
+    // because Trc10Inspector intercepts at the frame level.
+    // ====================================================================
+
+    /// TRC-10 token balance of `address` for `token_id`. Default: 0.
+    #[inline]
+    fn tron_token_balance(&self, _address: Address, _token_id: i64) -> i64 {
+        0
+    }
+
+    /// `true` if `address` has any deployed bytecode. Default: false.
+    #[inline]
+    fn tron_is_contract(&self, _address: Address) -> bool {
+        false
+    }
+
+    /// **TRON fork** — per-contract dynamic-energy factor. Read once
+    /// at frame setup; the interpreter's `Gas` tracker multiplies every
+    /// charge by `(10_000 + factor) / 10_000`. Default `0` = no penalty.
+    #[inline]
+    fn tron_dynamic_energy_factor(&self, _address: Address) -> i64 {
+        0
+    }
+
+    /// **TRON fork** — `FREEZEEXPIRETIME` (0xd7). Default 0.
+    #[inline]
+    fn tron_freeze_expire_time(
+        &self,
+        _caller_address: Address,
+        _target_address: Address,
+        _resource_type: u32,
+    ) -> i64 {
+        0
+    }
+
+    // ---- State-mutating TRON opcodes (Stake 1.0 + 2.0) ----
+    //
+    // Each returns `(stack_push_value)` — typically 1 for success / 0
+    // for failure, matching java-tron's OperationActions. Defaults are
+    // no-op (return 0), so contracts that call these opcodes get a
+    // graceful "operation skipped" rather than a halt. Real state
+    // mutations need actuator-primitive refactoring + a Host override
+    // — same blocker as the read-side TRON methods.
+
+    /// `FREEZE` (0xd5) — Stake 1.0 freeze. Default: no-op, returns 0.
+    #[inline]
+    fn tron_freeze(
+        &mut self,
+        _caller: Address,
+        _frozen_balance: i64,
+        _frozen_duration: i64,
+        _resource_type: u32,
+        _receiver_address: Option<Address>,
+    ) -> i64 {
+        0
+    }
+
+    /// `UNFREEZE` (0xd6) — Stake 1.0 unfreeze. Default: no-op.
+    #[inline]
+    fn tron_unfreeze(
+        &mut self,
+        _caller: Address,
+        _resource_type: u32,
+        _receiver_address: Option<Address>,
+    ) -> i64 {
+        0
+    }
+
+    /// `VOTEWITNESS` (0xd8) — cast votes for one or more SR candidates.
+    /// Witnesses + vote counts live at the memory ranges decoded by the
+    /// handler. Default: no-op.
+    #[inline]
+    fn tron_vote_witness(&mut self, _caller: Address, _witnesses: &[(Address, i64)]) -> i64 {
+        0
+    }
+
+    /// `WITHDRAWREWARD` (0xd9) — withdraw accumulated SR rewards.
+    /// Returns the withdrawn amount. Default: 0.
+    #[inline]
+    fn tron_withdraw_reward(&mut self, _caller: Address) -> i64 {
+        0
+    }
+
+    /// `FREEZEBALANCEV2` (0xda) — Stake 2.0 freeze. Default: no-op.
+    #[inline]
+    fn tron_freeze_balance_v2(
+        &mut self,
+        _caller: Address,
+        _frozen_balance: i64,
+        _resource_type: u32,
+    ) -> i64 {
+        0
+    }
+
+    /// `UNFREEZEBALANCEV2` (0xdb) — Stake 2.0 unfreeze. Default: no-op.
+    #[inline]
+    fn tron_unfreeze_balance_v2(
+        &mut self,
+        _caller: Address,
+        _unfreeze_balance: i64,
+        _resource_type: u32,
+    ) -> i64 {
+        0
+    }
+
+    /// `CANCELALLUNFREEZEV2` (0xdc) — cancel every pending unfreeze
+    /// request and re-stake the corresponding amount. Default: no-op.
+    #[inline]
+    fn tron_cancel_all_unfreeze_v2(&mut self, _caller: Address) -> i64 {
+        0
+    }
+
+    /// `WITHDRAWEXPIREUNFREEZE` (0xdd) — sweep any unfreeze entries
+    /// whose maturity has passed. Returns the withdrawn amount.
+    #[inline]
+    fn tron_withdraw_expire_unfreeze(&mut self, _caller: Address) -> i64 {
+        0
+    }
+
+    /// `DELEGATERESOURCE` (0xde) — delegate Stake 2.0 resource.
+    /// Default: no-op.
+    #[inline]
+    fn tron_delegate_resource(
+        &mut self,
+        _caller: Address,
+        _balance: i64,
+        _receiver_address: Address,
+        _resource_type: u32,
+        _lock: bool,
+        _lock_period: i64,
+    ) -> i64 {
+        0
+    }
+
+    /// `UNDELEGATERESOURCE` (0xdf) — undelegate Stake 2.0 resource.
+    /// Default: no-op.
+    #[inline]
+    fn tron_undelegate_resource(
+        &mut self,
+        _caller: Address,
+        _balance: i64,
+        _receiver_address: Address,
+        _resource_type: u32,
+    ) -> i64 {
+        0
+    }
+}
+
+/// Dummy host that implements [`Host`] trait and  returns all default values.
+#[derive(Default, Debug)]
+pub struct DummyHost {
+    gas_params: GasParams,
+}
+
+impl DummyHost {
+    /// Create a new dummy host with the given spec.
+    pub fn new(spec: SpecId) -> Self {
+        Self {
+            gas_params: GasParams::new_spec(spec),
+        }
+    }
+}
+
+impl Host for DummyHost {
+    fn basefee(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn blob_gasprice(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn gas_limit(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn gas_params(&self) -> &GasParams {
+        &self.gas_params
+    }
+
+    fn is_amsterdam_eip8037_enabled(&self) -> bool {
+        false
+    }
+
+    fn cpsb(&self) -> u64 {
+        0
+    }
+
+    fn difficulty(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn prevrandao(&self) -> Option<U256> {
+        None
+    }
+
+    fn block_number(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn timestamp(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn beneficiary(&self) -> Address {
+        Address::ZERO
+    }
+
+    fn slot_num(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn chain_id(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn effective_gas_price(&self) -> U256 {
+        U256::ZERO
+    }
+
+    fn caller(&self) -> Address {
+        Address::ZERO
+    }
+
+    fn blob_hash(&self, _number: usize) -> Option<U256> {
+        None
+    }
+
+    fn max_initcode_size(&self) -> usize {
+        0
+    }
+
+    fn block_hash(&mut self, _number: u64) -> Option<B256> {
+        None
+    }
+
+    fn selfdestruct(
+        &mut self,
+        _address: Address,
+        _target: Address,
+        _skip_cold_load: bool,
+    ) -> Result<StateLoad<SelfDestructResult>, LoadError> {
+        Ok(Default::default())
+    }
+
+    fn log(&mut self, _log: Log) {}
+
+    fn tstore(&mut self, _address: Address, _key: StorageKey, _value: StorageValue) {}
+
+    fn tload(&mut self, _address: Address, _key: StorageKey) -> StorageValue {
+        StorageValue::ZERO
+    }
+
+    fn load_account_info_skip_cold_load(
+        &mut self,
+        _address: Address,
+        _load_code: bool,
+        _skip_cold_load: bool,
+    ) -> Result<AccountInfoLoad<'_>, LoadError> {
+        Ok(Default::default())
+    }
+
+    fn sstore_skip_cold_load(
+        &mut self,
+        _address: Address,
+        _key: StorageKey,
+        _value: StorageValue,
+        _skip_cold_load: bool,
+    ) -> Result<StateLoad<SStoreResult>, LoadError> {
+        Ok(Default::default())
+    }
+
+    fn sload_skip_cold_load(
+        &mut self,
+        _address: Address,
+        _key: StorageKey,
+        _skip_cold_load: bool,
+    ) -> Result<StateLoad<StorageValue>, LoadError> {
+        Ok(Default::default())
+    }
+}

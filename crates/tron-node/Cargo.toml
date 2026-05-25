@@ -1,0 +1,47 @@
+[package]
+name = "tron-node"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Full-node daemon: opens RocksDB stores, runs the JSON-RPC server, syncs blocks from a peer, executes them into state."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+tron-actuator = { path = "../tron-actuator" }
+tron-executor = { path = "../tron-executor" }
+tron-consensus = { path = "../tron-consensus" }
+tron-rpc = { path = "../tron-rpc" }
+tron-grpc = { path = "../tron-grpc" }
+tron-mempool = { path = "../tron-mempool" }
+tron-eventer = { path = "../tron-eventer" }
+tron-net = { path = "../tron-net" }
+tron-tvm = { path = "../tron-tvm" }
+tron-replay = { path = "../tron-replay" }
+tron-wallet = { path = "../tron-wallet" }
+tokio = { workspace = true, features = ["signal"] }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.8"
+prost.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tar.workspace = true
+flate2.workspace = true
+rand = "0.8"
+
+[dev-dependencies]
+hex-literal.workspace = true
+prost-types.workspace = true
+tempfile = "3"
+
+[[bin]]
+name = "tron-node"
+path = "src/main.rs"

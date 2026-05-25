@@ -1,0 +1,59 @@
+[package]
+name = "tron-grpc"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "gRPC server (Wallet / WalletSolidity / Database / Monitor / Network) wrapping the existing tron-rpc handlers. Mirrors java-tron's port-50051 API surface for TronWeb / Java-SDK / TronGrid compatibility."
+
+[dependencies]
+tron-proto = { path = "../tron-proto" }
+tron-rpc = { path = "../tron-rpc" }
+tron-chainbase = { path = "../tron-chainbase" }
+tron-actuator = { path = "../tron-actuator" }
+tron-tvm = { path = "../tron-tvm" }
+# Sapling primitives for the shielded TRC-20 helper RPCs
+# (`getSpendingKey`, `getDiversifier`, `getRcm`, `getAkFromAsk`, etc.).
+# Same dep set as `tron-rpc`'s JSON-RPC implementations. The
+# `circuit` feature enables the Spend / Output bellman circuits for
+# `create_shielded_transaction*` and `create_shielded_contract_parameters*`.
+sapling-crypto = { workspace = true, features = ["circuit", "temporary-zcashd"] }
+jubjub.workspace = true
+redjubjub = "0.8"
+rand_core = "0.6"
+rand = "0.8"
+# Sapling MPC proving parameters (~50 MB) embedded via 6 sub-crates,
+# each shipping a chunk of the bytes via `include_bytes!`. Zero
+# transitive deps, no network, no build script. Yields `(spend_bytes,
+# output_bytes)` ready to deserialise with `bellman::Parameters::read`.
+wagyu-zcash-parameters = "0.2"
+# Groth16 prover (used for create_shielded_transaction* + the 4
+# TRC-20 proving methods).
+bellman = "0.14"
+bls12_381 = "0.8"
+incrementalmerkletree = "0.8"
+# Used by scanNoteByIvk for the ShieldedOutput trait we adapt the
+# `ReceiveDescription` to.
+zcash_note_encryption = "0.4"
+# Raw ChaCha20-Poly1305 for the shielded TRC-20 BURN ciphertext —
+# 64-byte plaintext (amount || transparent_to_address || zeros) under
+# OVK with a zero nonce. Used in `encrypt_burn_message_by_ovk`.
+chacha20poly1305 = "0.10"
+blake2s_simd = "1"
+getrandom = "0.2"
+group = "0.13"
+tron-crypto = { path = "../tron-crypto" }
+tron-types = { path = "../tron-types" }
+tonic = { workspace = true }
+prost.workspace = true
+prost-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+hex-literal.workspace = true

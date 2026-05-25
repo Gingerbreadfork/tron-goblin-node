@@ -1,0 +1,109 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tron-crypto",
+    "crates/tron-proto",
+    "crates/tron-types",
+    "crates/tron-chainbase",
+    "crates/tron-net",
+    "crates/tron-replay",
+    "crates/tron-actuator",
+    "crates/tron-executor",
+    "crates/tron-consensus",
+    "crates/tron-rpc",
+    "crates/tron-grpc",
+    "crates/tron-tvm",
+    "crates/tron-node",
+    "crates/tron-mempool",
+    "crates/tron-wallet",
+    "crates/tron-eventer",
+    # Vendored forks of two revm component crates — needed so we can:
+    #  * extend `CallInputs` with the TRC-10 transfer fields
+    #    (`tron_token_id`, `tron_token_value`)
+    #  * add the five TRON-extended opcodes (0xd0..0xd4) without
+    #    re-implementing CALL's gas/access-list/journal logic.
+    # All other revm crates stay on crates.io.
+    "crates/revm-interpreter",
+    "crates/revm-handler",
+    "crates/revm-context-interface",
+    "crates/revm-context",
+]
+
+# Patching at the workspace root redirects every downstream use to the
+# vendored forks.
+[patch.crates-io]
+revm-interpreter = { path = "crates/revm-interpreter" }
+revm-handler = { path = "crates/revm-handler" }
+revm-context-interface = { path = "crates/revm-context-interface" }
+revm-context = { path = "crates/revm-context" }
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/gingerbreadfork/tron-goblin-node"
+
+[workspace.dependencies]
+# Hashing
+sha2 = "0.10"
+sha3 = "0.10"
+ripemd = "0.1"
+# secp256k1 (RustCrypto, pure-Rust)
+k256 = { version = "0.13", features = ["ecdsa", "arithmetic", "expose-field"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "rfc6979"] }
+elliptic-curve = "0.13"
+# SM2 (Chinese national-standard signature curve, pure Rust from
+# RustCrypto org — same maintainers as k256 above). Used for the
+# optional SM2 signing path TRON exposes alongside secp256k1.
+sm2 = { version = "0.13", features = ["arithmetic", "dsa", "std"] }
+# Utilities
+hex = "0.4"
+thiserror = "1"
+# Testing
+hex-literal = "0.4"
+# Protobuf
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+# gRPC — tonic + tonic-build for service codegen. Uses prost under
+# the hood so the message types stay aligned with the rest of the
+# proto layer.
+tonic = "0.12"
+tonic-build = "0.12"
+# Base58
+bs58 = "0.5"
+# RocksDB
+rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4"] }
+# Async runtime
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+# RPC
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json", "query", "ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# EVM interpreter — used by tron-tvm as a library (not a maintained fork);
+# TRON-specific bits (precompiles, CALLTOKEN) bolt on via revm's extension
+# points. `default-features = false` strips pieces we don't need
+# (KZG blobs, BLS) and uses a pure-Rust secp256k1.
+revm = { version = "40", default-features = false, features = ["std", "portable"] }
+# Ethereum-compatible Merkle-Patricia Trie. Used for accountStateRoot
+# computation (TRON inherits MPT semantics from Ethereum).
+eth_trie = "0.6"
+# Zcash Sapling primitives — Pedersen hash, Groth16 verification, key
+# types. Pure Rust, MIT/Apache. Used for TRON's shielded TRC-20
+# precompiles. Default features include `circuit` (proving keys) which
+# we don't need; turn them off to keep build small.
+sapling-crypto = { version = "0.7", default-features = false, features = ["std"] }
+# Structured logging — tracing macros across crates, EnvFilter +
+# fmt subscriber in the binary.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# tar + gzip — for the tron-node snapshot import/export subcommands.
+# `tar` reads/writes USTAR-format archives streaming; `flate2` does
+# gzip on top. Both are pure Rust, no system deps.
+tar = "0.4"
+flate2 = "1"
+bls12_381 = "0.8"
+jubjub = "0.10"
