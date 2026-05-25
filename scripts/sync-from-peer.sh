@@ -30,10 +30,10 @@
 # Examples:
 #
 #   # 100-block smoke test against a node on the same LAN.
-#   ./scripts/sync-from-peer.sh 192.168.0.36:18888
+#   ./scripts/sync-from-peer.sh <your-node-host>:18888
 #
 #   # 100K-block endurance run with debug-level sync logging.
-#   ./scripts/sync-from-peer.sh 192.168.0.36:18888 \
+#   ./scripts/sync-from-peer.sh <your-node-host>:18888 \
 #       --max-blocks 100000 \
 #       --log-level info,tron_node::sync=debug
 #

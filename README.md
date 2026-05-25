@@ -271,7 +271,7 @@ noise), there's a wrapper script that handles fresh-data-dir setup,
 TCP reachability pre-flight, log capture, and a post-run summary:
 
 ```sh
-./scripts/sync-from-peer.sh 192.168.0.36:18888 --max-blocks 100000
+./scripts/sync-from-peer.sh <your-node-host>:18888 --max-blocks 100000
 ```
 
 Run with `--help` for all options.
