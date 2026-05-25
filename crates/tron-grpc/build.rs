@@ -12,10 +12,16 @@
 use std::path::PathBuf;
 
 fn main() {
-    let proto_root: PathBuf =
-        ["..", "..", "java-tron", "protocol", "src", "main", "protos"]
+    // Same `JAVA_TRON_PROTO_ROOT` override + vendored fallback as
+    // `tron-proto/build.rs`. The vendored copy is what the public repo
+    // ships; the env var is for chasing upstream wire changes.
+    let proto_root: PathBuf = match std::env::var_os("JAVA_TRON_PROTO_ROOT") {
+        Some(p) => PathBuf::from(p),
+        None => ["..", "tron-proto", "vendored", "java-tron"]
             .iter()
-            .collect();
+            .collect(),
+    };
+    println!("cargo:rerun-if-env-changed=JAVA_TRON_PROTO_ROOT");
     // Same google/api stub `tron-proto` uses — annotations.proto is
     // imported by api.proto but never referenced.
     let vendored: PathBuf = ["..", "tron-proto", "vendored"].iter().collect();

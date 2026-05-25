@@ -295,14 +295,28 @@ compatible; runtime config is its own surface.
 
 ## Reference implementation
 
-Most parity work is grounded in side-by-side reading of the
-java-tron source. If you want to run that comparison yourself,
-clone java-tron and `tronprotocol/documentation-en` next to this
-checkout — they're gitignored on purpose so this repo stays small:
+The `.proto` definitions needed to build are vendored at
+`crates/tron-proto/vendored/java-tron/`, so a fresh clone builds
+without needing the full java-tron repo on disk.
+
+Parity work is still grounded in side-by-side reading of the java-tron
+source. If you want to run that comparison yourself, clone java-tron
+and `tronprotocol/documentation-en` next to this checkout —
+they're gitignored on purpose so this repo stays small:
 
 ```sh
 git clone https://github.com/tronprotocol/java-tron.git
 git clone https://github.com/tronprotocol/documentation-en.git tronprotocol/documentation-en
+```
+
+If you want the build to consume `.proto` files from a parallel
+java-tron clone instead of the vendored copy (useful when chasing a
+wire-format change before re-vendoring), point both `build.rs`
+scripts at it via:
+
+```sh
+export JAVA_TRON_PROTO_ROOT=$PWD/java-tron/protocol/src/main/protos
+cargo build --release
 ```
 
 ## Acknowledgements

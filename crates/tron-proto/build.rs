@@ -9,13 +9,26 @@
 //! uses anything from it — we vendor a STUB at
 //! `vendored/google/api/annotations.proto` so the import resolves
 //! without dragging in the real `googleapis` types.
+//!
+//! ## Proto source
+//!
+//! By default reads the vendored java-tron protos from
+//! `vendored/java-tron/`. To rebuild against a live java-tron checkout
+//! (useful when chasing an upstream wire change before re-vendoring),
+//! set the `JAVA_TRON_PROTO_ROOT` env var to a directory containing
+//! `core/`, `core/contract/`, and `api/` subtrees — typically
+//! `<java-tron>/protocol/src/main/protos`.
 
 use std::path::PathBuf;
 
 fn main() {
-    let proto_root: PathBuf = ["..", "..", "java-tron", "protocol", "src", "main", "protos"]
-        .iter()
-        .collect();
+    // Live override → vendored fallback. Vendored is what the public
+    // repo ships; the override is a development convenience.
+    let proto_root: PathBuf = match std::env::var_os("JAVA_TRON_PROTO_ROOT") {
+        Some(p) => PathBuf::from(p),
+        None => ["vendored", "java-tron"].iter().collect(),
+    };
+    println!("cargo:rerun-if-env-changed=JAVA_TRON_PROTO_ROOT");
     let vendored: PathBuf = ["vendored"].iter().collect();
 
     let core = proto_root.join("core");
