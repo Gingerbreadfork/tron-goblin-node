@@ -30,13 +30,28 @@ pub struct RocksDbBackend {
     db: Arc<DB>,
 }
 
+/// Bounded fallback for the per-store `max_open_files` setting on
+/// every open path that doesn't get explicit tuning from the node
+/// config. RocksDB's own default is `-1` (unlimited), which is a
+/// foot-gun: a long-running node accumulates SST-cache handles until
+/// it hits the process RLIMIT_NOFILE ceiling, and parallel tests open
+/// ~20 stores at once and trip the same limit on developer machines.
+///
+/// 256 is the historical RocksDB default and is plenty for both tests
+/// (where stores have 1–2 SSTs each) and a modestly-sized production
+/// node. Production deployments that want a larger SST-handle cache
+/// override via the `[storage]` config block or `OpenedStores::open_tuned`.
+const DEFAULT_MAX_OPEN_FILES: i32 = 256;
+
 impl RocksDbBackend {
-    /// Open `path` read-write, creating it if absent. RocksDB defaults
-    /// apply; pass a tuned [`Options`] via [`open_with`] if you need to
-    /// match a specific java-tron config.
+    /// Open `path` read-write, creating it if absent. Caps
+    /// `max_open_files` at [`DEFAULT_MAX_OPEN_FILES`]; pass a tuned
+    /// [`Options`] via [`open_with`] or use [`open_tuned`] if you need
+    /// to match a specific java-tron `dbSettings` value.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RocksDbError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
         Self::open_with(path, opts)
     }
 
@@ -89,7 +104,8 @@ impl RocksDbBackend {
     /// Open `path` read-only. Useful for `dump-blocks`-style tools that
     /// inspect a live java-tron data dir without risking a write.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, RocksDbError> {
-        let opts = Options::default();
+        let mut opts = Options::default();
+        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
         let db = DB::open_for_read_only(&opts, path, /* error_if_log_file_exist */ false)?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -111,7 +127,8 @@ impl RocksDbBackend {
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
     ) -> Result<Self, RocksDbError> {
-        let opts = Options::default();
+        let mut opts = Options::default();
+        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
         // `DB::open_as_secondary` requires both paths to share one `P`
         // type parameter; convert both to `&Path` first.
         let db = DB::open_as_secondary(&opts, primary_path.as_ref(), secondary_path.as_ref())?;
