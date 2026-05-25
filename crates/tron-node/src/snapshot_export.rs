@@ -344,6 +344,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(p);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_tar_gz_then_import_round_trips_via_unified_dispatch() {
         let data_dir = build_minimal_data_dir();
@@ -374,6 +375,7 @@ mod tests {
         cleanup(output.parent().unwrap());
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_tar_no_compression_emits_uncompressed() {
         let data_dir = build_minimal_data_dir();
@@ -392,6 +394,7 @@ mod tests {
         cleanup(output.parent().unwrap());
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_atomic_publishes_only_on_success() {
         let data_dir = build_minimal_data_dir();
@@ -414,6 +417,7 @@ mod tests {
         cleanup(output.parent().unwrap());
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_missing_data_dir_errors() {
         let nonexistent = std::env::temp_dir().join("tron-no-such-data-dir-xxxxx");
@@ -423,6 +427,7 @@ mod tests {
         assert!(matches!(err, ExportError::DataDirMissing(_)));
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_compression_from_str_round_trips() {
         assert_eq!(Compression::from_str("none"), Some(Compression::None));
@@ -436,6 +441,7 @@ mod tests {
     /// DB that the importer's `Copy` mode can re-open. Same round-trip
     /// shape as the tarball path, but skips the tar step (faster, and
     /// works on a running node — though this test stops via `drop`).
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_via_checkpoint_round_trips_through_import() {
         let data_dir = build_minimal_data_dir();
@@ -466,6 +472,7 @@ mod tests {
         cleanup(&restore_dir);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn export_via_checkpoint_missing_data_dir_errors() {
         let nonexistent = std::env::temp_dir().join("tron-no-such-checkpoint-data-yyyy");

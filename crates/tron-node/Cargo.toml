@@ -41,6 +41,11 @@ rand = "0.8"
 hex-literal.workspace = true
 prost-types.workspace = true
 tempfile = "3"
+# Serializes the snapshot import/export tests. Each test opens ~30
+# RocksDB stores (~10 FDs per store during init), so 10 parallel tests
+# burst past the default RLIMIT_NOFILE on most Linux systems and fail
+# with "Too many open files".
+serial_test = "3"
 
 [[bin]]
 name = "tron-node"

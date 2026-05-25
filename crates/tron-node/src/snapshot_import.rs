@@ -725,6 +725,7 @@ mod tests {
         data.join("db")
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_copy_round_trips_head_pointer_and_witnesses() {
         let snap_db = build_minimal_snapshot();
@@ -743,6 +744,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_into_populated_dir_without_force_errors() {
         let snap_db = build_minimal_snapshot();
@@ -758,6 +760,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_with_force_replaces_existing_data() {
         let snap_db = build_minimal_snapshot();
@@ -772,6 +775,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_from_nonexistent_source_errors_cleanly() {
         let dest = temp_dir("dest-no-src");
@@ -785,6 +789,7 @@ mod tests {
         assert!(matches!(err, ImportError::SourceMissing(_)));
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_from_empty_source_errors() {
         let empty = temp_dir("dest-empty-src");
@@ -795,6 +800,7 @@ mod tests {
         cleanup(&empty);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn verify_returns_same_report_shape() {
         let snap_db = build_minimal_snapshot();
@@ -808,6 +814,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_mode_from_str_accepts_documented_forms() {
         assert_eq!(ImportMode::from_str("copy"), Some(ImportMode::Copy));
@@ -843,6 +850,7 @@ mod tests {
         Ok(())
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_from_tar_gz_extracts_and_round_trips() {
         let snap_db = build_minimal_snapshot();
@@ -871,6 +879,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_snapshot_directory_dispatch_works() {
         // Sanity check: passing a directory to import_snapshot is
@@ -884,6 +893,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_snapshot_rejects_unknown_extension() {
         let bogus = std::env::temp_dir().join(format!(
@@ -898,6 +908,7 @@ mod tests {
         let _ = std::fs::remove_file(&bogus);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_live_round_trips_head_pointer_and_witnesses() {
         // Setup: build a minimal snapshot, then leave the source
@@ -924,6 +935,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_live_rejects_populated_destination_without_force() {
         let snap_db = build_minimal_snapshot();
@@ -945,6 +957,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_live_uses_explicit_secondary_cache_when_provided() {
         let snap_db = build_minimal_snapshot();
@@ -961,6 +974,7 @@ mod tests {
         cleanup(&dest);
     }
 
+    #[serial_test::serial(snapshot)]
     #[test]
     fn import_live_rejects_missing_source() {
         let phantom = std::env::temp_dir().join(format!(
