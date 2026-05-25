@@ -265,6 +265,17 @@ Or against a specific peer:
     --peer 18.221.130.41:18888
 ```
 
+If you have your own java-tron node on the LAN and want a clean
+sync-from-genesis test against just that peer (no public-mainnet
+noise), there's a wrapper script that handles fresh-data-dir setup,
+TCP reachability pre-flight, log capture, and a post-run summary:
+
+```sh
+./scripts/sync-from-peer.sh 192.168.0.36:18888 --max-blocks 100000
+```
+
+Run with `--help` for all options.
+
 To plant a java-tron snapshot first (skip the genesis-walk and start
 from a recent state):
 
