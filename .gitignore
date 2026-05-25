@@ -85,28 +85,38 @@ secrets.*
 # ---------------------------------------------------------------------------
 # Runtime data — never commit chain state. Cheap to reproduce, expensive
 # (and sometimes consensus-sensitive) to ship.
+#
+# Paths are anchored to the repo root (leading `/`) so a nested
+# `data/` or `db/` test fixture isn't silently swallowed.
 # ---------------------------------------------------------------------------
-mainnet-data/
-testnet-data/
-nile-data/
-shasta-data/
-data/
-db/
-snapshots/
+/mainnet-data/
+/testnet-data/
+/nile-data/
+/shasta-data/
+/data/
+/db/
+/snapshots/
 
 # ---------------------------------------------------------------------------
 # Local logs / debug dumps
+#
+# Coredump patterns are anchored to root — without the leading `/`,
+# a generic `core` rule swallows any directory literally named `core`
+# (we have one inside the vendored protos).
 # ---------------------------------------------------------------------------
 *.log
-logs/
-core
-core.*
+/logs/
+/core
+/core.*
 *.coredump
 
 # ---------------------------------------------------------------------------
 # Reference repositories cloned for grep / parity work. Not vendored — clone
 # them yourself if you want them locally. See README's "Reference
 # implementation" section.
+#
+# Anchored to the repo root so the vendored protos at
+# `crates/tron-proto/vendored/java-tron/` are NOT swallowed.
 # ---------------------------------------------------------------------------
-java-tron/
-tronprotocol/
+/java-tron/
+/tronprotocol/
