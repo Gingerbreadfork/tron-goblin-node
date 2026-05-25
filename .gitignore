@@ -96,6 +96,8 @@ secrets.*
 /data/
 /db/
 /snapshots/
+/bench-work/
+/sync-test-data/
 
 # ---------------------------------------------------------------------------
 # Local logs / debug dumps
