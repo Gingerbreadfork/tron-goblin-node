@@ -236,6 +236,13 @@ fn build_trigger_tx(
                 ..Default::default()
             }],
             timestamp: 1_700_000_000_000,
+            // 100 TRX (= 100 × 1_000_000 sun) → 1_000_000 energy at
+            // the default fee of 100 sun/energy. The contract's bytecode
+            // is a single Transfer-event emit, well under this budget.
+            // Required since the ET-C3 fix: the executor now derives
+            // the VM's per-tx energy budget from `fee_limit` rather
+            // than a hardcoded 10M fallback.
+            fee_limit: 100_000_000,
             ..Default::default()
         }),
         signature: Vec::new(),

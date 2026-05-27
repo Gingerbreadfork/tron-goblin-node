@@ -301,6 +301,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // compute `account_state_root` constructs its own
                     // `ExecConfig::unsigned()` inside `tron-executor`.
                     require_signature: true,
+                    // Same logic: production must derive the VM's
+                    // energy budget from each tx's `fee_limit`, never
+                    // a hardcoded fallback. A consensus break
+                    // otherwise.
+                    require_fee_limit: true,
                 };
                 (
                     vm.support_constant,

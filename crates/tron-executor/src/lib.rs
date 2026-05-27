@@ -92,6 +92,20 @@ pub struct ExecConfig {
     /// on an in-construction, not-yet-signed block — see
     /// `dry_run_for_state_root` and `sr_runtime`'s state-root branch.
     pub require_signature: bool,
+    /// Enforce `Transaction.raw_data.fee_limit` as the per-tx VM
+    /// energy budget. Defaults to `true` — VM execution computes
+    /// `vm_energy_limit = fee_limit / dyn_props.energy_fee()` and txs
+    /// with `fee_limit <= 0` are rejected with
+    /// `TxOutcome::InvalidFeeLimit`, mirroring java-tron's
+    /// `validateFeeLimit` gate.
+    ///
+    /// Set to `false` for synthetic test fixtures that build VM txs
+    /// via `..Default::default()` (which leaves `fee_limit = 0`) —
+    /// the executor falls back to a generous fixed cap so the test's
+    /// VM call has room to run. Production must keep this on or
+    /// every node will compute a different energy charge than its
+    /// peers for the same tx (consensus break).
+    pub require_fee_limit: bool,
 }
 
 impl Default for ExecConfig {
@@ -106,6 +120,13 @@ impl Default for ExecConfig {
             // bypass of `sync::accept_block` (the layer that normally
             // validates) silently applies a peer-injected block.
             require_signature: true,
+            // Same reasoning — without this, a tx with `fee_limit = 0`
+            // (the proto default; trivially the case for any test
+            // fixture using `..Default::default()`) would get the old
+            // 10M fallback energy budget, masking the fact that
+            // production should be deriving the VM's budget from the
+            // caller's stated `fee_limit`.
+            require_fee_limit: true,
         }
     }
 }
@@ -118,12 +139,22 @@ impl ExecConfig {
         self.save_internal_tx || self.vm_trace
     }
 
-    /// Defaults except `require_signature = false`. For the block-production
-    /// dry-run path (which applies an UNSIGNED, in-construction block to
-    /// compute its `account_state_root`) and for tests that exercise
-    /// `execute_block*` directly with synthetic unsigned blocks.
+    /// Defaults with the peer-block-level policy gates relaxed:
+    /// `require_signature = false` and `require_fee_limit = false`. For
+    /// the block-production dry-run path (which applies an UNSIGNED,
+    /// in-construction block to compute its `account_state_root`) and
+    /// for tests that exercise `execute_block*` directly with synthetic
+    /// blocks whose VM-bound txs are built via `..Default::default()`
+    /// (so `fee_limit = 0`).
+    ///
+    /// Production code paths that actually apply peer-received blocks
+    /// must NEVER use this helper — the strict default applies.
     pub fn unsigned() -> Self {
-        Self { require_signature: false, ..Self::default() }
+        Self {
+            require_signature: false,
+            require_fee_limit: false,
+            ..Self::default()
+        }
     }
 }
 
@@ -138,16 +169,20 @@ mod exec_config_tests {
         assert!(!c.vm_trace);
         assert!(!c.save_featured_internal_tx);
         assert!(!c.record_internal_txs());
-        // Default-strict: refuses unsigned blocks unless explicitly
-        // opted out. The dry-run path and a few executor tests use
-        // `ExecConfig::unsigned()` for the opt-out.
+        // Default-strict gates: anything that touches state must opt
+        // out of these explicitly. Mirrors the on-wire policies a
+        // real peer-received block goes through.
         assert!(c.require_signature);
+        assert!(c.require_fee_limit);
     }
 
     #[test]
-    fn unsigned_helper_only_flips_signature_gate() {
+    fn unsigned_helper_relaxes_peer_block_gates() {
         let c = ExecConfig::unsigned();
         assert!(!c.require_signature);
+        assert!(!c.require_fee_limit);
+        // Trace knobs untouched — `unsigned` is about peer-block-level
+        // policy, not about whether internal-tx recording is on.
         assert!(!c.save_internal_tx);
         assert!(!c.vm_trace);
         assert!(!c.save_featured_internal_tx);
@@ -175,6 +210,98 @@ mod exec_config_tests {
             ..Default::default()
         }
         .record_internal_txs());
+    }
+}
+
+#[cfg(test)]
+mod fee_limit_tests {
+    use super::*;
+
+    /// Strict mode + the canonical mainnet `DEFAULT_ENERGY_FEE = 100`:
+    /// every 100 sun of `fee_limit` buys one unit of energy.
+    #[test]
+    fn strict_mode_divides_fee_limit_by_energy_fee() {
+        assert_eq!(compute_vm_energy_limit(1_000_000, 100, true), Ok(10_000));
+        assert_eq!(compute_vm_energy_limit(100, 100, true), Ok(1));
+        // Truncates toward zero (i.e. caller paid for partial energy
+        // but doesn't get a full unit — matches java-tron's integer
+        // division).
+        assert_eq!(compute_vm_energy_limit(99, 100, true), Ok(0));
+    }
+
+    /// Strict mode rejects `fee_limit <= 0` (the proto default and the
+    /// trivial misconfiguration). Mirrors java-tron's
+    /// `validateFeeLimit` gate.
+    #[test]
+    fn strict_mode_rejects_zero_and_negative_fee_limit() {
+        assert_eq!(
+            compute_vm_energy_limit(0, 100, true),
+            Err(TxOutcome::InvalidFeeLimit { fee_limit: 0 })
+        );
+        assert_eq!(
+            compute_vm_energy_limit(-1, 100, true),
+            Err(TxOutcome::InvalidFeeLimit { fee_limit: -1 })
+        );
+        assert_eq!(
+            compute_vm_energy_limit(i64::MIN, 100, true),
+            Err(TxOutcome::InvalidFeeLimit { fee_limit: i64::MIN })
+        );
+    }
+
+    /// Lenient mode (`ExecConfig::unsigned()` / test fixtures): the
+    /// fee_limit is ignored entirely and the historical 10M fallback
+    /// is returned. Required so test fixtures built via
+    /// `..Default::default()` (so `fee_limit = 0`) keep running.
+    #[test]
+    fn lenient_mode_always_returns_test_fallback() {
+        assert_eq!(compute_vm_energy_limit(0, 100, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
+        assert_eq!(compute_vm_energy_limit(-1, 100, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
+        // Even a real-looking fee_limit is ignored in lenient mode —
+        // the helper's job is to keep test fixtures predictable, not
+        // to interpolate.
+        assert_eq!(compute_vm_energy_limit(1_000_000, 100, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
+    }
+
+    /// Defensive clamp against a misconfigured `energy_fee = 0` (or
+    /// negative). Division-by-zero would panic; the helper substitutes
+    /// 1 sun/energy so the derived budget is large but finite.
+    #[test]
+    fn clamps_energy_fee_to_at_least_one() {
+        // energy_fee = 0 → treated as 1 → energy_limit = fee_limit
+        // (capped by MAX).
+        assert_eq!(
+            compute_vm_energy_limit(500, 0, true),
+            Ok(500)
+        );
+        assert_eq!(
+            compute_vm_energy_limit(500, -42, true),
+            Ok(500)
+        );
+    }
+
+    /// The safety ceiling fires when `fee_limit / energy_fee` would
+    /// otherwise exceed 1B energy. Keeps the revm `u64` gas counter
+    /// well within arithmetic safety bounds.
+    #[test]
+    fn safety_ceiling_caps_runaway_fee_limits() {
+        // fee_limit = i64::MAX, energy_fee = 1 → would derive
+        // i64::MAX-as-u64 = 9.2e18; expect clamp at 1B.
+        assert_eq!(
+            compute_vm_energy_limit(i64::MAX, 1, true),
+            Ok(MAX_VM_ENERGY_LIMIT)
+        );
+        // Just over the ceiling → still clamped.
+        let just_over = (MAX_VM_ENERGY_LIMIT + 1) as i64 * 100;
+        assert_eq!(
+            compute_vm_energy_limit(just_over, 100, true),
+            Ok(MAX_VM_ENERGY_LIMIT)
+        );
+        // Exactly at the ceiling → returned unchanged.
+        let at_cap = (MAX_VM_ENERGY_LIMIT as i64) * 100;
+        assert_eq!(
+            compute_vm_energy_limit(at_cap, 100, true),
+            Ok(MAX_VM_ENERGY_LIMIT)
+        );
     }
 }
 
@@ -468,6 +595,12 @@ pub enum TxOutcome {
         expiration_ms: i64,
         block_timestamp_ms: i64,
     },
+    /// VM-bound contract tx had `raw_data.fee_limit <= 0` while the
+    /// executor's `require_fee_limit` gate was on. java-tron's
+    /// `validateFeeLimit` rejects these at validation; we enforce at
+    /// block-apply so the VM's energy budget is always derived from
+    /// the caller's stated `fee_limit`, never a hardcoded fallback.
+    InvalidFeeLimit { fee_limit: i64 },
 }
 
 impl TxOutcome {
@@ -1449,7 +1582,7 @@ fn execute_one_tx(
         ty,
         ContractType::TriggerSmartContract | ContractType::CreateSmartContract
     ) {
-        return execute_vm_tx(&session, tx_id, ty, parameter, config);
+        return execute_vm_tx(&session, tx_id, ty, parameter, config, raw.fee_limit);
     }
 
     // Validate. On reject: revert (drops any pending writes — though
@@ -1506,12 +1639,59 @@ fn execute_one_tx(
 /// revert — we mirror that. On insufficient balance for the fee, the
 /// whole session is reverted and the tx is marked
 /// [`TxOutcome::ExecutionFailed`].
+/// Cap when the strict gate is off: keeps synthetic test fixtures
+/// (which build VM txs via `..Default::default()`, so `fee_limit = 0`)
+/// running with a generous energy budget. Matches the historical
+/// hardcode this fix replaces. NEVER reached in production —
+/// `runtime.rs` sets `require_fee_limit = true`.
+const TEST_FALLBACK_ENERGY_LIMIT: u64 = 10_000_000;
+
+/// Absolute ceiling on the VM's per-tx energy budget. A mainnet block
+/// caps total energy at ~150M; permitting a single tx to demand up
+/// to 1B energy keeps the revm gas counter (a `u64`) well within
+/// arithmetic safety while still being looser than any realistic tx.
+/// A `fee_limit = i64::MAX` would otherwise saturate into a nonsense
+/// budget downstream.
+const MAX_VM_ENERGY_LIMIT: u64 = 1_000_000_000;
+
+/// Derive the per-tx VM energy budget from `fee_limit` and
+/// `energy_fee` per java-tron's `Manager.processTransaction` formula:
+/// `energyLimit = feeLimit / energyFee`, clamped to a safety ceiling.
+///
+/// Returns `Err(TxOutcome::InvalidFeeLimit { .. })` when strict mode
+/// is on and `fee_limit <= 0` (matches java-tron's `validateFeeLimit`
+/// gate; the proto default of 0 is rejected). Returns
+/// [`TEST_FALLBACK_ENERGY_LIMIT`] when strict mode is off (the
+/// `ExecConfig::unsigned()` escape hatch for tests / dry-run).
+///
+/// `energy_fee` defaults to `DEFAULT_ENERGY_FEE = 100` sun/energy on
+/// mainnet; defensively, a misconfigured `<= 0` is clamped to 1 to
+/// avoid division-by-zero (the production code paths read this from
+/// `DynamicPropertiesStore::energy_fee()` which already saturates at
+/// the documented default).
+fn compute_vm_energy_limit(
+    fee_limit: i64,
+    energy_fee: i64,
+    require_fee_limit: bool,
+) -> Result<u64, TxOutcome> {
+    if !require_fee_limit {
+        return Ok(TEST_FALLBACK_ENERGY_LIMIT);
+    }
+    if fee_limit <= 0 {
+        return Err(TxOutcome::InvalidFeeLimit { fee_limit });
+    }
+    let divisor = energy_fee.max(1) as u64;
+    let derived = (fee_limit as u64) / divisor;
+    Ok(derived.min(MAX_VM_ENERGY_LIMIT))
+}
+
 fn execute_vm_tx(
     session: &TxSession,
     tx_id: [u8; 32],
     ty: ContractType,
     parameter: &prost_types::Any,
     config: &ExecConfig,
+    fee_limit: i64,
 ) -> TxResult {
     use tron_chainbase::{
         BlockIndexStore as BIS, CodeStore as CS, ContractStateStore as CtS,
@@ -1567,9 +1747,23 @@ fn execute_vm_tx(
     let block_number = dp.latest_block_header_number().unwrap_or(0);
     let block_timestamp_ms = dp.latest_block_header_timestamp().unwrap_or(0);
 
-    // TODO(phase-3-followup): use the contract's `feeLimit` divided by
-    // ENERGY_FEE from dyn_props. For now, 10M energy is a generous cap.
-    let energy_limit = 10_000_000u64;
+    let energy_limit = match compute_vm_energy_limit(
+        fee_limit,
+        dp.energy_fee(),
+        config.require_fee_limit,
+    ) {
+        Ok(limit) => limit,
+        Err(reason) => {
+            session.revert();
+            return TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: reason,
+                internal_transactions: Vec::new(),
+                vm_logs: Vec::new(),
+            };
+        }
+    };
 
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number,
