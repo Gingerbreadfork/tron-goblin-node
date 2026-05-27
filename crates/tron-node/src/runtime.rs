@@ -295,6 +295,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     save_internal_tx: vm.save_internal_tx,
                     vm_trace: vm.vm_trace,
                     save_featured_internal_tx: vm.save_featured_internal_tx,
+                    // Default-strict: every peer-received and SR-produced
+                    // block we ever apply via the daemon must carry a
+                    // valid witness signature. The dry-run path used to
+                    // compute `account_state_root` constructs its own
+                    // `ExecConfig::unsigned()` inside `tron-executor`.
+                    require_signature: true,
                 };
                 (
                     vm.support_constant,

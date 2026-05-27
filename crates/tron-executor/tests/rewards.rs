@@ -23,10 +23,24 @@ use tron_chainbase::{
     WitnessStore, DEFAULT_BROKERAGE,
 };
 use tron_crypto::address::Address;
-use tron_executor::{execute_block, StateBackends};
+use tron_executor::{
+    execute_block_with_config, BlockExecError, BlockExecutionReport, ExecConfig, StateBackends,
+};
 use tron_proto::{
     block_header::Raw as BlockHeaderRaw, Account, Block, BlockHeader, Vote, Votes, Witness,
 };
+use tron_types::BlockId;
+
+/// Apply a synthetic UNSIGNED block. See note on the same helper in
+/// `maintenance_rotation.rs` — these tests exercise reward / brokerage
+/// logic, not the witness-sig path, so they opt out of the strict gate.
+fn apply_unsigned(
+    state: &StateBackends,
+    block: &Block,
+    prev: Option<BlockId>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_with_config(state, block, prev, &ExecConfig::unsigned())
+}
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -120,7 +134,7 @@ fn producer_gets_brokerage_into_allowance_and_remainder_into_cycle_pool() {
     // Default brokerage is 20% → producer allowance += 9_600_000;
     //   cycle pool += 38_400_000.
 
-    execute_block(&state, &empty_block(1, [0u8; 32], producer, 1_700_000_000_000), None)
+    apply_unsigned(&state, &empty_block(1, [0u8; 32], producer, 1_700_000_000_000), None)
         .expect("execute");
 
     let updated_acct = accts
@@ -169,7 +183,7 @@ fn standby_pool_distributes_proportionally_across_top_127() {
         );
     }
 
-    execute_block(&state, &empty_block(1, [0u8; 32], b, 1_700_000_000_000), None)
+    apply_unsigned(&state, &empty_block(1, [0u8; 32], b, 1_700_000_000_000), None)
         .expect("execute");
 
     let dlg = DelegationStore::new(state.delegation.clone());
@@ -230,7 +244,7 @@ fn maintenance_pass_advances_cycle_and_writes_vi() {
     // Block num must be > 1 for doMaintenance to actually fire.
     // Apply genesis first (num=1) so the head pointer advances and
     // num=2 lands on the boundary.
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(1, [0u8; 32], w, 1_699_999_997_000),
         None,
@@ -244,7 +258,7 @@ fn maintenance_pass_advances_cycle_and_writes_vi() {
     // Now block 2 at the maintenance-boundary timestamp.
     let dp2 = DynamicPropertiesStore::new(state.dyn_props.clone());
     let head_hash = dp2.latest_block_header_hash().unwrap().unwrap();
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(2, head_hash, w, 1_700_000_000_000),
         None,
@@ -333,14 +347,14 @@ fn voter_withdraws_reward_after_full_cycle() {
     dlg.set_end_cycle(&Address::from_raw(voter), 1);
 
     // Apply genesis (num=1) then a boundary block (num=2).
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(1, [0u8; 32], w, 1_699_999_997_000),
         None,
     )
     .unwrap();
     let head_hash = dp.latest_block_header_hash().unwrap().unwrap();
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(2, head_hash, w, 1_700_000_000_000),
         None,
@@ -410,14 +424,14 @@ fn maintenance_clears_votes_store_after_tally() {
     );
     assert!(vs.contains(&Address::from_raw(voter)));
 
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(1, [0u8; 32], w, 1_699_999_997_000),
         None,
     )
     .unwrap();
     let head_hash = dp.latest_block_header_hash().unwrap().unwrap();
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(2, head_hash, w, 1_700_000_000_000),
         None,
@@ -462,7 +476,7 @@ fn block_one_skips_maintenance_but_advances_next_time() {
     );
 
     let t = 1_700_000_000_000;
-    execute_block(&state, &empty_block(1, [0u8; 32], w, t), None).expect("genesis");
+    apply_unsigned(&state, &empty_block(1, [0u8; 32], w, t), None).expect("genesis");
 
     // Cycle MUST still be 0 — doMaintenance didn't run.
     assert_eq!(dp.current_cycle_number(), 0);

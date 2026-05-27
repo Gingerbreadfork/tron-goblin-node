@@ -20,8 +20,22 @@ use tron_chainbase::{
 };
 use tron_crypto::address::Address;
 use tron_executor::{
-    execute_block_with_undo, rollback_block, StateBackends,
+    execute_block_with_undo_and_config, rollback_block, BlockExecError, BlockExecutionReport,
+    ExecConfig, StateBackends,
 };
+use tron_types::BlockId;
+
+/// Apply a synthetic UNSIGNED block with undo capture. See note on the
+/// same helper in `maintenance_rotation.rs` — these tests exercise the
+/// undo/rollback machinery, not the witness-sig path.
+fn apply_unsigned_with_undo(
+    state: &StateBackends,
+    block: &Block,
+    prev: Option<BlockId>,
+    undo: &BlockUndoStore,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_with_undo_and_config(state, block, prev, undo, &ExecConfig::unsigned())
+}
 use tron_proto::{
     block_header::Raw as BlockHeaderRaw, transaction::contract::ContractType,
     transaction::Contract as TxContract, transaction::Raw as TxRaw, Account, Block, BlockHeader,
@@ -155,7 +169,7 @@ fn execute_block_with_undo_writes_a_record() {
     );
 
     let block = empty_block(1, [0u8; 32]);
-    execute_block_with_undo(&state, &block, None, &undo).expect("apply");
+    apply_unsigned_with_undo(&state, &block, None, &undo).expect("apply");
 
     let rec = undo.get(1).unwrap().expect("undo log present");
     // Should record at least a few DPS keys (head pointers, etc.) and
@@ -180,7 +194,7 @@ fn rollback_restores_dynamic_properties_head_pointer() {
 
     // Block 1: head goes to 1.
     let b1 = empty_block(1, [0u8; 32]);
-    execute_block_with_undo(&state, &b1, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &b1, None, &undo).unwrap();
     assert_eq!(dp.latest_block_header_number(), Some(1));
     let head_after_b1 = dp.latest_block_header_hash().unwrap();
     let ts_after_b1 = dp.latest_block_header_timestamp();
@@ -188,7 +202,7 @@ fn rollback_restores_dynamic_properties_head_pointer() {
     // Block 2: head goes to 2.
     let id1 = tron_types::block_id_from_block(&b1).unwrap();
     let b2 = empty_block(2, *id1.as_bytes());
-    execute_block_with_undo(&state, &b2, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &b2, None, &undo).unwrap();
     assert_eq!(dp.latest_block_header_number(), Some(2));
     assert_ne!(dp.latest_block_header_hash().unwrap(), head_after_b1);
 
@@ -231,7 +245,7 @@ fn rollback_deletes_keys_that_were_first_created_by_the_block() {
     let pre_block = ws.get(&Address::from_raw(new_witness)).unwrap().unwrap();
     assert_eq!(pre_block.total_produced, 5);
 
-    execute_block_with_undo(&state, &block_with_create, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &block_with_create, None, &undo).unwrap();
 
     // Witness total_produced bumped by 1.
     let after = ws.get(&Address::from_raw(new_witness)).unwrap().unwrap();
@@ -257,7 +271,7 @@ fn rollback_completely_removes_a_key_with_no_pre_image() {
     // Apply a block (this writes several DPS keys, none of which
     // existed before).
     let block = empty_block(1, [0u8; 32]);
-    execute_block_with_undo(&state, &block, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &block, None, &undo).unwrap();
     assert!(dp.latest_block_header_number().is_some());
 
     // Verify the undo log has at least one `before = None` DPS entry.
@@ -298,7 +312,7 @@ fn multi_block_rollback_chains_correctly() {
     );
 
     let b1 = empty_block(1, [0u8; 32]);
-    execute_block_with_undo(&state, &b1, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &b1, None, &undo).unwrap();
     let id1 = tron_types::block_id_from_block(&b1).unwrap();
     let count_after_1 = ws
         .get(&Address::from_raw(witness_addr))
@@ -307,11 +321,11 @@ fn multi_block_rollback_chains_correctly() {
         .total_produced;
 
     let b2 = empty_block(2, *id1.as_bytes());
-    execute_block_with_undo(&state, &b2, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &b2, None, &undo).unwrap();
     let id2 = tron_types::block_id_from_block(&b2).unwrap();
 
     let b3 = empty_block(3, *id2.as_bytes());
-    execute_block_with_undo(&state, &b3, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &b3, None, &undo).unwrap();
 
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     assert_eq!(dp.latest_block_header_number(), Some(3));
@@ -365,7 +379,7 @@ fn reapply_after_rollback_produces_same_state_when_block_is_identical() {
         b
     };
 
-    execute_block_with_undo(&state, &block, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &block, None, &undo).unwrap();
     let snapshot_after_apply = {
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
         (
@@ -396,7 +410,7 @@ fn reapply_after_rollback_produces_same_state_when_block_is_identical() {
 
     // Re-apply the same block. Resulting state must equal the first
     // apply.
-    execute_block_with_undo(&state, &block, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &block, None, &undo).unwrap();
     let snapshot_after_reapply = {
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
         (
@@ -447,7 +461,7 @@ fn apply_account_creating_block_then_rollback_removes_the_account() {
             witness_addr.to_vec();
         b
     };
-    execute_block_with_undo(&state, &block, None, &undo).unwrap();
+    apply_unsigned_with_undo(&state, &block, None, &undo).unwrap();
     assert!(dp.latest_block_header_hash().unwrap().is_some());
 
     rollback_block(&state, 1, &undo).unwrap();

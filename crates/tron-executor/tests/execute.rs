@@ -517,3 +517,61 @@ fn three_block_chain_replays_with_correct_parent_links() {
         1_000_000 - 600
     );
 }
+
+/// Regression: the default `ExecConfig` requires a non-empty
+/// `witness_signature` and rejects unsigned blocks with
+/// `BlockValidateError::MissingSignature`. Without this gate, any caller
+/// that bypassed `sync::accept_block` (the production layer that
+/// pre-validates) could silently apply a peer-injected block.
+///
+/// The dry-run path that produces `account_state_root` for in-construction
+/// blocks (see `dry_run_for_state_root`) and a handful of executor tests
+/// opt out via `ExecConfig::unsigned()`.
+#[test]
+fn unsigned_block_is_rejected_under_default_config() {
+    use tron_executor::BlockExecError;
+    use tron_types::BlockValidateError;
+
+    let state = StateBundle::fresh();
+    let mut block = build_block(1, [0u8; 32], Vec::new());
+    // Strip the signature `build_block` attached. Header is otherwise
+    // well-formed (correct tx_trie_root, matching witness_address).
+    block
+        .block_header
+        .as_mut()
+        .unwrap()
+        .witness_signature
+        .clear();
+
+    match execute_block(&state.backends(), &block, None) {
+        Err(BlockExecError::Structural(BlockValidateError::MissingSignature)) => {}
+        other => panic!(
+            "expected Structural(MissingSignature) under default-strict config, got {other:?}"
+        ),
+    }
+    // And state was NOT mutated — head pointer must still be unset.
+    assert_eq!(state.dyn_props.latest_block_header_number(), None);
+}
+
+/// Companion to the test above: with `ExecConfig::unsigned()`, the same
+/// unsigned block applies successfully. This is the path used by
+/// `dry_run_for_state_root` during block production.
+#[test]
+fn unsigned_block_is_accepted_when_explicitly_opted_out() {
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    let state = StateBundle::fresh();
+    let mut block = build_block(1, [0u8; 32], Vec::new());
+    block
+        .block_header
+        .as_mut()
+        .unwrap()
+        .witness_signature
+        .clear();
+
+    let report =
+        execute_block_with_config(&state.backends(), &block, None, &ExecConfig::unsigned())
+            .expect("opt-out config should accept unsigned block");
+    assert_eq!(report.tx_results.len(), 0);
+    assert_eq!(state.dyn_props.latest_block_header_number(), Some(1));
+}

@@ -14,8 +14,23 @@ use tron_chainbase::{
     AccountStore, DynamicPropertiesStore, KvBackend, MemBackend,
 };
 use tron_crypto::address::Address;
-use tron_executor::{compute_state_root, execute_block, BlockExecError, StateBackends};
+use tron_executor::{
+    compute_state_root, execute_block_with_config, BlockExecError, BlockExecutionReport,
+    ExecConfig, StateBackends,
+};
 use tron_proto::{block_header::Raw as BlockHeaderRaw, Account, Block, BlockHeader};
+use tron_types::BlockId;
+
+/// Apply a synthetic UNSIGNED block. See note on the same helper in
+/// `maintenance_rotation.rs` — these tests exercise account-state-root
+/// behaviour, not the witness-sig path.
+fn apply_unsigned(
+    state: &StateBackends,
+    block: &Block,
+    prev: Option<BlockId>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_with_config(state, block, prev, &ExecConfig::unsigned())
+}
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -127,7 +142,7 @@ fn execute_block_skips_root_check_when_flag_is_off() {
     let garbage_root = vec![0xff; 32];
     let block = block_with_root(1, [0u8; 32], garbage_root);
 
-    let result = execute_block(&state, &block, None);
+    let result = apply_unsigned(&state, &block, None);
     assert!(
         result.is_ok(),
         "flag=0 path must ignore garbage state_root; got {:?}",
@@ -146,7 +161,7 @@ fn execute_block_skips_root_check_when_header_field_is_empty() {
     dp.put_long(b"ALLOW_ACCOUNT_STATE_ROOT", 1);
 
     let block = block_with_root(1, [0u8; 32], Vec::new());
-    let result = execute_block(&state, &block, None);
+    let result = apply_unsigned(&state, &block, None);
     assert!(
         result.is_ok(),
         "empty header field must skip verification even with flag on; got {:?}",
@@ -164,7 +179,7 @@ fn execute_block_rejects_state_root_mismatch_when_flag_is_on() {
     let bogus_root = vec![0xab; 32];
     let block = block_with_root(1, [0u8; 32], bogus_root);
 
-    let err = execute_block(&state, &block, None).expect_err("must reject");
+    let err = apply_unsigned(&state, &block, None).expect_err("must reject");
     assert!(
         matches!(err, BlockExecError::StateRootMismatch { .. }),
         "expected StateRootMismatch, got {:?}",
@@ -185,7 +200,7 @@ fn execute_block_accepts_matching_state_root() {
     let expected = compute_state_root(&state);
     let block = block_with_root(1, [0u8; 32], expected.to_vec());
 
-    let result = execute_block(&state, &block, None);
+    let result = apply_unsigned(&state, &block, None);
     assert!(
         result.is_ok(),
         "matching root must pass; got {:?}",

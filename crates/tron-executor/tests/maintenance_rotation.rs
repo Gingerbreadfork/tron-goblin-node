@@ -15,10 +15,25 @@ use tron_chainbase::{
     WitnessStore,
 };
 use tron_crypto::address::Address;
-use tron_executor::{execute_block, StateBackends};
+use tron_executor::{
+    execute_block_with_config, BlockExecError, BlockExecutionReport, ExecConfig, StateBackends,
+};
 use tron_proto::{
     block_header::Raw as BlockHeaderRaw, Account, Block, BlockHeader, Vote, Votes, Witness,
 };
+use tron_types::BlockId;
+
+/// Apply a synthetic UNSIGNED block. Production code path runs through
+/// `execute_block`/`execute_block_with_config` with the default-strict
+/// `ExecConfig` (sig required); these tests skip that gate because they
+/// exercise maintenance/rotation logic, not the witness-sig path.
+fn apply_unsigned(
+    state: &StateBackends,
+    block: &Block,
+    prev: Option<BlockId>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_with_config(state, block, prev, &ExecConfig::unsigned())
+}
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -135,7 +150,7 @@ fn maintenance_block_surfaces_rotation_on_report() {
 
     // Genesis at num=1 doesn't run doMaintenance (java-tron's special
     // case) — apply it just to bump the head pointer.
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(1, [0u8; 32], w_old, 1_699_999_997_000),
         None,
@@ -145,7 +160,7 @@ fn maintenance_block_surfaces_rotation_on_report() {
     // Block 2 at the boundary: runs doMaintenance, swaps active set
     // from [w_old] to [w_new], and surfaces the rotation.
     let head = dp.latest_block_header_hash().unwrap().unwrap();
-    let report = execute_block(&state, &empty_block(2, head, w_old, 1_700_000_000_000), None)
+    let report = apply_unsigned(&state, &empty_block(2, head, w_old, 1_700_000_000_000), None)
         .expect("block 2 at boundary");
 
     let rot = report
@@ -200,7 +215,7 @@ fn genesis_block_has_no_maintenance_rotation_even_at_boundary() {
     let w = addr(0xaa);
     put_witness(&state, w, 100);
 
-    let report = execute_block(
+    let report = apply_unsigned(
         &state,
         &empty_block(1, [0u8; 32], w, 1_700_000_000_000),
         None,
@@ -224,7 +239,7 @@ fn non_boundary_block_has_no_maintenance_rotation() {
     WitnessScheduleStore::new(state.witness_schedule.as_ref().unwrap().clone())
         .save_active(&[Address::from_raw(w)]);
 
-    execute_block(
+    apply_unsigned(
         &state,
         &empty_block(1, [0u8; 32], w, 1_699_999_900_000),
         None,
@@ -232,7 +247,7 @@ fn non_boundary_block_has_no_maintenance_rotation() {
     .expect("genesis");
     let head = dp.latest_block_header_hash().unwrap().unwrap();
     // Block 2 a hair before the boundary — must NOT trigger maintenance.
-    let report = execute_block(
+    let report = apply_unsigned(
         &state,
         &empty_block(2, head, w, 1_699_999_990_000),
         None,

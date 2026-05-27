@@ -13,12 +13,26 @@ use tron_chainbase::{
 };
 use tron_crypto::address::Address;
 use tron_actuator::ActuatorError;
-use tron_executor::{execute_block, execute_block_with_config, ExecConfig, StateBackends, TxOutcome};
+use tron_executor::{
+    execute_block_with_config, BlockExecError, BlockExecutionReport, ExecConfig, StateBackends,
+    TxOutcome,
+};
 use tron_proto::{
     transaction::{contract::ContractType, Contract as TxContract, Raw as TxRaw},
     Account, Block, BlockHeader, Transaction, TriggerSmartContract,
 };
 use tron_types::BlockId;
+
+/// Apply a synthetic UNSIGNED block. See note on the same helper in
+/// `maintenance_rotation.rs` — these tests exercise VM execution paths,
+/// not the witness-sig path.
+fn apply_unsigned(
+    state: &StateBackends,
+    block: &Block,
+    prev: Option<BlockId>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_with_config(state, block, prev, &ExecConfig::unsigned())
+}
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -165,7 +179,7 @@ fn executor_runs_trigger_smart_contract_end_to_end() {
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
     let block = make_block(1, [0u8; 32], vec![tx]);
-    let report = execute_block(&state, &block, None).expect("execute_block");
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
     assert_eq!(
         report.failures(),
         0,
@@ -243,7 +257,7 @@ fn executor_top_level_calltoken_trigger_runs_with_trc10_transfer() {
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
     let block = make_block(1, [0u8; 32], vec![tx]);
-    let report = execute_block(&state, &block, None).unwrap();
+    let report = apply_unsigned(&state, &block, None).unwrap();
     assert_eq!(
         report.failures(),
         0,
@@ -318,7 +332,7 @@ fn executing_block_bumps_witnesss_total_produced_counter() {
     )
     .unwrap();
 
-    let _ = execute_block(&state, &block, None).unwrap();
+    let _ = apply_unsigned(&state, &block, None).unwrap();
 
     let updated = ws.get(&witness_addr_typed).unwrap().unwrap();
     assert_eq!(updated.total_produced, 8, "counter should bump by 1");
@@ -367,7 +381,7 @@ fn executing_block_for_unknown_witness_does_not_panic() {
     .unwrap();
 
     // Should succeed with no panic — counter update silently skipped.
-    let _ = execute_block(&state, &block, None).unwrap();
+    let _ = apply_unsigned(&state, &block, None).unwrap();
 }
 
 /// Mirrors java-tron's `StatisticManager.applyBlock`: when a block lands
@@ -453,7 +467,7 @@ fn executing_block_bumps_total_missed_for_skipped_slots() {
     )
     .unwrap();
 
-    execute_block(&state, &block, None).expect("execute");
+    apply_unsigned(&state, &block, None).expect("execute");
 
     // The producer (active[3]) should have total_produced = 1.
     let prod_row = ws.get(&producer).unwrap().unwrap();
@@ -531,7 +545,7 @@ fn executing_block_one_does_not_attribute_misses() {
     )
     .unwrap();
 
-    execute_block(&state, &block, None).expect("execute");
+    apply_unsigned(&state, &block, None).expect("execute");
 
     let m = ws.get(&other).unwrap().unwrap();
     assert_eq!(m.total_missed, 0, "block 1 must not debit anyone");
@@ -610,7 +624,7 @@ fn trigger_smart_contract_with_wrong_signer_is_rejected_by_permission_check() {
     tron_types::sign_transaction(&mut tx, &bob_priv).expect("sign with wrong key");
 
     let block = make_block(1, [0u8; 32], vec![tx]);
-    let report = execute_block(&state, &block, None).expect("execute_block");
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
     let outcome = &report.tx_results[0].outcome;
     assert!(
         matches!(outcome, TxOutcome::Invalid(ActuatorError::PermissionDenied(_))),
@@ -733,7 +747,9 @@ fn internal_call_trace_is_captured_for_nested_call() {
     let block = make_block(1, [0u8; 32], vec![tx]);
     let cfg = ExecConfig {
         save_internal_tx: true,
-        ..ExecConfig::default()
+        // Test fixture builds an unsigned block via `make_block`; opt out
+        // of the strict witness-sig gate accordingly.
+        ..ExecConfig::unsigned()
     };
     let report = execute_block_with_config(&state, &block, None, &cfg).expect("execute_block");
 
@@ -844,7 +860,9 @@ fn selfdestruct_emits_suicide_internal_tx() {
     let block = make_block(1, [0u8; 32], vec![tx]);
     let cfg = ExecConfig {
         save_internal_tx: true,
-        ..ExecConfig::default()
+        // Test fixture builds an unsigned block via `make_block`; opt out
+        // of the strict witness-sig gate accordingly.
+        ..ExecConfig::unsigned()
     };
     let report = execute_block_with_config(&state, &block, None, &cfg).expect("execute_block");
 
@@ -979,7 +997,7 @@ fn default_exec_config_drops_internal_tx_traces() {
     // Default config: traces are DROPPED — proves the gate is real and
     // the ON-path test isn't a false positive that always produces
     // traces regardless of config.
-    let report = execute_block(&state, &block, None).expect("execute_block");
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
 
     let tx_result = &report.tx_results[0];
     assert!(

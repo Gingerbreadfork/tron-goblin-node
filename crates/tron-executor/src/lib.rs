@@ -67,7 +67,7 @@ use tron_types::{
 /// behavior. Callers that want internal-tx traces materialised must opt
 /// in by passing an explicit config via [`execute_block_with_config`] /
 /// [`execute_block_with_undo_with_config`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ExecConfig {
     /// `vm.saveInternalTx`. When set, every per-frame CALL / CREATE /
     /// SELFDESTRUCT trace captured by the TVM inspector is materialised
@@ -86,6 +86,28 @@ pub struct ExecConfig {
     /// no actuator emits featured internal txs, so toggling this has no
     /// observable effect at the executor.
     pub save_featured_internal_tx: bool,
+    /// Require the block to carry a valid `witness_signature`. Defaults
+    /// to `true` (production safety). Set to `false` ONLY for the
+    /// block-production dry-run path that computes `account_state_root`
+    /// on an in-construction, not-yet-signed block — see
+    /// `dry_run_for_state_root` and `sr_runtime`'s state-root branch.
+    pub require_signature: bool,
+}
+
+impl Default for ExecConfig {
+    fn default() -> Self {
+        Self {
+            save_internal_tx: false,
+            vm_trace: false,
+            save_featured_internal_tx: false,
+            // Default-strict: anything that touches state with an
+            // unsigned block must opt out explicitly. Avoids the
+            // accidental "executor trusted the caller" footgun where a
+            // bypass of `sync::accept_block` (the layer that normally
+            // validates) silently applies a peer-injected block.
+            require_signature: true,
+        }
+    }
 }
 
 impl ExecConfig {
@@ -94,6 +116,14 @@ impl ExecConfig {
     /// to gate the per-frame trace materialisation.
     pub fn record_internal_txs(&self) -> bool {
         self.save_internal_tx || self.vm_trace
+    }
+
+    /// Defaults except `require_signature = false`. For the block-production
+    /// dry-run path (which applies an UNSIGNED, in-construction block to
+    /// compute its `account_state_root`) and for tests that exercise
+    /// `execute_block*` directly with synthetic unsigned blocks.
+    pub fn unsigned() -> Self {
+        Self { require_signature: false, ..Self::default() }
     }
 }
 
@@ -108,6 +138,19 @@ mod exec_config_tests {
         assert!(!c.vm_trace);
         assert!(!c.save_featured_internal_tx);
         assert!(!c.record_internal_txs());
+        // Default-strict: refuses unsigned blocks unless explicitly
+        // opted out. The dry-run path and a few executor tests use
+        // `ExecConfig::unsigned()` for the opt-out.
+        assert!(c.require_signature);
+    }
+
+    #[test]
+    fn unsigned_helper_only_flips_signature_gate() {
+        let c = ExecConfig::unsigned();
+        assert!(!c.require_signature);
+        assert!(!c.save_internal_tx);
+        assert!(!c.vm_trace);
+        assert!(!c.save_featured_internal_tx);
     }
 
     #[test]
@@ -840,10 +883,15 @@ fn execute_block_logic(
         verify_parent_link(block, parent)?;
     }
     verify_tx_trie_root(block)?;
-    if let Some(header) = &block.block_header {
-        if !header.witness_signature.is_empty() {
-            verify_witness_signature(block, None)?;
-        }
+    // Witness-signature gate. `config.require_signature` defaults to
+    // `true`; the block-production dry-run path (and a few tests that
+    // build synthetic unsigned blocks) opt out via `ExecConfig::unsigned`.
+    // The underlying `verify_witness_signature` returns
+    // `BlockValidateError::MissingSignature` on an empty `witness_signature`
+    // — so under strict mode an unsigned block is rejected here, not
+    // silently applied.
+    if config.require_signature {
+        verify_witness_signature(block, None)?;
     }
 
     // === 2. Per-tx atomic loop ===
@@ -1141,7 +1189,17 @@ pub fn dry_run_for_state_root(
     expected_parent: Option<BlockId>,
 ) -> Result<[u8; 32], BlockExecError> {
     let ephemeral = tron_chainbase::BlockUndoStore::new(Arc::new(tron_chainbase::MemBackend::new()));
-    execute_block_with_undo(state, block, expected_parent, &ephemeral)?;
+    // The block handed in here is UNSIGNED — the witness produces it,
+    // dry-runs it through us to compute `account_state_root`, embeds the
+    // root, then signs. Skip the signature gate accordingly; under the
+    // default-strict `ExecConfig` we'd reject it for `MissingSignature`.
+    execute_block_with_undo_and_config(
+        state,
+        block,
+        expected_parent,
+        &ephemeral,
+        &ExecConfig::unsigned(),
+    )?;
     let root = compute_state_root(state);
     let raw = block
         .block_header

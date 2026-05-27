@@ -12,11 +12,26 @@ use tron_chainbase::{
     AccountStore, CodeStore, KvBackend, MemBackend, StorageRowStore,
 };
 use tron_crypto::address::Address;
-use tron_executor::{execute_block, StateBackends, TxOutcome};
+use tron_executor::{
+    execute_block_with_config, BlockExecError, BlockExecutionReport, ExecConfig, StateBackends,
+    TxOutcome,
+};
 use tron_proto::{
     transaction::{contract::ContractType, Contract as TxContract, Raw as TxRaw},
     Account, Block, BlockHeader, Transaction, TriggerSmartContract,
 };
+use tron_types::BlockId;
+
+/// Apply a synthetic UNSIGNED block. See note on the same helper in
+/// `maintenance_rotation.rs` — these tests exercise the VM-logs path,
+/// not the witness-sig path.
+fn apply_unsigned(
+    state: &StateBackends,
+    block: &Block,
+    prev: Option<BlockId>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_with_config(state, block, prev, &ExecConfig::unsigned())
+}
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -217,7 +232,7 @@ fn vm_logs_surface_on_tx_result_for_successful_trigger() {
 
     let tx = build_trigger_tx(&caller_priv, caller, contract);
     let block = make_block(1, [0u8; 32], vec![tx]);
-    let report = execute_block(&state, &block, None).expect("execute_block");
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
 
     let result = &report.tx_results[0];
     assert!(
@@ -267,7 +282,7 @@ fn vm_logs_are_empty_for_reverted_tx() {
 
     let tx = build_trigger_tx(&caller_priv, caller, contract);
     let block = make_block(1, [0u8; 32], vec![tx]);
-    let report = execute_block(&state, &block, None).expect("execute_block");
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
     let result = &report.tx_results[0];
     assert!(
         !matches!(result.outcome, TxOutcome::Success),
@@ -317,7 +332,7 @@ fn vm_logs_are_empty_for_non_vm_contract() {
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign");
 
     let block = make_block(1, [0u8; 32], vec![tx]);
-    let report = execute_block(&state, &block, None).expect("execute_block");
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
     let result = &report.tx_results[0];
     assert!(
         result.vm_logs.is_empty(),
