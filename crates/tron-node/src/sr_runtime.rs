@@ -241,6 +241,11 @@ pub struct SrRuntime {
     /// window. When `None`, SR falls back to the legacy
     /// `BlockUndoStore`-driven apply path.
     snapshot_stack: Option<crate::storage::SnapshotStack>,
+    /// Optional cross-store checkpoint manifest. Only used on the
+    /// fallback BlockUndoStore path (when no snapshot stack is
+    /// attached); the snapshot-stack path provides cross-store
+    /// atomicity via its own checkpoint flow.
+    checkpoint: Option<tron_chainbase::CheckPointV2>,
     /// Optional WebSocket pubsub broker. When set, every produced
     /// block fires a `newHeads` notification to subscribers.
     pubsub: Option<Arc<tron_rpc::PubSubBroker>>,
@@ -274,8 +279,16 @@ impl SrRuntime {
             metrics: None,
             exec_config: tron_executor::ExecConfig::default(),
             snapshot_stack: None,
+            checkpoint: None,
             pubsub: None,
         }
+    }
+
+    /// Attach a cross-store [`tron_chainbase::CheckPointV2`]. Only
+    /// takes effect on the BlockUndoStore path (no snapshot stack).
+    pub fn with_checkpoint(mut self, cp: tron_chainbase::CheckPointV2) -> Self {
+        self.checkpoint = Some(cp);
+        self
     }
 
     /// Attach a WebSocket pubsub broker so produced blocks publish
@@ -573,14 +586,25 @@ impl SrRuntime {
                     })
                     .map_err(SrRuntimeError::Execute)?
             }
-            None => execute_block_with_undo_and_config(
-                &self.state,
-                &block,
-                Some(head_id),
-                &self.undo_store,
-                &self.exec_config,
-            )
-            .map_err(|e| SrRuntimeError::Execute(format!("{e:?}")))?,
+            None => match &self.checkpoint {
+                Some(cp) => tron_executor::execute_block_with_undo_checkpoint_and_config(
+                    &self.state,
+                    &block,
+                    Some(head_id),
+                    &self.undo_store,
+                    cp,
+                    &self.exec_config,
+                )
+                .map_err(|e| SrRuntimeError::Execute(format!("{e:?}")))?,
+                None => execute_block_with_undo_and_config(
+                    &self.state,
+                    &block,
+                    Some(head_id),
+                    &self.undo_store,
+                    &self.exec_config,
+                )
+                .map_err(|e| SrRuntimeError::Execute(format!("{e:?}")))?,
+            },
         };
 
         // Remove the txs we just included from the mempool so they

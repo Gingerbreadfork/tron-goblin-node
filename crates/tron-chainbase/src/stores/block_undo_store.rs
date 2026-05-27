@@ -71,6 +71,7 @@ pub enum StoreId {
     StorageRow = 19,
     ContractState = 20,
     BlockIndex = 21,
+    WitnessSchedule = 22,
 }
 
 impl StoreId {
@@ -102,8 +103,41 @@ impl StoreId {
             19 => Self::StorageRow,
             20 => Self::ContractState,
             21 => Self::BlockIndex,
+            22 => Self::WitnessSchedule,
             _ => return None,
         })
+    }
+
+    /// Canonical on-disk DB directory name for this store. Used by
+    /// the cross-store checkpoint manifest (CheckPointV2) so replay
+    /// can route each entry back to its store. Matches the
+    /// `DB_NAME` constant in the corresponding stores/ module.
+    pub fn db_name(self) -> &'static str {
+        match self {
+            Self::Accounts => "account",
+            Self::Witnesses => "witness",
+            Self::Votes => "votes",
+            Self::Delegation => "delegation",
+            Self::DelegatedResources => "DelegatedResource",
+            Self::DynProps => "properties",
+            Self::Proposals => "proposal",
+            Self::NameIndex => "account-index",
+            Self::IdIndex => "accountid-index",
+            Self::AssetV1 => "asset-issue",
+            Self::AssetV2 => "asset-issue-v2",
+            Self::Contracts => "contract",
+            Self::Abi => "abi",
+            Self::ExchangeV1 => "exchange",
+            Self::ExchangeV2 => "exchange-v2",
+            Self::MarketOrders => "market_order",
+            Self::Nullifiers => "nullifier",
+            Self::MerkleTrees => "IncrementalMerkleTree",
+            Self::Code => "code",
+            Self::StorageRow => "storage-row",
+            Self::ContractState => "contract-state",
+            Self::BlockIndex => "block-index",
+            Self::WitnessSchedule => "witness_schedule",
+        }
     }
 }
 

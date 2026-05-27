@@ -151,6 +151,33 @@ impl CheckPointV2 {
         decode_manifest(&bytes)
     }
 
+    /// Replay every leftover checkpoint, oldest first, then delete
+    /// each as it succeeds. This is the daemon startup path —
+    /// covers both "manifest written but per-store flush never ran"
+    /// and "per-store flush ran but checkpoint dir wasn't deleted".
+    /// The latter is idempotent: re-applying the same writes to the
+    /// per-store backends produces the same state.
+    ///
+    /// `apply` receives one entry at a time. The caller is
+    /// responsible for actually writing it to the right per-store
+    /// backend (look up `entry.db_name` and call put/delete).
+    ///
+    /// Returns the total number of entries replayed across all
+    /// checkpoints. On any error in `apply` or in the post-replay
+    /// delete, propagates without touching subsequent checkpoints —
+    /// caller can investigate without losing data.
+    pub fn replay_all<F>(&self, mut apply: F) -> Result<usize, CheckpointError>
+    where
+        F: FnMut(&CheckpointEntry) -> Result<(), CheckpointError>,
+    {
+        let mut total = 0;
+        for id in self.list()? {
+            total += self.replay(id, &mut apply)?;
+            self.delete(id)?;
+        }
+        Ok(total)
+    }
+
     /// Drop one checkpoint dir.
     pub fn delete(&self, id: CheckpointId) -> Result<(), CheckpointError> {
         let dir = self.root.join(format!("{id}"));
@@ -444,6 +471,64 @@ mod tests {
         let cpv2 = CheckPointV2::new(&root);
         cpv2.write(&[entry("a", b"k", Some(b"v"))]).unwrap();
         assert_eq!(cpv2.prune_keep_last(5).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `replay_all` walks every checkpoint oldest-first, invokes the
+    /// closure once per entry, then deletes the dir. After it
+    /// returns, the directory contains zero checkpoints.
+    #[test]
+    fn replay_all_applies_and_deletes_oldest_first() {
+        let root = tmp_root();
+        let cpv2 = CheckPointV2::new(&root);
+        let id1 = cpv2.write(&[entry("account", b"a", Some(b"1"))]).unwrap();
+        // unique_ms uses ms granularity — wait a beat so id2 > id1
+        // even on fast hardware. The test would still be correct if
+        // they collided (ids include the millisecond), but we want a
+        // clear "two distinct checkpoints" scenario.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id2 = cpv2.write(&[entry("witness", b"w", None)]).unwrap();
+        assert_ne!(id1, id2);
+
+        let applied = std::sync::Mutex::new(Vec::<(String, Vec<u8>, Option<Vec<u8>>)>::new());
+        let total = cpv2
+            .replay_all(|e| {
+                applied
+                    .lock()
+                    .unwrap()
+                    .push((e.db_name.clone(), e.key.clone(), e.value.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+
+        // Oldest-first → id1's entry before id2's.
+        let got = applied.into_inner().unwrap();
+        assert_eq!(got[0].0, "account");
+        assert_eq!(got[1].0, "witness");
+
+        // Both checkpoint dirs gone.
+        assert!(cpv2.list().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// If the apply closure errors, replay_all stops at the failing
+    /// checkpoint WITHOUT deleting it — caller can investigate.
+    /// Subsequent checkpoints are untouched.
+    #[test]
+    fn replay_all_stops_on_apply_error_without_deleting() {
+        let root = tmp_root();
+        let cpv2 = CheckPointV2::new(&root);
+        cpv2.write(&[entry("a", b"k", Some(b"v"))]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        cpv2.write(&[entry("b", b"k", Some(b"v"))]).unwrap();
+
+        let res = cpv2.replay_all(|_| {
+            Err(CheckpointError::Decode("simulated".into()))
+        });
+        assert!(matches!(res, Err(CheckpointError::Decode(_))));
+        // Both checkpoints still present.
+        assert_eq!(cpv2.list().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

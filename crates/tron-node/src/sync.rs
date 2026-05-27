@@ -163,6 +163,17 @@ pub struct SyncDriver {
     /// only. When `Some`, every applied block writes an undo record
     /// here and `accept_block` will perform a real reorg.
     undo_store: Option<tron_chainbase::BlockUndoStore>,
+    /// Cross-store atomic-flush manifest. When attached, every
+    /// block-apply through the BlockSession path goes through
+    /// `execute_block_with_undo_and_checkpoint` — writes for the
+    /// block are captured in one durable manifest BEFORE the per-
+    /// store batches run, so a crash mid-flush is replayed on the
+    /// next startup. Without this, per-store atomicity is RocksDB's
+    /// WriteBatch only; a crash between two stores' batches leaves
+    /// them out of sync. Skipped when the snapshot stack is attached
+    /// (which already provides cross-store atomicity at horizon-flush
+    /// time through its own checkpoint pathway).
+    checkpoint: Option<tron_chainbase::CheckPointV2>,
     /// Outbound channel for blocks produced by the local SR runtime.
     /// When set, the dispatch loop subscribes and forwards every
     /// produced block to its peer as a `MessageType::Block` frame —
@@ -275,6 +286,7 @@ impl SyncDriver {
             khaos: Arc::new(tron_consensus::KhaosDb::new()),
             khaos_started: false,
             undo_store: None,
+            checkpoint: None,
             produced_blocks_tx: None,
             pbft_channels: None,
             peer_state: None,
@@ -413,6 +425,16 @@ impl SyncDriver {
     /// one; tests can omit it for the cheaper no-undo execute path.
     pub fn with_undo_store(mut self, undo: tron_chainbase::BlockUndoStore) -> Self {
         self.undo_store = Some(undo);
+        self
+    }
+
+    /// Attach a cross-store checkpoint. Only takes effect on the
+    /// BlockSession path (i.e., when an undo store is attached and
+    /// no snapshot stack is attached) — the snapshot-stack path
+    /// already provides cross-store atomicity via its own checkpoint
+    /// flow, so this is ignored there.
+    pub fn with_checkpoint(mut self, cp: tron_chainbase::CheckPointV2) -> Self {
+        self.checkpoint = Some(cp);
         self
     }
 
@@ -1939,22 +1961,32 @@ impl SyncDriver {
 
         // Execute. The executor commits dyn_props head + applies every
         // tx atomically inside a session. With an undo store, also
-        // persist a per-block undo log for any future reorg.
-        let exec_result = if let Some(undo) = &self.undo_store {
-            tron_executor::execute_block_with_undo_and_config(
+        // persist a per-block undo log for any future reorg. If a
+        // cross-store checkpoint is attached, route through it so the
+        // block's writes land behind one durable manifest (recovered
+        // on next startup if we crash mid-flush).
+        let exec_result = match (&self.undo_store, &self.checkpoint) {
+            (Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
+                &self.state,
+                block,
+                prev_id,
+                undo,
+                cp,
+                &self.exec_config,
+            ),
+            (Some(undo), None) => tron_executor::execute_block_with_undo_and_config(
                 &self.state,
                 block,
                 prev_id,
                 undo,
                 &self.exec_config,
-            )
-        } else {
-            tron_executor::execute_block_with_config(
+            ),
+            (None, _) => tron_executor::execute_block_with_config(
                 &self.state,
                 block,
                 prev_id,
                 &self.exec_config,
-            )
+            ),
         };
         match exec_result {
             Ok(report) => {
@@ -2641,13 +2673,24 @@ impl SyncDriver {
             } else {
                 &kb.block
             };
-            match tron_executor::execute_block_with_undo_and_config(
-                &self.state,
-                block_to_apply,
-                None,
-                &undo_store,
-                &self.exec_config,
-            ) {
+            let apply_res = match &self.checkpoint {
+                Some(cp) => tron_executor::execute_block_with_undo_checkpoint_and_config(
+                    &self.state,
+                    block_to_apply,
+                    None,
+                    &undo_store,
+                    cp,
+                    &self.exec_config,
+                ),
+                None => tron_executor::execute_block_with_undo_and_config(
+                    &self.state,
+                    block_to_apply,
+                    None,
+                    &undo_store,
+                    &self.exec_config,
+                ),
+            };
+            match apply_res {
                 Ok(report) => {
                     applied_new.push(kb.num);
                     self.stats.blocks_applied += 1;
@@ -2700,13 +2743,26 @@ impl SyncDriver {
                     let mut reapplied = 0usize;
                     let mut reapply_failed = None;
                     for old_kb in path_old.iter().rev() {
-                        match tron_executor::execute_block_with_undo_and_config(
-                            &self.state,
-                            &old_kb.block,
-                            None,
-                            &undo_store,
-                            &self.exec_config,
-                        ) {
+                        let reapply_res = match &self.checkpoint {
+                            Some(cp) => {
+                                tron_executor::execute_block_with_undo_checkpoint_and_config(
+                                    &self.state,
+                                    &old_kb.block,
+                                    None,
+                                    &undo_store,
+                                    cp,
+                                    &self.exec_config,
+                                )
+                            }
+                            None => tron_executor::execute_block_with_undo_and_config(
+                                &self.state,
+                                &old_kb.block,
+                                None,
+                                &undo_store,
+                                &self.exec_config,
+                            ),
+                        };
+                        match reapply_res {
                             Ok(_) => reapplied += 1,
                             Err(re) => {
                                 reapply_failed =

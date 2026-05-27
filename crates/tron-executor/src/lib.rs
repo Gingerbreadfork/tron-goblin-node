@@ -771,6 +771,8 @@ pub enum BlockExecError {
         expected: String,
         computed: String,
     },
+    #[error("cross-store checkpoint flush failed: {0}")]
+    Checkpoint(#[from] tron_chainbase::CheckpointError),
 }
 
 // =============================================================================
@@ -788,7 +790,7 @@ pub fn execute_block(
     block: &Block,
     expected_parent: Option<BlockId>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, None, &ExecConfig::default())
+    execute_block_inner(state, block, expected_parent, None, None, &ExecConfig::default())
 }
 
 /// As [`execute_block`], but with an explicit `ExecConfig`. The config
@@ -800,7 +802,7 @@ pub fn execute_block_with_config(
     expected_parent: Option<BlockId>,
     config: &ExecConfig,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, None, config)
+    execute_block_inner(state, block, expected_parent, None, None, config)
 }
 
 /// Execute `block` and persist a complete undo log to `undo_store`
@@ -818,7 +820,7 @@ pub fn execute_block_with_undo(
     expected_parent: Option<BlockId>,
     undo_store: &tron_chainbase::BlockUndoStore,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, Some(undo_store), &ExecConfig::default())
+    execute_block_inner(state, block, expected_parent, Some(undo_store), None, &ExecConfig::default())
 }
 
 /// As [`execute_block_with_undo`], but with an explicit `ExecConfig`.
@@ -829,7 +831,53 @@ pub fn execute_block_with_undo_and_config(
     undo_store: &tron_chainbase::BlockUndoStore,
     config: &ExecConfig,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, Some(undo_store), config)
+    execute_block_inner(state, block, expected_parent, Some(undo_store), None, config)
+}
+
+/// Like [`execute_block_with_undo`] but additionally wires the cross-
+/// store atomic-flush primitive ([`tron_chainbase::CheckPointV2`]) so
+/// every per-store write a block makes lands behind one durable
+/// manifest. On crash mid-flush, the next startup replays the
+/// manifest and restores cross-store consistency.
+///
+/// This is the production-runtime path. Tests that only care about
+/// per-store atomicity (or that don't want a temp checkpoint dir on
+/// disk) can keep using [`execute_block_with_undo`].
+pub fn execute_block_with_undo_and_checkpoint(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    undo_store: &tron_chainbase::BlockUndoStore,
+    checkpoint: &tron_chainbase::CheckPointV2,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(
+        state,
+        block,
+        expected_parent,
+        Some(undo_store),
+        Some(checkpoint),
+        &ExecConfig::default(),
+    )
+}
+
+/// [`execute_block_with_undo_and_checkpoint`] with an explicit
+/// `ExecConfig`.
+pub fn execute_block_with_undo_checkpoint_and_config(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    undo_store: &tron_chainbase::BlockUndoStore,
+    checkpoint: &tron_chainbase::CheckPointV2,
+    config: &ExecConfig,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(
+        state,
+        block,
+        expected_parent,
+        Some(undo_store),
+        Some(checkpoint),
+        config,
+    )
 }
 
 fn execute_block_inner(
@@ -837,6 +885,7 @@ fn execute_block_inner(
     block: &Block,
     expected_parent: Option<BlockId>,
     undo_store: Option<&tron_chainbase::BlockUndoStore>,
+    checkpoint: Option<&tron_chainbase::CheckPointV2>,
     config: &ExecConfig,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     // Undo path: wrap every base backend in a top-level SessionBackend
@@ -844,13 +893,25 @@ fn execute_block_inner(
     // become nested overlays — when they commit, writes flow to the
     // block session's overlay, not directly to base. At the end of
     // execute_block_logic we capture the undo log + commit the block
-    // session to base atomically (modulo per-key writes — same
-    // atomicity guarantee as SessionBackend::commit).
+    // session to base.
+    //
+    // Two commit paths:
+    //   * With a CheckPointV2 attached — writes go through a manifest
+    //     for cross-store atomicity (the production path).
+    //   * Without — each store's session commits independently via
+    //     its own write_batch; per-store atomicity only (tests + the
+    //     pre-checkpoint code path).
     if let Some(undo_store) = undo_store {
         let block_session = BlockSession::wrap(state);
         let wrapped = block_session.as_state_backends();
         let report = execute_block_logic(&wrapped, block, expected_parent, config)?;
-        let record = block_session.commit_with_undo();
+        let record = if let Some(checkpoint) = checkpoint {
+            block_session
+                .commit_with_checkpoint_and_undo(checkpoint, state)
+                .map_err(BlockExecError::Checkpoint)?
+        } else {
+            block_session.commit_with_undo()
+        };
         let block_num = block
             .block_header
             .as_ref()
@@ -1019,8 +1080,217 @@ impl BlockSession {
         if let Some(s) = self.block_index {
             push(Id::BlockIndex, s.commit_with_undo());
         }
+        if let Some(s) = self.witness_schedule {
+            push(Id::WitnessSchedule, s.commit_with_undo());
+        }
         record
     }
+
+    /// Commit every store's overlay to its base backend under one
+    /// cross-store atomicity boundary: the [`CheckPointV2`] manifest.
+    ///
+    /// Mirrors java-tron's `SnapshotManager.flush`:
+    ///   1. Drain each session into per-store `(ops, undo_pairs)`.
+    ///   2. Build a flat manifest of every `(db_name, key, value)`.
+    ///   3. Atomically write the manifest (tmp + rename + fsync).
+    ///   4. Apply each per-store `write_batch` against the base
+    ///      backend (skipping the session overlay — we already
+    ///      drained it).
+    ///   5. Delete the checkpoint.
+    ///
+    /// If the process crashes between (3) and (4) — or between (4)
+    /// and (5) — the next startup runs [`replay_checkpoints`] which
+    /// re-applies the manifest entries and deletes the checkpoint.
+    /// (3)→(4) is the critical window: the manifest gives us a
+    /// durable, atomic record of *all* the writes the block intended,
+    /// so re-applying it restores the cross-store invariant. The
+    /// (4)→(5) replay is harmless — re-applying writes that already
+    /// landed produces the same state.
+    fn commit_with_checkpoint_and_undo(
+        self,
+        checkpoint: &tron_chainbase::CheckPointV2,
+        state: &StateBackends,
+    ) -> Result<tron_chainbase::BlockUndoRecord, tron_chainbase::CheckpointError> {
+        use tron_chainbase::{CheckpointEntry, KvBackend, UndoStoreId as Id, WriteOp};
+
+        // (1) Drain every per-store session, capturing pre-images for
+        //     undo. Pair each batch with the BASE backend we'll write
+        //     it to in step (4). Order matters only for replay
+        //     determinism; we use the variant order of StoreId.
+        let mut drained: Vec<(Id, Arc<dyn KvBackend>, Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
+        let mut take = |id: Id,
+                        session: Arc<tron_chainbase::SessionBackend>,
+                        base: Arc<dyn KvBackend>| {
+            let (ops, undo) = session.drain_pending_with_undo();
+            if !ops.is_empty() {
+                drained.push((id, base, ops, undo));
+            }
+        };
+        take(Id::Accounts, self.accounts, state.accounts.clone());
+        take(Id::Witnesses, self.witnesses, state.witnesses.clone());
+        take(Id::Votes, self.votes, state.votes.clone());
+        take(Id::Delegation, self.delegation, state.delegation.clone());
+        take(Id::DelegatedResources, self.delegated_resources, state.delegated_resources.clone());
+        take(Id::DynProps, self.dyn_props, state.dyn_props.clone());
+        take(Id::Proposals, self.proposals, state.proposals.clone());
+        take(Id::NameIndex, self.name_index, state.name_index.clone());
+        take(Id::IdIndex, self.id_index, state.id_index.clone());
+        take(Id::AssetV1, self.asset_v1, state.asset_v1.clone());
+        take(Id::AssetV2, self.asset_v2, state.asset_v2.clone());
+        take(Id::Contracts, self.contracts, state.contracts.clone());
+        take(Id::Abi, self.abi, state.abi.clone());
+        take(Id::ExchangeV1, self.exchange_v1, state.exchange_v1.clone());
+        take(Id::ExchangeV2, self.exchange_v2, state.exchange_v2.clone());
+        take(Id::MarketOrders, self.market_orders, state.market_orders.clone());
+        take(Id::Nullifiers, self.nullifiers, state.nullifiers.clone());
+        if let (Some(s), Some(b)) = (self.merkle_trees, state.merkle_trees.clone()) {
+            take(Id::MerkleTrees, s, b);
+        }
+        if let (Some(s), Some(b)) = (self.code, state.code.clone()) {
+            take(Id::Code, s, b);
+        }
+        if let (Some(s), Some(b)) = (self.storage_row, state.storage_row.clone()) {
+            take(Id::StorageRow, s, b);
+        }
+        if let (Some(s), Some(b)) = (self.contract_state, state.contract_state.clone()) {
+            take(Id::ContractState, s, b);
+        }
+        if let (Some(s), Some(b)) = (self.block_index, state.block_index.clone()) {
+            take(Id::BlockIndex, s, b);
+        }
+        if let (Some(s), Some(b)) = (self.witness_schedule, state.witness_schedule.clone()) {
+            take(Id::WitnessSchedule, s, b);
+        }
+
+        // (2) Build the manifest. Empty block? Skip the manifest
+        //     write entirely — there's nothing to make atomic and no
+        //     point creating a checkpoint dir we'll immediately delete.
+        let mut record = tron_chainbase::BlockUndoRecord::new();
+        if drained.is_empty() {
+            return Ok(record);
+        }
+        let mut entries: Vec<CheckpointEntry> = Vec::new();
+        for (id, _, ops, _) in &drained {
+            let db_name = id.db_name();
+            for op in ops {
+                let (key, value) = match op {
+                    WriteOp::Put(k, v) => (k.clone(), Some(v.clone())),
+                    WriteOp::Delete(k) => (k.clone(), None),
+                };
+                entries.push(CheckpointEntry {
+                    db_name: db_name.to_string(),
+                    key,
+                    value,
+                });
+            }
+        }
+
+        // (3) Atomic commit point — the manifest is now durable.
+        //     If we crash anywhere from here on, recovery replays it.
+        let checkpoint_id = checkpoint.write(&entries)?;
+
+        // (4) Per-store flush. Each call goes straight to the base
+        //     backend (not the drained session) and uses the parent's
+        //     `write_batch` — RocksDB native WriteBatch under the hood.
+        for (id, base, ops, undo) in drained {
+            base.write_batch(&ops);
+            for (key, before) in undo {
+                record.push(tron_chainbase::UndoEntry { store: id, key, before });
+            }
+        }
+
+        // (5) All per-store writes succeeded; the checkpoint is no
+        //     longer needed. A crash here just leaves the dir for the
+        //     next startup to replay idempotently.
+        checkpoint.delete(checkpoint_id)?;
+        Ok(record)
+    }
+}
+
+/// Replay every leftover cross-store checkpoint into `state`, then
+/// delete each as it succeeds. This is the daemon startup path —
+/// must run BEFORE the node starts serving blocks. Idempotent:
+/// re-applying writes that already landed produces the same state.
+///
+/// Manifest entries are routed to backends by `db_name`. An unknown
+/// name is a hard error — it means the checkpoint was produced by a
+/// different node build with stores this one doesn't know about, and
+/// silently dropping the entry could leave the on-disk state
+/// inconsistent. The operator should investigate (typically: roll
+/// back to a matching build or wipe the checkpoint dir).
+///
+/// Returns `(checkpoints_replayed, entries_applied)`.
+pub fn replay_pending_checkpoints(
+    state: &StateBackends,
+    checkpoint: &tron_chainbase::CheckPointV2,
+) -> Result<(usize, usize), tron_chainbase::CheckpointError> {
+    use tron_chainbase::{CheckpointEntry, KvBackend};
+
+    // Build a name → backend lookup. The full set covers every
+    // store BlockSession::commit_with_checkpoint_and_undo can write.
+    let mut by_name: std::collections::HashMap<&'static str, Arc<dyn KvBackend>> =
+        std::collections::HashMap::new();
+    use tron_chainbase::UndoStoreId as Id;
+    by_name.insert(Id::Accounts.db_name(), state.accounts.clone());
+    by_name.insert(Id::Witnesses.db_name(), state.witnesses.clone());
+    by_name.insert(Id::Votes.db_name(), state.votes.clone());
+    by_name.insert(Id::Delegation.db_name(), state.delegation.clone());
+    by_name.insert(Id::DelegatedResources.db_name(), state.delegated_resources.clone());
+    by_name.insert(Id::DynProps.db_name(), state.dyn_props.clone());
+    by_name.insert(Id::Proposals.db_name(), state.proposals.clone());
+    by_name.insert(Id::NameIndex.db_name(), state.name_index.clone());
+    by_name.insert(Id::IdIndex.db_name(), state.id_index.clone());
+    by_name.insert(Id::AssetV1.db_name(), state.asset_v1.clone());
+    by_name.insert(Id::AssetV2.db_name(), state.asset_v2.clone());
+    by_name.insert(Id::Contracts.db_name(), state.contracts.clone());
+    by_name.insert(Id::Abi.db_name(), state.abi.clone());
+    by_name.insert(Id::ExchangeV1.db_name(), state.exchange_v1.clone());
+    by_name.insert(Id::ExchangeV2.db_name(), state.exchange_v2.clone());
+    by_name.insert(Id::MarketOrders.db_name(), state.market_orders.clone());
+    by_name.insert(Id::Nullifiers.db_name(), state.nullifiers.clone());
+    if let Some(b) = state.merkle_trees.clone() {
+        by_name.insert(Id::MerkleTrees.db_name(), b);
+    }
+    if let Some(b) = state.code.clone() {
+        by_name.insert(Id::Code.db_name(), b);
+    }
+    if let Some(b) = state.storage_row.clone() {
+        by_name.insert(Id::StorageRow.db_name(), b);
+    }
+    if let Some(b) = state.contract_state.clone() {
+        by_name.insert(Id::ContractState.db_name(), b);
+    }
+    if let Some(b) = state.block_index.clone() {
+        by_name.insert(Id::BlockIndex.db_name(), b);
+    }
+    if let Some(b) = state.witness_schedule.clone() {
+        by_name.insert(Id::WitnessSchedule.db_name(), b);
+    }
+
+    let ids = checkpoint.list()?;
+    let mut total_entries = 0;
+    let mut total_checkpoints = 0;
+    for id in &ids {
+        let n = checkpoint.replay(*id, |entry: &CheckpointEntry| {
+            match by_name.get(entry.db_name.as_str()) {
+                Some(backend) => match &entry.value {
+                    Some(v) => backend.put(&entry.key, v),
+                    None => backend.delete(&entry.key),
+                },
+                None => {
+                    return Err(tron_chainbase::CheckpointError::Decode(format!(
+                        "checkpoint {} references unknown store '{}' — operator must investigate before continuing",
+                        id, entry.db_name
+                    )));
+                }
+            }
+            Ok(())
+        })?;
+        checkpoint.delete(*id)?;
+        total_entries += n;
+        total_checkpoints += 1;
+    }
+    Ok((total_checkpoints, total_entries))
 }
 
 /// Replay a previously-captured undo log to restore base-store state
@@ -1078,6 +1348,10 @@ pub fn rollback_block(
                 .block_index
                 .as_ref()
                 .ok_or(RollbackError::OptionalStoreNotAttached("block_index"))?,
+            Id::WitnessSchedule => state
+                .witness_schedule
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached("witness_schedule"))?,
         };
         match &entry.before {
             Some(v) => backend.put(&entry.key, v),

@@ -616,3 +616,69 @@ fn commit_with_undo_captures_pre_image_then_applies_batch() {
     assert_eq!(parent.get(b"will-delete"), None);
     assert_eq!(parent.get(b"brand-new"), Some(b"first-write".to_vec()));
 }
+
+// === drain_pending / drain_pending_with_undo ================================
+
+/// `drain_pending` extracts pending writes WITHOUT touching the parent.
+#[test]
+fn drain_pending_returns_ops_without_writing_parent() {
+    let parent = mem();
+    parent.put(b"untouched", b"keep");
+    let session = SessionBackend::new(parent.clone());
+    session.put(b"a", b"1");
+    session.delete(b"b");
+    session.put(b"c", b"3");
+
+    let ops = session.drain_pending();
+    assert_eq!(ops.len(), 3);
+    assert!(session.is_clean(), "drain clears pending");
+
+    // Parent unchanged: drain isn't a commit.
+    assert_eq!(parent.get(b"untouched"), Some(b"keep".to_vec()));
+    assert_eq!(parent.get(b"a"), None);
+    assert_eq!(parent.get(b"b"), None);
+    assert_eq!(parent.get(b"c"), None);
+
+    // Re-applying the ops via parent.write_batch reaches the same
+    // final state a normal commit() would have produced.
+    parent.write_batch(&ops);
+    let mut found = std::collections::HashSet::new();
+    if parent.get(b"a") == Some(b"1".to_vec()) { found.insert("a"); }
+    if parent.get(b"c") == Some(b"3".to_vec()) { found.insert("c"); }
+    if parent.get(b"b") == None { found.insert("b"); }
+    assert_eq!(found.len(), 3);
+}
+
+/// `drain_pending_with_undo` captures pre-images BEFORE the caller
+/// applies the batch (the pre-image must reflect parent state at
+/// drain time, not afterwards).
+#[test]
+fn drain_pending_with_undo_captures_pre_images_at_drain_time() {
+    let parent = mem();
+    parent.put(b"existing", b"pre");
+    let session = SessionBackend::new(parent.clone());
+    session.put(b"existing", b"new");
+    session.put(b"brand-new", b"first");
+
+    let (ops, undo) = session.drain_pending_with_undo();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(undo.len(), 2);
+    // Parent still has the pre-image (drain hasn't committed).
+    assert_eq!(parent.get(b"existing"), Some(b"pre".to_vec()));
+
+    let undo_map: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> =
+        undo.into_iter().collect();
+    assert_eq!(undo_map.get(b"existing".as_slice()), Some(&Some(b"pre".to_vec())));
+    assert_eq!(undo_map.get(b"brand-new".as_slice()), Some(&None));
+}
+
+/// Drain on an empty session returns empty vecs and is a no-op.
+#[test]
+fn drain_pending_on_empty_session_is_noop() {
+    let parent = mem();
+    let session = SessionBackend::new(parent);
+    assert!(session.drain_pending().is_empty());
+    let (ops, undo) = session.drain_pending_with_undo();
+    assert!(ops.is_empty());
+    assert!(undo.is_empty());
+}

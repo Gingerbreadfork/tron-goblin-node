@@ -80,10 +80,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     )?;
 
     // Checkpoint-V2 recovery: if the previous run crashed between the
-    // manifest write and the per-store merge, replay any orphan
+    // manifest write and the per-store flush, replay any orphan
     // manifests into the freshly-opened root backends so the chain
     // sees a consistent post-flush state. Cheap — `list()` is one
     // readdir; on the common no-crash path there are zero manifests.
+    //
+    // Two code paths converge on the same checkpoint dir:
+    //   * snapshot_reorg=true → snapshot-stack flush manifests.
+    //   * snapshot_reorg=false → BlockSession flush manifests
+    //     (cross-store atomicity for the executor's direct-to-base
+    //     path; see `replay_pending_checkpoints`).
     let checkpoint_dir = tron_chainbase::CheckPointV2::new(&config.data_dir);
     if config.storage.snapshot_reorg {
         match stores.snapshots.recover_from_checkpoints(&checkpoint_dir) {
@@ -104,6 +110,25 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .clone()
             .with_horizon(config.storage.snapshot_horizon)
             .with_checkpoint(checkpoint_dir.clone());
+    } else {
+        // BlockSession path: replay any leftover manifests into the
+        // base backends before serving blocks. Hard-fails on an
+        // unknown store id (manifest produced by a different build).
+        let state = stores.to_state_backends();
+        match tron_executor::replay_pending_checkpoints(&state, &checkpoint_dir) {
+            Ok((0, _)) => {}
+            Ok((cp_count, entries)) => info!(
+                checkpoints = cp_count,
+                entries,
+                "replayed orphan BlockSession checkpoint manifests into base stores"
+            ),
+            Err(e) => {
+                error!(error = ?e, "BlockSession checkpoint recovery failed");
+                return Err(RunError::Sync(format!(
+                    "BlockSession checkpoint recovery failed: {e}"
+                )));
+            }
+        }
     }
 
     // Decide whether the genesis block is already applied; if the
@@ -481,7 +506,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         let runtime = if config.storage.snapshot_reorg {
             runtime.with_snapshot_stack(stores.snapshots.clone())
         } else {
-            runtime
+            // BlockSession path: attach the cross-store checkpoint
+            // so each produced block's writes land behind one
+            // durable manifest.
+            runtime.with_checkpoint(checkpoint_dir.clone())
         };
         let tx = runtime.subscribe_handle();
 
@@ -929,6 +957,14 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             } else {
                 None
             };
+            // BlockSession-path checkpoint: only attach when the
+            // snapshot stack isn't (the stack already wraps cross-
+            // store atomicity in its own manifest flow).
+            let checkpoint_for_peer = if config.storage.snapshot_reorg {
+                None
+            } else {
+                Some(checkpoint_dir.clone())
+            };
             let pubsub_for_peer = pubsub.clone();
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
@@ -948,6 +984,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     .with_strict_ref_block_check();
                 if let Some(stack) = snapshot_stack_for_peer {
                     driver = driver.with_snapshot_stack(stack);
+                }
+                if let Some(cp) = checkpoint_for_peer {
+                    driver = driver.with_checkpoint(cp);
                 }
                 if let Some(tx) = produced_for_peer {
                     driver = driver.with_produced_blocks(tx);

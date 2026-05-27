@@ -133,6 +133,60 @@ impl SessionBackend {
         undo
     }
 
+    /// Drain pending writes WITHOUT applying them to the parent.
+    /// Used when multiple sessions share one atomicity boundary —
+    /// e.g., a block-level checkpoint that batches writes across many
+    /// stores under one manifest. The caller is now responsible for
+    /// persisting these via `parent.write_batch(..)` (or whatever
+    /// equivalent the cross-store flush path arranges).
+    ///
+    /// After this returns, the session's overlay is empty, future
+    /// writes start a fresh overlay, and reads through the session
+    /// fall through to the parent (which the caller may or may not
+    /// have updated yet).
+    pub fn drain_pending(&self) -> Vec<WriteOp> {
+        let drained = {
+            let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+            std::mem::take(&mut *g)
+        };
+        drained
+            .into_iter()
+            .map(|(key, op)| match op {
+                Op::Put(value) => WriteOp::Put(key, value),
+                Op::Delete => WriteOp::Delete(key),
+            })
+            .collect()
+    }
+
+    /// Same as [`drain_pending`] but also reads the parent's current
+    /// value for every drained key — for block-level undo logs.
+    /// Returns `(ops_to_apply, undo_pairs)` where each undo pair is
+    /// `(key, before)` — `before == None` means the key didn't exist
+    /// before (so rollback must `delete` it).
+    ///
+    /// The pre-image reads run BEFORE the caller's eventual
+    /// `parent.write_batch(..)`, so they capture the true pre-block
+    /// state.
+    ///
+    /// [`drain_pending`]: SessionBackend::drain_pending
+    pub fn drain_pending_with_undo(&self) -> (Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+        let drained = {
+            let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+            std::mem::take(&mut *g)
+        };
+        let mut ops = Vec::with_capacity(drained.len());
+        let mut undo = Vec::with_capacity(drained.len());
+        for (key, op) in drained {
+            let before = self.parent.get(&key);
+            undo.push((key.clone(), before));
+            ops.push(match op {
+                Op::Put(value) => WriteOp::Put(key, value),
+                Op::Delete => WriteOp::Delete(key),
+            });
+        }
+        (ops, undo)
+    }
+
     /// Discard all pending writes. The parent is unaffected.
     pub fn revert(&self) {
         self.pending
