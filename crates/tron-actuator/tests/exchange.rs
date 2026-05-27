@@ -10,7 +10,7 @@
 //! these tests cover the validation predicates + state coherence
 //! invariants the smoke test doesn't exercise.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hex_literal::hex;
@@ -57,7 +57,7 @@ fn ctx_with_alice(trx_balance: i64, asset_balance: i64, fee: i64) -> Ctx {
             address: ALICE.to_vec(),
             balance: trx_balance,
             r#type: AccountType::Normal as i32,
-            asset_v2: HashMap::from([("1000001".to_string(), asset_balance)]),
+            asset_v2: BTreeMap::from([("1000001".to_string(), asset_balance)]),
             ..Default::default()
         },
     );

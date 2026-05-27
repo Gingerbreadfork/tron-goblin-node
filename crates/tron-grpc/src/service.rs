@@ -1233,8 +1233,8 @@ impl Wallet for WalletService {
             // surface the global cap; clients reading this will see
             // the same total as `getChainParameters`.
             net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
-            asset_net_used: std::collections::HashMap::new(),
-            asset_net_limit: std::collections::HashMap::new(),
+            asset_net_used: std::collections::BTreeMap::new(),
+            asset_net_limit: std::collections::BTreeMap::new(),
             total_net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
             total_net_weight: dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0),
         }))
@@ -1265,8 +1265,8 @@ impl Wallet for WalletService {
             free_net_limit: dp.get_long(b"FREE_NET_LIMIT").unwrap_or(5000),
             net_used: acct.net_usage,
             net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
-            asset_net_used: std::collections::HashMap::new(),
-            asset_net_limit: std::collections::HashMap::new(),
+            asset_net_used: std::collections::BTreeMap::new(),
+            asset_net_limit: std::collections::BTreeMap::new(),
             total_net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
             total_net_weight: dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0),
             total_tron_power_weight: dp.get_long(b"TOTAL_TRON_POWER_WEIGHT").unwrap_or(0),

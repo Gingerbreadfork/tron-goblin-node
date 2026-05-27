@@ -4769,8 +4769,8 @@ pub fn proposal_create(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .get(0)
         .and_then(|v| v.as_object())
         .ok_or_else(|| RpcError::invalid_params("expected params: [{...}]"))?;
-    let mut parameters: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::new();
+    let mut parameters: std::collections::BTreeMap<i64, i64> =
+        std::collections::BTreeMap::new();
     match obj.get("parameters") {
         Some(Value::Array(arr)) => {
             for entry in arr {

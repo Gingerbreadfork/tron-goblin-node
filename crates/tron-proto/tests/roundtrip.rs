@@ -105,6 +105,79 @@ fn transaction_id_is_deterministic_across_encodings() {
     assert_eq!(txid_a, txid_c);
 }
 
+/// Protobuf `map<K,V>` fields must serialise deterministically — they're
+/// hashed into state roots (Account.asset/assetV2 land in account capsule
+/// bytes; ProposalCreateContract.parameters lands in tx-id input). prost's
+/// default is `HashMap`, which iterates in random order; `build.rs` opts
+/// every map into `BTreeMap` via `config.btree_map(["."])` to match
+/// java-tron's `LinkedHashMap`/`TreeMap` semantics. Without that override,
+/// two encodings of the same Account would produce different bytes and the
+/// byte-exact RocksDB compatibility claim breaks for any account with
+/// multiple TRC-10 assets.
+#[test]
+fn account_with_multiple_assets_encodes_deterministically() {
+    // Build the same logical Account two ways — populating the asset map
+    // in opposite insertion orders. Under HashMap the iteration order is
+    // a function of (insertion order, hasher state); under BTreeMap it's
+    // always sorted by key.
+    let mut a = Account::default();
+    a.asset.insert("ZZZ-coin".to_string(), 1);
+    a.asset.insert("AAA-coin".to_string(), 2);
+    a.asset.insert("MMM-coin".to_string(), 3);
+    a.asset_v2.insert("1000003".to_string(), 30);
+    a.asset_v2.insert("1000001".to_string(), 10);
+    a.asset_v2.insert("1000002".to_string(), 20);
+
+    let mut b = Account::default();
+    b.asset.insert("AAA-coin".to_string(), 2);
+    b.asset.insert("MMM-coin".to_string(), 3);
+    b.asset.insert("ZZZ-coin".to_string(), 1);
+    b.asset_v2.insert("1000001".to_string(), 10);
+    b.asset_v2.insert("1000002".to_string(), 20);
+    b.asset_v2.insert("1000003".to_string(), 30);
+
+    let bytes_a1 = a.encode_to_vec();
+    let bytes_a2 = a.encode_to_vec();
+    let bytes_b = b.encode_to_vec();
+
+    // Same instance, encoded twice — must match (rules out per-call RNG).
+    assert_eq!(bytes_a1, bytes_a2);
+    // Two instances populated in different orders — must match (rules out
+    // insertion-order dependence). This is the bit that fails with HashMap.
+    assert_eq!(bytes_a1, bytes_b);
+
+    // And the bytes must round-trip back to an equivalent Account.
+    let decoded = Account::decode(bytes_a1.as_slice()).unwrap();
+    assert_eq!(decoded.asset.get("AAA-coin"), Some(&2));
+    assert_eq!(decoded.asset_v2.get("1000002"), Some(&20));
+}
+
+/// Same property for `map<int64, int64>` (ProposalCreateContract.parameters,
+/// Proposal.parameters). Distinct from the string-keyed asset map because
+/// prost's codegen for `map<int64, V>` takes a different path internally.
+#[test]
+fn proposal_parameters_encode_deterministically() {
+    use tron_proto::ProposalCreateContract;
+
+    let mut a = ProposalCreateContract {
+        owner_address: hex::decode("412e988a386a799f506693793c6a5af6b54dfaabfb").unwrap(),
+        ..Default::default()
+    };
+    a.parameters.insert(99, 1_000);
+    a.parameters.insert(1, 100);
+    a.parameters.insert(42, 500);
+
+    let mut b = ProposalCreateContract {
+        owner_address: hex::decode("412e988a386a799f506693793c6a5af6b54dfaabfb").unwrap(),
+        ..Default::default()
+    };
+    b.parameters.insert(1, 100);
+    b.parameters.insert(42, 500);
+    b.parameters.insert(99, 1_000);
+
+    assert_eq!(a.encode_to_vec(), b.encode_to_vec());
+}
+
 #[test]
 fn block_with_no_transactions_roundtrips() {
     let block = Block {

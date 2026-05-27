@@ -8,7 +8,7 @@
 //! single happy-path round-trip; these tests cover witness gating,
 //! double-approve, post-expiration rejection, and proposer-only delete.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hex_literal::hex;
@@ -74,8 +74,8 @@ fn put_witness(ctx: &Ctx, who: [u8; 21]) {
     );
 }
 
-fn one_param() -> HashMap<i64, i64> {
-    let mut p = HashMap::new();
+fn one_param() -> BTreeMap<i64, i64> {
+    let mut p = BTreeMap::new();
     p.insert(0, 100); // ChainParameter id 0 = MAINTENANCE_TIME_INTERVAL
     p
 }
@@ -113,7 +113,7 @@ fn create_rejects_empty_parameters_map() {
     put_witness(&ctx, ALICE);
     let c = ProposalCreateContract {
         owner_address: ALICE.to_vec(),
-        parameters: HashMap::new(),
+        parameters: BTreeMap::new(),
     };
     let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &c).unwrap_err();
     assert!(

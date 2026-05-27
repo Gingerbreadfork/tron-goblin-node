@@ -9,7 +9,7 @@
 //! name-collision rejection, time-window enforcement, and the
 //! liquid-vs-frozen supply accounting.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hex_literal::hex;
@@ -357,7 +357,7 @@ fn transfer_asset_rejects_self() {
         &addr(ALICE),
         &Account {
             address: ALICE.to_vec(),
-            asset_v2: HashMap::from([("1000001".to_string(), 1000i64)]),
+            asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
             ..Default::default()
         },
     );
@@ -424,7 +424,7 @@ fn transfer_asset_rejects_insufficient_balance() {
         &addr(ALICE),
         &Account {
             address: ALICE.to_vec(),
-            asset_v2: HashMap::from([("1000001".to_string(), 5i64)]),
+            asset_v2: BTreeMap::from([("1000001".to_string(), 5i64)]),
             ..Default::default()
         },
     );
@@ -451,7 +451,7 @@ fn transfer_asset_creates_recipient_account_if_missing() {
         &addr(ALICE),
         &Account {
             address: ALICE.to_vec(),
-            asset_v2: HashMap::from([("1000001".to_string(), 1000i64)]),
+            asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
             ..Default::default()
         },
     );
@@ -476,7 +476,7 @@ fn transfer_asset_preserves_balance_invariant_under_split_transfers() {
         &addr(ALICE),
         &Account {
             address: ALICE.to_vec(),
-            asset_v2: HashMap::from([("1000001".to_string(), 1000i64)]),
+            asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
             ..Default::default()
         },
     );
@@ -510,7 +510,7 @@ fn transfer_asset_v1_fallback_works_when_only_v1_entry_exists() {
         &addr(ALICE),
         &Account {
             address: ALICE.to_vec(),
-            asset: HashMap::from([("LegacyCoin".to_string(), 1000i64)]),
+            asset: BTreeMap::from([("LegacyCoin".to_string(), 1000i64)]),
             ..Default::default()
         },
     );

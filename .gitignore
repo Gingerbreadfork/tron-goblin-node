@@ -98,6 +98,10 @@ secrets.*
 /snapshots/
 /bench-work/
 /sync-test-data/
+# Default data_dir from `tron-node init` (config.rs:1072) and the
+# scratch dir wired into the integration test harness.
+/tron-data/
+/test-data/
 
 # ---------------------------------------------------------------------------
 # Local logs / debug dumps
@@ -122,3 +126,9 @@ secrets.*
 # ---------------------------------------------------------------------------
 /java-tron/
 /tronprotocol/
+
+# ---------------------------------------------------------------------------
+# Temporary working directory — scratch notes, in-progress review docs, and
+# any other ephemeral artefacts that shouldn't be committed.
+# ---------------------------------------------------------------------------
+/working/

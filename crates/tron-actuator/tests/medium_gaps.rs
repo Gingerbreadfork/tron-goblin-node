@@ -12,7 +12,7 @@
 //! (~12), `UnfreezeAssetActuatorTest` (~9). Each previously had at
 //! most a single happy-path in `full_layer.rs`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hex_literal::hex;
@@ -210,7 +210,7 @@ fn market_sell_then_cancel_returns_unfilled_quantity() {
             address: ALICE.to_vec(),
             balance: 1_000_000_000,
             r#type: AccountType::Normal as i32,
-            asset_v2: HashMap::from([("1000001".to_string(), 200i64)]),
+            asset_v2: BTreeMap::from([("1000001".to_string(), 200i64)]),
             ..Default::default()
         },
     );

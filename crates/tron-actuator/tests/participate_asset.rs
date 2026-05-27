@@ -6,7 +6,7 @@
 //! exchange-rate math that can silently produce wrong asset amounts
 //! on extreme `num/trx_num` ratios.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hex_literal::hex;
@@ -71,8 +71,8 @@ fn seed_issuer_with_asset(
             address: ISSUER.to_vec(),
             balance: 0,
             r#type: AccountType::Normal as i32,
-            asset: HashMap::from([("TestCoin".to_string(), issuer_asset_balance)]),
-            asset_v2: HashMap::from([("TestCoin".to_string(), issuer_asset_balance)]),
+            asset: BTreeMap::from([("TestCoin".to_string(), issuer_asset_balance)]),
+            asset_v2: BTreeMap::from([("TestCoin".to_string(), issuer_asset_balance)]),
             ..Default::default()
         },
     );

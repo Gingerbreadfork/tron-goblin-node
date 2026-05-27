@@ -244,7 +244,7 @@ fn proposal_create_then_approve_then_delete() {
     // Create.
     let create = tron_proto::ProposalCreateContract {
         owner_address: ALICE.to_vec(),
-        parameters: std::collections::HashMap::from([(1i64, 1_000i64)]),
+        parameters: std::collections::BTreeMap::from([(1i64, 1_000i64)]),
     };
     proposal::validate_proposal_create(&accounts, &witnesses, &create).unwrap();
     proposal::execute_proposal_create(&proposals, &dp, &create).unwrap();
@@ -283,7 +283,7 @@ fn proposal_delete_rejects_non_owner() {
     dp.save_latest_block_header_timestamp(1_700_000_000_000);
     let create = tron_proto::ProposalCreateContract {
         owner_address: ALICE.to_vec(),
-        parameters: std::collections::HashMap::from([(1i64, 1_000i64)]),
+        parameters: std::collections::BTreeMap::from([(1i64, 1_000i64)]),
     };
     proposal::execute_proposal_create(&proposals, &dp, &create).unwrap();
     let del = tron_proto::ProposalDeleteContract {
@@ -535,7 +535,7 @@ fn exchange_create_round_trip() {
             address: ALICE.to_vec(),
             balance: 10_000_000_000,
             r#type: AccountType::Normal as i32,
-            asset_v2: std::collections::HashMap::from([("1000001".to_string(), 1_000_000_000i64)]),
+            asset_v2: std::collections::BTreeMap::from([("1000001".to_string(), 1_000_000_000i64)]),
             ..Default::default()
         },
     );

@@ -71,6 +71,17 @@ fn main() {
     }
 
     let mut config = prost_build::Config::new();
+    // Use BTreeMap for every proto `map<K,V>` field. The prost default
+    // is HashMap, which iterates in random order — and protobuf map
+    // fields are encoded as repeated MapEntry records in encounter
+    // order, so HashMap produces non-deterministic bytes. java-tron's
+    // LinkedHashMap-backed encoders write keys in a deterministic
+    // order; BTreeMap (sorted by key) matches that and gives us a
+    // stable serialized form. Without this, two writes of the same
+    // logical Account / Proposal produce different bytes and the
+    // byte-exact RocksDB / state-root parity claim breaks for any
+    // entity carrying multiple map entries.
+    config.btree_map(["."]);
     config
         .compile_protos(&inputs, &[&proto_root, &vendored])
         .expect("prost codegen failed");

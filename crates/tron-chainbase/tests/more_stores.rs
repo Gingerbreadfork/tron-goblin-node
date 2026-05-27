@@ -66,7 +66,7 @@ fn proposal_round_trip() {
     let p = tron_proto::Proposal {
         proposal_id: 42,
         proposer_address: alice().as_bytes().to_vec(),
-        parameters: std::collections::HashMap::from([(1i64, 1000i64)]),
+        parameters: std::collections::BTreeMap::from([(1i64, 1000i64)]),
         expiration_time: 1_700_000_000_000,
         create_time: 1_690_000_000_000,
         approvals: vec![bob().as_bytes().to_vec()],
