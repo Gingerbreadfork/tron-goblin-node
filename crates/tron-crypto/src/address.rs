@@ -22,7 +22,11 @@ pub const ADDRESS_LENGTH: usize = 21;
 ///
 /// Layout: `[prefix_byte, h_12, h_13, ..., h_31]` where `h` is
 /// `keccak256(pubkey_x || pubkey_y)` and the prefix is `0x41` on mainnet.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` / `PartialOrd` are derived as byte-lexicographic over the 21-byte
+/// payload — the natural and canonical sort order, and the one PBFT
+/// commit-signature persistence relies on (see
+/// `tron_chainbase::PbftSignDataStore::put_commit_result`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Address(pub [u8; ADDRESS_LENGTH]);
 
 impl Address {

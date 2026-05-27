@@ -13,9 +13,11 @@
 //!
 //! Source: `org.tron.core.db.PbftSignDataStore.buildKey`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use prost::Message;
+use tron_crypto::address::Address;
 use tron_proto::pbft_message::Raw as PbftRaw;
 
 use crate::backend::KvBackend;
@@ -58,20 +60,29 @@ impl PbftSignDataStore {
 
     /// Store the full signature aggregate (Raw + every commit signer's
     /// signature) under `key`. Uses [`tron_proto::PbftCommitResult`] —
-    /// `data` holds the encoded Raw, `signature` is a sorted list of
-    /// 65-byte signatures from the 2/3+ quorum.
+    /// `data` holds the encoded Raw, `signature` is the 65-byte
+    /// signatures from the 2/3+ quorum, **sorted by signer address**.
     ///
-    /// This is the byte layout java-tron's `PbftSignCapsule` produces
-    /// on disk via its custom serializer.
+    /// The sort order is part of the byte layout java-tron's
+    /// `PbftSignCapsule` produces on disk: two nodes that observe the
+    /// same quorum must persist byte-identical entries or the
+    /// `LATEST_SOLIDIFIED_BLOCK_NUM` capsule will diverge on a state-root
+    /// comparison.
+    ///
+    /// Taking a `BTreeMap` (rather than `&[Vec<u8>]`) encodes that
+    /// invariant in the type — iteration is sorted-by-key — so a future
+    /// caller that builds its own signature set can't accidentally write
+    /// an unsorted entry. The `Address` keys are NOT persisted; only the
+    /// signature values, in sort order, end up on disk.
     pub fn put_commit_result(
         &self,
         key: &[u8],
         raw: &PbftRaw,
-        signatures: &[Vec<u8>],
+        signatures: &BTreeMap<Address, Vec<u8>>,
     ) {
         let result = tron_proto::PbftCommitResult {
             data: raw.encode_to_vec(),
-            signature: signatures.to_vec(),
+            signature: signatures.values().cloned().collect(),
         };
         self.backend.put(key, &result.encode_to_vec());
     }

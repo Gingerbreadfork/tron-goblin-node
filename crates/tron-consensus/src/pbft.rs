@@ -60,7 +60,7 @@
 //!   snapshot is attached. The on-disk schedule store stores only the
 //!   current active list — same as java-tron.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use prost::Message as _;
 use tron_crypto::address::Address;
@@ -238,8 +238,14 @@ pub enum VoteRecord {
 pub struct BlockVoteTally {
     /// Signer → full signature bytes, prepare phase.
     pub prepare_votes: HashMap<Address, Vec<u8>>,
-    /// Signer → full signature bytes, commit phase.
-    pub commit_votes: HashMap<Address, Vec<u8>>,
+    /// Signer → full signature bytes, commit phase. `BTreeMap` (not
+    /// `HashMap`) because the iteration order — sorted by signer address —
+    /// IS the on-disk byte order of the persisted `PbftCommitResult`. See
+    /// [`commit_signatures`] and `PbftSignDataStore::put_commit_result`:
+    /// the store consumes `signatures.values()` verbatim, so the sort
+    /// key has to live in the type, not in a caller convention that a
+    /// future writer might forget.
+    pub commit_votes: BTreeMap<Address, Vec<u8>>,
     /// True once we've broadcast our own Prepare for this block.
     pub broadcast_prepare: bool,
     /// True once we've broadcast our own Commit for this block.
@@ -304,13 +310,14 @@ impl BlockVoteTally {
         self.commit_votes.len() >= agree_node_count(active_count)
     }
 
-    /// Sorted list of commit signatures (for persistence in
-    /// `PbftSignDataStore`). Sort by signer address for
-    /// deterministic ordering.
-    pub fn commit_signatures(&self) -> Vec<Vec<u8>> {
-        let mut pairs: Vec<(&Address, &Vec<u8>)> = self.commit_votes.iter().collect();
-        pairs.sort_by_key(|(a, _)| *a.as_bytes());
-        pairs.into_iter().map(|(_, s)| s.clone()).collect()
+    /// Commit signatures, keyed by signer address. Returns an owned
+    /// `BTreeMap` so the caller can release the tally lock before
+    /// handing the signatures to `PbftSignDataStore::put_commit_result`.
+    /// The sort-by-address invariant (which that store relies on for
+    /// byte-parity with java-tron) is enforced by the type, not by
+    /// caller discipline.
+    pub fn commit_signatures(&self) -> BTreeMap<Address, Vec<u8>> {
+        self.commit_votes.clone()
     }
 }
 
@@ -717,13 +724,16 @@ mod tests {
         let mut b = [0u8; 21];
         b[0] = 0x41;
         b[20] = 0xaa;
-        // Add in reverse address order; expect output sorted.
+        // Add in reverse address order; BTreeMap iteration order is
+        // sorted-by-key (signer address), which is exactly the on-disk
+        // order `PbftSignDataStore::put_commit_result` writes.
         t.record_commit(Address::from_raw(a), vec![0xcc; 65]);
         t.record_commit(Address::from_raw(b), vec![0xaa; 65]);
         let sigs = t.commit_signatures();
+        let ordered: Vec<&Vec<u8>> = sigs.values().collect();
         // b's signature (0xaa..) should come first.
-        assert_eq!(sigs[0][0], 0xaa);
-        assert_eq!(sigs[1][0], 0xcc);
+        assert_eq!(ordered[0][0], 0xaa);
+        assert_eq!(ordered[1][0], 0xcc);
     }
 
     #[test]

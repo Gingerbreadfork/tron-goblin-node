@@ -102,6 +102,94 @@ fn pbft_sign_data_keys_concatenate_directly() {
     assert_eq!(PbftSignDataStore::block_key(1_000_000), b"BLOCK1000000");
 }
 
+/// **Critical byte layout**: `PbftCommitResult.signature` is persisted
+/// in signer-address sort order. java-tron's `PbftSignCapsule`
+/// serializer writes the signatures in the same order — if our output
+/// differs, the on-disk capsule diverges and any future state-root
+/// computation that hashes the commit-result will mismatch.
+///
+/// The store's API takes `&BTreeMap<Address, Vec<u8>>` to make the sort
+/// invariant type-enforced (caller can't construct an unsorted input).
+/// This test exercises that promise: building the map insertion order
+/// at random has no effect on the on-disk byte layout.
+#[test]
+fn pbft_commit_result_persists_signatures_in_address_sort_order() {
+    use std::collections::BTreeMap;
+    use prost::Message as _;
+
+    let store = PbftSignDataStore::new(mem());
+    let key = PbftSignDataStore::block_key(100);
+    let raw = tron_proto::pbft_message::Raw {
+        msg_type: 0,
+        data_type: 0,
+        view_n: 0,
+        epoch: 0,
+        data: b"payload".to_vec(),
+    };
+
+    // Three distinct signer addresses, deliberately constructed with the
+    // last byte controlling the sort key so the expected order is clear.
+    let addr_aa = Address::from_raw(hex!("4100000000000000000000000000000000000000aa"));
+    let addr_bb = Address::from_raw(hex!("4100000000000000000000000000000000000000bb"));
+    let addr_cc = Address::from_raw(hex!("4100000000000000000000000000000000000000cc"));
+    let sig_aa = vec![0xaa; 65];
+    let sig_bb = vec![0xbb; 65];
+    let sig_cc = vec![0xcc; 65];
+
+    // Insert into the BTreeMap in reverse address order to prove
+    // insertion order doesn't matter for on-disk layout.
+    let mut sigs = BTreeMap::new();
+    sigs.insert(addr_cc, sig_cc.clone());
+    sigs.insert(addr_aa, sig_aa.clone());
+    sigs.insert(addr_bb, sig_bb.clone());
+
+    store.put_commit_result(&key, &raw, &sigs);
+
+    // Read back and confirm the on-disk byte order is address-sorted.
+    let (_, persisted) = store.get_commit_result(&key).unwrap().unwrap();
+    assert_eq!(persisted.len(), 3);
+    assert_eq!(persisted[0], sig_aa); // 0x...aa
+    assert_eq!(persisted[1], sig_bb); // 0x...bb
+    assert_eq!(persisted[2], sig_cc); // 0x...cc
+
+    // Belt-and-braces: re-write with the same logical content via a
+    // DIFFERENT BTreeMap instance (rebuilt in yet another order) and
+    // assert the raw on-disk bytes are byte-identical to the first
+    // write. This is the property java-tron parity actually depends on.
+    let backend1_bytes = {
+        let backend = Arc::new(MemBackend::new());
+        let store1 = PbftSignDataStore::new(backend.clone());
+        let mut sigs1 = BTreeMap::new();
+        sigs1.insert(addr_aa, sig_aa.clone());
+        sigs1.insert(addr_bb, sig_bb.clone());
+        sigs1.insert(addr_cc, sig_cc.clone());
+        store1.put_commit_result(&key, &raw, &sigs1);
+        backend.get(&key).unwrap()
+    };
+    let backend2_bytes = {
+        let backend = Arc::new(MemBackend::new());
+        let store2 = PbftSignDataStore::new(backend.clone());
+        let mut sigs2 = BTreeMap::new();
+        sigs2.insert(addr_bb, sig_bb.clone());
+        sigs2.insert(addr_cc, sig_cc.clone());
+        sigs2.insert(addr_aa, sig_aa.clone());
+        store2.put_commit_result(&key, &raw, &sigs2);
+        backend.get(&key).unwrap()
+    };
+    assert_eq!(
+        backend1_bytes, backend2_bytes,
+        "two writes of the same logical quorum (insertion-order varied) must \
+         produce byte-identical PbftCommitResult bytes"
+    );
+
+    // And the persisted bytes must decode back to a `PbftCommitResult`
+    // whose `signature` field is in the same address-sorted order.
+    let decoded = tron_proto::PbftCommitResult::decode(backend1_bytes.as_slice()).unwrap();
+    assert_eq!(decoded.signature[0][0], 0xaa);
+    assert_eq!(decoded.signature[1][0], 0xbb);
+    assert_eq!(decoded.signature[2][0], 0xcc);
+}
+
 // --- AccountAssetStore -----------------------------------------------------
 
 #[test]
