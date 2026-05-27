@@ -458,6 +458,16 @@ pub enum TxOutcome {
     UnknownContractType(i32),
     Invalid(ActuatorError),
     ExecutionFailed(ActuatorError),
+    /// `raw_data.expiration` was already in the past at the moment this
+    /// block was applied. The mempool catches this at submit time
+    /// against wall-clock — but a peer-pushed block bypasses the
+    /// mempool, so the executor enforces against the block's timestamp.
+    /// Matches java-tron's `TransactionUtil.validateTransactionExpiration`
+    /// rejection at block-apply.
+    Expired {
+        expiration_ms: i64,
+        block_timestamp_ms: i64,
+    },
 }
 
 impl TxOutcome {
@@ -894,16 +904,21 @@ fn execute_block_logic(
         verify_witness_signature(block, None)?;
     }
 
-    // === 2. Per-tx atomic loop ===
-    let mut tx_results = Vec::with_capacity(block.transactions.len());
-    for tx in &block.transactions {
-        tx_results.push(execute_one_tx(state, tx, config));
-    }
-
-    // === 3. Head-pointer update (directly on base) ===
+    // Lift the header out once — needed both by the per-tx loop (for
+    // `block_timestamp`, the reference frame for expiration checks) and
+    // by the head-pointer update in step 3.
     let block_id = block_id_from_block(block).map_err(|_| BlockExecError::NoHeader)?;
     let header = block.block_header.as_ref().ok_or(BlockExecError::NoHeader)?;
     let raw = header.raw_data.as_ref().ok_or(BlockExecError::NoHeader)?;
+    let block_timestamp_ms = raw.timestamp;
+
+    // === 2. Per-tx atomic loop ===
+    let mut tx_results = Vec::with_capacity(block.transactions.len());
+    for tx in &block.transactions {
+        tx_results.push(execute_one_tx(state, tx, config, block_timestamp_ms));
+    }
+
+    // === 3. Head-pointer update (directly on base) ===
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     // Snapshot the previous block's timestamp BEFORE overwriting —
     // step 5 needs it for slot-gap attribution (`total_missed`).
@@ -1252,7 +1267,12 @@ pub fn compute_state_root(state: &StateBackends) -> [u8; 32] {
     tron_types::compute_account_state_root_with_storage(&accounts, storage_lookup)
 }
 
-fn execute_one_tx(state: &StateBackends, tx: &Transaction, config: &ExecConfig) -> TxResult {
+fn execute_one_tx(
+    state: &StateBackends,
+    tx: &Transaction,
+    config: &ExecConfig,
+    block_timestamp_ms: i64,
+) -> TxResult {
     // Fork a fresh session for this tx — any writes here are confined
     // until we commit. Failed txs revert; the next tx starts fresh.
     let session = TxSession::fork(state);
@@ -1270,6 +1290,41 @@ fn execute_one_tx(state: &StateBackends, tx: &Transaction, config: &ExecConfig) 
         };
     };
     let tx_id = sha256(&raw.encode_to_vec());
+
+    // === Expiration check. ===
+    //
+    // Reject any tx whose `raw_data.expiration` has already passed AS OF
+    // the block we're applying it under. The mempool path already
+    // performs this check at submit time against wall-clock — but a
+    // block we received from a peer (sync path) didn't go through the
+    // mempool, so without this gate a stale, signed transaction could
+    // be replayed inside a block at any time.
+    //
+    // Compared against the BLOCK timestamp (not wall-clock) so the
+    // outcome is deterministic across replays of the same block and
+    // matches what every other node will compute. `expiration == 0` is
+    // the "unset" sentinel java-tron uses and we leave it untouched.
+    if raw.expiration > 0 && raw.expiration <= block_timestamp_ms {
+        // No state was mutated — the session is fresh, no revert needed.
+        return TxResult {
+            tx_id,
+            contract_type: None,
+            outcome: TxOutcome::Expired {
+                expiration_ms: raw.expiration,
+                block_timestamp_ms,
+            },
+            internal_transactions: Vec::new(),
+            vm_logs: Vec::new(),
+        };
+    }
+
+    // NOTE: ref_block / chain-id replay validation does NOT happen
+    // here — per java-tron's `Manager.pushBlock` model, that gate
+    // belongs at the sync layer (where the block enters) and the
+    // mempool (where individual txs enter). The executor's contract
+    // is to be a pure-execution engine that trusts its caller has
+    // already gated on those policies. Sub-issue B of REVIEW.md ET-C4
+    // tracks wiring the missing sync-layer + mempool-layer check.
 
     let Some(contract) = raw.contract.first() else {
         return TxResult {

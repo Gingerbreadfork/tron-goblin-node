@@ -5,18 +5,26 @@
 //!
 //! Key:   2-byte big-endian `(block_num & 0xFFFF)` — only the low 16 bits
 //!        of the block height, so the window naturally wraps.
-//! Value: 2-byte slice of the block hash (matches java-tron's
-//!        `ref_block_bytes` field length).
+//! Value: 8 bytes — `BlockId.bytes[8..16]` of the block at that height,
+//!        matching the canonical encoding the tx-builder writes into
+//!        `raw_data.ref_block_hash` (see
+//!        `tron_rpc::builder::build_unsigned_tx`: `id.as_bytes()[8..16]`).
 //!
 //! A transaction includes `ref_block_bytes` + `ref_block_hash` so the
-//! node can confirm it was crafted against a recent chain head. The
-//! 2-byte truncation is enough because ref_block validity is checked
-//! within a 65k-block window — collisions across that window can't
-//! occur fast enough to matter.
+//! node can confirm it was crafted against a recent chain head: look up
+//! `ref_block_bytes` (the lookup key — low 16 bits of the referenced
+//! block-num) and compare the stored value to `ref_block_hash`. A
+//! match proves the tx targets this fork; a mismatch (or no entry)
+//! means the tx is too old or was built against a different chain.
 //!
 //! Source: `org.tron.core.db.RecentBlockStore`. The store itself just
-//! stores raw bytes; the truncation is applied by the caller in
-//! `Manager.processBlock` when populating the index.
+//! stores raw bytes; both the key truncation and the value slicing are
+//! applied by the caller in `Manager.processBlock` when populating the
+//! index. **Note**: nothing in the node currently populates this store
+//! — ref_block validation is the open ET-C4 (sub-issue B) item in
+//! REVIEW.md. Whoever wires the validator should also wire population
+//! here, in `execute_block_logic`'s step 3, so the byte layout matches
+//! java-tron exactly.
 
 use std::sync::Arc;
 

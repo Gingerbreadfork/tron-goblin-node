@@ -196,7 +196,11 @@ fn transfer_tx(owner: [u8; 21], to: [u8; 21], amount: i64) -> Transaction {
             ref_block_bytes: vec![0, 1],
             ref_block_num: 0,
             ref_block_hash: vec![0u8; 8],
-            expiration: 1_700_000_000_000,
+            // 24h past the base block timestamp — well into the future
+            // for every block this file builds (`build_block(N)` uses
+            // `base + N*3000ms`). Keeps the per-tx expiration gate from
+            // rejecting transfers in tests that aren't about expiration.
+            expiration: 1_700_000_000_000 + 86_400_000,
             auths: Vec::new(),
             data: Vec::new(),
             contract: vec![TxContract {
@@ -515,6 +519,112 @@ fn three_block_chain_replays_with_correct_parent_links() {
     assert_eq!(
         state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
         1_000_000 - 600
+    );
+}
+
+/// Regression: a transaction whose `raw_data.expiration` is at or before
+/// the block's `timestamp` is rejected with `TxOutcome::Expired` and
+/// state is NOT mutated. The mempool catches this at submit time
+/// against wall-clock — but a peer-pushed block bypasses the mempool,
+/// so the executor enforces against the BLOCK timestamp (deterministic
+/// across replays) at block-apply time.
+#[test]
+fn expired_tx_is_rejected_at_block_apply_and_state_unchanged() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    // Build a transfer tx, then back-date its expiration to one ms
+    // BEFORE what `build_block(1, …)` will stamp as the block
+    // timestamp. Re-sign because mutating raw_data changed the digest.
+    let mut tx = transfer_tx(ALICE, BOB, 100);
+    let block_ts = 1_700_000_000_000 + 3000; // mirrors build_block formula
+    tx.raw_data.as_mut().unwrap().expiration = block_ts - 1;
+    // sign_transaction pushes (multi-sig semantics) — clear first so we
+    // re-sign exactly once after the raw_data mutation above.
+    tx.signature.clear();
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("re-sign");
+    let expected_tx_id =
+        tron_crypto::hash::sha256(&prost::Message::encode_to_vec(tx.raw_data.as_ref().unwrap()));
+
+    let block = build_block(1, [0u8; 32], vec![tx]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+
+    assert_eq!(report.tx_results.len(), 1);
+    let tx_result = &report.tx_results[0];
+    match &tx_result.outcome {
+        TxOutcome::Expired { expiration_ms, block_timestamp_ms } => {
+            assert_eq!(*expiration_ms, block_ts - 1);
+            assert_eq!(*block_timestamp_ms, block_ts);
+        }
+        other => panic!("expected TxOutcome::Expired, got {other:?}"),
+    }
+
+    // No state mutation: Alice's balance is untouched, Bob's at zero.
+    // The outcome reports the right tx_id (not the zero sentinel).
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        1_000_000
+    );
+    assert_eq!(
+        state.accounts.get(&addr(BOB)).unwrap().unwrap().balance,
+        0
+    );
+    assert_eq!(tx_result.tx_id, expected_tx_id);
+
+    // And the block's head pointer DID still advance — block validity
+    // is not blocked by per-tx expiration; only that one tx is dropped.
+    assert_eq!(state.dyn_props.latest_block_header_number(), Some(1));
+}
+
+/// Companion: `expiration == 0` (java-tron's "unset" sentinel) is NOT
+/// treated as expired. Required so transactions built before the
+/// expiration field existed don't suddenly start failing.
+#[test]
+fn expiration_zero_sentinel_is_not_treated_as_expired() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    let mut tx = transfer_tx(ALICE, BOB, 100);
+    tx.raw_data.as_mut().unwrap().expiration = 0;
+    // sign_transaction pushes (multi-sig semantics) — clear first so we
+    // re-sign exactly once after the raw_data mutation above.
+    tx.signature.clear();
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("re-sign");
+
+    let block = build_block(1, [0u8; 32], vec![tx]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+    assert!(
+        matches!(report.tx_results[0].outcome, TxOutcome::Success),
+        "got: {:?}", report.tx_results[0].outcome
+    );
+    assert_eq!(state.accounts.get(&addr(BOB)).unwrap().unwrap().balance, 100);
+}
+
+/// Companion: an `expiration` exactly one millisecond AFTER the block
+/// timestamp passes (the rejection condition is `<=`, not `<`). Pins
+/// the boundary so a future refactor doesn't accidentally make it
+/// inclusive on the high end.
+#[test]
+fn expiration_one_ms_in_the_future_passes() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    let mut tx = transfer_tx(ALICE, BOB, 100);
+    let block_ts = 1_700_000_000_000 + 3000;
+    tx.raw_data.as_mut().unwrap().expiration = block_ts + 1;
+    // sign_transaction pushes (multi-sig semantics) — clear first so we
+    // re-sign exactly once after the raw_data mutation above.
+    tx.signature.clear();
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("re-sign");
+
+    let block = build_block(1, [0u8; 32], vec![tx]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+    assert!(
+        matches!(report.tx_results[0].outcome, TxOutcome::Success),
+        "got: {:?}", report.tx_results[0].outcome
     );
 }
 
