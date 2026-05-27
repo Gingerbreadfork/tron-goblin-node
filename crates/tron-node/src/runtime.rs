@@ -935,7 +935,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     .with_peer_registry(peer_registry_for_peer)
                     .with_eviction_signal(eviction_tx_for_peer)
                     .with_exec_config(exec_config_for_peer)
-                    .with_pubsub(pubsub_for_peer);
+                    .with_pubsub(pubsub_for_peer)
+                    // Production runs the per-tx replay gate. The
+                    // `BlockIndexStore` is populated from
+                    // `initialize_genesis` onward, so the validator
+                    // has chain history to compare against.
+                    .with_strict_ref_block_check();
                 if let Some(stack) = snapshot_stack_for_peer {
                     driver = driver.with_snapshot_stack(stack);
                 }

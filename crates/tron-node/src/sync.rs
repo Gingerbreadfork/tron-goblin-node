@@ -239,6 +239,18 @@ pub struct SyncDriver {
     /// runtime's local apply still publishes if it has its own
     /// broker handle.
     pubsub: Option<Arc<tron_rpc::PubSubBroker>>,
+    /// When `true`, every tx inside an incoming block has its
+    /// `ref_block_bytes` / `ref_block_hash` validated against the
+    /// chain's `BlockIndexStore` before the block is accepted. A bad
+    /// ref_block rejects the entire block with
+    /// `AcceptOutcome::RejectedValidation` (mirrors java-tron's
+    /// `Manager.pushBlock → TransactionUtil.validateRefBlock` —
+    /// structurally-invalid tx in a block means the whole block is
+    /// malformed). Defaults to `false` so test setups whose
+    /// `block_index` isn't populated still work; production wires
+    /// `with_strict_ref_block_check()` to turn it on. See
+    /// `crate::ref_block` for the validator implementation.
+    strict_ref_block: bool,
 }
 
 impl SyncDriver {
@@ -274,6 +286,7 @@ impl SyncDriver {
             exec_config: tron_executor::ExecConfig::default(),
             snapshot_stack: None,
             pubsub: None,
+            strict_ref_block: false,
         }
     }
 
@@ -282,6 +295,19 @@ impl SyncDriver {
     /// notification to subscribers.
     pub fn with_pubsub(mut self, broker: Arc<tron_rpc::PubSubBroker>) -> Self {
         self.pubsub = Some(broker);
+        self
+    }
+
+    /// Enable per-tx `ref_block_bytes` / `ref_block_hash` validation
+    /// during `accept_block`. Production callers should always set
+    /// this; the daemon's runtime wires it in. The opt-in is
+    /// deliberate so that the many tron-node integration tests that
+    /// construct synthetic blocks against a fresh, empty
+    /// `BlockIndexStore` don't have their txs mass-rejected — those
+    /// tests exercise the sync driver's orchestration, not the
+    /// per-tx replay gate.
+    pub fn with_strict_ref_block_check(mut self) -> Self {
+        self.strict_ref_block = true;
         self
     }
 
@@ -1723,6 +1749,37 @@ impl SyncDriver {
             Ok(id) => id,
             Err(e) => return AcceptOutcome::RejectedValidation(format!("block id: {e:?}")),
         };
+
+        // Per-tx ref_block / chain-id replay check. The check is
+        // anchored at the PARENT (`block_num - 1`) — the current
+        // block isn't in `block_index` yet at this point (sync.rs
+        // populates `block_index` further down, just before handing
+        // off to the executor). java-tron's
+        // `Manager.pushBlock → validateTransaction` rejects the whole
+        // block if any tx fails, since a structurally-invalid tx in
+        // a valid-looking block means the producer or a relay
+        // tampered with the contents.
+        if self.strict_ref_block {
+            if let Some(bi) = &self.state.block_index {
+                let block_num = block
+                    .block_header
+                    .as_ref()
+                    .and_then(|h| h.raw_data.as_ref())
+                    .map(|r| r.number)
+                    .unwrap_or(0);
+                let head_num = block_num.saturating_sub(1);
+                for (i, tx) in block.transactions.iter().enumerate() {
+                    let Some(raw) = tx.raw_data.as_ref() else {
+                        continue; // a tx with no raw_data is rejected by execute_one_tx separately
+                    };
+                    if let Err(e) = crate::ref_block::validate_ref_block(raw, head_num, bi) {
+                        return AcceptOutcome::RejectedValidation(format!(
+                            "ref_block (tx {i}): {e}"
+                        ));
+                    }
+                }
+            }
+        }
 
         // Seed KhaosDb on the first block of the session. We can't do
         // this in `new()` because `state` may not have a head yet.

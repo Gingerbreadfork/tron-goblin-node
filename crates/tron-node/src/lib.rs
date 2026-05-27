@@ -20,6 +20,7 @@ pub mod resilience;
 pub mod runtime;
 pub mod pbft_runtime;
 pub mod peer_state;
+pub mod ref_block;
 pub mod snapshot_export;
 pub mod snapshot_import;
 pub mod sr_runtime;

@@ -24,6 +24,8 @@ use tron_executor::StateBackends;
 use tron_mempool::TxValidatorFn;
 use tron_proto::{transaction::contract::ContractType, Transaction};
 
+use crate::ref_block::validate_ref_block;
+
 /// Construct a state-aware mempool validator from the live backends.
 /// The closure clones the necessary `Arc<dyn KvBackend>` handles once;
 /// every call reconstructs the per-store wrappers (cheap — they're
@@ -48,11 +50,30 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
     let market_orders_be = state.market_orders.clone();
     let nullifiers_be = state.nullifiers.clone();
     let merkle_trees_be: Option<Arc<dyn KvBackend>> = state.merkle_trees.clone();
+    // The ref_block / chain-id replay gate also runs at mempool
+    // admission so wallets get a fast, clear rejection instead of
+    // their tx silently lingering until expiration. Optional so
+    // tests with no block_index (the gate has no chain history to
+    // compare against) skip the check.
+    let block_index_be: Option<Arc<dyn KvBackend>> = state.block_index.clone();
+    let dyn_props_for_ref_block = state.dyn_props.clone();
 
     Box::new(move |tx: &Transaction| -> Result<(), String> {
         let raw = tx.raw_data.as_ref().ok_or("transaction has no raw_data")?;
         if raw.contract.is_empty() {
             return Err("transaction has no contracts".into());
+        }
+
+        // Per-tx replay gate. Anchored at the current chain head
+        // (`latest_block_header_number`) — at mempool admission
+        // there's no "block being applied" so head is the right
+        // reference frame. Skipped if no `block_index` is attached.
+        if let Some(bi) = &block_index_be {
+            let dp = DynamicPropertiesStore::new(dyn_props_for_ref_block.clone());
+            let head_num = dp.latest_block_header_number().unwrap_or(0);
+            if let Err(e) = validate_ref_block(raw, head_num, bi) {
+                return Err(format!("ref_block: {e}"));
+            }
         }
 
         // Build the actuator store handles once per call. Cheap —
