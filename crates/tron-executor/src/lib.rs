@@ -573,6 +573,93 @@ impl SessionStoreOwners {
 }
 
 // =============================================================================
+// Per-VM-call inner session (nested over TxSession)
+// =============================================================================
+
+/// Inner session layer dedicated to VM-frame state mutations. Wraps
+/// every backend the TVM (revm + precompiles + TronHost staking + TRC-10
+/// inspector) may write to in a second [`SessionBackend`] over the
+/// per-tx session. On [`commit`](Self::commit) the buffered writes
+/// flow into the per-tx session; on [`revert`](Self::revert) they're
+/// discarded.
+///
+/// Mirrors java-tron's `Program.java` `Deposit` pattern — every VM
+/// frame runs against a child deposit committed on success, dropped
+/// on revert. Without this layer, a `VmOutcome::Revert` (or `Halt`,
+/// `Timeout`) followed by `session.commit()` on the per-tx session
+/// would persist contract storage writes / balance changes / freeze /
+/// vote / delegate effects that revm's journal said should be undone
+/// — a hard consensus break against every other node.
+///
+/// Backends the VM only READS (`dyn_props`, `witnesses`, `delegation`,
+/// `block_index`, `contracts`) pass through unwrapped — nothing to
+/// revert. The per-tx session's bandwidth + energy charge writes go
+/// to the outer `TxSession` directly and survive regardless of
+/// VM-side commit/revert (matches java-tron's "energy is paid even on
+/// revert" rule).
+struct VmSession {
+    accounts: Arc<SessionBackend>,
+    code: Arc<SessionBackend>,
+    storage_row: Arc<SessionBackend>,
+    contract_state: Arc<SessionBackend>,
+    votes: Arc<SessionBackend>,
+    delegated_resources: Arc<SessionBackend>,
+}
+
+impl VmSession {
+    /// Wrap the per-tx session's VM-writeable backends in a fresh
+    /// inner session. The four EVM-store handles (`code`, `storage`,
+    /// `contract_state`) are required by the caller's gate above —
+    /// `execute_vm_tx` rejects with `NotImplemented` if any of them
+    /// is missing on the per-tx session.
+    fn wrap(
+        accounts: Arc<SessionBackend>,
+        code: Arc<SessionBackend>,
+        storage_row: Arc<SessionBackend>,
+        contract_state: Arc<SessionBackend>,
+        votes: Arc<SessionBackend>,
+        delegated_resources: Arc<SessionBackend>,
+    ) -> Self {
+        Self {
+            accounts: Arc::new(SessionBackend::new(accounts as Arc<dyn KvBackend>)),
+            code: Arc::new(SessionBackend::new(code as Arc<dyn KvBackend>)),
+            storage_row: Arc::new(SessionBackend::new(storage_row as Arc<dyn KvBackend>)),
+            contract_state: Arc::new(SessionBackend::new(
+                contract_state as Arc<dyn KvBackend>,
+            )),
+            votes: Arc::new(SessionBackend::new(votes as Arc<dyn KvBackend>)),
+            delegated_resources: Arc::new(SessionBackend::new(
+                delegated_resources as Arc<dyn KvBackend>,
+            )),
+        }
+    }
+
+    /// Flush every wrapped backend's pending writes into the per-tx
+    /// session. Called once per VM frame on `VmOutcome::Success`.
+    fn commit(&self) {
+        self.accounts.commit();
+        self.code.commit();
+        self.storage_row.commit();
+        self.contract_state.commit();
+        self.votes.commit();
+        self.delegated_resources.commit();
+    }
+
+    /// Discard every wrapped backend's pending writes. Called once per
+    /// VM frame on `VmOutcome::Revert` / `Halt` / `Timeout` /
+    /// `CallTokenIgnored` / `PreflightError`. The per-tx session is
+    /// untouched.
+    fn revert(&self) {
+        self.accounts.revert();
+        self.code.revert();
+        self.storage_row.revert();
+        self.contract_state.revert();
+        self.votes.revert();
+        self.delegated_resources.revert();
+    }
+}
+
+// =============================================================================
 // Per-tx outcome + report
 // =============================================================================
 
@@ -1718,26 +1805,54 @@ fn execute_vm_tx(
         };
     };
 
+    // VM-frame isolation layer. Every backend the TVM (revm +
+    // precompiles + TronHost staking + TRC-10 inspector) may write
+    // to is wrapped in a second SessionBackend on top of the per-tx
+    // session. After the VM returns we either commit this inner
+    // layer (Success) or revert it (Revert/Halt/Timeout/etc.) —
+    // mirrors java-tron's `Program.java` Deposit pattern, where
+    // every nested VM frame runs against a child deposit that's
+    // dropped on revert via stack unwind.
+    //
+    // The OUTER per-tx session keeps the bandwidth charge (applied
+    // before this function) and the post-VM energy charge (applied
+    // below via `pay_energy_bill`) intact regardless of VM outcome,
+    // matching java-tron's consensus rule that energy is paid even
+    // on revert.
+    let vm_session = VmSession::wrap(
+        session.accounts.clone(),
+        code.clone(),
+        storage.clone(),
+        contract_state.clone(),
+        session.votes.clone(),
+        session.delegated_resources.clone(),
+    );
+
     let vm_stores = tron_tvm::execute::VmStores {
-        accounts: Arc::new(AccountStore::new(session.accounts.clone() as _)),
-        code: Arc::new(CS::new(code.clone() as _)),
-        storage: Arc::new(SRS::new(storage.clone() as _)),
+        accounts: Arc::new(AccountStore::new(vm_session.accounts.clone() as _)),
+        code: Arc::new(CS::new(vm_session.code.clone() as _)),
+        storage: Arc::new(SRS::new(vm_session.storage_row.clone() as _)),
         witnesses: Arc::new(WS::new(session.witnesses.clone() as _)),
-        contract_state: Arc::new(CtS::new(contract_state.clone() as _)),
+        contract_state: Arc::new(CtS::new(vm_session.contract_state.clone() as _)),
         dynamic_properties: Arc::new(DPS::new(session.dyn_props.clone() as _)),
-        delegated_resources: Arc::new(DRS::new(session.delegated_resources.clone() as _)),
+        delegated_resources: Arc::new(DRS::new(vm_session.delegated_resources.clone() as _)),
         delegation: Arc::new(DelS::new(session.delegation.clone() as _)),
         // Attach BlockIndexStore so BLOCKHASH(n) returns real hashes
         // for the last 256 blocks (when the backend is configured).
+        // Read-only from the VM's perspective — no inner-session
+        // wrapping needed.
         block_index: session
             .block_index
             .as_ref()
             .map(|b| Arc::new(BIS::new(b.clone() as _))),
         // ContractStore lets the v1/v2 storage-key layout selector
-        // read SmartContract.version.
+        // read SmartContract.version. Read-only from the VM.
         contracts: Some(Arc::new(ConS::new(session.contracts.clone() as _))),
-        // VotesStore feeds the VOTEWITNESS opcode bridge.
-        votes: Some(Arc::new(VotesStore::new(session.votes.clone() as _))),
+        // VotesStore feeds the VOTEWITNESS opcode bridge, which DOES
+        // write (the corresponding `accounts` row plus the votes
+        // row). Routed through the inner session so a reverted VM
+        // frame doesn't leave votes persisted.
+        votes: Some(Arc::new(VotesStore::new(vm_session.votes.clone() as _))),
     };
 
     // Read current block number/time from the dyn-props session (so we
@@ -1846,6 +1961,25 @@ fn execute_vm_tx(
         _ => unreachable!("execute_vm_tx invoked for non-VM contract type"),
     };
 
+    // === VM-frame state isolation. ===
+    //
+    // Commit or revert the inner `vm_session` based on the VM's
+    // outcome BEFORE applying the energy charge:
+    //
+    //   * `Success` → commit: VM writes flow into the per-tx session.
+    //   * `Revert` / `Halt` / `Timeout` → revert: VM writes dropped
+    //     (matches java-tron's "every revert unwinds the deposit").
+    //   * `CallTokenIgnored` / `PreflightError` → revert: tx is
+    //     consensus-invalid; nothing the VM may have touched (top-level
+    //     CALLTOKEN debit, CREATE pre-installs, etc.) should persist.
+    //
+    // The per-tx outer session is untouched here — its bandwidth +
+    // about-to-apply energy charge survive whichever branch fires.
+    match &outcome {
+        tron_tvm::execute::VmOutcome::Success { .. } => vm_session.commit(),
+        _ => vm_session.revert(),
+    }
+
     // Charge energy for the caller. java-tron does this in
     // `TransactionTrace.pay()` after the VM finishes. Even on revert
     // the energy that ran is still charged — that's the consensus rule.
@@ -1946,28 +2080,13 @@ fn execute_vm_tx(
             }
         }
         tron_tvm::execute::VmOutcome::Revert { .. } => {
-            // Revert undoes the VM's state mutations but *keeps* the
-            // energy charge — that's the java-tron contract. So we
-            // re-commit ONLY the energy-charge sub-effect.
-            //
-            // Implementation: the energy charge above wrote to the
-            // session backends. A naive `session.revert()` here would
-            // also undo the energy charge. Instead, we commit the
-            // session (which keeps the energy charge) AND undo only
-            // the VM state mutations.
-            //
-            // The cleanest way to do that is to have the VM run in a
-            // *nested* session and revert just that one. Today VM
-            // mutations go straight to `session.accounts` etc.; until
-            // we add a nested session for VM-only mutations, the
-            // pragmatic approach is: commit the whole session (energy
-            // charge + any partial VM state). java-tron's behavior is
-            // closer to commit-energy-only-revert-VM, but for revert
-            // semantics the tx is still consensus-rejected, so the
-            // divergence is at most "extra writes that real mainnet
-            // didn't make". The integration test for this lives in
-            // `crates/tron-executor/tests/energy.rs` and pins the
-            // safer-side behavior. Pinned as a follow-up.
+            // VM-side writes were already discarded by `vm_session.revert()`
+            // above (the inner nested-session layer). All that remains
+            // in the per-tx session is bandwidth (charged before the
+            // VM) and the energy charge that `pay_energy_bill` applied
+            // afterwards — both of which java-tron's consensus rule
+            // says must survive a revert. `session.commit()` flushes
+            // exactly those into the per-tx parent.
             session.commit();
             TxResult {
                 tx_id,

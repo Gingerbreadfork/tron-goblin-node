@@ -1011,3 +1011,248 @@ fn default_exec_config_drops_internal_tx_traces() {
         tx_result.internal_transactions.len()
     );
 }
+
+// =============================================================================
+// ET-C2: VM-frame state isolation — a tx whose top-level VM call
+// REVERTs must leave contract storage / balances / etc. untouched
+// while STILL charging energy (java-tron's consensus rule).
+// =============================================================================
+
+/// Mirrors the "SSTORE then STOP" contract above but reverts after
+/// the SSTORE. Storage MUST NOT show the SSTOREd value; the executor
+/// MUST still charge the caller for the energy the VM consumed
+/// before the revert.
+///
+/// Bytecode (10 bytes): PUSH1 0x42 PUSH1 0x00 SSTORE PUSH1 0x00
+/// PUSH1 0x00 REVERT.
+#[test]
+fn revert_after_sstore_drops_storage_write_but_charges_energy() {
+    let state = build_state();
+    let (caller_priv, caller_bytes) = caller_keypair(0xa3);
+    let contract_bytes = addr_with_byte(0xc3);
+
+    let bytecode: Vec<u8> = vec![
+        0x60, 0x42, // PUSH1 0x42
+        0x60, 0x00, // PUSH1 0x00 (slot)
+        0x55,       // SSTORE
+        0x60, 0x00, // PUSH1 0x00 (revert offset)
+        0x60, 0x00, // PUSH1 0x00 (revert size)
+        0xfd,       // REVERT
+    ];
+
+    // Pre-install caller with TRX balance (no frozen energy → fee path).
+    // Pre-install contract with the bytecode.
+    let accounts = AccountStore::new(state.accounts.clone());
+    let initial_balance: i64 = 1_000_000_000;
+    accounts.put(
+        &Address::from_raw(caller_bytes),
+        &Account {
+            address: caller_bytes.to_vec(),
+            balance: initial_balance,
+            ..Default::default()
+        },
+    );
+    let code = CodeStore::new(state.code.as_ref().unwrap().clone());
+    let hash = tron_crypto::hash::keccak256(&bytecode);
+    code.put(&hash, &bytecode);
+    accounts.put(
+        &Address::from_raw(contract_bytes),
+        &Account {
+            address: contract_bytes.to_vec(),
+            balance: 0,
+            code: bytecode.clone(),
+            code_hash: hash.to_vec(),
+            ..Default::default()
+        },
+    );
+
+    // Pre-seed storage slot 0 with a sentinel so we can distinguish
+    // "no write happened" from "write happened then was reverted into
+    // an empty slot". After the revert the slot MUST still read 0x07.
+    let storage = StorageRowStore::new(state.storage_row.as_ref().unwrap().clone());
+    let composite_key =
+        StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
+    let mut sentinel = [0u8; 32];
+    sentinel[31] = 0x07;
+    storage.put(&composite_key, &sentinel);
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_bytes.to_vec(),
+        contract_address: contract_bytes.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let any = Any {
+        type_url: "type.googleapis.com/protocol.TriggerSmartContract".into(),
+        value: trigger.encode_to_vec(),
+    };
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TriggerSmartContract as i32,
+                parameter: Some(any),
+                ..Default::default()
+            }],
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        }),
+        signature: Vec::new(),
+        ret: Vec::new(),
+    };
+    tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign");
+
+    let block = make_block(1, [0u8; 32], vec![tx]);
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
+    assert_eq!(report.tx_results.len(), 1);
+
+    // Outcome should be ExecutionFailed("VM revert") — the tx is
+    // rejected, but the energy still applies. Halt would mean the
+    // revert wasn't reached (e.g. the SSTORE ran out of gas).
+    let tx_result = &report.tx_results[0];
+    match &tx_result.outcome {
+        TxOutcome::ExecutionFailed(e) => {
+            let s = format!("{e}");
+            assert!(s.contains("VM revert"), "expected 'VM revert', got: {s}");
+        }
+        other => panic!("expected ExecutionFailed(VM revert), got {other:?}"),
+    }
+
+    // The decisive assertion: storage slot 0 still holds the sentinel.
+    // Pre-fix this would fail with the SSTOREd value 0x42 (or, worst
+    // case, with revm's net-zero "delete the slot" depending on
+    // commit semantics).
+    let after_value = storage
+        .get(&composite_key)
+        .expect("sentinel must still be there");
+    assert_eq!(
+        after_value, sentinel,
+        "revert must drop the SSTORE; slot 0 should still read 0x07"
+    );
+
+    // Energy charge survived the revert. The caller's TRX balance
+    // shrank by `energy_used * energy_fee` sun. Exact value is
+    // VM-dependent; assert "strictly less than starting balance" so
+    // the test isn't tied to a specific gas formula.
+    let after_caller = accounts
+        .get(&Address::from_raw(caller_bytes))
+        .unwrap()
+        .expect("caller account still present");
+    assert!(
+        after_caller.balance < initial_balance,
+        "energy charge must apply on revert: balance was {}, expected < {}",
+        after_caller.balance,
+        initial_balance
+    );
+}
+
+/// Companion: a Halt (e.g. out-of-gas) on a tx that performed
+/// state-changing ops must ALSO drop those state changes while
+/// keeping the energy charge. Uses a contract with an infinite loop
+/// preceded by an SSTORE — the SSTORE runs, then the loop runs out
+/// of gas. Storage must still read the pre-call sentinel.
+#[test]
+fn halt_after_sstore_drops_storage_write_but_charges_energy() {
+    let state = build_state();
+    let (caller_priv, caller_bytes) = caller_keypair(0xa4);
+    let contract_bytes = addr_with_byte(0xc4);
+
+    // SSTORE 0x42 to slot 0, then JUMPDEST loop forever.
+    // PUSH1 0x42 PUSH1 0x00 SSTORE JUMPDEST PUSH1 0x05 JUMP
+    let bytecode: Vec<u8> = vec![
+        0x60, 0x42, // PUSH1 0x42
+        0x60, 0x00, // PUSH1 0x00
+        0x55,       // SSTORE
+        0x5b,       // JUMPDEST (pc=5)
+        0x60, 0x05, // PUSH1 0x05
+        0x56,       // JUMP
+    ];
+
+    let accounts = AccountStore::new(state.accounts.clone());
+    let initial_balance: i64 = 1_000_000_000;
+    accounts.put(
+        &Address::from_raw(caller_bytes),
+        &Account {
+            address: caller_bytes.to_vec(),
+            balance: initial_balance,
+            ..Default::default()
+        },
+    );
+    let code = CodeStore::new(state.code.as_ref().unwrap().clone());
+    let hash = tron_crypto::hash::keccak256(&bytecode);
+    code.put(&hash, &bytecode);
+    accounts.put(
+        &Address::from_raw(contract_bytes),
+        &Account {
+            address: contract_bytes.to_vec(),
+            balance: 0,
+            code: bytecode.clone(),
+            code_hash: hash.to_vec(),
+            ..Default::default()
+        },
+    );
+
+    let storage = StorageRowStore::new(state.storage_row.as_ref().unwrap().clone());
+    let composite_key =
+        StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
+    let mut sentinel = [0u8; 32];
+    sentinel[31] = 0x09;
+    storage.put(&composite_key, &sentinel);
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_bytes.to_vec(),
+        contract_address: contract_bytes.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let any = Any {
+        type_url: "type.googleapis.com/protocol.TriggerSmartContract".into(),
+        value: trigger.encode_to_vec(),
+    };
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TriggerSmartContract as i32,
+                parameter: Some(any),
+                ..Default::default()
+            }],
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        }),
+        signature: Vec::new(),
+        ret: Vec::new(),
+    };
+    tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign");
+
+    let block = make_block(1, [0u8; 32], vec![tx]);
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
+    let tx_result = &report.tx_results[0];
+    match &tx_result.outcome {
+        TxOutcome::ExecutionFailed(e) => {
+            let s = format!("{e}");
+            assert!(
+                s.contains("VM halt"),
+                "expected 'VM halt' (out-of-gas loop), got: {s}"
+            );
+        }
+        other => panic!("expected ExecutionFailed(VM halt), got {other:?}"),
+    }
+    let after = storage.get(&composite_key).expect("sentinel must remain");
+    assert_eq!(
+        after, sentinel,
+        "halt must drop the SSTORE; slot 0 should still read 0x09"
+    );
+    let after_caller = accounts
+        .get(&Address::from_raw(caller_bytes))
+        .unwrap()
+        .unwrap();
+    assert!(
+        after_caller.balance < initial_balance,
+        "energy charge must apply on halt: balance was {}, expected < {}",
+        after_caller.balance,
+        initial_balance
+    );
+}
