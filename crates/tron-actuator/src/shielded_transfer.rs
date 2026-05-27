@@ -169,6 +169,14 @@ pub fn validate_shielded_transfer(
     fee: i64,
 ) -> Result<(), ActuatorError> {
     // === 1. Feature flags (proposal-gated). ===
+    // NOTE: the leading space in `" ALLOW_SAME_TOKEN_NAME"` is intentional —
+    // it's a java-tron quirk preserved for byte-exact DB parity. See the
+    // canonical constant at `tron_chainbase::dynamic_properties_store::keys::
+    // ALLOW_SAME_TOKEN_NAME` and the parity-pinning test in
+    // `crates/tron-chainbase/tests/stores.rs` ("Critical consensus quirk").
+    // Do NOT "fix" this to the unprefixed form — the writers in
+    // `tron-node/src/runtime.rs` and the genesis-wiring tests would stop
+    // matching and the gate would always reject.
     let allow_same_token_name = dyn_props.get_long(b" ALLOW_SAME_TOKEN_NAME").unwrap_or(0);
     if allow_same_token_name != 1 {
         return Err(ActuatorError::Validate(
