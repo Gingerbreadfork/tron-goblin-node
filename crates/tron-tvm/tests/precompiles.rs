@@ -353,6 +353,68 @@ fn energy_costs_match_pinned_values_from_java_tron() {
     assert_eq!(PrecompileImpl::RewardBalance.energy_cost(&[]), 500);
     assert_eq!(PrecompileImpl::GetChainParameter.energy_cost(&[]), 500);
     assert_eq!(PrecompileImpl::ValidateMultiSign.energy_cost(&[]), 1500);
+    // Shielded zk-SNARK verifiers. Constants pinned against java-tron's
+    // `PrecompiledContracts.{VerifyMintProof,VerifyTransferProof,
+    // VerifyBurnProof,MerkleHash}.getEnergyForData`. **Input-independent**:
+    // VerifyTransferProof does NOT scale per spend/output despite the
+    // payload encoding 1..=2 of each — java-tron charges a flat 200k.
+    assert_eq!(PrecompileImpl::VerifyMintProof.energy_cost(&[]), 150_000);
+    assert_eq!(PrecompileImpl::VerifyTransferProof.energy_cost(&[]), 200_000);
+    assert_eq!(PrecompileImpl::VerifyBurnProof.energy_cost(&[]), 150_000);
+    assert_eq!(PrecompileImpl::MerkleHash.energy_cost(&[]), 500);
+    // Sanity: realistic payload sizes don't change the cost.
+    assert_eq!(
+        PrecompileImpl::VerifyTransferProof.energy_cost(&vec![0u8; 2080]),
+        200_000
+    );
+    assert_eq!(
+        PrecompileImpl::VerifyTransferProof.energy_cost(&vec![0u8; 2752]),
+        200_000
+    );
+    // P256Verify is a flat 6900 per java-tron (matches RIP-7212's
+    // 3450 doubled — java-tron's chosen value pre-dates the RIP).
+    assert_eq!(PrecompileImpl::P256Verify.energy_cost(&[]), 6_900);
+    assert_eq!(PrecompileImpl::P256Verify.energy_cost(&vec![0u8; 160]), 6_900);
+}
+
+/// Blake2F's energy is per-Blake2b-round (EIP-152): when input is the
+/// canonical 213 bytes and the finalization flag (data[212]) is 0 or 1,
+/// the cost is `u32` BE of data[0..4]. Otherwise 0 — a malformed input
+/// returns an error from execute and costs nothing. Pinned against
+/// java-tron's `PrecompiledContracts.Blake2F.getEnergyForData`.
+#[test]
+fn blake2f_energy_is_per_round_with_canonical_input() {
+    // Build a well-formed input: 4 bytes rounds || 208 bytes payload ||
+    // 1 byte finalization flag.
+    let mut input = vec![0u8; 213];
+    // 12 rounds (Blake2b standard).
+    input[0..4].copy_from_slice(&12u32.to_be_bytes());
+    input[212] = 1; // finalization
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&input), 12);
+
+    // High round count: u32 BE → u64 promotion.
+    input[0..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&input), u32::MAX as u64);
+
+    // Other valid finalization flag.
+    input[212] = 0;
+    input[0..4].copy_from_slice(&5u32.to_be_bytes());
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&input), 5);
+}
+
+#[test]
+fn blake2f_energy_is_zero_for_malformed_input() {
+    // Wrong length entirely.
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&[]), 0);
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&[0u8; 212]), 0);
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&[0u8; 214]), 0);
+    // Correct length but invalid finalization flag (any high bit set).
+    let mut input = vec![0u8; 213];
+    input[0..4].copy_from_slice(&100u32.to_be_bytes());
+    input[212] = 2; // not 0 or 1 → java-tron returns 0
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&input), 0);
+    input[212] = 0xff;
+    assert_eq!(PrecompileImpl::Blake2F.energy_cost(&input), 0);
 }
 
 /// BatchValidateSign charges 1500 energy per signature. Input layout is

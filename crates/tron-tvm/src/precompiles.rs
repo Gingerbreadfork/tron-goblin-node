@@ -216,7 +216,25 @@ impl PrecompileImpl {
             }
             // 1500 + 10000 baseline (per java-tron)
             Self::ValidateMultiSign => 1500,
-            // Standard EVM precompiles + deferred ones don't compute here.
+            // Shielded zk-SNARK verifiers — flat costs per java-tron's
+            // `PrecompiledContracts.VerifyMintProof.getEnergyForData`
+            // (and Burn/Transfer/MerkleHash siblings). NO per-spend or
+            // per-output scaling — the cost is constant regardless of
+            // how many spends/outputs the transfer payload encodes.
+            // Source: org/tron/core/vm/PrecompiledContracts.java (the
+            // upstream commit pinned in vendored/java-tron/).
+            Self::VerifyMintProof => 150_000,
+            Self::VerifyTransferProof => 200_000,
+            Self::VerifyBurnProof => 150_000,
+            Self::MerkleHash => 500,
+            // EVM-compat extras with java-tron's pinned costs.
+            Self::Blake2F => blake2f_energy_cost(input),
+            Self::P256Verify => 6_900,
+            // Standard EVM precompiles (EcRecover, Sha256, Ripemd160,
+            // Identity, ModExp, Bn128Add, Bn128Mul, Bn128Pairing,
+            // EthRipemd160) are handled by the interpreter — their
+            // execute() returns HandledByInterpreter and the cost
+            // calculation lives in revm.
             _ => 0,
         }
     }
@@ -284,6 +302,22 @@ fn merkle_hash_precompile(input: &[u8]) -> PrecompileResult {
 /// `0x0002_0009` — EIP-152 Blake2F compression. Input layout (213 bytes):
 /// `[rounds(4 BE)|h(64 LE = 8×u64)|m(128 LE = 16×u64)|t(16 LE = 2×u64)|f(1)]`.
 ///
+/// Energy cost for Blake2F. Mirrors java-tron's
+/// `PrecompiledContracts.Blake2F.getEnergyForData`:
+///
+/// * Returns `0` if the input is malformed — exactly 213 bytes are
+///   required AND `data[212]` must be 0 or 1 (the finalization flag).
+///   A malformed input executes to an error and costs nothing.
+/// * Otherwise returns the round count from `u32` BE of `data[0..4]`
+///   (one energy per Blake2b round, matching EIP-152).
+pub(crate) fn blake2f_energy_cost(input: &[u8]) -> u64 {
+    const INPUT_LEN: usize = 213;
+    if input.len() != INPUT_LEN || (input[212] & 0xFEu8) != 0 {
+        return 0;
+    }
+    u32::from_be_bytes(input[0..4].try_into().unwrap()) as u64
+}
+
 /// Output: 64 bytes (the post-compression `h` state, little-endian).
 /// Matches java-tron's `PrecompiledContracts.Blake2F.execute` byte-for-byte
 /// by delegating to `revm::precompile::blake2::compress` for the actual
