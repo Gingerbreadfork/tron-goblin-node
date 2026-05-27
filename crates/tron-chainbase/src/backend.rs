@@ -7,6 +7,17 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+/// One write operation in a [`KvBackend::write_batch`] call. Owned
+/// bytes so callers can drain a session's pending map (or any other
+/// in-memory log) directly into the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    /// Put `value` at `key`, replacing any existing entry.
+    Put(Vec<u8>, Vec<u8>),
+    /// Delete `key`. No-op if the key doesn't exist.
+    Delete(Vec<u8>),
+}
+
 /// Minimum-viable KV interface every backend must support.
 ///
 /// Returning `Vec<u8>` here (instead of borrows) keeps the trait
@@ -17,6 +28,34 @@ pub trait KvBackend: Send + Sync {
     fn delete(&self, key: &[u8]);
     fn contains(&self, key: &[u8]) -> bool {
         self.get(key).is_some()
+    }
+
+    /// Apply `ops` as a single atomic batch. Either every operation is
+    /// visible to subsequent reads, or none is — even across a process
+    /// crash. Backends that can't provide that guarantee (test stubs,
+    /// third-party impls that pre-date this method) fall through to
+    /// the default implementation, which simply replays the ops via
+    /// `put` / `delete` in order — correct, but non-atomic.
+    ///
+    /// `MemBackend` and `RocksDbBackend` (the only production
+    /// implementors in this crate) both override with native atomic
+    /// writes: `MemBackend` acquires its inner `RwLock` write guard
+    /// once for the whole batch; `RocksDbBackend` builds a
+    /// `rocksdb::WriteBatch` and submits it with one `db.write` call,
+    /// which RocksDB writes to its WAL and applies as a single
+    /// transaction.
+    ///
+    /// Used by [`crate::SessionBackend::commit`] to drain a tx's
+    /// pending writes in one shot (so a crash mid-commit can't leave
+    /// half a tx's mutations on disk), and by the snapshot stack's
+    /// `merge` to flush a layer's tentative writes to root atomically.
+    fn write_batch(&self, ops: &[WriteOp]) {
+        for op in ops {
+            match op {
+                WriteOp::Put(k, v) => self.put(k, v),
+                WriteOp::Delete(k) => self.delete(k),
+            }
+        }
     }
 
     /// Snapshot every `(key, value)` pair currently stored. Callers get
@@ -168,5 +207,22 @@ impl KvBackend for MemBackend {
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    fn write_batch(&self, ops: &[WriteOp]) {
+        // Single write-lock acquisition — apply the whole batch
+        // atomically with respect to any other reader/writer of this
+        // backend.
+        let mut g = self.inner.write().expect("MemBackend lock poisoned");
+        for op in ops {
+            match op {
+                WriteOp::Put(k, v) => {
+                    g.insert(k.clone(), v.clone());
+                }
+                WriteOp::Delete(k) => {
+                    g.remove(k);
+                }
+            }
+        }
     }
 }

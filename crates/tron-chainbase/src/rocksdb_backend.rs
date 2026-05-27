@@ -21,9 +21,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{Options, DB};
+use rocksdb::{Options, WriteBatch, DB};
 
-use crate::backend::KvBackend;
+use crate::backend::{KvBackend, WriteOp};
 
 /// Wraps a single RocksDB instance (one store, one directory).
 pub struct RocksDbBackend {
@@ -258,6 +258,33 @@ impl KvBackend for RocksDbBackend {
 
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.rocks_scan_prefix(prefix)
+    }
+
+    fn write_batch(&self, ops: &[WriteOp]) {
+        // Native RocksDB `WriteBatch` — atomic across the whole batch.
+        // RocksDB writes the batch to its WAL before applying to the
+        // MemTable, so a crash mid-write either replays the whole
+        // batch on recovery or none of it. The per-call `put`/`delete`
+        // path gets the same WAL durability per-key, but loses the
+        // cross-key atomicity that the executor's per-tx commit relies
+        // on (one tx writing accounts A and B can't be split into
+        // "wrote A but not B" by a crash).
+        if ops.is_empty() {
+            return;
+        }
+        let mut batch = WriteBatch::default();
+        for op in ops {
+            match op {
+                WriteOp::Put(k, v) => batch.put(k, v),
+                WriteOp::Delete(k) => batch.delete(k),
+            }
+        }
+        if let Err(e) = self.db.write(batch) {
+            // Same fail-loud policy as the per-call `put`/`delete`
+            // panics — see those for the rationale (no fallible-write
+            // path on the trait; the alternative is silent corruption).
+            panic!("rocksdb write_batch failed: {e}");
+        }
     }
 }
 

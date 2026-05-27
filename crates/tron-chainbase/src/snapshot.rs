@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::backend::KvBackend;
+use crate::backend::{KvBackend, WriteOp};
 
 /// Per-layer tentative state. `None` value means "tombstone" — the
 /// key was deleted in this layer.
@@ -82,6 +82,14 @@ impl SnapshotKvBackend {
     /// tentative writes become permanent).
     ///
     /// No-op when the stack is empty.
+    ///
+    /// **Root-flush atomicity**: when the squashed layer goes to root
+    /// (not an in-memory layer below), the writes are submitted as a
+    /// single [`KvBackend::write_batch`]. Without that, a crash mid-flush
+    /// could leave the root partially mutated AND the snapshot layer
+    /// already popped — no way to recover the unwritten entries.
+    /// RocksDB's WriteBatch + WAL is what makes the all-or-nothing
+    /// recovery guarantee hold across crashes.
     pub fn merge(&self) {
         let mut g = self.state.write().expect("snapshot lock poisoned");
         let Some(top) = g.layers.pop() else {
@@ -93,13 +101,18 @@ impl SnapshotKvBackend {
             }
             return;
         }
-        // No remaining layer → flush to root.
-        for (k, v) in top {
-            match v {
-                Some(value) => self.root.put(&k, &value),
-                None => self.root.delete(&k),
-            }
+        // No remaining layer → flush to root as a single atomic batch.
+        if top.is_empty() {
+            return;
         }
+        let ops: Vec<WriteOp> = top
+            .into_iter()
+            .map(|(k, v)| match v {
+                Some(value) => WriteOp::Put(k, value),
+                None => WriteOp::Delete(k),
+            })
+            .collect();
+        self.root.write_batch(&ops);
     }
 
     /// Squash every layer into the root. Equivalent to repeated
@@ -459,6 +472,119 @@ mod tests {
         // underlying state.
         snap.revoke();
         assert!(dyn_ref.get(b"k").is_none());
+    }
+
+    /// **C-6 pin.** Squashing the bottom layer to root MUST route
+    /// through `root.write_batch` (one call, all ops at once), NOT
+    /// through per-key `put`/`delete` loops. Without the batch, a
+    /// crash mid-flush leaves the root partially mutated AND the
+    /// snapshot layer already popped — no way to recover. The batch
+    /// path inherits RocksDB's WriteBatch + WAL atomicity.
+    #[test]
+    fn bottom_layer_flush_routes_through_root_write_batch() {
+        use std::sync::Mutex;
+        use crate::backend::WriteOp;
+
+        struct RecordingRoot {
+            inner: MemBackend,
+            batches: Mutex<Vec<Vec<WriteOp>>>,
+            per_call_puts: Mutex<usize>,
+            per_call_deletes: Mutex<usize>,
+        }
+
+        impl KvBackend for RecordingRoot {
+            fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) {
+                *self.per_call_puts.lock().unwrap() += 1;
+                self.inner.put(key, value);
+            }
+            fn delete(&self, key: &[u8]) {
+                *self.per_call_deletes.lock().unwrap() += 1;
+                self.inner.delete(key);
+            }
+            fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+                self.inner.scan_all()
+            }
+            fn write_batch(&self, ops: &[WriteOp]) {
+                self.batches.lock().unwrap().push(ops.to_vec());
+                self.inner.write_batch(ops);
+            }
+        }
+
+        let root = Arc::new(RecordingRoot {
+            inner: MemBackend::new(),
+            batches: Mutex::new(Vec::new()),
+            per_call_puts: Mutex::new(0),
+            per_call_deletes: Mutex::new(0),
+        });
+        let snap = SnapshotKvBackend::new(root.clone() as Arc<dyn KvBackend>);
+        snap.advance();
+        snap.put(b"a", b"1");
+        snap.put(b"b", b"2");
+        snap.delete(b"c");
+        snap.merge(); // bottom → flushed to root
+
+        let batches = root.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1, "expected one batch flush, got {}", batches.len());
+        assert_eq!(
+            batches[0].len(),
+            3,
+            "all three pending ops should be in the single batch"
+        );
+        drop(batches);
+        assert_eq!(
+            *root.per_call_puts.lock().unwrap(),
+            0,
+            "merge must NOT fall back to per-key put"
+        );
+        assert_eq!(
+            *root.per_call_deletes.lock().unwrap(),
+            0,
+            "merge must NOT fall back to per-key delete"
+        );
+    }
+
+    /// Empty bottom layer doesn't even invoke `write_batch` — short-
+    /// circuit to avoid spurious empty-batch lock acquisitions on
+    /// the hot path.
+    #[test]
+    fn bottom_layer_flush_with_no_writes_is_noop() {
+        use std::sync::Mutex;
+        use crate::backend::WriteOp;
+
+        struct CountingRoot {
+            inner: MemBackend,
+            calls: Mutex<usize>,
+        }
+        impl KvBackend for CountingRoot {
+            fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) {
+                self.inner.put(key, value);
+            }
+            fn delete(&self, key: &[u8]) {
+                self.inner.delete(key);
+            }
+            fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+                self.inner.scan_all()
+            }
+            fn write_batch(&self, ops: &[WriteOp]) {
+                *self.calls.lock().unwrap() += 1;
+                self.inner.write_batch(ops);
+            }
+        }
+
+        let root = Arc::new(CountingRoot {
+            inner: MemBackend::new(),
+            calls: Mutex::new(0),
+        });
+        let snap = SnapshotKvBackend::new(root.clone() as Arc<dyn KvBackend>);
+        snap.advance();
+        snap.merge(); // empty bottom layer → flushed to root with nothing to do
+        assert_eq!(*root.calls.lock().unwrap(), 0);
     }
 
     use std::collections::HashSet;

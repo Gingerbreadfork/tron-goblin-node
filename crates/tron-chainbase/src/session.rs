@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use crate::backend::KvBackend;
+use crate::backend::{KvBackend, WriteOp};
 
 /// A single pending mutation in a session's overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,23 +68,30 @@ impl SessionBackend {
     /// (they see whatever the parent now contains); future writes start
     /// a fresh overlay.
     ///
-    /// **Atomicity**: the writes are pushed to the parent one at a
-    /// time. Iteration order is unspecified (`HashMap`). Any caller
-    /// that needs cross-key atomicity guarantees beyond "all-or-revert"
-    /// must use a parent that itself supports batch writes (e.g. a
-    /// RocksDB WriteBatch — not currently wired through the
-    /// `KvBackend` trait, but room exists for it).
+    /// **Atomicity**: the writes are pushed to the parent through a
+    /// single [`KvBackend::write_batch`] call. The atomicity guarantee
+    /// the caller gets is the parent's — `MemBackend` applies the whole
+    /// batch under one write-lock; `RocksDbBackend` submits a single
+    /// `rocksdb::WriteBatch` (WAL-backed, all-or-nothing across a
+    /// crash). A custom parent that doesn't override `write_batch`
+    /// falls back to per-key `put`/`delete`, which is non-atomic — fine
+    /// for test stubs, not for production stores.
     pub fn commit(&self) {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
             std::mem::take(&mut *g)
         };
-        for (key, op) in drained {
-            match op {
-                Op::Put(value) => self.parent.put(&key, &value),
-                Op::Delete => self.parent.delete(&key),
-            }
+        if drained.is_empty() {
+            return;
         }
+        let ops: Vec<WriteOp> = drained
+            .into_iter()
+            .map(|(key, op)| match op {
+                Op::Put(value) => WriteOp::Put(key, value),
+                Op::Delete => WriteOp::Delete(key),
+            })
+            .collect();
+        self.parent.write_batch(&ops);
     }
 
     /// Same as [`commit`], but for every pending key, read the parent's
@@ -99,22 +106,30 @@ impl SessionBackend {
     /// must `delete` it). `before == Some(v)` means rollback must `put`
     /// the old value back.
     ///
+    /// Reads the parent's current value for every drained key BEFORE
+    /// submitting the batch — captures the true pre-images. The batch
+    /// itself is atomic per the same guarantees as [`commit`].
+    ///
     /// [`commit`]: SessionBackend::commit
     pub fn commit_with_undo(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
             std::mem::take(&mut *g)
         };
+        if drained.is_empty() {
+            return Vec::new();
+        }
         let mut undo = Vec::with_capacity(drained.len());
+        let mut ops = Vec::with_capacity(drained.len());
         for (key, op) in drained {
-            // Read parent BEFORE writing — captures the true pre-image.
             let before = self.parent.get(&key);
             undo.push((key.clone(), before));
-            match op {
-                Op::Put(value) => self.parent.put(&key, &value),
-                Op::Delete => self.parent.delete(&key),
-            }
+            ops.push(match op {
+                Op::Put(value) => WriteOp::Put(key, value),
+                Op::Delete => WriteOp::Delete(key),
+            });
         }
+        self.parent.write_batch(&ops);
         undo
     }
 
