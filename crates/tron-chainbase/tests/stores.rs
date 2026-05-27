@@ -762,3 +762,59 @@ fn witness_store_all_returns_every_registered_witness() {
     let sum: i64 = all.iter().map(|(_, w)| w.vote_count).sum();
     assert_eq!(sum, 600);
 }
+
+#[test]
+fn rocksdb_write_batch_sync_produces_same_state_as_write_batch() {
+    use tron_chainbase::WriteOp;
+
+    let async_dir = rocks_tempdir();
+    let sync_dir = rocks_tempdir();
+    let async_be = RocksDbBackend::open(&async_dir).unwrap();
+    let sync_be = RocksDbBackend::open(&sync_dir).unwrap();
+
+    let ops = vec![
+        WriteOp::Put(b"a".to_vec(), b"1".to_vec()),
+        WriteOp::Put(b"b".to_vec(), b"2".to_vec()),
+        WriteOp::Delete(b"c".to_vec()), // tombstone on never-existed
+        WriteOp::Put(b"d".to_vec(), vec![0u8; 4096]),
+    ];
+    async_be.write_batch(&ops);
+    sync_be.write_batch_sync(&ops);
+
+    assert_eq!(async_be.scan_all(), sync_be.scan_all());
+    // Both should see the writes:
+    assert_eq!(sync_be.get(b"a"), Some(b"1".to_vec()));
+    assert_eq!(sync_be.get(b"d"), Some(vec![0u8; 4096]));
+
+    std::fs::remove_dir_all(&async_dir).ok();
+    std::fs::remove_dir_all(&sync_dir).ok();
+}
+
+#[test]
+fn rocksdb_write_batch_sync_empty_ops_is_noop() {
+    let dir = rocks_tempdir();
+    let be = RocksDbBackend::open(&dir).unwrap();
+    be.put(b"k", b"v");
+    be.write_batch_sync(&[]);
+    assert_eq!(be.get(b"k"), Some(b"v".to_vec()));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A RocksDB store opened with paranoid_checks(true) still reads
+/// and writes normally — the safety knob doesn't change observable
+/// behavior on a healthy data dir. (Verifies the open paths picked
+/// up the new safety_baseline without breaking anything.)
+#[test]
+fn rocksdb_paranoid_checks_does_not_change_happy_path_behavior() {
+    let dir = rocks_tempdir();
+    {
+        let be = RocksDbBackend::open(&dir).unwrap();
+        be.put(b"alpha", b"1");
+        be.put(b"beta", b"2");
+    }
+    // Re-open: paranoid_checks should NOT reject a clean DB.
+    let be = RocksDbBackend::open(&dir).unwrap();
+    assert_eq!(be.get(b"alpha"), Some(b"1".to_vec()));
+    assert_eq!(be.get(b"beta"), Some(b"2".to_vec()));
+    std::fs::remove_dir_all(&dir).ok();
+}

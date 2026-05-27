@@ -261,8 +261,21 @@ impl BlockUndoStore {
     /// entry — which only happens during a reorg where we're
     /// re-applying a block we previously rolled back, and the new
     /// log supersedes the old one.
+    ///
+    /// Uses [`KvBackend::write_batch_sync`] (single-op batch) so the
+    /// fsync runs before this returns. Without that, a power loss
+    /// between block-apply and the next checkpoint can lose the
+    /// rollback log — meaning a later reorg has no way to undo a
+    /// block whose state writes did survive. The single-op batch is
+    /// the cheapest API on `KvBackend` that exposes the sync option;
+    /// the cost of one extra heap allocation per block is dwarfed
+    /// by the fsync itself.
     pub fn put(&self, block_num: i64, record: &BlockUndoRecord) {
-        self.backend.put(&num_key(block_num), &record.encode());
+        let ops = [crate::backend::WriteOp::Put(
+            num_key(block_num).to_vec(),
+            record.encode(),
+        )];
+        self.backend.write_batch_sync(&ops);
     }
 
     /// Read the undo log for `block_num`. `None` when there's no

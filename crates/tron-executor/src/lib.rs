@@ -1190,10 +1190,14 @@ impl BlockSession {
         let checkpoint_id = checkpoint.write(&entries)?;
 
         // (4) Per-store flush. Each call goes straight to the base
-        //     backend (not the drained session) and uses the parent's
-        //     `write_batch` — RocksDB native WriteBatch under the hood.
+        //     backend (not the drained session) and uses
+        //     `write_batch_sync` — RocksDB native WriteBatch with
+        //     `WriteOptions { sync: true }`. The fsync is required
+        //     so step (5)'s manifest delete is safe: once we return
+        //     from write_batch_sync the per-store WAL is on disk, so
+        //     losing the manifest no longer means losing the writes.
         for (id, base, ops, undo) in drained {
-            base.write_batch(&ops);
+            base.write_batch_sync(&ops);
             for (key, before) in undo {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
             }

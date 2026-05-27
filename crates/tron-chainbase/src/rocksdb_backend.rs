@@ -21,9 +21,26 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocksdb::{Options, WriteBatch, DB};
+use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 
 use crate::backend::{KvBackend, WriteOp};
+
+/// Build an `Options` with the parity-friendly defaults this crate
+/// applies to every RocksDB open path. Centralised so the four open
+/// paths (rw, tuned, read-only, secondary) can't drift on which
+/// safety knobs they enable.
+///
+/// * `paranoid_checks(true)` — RocksDB compares SST checksums
+///   aggressively at open time and during compactions. Catches a
+///   silently-bit-rotting SST early (load-time error rather than
+///   serving wrong bytes for the rest of the run). Cheap — metadata
+///   reads only at open; the per-block-read overhead is negligible.
+fn safety_baseline() -> Options {
+    let mut opts = Options::default();
+    opts.set_paranoid_checks(true);
+    opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+    opts
+}
 
 /// Wraps a single RocksDB instance (one store, one directory).
 pub struct RocksDbBackend {
@@ -49,9 +66,8 @@ impl RocksDbBackend {
     /// [`Options`] via [`open_with`] or use [`open_tuned`] if you need
     /// to match a specific java-tron `dbSettings` value.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RocksDbError> {
-        let mut opts = Options::default();
+        let mut opts = safety_baseline();
         opts.create_if_missing(true);
-        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
         Self::open_with(path, opts)
     }
 
@@ -64,10 +80,10 @@ impl RocksDbBackend {
         write_buffer_mb: usize,
         max_open_files: i32,
     ) -> Result<Self, RocksDbError> {
-        let mut opts = Options::default();
+        let mut opts = safety_baseline();
         opts.create_if_missing(true);
         opts.set_write_buffer_size(write_buffer_mb * 1024 * 1024);
-        opts.set_max_open_files(max_open_files);
+        opts.set_max_open_files(max_open_files); // overrides safety_baseline default
         Self::open_with(path, opts)
     }
 
@@ -104,8 +120,7 @@ impl RocksDbBackend {
     /// Open `path` read-only. Useful for `dump-blocks`-style tools that
     /// inspect a live java-tron data dir without risking a write.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, RocksDbError> {
-        let mut opts = Options::default();
-        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+        let opts = safety_baseline();
         let db = DB::open_for_read_only(&opts, path, /* error_if_log_file_exist */ false)?;
         Ok(Self { db: Arc::new(db) })
     }
@@ -127,8 +142,7 @@ impl RocksDbBackend {
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
     ) -> Result<Self, RocksDbError> {
-        let mut opts = Options::default();
-        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+        let opts = safety_baseline();
         // `DB::open_as_secondary` requires both paths to share one `P`
         // type parameter; convert both to `&Path` first.
         let db = DB::open_as_secondary(&opts, primary_path.as_ref(), secondary_path.as_ref())?;
@@ -272,13 +286,7 @@ impl KvBackend for RocksDbBackend {
         if ops.is_empty() {
             return;
         }
-        let mut batch = WriteBatch::default();
-        for op in ops {
-            match op {
-                WriteOp::Put(k, v) => batch.put(k, v),
-                WriteOp::Delete(k) => batch.delete(k),
-            }
-        }
+        let batch = build_batch(ops);
         if let Err(e) = self.db.write(batch) {
             // Same fail-loud policy as the per-call `put`/`delete`
             // panics — see those for the rationale (no fallible-write
@@ -286,6 +294,36 @@ impl KvBackend for RocksDbBackend {
             panic!("rocksdb write_batch failed: {e}");
         }
     }
+
+    fn write_batch_sync(&self, ops: &[WriteOp]) {
+        // Same as `write_batch` but with `WriteOptions { sync: true }`.
+        // RocksDB fsyncs the WAL before returning, so a kernel panic
+        // / power loss between this call and the next can't lose the
+        // writes. Used on the consensus-critical block-flush path
+        // (cross-store CheckPointV2 commit) — once this returns,
+        // deleting the manifest is safe because the per-store WAL is
+        // durably on disk.
+        if ops.is_empty() {
+            return;
+        }
+        let batch = build_batch(ops);
+        let mut wopts = WriteOptions::default();
+        wopts.set_sync(true);
+        if let Err(e) = self.db.write_opt(batch, &wopts) {
+            panic!("rocksdb write_batch_sync failed: {e}");
+        }
+    }
+}
+
+fn build_batch(ops: &[WriteOp]) -> WriteBatch {
+    let mut batch = WriteBatch::default();
+    for op in ops {
+        match op {
+            WriteOp::Put(k, v) => batch.put(k, v),
+            WriteOp::Delete(k) => batch.delete(k),
+        }
+    }
+    batch
 }
 
 #[derive(Debug, thiserror::Error)]

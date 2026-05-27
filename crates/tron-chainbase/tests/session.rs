@@ -682,3 +682,24 @@ fn drain_pending_on_empty_session_is_noop() {
     assert!(ops.is_empty());
     assert!(undo.is_empty());
 }
+
+// === write_batch_sync default delegation ====================================
+
+/// The default `write_batch_sync` impl on `KvBackend` delegates to
+/// `write_batch`. MemBackend doesn't override it (no persistent
+/// storage to fsync), so this pins that delegation is in place —
+/// callers that switch from `write_batch` to `write_batch_sync` for
+/// durability get the same observable state from a memory backend.
+#[test]
+fn write_batch_sync_default_matches_write_batch_on_mem_backend() {
+    let async_be = MemBackend::new();
+    let sync_be = MemBackend::new();
+    let ops = vec![
+        WriteOp::Put(b"a".to_vec(), b"1".to_vec()),
+        WriteOp::Delete(b"missing".to_vec()),
+        WriteOp::Put(b"b".to_vec(), b"2".to_vec()),
+    ];
+    async_be.write_batch(&ops);
+    sync_be.write_batch_sync(&ops);
+    assert_eq!(async_be.scan_all(), sync_be.scan_all());
+}

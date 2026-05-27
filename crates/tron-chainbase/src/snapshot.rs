@@ -219,6 +219,54 @@ impl KvBackend for SnapshotKvBackend {
         SnapshotKvBackend::contains(self, key)
     }
 
+    /// Atomic batch write. When the snapshot stack is empty (depth =
+    /// 0) the batch flows straight to the root — for RocksDB roots
+    /// this means a single native `WriteBatch`, preserving per-store
+    /// atomicity across the keys in `ops`. When layers exist, the
+    /// batch is applied to the topmost layer under a single lock
+    /// acquisition (atomic from the perspective of any concurrent
+    /// reader of this snapshot wrapper).
+    fn write_batch(&self, ops: &[crate::backend::WriteOp]) {
+        if ops.is_empty() {
+            return;
+        }
+        let mut g = self.state.write().expect("snapshot lock poisoned");
+        if let Some(top) = g.layers.last_mut() {
+            for op in ops {
+                match op {
+                    crate::backend::WriteOp::Put(k, v) => {
+                        top.insert(k.clone(), Some(v.clone()));
+                    }
+                    crate::backend::WriteOp::Delete(k) => {
+                        top.insert(k.clone(), None);
+                    }
+                }
+            }
+            return;
+        }
+        drop(g);
+        self.root.write_batch(ops);
+    }
+
+    /// Sync variant — only meaningful at depth = 0 (writes are going
+    /// to the persistent root). When a layer is on top, the batch is
+    /// in-memory by definition and the fsync is a no-op; we degrade
+    /// gracefully to the non-sync overlay path. The whole point of
+    /// the stack layers is that they aren't durable yet.
+    fn write_batch_sync(&self, ops: &[crate::backend::WriteOp]) {
+        if ops.is_empty() {
+            return;
+        }
+        let g = self.state.read().expect("snapshot lock poisoned");
+        let has_layers = !g.layers.is_empty();
+        drop(g);
+        if has_layers {
+            self.write_batch(ops);
+            return;
+        }
+        self.root.write_batch_sync(ops);
+    }
+
     fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         // Start from the root's full key set, then overlay tentative
         // writes (puts/deletes) from each layer in order. We use a
@@ -588,4 +636,148 @@ mod tests {
     }
 
     use std::collections::HashSet;
+
+    /// At depth = 0, `write_batch` forwards to the root's
+    /// `write_batch` in one call — that's what gives the executor's
+    /// per-store flush per-store atomicity even when the SnapshotKv
+    /// wrapper is in front of RocksDB.
+    #[test]
+    fn write_batch_at_depth_zero_forwards_to_root_in_one_call() {
+        use std::sync::Mutex;
+
+        struct CountingRoot {
+            inner: MemBackend,
+            batch_calls: Mutex<usize>,
+            put_calls: Mutex<usize>,
+        }
+        impl KvBackend for CountingRoot {
+            fn get(&self, k: &[u8]) -> Option<Vec<u8>> {
+                self.inner.get(k)
+            }
+            fn put(&self, k: &[u8], v: &[u8]) {
+                *self.put_calls.lock().unwrap() += 1;
+                self.inner.put(k, v);
+            }
+            fn delete(&self, k: &[u8]) {
+                self.inner.delete(k);
+            }
+            fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+                self.inner.scan_all()
+            }
+            fn write_batch(&self, ops: &[crate::backend::WriteOp]) {
+                *self.batch_calls.lock().unwrap() += 1;
+                self.inner.write_batch(ops);
+            }
+        }
+        let root = Arc::new(CountingRoot {
+            inner: MemBackend::new(),
+            batch_calls: Mutex::new(0),
+            put_calls: Mutex::new(0),
+        });
+        let snap = SnapshotKvBackend::new(root.clone() as Arc<dyn KvBackend>);
+        snap.write_batch(&[
+            crate::backend::WriteOp::Put(b"a".to_vec(), b"1".to_vec()),
+            crate::backend::WriteOp::Put(b"b".to_vec(), b"2".to_vec()),
+        ]);
+        assert_eq!(*root.batch_calls.lock().unwrap(), 1);
+        assert_eq!(*root.put_calls.lock().unwrap(), 0);
+        assert_eq!(snap.get(b"a"), Some(b"1".to_vec()));
+        assert_eq!(snap.get(b"b"), Some(b"2".to_vec()));
+    }
+
+    /// When layers are pushed, `write_batch` applies in-memory under
+    /// one lock — does NOT touch root (which would be a correctness
+    /// bug: layers are tentative).
+    #[test]
+    fn write_batch_with_layer_writes_only_to_top_layer() {
+        use std::sync::Mutex;
+
+        struct CountingRoot {
+            inner: MemBackend,
+            batch_calls: Mutex<usize>,
+            put_calls: Mutex<usize>,
+        }
+        impl KvBackend for CountingRoot {
+            fn get(&self, k: &[u8]) -> Option<Vec<u8>> {
+                self.inner.get(k)
+            }
+            fn put(&self, k: &[u8], v: &[u8]) {
+                *self.put_calls.lock().unwrap() += 1;
+                self.inner.put(k, v);
+            }
+            fn delete(&self, k: &[u8]) {
+                self.inner.delete(k);
+            }
+            fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+                self.inner.scan_all()
+            }
+            fn write_batch(&self, ops: &[crate::backend::WriteOp]) {
+                *self.batch_calls.lock().unwrap() += 1;
+                self.inner.write_batch(ops);
+            }
+        }
+        let root = Arc::new(CountingRoot {
+            inner: MemBackend::new(),
+            batch_calls: Mutex::new(0),
+            put_calls: Mutex::new(0),
+        });
+        let snap = SnapshotKvBackend::new(root.clone() as Arc<dyn KvBackend>);
+        snap.advance();
+        snap.write_batch(&[
+            crate::backend::WriteOp::Put(b"a".to_vec(), b"1".to_vec()),
+            crate::backend::WriteOp::Delete(b"b".to_vec()),
+        ]);
+        // Root untouched.
+        assert_eq!(*root.batch_calls.lock().unwrap(), 0);
+        assert_eq!(*root.put_calls.lock().unwrap(), 0);
+        // Snapshot sees the writes (tentative).
+        assert_eq!(snap.get(b"a"), Some(b"1".to_vec()));
+        assert_eq!(snap.get(b"b"), None);
+    }
+
+    /// `write_batch_sync` at depth 0 forwards to the root's sync
+    /// variant. The default impl on MemBackend delegates to
+    /// write_batch — so we use a custom root that counts which
+    /// method was called.
+    #[test]
+    fn write_batch_sync_at_depth_zero_forwards_to_root_sync() {
+        use std::sync::Mutex;
+
+        struct CountingRoot {
+            inner: MemBackend,
+            sync_calls: Mutex<usize>,
+            async_calls: Mutex<usize>,
+        }
+        impl KvBackend for CountingRoot {
+            fn get(&self, k: &[u8]) -> Option<Vec<u8>> {
+                self.inner.get(k)
+            }
+            fn put(&self, k: &[u8], v: &[u8]) {
+                self.inner.put(k, v);
+            }
+            fn delete(&self, k: &[u8]) {
+                self.inner.delete(k);
+            }
+            fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+                self.inner.scan_all()
+            }
+            fn write_batch(&self, ops: &[crate::backend::WriteOp]) {
+                *self.async_calls.lock().unwrap() += 1;
+                self.inner.write_batch(ops);
+            }
+            fn write_batch_sync(&self, ops: &[crate::backend::WriteOp]) {
+                *self.sync_calls.lock().unwrap() += 1;
+                self.inner.write_batch(ops);
+            }
+        }
+        let root = Arc::new(CountingRoot {
+            inner: MemBackend::new(),
+            sync_calls: Mutex::new(0),
+            async_calls: Mutex::new(0),
+        });
+        let snap = SnapshotKvBackend::new(root.clone() as Arc<dyn KvBackend>);
+        snap.write_batch_sync(&[crate::backend::WriteOp::Put(b"a".to_vec(), b"1".to_vec())]);
+        assert_eq!(*root.sync_calls.lock().unwrap(), 1);
+        assert_eq!(*root.async_calls.lock().unwrap(), 0);
+    }
 }

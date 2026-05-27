@@ -58,6 +58,32 @@ pub trait KvBackend: Send + Sync {
         }
     }
 
+    /// Apply `ops` as a single atomic batch AND fsync the WAL before
+    /// returning. The "atomic" guarantee matches [`write_batch`]; the
+    /// "sync" guarantee adds **durability against power loss** — when
+    /// this returns Ok, the writes survive a kernel panic / pulled
+    /// plug, not just a process crash.
+    ///
+    /// Use this for consensus-critical writes where losing the write
+    /// would put the chain into an inconsistent state on restart —
+    /// notably the per-store flush inside the CheckPointV2 commit
+    /// path (so deleting the manifest is safe), and the block-undo
+    /// log (so rollback isn't lost on power loss).
+    ///
+    /// Non-critical writes (mempool entries, peer-state cache) should
+    /// stay on [`write_batch`] — the extra fsync per write is ~10×
+    /// slower and they're recoverable from peers anyway.
+    ///
+    /// Default impl delegates to [`write_batch`] — non-RocksDB
+    /// backends (MemBackend, test stubs) treat both the same since
+    /// they have no persistent storage to fsync. RocksDB overrides
+    /// with `WriteOptions { sync: true }`.
+    ///
+    /// [`write_batch`]: KvBackend::write_batch
+    fn write_batch_sync(&self, ops: &[WriteOp]) {
+        self.write_batch(ops);
+    }
+
     /// Snapshot every `(key, value)` pair currently stored. Callers get
     /// owned bytes to avoid lifetime entanglement with internal locks.
     /// Iteration order is ascending byte-lexicographic (matches RocksDB
