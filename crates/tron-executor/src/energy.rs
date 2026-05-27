@@ -17,13 +17,19 @@
 //! maintenance pass can drive the `TOTAL_ENERGY_CURRENT_LIMIT` adaptive
 //! adjustment (see [`crate::adaptive`]).
 //!
-//! **Note on contract-owner energy (`origin_energy_usage`).** java-tron's
-//! full `TransactionTrace.pay()` flow splits the energy cost between the
-//! contract origin (limited by `originEnergyLimit / consumeUserResourcePercent`)
-//! and the caller. The current implementation models only the caller's
-//! share — origin-side accounting is pinned as a follow-up gap. The
-//! divergence affects contracts that set `consume_user_resource_percent < 100`
-//! (rare on mainnet — most user-facing contracts charge the caller 100%).
+//! ## Origin / caller split
+//!
+//! For `TriggerSmartContract`, java-tron's `TransactionTrace.pay()` →
+//! `ReceiptCapsule.payEnergyBill` splits the total energy cost between
+//! the contract's `origin_address` (the deployer who agreed to subsidize
+//! `100 - consume_user_resource_percent` of each call) and the
+//! `caller_address` (the user invoking the contract). [`pay_energy_bill`]
+//! implements that split; [`consume_energy`] remains the per-account
+//! frozen-quota-then-TRX-fee primitive used by both halves of the
+//! split as well as by non-VM bandwidth charging.
+//!
+//! `CreateSmartContract` has no pre-existing origin (the caller IS the
+//! origin), so the split degenerates and the caller pays everything.
 
 use tron_chainbase::{AccountStore, DynamicPropertiesStore, StoreError};
 use tron_crypto::address::Address;
@@ -245,6 +251,152 @@ fn account_energy_usage(account: &Account) -> i64 {
 
 fn head_block_timestamp(dyn_props: &DynamicPropertiesStore) -> i64 {
     dyn_props.latest_block_header_timestamp().unwrap_or(0)
+}
+
+/// Result of `pay_energy_bill`: the origin's contribution (if any) and
+/// the caller's. The origin's share is always `EnergyCharge::Frozen`
+/// (origin only contributes from its frozen quota, never a TRX fee —
+/// the pre-clamp guarantees `originUsage <= origin_quota_left`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnergyBill {
+    /// `None` when no split applied (caller == origin, origin missing,
+    /// or the percent / origin-quota math produced zero origin usage).
+    pub origin_charge: Option<EnergyCharge>,
+    /// The caller's slice — always present, may be `EnergyCharge::Frozen`
+    /// with `energy_used = 0` if origin covered the whole bill.
+    pub caller_charge: EnergyCharge,
+}
+
+/// java-tron's `consume_user_resource_percent` is the percentage of
+/// each call's energy charged to the CALLER. The origin pays the
+/// complement, clamped to `[0, 100]` defensively against bad contract
+/// rows. Mirrors `payEnergyBill`'s `percent` derivation.
+fn origin_percent(consume_user_resource_percent: i64) -> i64 {
+    (100 - consume_user_resource_percent).clamp(0, 100)
+}
+
+/// How much energy the origin account could pay from its frozen quota
+/// right now. Reads the same `account_resource.energy_usage` +
+/// windowed-decay primitive `consume_energy` uses, so the two stay
+/// consistent. Returns 0 if the account has no row.
+///
+/// Pre-clamping the origin's share by this value guarantees the
+/// subsequent `consume_energy` call against origin can never go through
+/// the TRX-fee path (origin never pays a fee — that's the caller's
+/// responsibility per `payEnergyBill`).
+fn origin_quota_left(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    origin: &Address,
+    now_slot: i64,
+) -> Result<i64, EnergyError> {
+    let Some(account) = accounts.get(origin)? else {
+        return Ok(0);
+    };
+    let res = account.account_resource.unwrap_or_default();
+    let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
+    let decayed_usage = if support_unfreeze_delay {
+        recovery(
+            res.energy_usage,
+            res.latest_consume_time_for_energy,
+            now_slot,
+            res.energy_window_size,
+        )
+    } else {
+        increase_default(
+            res.energy_usage,
+            0,
+            res.latest_consume_time_for_energy,
+            now_slot,
+        )
+    };
+    let energy_limit = calculate_global_energy_limit(&account, dyn_props);
+    Ok(energy_limit.saturating_sub(decayed_usage).max(0))
+}
+
+/// Top-level energy charge for a smart-contract tx — splits the bill
+/// between the contract origin and the caller per java-tron's
+/// `TransactionTrace.pay()` + `ReceiptCapsule.payEnergyBill`.
+///
+/// * `origin`: the contract's deployer (from `SmartContract.origin_address`).
+///   Pass `None` for `CreateSmartContract` (no pre-existing origin), for
+///   contracts whose row is missing from `ContractStore`, or any other
+///   case where the split should collapse to "caller pays everything".
+/// * `origin_energy_limit`: the contract's per-tx cap on its deployer's
+///   subsidy (`SmartContract.origin_energy_limit`). Ignored when `origin`
+///   is `None`.
+/// * `consume_user_resource_percent`: the % charged to the caller
+///   (`SmartContract.consume_user_resource_percent`); the origin pays
+///   `100 - this`, clamped to `[0, 100]`. Ignored when `origin` is `None`.
+///
+/// Returns an [`EnergyBill`] describing what each party paid. Mutates
+/// both account rows. Insufficient caller funds returns
+/// [`EnergyError::Insufficient`] and rolls nothing — but ONLY after
+/// origin's frozen quota has been debited (mirrors java-tron, which
+/// runs `useEnergy(origin)` before `payEnergyBill(caller)`); the
+/// session-level revert in the executor undoes both writes atomically.
+pub fn pay_energy_bill(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    caller: &Address,
+    origin: Option<&Address>,
+    origin_energy_limit: i64,
+    consume_user_resource_percent: i64,
+    energy_used: u64,
+    now_slot: i64,
+) -> Result<EnergyBill, EnergyError> {
+    // Collapse to caller-pays-all when there's no distinct origin.
+    let origin_addr = match origin {
+        None => {
+            return Ok(EnergyBill {
+                origin_charge: None,
+                caller_charge: consume_energy(accounts, dyn_props, caller, energy_used, now_slot)?,
+            });
+        }
+        Some(o) if o == caller => {
+            return Ok(EnergyBill {
+                origin_charge: None,
+                caller_charge: consume_energy(accounts, dyn_props, caller, energy_used, now_slot)?,
+            });
+        }
+        Some(o) => o,
+    };
+
+    let percent = origin_percent(consume_user_resource_percent);
+    let total_i = energy_used as i64;
+    // `originUsage = total * percent / 100`, then clamped to the
+    // smaller of (a) origin's remaining frozen quota, (b) the
+    // per-contract `origin_energy_limit`. Both clamps are non-negative
+    // so the result fits in i64 without overflow concerns.
+    let origin_share_raw = total_i.saturating_mul(percent) / 100;
+    let origin_left = origin_quota_left(accounts, dyn_props, origin_addr, now_slot)?;
+    let origin_usage = origin_share_raw
+        .min(origin_left)
+        .min(origin_energy_limit.max(0))
+        .max(0);
+    let caller_usage = (total_i - origin_usage).max(0) as u64;
+
+    // Debit origin first (frozen-only — guaranteed by the pre-clamp).
+    let origin_charge = if origin_usage > 0 {
+        Some(consume_energy(
+            accounts,
+            dyn_props,
+            origin_addr,
+            origin_usage as u64,
+            now_slot,
+        )?)
+    } else {
+        None
+    };
+    // Then debit caller. If the caller can't cover, `consume_energy`
+    // returns `Insufficient` and the executor reverts the whole
+    // session — origin's debit comes back with it.
+    let caller_charge = consume_energy(accounts, dyn_props, caller, caller_usage, now_slot)?;
+
+    Ok(EnergyBill {
+        origin_charge,
+        caller_charge,
+    })
 }
 
 /// Pay the energy-side fee (matches `BandwidthProcessor.consumeFeeForBandwidth`

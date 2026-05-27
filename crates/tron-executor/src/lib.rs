@@ -1780,7 +1780,7 @@ fn execute_vm_tx(
     // energy_fee`. Until that flow lands we keep the 10M cap.
     let now_slot = dp.latest_block_header_number().unwrap_or(0);
 
-    let (caller_addr, outcome, vm_traces) = match ty {
+    let (caller_addr, trigger_contract_addr, outcome, vm_traces) = match ty {
         ContractType::TriggerSmartContract => {
             let trigger: tron_proto::TriggerSmartContract =
                 match prost::Message::decode(parameter.value.as_slice()) {
@@ -1799,13 +1799,14 @@ fn execute_vm_tx(
                     }
                 };
             let caller = address_from_proto(&trigger.owner_address);
+            let contract_addr = address_from_proto(&trigger.contract_address);
             let (outcome, traces) = tron_tvm::execute::execute_trigger_with_trace(
                 &vm_stores,
                 block_env,
                 &trigger,
                 energy_limit,
             );
-            (caller, outcome, traces)
+            (caller, contract_addr, outcome, traces)
         }
         ContractType::CreateSmartContract => {
             let create: tron_proto::CreateSmartContract =
@@ -1837,7 +1838,10 @@ fn execute_vm_tx(
                 &tx_id,
                 energy_limit,
             );
-            (caller, outcome, traces)
+            // CreateSmartContract: caller IS the origin, so no origin
+            // split applies. Pass `None` for the contract address so
+            // the energy-charge path takes the caller-pays-all branch.
+            (caller, None, outcome, traces)
         }
         _ => unreachable!("execute_vm_tx invoked for non-VM contract type"),
     };
@@ -1859,12 +1863,49 @@ fn execute_vm_tx(
         if energy_used > 0 {
             let accounts = AccountStore::new(session.accounts.clone() as _);
             let dp_store = DynamicPropertiesStore::new(session.dyn_props.clone() as _);
-            match energy::consume_energy(&accounts, &dp_store, &caller, energy_used, now_slot) {
-                Ok(_charge) => { /* state updated in-place */ }
+            // For `TriggerSmartContract`, look up the contract row to
+            // get the origin / `consume_user_resource_percent` /
+            // `origin_energy_limit` triple that drives java-tron's
+            // origin/caller energy split (`ReceiptCapsule.payEnergyBill`).
+            // For `CreateSmartContract` (origin is the caller) or any
+            // contract missing from `ContractStore`, the split
+            // degenerates and `pay_energy_bill` charges the caller for
+            // the whole bill.
+            let (origin_opt, percent, origin_limit) = match trigger_contract_addr {
+                Some(contract_addr) => {
+                    let contracts = ConS::new(session.contracts.clone() as _);
+                    match contracts.get(&contract_addr) {
+                        Ok(Some(sc)) => {
+                            let origin = address_from_proto(&sc.origin_address);
+                            (
+                                origin,
+                                sc.consume_user_resource_percent,
+                                sc.origin_energy_limit,
+                            )
+                        }
+                        _ => (None, 0, 0),
+                    }
+                }
+                None => (None, 0, 0),
+            };
+            match energy::pay_energy_bill(
+                &accounts,
+                &dp_store,
+                &caller,
+                origin_opt.as_ref(),
+                origin_limit,
+                percent,
+                energy_used,
+                now_slot,
+            ) {
+                Ok(_bill) => { /* state updated in-place */ }
                 Err(e) => {
                     // Insufficient balance for fee, or account missing.
                     // Whole session reverts (which also undoes any VM
-                    // state changes); tx marked as failed.
+                    // state changes AND any origin-side debit
+                    // `pay_energy_bill` may have applied before
+                    // hitting the caller-side shortfall); tx marked
+                    // as failed.
                     session.revert();
                     return TxResult {
                         tx_id,
