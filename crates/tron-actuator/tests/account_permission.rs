@@ -383,3 +383,98 @@ fn accepts_valid_contract_and_executes_with_fee() {
     assert!(after.witness_permission.is_none());
     assert_eq!(after.active_permission.len(), 1);
 }
+
+// =============================================================================
+// CA-C2: active permission `id` enforcement.
+//
+// java-tron's `AccountPermissionUpdateActuator` assigns active IDs
+// contiguously starting at 2 (Owner=0, Witness=1, Active=2..9).
+// `resolve_permission` previously looked actives up by array index
+// `permission_id - 2`, which assumed the IDs matched the index. Without
+// validate-side enforcement, a malicious or buggy writer could land
+// actives with arbitrary IDs (duplicates, out-of-range, holes) and
+// every downstream multi-sig check would silently authorize the wrong
+// permission.
+//
+// These tests pin: the `actives[i].id == 2 + i` invariant is enforced
+// by `validate`, AND `resolve_permission` (after the CA-C1 fix) finds
+// permissions by stored `id` even when array order doesn't match.
+// =============================================================================
+
+#[test]
+fn rejects_active_with_wrong_id_on_first_slot() {
+    let (accounts, dp) = enabled_stores();
+    let owner = addr(0x11);
+    put_account(&accounts, &owner, false);
+    let mut c = valid_contract(&owner);
+    // valid_contract gives a single active with id=2 (correct for
+    // index 0). Bump to id=3 to confirm validate rejects.
+    c.actives[0].id = 3;
+    let err = validate_account_permission_update(&accounts, &dp, &c).unwrap_err();
+    assert!(
+        matches!(&err, ActuatorError::Validate(s) if s.contains("active permission id")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn rejects_active_with_duplicate_ids_across_multiple_slots() {
+    let (accounts, dp) = enabled_stores();
+    let owner = addr(0x11);
+    put_account(&accounts, &owner, false);
+    let mut c = valid_contract(&owner);
+    // Two actives with id=2 — what would happen if the producer forgot
+    // to increment. Validate must catch this because resolver matches
+    // on id; with duplicates, `permission_id=3` would never resolve
+    // even though there are two actives configured.
+    let second_active = active_permission(vec![key(0xcc, 1)], 1, vec![0xffu8; 32]);
+    c.actives.push(second_active); // id=2 again
+    let err = validate_account_permission_update(&accounts, &dp, &c).unwrap_err();
+    assert!(
+        matches!(&err, ActuatorError::Validate(s) if s.contains("active permission id")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn accepts_actives_with_contiguous_ids_starting_at_2() {
+    let (accounts, dp) = enabled_stores();
+    let owner = addr(0x11);
+    put_account(&accounts, &owner, false);
+    let mut c = valid_contract(&owner);
+    // Build a second active with the correct id=3 (= 2 + 1).
+    let mut second_active = active_permission(vec![key(0xcc, 1)], 1, vec![0xffu8; 32]);
+    second_active.id = 3;
+    c.actives.push(second_active);
+    validate_account_permission_update(&accounts, &dp, &c)
+        .expect("contiguous active ids should pass");
+}
+
+#[test]
+fn rejects_active_with_id_below_2() {
+    // Owner=0 and Witness=1 are reserved; an active claiming id=1
+    // would resolve through the wrong code path entirely. Validate
+    // must reject — the contiguous-starting-at-2 rule covers this
+    // implicitly (2 + 0 = 2, not 1).
+    let (accounts, dp) = enabled_stores();
+    let owner = addr(0x11);
+    put_account(&accounts, &owner, false);
+    let mut c = valid_contract(&owner);
+    c.actives[0].id = 1;
+    let err = validate_account_permission_update(&accounts, &dp, &c).unwrap_err();
+    assert!(matches!(&err, ActuatorError::Validate(s) if s.contains("active permission id")));
+}
+
+#[test]
+fn rejects_active_with_id_above_9() {
+    // MAX_ACTIVE_PERMISSIONS = 8 → highest legal id is 9 (= 2 + 7).
+    // A single active claiming id=10 fails the `2 + idx` rule at
+    // index 0 (where the expected id is 2).
+    let (accounts, dp) = enabled_stores();
+    let owner = addr(0x11);
+    put_account(&accounts, &owner, false);
+    let mut c = valid_contract(&owner);
+    c.actives[0].id = 10;
+    let err = validate_account_permission_update(&accounts, &dp, &c).unwrap_err();
+    assert!(matches!(&err, ActuatorError::Validate(s) if s.contains("active permission id")));
+}

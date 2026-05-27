@@ -409,3 +409,123 @@ fn duplicate_signer_is_rejected() {
         "got {err:?}"
     );
 }
+
+// =============================================================================
+// CA-C1: resolve_permission matches actives by `Permission.id`, NOT by
+// array index. Without this fix, an account whose `active_permission`
+// vector had non-contiguous IDs (e.g. from an imported snapshot, or
+// from a pre-CA-C2 writer) would silently authorize the WRONG
+// permission for any given `permission_id`. java-tron's
+// `AccountCapsule.getPermissionById` does the same iterate-and-match.
+// =============================================================================
+
+#[test]
+fn resolve_finds_active_by_id_even_when_array_order_doesnt_match() {
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+
+    // Account with TWO actives. Critically, the array order is
+    // reversed: the entry at index 0 has id=3, and the entry at
+    // index 1 has id=2. Pre-fix this would resolve `permission_id=2`
+    // to `active_permission[0]` (which has id=3), authorizing the
+    // wrong permission. Post-fix, the resolver finds the entry whose
+    // `id` field actually equals 2.
+    //
+    // The id=2 permission has Alice as the only key. The id=3
+    // permission has Bob as the only key. If the resolver picked the
+    // wrong one, a tx signed by Alice with `permission_id=2` would
+    // fail (because the array[0] permission expects Bob).
+    put_account(
+        &accounts,
+        ALICE,
+        Account {
+            address: ALICE.to_vec(),
+            balance: 1_000,
+            active_permission: vec![
+                // Index 0 — id=3, Bob's key.
+                Permission {
+                    r#type: PermissionType::Active as i32,
+                    id: 3,
+                    permission_name: "bob_active".to_string(),
+                    threshold: 1,
+                    parent_id: 0,
+                    operations: vec![0xffu8; 32],
+                    keys: vec![Key {
+                        address: BOB.to_vec(),
+                        weight: 1,
+                    }],
+                },
+                // Index 1 — id=2, Alice's key.
+                Permission {
+                    r#type: PermissionType::Active as i32,
+                    id: 2,
+                    permission_name: "alice_active".to_string(),
+                    threshold: 1,
+                    parent_id: 0,
+                    operations: vec![0xffu8; 32],
+                    keys: vec![Key {
+                        address: ALICE.to_vec(),
+                        weight: 1,
+                    }],
+                },
+            ],
+            ..Default::default()
+        },
+    );
+
+    // Alice signs a tx claiming permission_id=2 (her permission).
+    let mut tx = make_transfer_tx(ALICE, BOB, 2);
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
+    let contract = tx.raw_data.as_ref().unwrap().contract[0].clone();
+    // Resolver must find the id=2 permission (Alice's) even though
+    // it's at array index 1, not 0.
+    check_transaction_permission(
+        &accounts,
+        &dp,
+        &tx,
+        &contract,
+        ContractType::TransferContract,
+    )
+    .expect("should resolve by id, not by array index");
+}
+
+#[test]
+fn resolve_returns_not_found_when_no_active_has_matching_id() {
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    // One active, id=2. Tx asks for permission_id=3 — must fail
+    // cleanly (NOT silently fall through to a different active).
+    put_account(
+        &accounts,
+        ALICE,
+        Account {
+            address: ALICE.to_vec(),
+            balance: 1_000,
+            active_permission: vec![Permission {
+                r#type: PermissionType::Active as i32,
+                id: 2,
+                permission_name: "active".to_string(),
+                threshold: 1,
+                parent_id: 0,
+                operations: vec![0xffu8; 32],
+                keys: vec![Key {
+                    address: ALICE.to_vec(),
+                    weight: 1,
+                }],
+            }],
+            ..Default::default()
+        },
+    );
+    let mut tx = make_transfer_tx(ALICE, BOB, 3); // no such id
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
+    let contract = tx.raw_data.as_ref().unwrap().contract[0].clone();
+    let err = check_transaction_permission(
+        &accounts,
+        &dp,
+        &tx,
+        &contract,
+        ContractType::TransferContract,
+    )
+    .unwrap_err();
+    assert!(matches!(err, PermissionError::PermissionIdNotFound(3)));
+}

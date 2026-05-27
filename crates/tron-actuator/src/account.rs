@@ -260,9 +260,23 @@ pub fn validate_account_permission_update(
         check_permission(witness_perm, dyn_props)?;
     }
 
-    for active in &contract.actives {
+    for (idx, active) in contract.actives.iter().enumerate() {
         if active.r#type != PermissionType::Active as i32 {
             return Err(ActuatorError::Validate("active permission type is error"));
+        }
+        // Enforce `actives[i].id == 2 + i` — java-tron's
+        // `AccountPermissionUpdateActuator` assigns these IDs
+        // contiguously starting at 2, and `resolve_permission`
+        // relies on the invariant being honored across writes.
+        // Without this gate, a contract could write actives with
+        // arbitrary IDs (e.g. duplicates, or values > 9), confusing
+        // every downstream lookup and breaking the multi-sig contract
+        // type → permission mapping. Owner=0, Witness=1, Active=2..9.
+        let expected_id = 2 + idx as i32;
+        if active.id != expected_id {
+            return Err(ActuatorError::Validate(
+                "active permission id must be 2 + index (contiguous from 2)",
+            ));
         }
         check_permission(active, dyn_props)?;
     }

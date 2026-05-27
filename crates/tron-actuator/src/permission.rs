@@ -8,9 +8,11 @@
 //!    `WitnessCreateContract.owner_address`, etc.).
 //! 2. Look up the account; pick the active `Permission` by the
 //!    `Contract.permission_id` field (0 = owner, 1 = witness, ≥ 2 =
-//!    active[i-2]). When the account has none configured, fall back
-//!    to a synthetic default permission (single key = the owner
-//!    address, weight = 1, threshold = 1).
+//!    match by `Permission.id` against the account's `active_permission`
+//!    vector). java-tron's `AccountCapsule.getPermissionById` does
+//!    the same — iterate, match, don't index. When the account has
+//!    none configured, fall back to a synthetic default permission
+//!    (single key = the owner address, weight = 1, threshold = 1).
 //! 3. For each signature on the transaction:
 //!    * Recover the signer address.
 //!    * Reject if it's not a key in the permission.
@@ -340,10 +342,19 @@ fn resolve_permission(
             }
         }
         n if n >= 2 => {
-            let idx = (n - 2) as usize;
+            // Match on the stored `Permission.id` field — NOT the
+            // array index. `AccountPermissionUpdateActuator.validate`
+            // enforces `actives[i].id == 2 + i` so in practice the
+            // index lookup would also work, but the array-index
+            // assumption is fragile against (a) state imported from a
+            // java-tron snapshot that predates the validator's strict
+            // gate, or (b) any future writer that lands actives with
+            // non-contiguous IDs. Mirrors java-tron's
+            // `AccountCapsule.getPermissionById`.
             account
                 .active_permission
-                .get(idx)
+                .iter()
+                .find(|p| p.id == n)
                 .cloned()
                 .ok_or(PermissionError::PermissionIdNotFound(n))
         }
