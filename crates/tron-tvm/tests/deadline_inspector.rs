@@ -148,13 +148,21 @@ fn infinite_loop_with_tight_deadline_returns_timeout() {
     let timeout_ms: u64 = 100;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let started = Instant::now();
+    // Headroom sizing: each loop iter is JUMPDEST+PUSH1+JUMP = 12 gas.
+    // At release-mode dispatch speed (~45M iters/sec on a modern CPU)
+    // we burn ~540M gas in 100ms — the previous 50_000_000 limit was
+    // marginal and OOG'd before the deadline on fast hardware (~4%
+    // failure rate in release). Pick a budget 10× the 100ms-window
+    // burn rate so the deadline wins by an order of magnitude even on
+    // a 5× faster future CPU. Both args must be raised: `energy_limit`
+    // is the sun-paid allowance, `gas_cap_override` is the per-tx VM
+    // cap, and the effective limit is `min(energy_limit, cap)`.
     let (outcome, _) = execute_trigger_with_deadline(
         &stores,
         block,
         &trigger(caller_addr, contract_addr),
-        // Big enough that gas can't exhaust before the deadline.
-        50_000_000,
-        50_000_000,
+        5_000_000_000,
+        5_000_000_000,
         deadline,
         timeout_ms,
     );
