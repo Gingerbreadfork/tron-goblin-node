@@ -105,6 +105,8 @@ pub enum ImportError {
     Verification(String),
     #[error("unsupported archive extension (expected .tar, .tar.gz, .tgz): {0:?}")]
     UnsupportedArchive(PathBuf),
+    #[error("refusing unsafe archive entry (absolute path, `..` traversal, or symlink/hardlink): {0:?}")]
+    UnsafeArchiveEntry(PathBuf),
     #[error("could not locate per-store subdirs inside extracted archive at {0:?}")]
     SnapshotLayout(PathBuf),
     #[error("rocksdb live-import failed for {store}: {source}")]
@@ -203,19 +205,71 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), ImportError> {
         .unwrap_or_default();
     if name_lower.ends_with(".tar.gz") || name_lower.ends_with(".tgz") {
         let decoder = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        archive.unpack(dest).map_err(|e| ImportError::Io {
-            path: dest.to_path_buf(),
-            source: e,
-        })?;
+        unpack_safely(tar::Archive::new(decoder), dest)?;
     } else if name_lower.ends_with(".tar") {
-        let mut archive = tar::Archive::new(file);
-        archive.unpack(dest).map_err(|e| ImportError::Io {
-            path: dest.to_path_buf(),
-            source: e,
-        })?;
+        unpack_safely(tar::Archive::new(file), dest)?;
     } else {
         return Err(ImportError::UnsupportedArchive(archive.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Unpack `archive` into `dest`, refusing any entry that could plant
+/// something outside it (F-28). A snapshot is just RocksDB data dirs, so
+/// we reject:
+///
+/// * absolute paths and `..` / root traversal components, and
+/// * symlink and hardlink entries.
+///
+/// The library already skips `..` and blocks writes that resolve outside
+/// `dest`, but it would still *create* a symlink entry inside `dest` —
+/// which the subsequent directory import (copy / symlink / move) then
+/// follows, escaping the data dir after the fact. Refusing link entries
+/// outright closes that. We also stop preserving archive permissions and
+/// ownerships (no suid / foreign-UID files) and never overwrite existing
+/// files. Failures are explicit errors rather than silent skips.
+fn unpack_safely<R: std::io::Read>(
+    mut archive: tar::Archive<R>,
+    dest: &Path,
+) -> Result<(), ImportError> {
+    use std::path::Component;
+
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
+    archive.set_overwrite(false);
+
+    let io_err = |e: std::io::Error| ImportError::Io {
+        path: dest.to_path_buf(),
+        source: e,
+    };
+
+    let entries = archive.entries().map_err(io_err)?;
+    for entry in entries {
+        let mut entry = entry.map_err(io_err)?;
+        let path = entry.path().map_err(io_err)?.into_owned();
+
+        // Reject absolute paths and any parent-dir / root traversal.
+        if path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(ImportError::UnsafeArchiveEntry(path));
+        }
+
+        // Reject symlink / hardlink entries outright — never legitimate
+        // in a store snapshot, and the escape primitive.
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(ImportError::UnsafeArchiveEntry(path));
+        }
+
+        // `unpack_in` re-validates containment within `dest` and returns
+        // false if the entry would still escape — treat that as unsafe.
+        if !entry.unpack_in(dest).map_err(io_err)? {
+            return Err(ImportError::UnsafeArchiveEntry(path));
+        }
     }
     Ok(())
 }
@@ -688,6 +742,97 @@ mod tests {
 
     fn cleanup(p: &Path) {
         let _ = std::fs::remove_dir_all(p);
+    }
+
+    /// Build a `.tar` at `path` from a builder closure.
+    fn build_tar(path: &Path, f: impl FnOnce(&mut tar::Builder<std::fs::File>)) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut b = tar::Builder::new(file);
+        f(&mut b);
+        b.finish().unwrap();
+    }
+
+    /// F-28: a `..` entry must be refused with an explicit error, not
+    /// silently skipped, and must not land outside the destination.
+    #[test]
+    fn extract_archive_rejects_parent_dir_traversal() {
+        let dir = temp_dir("evil-dotdot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar_path = dir.join("evil.tar");
+        build_tar(&tar_path, |b| {
+            let data = b"pwned";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            // Write the `..` path straight into the header's name field,
+            // bypassing `set_path`'s own `..` guard — i.e. a hand-rolled
+            // malicious archive, which is exactly the threat here.
+            let name = b"../escape.txt";
+            h.as_mut_bytes()[..name.len()].copy_from_slice(name);
+            h.set_cksum();
+            b.append(&h, &data[..]).unwrap();
+        });
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let err = extract_archive(&tar_path, &dest).unwrap_err();
+        assert!(matches!(err, ImportError::UnsafeArchiveEntry(_)), "got {err:?}");
+        // `dest/../escape.txt` would be `dir/escape.txt` — must not exist.
+        assert!(!dir.join("escape.txt").exists());
+        cleanup(&dir);
+    }
+
+    /// F-28: a symlink entry is the escape primitive (the directory import
+    /// that runs next would follow it out of the data dir). Refuse it.
+    #[test]
+    fn extract_archive_rejects_symlink_entry() {
+        let dir = temp_dir("evil-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar_path = dir.join("evil.tar");
+        build_tar(&tar_path, |b| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            b.append_link(&mut h, "db-link", "/tmp").unwrap();
+        });
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let err = extract_archive(&tar_path, &dest).unwrap_err();
+        assert!(matches!(err, ImportError::UnsafeArchiveEntry(_)), "got {err:?}");
+        assert!(!dest.join("db-link").exists());
+        cleanup(&dir);
+    }
+
+    /// A normal nested file extracts intact — the guard must not be
+    /// overzealous.
+    #[test]
+    fn extract_archive_accepts_benign_nested_files() {
+        let dir = temp_dir("benign-tar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar_path = dir.join("ok.tar");
+        build_tar(&tar_path, |b| {
+            let mut dh = tar::Header::new_gnu();
+            dh.set_entry_type(tar::EntryType::Directory);
+            dh.set_size(0);
+            dh.set_mode(0o755);
+            b.append_data(&mut dh, "properties/", std::io::empty()).unwrap();
+            let data = b"properties-data";
+            let mut fh = tar::Header::new_gnu();
+            fh.set_size(data.len() as u64);
+            fh.set_mode(0o644);
+            b.append_data(&mut fh, "properties/CURRENT", &data[..]).unwrap();
+        });
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_archive(&tar_path, &dest).expect("benign archive extracts");
+        let extracted = dest.join("properties").join("CURRENT");
+        assert!(extracted.is_file());
+        assert_eq!(std::fs::read(&extracted).unwrap(), b"properties-data");
+        cleanup(&dir);
     }
 
     /// Build a minimum-viable "snapshot" by running `tron-node init`
