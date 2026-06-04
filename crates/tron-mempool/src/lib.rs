@@ -44,6 +44,19 @@ pub struct MempoolConfig {
     /// channel (the txs stay in the mempool — only the broadcast
     /// notification is lost).
     pub broadcast_buffer: usize,
+    /// Maximum wire size of a single accepted tx. Defaults to java-tron's
+    /// `TRANSACTION_MAX_BYTE_SIZE` (500 KiB) — anything larger is invalid
+    /// on-chain anyway, so rejecting it costs nothing and stops one
+    /// oversized tx from eating more memory than hundreds of normal ones.
+    pub per_tx_max_bytes: usize,
+    /// Maximum total wire bytes across all pending txs. Bounds mempool
+    /// memory independently of `max_size`: 2000 × 500 KiB would be ~1 GiB.
+    pub max_bytes: usize,
+    /// Maximum pending txs from a single signer. Stops one account from
+    /// monopolizing all `max_size` slots and crowding everyone else out.
+    /// (An attacker with many keys can Sybil around this — it mainly
+    /// bounds accidental single-sender floods and raises the bar.)
+    pub per_sender_cap: usize,
 }
 
 impl Default for MempoolConfig {
@@ -51,6 +64,9 @@ impl Default for MempoolConfig {
         Self {
             max_size: 2000,
             broadcast_buffer: 1024,
+            per_tx_max_bytes: 500 * 1024,
+            max_bytes: 128 * 1024 * 1024,
+            per_sender_cap: 256,
         }
     }
 }
@@ -72,6 +88,16 @@ pub enum MempoolError {
     Duplicate,
     #[error("mempool full ({size} / {max})")]
     Full { size: usize, max: usize },
+    #[error("transaction too large ({size} bytes > {max})")]
+    TxTooLarge { size: usize, max: usize },
+    #[error("mempool byte budget exhausted ({current} + {incoming} > {max})")]
+    BytesFull {
+        current: usize,
+        incoming: usize,
+        max: usize,
+    },
+    #[error("per-sender pending limit reached ({pending} >= {cap})")]
+    SenderLimit { pending: usize, cap: usize },
     #[error("state validation failed: {0}")]
     ValidationFailed(String),
 }
@@ -89,6 +115,9 @@ impl MempoolError {
             MempoolError::BadSignature(_) => "bad_signature",
             MempoolError::Duplicate => "duplicate",
             MempoolError::Full { .. } => "full",
+            MempoolError::TxTooLarge { .. } => "tx_too_large",
+            MempoolError::BytesFull { .. } => "bytes_full",
+            MempoolError::SenderLimit { .. } => "sender_limit",
             MempoolError::ValidationFailed(_) => "validation_failed",
         }
     }
@@ -116,6 +145,9 @@ pub struct PendingTx {
     /// `raw_data.expiration`. The eviction sweeper drops entries
     /// past this point.
     pub expiration_ms: i64,
+    /// Primary signer (first recovered signer) of this tx, used to key
+    /// the per-sender cap. `None` only if no signer could be determined.
+    pub sender: Option<[u8; 21]>,
 }
 
 pub struct TxMempool {
@@ -218,6 +250,15 @@ impl TxMempool {
     fn submit_inner(&self, raw: &[u8]) -> Result<[u8; 32], MempoolError> {
         let now_ms = now_ms();
 
+        // Reject oversized txs before the (more expensive) decode. Bounds
+        // per-tx memory; mirrors java-tron's on-chain size limit.
+        if raw.len() > self.config.per_tx_max_bytes {
+            return Err(MempoolError::TxTooLarge {
+                size: raw.len(),
+                max: self.config.per_tx_max_bytes,
+            });
+        }
+
         let tx = Transaction::decode(raw)
             .map_err(|e| MempoolError::Decode(e.to_string()))?;
         let raw_data = tx
@@ -241,9 +282,10 @@ impl TxMempool {
         // Recover at least one signer to ensure the signature bytes
         // are well-formed and recoverable. Doesn't check the signer
         // is in any permission — that's an actuator-layer concern.
-        if let Err(e) = tron_types::recover_all_signers(&tx) {
-            return Err(MempoolError::BadSignature(e.to_string()));
-        }
+        let signers = tron_types::recover_all_signers(&tx)
+            .map_err(|e| MempoolError::BadSignature(e.to_string()))?;
+        // Primary signer keys the per-sender cap below.
+        let sender = signers.first().map(|a| *a.as_bytes());
 
         let tx_id = tron_types::tx_id(&tx)
             .map_err(|e| MempoolError::Decode(format!("tx_id: {e:?}")))?;
@@ -285,12 +327,37 @@ impl TxMempool {
             });
         }
 
+        // One pass over the pending set for the byte budget and the
+        // per-sender cap (n <= max_size, so this stays cheap).
+        let mut current_bytes = 0usize;
+        let mut sender_pending = 0usize;
+        for p in inner.pending.values() {
+            current_bytes += p.raw_bytes.len();
+            if sender.is_some() && p.sender == sender {
+                sender_pending += 1;
+            }
+        }
+        if current_bytes + raw.len() > self.config.max_bytes {
+            return Err(MempoolError::BytesFull {
+                current: current_bytes,
+                incoming: raw.len(),
+                max: self.config.max_bytes,
+            });
+        }
+        if sender.is_some() && sender_pending >= self.config.per_sender_cap {
+            return Err(MempoolError::SenderLimit {
+                pending: sender_pending,
+                cap: self.config.per_sender_cap,
+            });
+        }
+
         let pending = PendingTx {
             tx,
             raw_bytes: raw.to_vec(),
             tx_id,
             received_at_ms: now_ms,
             expiration_ms,
+            sender,
         };
         inner.pending.insert(tx_id, pending);
         drop(inner);
@@ -604,6 +671,7 @@ mod tests {
         let m = TxMempool::new(MempoolConfig {
             max_size: 2,
             broadcast_buffer: 8,
+            ..MempoolConfig::default()
         });
         // Fill with distinct amounts so distinct tx_ids.
         for amount in [1i64, 2] {
@@ -611,6 +679,48 @@ mod tests {
         }
         let err = m.submit(&signed_tx(3, 60_000)).unwrap_err();
         assert!(matches!(err, MempoolError::Full { .. }));
+    }
+
+    #[test]
+    fn submit_oversize_tx_rejected() {
+        // H-7: a per-tx byte cap smaller than any real signed tx.
+        let m = TxMempool::new(MempoolConfig {
+            per_tx_max_bytes: 16,
+            ..MempoolConfig::default()
+        });
+        let err = m.submit(&signed_tx(1, 60_000)).unwrap_err();
+        assert!(matches!(err, MempoolError::TxTooLarge { .. }), "got {err:?}");
+        assert_eq!(m.pending_count(), 0);
+    }
+
+    #[test]
+    fn submit_rejected_when_total_byte_budget_exhausted() {
+        // H-7: budget admits exactly one tx of this size; the second
+        // distinct tx pushes the total over and is rejected.
+        let first = signed_tx(1, 60_000);
+        let m = TxMempool::new(MempoolConfig {
+            max_bytes: first.len(),
+            ..MempoolConfig::default()
+        });
+        m.submit(&first).expect("first fits exactly");
+        let err = m.submit(&signed_tx(2, 60_000)).unwrap_err();
+        assert!(matches!(err, MempoolError::BytesFull { .. }), "got {err:?}");
+        assert_eq!(m.pending_count(), 1);
+    }
+
+    #[test]
+    fn submit_rejected_when_sender_cap_exceeded() {
+        // H-7: all `signed_tx` outputs share one signer (PRIV), so the
+        // cap trips after `per_sender_cap` distinct txs from it.
+        let m = TxMempool::new(MempoolConfig {
+            per_sender_cap: 2,
+            ..MempoolConfig::default()
+        });
+        m.submit(&signed_tx(1, 60_000)).unwrap();
+        m.submit(&signed_tx(2, 60_000)).unwrap();
+        let err = m.submit(&signed_tx(3, 60_000)).unwrap_err();
+        assert!(matches!(err, MempoolError::SenderLimit { .. }), "got {err:?}");
+        assert_eq!(m.pending_count(), 2);
     }
 
     #[test]
