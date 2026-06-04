@@ -33,7 +33,7 @@ use tron_proto::{DisconnectMessage, Endpoint, HelloMessage, ReasonCode};
 
 use crate::hello::{build_hello, HelloInputs};
 use crate::message_type::MessageType;
-use crate::transport::{Frame, FrameError, TronFrameCodec};
+use crate::transport::{Frame, FrameError, TronFrameCodec, MAX_FRAME_BYTES};
 
 /// Inputs needed for the libp2p-layer (connection-level) Hello.
 ///
@@ -396,15 +396,7 @@ where
             )))?;
         let data = match CompressType::try_from(compressed.r#type) {
             Ok(CompressType::Uncompress) => compressed.data,
-            Ok(CompressType::Snappy) => {
-                let mut dec = snap::raw::Decoder::new();
-                dec.decompress_vec(&compressed.data).map_err(|e| {
-                    FrameError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("snappy decode: {e}"),
-                    ))
-                })?
-            }
+            Ok(CompressType::Snappy) => snappy_decompress_checked(&compressed.data)?,
             Err(_) => {
                 return Err(FrameError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -436,6 +428,29 @@ where
             Err(_elapsed) => Err(HandshakeError::TimedOut(limit)),
         }
     }
+}
+
+/// Decompress a snappy frame, rejecting a decompression bomb whose
+/// declared output exceeds [`MAX_FRAME_BYTES`] *before* allocating (N-4).
+/// The on-wire frame is already capped, but snappy can inflate ~10 MiB
+/// into hundreds of MiB; `decompress_len` reads only the frame's varint
+/// size prefix, so the guard is O(1) and allocation-free.
+fn snappy_decompress_checked(data: &[u8]) -> Result<Vec<u8>, FrameError> {
+    let declared = snap::raw::decompress_len(data).map_err(|e| {
+        FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("snappy decompress_len: {e}"),
+        ))
+    })?;
+    if declared > MAX_FRAME_BYTES {
+        return Err(FrameError::TooLarge);
+    }
+    snap::raw::Decoder::new().decompress_vec(data).map_err(|e| {
+        FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("snappy decode: {e}"),
+        ))
+    })
 }
 
 /// Outbound-dial convenience for the common case of a real TCP socket.
@@ -567,5 +582,38 @@ fn libp2p_handshake_code_name(code: i32) -> &'static str {
         5 => "MAX_CONNECTION_WITH_SAME_IP",
         256 => "UNKNOWN",
         _ => "UNKNOWN_CODE",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snappy_decompress_checked_round_trips_normal_frames() {
+        let original = b"hello snappy world".repeat(64);
+        let compressed = snap::raw::Encoder::new().compress_vec(&original).unwrap();
+        let got = snappy_decompress_checked(&compressed).expect("normal frame decompresses");
+        assert_eq!(got, original);
+    }
+
+    #[test]
+    fn snappy_decompress_checked_rejects_decompression_bomb() {
+        // A tiny compressed frame can declare a huge output. Craft one
+        // that decompresses to just over MAX_FRAME_BYTES and confirm it's
+        // rejected by size — before any large allocation — rather than
+        // ballooning memory.
+        let bomb_size = MAX_FRAME_BYTES + 1024 * 1024; // 11 MiB declared
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&vec![0u8; bomb_size])
+            .unwrap();
+        assert!(
+            compressed.len() < MAX_FRAME_BYTES,
+            "compressed bomb must still fit the on-wire frame cap"
+        );
+        assert!(matches!(
+            snappy_decompress_checked(&compressed),
+            Err(FrameError::TooLarge)
+        ));
     }
 }
