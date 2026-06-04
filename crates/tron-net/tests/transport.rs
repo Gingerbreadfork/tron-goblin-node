@@ -298,6 +298,29 @@ async fn handshake_surfaces_implicit_accept_without_fabricated_hello() {
     assert_eq!(&early.payload[..], b"ping");
 }
 
+/// **N-1 regression.** A peer that opens the connection but never sends
+/// its Hello (slowloris) must not pin the task forever — the handshake
+/// read is bounded by `handshake_timeout`. Both phases share the same
+/// bounded read, so this exercises the mechanism for the whole handshake.
+/// A tiny override keeps the test fast.
+#[tokio::test]
+async fn handshake_times_out_on_silent_peer() {
+    let genesis = genesis_block_id(&mainnet_inputs());
+    let (a_stream, b_stream) = tokio::io::duplex(64 * 1024);
+    // Hold the peer end open (no EOF) but never read or write it — the
+    // peer is connected yet silent. (Dropping it would EOF instead.)
+    let _peer = b_stream;
+    let mut a = PeerConnection::new(a_stream)
+        .with_handshake_timeout(std::time::Duration::from_millis(50));
+    let result = a
+        .handshake(local_hello_inputs(MAINNET_P2P_VERSION, genesis))
+        .await;
+    assert!(matches!(result, Err(tron_net::HandshakeError::TimedOut(_))));
+    // We sent our Hello (state advanced to Handshake) but never reached
+    // Syncing because the peer never replied.
+    assert_eq!(a.state(), TronState::Handshake);
+}
+
 /// After a successful handshake, both sides can send arbitrary frames.
 #[tokio::test]
 async fn post_handshake_can_exchange_application_frames() {

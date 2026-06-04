@@ -17,6 +17,8 @@
 //! On a peer-initiated `DisconnectMessage` we record the
 //! [`DisconnectReason`] and tear the connection down.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use prost::Message as _;
@@ -64,6 +66,13 @@ pub enum TronState {
     Ok,
 }
 
+/// Default upper bound on how long each handshake read waits for the
+/// peer's frame before failing with [`HandshakeError::TimedOut`]. Without
+/// it, a peer that opens TCP and then sends nothing pins the task and its
+/// file descriptor indefinitely (slowloris — N-1). Override per-connection
+/// with [`PeerConnection::with_handshake_timeout`].
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A bidirectional framed connection to a single peer.
 pub struct PeerConnection<S> {
     framed: Framed<S, TronFrameCodec>,
@@ -87,6 +96,10 @@ pub struct PeerConnection<S> {
     /// inner `Frame`. Snappy compression is not yet supported on
     /// either side.
     compress_wrap: bool,
+    /// Per-read upper bound applied to both handshake phases. Defaults to
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`]; see
+    /// [`PeerConnection::with_handshake_timeout`].
+    handshake_timeout: Duration,
 }
 
 impl<S> PeerConnection<S>
@@ -102,6 +115,7 @@ where
             peer_hello: None,
             early_frame: None,
             compress_wrap: false,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -111,6 +125,14 @@ where
 
     pub fn peer_hello(&self) -> Option<&HelloMessage> {
         self.peer_hello.as_ref()
+    }
+
+    /// Override the handshake read timeout (default
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`]). Builder-style; intended for an
+    /// inbound listener that wants a tighter bound, or for tests.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Run the libp2p connection-layer handshake. **Must be called
@@ -403,9 +425,15 @@ where
     }
 
     async fn next_frame_required(&mut self) -> Result<Frame, HandshakeError> {
-        match self.next_frame().await? {
-            Some(f) => Ok(f),
-            None => Err(HandshakeError::ClosedDuringHandshake),
+        // Bound the read so a peer that connects but never sends can't
+        // pin this task and its FD forever (N-1). Both handshake phases
+        // funnel their reads through here, so one timeout covers both.
+        let limit = self.handshake_timeout;
+        match tokio::time::timeout(limit, self.next_frame()).await {
+            Ok(Ok(Some(f))) => Ok(f),
+            Ok(Ok(None)) => Err(HandshakeError::ClosedDuringHandshake),
+            Ok(Err(e)) => Err(HandshakeError::from(e)),
+            Err(_elapsed) => Err(HandshakeError::TimedOut(limit)),
         }
     }
 }
@@ -496,6 +524,8 @@ pub enum HandshakeError {
     UnexpectedFrame(MessageType),
     #[error("connection closed before peer Hello arrived")]
     ClosedDuringHandshake,
+    #[error("no peer frame within handshake timeout ({0:?})")]
+    TimedOut(Duration),
     #[error("incompatible p2p version: ours={ours}, theirs={theirs}")]
     IncompatibleVersion { ours: i32, theirs: i32 },
     #[error("incompatible chain (genesis hash mismatch)")]

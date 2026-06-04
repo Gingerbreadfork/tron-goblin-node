@@ -37,7 +37,7 @@ pub use hello::{
 pub use message_type::{MessageType, MessageTypeError};
 pub use peer::{
     DisconnectReason, HandshakeError, HandshakeOutcome, Libp2pHelloInputs, PeerConnection,
-    TronState,
+    TronState, DEFAULT_HANDSHAKE_TIMEOUT,
 };
 pub use sync::{
     recv_block, recv_chain_inventory, recv_fetch_inv_data, recv_sync_request, send_block,
