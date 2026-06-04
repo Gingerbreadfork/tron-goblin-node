@@ -193,11 +193,14 @@ where
     /// waits for the peer's, validates basic compatibility, and
     /// transitions [`TronState::Init`] → `Handshake` → `Syncing`.
     ///
-    /// Returns the peer's `HelloMessage` on success.
+    /// On success returns a [`HandshakeOutcome`]: `Verified` carries the
+    /// peer's chain-checked `HelloMessage`; `ImplicitAccept` means the
+    /// peer skipped its reciprocal Hello and went straight to streaming
+    /// (its chain id is therefore unverified — see N-5 / N-30).
     pub async fn handshake(
         &mut self,
         local: HelloInputs<'_>,
-    ) -> Result<HelloMessage, HandshakeError> {
+    ) -> Result<HandshakeOutcome, HandshakeError> {
         if self.state != TronState::Init {
             return Err(HandshakeError::WrongState(self.state));
         }
@@ -243,9 +246,14 @@ where
         // and the early frame is stashed so `next_frame` returns it
         // before reading more from the socket.
         if frame.ty != MessageType::P2pHello {
+            // Surface implicit-accept as its own outcome rather than
+            // fabricating an `Ok(HelloMessage::default())` — returning a
+            // default Hello would tell the caller the peer passed the
+            // version / genesis checks when it never sent a Hello at all
+            // (N-5). `peer_hello` deliberately stays `None`.
             self.early_frame = Some(frame);
             self.state = TronState::Syncing;
-            return Ok(HelloMessage::default());
+            return Ok(HandshakeOutcome::ImplicitAccept);
         }
 
         let peer_hello =
@@ -259,15 +267,18 @@ where
                 theirs: peer_hello.version,
             });
         }
-        if let Some(theirs) = &peer_hello.genesis_block_id {
-            if theirs.hash != local_genesis.as_bytes() {
-                return Err(HandshakeError::IncompatibleChain);
-            }
+        // Fail closed on chain identity: a peer that omits
+        // `genesis_block_id` has NOT proved it is on our chain, so treat
+        // "missing" the same as "mismatch" (N-30). Real java-tron peers
+        // always include it.
+        match &peer_hello.genesis_block_id {
+            Some(theirs) if theirs.hash == local_genesis.as_bytes() => {}
+            _ => return Err(HandshakeError::IncompatibleChain),
         }
 
         self.peer_hello = Some(peer_hello.clone());
         self.state = TronState::Syncing;
-        Ok(peer_hello)
+        Ok(HandshakeOutcome::Verified(peer_hello))
     }
 
     /// Politely terminate the connection with a `DisconnectMessage`.
@@ -423,6 +434,54 @@ impl std::fmt::Display for DisconnectReason {
         match ReasonCode::try_from(self.0) {
             Ok(r) => write!(f, "{r:?}"),
             Err(_) => write!(f, "unknown reason ({})", self.0),
+        }
+    }
+}
+
+/// Outcome of the app-level [`PeerConnection::handshake`].
+///
+/// A handshake can complete two ways, and distinguishing them is a
+/// chain-safety requirement: an *implicit accept* means the peer never
+/// proved it is on our chain, so the caller MUST NOT treat it as
+/// verified (see N-5 / N-30).
+#[derive(Debug, Clone, PartialEq)]
+pub enum HandshakeOutcome {
+    /// The peer replied with a `P2pHello` that passed the protocol
+    /// version and genesis / chain-id checks. The same message is also
+    /// retrievable via [`PeerConnection::peer_hello`].
+    Verified(HelloMessage),
+    /// The peer accepted us implicitly: instead of a reciprocal
+    /// `P2pHello` it began streaming application traffic (the first such
+    /// frame is stashed and returned by the next
+    /// [`PeerConnection::next_frame`]). The handshake therefore did NOT
+    /// verify the peer's protocol version or genesis / chain id, and
+    /// [`PeerConnection::peer_hello`] stays `None`. Callers must enforce
+    /// chain identity another way (e.g. validating delivered blocks
+    /// against the local chain) before trusting this peer's stream.
+    ImplicitAccept,
+}
+
+impl HandshakeOutcome {
+    /// `true` if the peer accepted us implicitly (no reciprocal,
+    /// chain-verified `P2pHello`).
+    pub fn is_implicit_accept(&self) -> bool {
+        matches!(self, HandshakeOutcome::ImplicitAccept)
+    }
+
+    /// The verified peer `HelloMessage`, or `None` for an implicit accept.
+    pub fn hello(&self) -> Option<&HelloMessage> {
+        match self {
+            HandshakeOutcome::Verified(h) => Some(h),
+            HandshakeOutcome::ImplicitAccept => None,
+        }
+    }
+
+    /// Consume the outcome, returning the verified peer `HelloMessage`,
+    /// or `None` for an implicit accept.
+    pub fn into_hello(self) -> Option<HelloMessage> {
+        match self {
+            HandshakeOutcome::Verified(h) => Some(h),
+            HandshakeOutcome::ImplicitAccept => None,
         }
     }
 }

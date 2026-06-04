@@ -171,8 +171,8 @@ async fn two_peers_handshake_over_duplex() {
 
     // Run both handshakes concurrently — each side awaits the other's Hello.
     let (ra, rb) = tokio::join!(a.handshake(a_inputs), b.handshake(b_inputs));
-    let peer_a_saw = ra.unwrap();
-    let peer_b_saw = rb.unwrap();
+    let peer_a_saw = ra.unwrap().into_hello().expect("verified hello");
+    let peer_b_saw = rb.unwrap().into_hello().expect("verified hello");
     assert_eq!(peer_a_saw.version, MAINNET_P2P_VERSION);
     assert_eq!(peer_b_saw.version, MAINNET_P2P_VERSION);
     assert_eq!(a.state(), TronState::Syncing);
@@ -219,6 +219,83 @@ async fn handshake_rejects_chain_mismatch() {
     let (ra, rb) = tokio::join!(a.handshake(a_inputs), b.handshake(b_inputs));
     assert!(matches!(ra, Err(tron_net::HandshakeError::IncompatibleChain)));
     assert!(matches!(rb, Err(tron_net::HandshakeError::IncompatibleChain)));
+}
+
+/// **N-30 regression.** A peer that replies with a `P2pHello` carrying no
+/// `genesis_block_id` has not proved it is on our chain. The handshake
+/// must fail closed with `IncompatibleChain` rather than skipping the
+/// check (the old code only compared the hash when one was present).
+#[tokio::test]
+async fn handshake_rejects_missing_genesis() {
+    let genesis = genesis_block_id(&mainnet_inputs());
+    let (a_stream, b_stream) = tokio::io::duplex(64 * 1024);
+    let mut a = PeerConnection::new(a_stream);
+    let mut b = PeerConnection::new(b_stream);
+
+    // B answers with a version-compatible Hello that omits the genesis
+    // id entirely.
+    let crafted = HelloMessage {
+        version: MAINNET_P2P_VERSION,
+        genesis_block_id: None,
+        ..Default::default()
+    };
+    let b_fut = async {
+        b.next_frame().await.unwrap(); // drain A's Hello
+        b.send_frame(Frame {
+            ty: MessageType::P2pHello,
+            payload: Bytes::from(crafted.encode_to_vec()),
+        })
+        .await
+        .unwrap();
+    };
+    let (ra, _) = tokio::join!(
+        a.handshake(local_hello_inputs(MAINNET_P2P_VERSION, genesis)),
+        b_fut
+    );
+    assert!(matches!(
+        ra,
+        Err(tron_net::HandshakeError::IncompatibleChain)
+    ));
+    assert!(a.peer_hello().is_none());
+}
+
+/// **N-5 regression.** A peer that skips its reciprocal Hello and jumps
+/// straight to application traffic is an *implicit accept*. The handshake
+/// must surface that as a distinct [`tron_net::HandshakeOutcome`] — never
+/// a fabricated default Hello — leave `peer_hello` empty, and stash the
+/// early frame for the next `next_frame`.
+#[tokio::test]
+async fn handshake_surfaces_implicit_accept_without_fabricated_hello() {
+    let genesis = genesis_block_id(&mainnet_inputs());
+    let (a_stream, b_stream) = tokio::io::duplex(64 * 1024);
+    let mut a = PeerConnection::new(a_stream);
+    let mut b = PeerConnection::new(b_stream);
+
+    let b_fut = async {
+        b.next_frame().await.unwrap(); // drain A's Hello
+        // Stream an application frame instead of replying with a Hello.
+        b.send_frame(Frame {
+            ty: MessageType::P2pPing,
+            payload: Bytes::from_static(b"ping"),
+        })
+        .await
+        .unwrap();
+    };
+    let (ra, _) = tokio::join!(
+        a.handshake(local_hello_inputs(MAINNET_P2P_VERSION, genesis)),
+        b_fut
+    );
+
+    let outcome = ra.expect("implicit accept is not a handshake error");
+    assert!(outcome.is_implicit_accept());
+    assert!(outcome.hello().is_none());
+    assert!(a.peer_hello().is_none(), "must not fabricate a peer Hello");
+    assert_eq!(a.state(), TronState::Syncing);
+
+    // The stashed early frame is delivered before any further socket read.
+    let early = a.next_frame().await.unwrap().unwrap();
+    assert_eq!(early.ty, MessageType::P2pPing);
+    assert_eq!(&early.payload[..], b"ping");
 }
 
 /// After a successful handshake, both sides can send arbitrary frames.
@@ -277,8 +354,8 @@ async fn handshake_completes_over_real_loopback_tcp() {
 
     let server_result = server.await.unwrap();
     let client_result = client.await.unwrap();
-    let server_saw = server_result.unwrap();
-    let client_saw = client_result.unwrap();
+    let server_saw = server_result.unwrap().into_hello().expect("verified hello");
+    let client_saw = client_result.unwrap().into_hello().expect("verified hello");
     assert_eq!(server_saw.version, MAINNET_P2P_VERSION);
     assert_eq!(client_saw.version, MAINNET_P2P_VERSION);
 }

@@ -816,8 +816,20 @@ impl SyncDriver {
             lowest_block_num: 0,
             code_version: b"tron-goblin/0.0.1",
         };
-        if let Err(e) = conn.handshake(hello).await {
-            return PeerOutcome::PeerFailure(format!("handshake: {e}"));
+        match conn.handshake(hello).await {
+            Ok(outcome) => {
+                if outcome.is_implicit_accept() {
+                    // Peer skipped its reciprocal Hello and went straight
+                    // to streaming, so the handshake did NOT verify its
+                    // genesis / chain id. We still proceed — mainnet peers
+                    // routinely accept implicitly — but per-block
+                    // validation on the delivered stream is what actually
+                    // anchors us to the right chain. Flag it so an eclipse
+                    // attempt via a sinkhole peer is at least visible.
+                    warn!(peer, "peer accepted implicitly; chain identity not verified at handshake");
+                }
+            }
+            Err(e) => return PeerOutcome::PeerFailure(format!("handshake: {e}")),
         }
         info!(
             peer,

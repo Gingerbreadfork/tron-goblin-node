@@ -179,21 +179,26 @@ async fn handshake_with_live_mainnet_seed() {
     };
 
     match result {
-        Ok(peer_hello) => {
-            eprintln!(
-                "✓ mainnet handshake ok — peer version={}, head={}, solid={}",
-                peer_hello.version,
-                peer_hello
-                    .head_block_id
-                    .as_ref()
-                    .map(|b| b.number)
-                    .unwrap_or(-1),
-                peer_hello
-                    .solid_block_id
-                    .as_ref()
-                    .map(|b| b.number)
-                    .unwrap_or(-1),
-            );
+        Ok(outcome) => match outcome.into_hello() {
+            Some(peer_hello) => {
+                eprintln!(
+                    "✓ mainnet handshake ok — peer version={}, head={}, solid={}",
+                    peer_hello.version,
+                    peer_hello
+                        .head_block_id
+                        .as_ref()
+                        .map(|b| b.number)
+                        .unwrap_or(-1),
+                    peer_hello
+                        .solid_block_id
+                        .as_ref()
+                        .map(|b| b.number)
+                        .unwrap_or(-1),
+                );
+            }
+            None => {
+                eprintln!("✓ mainnet handshake ok — peer accepted implicitly (no reciprocal Hello)");
+            }
         }
         Err(e) => {
             // Detailed interpretation of common rejection codes — proves

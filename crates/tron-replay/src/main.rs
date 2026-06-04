@@ -275,18 +275,25 @@ fn cmd_listen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 code_version: b"tron-goblin/0.0.1",
             };
             match conn.handshake(inputs).await {
-                Ok(hello) => {
-                    eprintln!(
-                        "handshake OK with {peer_addr}: version={} head_num={} code={}",
-                        hello.version,
-                        hello
-                            .head_block_id
-                            .as_ref()
-                            .map(|b| b.number)
-                            .unwrap_or(-1),
-                        String::from_utf8_lossy(&hello.code_version),
-                    );
-                }
+                Ok(outcome) => match outcome.hello() {
+                    Some(hello) => {
+                        eprintln!(
+                            "handshake OK with {peer_addr}: version={} head_num={} code={}",
+                            hello.version,
+                            hello
+                                .head_block_id
+                                .as_ref()
+                                .map(|b| b.number)
+                                .unwrap_or(-1),
+                            String::from_utf8_lossy(&hello.code_version),
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "handshake OK with {peer_addr}: peer accepted implicitly (no reciprocal Hello)"
+                        );
+                    }
+                },
                 Err(e) => {
                     eprintln!("handshake FAILED with {peer_addr}: {e}");
                 }

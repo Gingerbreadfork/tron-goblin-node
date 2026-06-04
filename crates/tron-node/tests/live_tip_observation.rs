@@ -122,7 +122,9 @@ async fn observe_tip_block_announcements_from_live_peer() {
             code_version: b"tron-goblin observer/discovery",
         })
         .await
-        .expect("phase1 app handshake");
+        .expect("phase1 app handshake")
+        .into_hello()
+        .expect("discovery peer must send a verified Hello");
 
     let peer_head_bytes: [u8; 32] = peer_hello
         .head_block_id
