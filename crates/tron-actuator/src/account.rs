@@ -54,7 +54,7 @@ pub fn validate_create_account(
             needed: fee,
         });
     }
-    if accounts.contains(&new_addr) {
+    if accounts.contains(&new_addr)? {
         return Err(ActuatorError::AccountAlreadyExists);
     }
     Ok(())
@@ -76,7 +76,7 @@ pub fn execute_create_account(
         .get_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT")
         .unwrap_or(0);
     owner_account.balance = check_sub(owner_account.balance, fee)?;
-    accounts.put(&owner, &owner_account);
+    accounts.put(&owner, &owner_account)?;
 
     let new_account = Account {
         address: new_addr.as_bytes().to_vec(),
@@ -84,7 +84,7 @@ pub fn execute_create_account(
         create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
         ..Default::default()
     };
-    accounts.put(&new_addr, &new_account);
+    accounts.put(&new_addr, &new_account)?;
 
     Ok(ExecutionResult {
         fee,
@@ -133,8 +133,8 @@ pub fn execute_update_account(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     account.account_name = contract.account_name.clone();
-    accounts.put(&owner, &account);
-    name_index.put(&contract.account_name, &owner);
+    accounts.put(&owner, &account)?;
+    name_index.put(&contract.account_name, &owner)?;
     Ok(ExecutionResult::default())
 }
 
@@ -173,8 +173,8 @@ pub fn execute_set_account_id(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     account.account_id = contract.account_id.clone();
-    accounts.put(&owner, &account);
-    id_index.put(&contract.account_id, &owner);
+    accounts.put(&owner, &account)?;
+    id_index.put(&contract.account_id, &owner)?;
     Ok(ExecutionResult::default())
 }
 
@@ -412,7 +412,7 @@ pub fn execute_account_permission_update(
     account.owner_permission = contract.owner.clone();
     account.witness_permission = contract.witness.clone();
     account.active_permission = contract.actives.clone();
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     Ok(ExecutionResult {
         fee,

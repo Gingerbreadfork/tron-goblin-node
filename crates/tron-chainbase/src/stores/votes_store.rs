@@ -30,23 +30,25 @@ impl VotesStore {
         Self { backend }
     }
 
-    pub fn put(&self, address: &Address, votes: &Votes) {
-        self.backend.put(address.as_bytes(), &votes.encode_to_vec());
+    pub fn put(&self, address: &Address, votes: &Votes) -> Result<(), StoreError> {
+        self.backend.put(address.as_bytes(), &votes.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, address: &Address) -> Result<Option<Votes>, StoreError> {
-        let Some(bytes) = self.backend.get(address.as_bytes()) else {
+        let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(Votes::decode(bytes.as_slice())?))
     }
 
-    pub fn contains(&self, address: &Address) -> bool {
-        self.backend.contains(address.as_bytes())
+    pub fn contains(&self, address: &Address) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(address.as_bytes())?)
     }
 
-    pub fn delete(&self, address: &Address) {
-        self.backend.delete(address.as_bytes());
+    pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
+        self.backend.delete(address.as_bytes())?;
+        Ok(())
     }
 
     /// Scan every voter row. Used by the maintenance pass to walk all
@@ -55,14 +57,32 @@ impl VotesStore {
     /// a 21-byte address or whose value doesn't decode as `Votes`.
     pub fn all(&self) -> Result<Vec<(Address, Votes)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
+        for (k, v) in self.backend.scan_all()? {
             if k.len() != tron_crypto::address::ADDRESS_LENGTH {
+                // C-8: consensus store — a malformed key in the votes CF
+                // can't be silently dropped, it would skew the vote tally.
+                // Log loudly; skip to match java-tron's iterate-and-continue.
+                tracing::error!(
+                    store = "votes",
+                    key = %hex::encode(&k),
+                    key_len = k.len(),
+                    "skipping votes row with non-address key (expected 21 bytes)"
+                );
                 continue;
             }
             let mut buf = [0u8; tron_crypto::address::ADDRESS_LENGTH];
             buf.copy_from_slice(&k);
-            let Ok(votes) = Votes::decode(v.as_slice()) else {
-                continue;
+            let votes = match Votes::decode(v.as_slice()) {
+                Ok(votes) => votes,
+                Err(e) => {
+                    tracing::error!(
+                        store = "votes",
+                        key = %hex::encode(&k),
+                        error = %e,
+                        "skipping votes row that failed to decode as Votes"
+                    );
+                    continue;
+                }
             };
             out.push((Address::from_raw(buf), votes));
         }

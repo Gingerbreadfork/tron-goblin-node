@@ -97,9 +97,9 @@ fn seed_head(
     };
     sign_block(&mut block, &ALICE_PRIV).expect("sign");
     let block_id = tron_types::block_id_from_block(&block).unwrap();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
     if let Some(bi_be) = &state.block_index {
-        BlockIndexStore::new(bi_be.clone()).put(&block_id);
+        BlockIndexStore::new(bi_be.clone()).put(&block_id).unwrap();
     }
     execute_block(state, &block, None).expect("execute genesis");
     khaos.start(block).expect("seed khaos");
@@ -123,7 +123,7 @@ async fn sr_runtime_pushes_layer_when_snapshot_stack_attached() {
                 vote_count: 100,
                 ..Default::default()
             },
-        );
+        ).unwrap();
         let accts = AccountStore::new(state.accounts.clone());
         accts.put(
             &Address::from_raw(ALICE_ADDR),
@@ -132,10 +132,10 @@ async fn sr_runtime_pushes_layer_when_snapshot_stack_attached() {
                 balance: 0,
                 ..Default::default()
             },
-        );
+        ).unwrap();
     }
     seed_head(&state, &blocks_be, &khaos);
-    WitnessScheduleStore::new(witness_schedule_be).save_active(&[Address::from_raw(ALICE_ADDR)]);
+    WitnessScheduleStore::new(witness_schedule_be).save_active(&[Address::from_raw(ALICE_ADDR)]).unwrap();
 
     // Past slot boundary.
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());

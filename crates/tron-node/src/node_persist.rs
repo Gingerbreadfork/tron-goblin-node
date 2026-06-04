@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use tron_chainbase::CommonStore;
 
 /// Java-tron's hard limit on the persisted peer set.
@@ -91,7 +92,7 @@ impl NodePersistService {
         if !self.enabled {
             return Vec::new();
         }
-        let Some(bytes) = self.store.get(DB_KEY_PEERS) else {
+        let Ok(Some(bytes)) = self.store.get(DB_KEY_PEERS) else {
             return Vec::new();
         };
         if bytes.is_empty() {
@@ -118,7 +119,14 @@ impl NodePersistService {
             nodes: batch[..take].to_vec(),
         };
         let json = serde_json::to_vec(&envelope).expect("DbNodes never serializes to err");
-        self.store.put(DB_KEY_PEERS, &json);
+        // Peer cache is NOT consensus-critical — losing it just means
+        // slower peer discovery on next restart. Log and continue
+        // instead of crashing the node on a transient disk write
+        // error (the periodic flush will retry on its next tick).
+        if let Err(e) = self.store.put(DB_KEY_PEERS, &json) {
+            warn!(error = %e, "peer-cache write failed; will retry on next flush tick");
+            return 0;
+        }
         take
     }
 }
@@ -139,6 +147,9 @@ where
     loop {
         ticker.tick().await;
         let snap = peers_fn();
+        // `write_batch` returns a written-count and already logs any
+        // underlying store error internally (see its body), so discarding
+        // the count here is correct.
         let _ = svc.write_batch(&snap);
     }
 }
@@ -198,7 +209,7 @@ mod tests {
     #[test]
     fn corrupt_blob_returns_empty_without_panic() {
         let svc = fresh();
-        svc.store.put(DB_KEY_PEERS, b"this is not json");
+        svc.store.put(DB_KEY_PEERS, b"this is not json").unwrap();
         assert!(svc.read().is_empty());
     }
 }

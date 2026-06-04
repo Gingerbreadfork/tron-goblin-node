@@ -297,11 +297,14 @@ impl TxMempool {
 
         // Persist after the in-memory insert so a crash between the
         // insert and broadcast leaves a recoverable on-disk entry.
-        // KvBackend writes are infallible by trait contract; the
-        // RocksDB backend panics internally on I/O errors (same as
-        // every other store), so we don't unwind here.
+        // A persistence write failure is best-effort and logged — the
+        // in-memory pending entry is still authoritative for this
+        // process; a crash before the persist would have produced
+        // identical observable state.
         if let Some(p) = &self.persistence {
-            p.put(&tx_id, raw);
+            if let Err(e) = p.put(&tx_id, raw) {
+                debug!(error = %e, "mempool persistence put failed");
+            }
         }
 
         // Best-effort broadcast — if no subscribers, send() errors
@@ -333,7 +336,9 @@ impl TxMempool {
         let removed = self.inner.lock().unwrap().pending.remove(tx_id).is_some();
         if removed {
             if let Some(p) = &self.persistence {
-                p.delete(tx_id);
+                if let Err(e) = p.delete(tx_id) {
+                    debug!(error = %e, "mempool persistence delete failed");
+                }
             }
             if let Some(m) = &self.metrics {
                 m.set_mempool_size(self.pending_count() as i64);
@@ -352,7 +357,9 @@ impl TxMempool {
         drop(inner);
         if let Some(p) = &self.persistence {
             for id in &evicted_ids {
-                p.delete(id);
+                if let Err(e) = p.delete(id) {
+                    debug!(error = %e, "mempool persistence delete failed");
+                }
             }
         }
         if let Some(m) = &self.metrics {
@@ -398,7 +405,13 @@ impl TxMempool {
             None => return ReloadStats::default(),
         };
         let mut stats = ReloadStats::default();
-        let entries = backend.scan_all();
+        let entries = match backend.scan_all() {
+            Ok(rows) => rows,
+            Err(e) => {
+                debug!(error = %e, "mempool persistence scan_all failed");
+                return stats;
+            }
+        };
         stats.scanned = entries.len();
         for (key, raw) in entries {
             match self.submit(&raw) {
@@ -412,12 +425,15 @@ impl TxMempool {
                     // Decode/sig/expiration/validator failure — the
                     // tx is no longer admissible. Drop the on-disk
                     // entry so we don't keep retrying every restart.
-                    if let Ok(id) = <[u8; 32]>::try_from(key.as_slice()) {
-                        backend.delete(&id);
+                    let del_result = if let Ok(id) = <[u8; 32]>::try_from(key.as_slice()) {
+                        backend.delete(&id)
                     } else {
                         // Malformed key (not a 32-byte tx_id) — delete
                         // by the raw bytes anyway.
-                        backend.delete(&key);
+                        backend.delete(&key)
+                    };
+                    if let Err(del_err) = del_result {
+                        debug!(error = %del_err, "mempool persistence delete failed");
                     }
                     stats.dropped += 1;
                     debug!(reason = %e, "dropped stale persisted tx");
@@ -669,7 +685,7 @@ mod tests {
             .with_persistence(backend.clone());
         let bytes = signed_tx(1, 60_000);
         let id = m.submit(&bytes).unwrap();
-        let on_disk = backend.get(&id).expect("persisted");
+        let on_disk = backend.get(&id).unwrap().expect("persisted");
         assert_eq!(on_disk, bytes);
     }
 
@@ -681,9 +697,9 @@ mod tests {
             .with_persistence(backend.clone());
         let bytes = signed_tx(1, 60_000);
         let id = m.submit(&bytes).unwrap();
-        assert!(backend.contains(&id));
+        assert!(backend.contains(&id).unwrap());
         assert!(m.remove(&id));
-        assert!(!backend.contains(&id));
+        assert!(!backend.contains(&id).unwrap());
     }
 
     #[test]
@@ -694,11 +710,11 @@ mod tests {
             .with_persistence(backend.clone());
         let bytes = signed_tx(1, 60_000);
         let id = m.submit(&bytes).unwrap();
-        assert!(backend.contains(&id));
+        assert!(backend.contains(&id).unwrap());
         let future = now_ms() + 120_000;
         let evicted = m.evict_expired(future);
         assert_eq!(evicted, 1);
-        assert!(!backend.contains(&id));
+        assert!(!backend.contains(&id).unwrap());
     }
 
     #[test]
@@ -711,9 +727,12 @@ mod tests {
         let m = TxMempool::new(MempoolConfig::default())
             .with_persistence(backend.clone());
         // Pre-seed a row that should survive the no-op remove.
-        backend.put(&[0u8; 32], b"untouched");
+        backend.put(&[0u8; 32], b"untouched").unwrap();
         assert!(!m.remove(&[0u8; 32]));
-        assert_eq!(backend.get(&[0u8; 32]).as_deref(), Some(b"untouched".as_slice()));
+        assert_eq!(
+            backend.get(&[0u8; 32]).unwrap().as_deref(),
+            Some(b"untouched".as_slice())
+        );
     }
 
     #[test]
@@ -758,7 +777,7 @@ mod tests {
         // submit() would have written.
         let tx = Transaction::decode(expired_bytes.as_slice()).unwrap();
         let id = tron_types::tx_id(&tx).unwrap();
-        backend.put(&id, &expired_bytes);
+        backend.put(&id, &expired_bytes).unwrap();
 
         let m = TxMempool::new(MempoolConfig::default())
             .with_persistence(backend.clone());
@@ -767,7 +786,10 @@ mod tests {
         assert_eq!(stats.restored, 0);
         assert_eq!(stats.dropped, 1);
         assert_eq!(m.pending_count(), 0);
-        assert!(!backend.contains(&id), "stale persisted tx must be pruned");
+        assert!(
+            !backend.contains(&id).unwrap(),
+            "stale persisted tx must be pruned"
+        );
     }
 
     #[test]
@@ -786,7 +808,7 @@ mod tests {
         assert_eq!(stats.skipped, 1);
         assert_eq!(stats.dropped, 0);
         // Row still on disk.
-        assert!(backend.contains(&id));
+        assert!(backend.contains(&id).unwrap());
         assert_eq!(m.pending_count(), 1);
     }
 
@@ -804,14 +826,14 @@ mod tests {
         // (decode failure) without panicking.
         let backend: std::sync::Arc<dyn KvBackend> =
             std::sync::Arc::new(tron_chainbase::MemBackend::new());
-        backend.put(&[7u8; 32], b"\xff\xff\xff");
+        backend.put(&[7u8; 32], b"\xff\xff\xff").unwrap();
         let m = TxMempool::new(MempoolConfig::default())
             .with_persistence(backend.clone());
         let stats = m.reload_from_disk();
         assert_eq!(stats.scanned, 1);
         assert_eq!(stats.dropped, 1);
         assert_eq!(stats.restored, 0);
-        assert!(!backend.contains(&[7u8; 32]));
+        assert!(!backend.contains(&[7u8; 32]).unwrap());
     }
 
     #[test]
@@ -824,7 +846,7 @@ mod tests {
             .with_persistence(backend.clone());
         let bytes = signed_tx(1, -60_000);
         assert!(m.submit(&bytes).is_err());
-        assert!(backend.scan_all().is_empty());
+        assert!(backend.scan_all().unwrap().is_empty());
     }
 
     #[test]
@@ -836,7 +858,7 @@ mod tests {
             .with_validator(Box::new(|_| Err("fee too low".into())))
             .with_persistence(backend.clone());
         assert!(m.submit(&signed_tx(1, 60_000)).is_err());
-        assert!(backend.scan_all().is_empty());
+        assert!(backend.scan_all().unwrap().is_empty());
     }
 
     #[test]

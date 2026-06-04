@@ -34,7 +34,7 @@ pub fn validate_proposal_create(
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
     }
-    if !witnesses.contains(&owner) {
+    if !witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessMissing);
     }
     if contract.parameters.is_empty() {
@@ -79,7 +79,7 @@ pub fn execute_proposal_create(
         approvals: Vec::new(),
         state: ProposalState::Pending as i32,
     };
-    proposals.put(next_id, &proposal);
+    proposals.put(next_id, &proposal)?;
     dyn_props.put_long(dynamic_properties_keys::LATEST_PROPOSAL_NUM, next_id);
 
     Ok(ExecutionResult::default())
@@ -100,7 +100,7 @@ pub fn validate_proposal_approve(
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
     }
-    if !witnesses.contains(&owner) {
+    if !witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessMissing);
     }
     let latest = dyn_props
@@ -144,7 +144,7 @@ pub fn execute_proposal_approve(
     } else {
         proposal.approvals.retain(|a| a != owner.as_bytes().as_slice());
     }
-    proposals.put(contract.proposal_id, &proposal);
+    proposals.put(contract.proposal_id, &proposal)?;
     Ok(ExecutionResult::default())
 }
 
@@ -192,6 +192,6 @@ pub fn execute_proposal_delete(
         .get(contract.proposal_id)?
         .ok_or(ActuatorError::ProposalMissing)?;
     proposal.state = ProposalState::Canceled as i32;
-    proposals.put(contract.proposal_id, &proposal);
+    proposals.put(contract.proposal_id, &proposal)?;
     Ok(ExecutionResult::default())
 }

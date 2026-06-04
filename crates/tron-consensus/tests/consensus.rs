@@ -224,7 +224,7 @@ fn update_active_witnesses_promotes_top_by_vote_count() {
                 vote_count: (i as i64) * 10, // 0, 10, 20, 30, 40
                 ..Default::default()
             },
-        );
+        ).unwrap();
     }
 
     // Three voters cast new_votes: voter1 → w0 (+100), voter2 → w0 (+50), w3 (+200).
@@ -240,7 +240,7 @@ fn update_active_witnesses_promotes_top_by_vote_count() {
                 vote_count: 100,
             }],
         },
-    );
+    ).unwrap();
     votes.put(
         &voter2,
         &Votes {
@@ -257,7 +257,7 @@ fn update_active_witnesses_promotes_top_by_vote_count() {
                 },
             ],
         },
-    );
+    ).unwrap();
 
     let report = update_active_witnesses(
         &witnesses,
@@ -306,7 +306,7 @@ fn update_active_witnesses_caps_at_27() {
                 vote_count: i as i64, // 0..29
                 ..Default::default()
             },
-        );
+        ).unwrap();
     }
     let report =
         update_active_witnesses(&witnesses, &votes, &schedule, &[], &candidates).unwrap();

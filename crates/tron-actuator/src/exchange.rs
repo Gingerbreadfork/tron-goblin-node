@@ -83,7 +83,7 @@ pub fn execute_exchange_create(
         &contract.second_token_id,
         contract.second_token_balance,
     )?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     let next_id = dyn_props
         .get_long(tron_chainbase::dynamic_properties_keys::LATEST_EXCHANGE_NUM)
@@ -98,8 +98,8 @@ pub fn execute_exchange_create(
         second_token_id: contract.second_token_id.clone(),
         second_token_balance: contract.second_token_balance,
     };
-    v1.put(next_id, &exchange);
-    v2.put(next_id, &exchange);
+    v1.put(next_id, &exchange)?;
+    v2.put(next_id, &exchange)?;
     dyn_props.put_long(
         tron_chainbase::dynamic_properties_keys::LATEST_EXCHANGE_NUM,
         next_id,
@@ -184,7 +184,7 @@ pub fn execute_exchange_inject(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     debit_token(&mut account, &my_id, contract.quant)?;
     debit_token(&mut account, &other_id, other_quant)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     if contract.token_id == exchange.first_token_id {
         exchange.first_token_balance = check_add(exchange.first_token_balance, contract.quant)?;
@@ -193,8 +193,8 @@ pub fn execute_exchange_inject(
         exchange.second_token_balance = check_add(exchange.second_token_balance, contract.quant)?;
         exchange.first_token_balance = check_add(exchange.first_token_balance, other_quant)?;
     }
-    v1.put(exchange.exchange_id, &exchange);
-    v2.put(exchange.exchange_id, &exchange);
+    v1.put(exchange.exchange_id, &exchange)?;
+    v2.put(exchange.exchange_id, &exchange)?;
 
     Ok(ExecutionResult::default())
 }
@@ -269,7 +269,7 @@ pub fn execute_exchange_withdraw(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     credit_token(&mut account, &my_id, contract.quant)?;
     credit_token(&mut account, &other_id, other_quant)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     if contract.token_id == exchange.first_token_id {
         exchange.first_token_balance = check_sub(exchange.first_token_balance, contract.quant)?;
@@ -278,8 +278,8 @@ pub fn execute_exchange_withdraw(
         exchange.second_token_balance = check_sub(exchange.second_token_balance, contract.quant)?;
         exchange.first_token_balance = check_sub(exchange.first_token_balance, other_quant)?;
     }
-    v1.put(exchange.exchange_id, &exchange);
-    v2.put(exchange.exchange_id, &exchange);
+    v1.put(exchange.exchange_id, &exchange)?;
+    v2.put(exchange.exchange_id, &exchange)?;
 
     Ok(ExecutionResult::default())
 }
@@ -356,7 +356,7 @@ pub fn execute_exchange_transaction(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     debit_token(&mut account, &my_id, contract.quant)?;
     credit_token(&mut account, &other_id, output)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     if contract.token_id == exchange.first_token_id {
         exchange.first_token_balance = check_add(exchange.first_token_balance, contract.quant)?;
@@ -365,8 +365,8 @@ pub fn execute_exchange_transaction(
         exchange.second_token_balance = check_add(exchange.second_token_balance, contract.quant)?;
         exchange.first_token_balance = check_sub(exchange.first_token_balance, output)?;
     }
-    v1.put(exchange.exchange_id, &exchange);
-    v2.put(exchange.exchange_id, &exchange);
+    v1.put(exchange.exchange_id, &exchange)?;
+    v2.put(exchange.exchange_id, &exchange)?;
 
     Ok(ExecutionResult::default())
 }

@@ -62,7 +62,7 @@ fn put_account(ctx: &Ctx, who: [u8; 21], balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn base_issue() -> AssetIssueContract {
@@ -182,7 +182,7 @@ fn issue_rejects_account_already_issued() {
     };
     alice.asset_issued_name = b"Existing".to_vec();
     alice.asset_issued_id = b"1000001".to_vec();
-    ctx.accounts.put(&addr(ALICE), &alice);
+    ctx.accounts.put(&addr(ALICE), &alice).unwrap();
     let c = base_issue();
     let err = asset::validate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::AccountAlreadyIssuedAsset));
@@ -207,7 +207,7 @@ fn issue_rejects_duplicate_asset_name() {
         name: b"TestCoin".to_vec(),
         ..base_issue()
     };
-    ctx.v1.put(&existing.name, &existing);
+    ctx.v1.put(&existing.name, &existing).unwrap();
     let c = base_issue();
     let err = asset::validate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::AssetNameTaken), "got: {err:?}");
@@ -305,7 +305,7 @@ fn update_rejects_negative_limits() {
         ..Default::default()
     };
     alice.asset_issued_id = b"1000001".to_vec();
-    ctx.accounts.put(&addr(ALICE), &alice);
+    ctx.accounts.put(&addr(ALICE), &alice).unwrap();
     for (l, pl) in [(-1, 100), (100, -1), (-1, -1)] {
         let c = UpdateAssetContract {
             owner_address: ALICE.to_vec(),
@@ -360,7 +360,7 @@ fn transfer_asset_rejects_self() {
             asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: ALICE.to_vec(),
@@ -374,7 +374,7 @@ fn transfer_asset_rejects_self() {
 #[test]
 fn transfer_asset_rejects_non_positive_amount() {
     let accounts = AccountStore::new(mem());
-    accounts.put(&addr(ALICE), &Account::default());
+    accounts.put(&addr(ALICE), &Account::default()).unwrap();
     for amt in [0, -1] {
         let c = TransferAssetContract {
             owner_address: ALICE.to_vec(),
@@ -393,7 +393,7 @@ fn transfer_asset_rejects_non_positive_amount() {
 #[test]
 fn transfer_asset_rejects_empty_asset_name() {
     let accounts = AccountStore::new(mem());
-    accounts.put(&addr(ALICE), &Account::default());
+    accounts.put(&addr(ALICE), &Account::default()).unwrap();
     let c = TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: BOB.to_vec(),
@@ -427,7 +427,7 @@ fn transfer_asset_rejects_insufficient_balance() {
             asset_v2: BTreeMap::from([("1000001".to_string(), 5i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: BOB.to_vec(),
@@ -454,7 +454,7 @@ fn transfer_asset_creates_recipient_account_if_missing() {
             asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: BOB.to_vec(),
@@ -479,7 +479,7 @@ fn transfer_asset_preserves_balance_invariant_under_split_transfers() {
             asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c1 = TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: BOB.to_vec(),
@@ -513,7 +513,7 @@ fn transfer_asset_v1_fallback_works_when_only_v1_entry_exists() {
             asset: BTreeMap::from([("LegacyCoin".to_string(), 1000i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: BOB.to_vec(),

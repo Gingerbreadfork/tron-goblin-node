@@ -37,12 +37,13 @@ impl ExchangeStore {
         exchange_key(id)
     }
 
-    pub fn put(&self, id: i64, exchange: &Exchange) {
-        self.backend.put(&Self::key_for(id), &exchange.encode_to_vec());
+    pub fn put(&self, id: i64, exchange: &Exchange) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(id), &exchange.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Exchange>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::key_for(id)) else {
+        let Some(bytes) = self.backend.get(&Self::key_for(id))? else {
             return Ok(None);
         };
         Ok(Some(Exchange::decode(bytes.as_slice())?))
@@ -50,7 +51,7 @@ impl ExchangeStore {
 
     pub fn all(&self) -> Result<Vec<(i64, Exchange)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
+        for (k, v) in self.backend.scan_all()? {
             if k.len() != 8 {
                 continue;
             }
@@ -79,12 +80,13 @@ impl ExchangeV2Store {
         exchange_key(id)
     }
 
-    pub fn put(&self, id: i64, exchange: &Exchange) {
-        self.backend.put(&Self::key_for(id), &exchange.encode_to_vec());
+    pub fn put(&self, id: i64, exchange: &Exchange) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(id), &exchange.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Exchange>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::key_for(id)) else {
+        let Some(bytes) = self.backend.get(&Self::key_for(id))? else {
             return Ok(None);
         };
         Ok(Some(Exchange::decode(bytes.as_slice())?))
@@ -92,7 +94,7 @@ impl ExchangeV2Store {
 
     pub fn all(&self) -> Result<Vec<(i64, Exchange)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
+        for (k, v) in self.backend.scan_all()? {
             if k.len() != 8 {
                 continue;
             }

@@ -107,10 +107,23 @@ pub enum StoreError {
     InvalidValueLength { got: usize, expected: usize },
     #[error("protobuf decode error: {0}")]
     Decode(String),
+    /// Surfaced when the underlying [`crate::KvBackend`] returned an
+    /// error (RocksDB IO, corruption detected at open, etc.). Lets
+    /// store-level callers distinguish "key isn't there" from
+    /// "couldn't even ask the disk" — the prior infallible `get`
+    /// silently merged both, which was the C-9 footgun.
+    #[error("kv backend: {0}")]
+    Backend(String),
 }
 
 impl From<prost::DecodeError> for StoreError {
     fn from(e: prost::DecodeError) -> Self {
         Self::Decode(e.to_string())
+    }
+}
+
+impl From<crate::KvError> for StoreError {
+    fn from(e: crate::KvError) -> Self {
+        Self::Backend(e.to_string())
     }
 }

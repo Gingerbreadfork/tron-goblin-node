@@ -59,7 +59,7 @@ fn fresh_stores() -> Stores {
 fn install_contract(stores: &Stores, addr: EvmAddress, bytecode: &[u8]) {
     let tron_addr = evm_to_tron_address(&addr);
     let hash = code_hash(bytecode);
-    stores.code.put(hash.as_slice(), bytecode);
+    stores.code.put(hash.as_slice(), bytecode).unwrap();
     stores.accounts.put(
         &tron_addr,
         &tron_proto::Account {
@@ -69,7 +69,7 @@ fn install_contract(stores: &Stores, addr: EvmAddress, bytecode: &[u8]) {
             code: bytecode.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 /// Build the EVM in a local macro so we avoid spelling out the deep
@@ -149,7 +149,7 @@ fn contract_that_returns_constant_returns_it_through_revm() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut evm = build_evm!(stores);
     let tx = TxEnv::builder()
@@ -206,7 +206,7 @@ fn sstore_lands_in_storage_row_store_via_v2_layout() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut evm = build_evm!(stores);
     let tx = TxEnv::builder()
@@ -226,7 +226,11 @@ fn sstore_lands_in_storage_row_store_via_v2_layout() {
     let contract_tron = evm_to_tron_address(&contract);
     let slot_bytes = [0u8; 32]; // slot index 0
     let composite = StorageRowStore::compose_key(&contract_tron, &slot_bytes);
-    let stored = stores.storage.get(&composite).expect("storage not written");
+    let stored = stores
+        .storage
+        .get(&composite)
+        .unwrap()
+        .expect("storage not written");
     // Right-aligned big-endian 0x12345678
     let mut expected = [0u8; 32];
     expected[28..32].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
@@ -283,7 +287,7 @@ fn sstore_then_sload_within_one_contract_round_trips_the_value() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut evm = build_evm!(stores);
     let tx = TxEnv::builder()
@@ -313,6 +317,7 @@ fn sstore_then_sload_within_one_contract_round_trips_the_value() {
     let stored = stores
         .storage
         .get(&composite)
+        .unwrap()
         .expect("storage row missing after commit");
     let mut expected_bytes = [0u8; 32];
     expected_bytes[31] = 99;
@@ -343,7 +348,7 @@ fn tron_extended_opcode_halts_cleanly_not_undefined() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut evm = build_evm!(stores);
     let tx = TxEnv::builder()

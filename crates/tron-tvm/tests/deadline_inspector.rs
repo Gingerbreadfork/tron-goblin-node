@@ -64,7 +64,7 @@ fn infinite_loop_bytecode() -> Vec<u8> {
 
 fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
     let hash = code_hash(&bytecode).to_vec();
-    stores.code.put(&hash, &bytecode);
+    stores.code.put(&hash, &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(addr),
         &Account {
@@ -74,7 +74,7 @@ fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
             code_hash: hash,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn caller(addr: [u8; 21]) -> Account {
@@ -108,7 +108,7 @@ fn infinite_loop_without_deadline_halts_on_out_of_gas() {
     let contract_addr = tron_addr(0xb1);
     stores
         .accounts
-        .put(&Address::from_raw(caller_addr), &caller(caller_addr));
+        .put(&Address::from_raw(caller_addr), &caller(caller_addr)).unwrap();
     install_contract(&stores, contract_addr, infinite_loop_bytecode());
 
     let block = VmBlockEnv {
@@ -138,7 +138,7 @@ fn infinite_loop_with_tight_deadline_returns_timeout() {
     let contract_addr = tron_addr(0xb2);
     stores
         .accounts
-        .put(&Address::from_raw(caller_addr), &caller(caller_addr));
+        .put(&Address::from_raw(caller_addr), &caller(caller_addr)).unwrap();
     install_contract(&stores, contract_addr, infinite_loop_bytecode());
 
     let block = VmBlockEnv {
@@ -201,7 +201,7 @@ fn already_elapsed_deadline_halts_essentially_immediately() {
     let contract_addr = tron_addr(0xb3);
     stores
         .accounts
-        .put(&Address::from_raw(caller_addr), &caller(caller_addr));
+        .put(&Address::from_raw(caller_addr), &caller(caller_addr)).unwrap();
     install_contract(&stores, contract_addr, infinite_loop_bytecode());
 
     let block = VmBlockEnv {
@@ -244,7 +244,7 @@ fn deadline_in_the_future_does_not_trip_for_short_call() {
     let contract_addr = tron_addr(0xb4);
     stores
         .accounts
-        .put(&Address::from_raw(caller_addr), &caller(caller_addr));
+        .put(&Address::from_raw(caller_addr), &caller(caller_addr)).unwrap();
     install_contract(&stores, contract_addr, vec![0x00]); // STOP
 
     let block = VmBlockEnv {

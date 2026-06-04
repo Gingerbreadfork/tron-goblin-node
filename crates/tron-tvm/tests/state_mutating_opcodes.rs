@@ -67,7 +67,7 @@ fn tron_addr(byte: u8) -> [u8; 21] {
 
 fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>, balance: i64) {
     let hash = code_hash(&bytecode);
-    stores.code.put(hash.as_slice(), &bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(addr),
         &Account {
@@ -77,7 +77,7 @@ fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>, balanc
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn install_caller(stores: &VmStores, addr: [u8; 21], balance: i64) {
@@ -88,7 +88,7 @@ fn install_caller(stores: &VmStores, addr: [u8; 21], balance: i64) {
             balance,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn trigger(from: [u8; 21], to: [u8; 21]) -> tron_proto::TriggerSmartContract {
@@ -194,6 +194,7 @@ fn freeze_balance_v2_actually_freezes_caller_balance() {
     let bytes = stores
         .storage
         .get(&storage_key)
+        .unwrap()
         .expect("FREEZEBALANCEV2 success flag persisted");
     let last = bytes[31];
     assert_eq!(last, 1, "FREEZEBALANCEV2 should push 1 on success");
@@ -218,7 +219,7 @@ fn unfreeze_balance_v2_moves_funds_to_unfrozen_v2_queue() {
     bc.push(0x55);
     bc.push(0x00);
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     // Pre-seed the contract with a FreezeV2 slot to unfreeze from.
     stores.accounts.put(
         &Address::from_raw(contract_addr),
@@ -233,7 +234,7 @@ fn unfreeze_balance_v2_moves_funds_to_unfrozen_v2_queue() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -276,7 +277,7 @@ fn withdraw_expire_unfreeze_sweeps_matured_entries() {
 
     let bc = vec![0xdd, 0x60, 0x00, 0x55, 0x00];
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     // Pre-seed two unfrozen_v2 entries: one matured, one not.
     let now = 1_700_000_000_000i64;
     stores.accounts.put(
@@ -300,7 +301,7 @@ fn withdraw_expire_unfreeze_sweeps_matured_entries() {
             ],
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -332,7 +333,7 @@ fn withdraw_expire_unfreeze_sweeps_matured_entries() {
         &Address::from_raw(contract_addr),
         &[0u8; 32],
     );
-    let bytes = stores.storage.get(&storage_key).unwrap();
+    let bytes = stores.storage.get(&storage_key).unwrap().unwrap();
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[24..32]);
     assert_eq!(i64::from_be_bytes(buf), 1_000_000);
@@ -350,7 +351,7 @@ fn cancel_all_unfreeze_v2_restakes_pending_entries() {
 
     let bc = vec![0xdc, 0x60, 0x00, 0x55, 0x00];
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     stores.accounts.put(
         &Address::from_raw(contract_addr),
         &Account {
@@ -369,7 +370,7 @@ fn cancel_all_unfreeze_v2_restakes_pending_entries() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -406,7 +407,7 @@ fn withdraw_reward_returns_allowance_and_zeroes_it() {
 
     let bc = vec![0xd9, 0x60, 0x00, 0x55, 0x00];
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     stores.accounts.put(
         &Address::from_raw(contract_addr),
         &Account {
@@ -418,7 +419,7 @@ fn withdraw_reward_returns_allowance_and_zeroes_it() {
             latest_withdraw_time: 0, // first call ever
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -446,7 +447,7 @@ fn withdraw_reward_returns_allowance_and_zeroes_it() {
         &Address::from_raw(contract_addr),
         &[0u8; 32],
     );
-    let bytes = stores.storage.get(&storage_key).unwrap();
+    let bytes = stores.storage.get(&storage_key).unwrap().unwrap();
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[24..32]);
     assert_eq!(i64::from_be_bytes(buf), 7_500_000);
@@ -478,7 +479,7 @@ fn freeze_v1_actually_locks_balance_with_expire_time() {
     bc.push(0x55);
     bc.push(0x00);
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     stores.accounts.put(
         &Address::from_raw(contract_addr),
         &Account {
@@ -488,7 +489,7 @@ fn freeze_v1_actually_locks_balance_with_expire_time() {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -541,7 +542,7 @@ fn unfreeze_v1_clears_matured_frozen_entries() {
     bc.push(0x55);
     bc.push(0x00);
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     // Pre-seed an EXPIRED frozen entry on the contract.
     stores.accounts.put(
         &Address::from_raw(contract_addr),
@@ -556,7 +557,7 @@ fn unfreeze_v1_clears_matured_frozen_entries() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -604,7 +605,7 @@ fn delegate_resource_creates_record_and_moves_balances() {
     bc.push(0x55);
     bc.push(0x00);
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     // Pre-seed contract with FreezeV2 to delegate FROM.
     stores.accounts.put(
         &Address::from_raw(contract_addr),
@@ -619,7 +620,7 @@ fn delegate_resource_creates_record_and_moves_balances() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Receiver must also exist (the bridge checks).
     stores.accounts.put(
         &Address::from_raw(receiver),
@@ -628,7 +629,7 @@ fn delegate_resource_creates_record_and_moves_balances() {
             balance: 0,
             ..Default::default()
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -706,7 +707,7 @@ fn undelegate_resource_reverses_a_delegation() {
     bc.push(0x55);
     bc.push(0x00);
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     // Pre-seed the delegation record AND both accounts' acquired/
     // delegated counters.
     stores.accounts.put(
@@ -719,7 +720,7 @@ fn undelegate_resource_reverses_a_delegation() {
             delegated_frozen_v2_balance_for_bandwidth: amount as i64,
             ..Default::default()
         },
-    );
+    ).unwrap();
     stores.accounts.put(
         &Address::from_raw(receiver),
         &Account {
@@ -728,7 +729,7 @@ fn undelegate_resource_reverses_a_delegation() {
             acquired_delegated_frozen_v2_balance_for_bandwidth: amount as i64,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(
         &Address::from_raw(contract_addr),
         &Address::from_raw(receiver),
@@ -743,7 +744,7 @@ fn undelegate_resource_reverses_a_delegation() {
             expire_time_for_bandwidth: 0,
             expire_time_for_energy: 0,
         },
-    );
+    ).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(
@@ -814,7 +815,7 @@ fn vote_witness_writes_empty_vote_set_when_args_are_empty() {
     bc.push(0x55);
     bc.push(0x00);
     let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
     let mut pre_account = Account {
         address: contract_addr.to_vec(),
         balance: 0,
@@ -827,7 +828,7 @@ fn vote_witness_writes_empty_vote_set_when_args_are_empty() {
         vote_address: tron_addr(0xfe).to_vec(),
         vote_count: 100,
     });
-    stores.accounts.put(&Address::from_raw(contract_addr), &pre_account);
+    stores.accounts.put(&Address::from_raw(contract_addr), &pre_account).unwrap();
     install_caller(&stores, caller_user, 1_000_000_000);
 
     let outcome = execute_trigger(

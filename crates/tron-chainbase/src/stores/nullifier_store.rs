@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "nullifier";
 
@@ -29,13 +30,14 @@ impl NullifierStore {
 
     /// Record `nullifier` as spent. java-tron stores the nullifier as
     /// both key and value (`put(bytes.getData(), new BytesCapsule(bytes.getData()))`).
-    pub fn put(&self, nullifier: &[u8]) {
-        self.backend.put(nullifier, nullifier);
+    pub fn put(&self, nullifier: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(nullifier, nullifier)?;
+        Ok(())
     }
 
     /// Has this nullifier ever been recorded? java-tron's
     /// `NullifierStore.get` returns `null` for unseen entries.
-    pub fn contains(&self, nullifier: &[u8]) -> bool {
-        self.backend.contains(nullifier)
+    pub fn contains(&self, nullifier: &[u8]) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(nullifier)?)
     }
 }

@@ -60,7 +60,7 @@ fn ctx_with_alice(trx_balance: i64, asset_balance: i64, fee: i64) -> Ctx {
             asset_v2: BTreeMap::from([("1000001".to_string(), asset_balance)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     ctx.dp.put_long(b"EXCHANGE_CREATE_FEE", fee);
     ctx
 }
@@ -81,8 +81,8 @@ fn seed_trx_asset_exchange(
         second_token_id: b"1000001".to_vec(),
         second_token_balance: asset_balance,
     };
-    ctx.v1.put(exchange_id, &ex);
-    ctx.v2.put(exchange_id, &ex);
+    ctx.v1.put(exchange_id, &ex).unwrap();
+    ctx.v2.put(exchange_id, &ex).unwrap();
 }
 
 // ============================================================
@@ -243,7 +243,7 @@ fn inject_rejects_non_creator_owner() {
             balance: 100_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = ExchangeInjectContract {
         owner_address: BOB.to_vec(),
         exchange_id: 1,
@@ -423,7 +423,7 @@ fn transaction_rejects_missing_owner_account() {
             balance: 0,
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Carol (not in accounts) tries to swap.
     let mut carol = [0u8; 21];
     carol[0] = 0x41;

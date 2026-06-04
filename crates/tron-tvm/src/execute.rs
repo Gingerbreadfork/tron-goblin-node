@@ -688,7 +688,9 @@ fn apply_top_level_trc10(
         ));
     }
     from_acct.asset_v2.insert(key.clone(), from_balance - value);
-    accounts.put(&from_addr, &from_acct);
+    accounts
+        .put(&from_addr, &from_acct)
+        .map_err(|e| format!("write sender: {e:?}"))?;
 
     let mut to_acct = accounts
         .get(&to_addr)
@@ -702,7 +704,9 @@ fn apply_top_level_trc10(
         .checked_add(value)
         .ok_or_else(|| "CALLTOKEN target balance overflow".to_string())?;
     to_acct.asset_v2.insert(key, new_to);
-    accounts.put(&to_addr, &to_acct);
+    accounts
+        .put(&to_addr, &to_acct)
+        .map_err(|e| format!("write target: {e:?}"))?;
     Ok(())
 }
 
@@ -787,8 +791,13 @@ pub fn execute_create_with_trace(
     // Pre-install Account at the TRON address with init code.
     let init_code = &smart_contract.bytecode;
     let init_hash = tron_crypto::hash::keccak256(init_code);
-    stores.code.put(&init_hash, init_code);
-    stores.accounts.put(
+    if let Err(e) = stores.code.put(&init_hash, init_code) {
+        return (
+            VmOutcome::PreflightError(format!("write init code: {e:?}")),
+            Vec::new(),
+        );
+    }
+    if let Err(e) = stores.accounts.put(
         &tron_contract_addr,
         &tron_proto::Account {
             address: tron_contract_addr.as_bytes().to_vec(),
@@ -797,7 +806,12 @@ pub fn execute_create_with_trace(
             code_hash: init_hash.to_vec(),
             ..Default::default()
         },
-    );
+    ) {
+        return (
+            VmOutcome::PreflightError(format!("install contract account: {e:?}")),
+            Vec::new(),
+        );
+    }
 
     // CALL the just-installed account; init code runs.
     let mut tron_db = TronDatabase::new(
@@ -899,7 +913,10 @@ pub fn execute_create_with_trace(
             let already_used = gas.tx_gas_used();
             let total_with_deposit = already_used.saturating_add(deposit_cost);
             if total_with_deposit > energy_limit {
-                stores.accounts.delete(&tron_contract_addr);
+                stores
+                    .accounts
+                    .delete(&tron_contract_addr)
+                    .expect("db error in execute_create cleaning up after code-deposit OOG");
                 VmOutcome::Halt {
                     reason: format!(
                         "out of gas charging code-deposit ({} bytes × 200 = {} gas; \
@@ -918,13 +935,19 @@ pub fn execute_create_with_trace(
                     tron_crypto::hash::keccak256(&runtime_code).to_vec()
                 };
                 if !runtime_code.is_empty() {
-                    stores.code.put(&runtime_hash, &runtime_code);
+                    stores
+                        .code
+                        .put(&runtime_hash, &runtime_code)
+                        .expect("db error in execute_create writing runtime code");
                 }
                 // Replace init code on the Account with the runtime code.
                 if let Ok(Some(mut acct)) = stores.accounts.get(&tron_contract_addr) {
                     acct.code = runtime_code;
                     acct.code_hash = runtime_hash;
-                    stores.accounts.put(&tron_contract_addr, &acct);
+                    stores
+                        .accounts
+                        .put(&tron_contract_addr, &acct)
+                        .expect("db error in execute_create finalizing contract account");
                 }
                 VmOutcome::Success {
                     return_data: tron_contract_addr.as_bytes().to_vec(),
@@ -936,14 +959,20 @@ pub fn execute_create_with_trace(
         ExecutionResult::Revert { output, gas, .. } => {
             // Init code reverted — clean up the pre-installed Account
             // so deployment doesn't leak.
-            stores.accounts.delete(&tron_contract_addr);
+            stores
+                .accounts
+                .delete(&tron_contract_addr)
+                .expect("db error in execute_create cleaning up after Revert");
             VmOutcome::Revert {
                 return_data: output.to_vec(),
                 energy_used: gas.tx_gas_used(),
             }
         }
         ExecutionResult::Halt { reason, gas, .. } => {
-            stores.accounts.delete(&tron_contract_addr);
+            stores
+                .accounts
+                .delete(&tron_contract_addr)
+                .expect("db error in execute_create cleaning up after Halt");
             VmOutcome::Halt {
                 reason: format!("{reason:?}"),
                 energy_used: gas.tx_gas_used(),

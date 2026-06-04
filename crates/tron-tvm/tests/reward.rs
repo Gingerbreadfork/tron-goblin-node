@@ -67,7 +67,7 @@ fn query_reward_returns_allowance_for_account_with_no_votes() {
             votes: vec![],
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let reward = query_reward(&voter, &accounts, &delegation, &dp).unwrap();
     assert_eq!(reward, 7_000_000);
@@ -101,7 +101,7 @@ fn query_reward_sums_vi_delta_times_vote_count_per_witness() {
             ],
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Cycle window [10, 20).
     delegation.set_begin_cycle(&voter, 10);
@@ -136,7 +136,7 @@ fn query_reward_returns_just_allowance_when_begin_cycle_equals_end_cycle() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // No cycles to walk — begin == end.
     delegation.set_begin_cycle(&voter, 5);
     delegation.set_end_cycle(&voter, 5);
@@ -173,7 +173,7 @@ fn query_reward_handles_vi_progression_across_cycles() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     delegation.set_begin_cycle(&voter, 100);
     delegation.set_end_cycle(&voter, 110);
 
@@ -207,7 +207,7 @@ fn query_reward_includes_partial_current_cycle_when_voter_has_voted() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Finalised window: cycles 5..10 — voter has earned through cycle 9.
     delegation.set_begin_cycle(&voter, 5);
     delegation.set_end_cycle(&voter, 10);
@@ -225,7 +225,7 @@ fn query_reward_includes_partial_current_cycle_when_voter_has_voted() {
             address: voter.as_bytes().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let reward = query_reward(&voter, &accounts, &delegation, &dp).unwrap();
     // Finalised: 100 × (2 - 0) = 200
@@ -254,7 +254,7 @@ fn query_reward_skips_partial_when_voter_didnt_vote_in_current_cycle() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     delegation.set_begin_cycle(&voter, 5);
     delegation.set_end_cycle(&voter, 10);
     delegation.set_witness_vi_raw(4, &witness, &encode_vi(0));
@@ -290,7 +290,7 @@ fn withdraw_reward_noop_when_allow_change_delegation_disabled() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // ALLOW_CHANGE_DELEGATION not set ⇒ 0 ⇒ disabled.
     let paid = withdraw_reward(&voter, &accounts, &delegation, &dp).unwrap();
     assert_eq!(paid, 0);
@@ -328,7 +328,7 @@ fn withdraw_reward_noop_when_already_claimed_this_cycle() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // begin_cycle == current_cycle AND account_vote already recorded
     // ⇒ already claimed.
     delegation.set_begin_cycle(&voter, 10);
@@ -340,7 +340,7 @@ fn withdraw_reward_noop_when_already_claimed_this_cycle() {
             address: voter.as_bytes().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let paid = withdraw_reward(&voter, &accounts, &delegation, &dp).unwrap();
     assert_eq!(paid, 0);
 }
@@ -366,7 +366,7 @@ fn withdraw_reward_bulk_window_pays_finalised_cycles_and_advances_state() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Window [5, 10): Vi grew from 0 to 3×DECIMAL → 100 × 3 = 300 sun.
     delegation.set_begin_cycle(&voter, 5);
     delegation.set_end_cycle(&voter, 10);
@@ -415,7 +415,7 @@ fn withdraw_reward_latest_cycle_catchup_uses_snapshot_not_current_votes() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // begin+1 == end & begin < current ⇒ latest-cycle catch-up path.
     // begin=7, end=8, current=10. Snapshot at cycle 7 says voted for old_witness.
     delegation.set_begin_cycle(&voter, 7);
@@ -431,7 +431,7 @@ fn withdraw_reward_latest_cycle_catchup_uses_snapshot_not_current_votes() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Catch-up window [7, 8): Vi(6→7) on OLD witness: 0 → 4×DECIMAL.
     delegation.set_witness_vi_raw(6, &old_witness, &encode_vi(0));
     delegation.set_witness_vi_raw(7, &old_witness, &encode_vi(4 * REWARD_VI_DECIMAL));
@@ -466,7 +466,7 @@ fn withdraw_reward_no_votes_account_fast_forwards_begin_cycle() {
             votes: vec![], // no live votes
             ..Default::default()
         },
-    );
+    ).unwrap();
     delegation.set_begin_cycle(&voter, 5);
     delegation.set_end_cycle(&voter, 6);
 
@@ -498,7 +498,7 @@ fn withdraw_reward_noop_when_begin_cycle_in_future() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Voter's begin is somehow ahead of current — must bail with no state change.
     delegation.set_begin_cycle(&voter, 10);
     delegation.set_end_cycle(&voter, 11);

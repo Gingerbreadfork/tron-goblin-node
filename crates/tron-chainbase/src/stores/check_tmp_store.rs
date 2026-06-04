@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "tmp";
 
@@ -25,7 +26,7 @@ impl CheckTmpStore {
     /// **No-op**, matching `CheckTmpStore.put` in java-tron (empty body).
     pub fn put(&self, _key: &[u8], _value: &[u8]) {}
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.backend.get(key)
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(key)?)
     }
 }

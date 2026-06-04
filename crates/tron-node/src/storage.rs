@@ -251,13 +251,18 @@ impl SnapshotStack {
                                 // Checkpoint failed — fall back to
                                 // direct merge so we don't get stuck.
                                 for (_, b) in &g.backends {
-                                    b.merge();
+                                    b.merge().expect(
+                                        "db error in SnapshotStack::apply_block: \
+                                         merge fallback after checkpoint failure",
+                                    );
                                 }
                             }
                         }
                     } else {
                         for (_, b) in &g.backends {
-                            b.merge();
+                            b.merge().expect(
+                                "db error in SnapshotStack::apply_block: merge bottom layer",
+                            );
                         }
                     }
                     g.block_nums.remove(0);
@@ -362,7 +367,9 @@ impl SnapshotStack {
                 let _ = flush_bottom_locked(&g.backends, cp);
             } else {
                 for (_, b) in &g.backends {
-                    b.merge();
+                    b.merge().expect(
+                        "db error in SnapshotStack::reorg_apply: merge bottom layer",
+                    );
                 }
             }
             g.block_nums.remove(0);
@@ -377,7 +384,9 @@ impl SnapshotStack {
         let mut g = self.inner.lock().expect("snapshot stack lock poisoned");
         while !g.block_nums.is_empty() {
             for (_, b) in &g.backends {
-                b.merge();
+                b.merge().expect(
+                    "db error in SnapshotStack::merge_all: shutdown flush layer",
+                );
             }
             g.block_nums.remove(0);
         }
@@ -415,14 +424,23 @@ impl SnapshotStack {
             let n = checkpoint.replay(id, |entry| {
                 if let Some((_, b)) = g.backends.iter().find(|(n, _)| n == &entry.db_name) {
                     match &entry.value {
-                        Some(v) => b.put(&entry.key, v),
-                        None => b.delete(&entry.key),
+                        Some(v) => b
+                            .put(&entry.key, v)
+                            .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?,
+                        None => b
+                            .delete(&entry.key)
+                            .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?,
                     }
                 }
                 Ok(())
             })?;
             total += n;
-            let _ = checkpoint.delete(id);
+            // Best-effort cleanup: the checkpoint's data is already replayed,
+            // so a failed delete only leaves a stale (idempotently re-applied)
+            // checkpoint behind — log it rather than discard the error silently.
+            if let Err(e) = checkpoint.delete(id) {
+                tracing::warn!(checkpoint_id = id, error = %e, "failed to delete replayed checkpoint");
+            }
         }
         Ok(total)
     }
@@ -485,10 +503,15 @@ fn flush_bottom_locked(
         Some(checkpoint.write(&entries)?)
     };
     for (_, b) in backends {
-        b.merge();
+        b.merge()
+            .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
     }
     if let Some(id) = id {
-        let _ = checkpoint.delete(id);
+        // Best-effort: data already merged to root; a failed delete only
+        // leaves a stale checkpoint behind. Log instead of swallowing.
+        if let Err(e) = checkpoint.delete(id) {
+            tracing::warn!(checkpoint_id = id, error = %e, "failed to delete merged checkpoint");
+        }
     }
     Ok(id)
 }
@@ -725,6 +748,10 @@ pub enum StorageError {
         path: PathBuf,
         source: RocksDbError,
     },
+    #[error("store error: {0}")]
+    Store(#[from] tron_chainbase::StoreError),
+    #[error("kv backend error: {0}")]
+    Kv(#[from] tron_chainbase::KvError),
 }
 
 #[cfg(test)]
@@ -776,11 +803,11 @@ mod snapshot_stack_tests {
         assert!(cp.list().unwrap().is_empty());
         // Writes landed in the roots.
         assert_eq!(
-            handles[0].get(b"recovered_key0").as_deref(),
+            handles[0].get(b"recovered_key0").unwrap().as_deref(),
             Some(b"recovered_value0".as_ref())
         );
         assert_eq!(
-            handles[1].get(b"recovered_key1").as_deref(),
+            handles[1].get(b"recovered_key1").unwrap().as_deref(),
             Some(b"recovered_value1".as_ref())
         );
     }
@@ -791,7 +818,7 @@ mod snapshot_stack_tests {
         let cp = tron_chainbase::CheckPointV2::new(tmp.path());
         let (stack, handles) = build_stack(1);
         // Pre-seed a value the recovery should tombstone.
-        handles[0].put(b"to_delete", b"present");
+        handles[0].put(b"to_delete", b"present").unwrap();
         cp.write(&[tron_chainbase::CheckpointEntry {
             db_name: "store_0".into(),
             key: b"to_delete".to_vec(),
@@ -799,7 +826,7 @@ mod snapshot_stack_tests {
         }])
         .unwrap();
         stack.recover_from_checkpoints(&cp).unwrap();
-        assert!(handles[0].get(b"to_delete").is_none());
+        assert!(handles[0].get(b"to_delete").unwrap().is_none());
     }
 
     #[test]

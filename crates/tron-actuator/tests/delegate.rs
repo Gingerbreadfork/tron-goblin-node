@@ -58,7 +58,7 @@ fn put_basic_account(ctx: &Ctx, who: [u8; 21]) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn put_account_with_frozen(ctx: &Ctx, who: [u8; 21], resource: i32, amount: i64) {
@@ -74,7 +74,7 @@ fn put_account_with_frozen(ctx: &Ctx, who: [u8; 21], resource: i32, amount: i64)
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 // ============================================================
@@ -189,7 +189,7 @@ fn delegate_rejects_to_contract_account() {
             r#type: AccountType::Contract as i32, // contract
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = DelegateResourceContract {
         owner_address: ALICE.to_vec(),
         receiver_address: BOB.to_vec(),
@@ -455,7 +455,7 @@ fn undelegate_keeps_record_when_other_resource_type_still_has_balance() {
         r#type: 1,
         amount: 100 * PRECISION,
     });
-    ctx.accounts.put(&addr(ALICE), &alice);
+    ctx.accounts.put(&addr(ALICE), &alice).unwrap();
     put_basic_account(&ctx, BOB);
     // Delegate both BW and Energy.
     let c_del_bw = DelegateResourceContract {

@@ -48,7 +48,7 @@ async fn spawn_server() -> std::net::SocketAddr {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
     AccountStore::new(accounts_be.clone()).put(
         &Address::from_raw(BOB),
         &Account {
@@ -57,7 +57,7 @@ async fn spawn_server() -> std::net::SocketAddr {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let block = Block {
         block_header: Some(BlockHeader {
@@ -73,8 +73,8 @@ async fn spawn_server() -> std::net::SocketAddr {
         transactions: Vec::new(),
     };
     let block_id = block_id_from_block(&block).unwrap();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     let dp = DynamicPropertiesStore::new(dp_be.clone());
     dp.save_latest_block_header_number(1);
     dp.save_latest_block_header_hash(block_id.as_bytes());
@@ -87,7 +87,7 @@ async fn spawn_server() -> std::net::SocketAddr {
             url: "https://test.witness".into(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let state = RpcState::new(
         accounts_be,

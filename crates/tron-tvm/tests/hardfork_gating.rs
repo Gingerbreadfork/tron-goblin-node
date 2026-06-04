@@ -53,13 +53,13 @@ fn install_caller(stores: &VmStores) -> [u8; 21] {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     caller
 }
 
 fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
     let hash = code_hash(&bytecode);
-    stores.code.put(hash.as_slice(), &bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(addr),
         &Account {
@@ -69,7 +69,7 @@ fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn run(stores: &VmStores, caller: [u8; 21], contract: [u8; 21]) -> VmOutcome {
@@ -437,7 +437,11 @@ fn validatemultisign_precompile_unreachable_without_solidity_059() {
     if let VmOutcome::Success { .. } = outcome {
         use tron_chainbase::StorageRowStore;
         let key = StorageRowStore::compose_key(&Address::from_raw(c), &[0u8; 32]);
-        let value = stores.storage.get(&key).unwrap_or_default();
+        let value = stores
+            .storage
+            .get(&key)
+            .unwrap()
+            .unwrap_or_default();
         // returndatasize fits in the low bytes — assert all 32 bytes
         // are zero (no precompile output).
         assert!(

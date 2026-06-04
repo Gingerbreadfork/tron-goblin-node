@@ -38,6 +38,18 @@ impl RpcError {
     }
 }
 
+impl From<tron_chainbase::StoreError> for RpcError {
+    fn from(e: tron_chainbase::StoreError) -> Self {
+        Self::internal(format!("store error: {e}"))
+    }
+}
+
+impl From<tron_chainbase::KvError> for RpcError {
+    fn from(e: tron_chainbase::KvError) -> Self {
+        Self::internal(format!("kv backend error: {e}"))
+    }
+}
+
 // =============================================================================
 // Helpers — hex encoding the Ethereum way (lowercase, `0x`-prefixed, minimal).
 // =============================================================================
@@ -244,7 +256,7 @@ pub fn eth_get_code(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     if account.code_hash.is_empty() {
         return Ok(Value::String("0x".to_string()));
     }
-    match code_store.get(&account.code_hash) {
+    match code_store.get(&account.code_hash)? {
         Some(bytecode) => Ok(Value::String(hex_bytes(&bytecode))),
         None => Ok(Value::String("0x".to_string())),
     }
@@ -284,7 +296,7 @@ pub fn eth_get_storage_at(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     // sync-aware caller would consult ContractStore to switch, but for
     // a read-only RPC the v2 default matches what new contracts emit.
     let key = tron_chainbase::StorageRowStore::compose_key(&addr, &slot);
-    let value = storage.get(&key).unwrap_or_else(|| vec![0u8; 32]);
+    let value = storage.get(&key)?.unwrap_or_else(|| vec![0u8; 32]);
     let mut padded = [0u8; 32];
     let n = value.len().min(32);
     padded[32 - n..].copy_from_slice(&value[value.len() - n..]);
@@ -2530,7 +2542,7 @@ pub fn eth_get_proof(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             let value = match &s.storage {
                 Some(storage) => {
                     let key = tron_chainbase::StorageRowStore::compose_key(&addr, &slot);
-                    storage.get(&key).unwrap_or_else(|| vec![0u8; 32])
+                    storage.get(&key).ok().flatten().unwrap_or_else(|| vec![0u8; 32])
                 }
                 None => vec![0u8; 32],
             };
@@ -3012,7 +3024,7 @@ pub fn get_contract_info(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     // store is keyed by 32-byte code_hash (keccak256 of bytecode).
     let runtime_code = match &s.code {
         Some(code) if contract.code_hash.len() == 32 => {
-            code.get(&contract.code_hash).unwrap_or_default()
+            code.get(&contract.code_hash).ok().flatten().unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -3470,7 +3482,7 @@ pub fn get_market_pair_list(_p: &Value, s: &RpcState) -> Result<Value, RpcError>
         return Ok(json!({ "orderPair": Vec::<Value>::new() }));
     };
     let pairs: Vec<Value> = prices
-        .all()
+        .all()?
         .into_iter()
         .filter_map(|(k, _count)| {
             if k.len() != 2 * MARKET_TOKEN_ID_LENGTH {

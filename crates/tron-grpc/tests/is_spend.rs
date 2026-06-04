@@ -150,8 +150,8 @@ fn build_state_with_n_outputs(output_count: usize) -> (RpcState, [u8; 32]) {
     let block_index_be = mem();
     let dp_be = mem();
     let nullifiers_be = mem();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     let dp = DynamicPropertiesStore::new(dp_be.clone());
     dp.save_latest_block_header_number(1);
     dp.save_latest_block_header_hash(block_id.as_bytes());
@@ -254,7 +254,7 @@ async fn is_spend_reports_spent_when_nullifier_in_store() {
     // nullifier, and re-use the *same state* (since the Arc shares the
     // backend across clones).
     let nullifiers = state.nullifiers.clone().expect("nullifiers attached");
-    nullifiers.put(&expected_nf);
+    nullifiers.put(&expected_nf).unwrap();
 
     let (addr, _shutdown, _server) = spawn_server(state).await;
     let mut client = WalletClient::connect(format!("http://{}", addr))

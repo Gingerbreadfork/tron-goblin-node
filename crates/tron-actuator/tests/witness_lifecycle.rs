@@ -41,7 +41,7 @@ fn put_funded(accounts: &AccountStore, who: [u8; 21], balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 // ============================================================
@@ -102,7 +102,7 @@ fn create_witness_rejects_when_already_a_witness() {
             url: "https://existing.test".to_string(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = WitnessCreateContract {
         owner_address: ALICE.to_vec(),
         url: b"https://new.test".to_vec(),
@@ -178,7 +178,7 @@ fn update_witness_rejects_invalid_url() {
             url: "https://old.test".to_string(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     for url in [Vec::new(), vec![b'a'; 300]] {
         let c = WitnessUpdateContract {
             owner_address: ALICE.to_vec(),
@@ -229,7 +229,7 @@ fn update_witness_changes_url_only() {
             total_missed: 1,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let c = WitnessUpdateContract {
         owner_address: ALICE.to_vec(),
         update_url: b"https://new.test".to_vec(),
@@ -287,7 +287,7 @@ fn update_account_rejects_renaming_when_already_named_and_proposal_disabled() {
         ..Default::default()
     };
     alice.account_name = b"existing".to_vec();
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = AccountUpdateContract {
         owner_address: ALICE.to_vec(),
         account_name: b"renamed".to_vec(),
@@ -302,7 +302,7 @@ fn update_account_rejects_name_taken_by_another_account() {
     let idx = AccountIndexStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     put_funded(&accounts, ALICE, 0);
-    idx.put(b"taken", &addr(BOB));
+    idx.put(b"taken", &addr(BOB)).unwrap();
     let c = AccountUpdateContract {
         owner_address: ALICE.to_vec(),
         account_name: b"taken".to_vec(),
@@ -323,7 +323,7 @@ fn update_account_allows_rename_when_proposal_enabled() {
         ..Default::default()
     };
     alice.account_name = b"old".to_vec();
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = AccountUpdateContract {
         owner_address: ALICE.to_vec(),
         account_name: b"new".to_vec(),

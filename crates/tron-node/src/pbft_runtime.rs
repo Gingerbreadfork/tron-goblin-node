@@ -531,7 +531,7 @@ impl PbftRuntime {
         };
 
         let store = PbftSignDataStore::new(self.pbft_sign_data.clone());
-        store.put_commit_result(&PbftSignDataStore::block_key(block_num), raw, &signatures);
+        store.put_commit_result(&PbftSignDataStore::block_key(block_num), raw, &signatures)?;
 
         let dp = DynamicPropertiesStore::new(self.state_dyn_props.clone());
         let prev_solid = dp.latest_solidified_block_num().unwrap_or(0);
@@ -661,7 +661,7 @@ impl PbftRuntime {
                     &PbftSignDataStore::sr_list_key(raw.epoch),
                     raw,
                     &signatures,
-                );
+                )?;
                 info!(epoch = raw.epoch, "PBFT solidified SRL rotation");
                 // Drop the SRL tally for this epoch.
                 let mut t = self.srl_tally.lock().unwrap();
@@ -769,6 +769,18 @@ pub enum PbftRuntimeError {
     Storage(String),
 }
 
+impl From<tron_chainbase::StoreError> for PbftRuntimeError {
+    fn from(e: tron_chainbase::StoreError) -> Self {
+        Self::Storage(e.to_string())
+    }
+}
+
+impl From<tron_chainbase::KvError> for PbftRuntimeError {
+    fn from(e: tron_chainbase::KvError) -> Self {
+        Self::Storage(e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,7 +801,7 @@ mod tests {
     }
 
     fn seed_active(schedule_be: &Arc<dyn KvBackend>, addrs: &[Address]) {
-        WitnessScheduleStore::new(schedule_be.clone()).save_active(addrs);
+        WitnessScheduleStore::new(schedule_be.clone()).save_active(addrs).unwrap();
     }
 
     #[tokio::test]
@@ -1228,7 +1240,7 @@ mod per_cycle_snapshot_tests {
         let schedule_be = mem();
         let sched = WitnessScheduleStore::new(schedule_be.clone());
         // Current active = [Alice]; Bob has rotated out.
-        sched.save_active(&[alice.witness_address]);
+        sched.save_active(&[alice.witness_address]).unwrap();
 
         let channels = PbftChannels::new();
         let runtime = PbftRuntime::new(mem(), schedule_be, mem(), alice, channels);
@@ -1260,7 +1272,7 @@ mod per_cycle_snapshot_tests {
         let alice = id_from_priv(alice_priv);
         let schedule_be = mem();
         let sched = WitnessScheduleStore::new(schedule_be.clone());
-        sched.save_active(&[alice.witness_address]);
+        sched.save_active(&[alice.witness_address]).unwrap();
 
         let alice_addr = alice.witness_address;
         let channels = PbftChannels::new();
@@ -1339,7 +1351,7 @@ mod srl_tests {
 
         let schedule_be = mem();
         let sched = WitnessScheduleStore::new(schedule_be.clone());
-        sched.save_active(&[alice.witness_address, bob_addr, charlie_addr, dan_addr]);
+        sched.save_active(&[alice.witness_address, bob_addr, charlie_addr, dan_addr]).unwrap();
 
         let dp_be = mem();
         let pbft_be = mem();
@@ -1392,7 +1404,7 @@ mod srl_tests {
 
         let schedule_be = mem();
         let sched = WitnessScheduleStore::new(schedule_be.clone());
-        sched.save_active(&[alice.witness_address, bob_addr, charlie_addr, dan_addr]);
+        sched.save_active(&[alice.witness_address, bob_addr, charlie_addr, dan_addr]).unwrap();
 
         let channels = PbftChannels::new();
         let mut outbound_rx = channels.outbound.subscribe();
@@ -1457,7 +1469,7 @@ mod cross_rotation_tests {
     }
 
     fn seed_active(schedule_be: &Arc<dyn KvBackend>, addrs: &[Address]) {
-        WitnessScheduleStore::new(schedule_be.clone()).save_active(addrs);
+        WitnessScheduleStore::new(schedule_be.clone()).save_active(addrs).unwrap();
     }
 
     /// With a cross-rotation snapshot wired up, the SR membership lookup

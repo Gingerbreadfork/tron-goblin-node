@@ -50,8 +50,8 @@ fn fixture() -> RpcState {
     }
     let block_id = tron_types::block_id_from_block(&block).expect("block id");
 
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     let dp = DynamicPropertiesStore::new(dp_be.clone());
     dp.save_latest_block_header_number(1);
     dp.save_latest_block_header_hash(block_id.as_bytes());
@@ -65,7 +65,7 @@ fn fixture() -> RpcState {
             balance: 1_234_567,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let ws = WitnessStore::new(witnesses_be.clone());
     let w_addr = {
         let mut a = [0u8; 21];
@@ -82,7 +82,7 @@ fn fixture() -> RpcState {
             is_jobs: true,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     RpcState {
         accounts: Arc::new(AccountStore::new(accounts_be)),

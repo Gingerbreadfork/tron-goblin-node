@@ -36,12 +36,13 @@ impl TransactionRetStore {
         block_num.to_be_bytes()
     }
 
-    pub fn put(&self, block_num: i64, ret: &TransactionRet) {
-        self.backend.put(&Self::key_for(block_num), &ret.encode_to_vec());
+    pub fn put(&self, block_num: i64, ret: &TransactionRet) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(block_num), &ret.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, block_num: i64) -> Result<Option<TransactionRet>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::key_for(block_num)) else {
+        let Some(bytes) = self.backend.get(&Self::key_for(block_num))? else {
             return Ok(None);
         };
         Ok(Some(TransactionRet::decode(bytes.as_slice())?))

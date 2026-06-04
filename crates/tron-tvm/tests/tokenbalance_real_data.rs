@@ -110,7 +110,7 @@ fn tokenbalance_opcode_returns_real_chainbase_asset_v2_balance() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // The holder account — has a real asset_v2 entry. THIS is what
     // TOKENBALANCE must surface.
@@ -122,12 +122,12 @@ fn tokenbalance_opcode_returns_real_chainbase_asset_v2_balance() {
     holder
         .asset_v2
         .insert(token_id.to_string(), real_balance);
-    stores.accounts.put(&Address::from_raw(holder_addr), &holder);
+    stores.accounts.put(&Address::from_raw(holder_addr), &holder).unwrap();
 
     // The contract that calls TOKENBALANCE.
     let bytecode = build_tokenbalance_caller(holder_addr, token_id);
     let hash = code_hash(&bytecode);
-    stores.code.put(hash.as_slice(), &bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(contract_addr),
         &Account {
@@ -137,7 +137,7 @@ fn tokenbalance_opcode_returns_real_chainbase_asset_v2_balance() {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_user.to_vec(),
@@ -168,6 +168,7 @@ fn tokenbalance_opcode_returns_real_chainbase_asset_v2_balance() {
     let bytes = stores
         .storage
         .get(&slot_key)
+        .unwrap()
         .expect("TOKENBALANCE result must be persisted to slot 0");
 
     // The pushed U256 is in big-endian. Extract the low 8 bytes.
@@ -201,18 +202,18 @@ fn tokenbalance_returns_zero_for_unknown_token() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut holder = Account {
         address: holder_addr.to_vec(),
         ..Default::default()
     };
     holder.asset_v2.insert(real_token.to_string(), 12345);
-    stores.accounts.put(&Address::from_raw(holder_addr), &holder);
+    stores.accounts.put(&Address::from_raw(holder_addr), &holder).unwrap();
 
     let bytecode = build_tokenbalance_caller(holder_addr, queried_token);
     let hash = code_hash(&bytecode);
-    stores.code.put(hash.as_slice(), &bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(contract_addr),
         &Account {
@@ -221,7 +222,7 @@ fn tokenbalance_returns_zero_for_unknown_token() {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_user.to_vec(),
@@ -247,7 +248,7 @@ fn tokenbalance_returns_zero_for_unknown_token() {
         StorageRowStore::compose_key(&Address::from_raw(contract_addr), &[0u8; 32]);
     // SSTORE of zero is a no-op (slot stays absent).
     assert!(
-        stores.storage.get(&slot_key).is_none(),
+        stores.storage.get(&slot_key).unwrap().is_none(),
         "TOKENBALANCE for unknown token must push 0 (SSTORE 0 is a no-op)"
     );
 }
@@ -273,7 +274,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
                 balance: 1_000_000_000,
                 ..Default::default()
             },
-        );
+        ).unwrap();
 
         if is_contract {
             stores.accounts.put(
@@ -283,7 +284,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
                     code_hash: vec![0xff; 32], // any non-empty
                     ..Default::default()
                 },
-            );
+            ).unwrap();
         } else {
             stores.accounts.put(
                 &Address::from_raw(target_addr),
@@ -292,7 +293,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
                     code_hash: vec![],
                     ..Default::default()
                 },
-            );
+            ).unwrap();
         }
 
         // PUSH20 target; ISCONTRACT (0xd4); PUSH1 0; SSTORE; STOP
@@ -305,7 +306,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
         bc.push(0x00);
 
         let hash = code_hash(&bc);
-        stores.code.put(hash.as_slice(), &bc);
+        stores.code.put(hash.as_slice(), &bc).unwrap();
         stores.accounts.put(
             &Address::from_raw(contract_addr),
             &Account {
@@ -314,7 +315,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
                 code_hash: hash.as_slice().to_vec(),
                 ..Default::default()
             },
-        );
+        ).unwrap();
 
         let trigger = TriggerSmartContract {
             owner_address: caller_user.to_vec(),
@@ -337,7 +338,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
 
         let slot_key =
             StorageRowStore::compose_key(&Address::from_raw(contract_addr), &[0u8; 32]);
-        let observed_nonzero = stores.storage.get(&slot_key).is_some();
+        let observed_nonzero = stores.storage.get(&slot_key).unwrap().is_some();
         assert_eq!(
             observed_nonzero, expect_slot_value,
             "ISCONTRACT for {label} (target=0x{target_byte:02x}) should push {} → slot present={expect_slot_value}",

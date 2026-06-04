@@ -61,7 +61,7 @@ fn basic_reads_balance_and_code_hash_from_tron_account_store() {
             code_hash: vec![0x33u8; 32],
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let info = db.basic(evm_addr).unwrap().unwrap();
     assert_eq!(info.balance, U256::from(1_000_000u64));
@@ -80,7 +80,7 @@ fn basic_returns_keccak_empty_for_account_without_code_hash() {
             balance: 0,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let info = db.basic(evm_addr).unwrap().unwrap();
     assert_eq!(info.code_hash, revm::primitives::KECCAK_EMPTY);
 }
@@ -97,7 +97,7 @@ fn code_by_hash_reads_back_what_was_written_to_code_store() {
     let mut db = fresh_db();
     let bytes = vec![0x60, 0x00, 0x60, 0x00, 0xf3]; // PUSH1 0 PUSH1 0 RETURN
     let hash = code_hash(&bytes);
-    db.code.put(hash.as_slice(), &bytes);
+    db.code.put(hash.as_slice(), &bytes).unwrap();
 
     let bc = db.code_by_hash(hash).unwrap();
     assert_eq!(bc.original_byte_slice(), bytes.as_slice());
@@ -123,7 +123,7 @@ fn storage_round_trips_via_v2_composite_key() {
 
     let value = U256::from(0x12345678u64);
     let value_bytes: [u8; 32] = value.to_be_bytes();
-    db.storage.put(&composite, &value_bytes);
+    db.storage.put(&composite, &value_bytes).unwrap();
 
     let read_back = db.storage(evm_addr, slot_key).unwrap();
     assert_eq!(read_back, value);
@@ -177,7 +177,7 @@ fn commit_preserves_tron_only_fields_on_existing_account() {
             allowance: 999,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Touch the account through revm with a new balance only.
     let mut changes = revm::primitives::AddressMap::default();
@@ -208,7 +208,7 @@ fn commit_writes_code_and_code_hash_on_contract_deployment() {
     db.commit(changes);
 
     // CodeStore got the bytecode keyed by hash.
-    assert_eq!(db.code.get(hash.as_slice()).unwrap(), runtime_code);
+    assert_eq!(db.code.get(hash.as_slice()).unwrap().unwrap(), runtime_code);
     // Account got both the inline code and the hash.
     let acct = db.accounts.get(&tron_addr).unwrap().unwrap();
     assert_eq!(acct.code, runtime_code);
@@ -236,7 +236,7 @@ fn commit_writes_changed_storage_slots() {
 
     let slot_bytes: [u8; 32] = slot.to_be_bytes();
     let composite = StorageRowStore::compose_key(&tron_addr, &slot_bytes);
-    let stored = db.storage.get(&composite).unwrap();
+    let stored = db.storage.get(&composite).unwrap().unwrap();
     let expected: [u8; 32] = new_value.to_be_bytes();
     assert_eq!(stored, expected.to_vec());
 }
@@ -254,7 +254,7 @@ fn commit_deletes_selfdestructed_accounts() {
             balance: 1_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut account = make_touched_account(0);
     account.status |= AccountStatus::SelfDestructed;
@@ -279,7 +279,7 @@ fn commit_skips_loaded_but_untouched_accounts() {
             balance: 500,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let mut untouched = Account::default();
     untouched.info = AccountInfo {
@@ -319,7 +319,7 @@ fn block_hash_returns_stored_id_when_index_attached() {
     let mut raw = [0xabu8; 32];
     raw[0..8].copy_from_slice(&100u64.to_be_bytes());
     let id = BlockId::from_raw(raw);
-    index.put(&id);
+    index.put(&id).unwrap();
 
     let mut db = fresh_db();
     db.block_index = Some(index);
@@ -344,7 +344,7 @@ fn storage_uses_v2_layout_when_no_contract_store_attached() {
     let slot = U256::from(7u8);
     let slot_bytes: [u8; 32] = slot.to_be_bytes();
     let v2_key = tron_chainbase::StorageRowStore::compose_key(&tron_addr, &slot_bytes);
-    db.storage.put(&v2_key, &[0xffu8; 32]);
+    db.storage.put(&v2_key, &[0xffu8; 32]).unwrap();
 
     // Read should hit the v2 key.
     let val = db.storage(evm_addr, slot).unwrap();
@@ -370,7 +370,7 @@ fn storage_uses_v1_layout_when_contract_version_is_1() {
             version: 1,
             ..Default::default()
         },
-    );
+    ).unwrap();
     db.contracts = Some(contracts);
 
     // Write to the v1 key (slot pre-hashed).
@@ -380,7 +380,7 @@ fn storage_uses_v1_layout_when_contract_version_is_1() {
     let v2_key = tron_chainbase::StorageRowStore::compose_key(&tron_addr, &slot_bytes);
     assert_ne!(v1_key, v2_key, "v1 and v2 keys must differ for sanity");
 
-    db.storage.put(&v1_key, &[0x77u8; 32]);
+    db.storage.put(&v1_key, &[0x77u8; 32]).unwrap();
 
     // With v1 routing in place, the read should find the value at v1_key.
     let val = db.storage(evm_addr, slot).unwrap();
@@ -390,7 +390,7 @@ fn storage_uses_v1_layout_when_contract_version_is_1() {
     let other_slot = U256::from(99u8);
     let other_slot_bytes: [u8; 32] = other_slot.to_be_bytes();
     let v2_other = tron_chainbase::StorageRowStore::compose_key(&tron_addr, &other_slot_bytes);
-    db.storage.put(&v2_other, &[0xaau8; 32]);
+    db.storage.put(&v2_other, &[0xaau8; 32]).unwrap();
     let val2 = db.storage(evm_addr, other_slot).unwrap();
     assert_eq!(
         val2, U256::ZERO,

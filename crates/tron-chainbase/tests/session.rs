@@ -18,61 +18,61 @@ fn mem() -> Arc<dyn KvBackend> {
 fn write_then_read_within_session_returns_pending_value() {
     let parent = mem();
     let session = SessionBackend::new(parent);
-    session.put(b"k", b"v");
-    assert_eq!(session.get(b"k"), Some(b"v".to_vec()));
+    session.put(b"k", b"v").unwrap();
+    assert_eq!(session.get(b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
 fn read_misses_in_session_fall_through_to_parent() {
     let parent = mem();
-    parent.put(b"k", b"parent-value");
+    parent.put(b"k", b"parent-value").unwrap();
     let session = SessionBackend::new(parent.clone());
-    assert_eq!(session.get(b"k"), Some(b"parent-value".to_vec()));
+    assert_eq!(session.get(b"k").unwrap(), Some(b"parent-value".to_vec()));
 }
 
 #[test]
 fn write_in_session_shadows_parent() {
     let parent = mem();
-    parent.put(b"k", b"parent-value");
+    parent.put(b"k", b"parent-value").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"k", b"session-value");
-    assert_eq!(session.get(b"k"), Some(b"session-value".to_vec()));
+    session.put(b"k", b"session-value").unwrap();
+    assert_eq!(session.get(b"k").unwrap(), Some(b"session-value".to_vec()));
     // Parent unchanged until commit.
-    assert_eq!(parent.get(b"k"), Some(b"parent-value".to_vec()));
+    assert_eq!(parent.get(b"k").unwrap(), Some(b"parent-value".to_vec()));
 }
 
 #[test]
 fn delete_in_session_shadows_parent() {
     let parent = mem();
-    parent.put(b"k", b"parent-value");
+    parent.put(b"k", b"parent-value").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.delete(b"k");
-    assert_eq!(session.get(b"k"), None);
-    assert_eq!(parent.get(b"k"), Some(b"parent-value".to_vec()));
+    session.delete(b"k").unwrap();
+    assert_eq!(session.get(b"k").unwrap(), None);
+    assert_eq!(parent.get(b"k").unwrap(), Some(b"parent-value".to_vec()));
 }
 
 #[test]
 fn writes_dont_touch_parent_before_commit() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"a", b"1");
-    session.put(b"b", b"2");
-    session.put(b"c", b"3");
-    assert_eq!(parent.get(b"a"), None);
-    assert_eq!(parent.get(b"b"), None);
-    assert_eq!(parent.get(b"c"), None);
+    session.put(b"a", b"1").unwrap();
+    session.put(b"b", b"2").unwrap();
+    session.put(b"c", b"3").unwrap();
+    assert_eq!(parent.get(b"a").unwrap(), None);
+    assert_eq!(parent.get(b"b").unwrap(), None);
+    assert_eq!(parent.get(b"c").unwrap(), None);
 }
 
 #[test]
 fn pending_len_tracks_distinct_keys_not_writes() {
     let session = SessionBackend::new(mem());
     assert!(session.is_clean());
-    session.put(b"a", b"1");
+    session.put(b"a", b"1").unwrap();
     assert_eq!(session.pending_len(), 1);
     // Overwriting the same key doesn't grow the pending set.
-    session.put(b"a", b"2");
+    session.put(b"a", b"2").unwrap();
     assert_eq!(session.pending_len(), 1);
-    session.put(b"b", b"3");
+    session.put(b"b", b"3").unwrap();
     assert_eq!(session.pending_len(), 2);
 }
 
@@ -82,45 +82,45 @@ fn pending_len_tracks_distinct_keys_not_writes() {
 fn commit_flushes_puts_to_parent() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"a", b"1");
-    session.put(b"b", b"2");
-    session.commit();
-    assert_eq!(parent.get(b"a"), Some(b"1".to_vec()));
-    assert_eq!(parent.get(b"b"), Some(b"2".to_vec()));
+    session.put(b"a", b"1").unwrap();
+    session.put(b"b", b"2").unwrap();
+    session.commit().unwrap();
+    assert_eq!(parent.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(parent.get(b"b").unwrap(), Some(b"2".to_vec()));
 }
 
 #[test]
 fn commit_propagates_deletes_to_parent() {
     let parent = mem();
-    parent.put(b"k", b"v");
+    parent.put(b"k", b"v").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.delete(b"k");
-    session.commit();
-    assert_eq!(parent.get(b"k"), None);
+    session.delete(b"k").unwrap();
+    session.commit().unwrap();
+    assert_eq!(parent.get(b"k").unwrap(), None);
 }
 
 #[test]
 fn commit_clears_overlay_so_session_reuse_starts_fresh() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"a", b"1");
+    session.put(b"a", b"1").unwrap();
     assert_eq!(session.pending_len(), 1);
-    session.commit();
+    session.commit().unwrap();
     assert!(session.is_clean());
 
     // Reuse: writes start a fresh overlay.
-    session.put(b"b", b"2");
+    session.put(b"b", b"2").unwrap();
     assert_eq!(session.pending_len(), 1);
     // Parent reflects the first commit but not the new write yet.
-    assert_eq!(parent.get(b"a"), Some(b"1".to_vec()));
-    assert_eq!(parent.get(b"b"), None);
+    assert_eq!(parent.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(parent.get(b"b").unwrap(), None);
 }
 
 #[test]
 fn commit_on_empty_session_is_noop() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.commit(); // doesn't panic
+    session.commit().unwrap(); // doesn't panic
     assert!(session.is_clean());
 }
 
@@ -128,12 +128,12 @@ fn commit_on_empty_session_is_noop() {
 fn last_write_wins_on_commit() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"k", b"v1");
-    session.put(b"k", b"v2");
-    session.delete(b"k");
-    session.put(b"k", b"v3");
-    session.commit();
-    assert_eq!(parent.get(b"k"), Some(b"v3".to_vec()));
+    session.put(b"k", b"v1").unwrap();
+    session.put(b"k", b"v2").unwrap();
+    session.delete(b"k").unwrap();
+    session.put(b"k", b"v3").unwrap();
+    session.commit().unwrap();
+    assert_eq!(parent.get(b"k").unwrap(), Some(b"v3".to_vec()));
 }
 
 // === revert() ===============================================================
@@ -142,35 +142,35 @@ fn last_write_wins_on_commit() {
 fn revert_discards_pending_writes() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"a", b"1");
-    session.put(b"b", b"2");
+    session.put(b"a", b"1").unwrap();
+    session.put(b"b", b"2").unwrap();
     session.revert();
     assert!(session.is_clean());
-    assert_eq!(parent.get(b"a"), None);
-    assert_eq!(parent.get(b"b"), None);
+    assert_eq!(parent.get(b"a").unwrap(), None);
+    assert_eq!(parent.get(b"b").unwrap(), None);
 }
 
 #[test]
 fn revert_restores_session_view_of_parent() {
     let parent = mem();
-    parent.put(b"k", b"parent-value");
+    parent.put(b"k", b"parent-value").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"k", b"overwritten");
-    assert_eq!(session.get(b"k"), Some(b"overwritten".to_vec()));
+    session.put(b"k", b"overwritten").unwrap();
+    assert_eq!(session.get(b"k").unwrap(), Some(b"overwritten".to_vec()));
     session.revert();
     // After revert, the session sees the parent unchanged.
-    assert_eq!(session.get(b"k"), Some(b"parent-value".to_vec()));
+    assert_eq!(session.get(b"k").unwrap(), Some(b"parent-value".to_vec()));
 }
 
 #[test]
 fn revert_then_write_then_commit_works_as_expected() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"k", b"discarded");
+    session.put(b"k", b"discarded").unwrap();
     session.revert();
-    session.put(b"k", b"kept");
-    session.commit();
-    assert_eq!(parent.get(b"k"), Some(b"kept".to_vec()));
+    session.put(b"k", b"kept").unwrap();
+    session.commit().unwrap();
+    assert_eq!(parent.get(b"k").unwrap(), Some(b"kept".to_vec()));
 }
 
 // === Isolation across sibling sessions ======================================
@@ -180,14 +180,14 @@ fn revert_then_write_then_commit_works_as_expected() {
 #[test]
 fn sibling_sessions_are_isolated() {
     let parent = mem();
-    parent.put(b"k", b"parent");
+    parent.put(b"k", b"parent").unwrap();
     let a = SessionBackend::new(parent.clone());
     let b = SessionBackend::new(parent.clone());
 
-    a.put(b"k", b"from-a");
-    assert_eq!(a.get(b"k"), Some(b"from-a".to_vec()));
-    assert_eq!(b.get(b"k"), Some(b"parent".to_vec()));
-    assert_eq!(parent.get(b"k"), Some(b"parent".to_vec()));
+    a.put(b"k", b"from-a").unwrap();
+    assert_eq!(a.get(b"k").unwrap(), Some(b"from-a".to_vec()));
+    assert_eq!(b.get(b"k").unwrap(), Some(b"parent".to_vec()));
+    assert_eq!(parent.get(b"k").unwrap(), Some(b"parent".to_vec()));
 }
 
 /// One sibling commits; the other still sees its own pending state
@@ -199,18 +199,18 @@ fn commit_visible_to_later_sibling_reads_but_not_pending_writes() {
     let a = SessionBackend::new(parent.clone());
     let b = SessionBackend::new(parent.clone());
 
-    a.put(b"k", b"a-value");
-    a.commit();
+    a.put(b"k", b"a-value").unwrap();
+    a.commit().unwrap();
 
     // b's overlay is still empty → its reads fall through to parent
     // which now reflects a's commit.
-    assert_eq!(b.get(b"k"), Some(b"a-value".to_vec()));
+    assert_eq!(b.get(b"k").unwrap(), Some(b"a-value".to_vec()));
 
-    b.put(b"k", b"b-value");
+    b.put(b"k", b"b-value").unwrap();
     // b's overlay now shadows parent.
-    assert_eq!(b.get(b"k"), Some(b"b-value".to_vec()));
+    assert_eq!(b.get(b"k").unwrap(), Some(b"b-value".to_vec()));
     // Parent still shows a's value because b hasn't committed.
-    assert_eq!(parent.get(b"k"), Some(b"a-value".to_vec()));
+    assert_eq!(parent.get(b"k").unwrap(), Some(b"a-value".to_vec()));
 }
 
 // === Stacking sessions ======================================================
@@ -221,24 +221,24 @@ fn commit_visible_to_later_sibling_reads_but_not_pending_writes() {
 #[test]
 fn stacked_sessions_propagate_commits_one_level() {
     let base = mem();
-    base.put(b"k", b"base");
+    base.put(b"k", b"base").unwrap();
     let mid = Arc::new(SessionBackend::new(base.clone()));
     let top = SessionBackend::new(mid.clone() as Arc<dyn KvBackend>);
 
-    top.put(b"k", b"from-top");
+    top.put(b"k", b"from-top").unwrap();
     // top sees its own write.
-    assert_eq!(top.get(b"k"), Some(b"from-top".to_vec()));
+    assert_eq!(top.get(b"k").unwrap(), Some(b"from-top".to_vec()));
     // mid sees only base.
-    assert_eq!(mid.get(b"k"), Some(b"base".to_vec()));
+    assert_eq!(mid.get(b"k").unwrap(), Some(b"base".to_vec()));
 
     // Commit top → its overlay flushes into mid (not base).
-    top.commit();
-    assert_eq!(mid.get(b"k"), Some(b"from-top".to_vec()));
-    assert_eq!(base.get(b"k"), Some(b"base".to_vec()));
+    top.commit().unwrap();
+    assert_eq!(mid.get(b"k").unwrap(), Some(b"from-top".to_vec()));
+    assert_eq!(base.get(b"k").unwrap(), Some(b"base".to_vec()));
 
     // Commit mid → finally reaches base.
-    mid.commit();
-    assert_eq!(base.get(b"k"), Some(b"from-top".to_vec()));
+    mid.commit().unwrap();
+    assert_eq!(base.get(b"k").unwrap(), Some(b"from-top".to_vec()));
 }
 
 // === Larger-scale stress ====================================================
@@ -250,12 +250,12 @@ fn large_session_commits_all_pending_writes() {
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
     for i in 0..1000u32 {
-        session.put(&i.to_be_bytes(), &i.to_le_bytes());
+        session.put(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
     }
     assert_eq!(session.pending_len(), 1000);
-    session.commit();
+    session.commit().unwrap();
     for i in 0..1000u32 {
-        assert_eq!(parent.get(&i.to_be_bytes()), Some(i.to_le_bytes().to_vec()));
+        assert_eq!(parent.get(&i.to_be_bytes()).unwrap(), Some(i.to_le_bytes().to_vec()));
     }
 }
 
@@ -280,7 +280,7 @@ fn session_can_back_an_account_store_transparently() {
         balance: 1234,
         ..Default::default()
     };
-    store.put(&addr, &alice);
+    store.put(&addr, &alice).unwrap();
 
     // Visible through the session-backed store.
     assert_eq!(store.get(&addr).unwrap().unwrap().balance, 1234);
@@ -289,7 +289,7 @@ fn session_can_back_an_account_store_transparently() {
     assert!(parent_store.get(&addr).unwrap().is_none());
 
     // Commit via the typed handle (Arc<SessionBackend>).
-    session_typed.commit();
+    session_typed.commit().unwrap();
 
     // Now visible through parent.
     assert_eq!(parent_store.get(&addr).unwrap().unwrap().balance, 1234);
@@ -300,10 +300,10 @@ fn session_can_back_an_account_store_transparently() {
 #[test]
 fn mem_backend_scan_all_returns_entries_in_byte_order() {
     let m = MemBackend::new();
-    m.put(b"b", b"2");
-    m.put(b"a", b"1");
-    m.put(b"c", b"3");
-    let snap = m.scan_all();
+    m.put(b"b", b"2").unwrap();
+    m.put(b"a", b"1").unwrap();
+    m.put(b"c", b"3").unwrap();
+    let snap = m.scan_all().unwrap();
     assert_eq!(
         snap,
         vec![
@@ -317,13 +317,13 @@ fn mem_backend_scan_all_returns_entries_in_byte_order() {
 #[test]
 fn session_scan_all_overlays_pending_puts_over_parent() {
     let parent = mem();
-    parent.put(b"a", b"parent-a");
-    parent.put(b"b", b"parent-b");
+    parent.put(b"a", b"parent-a").unwrap();
+    parent.put(b"b", b"parent-b").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"a", b"session-a");
-    session.put(b"c", b"session-c");
+    session.put(b"a", b"session-a").unwrap();
+    session.put(b"c", b"session-c").unwrap();
 
-    let snap = session.scan_all();
+    let snap = session.scan_all().unwrap();
     assert_eq!(
         snap,
         vec![
@@ -337,26 +337,26 @@ fn session_scan_all_overlays_pending_puts_over_parent() {
 #[test]
 fn session_scan_all_hides_pending_deletes_from_parent() {
     let parent = mem();
-    parent.put(b"a", b"parent-a");
-    parent.put(b"b", b"parent-b");
+    parent.put(b"a", b"parent-a").unwrap();
+    parent.put(b"b", b"parent-b").unwrap();
     let session = SessionBackend::new(parent);
-    session.delete(b"a");
+    session.delete(b"a").unwrap();
 
-    let snap = session.scan_all();
+    let snap = session.scan_all().unwrap();
     assert_eq!(snap, vec![(b"b".to_vec(), b"parent-b".to_vec())]);
 }
 
 #[test]
 fn session_scan_all_after_revert_matches_parent() {
     let parent = mem();
-    parent.put(b"a", b"parent-a");
+    parent.put(b"a", b"parent-a").unwrap();
     let session = SessionBackend::new(parent);
-    session.put(b"a", b"session-a");
-    session.delete(b"a");
-    session.put(b"b", b"session-b");
+    session.put(b"a", b"session-a").unwrap();
+    session.delete(b"a").unwrap();
+    session.put(b"b", b"session-b").unwrap();
     session.revert();
 
-    let snap = session.scan_all();
+    let snap = session.scan_all().unwrap();
     assert_eq!(snap, vec![(b"a".to_vec(), b"parent-a".to_vec())]);
 }
 
@@ -369,21 +369,21 @@ fn session_scan_all_after_revert_matches_parent() {
 #[test]
 fn write_batch_produces_equivalent_final_state() {
     let backend = MemBackend::new();
-    backend.put(b"keep", b"original");
-    backend.put(b"replace-me", b"old");
-    backend.put(b"delete-me", b"goodbye");
+    backend.put(b"keep", b"original").unwrap();
+    backend.put(b"replace-me", b"old").unwrap();
+    backend.put(b"delete-me", b"goodbye").unwrap();
 
     let ops = vec![
         WriteOp::Put(b"new-key".to_vec(), b"new-value".to_vec()),
         WriteOp::Put(b"replace-me".to_vec(), b"new".to_vec()),
         WriteOp::Delete(b"delete-me".to_vec()),
     ];
-    backend.write_batch(&ops);
+    backend.write_batch(&ops).unwrap();
 
-    assert_eq!(backend.get(b"keep"), Some(b"original".to_vec()));
-    assert_eq!(backend.get(b"new-key"), Some(b"new-value".to_vec()));
-    assert_eq!(backend.get(b"replace-me"), Some(b"new".to_vec()));
-    assert_eq!(backend.get(b"delete-me"), None);
+    assert_eq!(backend.get(b"keep").unwrap(), Some(b"original".to_vec()));
+    assert_eq!(backend.get(b"new-key").unwrap(), Some(b"new-value".to_vec()));
+    assert_eq!(backend.get(b"replace-me").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(backend.get(b"delete-me").unwrap(), None);
 }
 
 /// Empty op list is a no-op. `SessionBackend::commit` short-circuits
@@ -391,10 +391,10 @@ fn write_batch_produces_equivalent_final_state() {
 #[test]
 fn write_batch_with_empty_ops_is_noop() {
     let backend = MemBackend::new();
-    backend.put(b"a", b"unchanged");
-    backend.write_batch(&[]);
-    assert_eq!(backend.get(b"a"), Some(b"unchanged".to_vec()));
-    assert_eq!(backend.scan_all().len(), 1);
+    backend.put(b"a", b"unchanged").unwrap();
+    backend.write_batch(&[]).unwrap();
+    assert_eq!(backend.get(b"a").unwrap(), Some(b"unchanged".to_vec()));
+    assert_eq!(backend.scan_all().unwrap().len(), 1);
 }
 
 /// Ops are processed in order — last write per key wins. Mirrors
@@ -408,8 +408,8 @@ fn write_batch_processes_ops_in_order_last_op_wins() {
         WriteOp::Delete(b"k".to_vec()),
         WriteOp::Put(b"k".to_vec(), b"final".to_vec()),
     ];
-    backend.write_batch(&ops);
-    assert_eq!(backend.get(b"k"), Some(b"final".to_vec()));
+    backend.write_batch(&ops).unwrap();
+    assert_eq!(backend.get(b"k").unwrap(), Some(b"final".to_vec()));
 }
 
 /// **Atomicity pin via a `scan_all` snapshot.** A reader that takes
@@ -432,8 +432,8 @@ fn write_batch_is_atomic_against_concurrent_snapshot_reads() {
     use std::time::Duration;
 
     let backend = Arc::new(MemBackend::new());
-    backend.put(b"a", b"old-a");
-    backend.put(b"b", b"old-b");
+    backend.put(b"a", b"old-a").unwrap();
+    backend.put(b"b", b"old-b").unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let saw_torn = Arc::new(AtomicBool::new(false));
@@ -444,7 +444,7 @@ fn write_batch_is_atomic_against_concurrent_snapshot_reads() {
     let reader = thread::spawn(move || {
         while !reader_stop.load(Ordering::Relaxed) {
             let snap: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-                reader_backend.scan_all().into_iter().collect();
+                reader_backend.scan_all().unwrap().into_iter().collect();
             let a = snap.get(b"a".as_slice()).map(|v| v.as_slice());
             let b = snap.get(b"b".as_slice()).map(|v| v.as_slice());
             let a_old = a == Some(b"old-a".as_slice());
@@ -466,10 +466,12 @@ fn write_batch_is_atomic_against_concurrent_snapshot_reads() {
         } else {
             (b"old-a".to_vec(), b"old-b".to_vec())
         };
-        backend.write_batch(&[
-            WriteOp::Put(b"a".to_vec(), av),
-            WriteOp::Put(b"b".to_vec(), bv),
-        ]);
+        backend
+            .write_batch(&[
+                WriteOp::Put(b"a".to_vec(), av),
+                WriteOp::Put(b"b".to_vec(), bv),
+            ])
+            .unwrap();
     }
     thread::sleep(Duration::from_millis(5));
     stop.store(true, Ordering::Relaxed);
@@ -496,23 +498,23 @@ fn session_commit_invokes_parent_write_batch_once() {
     }
 
     impl KvBackend for RecordingBackend {
-        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, tron_chainbase::KvError> {
             self.inner.get(key)
         }
-        fn put(&self, key: &[u8], value: &[u8]) {
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), tron_chainbase::KvError> {
             *self.per_call_writes.lock().unwrap() += 1;
-            self.inner.put(key, value);
+            self.inner.put(key, value)
         }
-        fn delete(&self, key: &[u8]) {
+        fn delete(&self, key: &[u8]) -> Result<(), tron_chainbase::KvError> {
             *self.per_call_writes.lock().unwrap() += 1;
-            self.inner.delete(key);
+            self.inner.delete(key)
         }
-        fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, tron_chainbase::KvError> {
             self.inner.scan_all()
         }
-        fn write_batch(&self, ops: &[WriteOp]) {
+        fn write_batch(&self, ops: &[WriteOp]) -> Result<(), tron_chainbase::KvError> {
             self.batches.lock().unwrap().push(ops.to_vec());
-            self.inner.write_batch(ops);
+            self.inner.write_batch(ops)
         }
     }
 
@@ -522,10 +524,10 @@ fn session_commit_invokes_parent_write_batch_once() {
         per_call_writes: Mutex::new(0),
     });
     let session = SessionBackend::new(parent.clone() as Arc<dyn KvBackend>);
-    session.put(b"a", b"1");
-    session.put(b"b", b"2");
-    session.delete(b"c");
-    session.commit();
+    session.put(b"a", b"1").unwrap();
+    session.put(b"b", b"2").unwrap();
+    session.delete(b"c").unwrap();
+    session.commit().unwrap();
 
     let batches = parent.batches.lock().unwrap();
     assert_eq!(batches.len(), 1, "commit must produce exactly one batch");
@@ -554,21 +556,21 @@ fn session_commit_with_no_pending_does_not_invoke_write_batch() {
     }
 
     impl KvBackend for CountingBackend {
-        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, tron_chainbase::KvError> {
             self.inner.get(key)
         }
-        fn put(&self, key: &[u8], value: &[u8]) {
-            self.inner.put(key, value);
+        fn put(&self, key: &[u8], value: &[u8]) -> Result<(), tron_chainbase::KvError> {
+            self.inner.put(key, value)
         }
-        fn delete(&self, key: &[u8]) {
-            self.inner.delete(key);
+        fn delete(&self, key: &[u8]) -> Result<(), tron_chainbase::KvError> {
+            self.inner.delete(key)
         }
-        fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, tron_chainbase::KvError> {
             self.inner.scan_all()
         }
-        fn write_batch(&self, ops: &[WriteOp]) {
+        fn write_batch(&self, ops: &[WriteOp]) -> Result<(), tron_chainbase::KvError> {
             *self.batch_calls.lock().unwrap() += 1;
-            self.inner.write_batch(ops);
+            self.inner.write_batch(ops)
         }
     }
 
@@ -577,7 +579,7 @@ fn session_commit_with_no_pending_does_not_invoke_write_batch() {
         batch_calls: Mutex::new(0),
     });
     let session = SessionBackend::new(parent.clone() as Arc<dyn KvBackend>);
-    session.commit();
+    session.commit().unwrap();
     assert_eq!(*parent.batch_calls.lock().unwrap(), 0);
 }
 
@@ -586,14 +588,14 @@ fn session_commit_with_no_pending_does_not_invoke_write_batch() {
 #[test]
 fn commit_with_undo_captures_pre_image_then_applies_batch() {
     let parent = mem();
-    parent.put(b"existing", b"pre-image");
-    parent.put(b"will-delete", b"goes-away");
+    parent.put(b"existing", b"pre-image").unwrap();
+    parent.put(b"will-delete", b"goes-away").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"existing", b"new-value");
-    session.delete(b"will-delete");
-    session.put(b"brand-new", b"first-write");
+    session.put(b"existing", b"new-value").unwrap();
+    session.delete(b"will-delete").unwrap();
+    session.put(b"brand-new", b"first-write").unwrap();
 
-    let undo = session.commit_with_undo();
+    let undo = session.commit_with_undo().unwrap();
 
     let mut undo_map: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> =
         undo.into_iter().collect();
@@ -612,9 +614,9 @@ fn commit_with_undo_captures_pre_image_then_applies_batch() {
     );
     assert!(undo_map.is_empty(), "no extra entries");
 
-    assert_eq!(parent.get(b"existing"), Some(b"new-value".to_vec()));
-    assert_eq!(parent.get(b"will-delete"), None);
-    assert_eq!(parent.get(b"brand-new"), Some(b"first-write".to_vec()));
+    assert_eq!(parent.get(b"existing").unwrap(), Some(b"new-value".to_vec()));
+    assert_eq!(parent.get(b"will-delete").unwrap(), None);
+    assert_eq!(parent.get(b"brand-new").unwrap(), Some(b"first-write".to_vec()));
 }
 
 // === drain_pending / drain_pending_with_undo ================================
@@ -623,29 +625,29 @@ fn commit_with_undo_captures_pre_image_then_applies_batch() {
 #[test]
 fn drain_pending_returns_ops_without_writing_parent() {
     let parent = mem();
-    parent.put(b"untouched", b"keep");
+    parent.put(b"untouched", b"keep").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"a", b"1");
-    session.delete(b"b");
-    session.put(b"c", b"3");
+    session.put(b"a", b"1").unwrap();
+    session.delete(b"b").unwrap();
+    session.put(b"c", b"3").unwrap();
 
     let ops = session.drain_pending();
     assert_eq!(ops.len(), 3);
     assert!(session.is_clean(), "drain clears pending");
 
     // Parent unchanged: drain isn't a commit.
-    assert_eq!(parent.get(b"untouched"), Some(b"keep".to_vec()));
-    assert_eq!(parent.get(b"a"), None);
-    assert_eq!(parent.get(b"b"), None);
-    assert_eq!(parent.get(b"c"), None);
+    assert_eq!(parent.get(b"untouched").unwrap(), Some(b"keep".to_vec()));
+    assert_eq!(parent.get(b"a").unwrap(), None);
+    assert_eq!(parent.get(b"b").unwrap(), None);
+    assert_eq!(parent.get(b"c").unwrap(), None);
 
     // Re-applying the ops via parent.write_batch reaches the same
     // final state a normal commit() would have produced.
-    parent.write_batch(&ops);
+    parent.write_batch(&ops).unwrap();
     let mut found = std::collections::HashSet::new();
-    if parent.get(b"a") == Some(b"1".to_vec()) { found.insert("a"); }
-    if parent.get(b"c") == Some(b"3".to_vec()) { found.insert("c"); }
-    if parent.get(b"b") == None { found.insert("b"); }
+    if parent.get(b"a").unwrap() == Some(b"1".to_vec()) { found.insert("a"); }
+    if parent.get(b"c").unwrap() == Some(b"3".to_vec()) { found.insert("c"); }
+    if parent.get(b"b").unwrap() == None { found.insert("b"); }
     assert_eq!(found.len(), 3);
 }
 
@@ -655,16 +657,16 @@ fn drain_pending_returns_ops_without_writing_parent() {
 #[test]
 fn drain_pending_with_undo_captures_pre_images_at_drain_time() {
     let parent = mem();
-    parent.put(b"existing", b"pre");
+    parent.put(b"existing", b"pre").unwrap();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"existing", b"new");
-    session.put(b"brand-new", b"first");
+    session.put(b"existing", b"new").unwrap();
+    session.put(b"brand-new", b"first").unwrap();
 
-    let (ops, undo) = session.drain_pending_with_undo();
+    let (ops, undo) = session.drain_pending_with_undo().unwrap();
     assert_eq!(ops.len(), 2);
     assert_eq!(undo.len(), 2);
     // Parent still has the pre-image (drain hasn't committed).
-    assert_eq!(parent.get(b"existing"), Some(b"pre".to_vec()));
+    assert_eq!(parent.get(b"existing").unwrap(), Some(b"pre".to_vec()));
 
     let undo_map: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> =
         undo.into_iter().collect();
@@ -678,7 +680,7 @@ fn drain_pending_on_empty_session_is_noop() {
     let parent = mem();
     let session = SessionBackend::new(parent);
     assert!(session.drain_pending().is_empty());
-    let (ops, undo) = session.drain_pending_with_undo();
+    let (ops, undo) = session.drain_pending_with_undo().unwrap();
     assert!(ops.is_empty());
     assert!(undo.is_empty());
 }
@@ -699,7 +701,7 @@ fn write_batch_sync_default_matches_write_batch_on_mem_backend() {
         WriteOp::Delete(b"missing".to_vec()),
         WriteOp::Put(b"b".to_vec(), b"2".to_vec()),
     ];
-    async_be.write_batch(&ops);
-    sync_be.write_batch_sync(&ops);
-    assert_eq!(async_be.scan_all(), sync_be.scan_all());
+    async_be.write_batch(&ops).unwrap();
+    sync_be.write_batch_sync(&ops).unwrap();
+    assert_eq!(async_be.scan_all().unwrap(), sync_be.scan_all().unwrap());
 }

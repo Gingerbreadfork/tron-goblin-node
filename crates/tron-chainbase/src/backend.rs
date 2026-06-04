@@ -18,16 +18,45 @@ pub enum WriteOp {
     Delete(Vec<u8>),
 }
 
+/// Error surfaced by any [`KvBackend`] method when the underlying
+/// store fails. Holds a backend-specific message (rocksdb error
+/// text, IO error, etc.) so consensus-critical callers can log
+/// rich context without coupling to the specific backend.
+///
+/// **Why fallible at all:** the prior `get`-returns-`Option` API
+/// made transient IO faults indistinguishable from "not found",
+/// and the prior `put`-panics policy crashed the process mid
+/// multi-store write — leaving partial state on disk. Both
+/// failure modes are now visible to the caller, which can choose
+/// to bubble up to the block-apply boundary (chain stays at the
+/// previous head) or to fail the RPC.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum KvError {
+    /// Backend-specific failure (RocksDB IO, corruption detected at
+    /// open time via `paranoid_checks`, disk full on write, etc.).
+    /// The string is the underlying error's `Display`.
+    #[error("kv backend: {0}")]
+    Backend(String),
+}
+
 /// Minimum-viable KV interface every backend must support.
 ///
 /// Returning `Vec<u8>` here (instead of borrows) keeps the trait
 /// object-safe and matches what RocksDB/LevelDB FFIs naturally produce.
+///
+/// Every read and write returns `Result<_, KvError>`. The previous
+/// infallible API silently swallowed IO failures on reads (returning
+/// `None` as if the key were absent) and panicked mid-flight on
+/// writes; both were latent correctness footguns now closed by the
+/// fallible surface. Backends that can't fail (MemBackend) wrap
+/// every result in `Ok(...)`; RocksDB maps native errors to
+/// [`KvError::Backend`].
 pub trait KvBackend: Send + Sync {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
-    fn put(&self, key: &[u8], value: &[u8]);
-    fn delete(&self, key: &[u8]);
-    fn contains(&self, key: &[u8]) -> bool {
-        self.get(key).is_some()
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError>;
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError>;
+    fn delete(&self, key: &[u8]) -> Result<(), KvError>;
+    fn contains(&self, key: &[u8]) -> Result<bool, KvError> {
+        self.get(key).map(|v| v.is_some())
     }
 
     /// Apply `ops` as a single atomic batch. Either every operation is
@@ -49,13 +78,14 @@ pub trait KvBackend: Send + Sync {
     /// pending writes in one shot (so a crash mid-commit can't leave
     /// half a tx's mutations on disk), and by the snapshot stack's
     /// `merge` to flush a layer's tentative writes to root atomically.
-    fn write_batch(&self, ops: &[WriteOp]) {
+    fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         for op in ops {
             match op {
-                WriteOp::Put(k, v) => self.put(k, v),
-                WriteOp::Delete(k) => self.delete(k),
+                WriteOp::Put(k, v) => self.put(k, v)?,
+                WriteOp::Delete(k) => self.delete(k)?,
             }
         }
+        Ok(())
     }
 
     /// Apply `ops` as a single atomic batch AND fsync the WAL before
@@ -80,8 +110,8 @@ pub trait KvBackend: Send + Sync {
     /// with `WriteOptions { sync: true }`.
     ///
     /// [`write_batch`]: KvBackend::write_batch
-    fn write_batch_sync(&self, ops: &[WriteOp]) {
-        self.write_batch(ops);
+    fn write_batch_sync(&self, ops: &[WriteOp]) -> Result<(), KvError> {
+        self.write_batch(ops)
     }
 
     /// Snapshot every `(key, value)` pair currently stored. Callers get
@@ -93,13 +123,15 @@ pub trait KvBackend: Send + Sync {
     /// that must walk the full table — e.g. `WitnessStore::all` for the
     /// maintenance round, or the `TotalVoteCount` precompile.
     ///
-    /// The default implementation panics; backends MUST override. It's a
-    /// default only so trait objects taken before `scan_all` existed
-    /// remain object-safe — every real backend in this crate overrides
-    /// it. A `#[must_implement]` lint would be nicer but stable Rust
-    /// doesn't have one.
-    fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        panic!("scan_all not implemented for this KvBackend");
+    /// The default implementation returns an error; backends MUST
+    /// override. It's a default only so trait objects taken before
+    /// `scan_all` existed remain object-safe — every real backend in
+    /// this crate overrides it. A `#[must_implement]` lint would be
+    /// nicer but stable Rust doesn't have one.
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Err(KvError::Backend(
+            "scan_all not implemented for this KvBackend".into(),
+        ))
     }
 
     /// Read up to `limit` `(key, value)` pairs starting at the first
@@ -111,12 +143,13 @@ pub trait KvBackend: Send + Sync {
     /// Default implementation builds on `scan_all` (O(N) but correct).
     /// RocksDB-backed implementations override with native iterator
     /// seek for O(log N + limit).
-    fn scan_from(&self, start: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
         if limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        let all = self.scan_all()?;
         let mut out = Vec::with_capacity(limit.min(64));
-        for (k, v) in self.scan_all() {
+        for (k, v) in all {
             if k.as_slice() < start {
                 continue;
             }
@@ -125,7 +158,7 @@ pub trait KvBackend: Send + Sync {
                 break;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Read every `(key, value)` whose key starts with `prefix`,
@@ -135,11 +168,12 @@ pub trait KvBackend: Send + Sync {
     ///
     /// Default implementation builds on `scan_all`. RocksDB backends
     /// can override for native prefix iteration.
-    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.scan_all()
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self
+            .scan_all()?
             .into_iter()
             .filter(|(k, _)| k.starts_with(prefix))
-            .collect()
+            .collect())
     }
 }
 
@@ -176,66 +210,72 @@ impl MemBackend {
 }
 
 impl KvBackend for MemBackend {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.inner
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        Ok(self
+            .inner
             .read()
             .expect("MemBackend lock poisoned")
             .get(key)
-            .cloned()
+            .cloned())
     }
 
-    fn put(&self, key: &[u8], value: &[u8]) {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
         self.inner
             .write()
             .expect("MemBackend lock poisoned")
             .insert(key.to_vec(), value.to_vec());
+        Ok(())
     }
 
-    fn delete(&self, key: &[u8]) {
+    fn delete(&self, key: &[u8]) -> Result<(), KvError> {
         self.inner
             .write()
             .expect("MemBackend lock poisoned")
             .remove(key);
+        Ok(())
     }
 
-    fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.inner
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self
+            .inner
             .read()
             .expect("MemBackend lock poisoned")
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect())
     }
 
-    fn scan_from(&self, start: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
         if limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // BTreeMap::range(start..) is the in-memory equivalent of
         // RocksDB's iter+seek. No O(N) scan.
-        self.inner
+        Ok(self
+            .inner
             .read()
             .expect("MemBackend lock poisoned")
             .range(start.to_vec()..)
             .take(limit)
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect())
     }
 
-    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
         if prefix.is_empty() {
             return self.scan_all();
         }
-        self.inner
+        Ok(self
+            .inner
             .read()
             .expect("MemBackend lock poisoned")
             .range(prefix.to_vec()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect())
     }
 
-    fn write_batch(&self, ops: &[WriteOp]) {
+    fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         // Single write-lock acquisition — apply the whole batch
         // atomically with respect to any other reader/writer of this
         // backend.
@@ -250,5 +290,6 @@ impl KvBackend for MemBackend {
                 }
             }
         }
+        Ok(())
     }
 }

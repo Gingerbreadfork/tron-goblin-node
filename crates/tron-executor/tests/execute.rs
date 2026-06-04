@@ -182,7 +182,7 @@ fn put_account(store: &AccountStore, address: [u8; 21], balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn transfer_tx(owner: [u8; 21], to: [u8; 21], amount: i64) -> Transaction {

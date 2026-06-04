@@ -113,8 +113,8 @@ fn put_block(
         transactions,
     };
     let block_id = tron_types::block_id_from_block(&block).unwrap();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     dp.save_latest_block_header_number(block_num);
     dp.save_latest_block_header_hash(block_id.as_bytes());
     *block_id.as_bytes()

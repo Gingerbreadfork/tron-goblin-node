@@ -30,22 +30,24 @@ impl BlockStore {
     }
 
     /// Store a block, keyed by its `BlockId`.
-    pub fn put(&self, id: &BlockId, block: &Block) {
+    pub fn put(&self, id: &BlockId, block: &Block) -> Result<(), StoreError> {
         let bytes = block.encode_to_vec();
-        self.backend.put(id.as_bytes(), &bytes);
+        self.backend.put(id.as_bytes(), &bytes)?;
+        Ok(())
     }
 
     pub fn get(&self, id: &BlockId) -> Result<Block, StoreError> {
-        let bytes = self.backend.get(id.as_bytes()).ok_or(StoreError::NotFound)?;
+        let bytes = self.backend.get(id.as_bytes())?.ok_or(StoreError::NotFound)?;
         Ok(Block::decode(bytes.as_slice())?)
     }
 
-    pub fn contains(&self, id: &BlockId) -> bool {
-        self.backend.contains(id.as_bytes())
+    pub fn contains(&self, id: &BlockId) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(id.as_bytes())?)
     }
 
-    pub fn delete(&self, id: &BlockId) {
-        self.backend.delete(id.as_bytes());
+    pub fn delete(&self, id: &BlockId) -> Result<(), StoreError> {
+        self.backend.delete(id.as_bytes())?;
+        Ok(())
     }
 
     /// Return up to `limit` consecutive blocks starting at block
@@ -61,17 +63,32 @@ impl BlockStore {
     ///
     /// Skips entries that fail to decode as `Block` (matches java-tron
     /// which logs and continues).
-    pub fn get_limit_number(&self, start_num: i64, limit: usize) -> Vec<Block> {
+    pub fn get_limit_number(&self, start_num: i64, limit: usize) -> Result<Vec<Block>, StoreError> {
         if limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut start_key = [0u8; 32];
         start_key[..8].copy_from_slice(&start_num.to_be_bytes());
-        self.backend
-            .scan_from(&start_key, limit)
+        Ok(self
+            .backend
+            .scan_from(&start_key, limit)?
             .into_iter()
-            .filter_map(|(_, v)| Block::decode(v.as_slice()).ok())
-            .collect()
+            .filter_map(|(k, v)| match Block::decode(v.as_slice()) {
+                Ok(block) => Some(block),
+                Err(e) => {
+                    // C-8: log-and-continue (java-tron parity). A row that
+                    // won't decode as `Block` is corruption, not "end of
+                    // range" — surface it instead of silently dropping it.
+                    tracing::error!(
+                        store = "block",
+                        key = %hex::encode(&k),
+                        error = %e,
+                        "skipping undecodable Block row in get_limit_number"
+                    );
+                    None
+                }
+            })
+            .collect())
     }
 }
 
@@ -104,9 +121,9 @@ mod tests {
         let store = BlockStore::new(backend);
         for n in 5..15 {
             let (id, blk) = synth_block(n);
-            store.put(&id, &blk);
+            store.put(&id, &blk).unwrap();
         }
-        let got = store.get_limit_number(7, 4);
+        let got = store.get_limit_number(7, 4).unwrap();
         let nums: Vec<i64> = got
             .iter()
             .map(|b| b.block_header.as_ref().unwrap().raw_data.as_ref().unwrap().number)
@@ -119,8 +136,8 @@ mod tests {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = BlockStore::new(backend);
         let (id, blk) = synth_block(1);
-        store.put(&id, &blk);
-        assert!(store.get_limit_number(1, 0).is_empty());
+        store.put(&id, &blk).unwrap();
+        assert!(store.get_limit_number(1, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -129,10 +146,10 @@ mod tests {
         let store = BlockStore::new(backend);
         for n in [3, 4, 5] {
             let (id, blk) = synth_block(n);
-            store.put(&id, &blk);
+            store.put(&id, &blk).unwrap();
         }
         // Ask for 10 starting at 4 — only 2 exist.
-        let got = store.get_limit_number(4, 10);
+        let got = store.get_limit_number(4, 10).unwrap();
         assert_eq!(got.len(), 2);
     }
 }

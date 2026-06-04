@@ -63,7 +63,7 @@ pub fn execute_clear_abi(
     let target =
         decode_address(&contract.contract_address).ok_or(ActuatorError::InvalidAddress)?;
     // Clear by writing an empty ABI proto.
-    abi.put(&target, &Default::default());
+    abi.put(&target, &Default::default())?;
     Ok(ExecutionResult::default())
 }
 
@@ -95,7 +95,7 @@ pub fn execute_update_energy_limit(
         .get(&target)?
         .ok_or(ActuatorError::ContractMissing)?;
     sc.origin_energy_limit = contract.origin_energy_limit;
-    contracts.put(&target, &sc);
+    contracts.put(&target, &sc)?;
     Ok(ExecutionResult::default())
 }
 
@@ -127,6 +127,6 @@ pub fn execute_update_setting(
         .get(&target)?
         .ok_or(ActuatorError::ContractMissing)?;
     sc.consume_user_resource_percent = contract.consume_user_resource_percent;
-    contracts.put(&target, &sc);
+    contracts.put(&target, &sc)?;
     Ok(ExecutionResult::default())
 }

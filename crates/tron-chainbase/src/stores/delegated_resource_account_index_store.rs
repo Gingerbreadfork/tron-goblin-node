@@ -79,22 +79,28 @@ impl DelegatedResourceAccountIndexStore {
 
     // -------------------- CRUD ----------------------------------------
 
-    pub fn put_raw(&self, key: &[u8], index: &DelegatedResourceAccountIndex) {
-        self.backend.put(key, &index.encode_to_vec());
+    pub fn put_raw(
+        &self,
+        key: &[u8],
+        index: &DelegatedResourceAccountIndex,
+    ) -> Result<(), StoreError> {
+        self.backend.put(key, &index.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get_raw(
         &self,
         key: &[u8],
     ) -> Result<Option<DelegatedResourceAccountIndex>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         Ok(Some(DelegatedResourceAccountIndex::decode(bytes.as_slice())?))
     }
 
-    pub fn delete_raw(&self, key: &[u8]) {
-        self.backend.delete(key);
+    pub fn delete_raw(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.backend.delete(key)?;
+        Ok(())
     }
 }
 

@@ -1877,10 +1877,14 @@ impl SyncDriver {
         // Persist BEFORE executing so even a partial executor failure
         // leaves the block bytes recoverable for the RPC layer.
         let block_store = BlockStore::new(self.blocks_backend.clone());
-        block_store.put(&id, block);
+        if let Err(e) = block_store.put(&id, block) {
+            return AcceptOutcome::RejectedExecution(format!("block_store.put: {e}"));
+        }
         if let Some(bi) = &self.state.block_index {
             let block_index = BlockIndexStore::new(bi.clone());
-            block_index.put(&id);
+            if let Err(e) = block_index.put(&id) {
+                return AcceptOutcome::RejectedExecution(format!("block_index.put: {e}"));
+            }
         }
 
         // Solidified-containment gate: KhaosDb already picked
@@ -2371,14 +2375,29 @@ impl SyncDriver {
         if solid_num < 1 {
             return None;
         }
-        let Some(executed_head_bytes) = dp.latest_block_header_hash().ok().flatten() else {
-            return None;
+        let executed_head_bytes = match dp.latest_block_header_hash() {
+            Ok(Some(b)) => b,
+            Ok(None) => return None,
+            Err(e) => {
+                // A read fault here mustn't masquerade as "no head" silently.
+                error!(error = %e, "reorg ancestor scan: failed to read latest block header hash");
+                return None;
+            }
         };
         let executed_head_id = BlockId::from_raw(executed_head_bytes);
 
         let block_store = BlockStore::new(self.blocks_backend.clone());
         let parent_of = |id: &BlockId| -> Option<BlockId> {
-            let block = block_store.get(id).ok()?;
+            let block = match block_store.get(id) {
+                Ok(b) => b,
+                // Walking off the end of what we have is expected — stop quietly.
+                Err(tron_chainbase::StoreError::NotFound) => return None,
+                // A real IO fault is not "missing parent"; surface it.
+                Err(e) => {
+                    error!(block = ?id, error = %e, "reorg ancestor scan: failed to read block");
+                    return None;
+                }
+            };
             let raw = block.block_header.as_ref()?.raw_data.as_ref()?;
             if raw.parent_hash.len() != 32 {
                 return None;
@@ -3834,7 +3853,7 @@ mod trx_inventory_tests {
             transactions: vec![],
         };
         let id = block_id_from_block(&block).expect("id");
-        store.put(&id, &block);
+        store.put(&id, &block).unwrap();
 
         let req = tron_proto::Inventory {
             r#type: tron_proto::inventory::InventoryType::Block as i32,

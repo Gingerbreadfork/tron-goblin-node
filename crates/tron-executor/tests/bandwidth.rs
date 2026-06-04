@@ -40,7 +40,7 @@ fn mem() -> Arc<dyn KvBackend> {
 }
 
 fn put(accounts: &AccountStore, addr: [u8; 21], a: Account) {
-    accounts.put(&Address::from_raw(addr), &a);
+    accounts.put(&Address::from_raw(addr), &a).unwrap();
 }
 
 struct Env {
@@ -265,8 +265,8 @@ fn seed_asset(env: &Env, public_limit: i64, free_limit: i64) {
         public_latest_free_net_time: 0,
         ..Default::default()
     };
-    env.asset_v2.put(TOKEN_ID, &asset);
-    env.asset_v1.put(TOKEN_NAME, &asset);
+    env.asset_v2.put(TOKEN_ID, &asset).unwrap();
+    env.asset_v1.put(TOKEN_NAME, &asset).unwrap();
 
     // Issuer needs frozen bandwidth so the global-net check can pass.
     env.dyn_props.save_total_net_weight(10_000);
@@ -352,7 +352,7 @@ fn transfer_asset_falls_through_when_issuer_net_insufficient() {
     // Zero out the issuer's frozen bandwidth.
     let mut issuer_acct = env.accounts.get(&Address::from_raw(ISSUER)).unwrap().unwrap();
     issuer_acct.frozen_v2.clear();
-    env.accounts.put(&Address::from_raw(ISSUER), &issuer_acct);
+    env.accounts.put(&Address::from_raw(ISSUER), &issuer_acct).unwrap();
     put(
         &env.accounts,
         ALICE,

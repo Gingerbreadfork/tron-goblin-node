@@ -56,7 +56,7 @@ fn mainnet_witnesses_decodes_27_entries() {
 fn apply_genesis_allocations_writes_assets() {
     let state = fresh_state();
     let inputs = mainnet_inputs();
-    apply_genesis_allocations(&state, inputs.assets, &[]);
+    apply_genesis_allocations(&state, inputs.assets, &[]).unwrap();
     let accounts = AccountStore::new(state.accounts.clone());
     for asset in inputs.assets {
         let acct = accounts
@@ -74,7 +74,7 @@ fn apply_genesis_allocations_populates_account_name_and_name_index() {
     // proto's `account_name` field AND `AccountIndexStore[name]`.
     let state = fresh_state();
     let inputs = mainnet_inputs();
-    apply_genesis_allocations(&state, inputs.assets, &[]);
+    apply_genesis_allocations(&state, inputs.assets, &[]).unwrap();
 
     let accounts = AccountStore::new(state.accounts.clone());
     let name_index = AccountIndexStore::new(state.name_index.clone());
@@ -105,7 +105,7 @@ fn apply_genesis_allocations_populates_account_name_and_name_index() {
 #[test]
 fn apply_genesis_allocations_writes_witnesses_and_flags_accounts() {
     let state = fresh_state();
-    apply_genesis_allocations(&state, &[], mainnet_witnesses());
+    apply_genesis_allocations(&state, &[], mainnet_witnesses()).unwrap();
 
     let accounts = AccountStore::new(state.accounts.clone());
     let witnesses = WitnessStore::new(state.witnesses.clone());
@@ -128,8 +128,8 @@ fn apply_genesis_allocations_writes_witnesses_and_flags_accounts() {
 fn apply_genesis_allocations_is_idempotent() {
     let state = fresh_state();
     let inputs = mainnet_inputs();
-    apply_genesis_allocations(&state, inputs.assets, mainnet_witnesses());
-    apply_genesis_allocations(&state, inputs.assets, mainnet_witnesses());
+    apply_genesis_allocations(&state, inputs.assets, mainnet_witnesses()).unwrap();
+    apply_genesis_allocations(&state, inputs.assets, mainnet_witnesses()).unwrap();
 
     let accounts = AccountStore::new(state.accounts.clone());
     let witnesses = WitnessStore::new(state.witnesses.clone());

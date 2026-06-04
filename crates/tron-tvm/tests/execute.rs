@@ -39,7 +39,7 @@ fn install_contract(stores: &VmStores, prefix: u8, bytecode: &[u8]) -> [u8; 21] 
     tron_addr_bytes[1..].fill(prefix);
     let tron_addr = tron_crypto::address::Address::from_raw(tron_addr_bytes);
     let hash = code_hash(bytecode);
-    stores.code.put(hash.as_slice(), bytecode);
+    stores.code.put(hash.as_slice(), bytecode).unwrap();
     stores.accounts.put(
         &tron_addr,
         &tron_proto::Account {
@@ -49,7 +49,7 @@ fn install_contract(stores: &VmStores, prefix: u8, bytecode: &[u8]) -> [u8; 21] 
             code: bytecode.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     tron_addr_bytes
 }
 
@@ -65,7 +65,7 @@ fn fund_account(stores: &VmStores, prefix: u8, balance: i64) -> [u8; 21] {
             balance,
             ..Default::default()
         },
-    );
+    ).unwrap();
     tron_addr_bytes
 }
 
@@ -131,7 +131,7 @@ fn execute_trigger_top_level_calltoken_transfers_trc10_before_evm_runs() {
         .unwrap()
         .unwrap();
     owner.asset_v2.insert(key.clone(), 1_000);
-    stores.accounts.put(&Address::from_raw(owner_addr), &owner);
+    stores.accounts.put(&Address::from_raw(owner_addr), &owner).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: owner_addr.to_vec(),
@@ -182,7 +182,7 @@ fn execute_trigger_top_level_calltoken_unwinds_on_revert() {
         .unwrap()
         .unwrap();
     owner.asset_v2.insert(key.clone(), 500);
-    stores.accounts.put(&Address::from_raw(owner_addr), &owner);
+    stores.accounts.put(&Address::from_raw(owner_addr), &owner).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: owner_addr.to_vec(),

@@ -35,12 +35,13 @@ impl AssetIssueStore {
     }
 
     /// `put(name_bytes, asset)` — the key is the raw asset name.
-    pub fn put(&self, name: &[u8], asset: &AssetIssueContract) {
-        self.backend.put(name, &asset.encode_to_vec());
+    pub fn put(&self, name: &[u8], asset: &AssetIssueContract) -> Result<(), StoreError> {
+        self.backend.put(name, &asset.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, name: &[u8]) -> Result<Option<AssetIssueContract>, StoreError> {
-        let Some(bytes) = self.backend.get(name) else {
+        let Some(bytes) = self.backend.get(name)? else {
             return Ok(None);
         };
         Ok(Some(AssetIssueContract::decode(bytes.as_slice())?))
@@ -51,7 +52,7 @@ impl AssetIssueStore {
     /// prefix-style scans. Returns `(name_bytes, asset)` pairs.
     pub fn all(&self) -> Result<Vec<(Vec<u8>, AssetIssueContract)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
+        for (k, v) in self.backend.scan_all()? {
             let asset = AssetIssueContract::decode(v.as_slice())?;
             out.push((k, asset));
         }
@@ -72,14 +73,15 @@ impl AssetIssueV2Store {
 
     /// `put(id, asset)` — key is the decimal-string id of the asset
     /// encoded as UTF-8 bytes (e.g. id `1000001` → `b"1000001"`).
-    pub fn put(&self, id: i64, asset: &AssetIssueContract) {
+    pub fn put(&self, id: i64, asset: &AssetIssueContract) -> Result<(), StoreError> {
         let key = id.to_string();
-        self.backend.put(key.as_bytes(), &asset.encode_to_vec());
+        self.backend.put(key.as_bytes(), &asset.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<AssetIssueContract>, StoreError> {
         let key = id.to_string();
-        let Some(bytes) = self.backend.get(key.as_bytes()) else {
+        let Some(bytes) = self.backend.get(key.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(AssetIssueContract::decode(bytes.as_slice())?))
@@ -94,9 +96,25 @@ impl AssetIssueV2Store {
     /// Enumerate every asset. Returns `(decoded_id, asset)` pairs.
     pub fn all(&self) -> Result<Vec<(i64, AssetIssueContract)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
-            let Ok(id_str) = std::str::from_utf8(&k) else { continue };
-            let Ok(id) = id_str.parse::<i64>() else { continue };
+        for (k, v) in self.backend.scan_all()? {
+            let Ok(id_str) = std::str::from_utf8(&k) else {
+                // C-8: V2 asset keys are decimal-id UTF-8 strings; a
+                // non-UTF-8 key is corruption. Log, then skip.
+                tracing::error!(
+                    store = "asset-issue-v2",
+                    key = %hex::encode(&k),
+                    "skipping asset row with non-UTF-8 key"
+                );
+                continue;
+            };
+            let Ok(id) = id_str.parse::<i64>() else {
+                tracing::error!(
+                    store = "asset-issue-v2",
+                    key = %id_str,
+                    "skipping asset row whose key isn't a decimal i64 id"
+                );
+                continue;
+            };
             let asset = AssetIssueContract::decode(v.as_slice())?;
             out.push((id, asset));
         }

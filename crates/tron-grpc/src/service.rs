@@ -2382,7 +2382,9 @@ impl Wallet for WalletService {
         // assumption is symmetric key lengths; java-tron actually uses
         // a per-token length prefix, so this is a best-effort cut and
         // may need refinement once we have a real DEX dataset.
-        let entries = pairs.all();
+        let entries = pairs
+            .all()
+            .map_err(|e| Status::internal(format!("market pair list: {e}")))?;
         let order_pair: Vec<_> = entries
             .iter()
             .filter_map(|(k, _)| {

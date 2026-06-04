@@ -32,18 +32,34 @@ impl CommonDataBaseStore {
     /// non-monotonic writes (returns silently with a warn log) — we
     /// mirror that to keep on-disk values byte-identical across the
     /// two implementations.
+    ///
+    /// Backend IO errors are surfaced as panics with rich context —
+    /// this single-key store is read on every block-apply via
+    /// `latest_pbft_block_num()`, propagating Results through every
+    /// caller would cascade across the codebase. The panic message
+    /// names the store + key so triage is unambiguous.
     pub fn save_latest_pbft_block_num(&self, number: i64) {
         if number <= self.latest_pbft_block_num() {
             return;
         }
         self.backend
-            .put(LATEST_PBFT_BLOCK_NUM, &number.to_be_bytes());
+            .put(LATEST_PBFT_BLOCK_NUM, &number.to_be_bytes())
+            .unwrap_or_else(|e| {
+                panic!("common-database store: failed to write LATEST_PBFT_BLOCK_NUM: {e}")
+            });
     }
 
     /// Read the latest PBFT-committed block number. `0` when the key
-    /// hasn't been set yet.
+    /// hasn't been set yet. Backend IO failures panic with context
+    /// (same rationale as [`save_latest_pbft_block_num`]).
     pub fn latest_pbft_block_num(&self) -> i64 {
-        let Some(bytes) = self.backend.get(LATEST_PBFT_BLOCK_NUM) else {
+        let Some(bytes) = self
+            .backend
+            .get(LATEST_PBFT_BLOCK_NUM)
+            .unwrap_or_else(|e| {
+                panic!("common-database store: failed to read LATEST_PBFT_BLOCK_NUM: {e}")
+            })
+        else {
             return 0;
         };
         if bytes.len() != 8 {

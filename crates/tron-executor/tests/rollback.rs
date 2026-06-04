@@ -166,7 +166,7 @@ fn execute_block_with_undo_writes_a_record() {
             address: witness_addr.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let block = empty_block(1, [0u8; 32]);
     apply_unsigned_with_undo(&state, &block, None, &undo).expect("apply");
@@ -241,7 +241,7 @@ fn rollback_deletes_keys_that_were_first_created_by_the_block() {
         total_produced: 5,
         ..Default::default()
     };
-    ws.put(&Address::from_raw(new_witness), &initial_witness);
+    ws.put(&Address::from_raw(new_witness), &initial_witness).unwrap();
     let pre_block = ws.get(&Address::from_raw(new_witness)).unwrap().unwrap();
     assert_eq!(pre_block.total_produced, 5);
 
@@ -309,7 +309,7 @@ fn multi_block_rollback_chains_correctly() {
             address: witness_addr.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let b1 = empty_block(1, [0u8; 32]);
     apply_unsigned_with_undo(&state, &b1, None, &undo).unwrap();
@@ -370,7 +370,7 @@ fn reapply_after_rollback_produces_same_state_when_block_is_identical() {
             address: witness_addr.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let block = {
         let mut b = empty_block(1, [0u8; 32]);

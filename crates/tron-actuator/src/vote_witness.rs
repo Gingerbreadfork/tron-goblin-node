@@ -76,7 +76,7 @@ pub fn validate_vote_witness(
         if accounts.get(&candidate)?.is_none() {
             return Err(ActuatorError::CandidateAccountMissing);
         }
-        if !witnesses.contains(&candidate) {
+        if !witnesses.contains(&candidate)? {
             return Err(ActuatorError::CandidateWitnessMissing);
         }
         sum = sum
@@ -145,8 +145,8 @@ pub fn execute_vote_witness(
         votes_capsule.new_votes.push(entry);
     }
 
-    accounts.put(&owner, &owner_account);
-    votes_store.put(&owner, &votes_capsule);
+    accounts.put(&owner, &owner_account)?;
+    votes_store.put(&owner, &votes_capsule)?;
 
     Ok(())
 }

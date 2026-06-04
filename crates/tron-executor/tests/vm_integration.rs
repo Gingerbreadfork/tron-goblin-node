@@ -135,10 +135,10 @@ fn executor_runs_trigger_smart_contract_end_to_end() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let hash = tron_crypto::hash::keccak256(&bytecode);
-    code.put(&hash, &bytecode);
+    code.put(&hash, &bytecode).unwrap();
     accounts.put(
         &Address::from_raw(contract_bytes),
         &Account {
@@ -148,7 +148,7 @@ fn executor_runs_trigger_smart_contract_end_to_end() {
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Build the TriggerSmartContract transaction.
     let trigger = TriggerSmartContract {
@@ -195,7 +195,10 @@ fn executor_runs_trigger_smart_contract_end_to_end() {
     // composite-key layout.
     let storage = StorageRowStore::new(state.storage_row.as_ref().unwrap().clone());
     let composite = StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
-    let stored = storage.get(&composite).expect("storage row missing");
+    let stored = storage
+        .get(&composite)
+        .unwrap()
+        .expect("storage row missing");
     let mut expected = [0u8; 32];
     expected[31] = 0x42;
     assert_eq!(stored, expected.to_vec());
@@ -218,14 +221,14 @@ fn executor_top_level_calltoken_trigger_runs_with_trc10_transfer() {
         ..Default::default()
     };
     caller_acct.asset_v2.insert(key.clone(), 1_000);
-    accounts.put(&Address::from_raw(caller_bytes), &caller_acct);
+    accounts.put(&Address::from_raw(caller_bytes), &caller_acct).unwrap();
     accounts.put(
         &Address::from_raw(contract_bytes),
         &Account {
             address: contract_bytes.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // TriggerSmartContract with non-zero call_token_value → asset transferred,
     // EVM runs the (empty-STOP) contract bytecode, transaction succeeds.
@@ -317,7 +320,7 @@ fn executing_block_bumps_witnesss_total_produced_counter() {
             total_produced: 7, // starting value
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Build a block signed by this witness.
     let parent = tron_types::BlockId::from_raw([0u8; 32]);
@@ -429,7 +432,7 @@ fn executing_block_bumps_total_missed_for_skipped_slots() {
     // total_produced bumps independently of the miss accounting.
     active[3] = producer;
     WitnessScheduleStore::new(state.witness_schedule.clone().unwrap())
-        .save_active(&active);
+        .save_active(&active).unwrap();
 
     // Seed witness rows for everyone in the schedule with a starting
     // total_missed of 0. (Unknown witnesses are silently skipped, so
@@ -443,7 +446,7 @@ fn executing_block_bumps_total_missed_for_skipped_slots() {
                 vote_count: 100 + i as i64,
                 ..Default::default()
             },
-        );
+        ).unwrap();
     }
 
     // Genesis at t=0, prev block at t=3000ms (slot 1). This block lands
@@ -517,7 +520,7 @@ fn executing_block_one_does_not_attribute_misses() {
     let other = Address::from_raw(other_bytes);
 
     WitnessScheduleStore::new(state.witness_schedule.clone().unwrap())
-        .save_active(&[producer, other]);
+        .save_active(&[producer, other]).unwrap();
 
     let ws = WitnessStore::new(state.witnesses.clone());
     ws.put(
@@ -526,7 +529,7 @@ fn executing_block_one_does_not_attribute_misses() {
             address: other_bytes.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     dp.save_genesis_block_timestamp(0);
@@ -579,10 +582,10 @@ fn trigger_smart_contract_with_wrong_signer_is_rejected_by_permission_check() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let hash = tron_crypto::hash::keccak256(&bytecode);
-    code.put(&hash, &bytecode);
+    code.put(&hash, &bytecode).unwrap();
     accounts.put(
         &Address::from_raw(contract_bytes),
         &Account {
@@ -592,7 +595,7 @@ fn trigger_smart_contract_with_wrong_signer_is_rejected_by_permission_check() {
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: alice_bytes.to_vec(),
@@ -637,7 +640,7 @@ fn trigger_smart_contract_with_wrong_signer_is_rejected_by_permission_check() {
     let composite =
         StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
     assert!(
-        storage.get(&composite).is_none(),
+        storage.get(&composite).unwrap().is_none(),
         "VM ran despite permission rejection — storage slot should still be absent"
     );
 }
@@ -689,12 +692,12 @@ fn internal_call_trace_is_captured_for_nested_call() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let a_hash = tron_crypto::hash::keccak256(&a_bytecode);
     let b_hash = tron_crypto::hash::keccak256(&b_bytecode);
-    code.put(&a_hash, &a_bytecode);
-    code.put(&b_hash, &b_bytecode);
+    code.put(&a_hash, &a_bytecode).unwrap();
+    code.put(&b_hash, &b_bytecode).unwrap();
     accounts.put(
         &Address::from_raw(contract_a_bytes),
         &Account {
@@ -704,7 +707,7 @@ fn internal_call_trace_is_captured_for_nested_call() {
             code_hash: a_hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     accounts.put(
         &Address::from_raw(contract_b_bytes),
         &Account {
@@ -714,7 +717,7 @@ fn internal_call_trace_is_captured_for_nested_call() {
             code_hash: b_hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Trigger A.
     let trigger = TriggerSmartContract {
@@ -812,10 +815,10 @@ fn selfdestruct_emits_suicide_internal_tx() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let code_hash = tron_crypto::hash::keccak256(&bytecode);
-    code.put(&code_hash, &bytecode);
+    code.put(&code_hash, &bytecode).unwrap();
     // Contract has a non-zero balance so we can assert it shows up as
     // the suicide entry's value.
     let contract_balance: i64 = 12_345;
@@ -828,7 +831,7 @@ fn selfdestruct_emits_suicide_internal_tx() {
             code_hash: code_hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_bytes.to_vec(),
@@ -939,12 +942,12 @@ fn default_exec_config_drops_internal_tx_traces() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let a_hash = tron_crypto::hash::keccak256(&a_bytecode);
     let b_hash = tron_crypto::hash::keccak256(&b_bytecode);
-    code.put(&a_hash, &a_bytecode);
-    code.put(&b_hash, &b_bytecode);
+    code.put(&a_hash, &a_bytecode).unwrap();
+    code.put(&b_hash, &b_bytecode).unwrap();
     accounts.put(
         &Address::from_raw(contract_a_bytes),
         &Account {
@@ -954,7 +957,7 @@ fn default_exec_config_drops_internal_tx_traces() {
             code_hash: a_hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     accounts.put(
         &Address::from_raw(contract_b_bytes),
         &Account {
@@ -964,7 +967,7 @@ fn default_exec_config_drops_internal_tx_traces() {
             code_hash: b_hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_bytes.to_vec(),
@@ -1051,10 +1054,10 @@ fn revert_after_sstore_drops_storage_write_but_charges_energy() {
             balance: initial_balance,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let hash = tron_crypto::hash::keccak256(&bytecode);
-    code.put(&hash, &bytecode);
+    code.put(&hash, &bytecode).unwrap();
     accounts.put(
         &Address::from_raw(contract_bytes),
         &Account {
@@ -1064,7 +1067,7 @@ fn revert_after_sstore_drops_storage_write_but_charges_energy() {
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Pre-seed storage slot 0 with a sentinel so we can distinguish
     // "no write happened" from "write happened then was reverted into
@@ -1074,7 +1077,7 @@ fn revert_after_sstore_drops_storage_write_but_charges_energy() {
         StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
     let mut sentinel = [0u8; 32];
     sentinel[31] = 0x07;
-    storage.put(&composite_key, &sentinel);
+    storage.put(&composite_key, &sentinel).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_bytes.to_vec(),
@@ -1125,6 +1128,7 @@ fn revert_after_sstore_drops_storage_write_but_charges_energy() {
     // commit semantics).
     let after_value = storage
         .get(&composite_key)
+        .unwrap()
         .expect("sentinel must still be there");
     assert_eq!(
         after_value, sentinel,
@@ -1178,10 +1182,10 @@ fn halt_after_sstore_drops_storage_write_but_charges_energy() {
             balance: initial_balance,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let hash = tron_crypto::hash::keccak256(&bytecode);
-    code.put(&hash, &bytecode);
+    code.put(&hash, &bytecode).unwrap();
     accounts.put(
         &Address::from_raw(contract_bytes),
         &Account {
@@ -1191,14 +1195,14 @@ fn halt_after_sstore_drops_storage_write_but_charges_energy() {
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let storage = StorageRowStore::new(state.storage_row.as_ref().unwrap().clone());
     let composite_key =
         StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
     let mut sentinel = [0u8; 32];
     sentinel[31] = 0x09;
-    storage.put(&composite_key, &sentinel);
+    storage.put(&composite_key, &sentinel).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_bytes.to_vec(),
@@ -1240,7 +1244,10 @@ fn halt_after_sstore_drops_storage_write_but_charges_energy() {
         }
         other => panic!("expected ExecutionFailed(VM halt), got {other:?}"),
     }
-    let after = storage.get(&composite_key).expect("sentinel must remain");
+    let after = storage
+        .get(&composite_key)
+        .unwrap()
+        .expect("sentinel must remain");
     assert_eq!(
         after, sentinel,
         "halt must drop the SSTORE; slot 0 should still read 0x09"

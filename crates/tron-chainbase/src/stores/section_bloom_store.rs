@@ -25,6 +25,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "section-bloom";
 
@@ -51,20 +52,23 @@ impl SectionBloomStore {
     /// payload (little-endian within each byte, trailing-zero-trimmed).
     /// We zlib-compress on the way down to match java-tron's
     /// `ByteUtil.compress`.
-    pub fn put(&self, section: u32, bit_index: u32, bitset_bytes: &[u8]) {
+    pub fn put(&self, section: u32, bit_index: u32, bitset_bytes: &[u8]) -> Result<(), StoreError> {
         let k = Self::key_for(section, bit_index);
         let compressed = compress(bitset_bytes);
-        self.backend.put(&k, &compressed);
+        self.backend.put(&k, &compressed)?;
+        Ok(())
     }
 
     /// Read + decompress. Returns `None` if the row is absent or the
     /// stored value isn't valid zlib (treat corrupted as missing —
     /// matches java-tron which throws `EventBloomException` and the
     /// caller logs + skips).
-    pub fn get(&self, section: u32, bit_index: u32) -> Option<Vec<u8>> {
+    pub fn get(&self, section: u32, bit_index: u32) -> Result<Option<Vec<u8>>, StoreError> {
         let k = Self::key_for(section, bit_index);
-        let raw = self.backend.get(&k)?;
-        decompress(&raw).ok()
+        let Some(raw) = self.backend.get(&k)? else {
+            return Ok(None);
+        };
+        Ok(decompress(&raw).ok())
     }
 }
 
@@ -94,15 +98,15 @@ mod tests {
         // visibly smaller than the input (sanity-check we actually
         // deflated rather than echoed).
         let payload = vec![0xAA; 256];
-        store.put(0, 0, &payload);
-        let raw = backend.get(b"0").expect("row written");
+        store.put(0, 0, &payload).unwrap();
+        let raw = backend.get(b"0").unwrap().expect("row written");
         assert!(
             raw.len() < payload.len(),
             "compressed payload ({} bytes) should be smaller than input ({} bytes)",
             raw.len(),
             payload.len()
         );
-        let round = store.get(0, 0).expect("decompressed read");
+        let round = store.get(0, 0).unwrap().expect("decompressed read");
         assert_eq!(round, payload);
     }
 
@@ -111,7 +115,7 @@ mod tests {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = SectionBloomStore::new(backend.clone());
         // Write garbage directly; decompress will fail → None.
-        backend.put(b"0", b"not-zlib");
-        assert!(store.get(0, 0).is_none());
+        backend.put(b"0", b"not-zlib").unwrap();
+        assert!(store.get(0, 0).unwrap().is_none());
     }
 }

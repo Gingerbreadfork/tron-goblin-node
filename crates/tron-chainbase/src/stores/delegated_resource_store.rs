@@ -77,19 +77,21 @@ impl DelegatedResourceStore {
 
     // -------------------- CRUD ----------------------------------------
 
-    pub fn put_raw(&self, key: &[u8], resource: &DelegatedResource) {
-        self.backend.put(key, &resource.encode_to_vec());
+    pub fn put_raw(&self, key: &[u8], resource: &DelegatedResource) -> Result<(), StoreError> {
+        self.backend.put(key, &resource.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get_raw(&self, key: &[u8]) -> Result<Option<DelegatedResource>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         Ok(Some(DelegatedResource::decode(bytes.as_slice())?))
     }
 
-    pub fn delete_raw(&self, key: &[u8]) {
-        self.backend.delete(key);
+    pub fn delete_raw(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.backend.delete(key)?;
+        Ok(())
     }
 
     /// Return every V1 delegation row where `from` is the sender.
@@ -100,36 +102,56 @@ impl DelegatedResourceStore {
     /// V1 keys are 42 bytes (`from || to`) with no leading prefix
     /// byte, so we scan with `from.as_bytes()` as the prefix. Skips
     /// rows that decode as malformed `DelegatedResource`.
-    pub fn get_by_from_v1(&self, from: &Address) -> Vec<DelegatedResource> {
-        self.backend
-            .scan_prefix(from.as_bytes())
+    pub fn get_by_from_v1(&self, from: &Address) -> Result<Vec<DelegatedResource>, StoreError> {
+        Ok(self
+            .backend
+            .scan_prefix(from.as_bytes())?
             .into_iter()
             // Defensive: skip any row whose key isn't a V1 entry shape.
             // V2 entries have a 1-byte prefix so they wouldn't start
             // with a 21-byte address — but be explicit.
             .filter(|(k, _)| k.len() == ADDRESS_LENGTH * 2)
-            .filter_map(|(_, v)| DelegatedResource::decode(v.as_slice()).ok())
-            .collect()
+            .filter_map(|(k, v)| match DelegatedResource::decode(v.as_slice()) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    // C-8: a V1-shaped key whose value won't decode is
+                    // corruption — log instead of silently dropping it.
+                    tracing::error!(
+                        store = "DelegatedResource",
+                        key = %hex::encode(&k),
+                        error = %e,
+                        "skipping undecodable DelegatedResource V1 row"
+                    );
+                    None
+                }
+            })
+            .collect())
     }
 
     /// V2 variant — returns rows under either the locked or unlocked
     /// prefix that match `from`. Used by `Wallet.getDelegatedResourceV2`.
-    pub fn get_by_from_v2(&self, from: &Address) -> Vec<DelegatedResource> {
+    pub fn get_by_from_v2(&self, from: &Address) -> Result<Vec<DelegatedResource>, StoreError> {
         let mut out = Vec::new();
         for prefix_byte in [V2_PREFIX_UNLOCKED, V2_PREFIX_LOCKED] {
             let mut prefix = Vec::with_capacity(1 + ADDRESS_LENGTH);
             prefix.push(prefix_byte);
             prefix.extend_from_slice(from.as_bytes());
-            for (k, v) in self.backend.scan_prefix(&prefix) {
+            for (k, v) in self.backend.scan_prefix(&prefix)? {
                 if k.len() != 1 + ADDRESS_LENGTH * 2 {
                     continue;
                 }
-                if let Ok(d) = DelegatedResource::decode(v.as_slice()) {
-                    out.push(d);
+                match DelegatedResource::decode(v.as_slice()) {
+                    Ok(d) => out.push(d),
+                    Err(e) => tracing::error!(
+                        store = "DelegatedResource",
+                        key = %hex::encode(&k),
+                        error = %e,
+                        "skipping undecodable DelegatedResource V2 row"
+                    ),
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -161,7 +183,8 @@ mod tests {
                 frozen_balance_for_bandwidth: 100,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         store.put_raw(
             &DelegatedResourceStore::v1_key(&alice, &charlie),
             &DelegatedResource {
@@ -170,7 +193,8 @@ mod tests {
                 frozen_balance_for_bandwidth: 200,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         // Bob also delegates to charlie — must NOT appear in alice's results.
         store.put_raw(
             &DelegatedResourceStore::v1_key(&bob, &charlie),
@@ -180,8 +204,9 @@ mod tests {
                 frozen_balance_for_bandwidth: 999,
                 ..Default::default()
             },
-        );
-        let rows = store.get_by_from_v1(&alice);
+        )
+        .unwrap();
+        let rows = store.get_by_from_v1(&alice).unwrap();
         assert_eq!(rows.len(), 2);
         let amounts: Vec<i64> = rows
             .iter()

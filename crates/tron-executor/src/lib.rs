@@ -426,39 +426,40 @@ impl TxSession {
         }
     }
 
-    fn commit(&self) {
-        self.accounts.commit();
-        self.witnesses.commit();
-        self.votes.commit();
-        self.delegation.commit();
-        self.delegated_resources.commit();
-        self.dyn_props.commit();
-        self.proposals.commit();
-        self.name_index.commit();
-        self.id_index.commit();
-        self.asset_v1.commit();
-        self.asset_v2.commit();
-        self.contracts.commit();
-        self.abi.commit();
-        self.exchange_v1.commit();
-        self.exchange_v2.commit();
-        self.market_orders.commit();
-        self.nullifiers.commit();
+    fn commit(&self) -> Result<(), tron_chainbase::KvError> {
+        self.accounts.commit()?;
+        self.witnesses.commit()?;
+        self.votes.commit()?;
+        self.delegation.commit()?;
+        self.delegated_resources.commit()?;
+        self.dyn_props.commit()?;
+        self.proposals.commit()?;
+        self.name_index.commit()?;
+        self.id_index.commit()?;
+        self.asset_v1.commit()?;
+        self.asset_v2.commit()?;
+        self.contracts.commit()?;
+        self.abi.commit()?;
+        self.exchange_v1.commit()?;
+        self.exchange_v2.commit()?;
+        self.market_orders.commit()?;
+        self.nullifiers.commit()?;
         if let Some(s) = &self.merkle_trees {
-            s.commit();
+            s.commit()?;
         }
         if let Some(s) = &self.code {
-            s.commit();
+            s.commit()?;
         }
         if let Some(s) = &self.storage_row {
-            s.commit();
+            s.commit()?;
         }
         if let Some(s) = &self.contract_state {
-            s.commit();
+            s.commit()?;
         }
         if let Some(s) = &self.block_index {
-            s.commit();
+            s.commit()?;
         }
+        Ok(())
     }
 
     fn revert(&self) {
@@ -636,13 +637,14 @@ impl VmSession {
 
     /// Flush every wrapped backend's pending writes into the per-tx
     /// session. Called once per VM frame on `VmOutcome::Success`.
-    fn commit(&self) {
-        self.accounts.commit();
-        self.code.commit();
-        self.storage_row.commit();
-        self.contract_state.commit();
-        self.votes.commit();
-        self.delegated_resources.commit();
+    fn commit(&self) -> Result<(), tron_chainbase::KvError> {
+        self.accounts.commit()?;
+        self.code.commit()?;
+        self.storage_row.commit()?;
+        self.contract_state.commit()?;
+        self.votes.commit()?;
+        self.delegated_resources.commit()?;
+        Ok(())
     }
 
     /// Discard every wrapped backend's pending writes. Called once per
@@ -773,6 +775,10 @@ pub enum BlockExecError {
     },
     #[error("cross-store checkpoint flush failed: {0}")]
     Checkpoint(#[from] tron_chainbase::CheckpointError),
+    #[error("store error: {0}")]
+    Store(#[from] tron_chainbase::StoreError),
+    #[error("kv backend error: {0}")]
+    Kv(#[from] tron_chainbase::KvError),
 }
 
 // =============================================================================
@@ -910,7 +916,7 @@ fn execute_block_inner(
                 .commit_with_checkpoint_and_undo(checkpoint, state)
                 .map_err(BlockExecError::Checkpoint)?
         } else {
-            block_session.commit_with_undo()
+            block_session.commit_with_undo()?
         };
         let block_num = block
             .block_header
@@ -918,7 +924,7 @@ fn execute_block_inner(
             .and_then(|h| h.raw_data.as_ref())
             .map(|r| r.number)
             .unwrap_or(0);
-        undo_store.put(block_num, &record);
+        undo_store.put(block_num, &record)?;
         return Ok(report);
     }
     execute_block_logic(state, block, expected_parent, config)
@@ -1040,7 +1046,7 @@ impl BlockSession {
     /// Commit every store's overlay to its base backend, capturing
     /// `(store_id, key, before_image)` triples for each write. The
     /// result is one [`BlockUndoRecord`] suitable for persistence.
-    fn commit_with_undo(self) -> tron_chainbase::BlockUndoRecord {
+    fn commit_with_undo(self) -> Result<tron_chainbase::BlockUndoRecord, tron_chainbase::KvError> {
         use tron_chainbase::UndoStoreId as Id;
         let mut record = tron_chainbase::BlockUndoRecord::new();
         let mut push = |id: Id, undo: Vec<(Vec<u8>, Option<Vec<u8>>)>| {
@@ -1048,42 +1054,42 @@ impl BlockSession {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
             }
         };
-        push(Id::Accounts, self.accounts.commit_with_undo());
-        push(Id::Witnesses, self.witnesses.commit_with_undo());
-        push(Id::Votes, self.votes.commit_with_undo());
-        push(Id::Delegation, self.delegation.commit_with_undo());
-        push(Id::DelegatedResources, self.delegated_resources.commit_with_undo());
-        push(Id::DynProps, self.dyn_props.commit_with_undo());
-        push(Id::Proposals, self.proposals.commit_with_undo());
-        push(Id::NameIndex, self.name_index.commit_with_undo());
-        push(Id::IdIndex, self.id_index.commit_with_undo());
-        push(Id::AssetV1, self.asset_v1.commit_with_undo());
-        push(Id::AssetV2, self.asset_v2.commit_with_undo());
-        push(Id::Contracts, self.contracts.commit_with_undo());
-        push(Id::Abi, self.abi.commit_with_undo());
-        push(Id::ExchangeV1, self.exchange_v1.commit_with_undo());
-        push(Id::ExchangeV2, self.exchange_v2.commit_with_undo());
-        push(Id::MarketOrders, self.market_orders.commit_with_undo());
-        push(Id::Nullifiers, self.nullifiers.commit_with_undo());
+        push(Id::Accounts, self.accounts.commit_with_undo()?);
+        push(Id::Witnesses, self.witnesses.commit_with_undo()?);
+        push(Id::Votes, self.votes.commit_with_undo()?);
+        push(Id::Delegation, self.delegation.commit_with_undo()?);
+        push(Id::DelegatedResources, self.delegated_resources.commit_with_undo()?);
+        push(Id::DynProps, self.dyn_props.commit_with_undo()?);
+        push(Id::Proposals, self.proposals.commit_with_undo()?);
+        push(Id::NameIndex, self.name_index.commit_with_undo()?);
+        push(Id::IdIndex, self.id_index.commit_with_undo()?);
+        push(Id::AssetV1, self.asset_v1.commit_with_undo()?);
+        push(Id::AssetV2, self.asset_v2.commit_with_undo()?);
+        push(Id::Contracts, self.contracts.commit_with_undo()?);
+        push(Id::Abi, self.abi.commit_with_undo()?);
+        push(Id::ExchangeV1, self.exchange_v1.commit_with_undo()?);
+        push(Id::ExchangeV2, self.exchange_v2.commit_with_undo()?);
+        push(Id::MarketOrders, self.market_orders.commit_with_undo()?);
+        push(Id::Nullifiers, self.nullifiers.commit_with_undo()?);
         if let Some(s) = self.merkle_trees {
-            push(Id::MerkleTrees, s.commit_with_undo());
+            push(Id::MerkleTrees, s.commit_with_undo()?);
         }
         if let Some(s) = self.code {
-            push(Id::Code, s.commit_with_undo());
+            push(Id::Code, s.commit_with_undo()?);
         }
         if let Some(s) = self.storage_row {
-            push(Id::StorageRow, s.commit_with_undo());
+            push(Id::StorageRow, s.commit_with_undo()?);
         }
         if let Some(s) = self.contract_state {
-            push(Id::ContractState, s.commit_with_undo());
+            push(Id::ContractState, s.commit_with_undo()?);
         }
         if let Some(s) = self.block_index {
-            push(Id::BlockIndex, s.commit_with_undo());
+            push(Id::BlockIndex, s.commit_with_undo()?);
         }
         if let Some(s) = self.witness_schedule {
-            push(Id::WitnessSchedule, s.commit_with_undo());
+            push(Id::WitnessSchedule, s.commit_with_undo()?);
         }
-        record
+        Ok(record)
     }
 
     /// Commit every store's overlay to its base backend under one
@@ -1120,46 +1126,50 @@ impl BlockSession {
         let mut drained: Vec<(Id, Arc<dyn KvBackend>, Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
         let mut take = |id: Id,
                         session: Arc<tron_chainbase::SessionBackend>,
-                        base: Arc<dyn KvBackend>| {
-            let (ops, undo) = session.drain_pending_with_undo();
+                        base: Arc<dyn KvBackend>|
+         -> Result<(), tron_chainbase::CheckpointError> {
+            let (ops, undo) = session
+                .drain_pending_with_undo()
+                .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
             if !ops.is_empty() {
                 drained.push((id, base, ops, undo));
             }
+            Ok(())
         };
-        take(Id::Accounts, self.accounts, state.accounts.clone());
-        take(Id::Witnesses, self.witnesses, state.witnesses.clone());
-        take(Id::Votes, self.votes, state.votes.clone());
-        take(Id::Delegation, self.delegation, state.delegation.clone());
-        take(Id::DelegatedResources, self.delegated_resources, state.delegated_resources.clone());
-        take(Id::DynProps, self.dyn_props, state.dyn_props.clone());
-        take(Id::Proposals, self.proposals, state.proposals.clone());
-        take(Id::NameIndex, self.name_index, state.name_index.clone());
-        take(Id::IdIndex, self.id_index, state.id_index.clone());
-        take(Id::AssetV1, self.asset_v1, state.asset_v1.clone());
-        take(Id::AssetV2, self.asset_v2, state.asset_v2.clone());
-        take(Id::Contracts, self.contracts, state.contracts.clone());
-        take(Id::Abi, self.abi, state.abi.clone());
-        take(Id::ExchangeV1, self.exchange_v1, state.exchange_v1.clone());
-        take(Id::ExchangeV2, self.exchange_v2, state.exchange_v2.clone());
-        take(Id::MarketOrders, self.market_orders, state.market_orders.clone());
-        take(Id::Nullifiers, self.nullifiers, state.nullifiers.clone());
+        take(Id::Accounts, self.accounts, state.accounts.clone())?;
+        take(Id::Witnesses, self.witnesses, state.witnesses.clone())?;
+        take(Id::Votes, self.votes, state.votes.clone())?;
+        take(Id::Delegation, self.delegation, state.delegation.clone())?;
+        take(Id::DelegatedResources, self.delegated_resources, state.delegated_resources.clone())?;
+        take(Id::DynProps, self.dyn_props, state.dyn_props.clone())?;
+        take(Id::Proposals, self.proposals, state.proposals.clone())?;
+        take(Id::NameIndex, self.name_index, state.name_index.clone())?;
+        take(Id::IdIndex, self.id_index, state.id_index.clone())?;
+        take(Id::AssetV1, self.asset_v1, state.asset_v1.clone())?;
+        take(Id::AssetV2, self.asset_v2, state.asset_v2.clone())?;
+        take(Id::Contracts, self.contracts, state.contracts.clone())?;
+        take(Id::Abi, self.abi, state.abi.clone())?;
+        take(Id::ExchangeV1, self.exchange_v1, state.exchange_v1.clone())?;
+        take(Id::ExchangeV2, self.exchange_v2, state.exchange_v2.clone())?;
+        take(Id::MarketOrders, self.market_orders, state.market_orders.clone())?;
+        take(Id::Nullifiers, self.nullifiers, state.nullifiers.clone())?;
         if let (Some(s), Some(b)) = (self.merkle_trees, state.merkle_trees.clone()) {
-            take(Id::MerkleTrees, s, b);
+            take(Id::MerkleTrees, s, b)?;
         }
         if let (Some(s), Some(b)) = (self.code, state.code.clone()) {
-            take(Id::Code, s, b);
+            take(Id::Code, s, b)?;
         }
         if let (Some(s), Some(b)) = (self.storage_row, state.storage_row.clone()) {
-            take(Id::StorageRow, s, b);
+            take(Id::StorageRow, s, b)?;
         }
         if let (Some(s), Some(b)) = (self.contract_state, state.contract_state.clone()) {
-            take(Id::ContractState, s, b);
+            take(Id::ContractState, s, b)?;
         }
         if let (Some(s), Some(b)) = (self.block_index, state.block_index.clone()) {
-            take(Id::BlockIndex, s, b);
+            take(Id::BlockIndex, s, b)?;
         }
         if let (Some(s), Some(b)) = (self.witness_schedule, state.witness_schedule.clone()) {
-            take(Id::WitnessSchedule, s, b);
+            take(Id::WitnessSchedule, s, b)?;
         }
 
         // (2) Build the manifest. Empty block? Skip the manifest
@@ -1197,7 +1207,8 @@ impl BlockSession {
         //     from write_batch_sync the per-store WAL is on disk, so
         //     losing the manifest no longer means losing the writes.
         for (id, base, ops, undo) in drained {
-            base.write_batch_sync(&ops);
+            base.write_batch_sync(&ops)
+                .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
             for (key, before) in undo {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
             }
@@ -1278,8 +1289,12 @@ pub fn replay_pending_checkpoints(
         let n = checkpoint.replay(*id, |entry: &CheckpointEntry| {
             match by_name.get(entry.db_name.as_str()) {
                 Some(backend) => match &entry.value {
-                    Some(v) => backend.put(&entry.key, v),
-                    None => backend.delete(&entry.key),
+                    Some(v) => backend
+                        .put(&entry.key, v)
+                        .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?,
+                    None => backend
+                        .delete(&entry.key)
+                        .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?,
                 },
                 None => {
                     return Err(tron_chainbase::CheckpointError::Decode(format!(
@@ -1358,11 +1373,11 @@ pub fn rollback_block(
                 .ok_or(RollbackError::OptionalStoreNotAttached("witness_schedule"))?,
         };
         match &entry.before {
-            Some(v) => backend.put(&entry.key, v),
-            None => backend.delete(&entry.key),
+            Some(v) => backend.put(&entry.key, v)?,
+            None => backend.delete(&entry.key)?,
         }
     }
-    undo_store.delete(block_num);
+    undo_store.delete(block_num)?;
     Ok(n)
 }
 
@@ -1374,6 +1389,10 @@ pub enum RollbackError {
     Decode(String),
     #[error("rollback log references store '{0}' but it isn't attached on this node")]
     OptionalStoreNotAttached(&'static str),
+    #[error("kv backend error during rollback: {0}")]
+    Kv(#[from] tron_chainbase::KvError),
+    #[error("store error during rollback: {0}")]
+    Store(#[from] tron_chainbase::StoreError),
 }
 
 /// Pure executor logic — operates on whatever [`StateBackends`] is
@@ -1476,7 +1495,7 @@ fn execute_block_logic(
                 w.latest_slot_num = (raw.timestamp - genesis_ts_for_slot)
                     .max(0)
                     / BLOCK_INTERVAL_MS;
-                ws.put(&addr, &w);
+                ws.put(&addr, &w)?;
             }
         }
 
@@ -1519,7 +1538,7 @@ fn execute_block_logic(
                 let missed_addr = active_witnesses[idx];
                 if let Ok(Some(mut w)) = ws.get(&missed_addr) {
                     w.total_missed = w.total_missed.saturating_add(1);
-                    ws.put(&missed_addr, &w);
+                    ws.put(&missed_addr, &w)?;
                 }
             }
         }
@@ -1656,7 +1675,7 @@ fn execute_block_logic(
     if !raw.account_state_root.is_empty()
         && dp.get_long(b"ALLOW_ACCOUNT_STATE_ROOT").unwrap_or(0) == 1
     {
-        let computed = compute_state_root(state);
+        let computed = compute_state_root(state)?;
         if computed.as_slice() != raw.account_state_root.as_slice() {
             return Err(BlockExecError::StateRootMismatch {
                 block_num: raw.number,
@@ -1713,7 +1732,7 @@ pub fn dry_run_for_state_root(
         &ephemeral,
         &ExecConfig::unsigned(),
     )?;
-    let root = compute_state_root(state);
+    let root = compute_state_root(state)?;
     let raw = block
         .block_header
         .as_ref()
@@ -1733,25 +1752,30 @@ pub fn dry_run_for_state_root(
     Ok(root)
 }
 
-pub fn compute_state_root(state: &StateBackends) -> [u8; 32] {
+pub fn compute_state_root(state: &StateBackends) -> Result<[u8; 32], tron_chainbase::KvError> {
     use tron_crypto::address::Address;
     use tron_proto::Account;
 
     let storage_lookup = |addr: &Address| -> Option<[u8; 32]> {
         let rows_be = state.storage_row.as_ref()?;
+        // Scan failures here are surfaced via the outer Result —
+        // we treat any backend error during storage-root computation
+        // as a panic-worthy condition for the per-contract path
+        // since silently returning None would corrupt the root.
         let rows = tron_chainbase::StorageRowStore::new(rows_be.clone())
-            .scan_for_contract(addr);
+            .scan_for_contract(addr)
+            .expect("storage_row.scan_for_contract failed in compute_state_root");
         if rows.is_empty() {
             None
         } else {
             let rows_owned: Vec<([u8; 32], Vec<u8>)> =
-                rows.into_iter().map(|(k, v)| (k, v)).collect();
+                rows.into_iter().collect();
             Some(tron_types::compute_storage_root(&rows_owned))
         }
     };
 
     let mut accounts: Vec<(Address, Account)> = Vec::new();
-    for (key, value) in state.accounts.scan_all() {
+    for (key, value) in state.accounts.scan_all()? {
         if key.len() != 21 {
             continue;
         }
@@ -1762,7 +1786,7 @@ pub fn compute_state_root(state: &StateBackends) -> [u8; 32] {
         };
         accounts.push((Address::from_raw(addr_bytes), account));
     }
-    tron_types::compute_account_state_root_with_storage(&accounts, storage_lookup)
+    Ok(tron_types::compute_account_state_root_with_storage(&accounts, storage_lookup))
 }
 
 fn execute_one_tx(
@@ -1968,7 +1992,19 @@ fn execute_one_tx(
     // state mutations from a failed execute are NOT applied).
     match dispatch_execute(&stores, &tx_ctx, ty, parameter) {
         Ok(_result) => {
-            session.commit();
+            // Containment for the .expect():
+            // * Production (`execute_block_with_undo_*`) path: TxSession's
+            //   parent is a BlockSession-wrapped SessionBackend whose
+            //   `write_batch` is an in-memory `HashMap::insert` — the
+            //   only way it fails is lock poisoning, which is
+            //   unrecoverable anyway.
+            // * No-undo path (tests + dry-run tooling): parent is the
+            //   raw backend. A real IO error there is a tooling-level
+            //   failure; panicking surfaces it to the operator rather
+            //   than silently dropping the tx's writes.
+            session
+                .commit()
+                .expect("db error in execute_one_tx: TxSession::commit flush failed");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2254,7 +2290,9 @@ fn execute_vm_tx(
     // The per-tx outer session is untouched here — its bandwidth +
     // about-to-apply energy charge survive whichever branch fires.
     match &outcome {
-        tron_tvm::execute::VmOutcome::Success { .. } => vm_session.commit(),
+        tron_tvm::execute::VmOutcome::Success { .. } => vm_session
+            .commit()
+            .expect("db error in execute_vm_tx: VmSession::commit flush failed"),
         _ => vm_session.revert(),
     }
 
@@ -2348,7 +2386,9 @@ fn execute_vm_tx(
     match outcome {
         tron_tvm::execute::VmOutcome::Success { logs, .. } => {
             let _ = vm_succeeded;
-            session.commit();
+            session
+                .commit()
+                .expect("db error in execute_vm_tx: TxSession::commit flush failed on VM Success");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2365,7 +2405,9 @@ fn execute_vm_tx(
             // afterwards — both of which java-tron's consensus rule
             // says must survive a revert. `session.commit()` flushes
             // exactly those into the per-tx parent.
-            session.commit();
+            session
+                .commit()
+                .expect("db error in execute_vm_tx: TxSession::commit flush failed on VM Revert");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2377,7 +2419,9 @@ fn execute_vm_tx(
             }
         }
         tron_tvm::execute::VmOutcome::Halt { reason, .. } => {
-            session.commit();
+            session
+                .commit()
+                .expect("db error in execute_vm_tx: TxSession::commit flush failed on VM Halt");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2463,7 +2507,7 @@ pub fn apply_genesis_allocations(
     state: &StateBackends,
     assets: &[tron_types::GenesisAsset],
     witnesses: &[tron_types::GenesisWitness],
-) {
+) -> Result<(), tron_chainbase::StoreError> {
     use tron_crypto::address::Address;
     use tron_proto::{Account, AccountType, Witness};
 
@@ -2473,7 +2517,7 @@ pub fn apply_genesis_allocations(
 
     for asset in assets {
         let addr = Address::from_raw(asset.address);
-        let existing = accounts.get(&addr).ok().flatten();
+        let existing = accounts.get(&addr)?;
         let acct = Account {
             address: asset.address.to_vec(),
             account_name: asset.name.as_bytes().to_vec(),
@@ -2484,7 +2528,7 @@ pub fn apply_genesis_allocations(
             // from a re-run.
             ..existing.unwrap_or_default()
         };
-        accounts.put(&addr, &acct);
+        accounts.put(&addr, &acct)?;
         // Mirror java-tron's `Manager.initAccount`: also populate the
         // `account-index` store (name → address) so `getAccountByName`
         // works on genesis accounts. java-tron's
@@ -2494,13 +2538,13 @@ pub fn apply_genesis_allocations(
         // populated at genesis — assets don't carry an accountId in
         // mainnet config.conf; the id only gets set via `setAccountId`.
         if !asset.name.is_empty() {
-            name_index.put(asset.name.as_bytes(), &addr);
+            name_index.put(asset.name.as_bytes(), &addr)?;
         }
     }
 
     for w in witnesses {
         let addr = Address::from_raw(w.address);
-        let mut acct = accounts.get(&addr).ok().flatten().unwrap_or(Account {
+        let mut acct = accounts.get(&addr)?.unwrap_or(Account {
             address: w.address.to_vec(),
             balance: 0,
             // java-tron uses `AccountType::AssetIssue` for an
@@ -2509,7 +2553,7 @@ pub fn apply_genesis_allocations(
             ..Default::default()
         });
         acct.is_witness = true;
-        accounts.put(&addr, &acct);
+        accounts.put(&addr, &acct)?;
 
         let witness = Witness {
             address: w.address.to_vec(),
@@ -2522,8 +2566,9 @@ pub fn apply_genesis_allocations(
             is_jobs: true,
             pub_key: Vec::new(),
         };
-        witnesses_store.put(&addr, &witness);
+        witnesses_store.put(&addr, &witness)?;
     }
+    Ok(())
 }
 
 // =============================================================================

@@ -59,7 +59,7 @@ fn put_account(ctx: &Ctx, who: [u8; 21]) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn put_witness(ctx: &Ctx, who: [u8; 21]) {
@@ -71,7 +71,7 @@ fn put_witness(ctx: &Ctx, who: [u8; 21]) {
             url: "https://example.test".into(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn one_param() -> BTreeMap<i64, i64> {
@@ -168,7 +168,7 @@ fn seed_proposal(ctx: &Ctx, id: i64, proposer: [u8; 21], expire_at: i64) {
             approvals: Vec::new(),
             state: ProposalState::Pending as i32,
         },
-    );
+    ).unwrap();
     ctx.dp.put_long(dynamic_properties_keys::LATEST_PROPOSAL_NUM, id);
 }
 
@@ -269,7 +269,7 @@ fn approve_rejects_canceled_proposal() {
         state: ProposalState::Canceled as i32,
     };
     p.state = ProposalState::Canceled as i32;
-    ctx.proposals.put(1, &p);
+    ctx.proposals.put(1, &p).unwrap();
     ctx.dp.put_long(dynamic_properties_keys::LATEST_PROPOSAL_NUM, 1);
     let c = ProposalApproveContract {
         owner_address: ALICE.to_vec(),
@@ -466,7 +466,7 @@ fn delete_rejects_already_canceled_proposal() {
         approvals: Vec::new(),
         state: ProposalState::Canceled as i32,
     };
-    ctx.proposals.put(1, &p);
+    ctx.proposals.put(1, &p).unwrap();
     ctx.dp.put_long(dynamic_properties_keys::LATEST_PROPOSAL_NUM, 1);
     let c = ProposalDeleteContract {
         owner_address: ALICE.to_vec(),

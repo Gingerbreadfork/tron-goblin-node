@@ -64,7 +64,7 @@ fn seed_issuer_with_asset(
         total_supply: 1_000_000_000,
         ..Default::default()
     };
-    ctx.v1.put(ASSET_NAME, &asset);
+    ctx.v1.put(ASSET_NAME, &asset).unwrap();
     ctx.accounts.put(
         &addr(ISSUER),
         &Account {
@@ -75,7 +75,7 @@ fn seed_issuer_with_asset(
             asset_v2: BTreeMap::from([("TestCoin".to_string(), issuer_asset_balance)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn put_owner(ctx: &Ctx, trx_balance: i64) {
@@ -87,7 +87,7 @@ fn put_owner(ctx: &Ctx, trx_balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn base_contract(amount: i64) -> ParticipateAssetIssueContract {
@@ -312,7 +312,7 @@ fn execute_rejects_when_to_account_missing() {
         total_supply: 1_000_000_000,
         ..Default::default()
     };
-    ctx.v1.put(ASSET_NAME, &asset_record);
+    ctx.v1.put(ASSET_NAME, &asset_record).unwrap();
     let c = base_contract(100);
     // Validate passes (it doesn't load the to-account record).
     asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();

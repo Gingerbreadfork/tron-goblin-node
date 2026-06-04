@@ -91,9 +91,20 @@ impl DelegationStore {
     }
 
     // -------------------- Reward (i64) --------------------------------
+    //
+    // The reward/vote/brokerage getters return primitives directly, not
+    // `Result`. They're called from per-block reward accounting in many
+    // places. Backend IO failures panic with rich context so triage is
+    // unambiguous — see [`super::dynamic_properties_store`] for the same
+    // pattern rationale.
 
     pub fn get_reward(&self, cycle: i64, address: &Address) -> i64 {
-        match self.backend.get(&Self::reward_key(cycle, address)) {
+        let key = Self::reward_key(cycle, address);
+        match self
+            .backend
+            .get(&key)
+            .unwrap_or_else(|e| panic!("delegation store: failed to read reward key: {e}"))
+        {
             Some(bytes) => parse_long_permissive(&bytes),
             None => 0,
         }
@@ -103,11 +114,17 @@ impl DelegationStore {
     /// `DelegationStore.addReward`.
     pub fn add_reward(&self, cycle: i64, address: &Address, value: i64) {
         let key = Self::reward_key(cycle, address);
-        let new_total = match self.backend.get(&key) {
+        let new_total = match self
+            .backend
+            .get(&key)
+            .unwrap_or_else(|e| panic!("delegation store: failed to read reward key: {e}"))
+        {
             Some(bytes) => parse_long_permissive(&bytes).wrapping_add(value),
             None => value,
         };
-        self.backend.put(&key, &new_total.to_be_bytes());
+        self.backend
+            .put(&key, &new_total.to_be_bytes())
+            .unwrap_or_else(|e| panic!("delegation store: failed to write reward key: {e}"));
     }
 
     // -------------------- Witness vote (i64) --------------------------
@@ -115,7 +132,12 @@ impl DelegationStore {
     /// Returns [`REMARK`] (`-1`) when the entry is missing — matches
     /// java-tron's sentinel semantics.
     pub fn get_witness_vote(&self, cycle: i64, address: &Address) -> i64 {
-        match self.backend.get(&Self::vote_key(cycle, address)) {
+        let key = Self::vote_key(cycle, address);
+        match self
+            .backend
+            .get(&key)
+            .unwrap_or_else(|e| panic!("delegation store: failed to read vote key: {e}"))
+        {
             Some(bytes) => parse_long_permissive(&bytes),
             None => REMARK,
         }
@@ -123,13 +145,18 @@ impl DelegationStore {
 
     pub fn set_witness_vote(&self, cycle: i64, address: &Address, value: i64) {
         self.backend
-            .put(&Self::vote_key(cycle, address), &value.to_be_bytes());
+            .put(&Self::vote_key(cycle, address), &value.to_be_bytes())
+            .unwrap_or_else(|e| panic!("delegation store: failed to write vote key: {e}"));
     }
 
     // -------------------- Begin / end cycle ---------------------------
 
     pub fn get_begin_cycle(&self, address: &Address) -> i64 {
-        match self.backend.get(&Self::begin_cycle_key(address)) {
+        match self
+            .backend
+            .get(&Self::begin_cycle_key(address))
+            .unwrap_or_else(|e| panic!("delegation store: failed to read begin_cycle key: {e}"))
+        {
             Some(bytes) => parse_long_permissive(&bytes),
             None => 0,
         }
@@ -137,12 +164,17 @@ impl DelegationStore {
 
     pub fn set_begin_cycle(&self, address: &Address, number: i64) {
         self.backend
-            .put(&Self::begin_cycle_key(address), &number.to_be_bytes());
+            .put(&Self::begin_cycle_key(address), &number.to_be_bytes())
+            .unwrap_or_else(|e| panic!("delegation store: failed to write begin_cycle key: {e}"));
     }
 
     /// Returns [`REMARK`] (`-1`) when absent.
     pub fn get_end_cycle(&self, address: &Address) -> i64 {
-        match self.backend.get(&Self::end_cycle_key(address)) {
+        match self
+            .backend
+            .get(&Self::end_cycle_key(address))
+            .unwrap_or_else(|e| panic!("delegation store: failed to read end_cycle key: {e}"))
+        {
             Some(bytes) => parse_long_permissive(&bytes),
             None => REMARK,
         }
@@ -150,14 +182,19 @@ impl DelegationStore {
 
     pub fn set_end_cycle(&self, address: &Address, number: i64) {
         self.backend
-            .put(&Self::end_cycle_key(address), &number.to_be_bytes());
+            .put(&Self::end_cycle_key(address), &number.to_be_bytes())
+            .unwrap_or_else(|e| panic!("delegation store: failed to write end_cycle key: {e}"));
     }
 
     // -------------------- Brokerage (i32) -----------------------------
 
     /// Returns [`DEFAULT_BROKERAGE`] (`20`) when absent.
     pub fn get_brokerage(&self, cycle: i64, address: &Address) -> i32 {
-        match self.backend.get(&Self::brokerage_key(cycle, address)) {
+        match self
+            .backend
+            .get(&Self::brokerage_key(cycle, address))
+            .unwrap_or_else(|e| panic!("delegation store: failed to read brokerage key: {e}"))
+        {
             Some(bytes) => parse_int_permissive(&bytes),
             None => DEFAULT_BROKERAGE,
         }
@@ -165,7 +202,8 @@ impl DelegationStore {
 
     pub fn set_brokerage(&self, cycle: i64, address: &Address, brokerage: i32) {
         self.backend
-            .put(&Self::brokerage_key(cycle, address), &brokerage.to_be_bytes());
+            .put(&Self::brokerage_key(cycle, address), &brokerage.to_be_bytes())
+            .unwrap_or_else(|e| panic!("delegation store: failed to write brokerage key: {e}"));
     }
 
     /// Convenience: `setBrokerage(address, b)` uses `cycle = -1`.
@@ -185,11 +223,15 @@ impl DelegationStore {
     // layer that knows it's a bigint.
 
     pub fn get_witness_vi_raw(&self, cycle: i64, address: &Address) -> Option<Vec<u8>> {
-        self.backend.get(&Self::vi_key(cycle, address))
+        self.backend
+            .get(&Self::vi_key(cycle, address))
+            .unwrap_or_else(|e| panic!("delegation store: failed to read vi key: {e}"))
     }
 
     pub fn set_witness_vi_raw(&self, cycle: i64, address: &Address, value: &[u8]) {
-        self.backend.put(&Self::vi_key(cycle, address), value);
+        self.backend
+            .put(&Self::vi_key(cycle, address), value)
+            .unwrap_or_else(|e| panic!("delegation store: failed to write vi key: {e}"));
     }
 
     // -------------------- Account vote --------------------------------
@@ -199,15 +241,16 @@ impl DelegationStore {
         cycle: i64,
         address: &Address,
     ) -> Result<Option<Account>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::account_vote_key(cycle, address)) else {
+        let Some(bytes) = self.backend.get(&Self::account_vote_key(cycle, address))? else {
             return Ok(None);
         };
         Ok(Some(Account::decode(bytes.as_slice())?))
     }
 
-    pub fn set_account_vote(&self, cycle: i64, address: &Address, account: &Account) {
+    pub fn set_account_vote(&self, cycle: i64, address: &Address, account: &Account) -> Result<(), StoreError> {
         self.backend
-            .put(&Self::account_vote_key(cycle, address), &account.encode_to_vec());
+            .put(&Self::account_vote_key(cycle, address), &account.encode_to_vec())?;
+        Ok(())
     }
 }
 

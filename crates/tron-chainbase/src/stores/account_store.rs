@@ -27,13 +27,14 @@ impl AccountStore {
         Self { backend }
     }
 
-    pub fn put(&self, address: &Address, account: &Account) {
-        self.backend.put(address.as_bytes(), &account.encode_to_vec());
+    pub fn put(&self, address: &Address, account: &Account) -> Result<(), StoreError> {
+        self.backend.put(address.as_bytes(), &account.encode_to_vec())?;
+        Ok(())
     }
 
     /// Read by `Address`. `None` if absent.
     pub fn get(&self, address: &Address) -> Result<Option<Account>, StoreError> {
-        let Some(bytes) = self.backend.get(address.as_bytes()) else {
+        let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(Account::decode(bytes.as_slice())?))
@@ -48,17 +49,18 @@ impl AccountStore {
                 expected: ADDRESS_LENGTH,
             });
         }
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         Ok(Some(Account::decode(bytes.as_slice())?))
     }
 
-    pub fn contains(&self, address: &Address) -> bool {
-        self.backend.contains(address.as_bytes())
+    pub fn contains(&self, address: &Address) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(address.as_bytes())?)
     }
 
-    pub fn delete(&self, address: &Address) {
-        self.backend.delete(address.as_bytes());
+    pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
+        self.backend.delete(address.as_bytes())?;
+        Ok(())
     }
 }

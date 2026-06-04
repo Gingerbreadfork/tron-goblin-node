@@ -527,7 +527,7 @@ pub fn import_live(
         let store_name_for_err = name.clone();
         src.for_each(|k, v| {
             bytes_for_store += k.len() as u64 + v.len() as u64;
-            dst.put(k, v);
+            dst.put(k, v).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             Ok(())
         })
         .map_err(|e| ImportError::LiveScan {
@@ -708,8 +708,8 @@ mod tests {
             let inputs = mainnet_inputs();
             let block = build_genesis_block(&inputs);
             let id = genesis_block_id(&inputs);
-            BlockStore::new(stores.blocks.clone()).put(&id, &block);
-            BlockIndexStore::new(stores.block_index.clone()).put(&id);
+            BlockStore::new(stores.blocks.clone()).put(&id, &block).unwrap();
+            BlockIndexStore::new(stores.block_index.clone()).put(&id).unwrap();
             dp.save_latest_block_header_number(0);
             dp.save_latest_block_header_hash(id.as_bytes());
             // Apply allocations so witness_count > 0.
@@ -718,7 +718,7 @@ mod tests {
                 &state,
                 inputs.assets,
                 tron_types::mainnet_witnesses(),
-            );
+            ).unwrap();
         }
         // Drop the stores so RocksDB releases its locks before we copy.
         drop(stores);

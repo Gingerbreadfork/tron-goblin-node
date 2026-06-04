@@ -80,7 +80,7 @@ fn seed_alice(state: &StateBackends) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 /// Build a signed transfer tx from a deterministic owner derived from

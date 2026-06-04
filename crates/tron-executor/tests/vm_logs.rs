@@ -111,7 +111,7 @@ fn install_contract(state: &StateBackends, addr: [u8; 21], bytecode: &[u8]) {
     let accounts = AccountStore::new(state.accounts.clone());
     let code = CodeStore::new(state.code.as_ref().unwrap().clone());
     let hash = tron_crypto::hash::keccak256(bytecode);
-    code.put(&hash, bytecode);
+    code.put(&hash, bytecode).unwrap();
     accounts.put(
         &Address::from_raw(addr),
         &Account {
@@ -121,7 +121,7 @@ fn install_contract(state: &StateBackends, addr: [u8; 21], bytecode: &[u8]) {
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn install_caller(state: &StateBackends, addr: [u8; 21]) {
@@ -132,7 +132,7 @@ fn install_caller(state: &StateBackends, addr: [u8; 21]) {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn build_trigger_tx(

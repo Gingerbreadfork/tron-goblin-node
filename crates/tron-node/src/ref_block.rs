@@ -286,7 +286,7 @@ mod tests {
         // -65525, which is outside the window AND not in the index.
         let bi = mem();
         let bi_store = BlockIndexStore::new(bi.clone());
-        bi_store.put(&synthetic_block_id(5, 0xaa));
+        bi_store.put(&synthetic_block_id(5, 0xaa)).unwrap();
 
         let raw = raw_with(vec![0xFF, 0xFF], vec![0u8; 8]);
         let err = validate_ref_block(&raw, 10, &bi).unwrap_err();
@@ -298,7 +298,7 @@ mod tests {
         let bi = mem();
         let bi_store = BlockIndexStore::new(bi.clone());
         let real_block = synthetic_block_id(10, 0xaa);
-        bi_store.put(&real_block);
+        bi_store.put(&real_block).unwrap();
 
         // Same low-16 (10) but a wrong hash.
         let raw = raw_with(vec![0x00, 0x0a], vec![0xff; 8]);
@@ -318,7 +318,7 @@ mod tests {
         let bi = mem();
         let bi_store = BlockIndexStore::new(bi.clone());
         let real_block = synthetic_block_id(42, 0xcc);
-        bi_store.put(&real_block);
+        bi_store.put(&real_block).unwrap();
 
         let expected_hash = real_block.as_bytes()[8..16].to_vec();
         let raw = raw_with(vec![0x00, 0x2a], expected_hash);
@@ -333,7 +333,7 @@ mod tests {
         let bi = mem();
         let bi_store = BlockIndexStore::new(bi.clone());
         let genesis = synthetic_block_id(0, 0x00);
-        bi_store.put(&genesis);
+        bi_store.put(&genesis).unwrap();
 
         let expected = genesis.as_bytes()[8..16].to_vec();
         let raw = raw_with(vec![0x00, 0x00], expected);
@@ -346,7 +346,7 @@ mod tests {
         // 65_536 blocks back, which is `>= REF_BLOCK_WINDOW` → reject.
         let bi = mem();
         let bi_store = BlockIndexStore::new(bi.clone());
-        bi_store.put(&synthetic_block_id(0, 0x00));
+        bi_store.put(&synthetic_block_id(0, 0x00)).unwrap();
 
         let raw = raw_with(vec![0x00, 0x00], vec![0u8; 8]);
         let err = validate_ref_block(&raw, 65_536, &bi).unwrap_err();

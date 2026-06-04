@@ -67,14 +67,14 @@ fn install_contract_with_balance(
     };
     if !bytecode.is_empty() {
         let hash = code_hash(bytecode);
-        stores.code.put(hash.as_slice(), bytecode);
+        stores.code.put(hash.as_slice(), bytecode).unwrap();
         acct.code = bytecode.to_vec();
         acct.code_hash = hash.as_slice().to_vec();
     }
     if asset_id != 0 {
         acct.asset_v2.insert(asset_id.to_string(), asset_balance);
     }
-    stores.accounts.put(&Address::from_raw(addr), &acct);
+    stores.accounts.put(&Address::from_raw(addr), &acct).unwrap();
 }
 
 /// Push a U256 onto the EVM stack: PUSH32 followed by 32 bytes.
@@ -151,7 +151,7 @@ fn calltoken_transfers_trc10_and_callee_reads_token_data() {
     acct.asset_v2.insert(token_id.to_string(), initial_balance);
     stores
         .accounts
-        .put(&Address::from_raw(caller_user), &acct);
+        .put(&Address::from_raw(caller_user), &acct).unwrap();
 
     install_contract_with_balance(
         &stores,
@@ -222,20 +222,22 @@ fn calltoken_transfers_trc10_and_callee_reads_token_data() {
     };
     let slot1_key = StorageRowStore::compose_key(&Address::from_raw(receiver_contract), &slot1_bytes);
 
-    let slot0 = stores.storage.get(&slot0_key).expect("slot 0 missing");
-    let slot1 = stores.storage.get(&slot1_key).expect("slot 1 missing");
+    let slot0 = stores.storage.get(&slot0_key).unwrap().expect("slot 0 missing");
+    let slot1 = stores.storage.get(&slot1_key).unwrap().expect("slot 1 missing");
 
     let mut expected_value = [0u8; 32];
     expected_value[24..].copy_from_slice(&(transfer_amount as u64).to_be_bytes());
     assert_eq!(
-        slot0, expected_value,
+        slot0.as_slice(),
+        expected_value.as_slice(),
         "CALLTOKENVALUE inside callee should equal transferred amount"
     );
 
     let mut expected_id = [0u8; 32];
     expected_id[24..].copy_from_slice(&(token_id as u64).to_be_bytes());
     assert_eq!(
-        slot1, expected_id,
+        slot1.as_slice(),
+        expected_id.as_slice(),
         "CALLTOKENID inside callee should equal token id"
     );
 }
@@ -262,7 +264,7 @@ fn calltoken_unwinds_trc10_transfer_when_callee_reverts() {
         ..Default::default()
     };
     acct.asset_v2.insert(token_id.to_string(), initial_balance);
-    stores.accounts.put(&Address::from_raw(caller_user), &acct);
+    stores.accounts.put(&Address::from_raw(caller_user), &acct).unwrap();
 
     install_contract_with_balance(
         &stores,

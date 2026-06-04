@@ -10,14 +10,14 @@ use tron_chainbase::{
     dynamic_properties_keys as dp_keys, AccountStore, BlockIndexStore, BlockStore,
     DelegatedResourceAccountIndexStore, DelegatedResourceStore, DelegationStore,
     DynamicPropertiesStore, KvBackend, MemBackend, RocksDbBackend, StoreError, StoredTransaction,
-    TransactionStore, WitnessStore, DEFAULT_BROKERAGE, REMARK, V1_FROM_PREFIX, V1_TO_PREFIX,
-    V2_FROM_PREFIX, V2_PREFIX_LOCKED, V2_PREFIX_UNLOCKED, V2_TO_PREFIX,
+    TransactionStore, VotesStore, WitnessStore, DEFAULT_BROKERAGE, REMARK, V1_FROM_PREFIX,
+    V1_TO_PREFIX, V2_FROM_PREFIX, V2_PREFIX_LOCKED, V2_PREFIX_UNLOCKED, V2_TO_PREFIX,
 };
 use tron_crypto::address::Address;
 use tron_proto::block_header::Raw as BlockHeaderRaw;
 use tron_proto::transaction::contract::ContractType;
 use tron_proto::transaction::{Contract, Raw as TxRaw};
-use tron_proto::{Account, Block, BlockHeader, Transaction, TransferContract, Witness};
+use tron_proto::{Account, Block, BlockHeader, Transaction, TransferContract, Votes, Witness};
 use tron_types::{block_id_from_block, tx_id};
 
 fn mem() -> Arc<MemBackend> {
@@ -87,11 +87,11 @@ fn block_store_put_get_round_trip() {
 
     let block = sample_block(100);
     let id = block_id_from_block(&block).unwrap();
-    store.put(&id, &block);
+    store.put(&id, &block).unwrap();
 
     let got = store.get(&id).unwrap();
     assert_eq!(got, block);
-    assert!(store.contains(&id));
+    assert!(store.contains(&id).unwrap());
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn block_index_store_round_trips_block_id() {
 
     let block = sample_block(12345);
     let id = block_id_from_block(&block).unwrap();
-    store.put(&id);
+    store.put(&id).unwrap();
 
     let got = store.get(12345).unwrap();
     assert_eq!(got, id);
@@ -141,7 +141,7 @@ fn block_index_store_round_trips_block_id() {
 #[test]
 fn block_index_store_value_must_be_32_bytes() {
     let backend = mem();
-    backend.put(&BlockIndexStore::key_for(7), &[1, 2, 3]); // wrong length
+    backend.put(&BlockIndexStore::key_for(7), &[1, 2, 3]).unwrap(); // wrong length
     let store = BlockIndexStore::new(backend as Arc<_>);
     assert!(matches!(
         store.get(7),
@@ -158,7 +158,7 @@ fn transaction_store_block_ref_round_trip() {
 
     let tx = sample_transaction(1_000_000);
     let id = tx_id(&tx).unwrap();
-    store.put_block_ref(&id, 12345);
+    store.put_block_ref(&id, 12345).unwrap();
 
     match store.get(&id).unwrap().unwrap() {
         StoredTransaction::BlockRef(n) => assert_eq!(n, 12345),
@@ -174,7 +174,7 @@ fn transaction_store_full_round_trip() {
 
     let tx = sample_transaction(2_000_000);
     let id = tx_id(&tx).unwrap();
-    store.put_full(&id, &tx);
+    store.put_full(&id, &tx).unwrap();
 
     match store.get(&id).unwrap().unwrap() {
         StoredTransaction::Full(got) => assert_eq!(got, tx),
@@ -218,11 +218,11 @@ fn account_store_round_trip() {
         address: addr_bytes.to_vec(),
         ..Default::default()
     };
-    store.put(&addr, &account);
+    store.put(&addr, &account).unwrap();
 
     let got = store.get(&addr).unwrap().unwrap();
     assert_eq!(got, account);
-    assert!(store.contains(&addr));
+    assert!(store.contains(&addr).unwrap());
 }
 
 #[test]
@@ -286,7 +286,7 @@ fn dynamic_properties_long_writes_8_bytes_big_endian() {
     let backend = mem();
     let store = DynamicPropertiesStore::new(backend.clone() as Arc<_>);
     store.save_latest_block_header_number(0x0102030405060708);
-    let raw = backend.get(dp_keys::LATEST_BLOCK_HEADER_NUMBER).unwrap();
+    let raw = backend.get(dp_keys::LATEST_BLOCK_HEADER_NUMBER).unwrap().unwrap();
     assert_eq!(raw, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
 }
 
@@ -295,7 +295,7 @@ fn dynamic_properties_long_reader_is_permissive_about_length() {
     // Matches java-tron's `ByteArray.toLong` which accepts any non-empty
     // byte slice. Hand-craft a 3-byte value at the long-formatted key.
     let backend = mem();
-    backend.put(dp_keys::LATEST_PROPOSAL_NUM, &[0x12, 0x34, 0x56]);
+    backend.put(dp_keys::LATEST_PROPOSAL_NUM, &[0x12, 0x34, 0x56]).unwrap();
     let store = DynamicPropertiesStore::new(backend as Arc<_>);
     // Java parses `[0x12, 0x34, 0x56]` as unsigned BigInteger = 0x123456 =
     // 1_193_046, then `longValue()` returns 1_193_046 as a signed long.
@@ -305,7 +305,7 @@ fn dynamic_properties_long_reader_is_permissive_about_length() {
 #[test]
 fn dynamic_properties_long_empty_value_reads_as_zero() {
     let backend = mem();
-    backend.put(dp_keys::LATEST_PROPOSAL_NUM, &[]);
+    backend.put(dp_keys::LATEST_PROPOSAL_NUM, &[]).unwrap();
     let store = DynamicPropertiesStore::new(backend as Arc<_>);
     assert_eq!(store.get_long(dp_keys::LATEST_PROPOSAL_NUM), Some(0));
 }
@@ -322,7 +322,7 @@ fn dynamic_properties_hash_round_trip() {
 #[test]
 fn dynamic_properties_hash_rejects_wrong_length() {
     let backend = mem();
-    backend.put(dp_keys::LATEST_BLOCK_HEADER_HASH, &[0u8; 16]); // half-size
+    backend.put(dp_keys::LATEST_BLOCK_HEADER_HASH, &[0u8; 16]).unwrap(); // half-size
     let store = DynamicPropertiesStore::new(backend as Arc<_>);
     assert!(matches!(
         store.latest_block_header_hash(),
@@ -518,7 +518,7 @@ fn delegated_resource_store_round_trip() {
         expire_time_for_energy: 0,
     };
     let key = DelegatedResourceStore::v2_unlocked_key(&addr_a(), &addr_b());
-    store.put_raw(&key, &resource);
+    store.put_raw(&key, &resource).unwrap();
     let got = store.get_raw(&key).unwrap().unwrap();
     assert_eq!(got, resource);
 }
@@ -605,13 +605,13 @@ fn rocks_tempdir() -> std::path::PathBuf {
 fn rocksdb_backend_round_trips_arbitrary_bytes() {
     let dir = rocks_tempdir();
     let backend = RocksDbBackend::open(&dir).unwrap();
-    backend.put(b"alpha", b"one");
-    backend.put(b"beta", b"two");
-    assert_eq!(backend.get(b"alpha"), Some(b"one".to_vec()));
-    assert_eq!(backend.get(b"beta"), Some(b"two".to_vec()));
-    assert_eq!(backend.get(b"missing"), None);
-    backend.delete(b"alpha");
-    assert_eq!(backend.get(b"alpha"), None);
+    backend.put(b"alpha", b"one").unwrap();
+    backend.put(b"beta", b"two").unwrap();
+    assert_eq!(backend.get(b"alpha").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(backend.get(b"beta").unwrap(), Some(b"two".to_vec()));
+    assert_eq!(backend.get(b"missing").unwrap(), None);
+    backend.delete(b"alpha").unwrap();
+    assert_eq!(backend.get(b"alpha").unwrap(), None);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -630,11 +630,11 @@ fn rocksdb_backend_drives_a_store_byte_for_byte_like_mem() {
 
     let block = sample_block(42);
     let id = tron_types::block_id_from_block(&block).unwrap();
-    rocks_store.put(&id, &block);
-    mem_store.put(&id, &block);
+    rocks_store.put(&id, &block).unwrap();
+    mem_store.put(&id, &block).unwrap();
 
-    let rocks_raw = rocks.get(id.as_bytes()).unwrap();
-    let mem_raw = mem.get(id.as_bytes()).unwrap();
+    let rocks_raw = rocks.get(id.as_bytes()).unwrap().unwrap();
+    let mem_raw = mem.get(id.as_bytes()).unwrap().unwrap();
     assert_eq!(
         rocks_raw, mem_raw,
         "RocksDb and Mem backends must produce identical raw value bytes"
@@ -648,9 +648,9 @@ fn rocksdb_backend_iterates_in_lex_order() {
     let dir = rocks_tempdir();
     let backend = RocksDbBackend::open(&dir).unwrap();
     // Insert in non-sorted order; iteration must yield ascending bytes.
-    backend.put(b"\x03", b"c");
-    backend.put(b"\x01", b"a");
-    backend.put(b"\x02", b"b");
+    backend.put(b"\x03", b"c").unwrap();
+    backend.put(b"\x01", b"a").unwrap();
+    backend.put(b"\x02", b"b").unwrap();
 
     let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     backend
@@ -685,7 +685,7 @@ fn rocksdb_keys_sort_compatibly_with_block_index_store() {
     let mut ids = Vec::new();
     for b in &blocks {
         let id = tron_types::block_id_from_block(b).unwrap();
-        index.put(&id);
+        index.put(&id).unwrap();
         ids.push(id);
     }
     // Re-read each in ascending num order.
@@ -714,7 +714,7 @@ fn witness_store_round_trip() {
         latest_slot_num: 998,
         is_jobs: true,
     };
-    store.put(&addr, &witness);
+    store.put(&addr, &witness).unwrap();
 
     let got = store.get(&addr).unwrap().unwrap();
     assert_eq!(got, witness);
@@ -735,7 +735,7 @@ fn witness_store_all_returns_every_registered_witness() {
             vote_count: 100,
             ..Default::default()
         },
-    );
+    ).unwrap();
     store.put(
         &b,
         &Witness {
@@ -743,7 +743,7 @@ fn witness_store_all_returns_every_registered_witness() {
             vote_count: 200,
             ..Default::default()
         },
-    );
+    ).unwrap();
     store.put(
         &c,
         &Witness {
@@ -751,7 +751,7 @@ fn witness_store_all_returns_every_registered_witness() {
             vote_count: 300,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let all = store.all().unwrap();
     assert_eq!(all.len(), 3);
@@ -761,6 +761,86 @@ fn witness_store_all_returns_every_registered_witness() {
     assert_eq!(all[2].0, c);
     let sum: i64 = all.iter().map(|(_, w)| w.vote_count).sum();
     assert_eq!(sum, 600);
+}
+
+// C-8 regression tests: a malformed row in a consensus store must be
+// logged-and-skipped (java-tron parity) — never silently dropped without
+// trace, never panicked, never propagated as an error that wedges the
+// whole maintenance walk. We assert the *behaviour* (good rows survive,
+// bad row is skipped, no panic/Err); the `tracing::error!` side-effect
+// is verified by reading the code, not captured here.
+
+#[test]
+fn witness_store_all_skips_malformed_key_row() {
+    let backend = mem();
+    let raw = backend.clone();
+    let store = WitnessStore::new(backend as Arc<_>);
+
+    let good = Address::from_raw(hex!("41a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"));
+    store
+        .put(
+            &good,
+            &Witness {
+                address: good.as_bytes().to_vec(),
+                vote_count: 42,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Inject a row with a non-address (5-byte) key straight through the
+    // backend, bypassing the typed `put`.
+    raw.put(b"short", &Witness::default().encode_to_vec()).unwrap();
+
+    let all = store.all().unwrap();
+    assert_eq!(all.len(), 1, "malformed-key row must be skipped");
+    assert_eq!(all[0].0, good);
+    assert_eq!(all[0].1.vote_count, 42);
+}
+
+#[test]
+fn votes_store_all_skips_malformed_key_and_undecodable_value() {
+    let backend = mem();
+    let raw = backend.clone();
+    let store = VotesStore::new(backend as Arc<_>);
+
+    let good = Address::from_raw(hex!("41b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"));
+    let votes = Votes {
+        address: good.as_bytes().to_vec(),
+        old_votes: Vec::new(),
+        new_votes: Vec::new(),
+    };
+    store.put(&good, &votes).unwrap();
+    // (1) non-address key, (2) valid 21-byte key but value isn't a Votes proto.
+    raw.put(b"x", &votes.encode_to_vec()).unwrap();
+    let bad_addr = hex!("41c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3");
+    raw.put(&bad_addr, b"\xff\xff not-a-votes-proto").unwrap();
+
+    let all = store.all().unwrap();
+    assert_eq!(all.len(), 1, "both malformed rows must be skipped");
+    assert_eq!(all[0].0, good);
+}
+
+#[test]
+fn block_store_get_limit_number_skips_undecodable_block() {
+    let backend = mem();
+    let raw = backend.clone();
+    let store = BlockStore::new(backend as Arc<_>);
+
+    // Two real blocks at num 5 and 7; a corrupt value at num 6's key slot.
+    for n in [5i64, 7] {
+        let blk = sample_block(n);
+        store.put(&block_id_from_block(&blk).unwrap(), &blk).unwrap();
+    }
+    let mut key6 = [0u8; 32];
+    key6[..8].copy_from_slice(&6i64.to_be_bytes());
+    raw.put(&key6, b"not-a-block").unwrap();
+
+    let got = store.get_limit_number(5, 10).unwrap();
+    let nums: Vec<i64> = got
+        .iter()
+        .map(|b| b.block_header.as_ref().unwrap().raw_data.as_ref().unwrap().number)
+        .collect();
+    assert_eq!(nums, vec![5, 7], "undecodable block row must be skipped");
 }
 
 #[test]
@@ -778,13 +858,13 @@ fn rocksdb_write_batch_sync_produces_same_state_as_write_batch() {
         WriteOp::Delete(b"c".to_vec()), // tombstone on never-existed
         WriteOp::Put(b"d".to_vec(), vec![0u8; 4096]),
     ];
-    async_be.write_batch(&ops);
-    sync_be.write_batch_sync(&ops);
+    async_be.write_batch(&ops).unwrap();
+    sync_be.write_batch_sync(&ops).unwrap();
 
-    assert_eq!(async_be.scan_all(), sync_be.scan_all());
+    assert_eq!(async_be.scan_all().unwrap(), sync_be.scan_all().unwrap());
     // Both should see the writes:
-    assert_eq!(sync_be.get(b"a"), Some(b"1".to_vec()));
-    assert_eq!(sync_be.get(b"d"), Some(vec![0u8; 4096]));
+    assert_eq!(sync_be.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(sync_be.get(b"d").unwrap(), Some(vec![0u8; 4096]));
 
     std::fs::remove_dir_all(&async_dir).ok();
     std::fs::remove_dir_all(&sync_dir).ok();
@@ -794,9 +874,9 @@ fn rocksdb_write_batch_sync_produces_same_state_as_write_batch() {
 fn rocksdb_write_batch_sync_empty_ops_is_noop() {
     let dir = rocks_tempdir();
     let be = RocksDbBackend::open(&dir).unwrap();
-    be.put(b"k", b"v");
-    be.write_batch_sync(&[]);
-    assert_eq!(be.get(b"k"), Some(b"v".to_vec()));
+    be.put(b"k", b"v").unwrap();
+    be.write_batch_sync(&[]).unwrap();
+    assert_eq!(be.get(b"k").unwrap(), Some(b"v".to_vec()));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -809,12 +889,12 @@ fn rocksdb_paranoid_checks_does_not_change_happy_path_behavior() {
     let dir = rocks_tempdir();
     {
         let be = RocksDbBackend::open(&dir).unwrap();
-        be.put(b"alpha", b"1");
-        be.put(b"beta", b"2");
+        be.put(b"alpha", b"1").unwrap();
+        be.put(b"beta", b"2").unwrap();
     }
     // Re-open: paranoid_checks should NOT reject a clean DB.
     let be = RocksDbBackend::open(&dir).unwrap();
-    assert_eq!(be.get(b"alpha"), Some(b"1".to_vec()));
-    assert_eq!(be.get(b"beta"), Some(b"2".to_vec()));
+    assert_eq!(be.get(b"alpha").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(be.get(b"beta").unwrap(), Some(b"2".to_vec()));
     std::fs::remove_dir_all(&dir).ok();
 }

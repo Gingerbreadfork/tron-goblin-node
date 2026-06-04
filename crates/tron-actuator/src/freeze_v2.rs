@@ -99,7 +99,7 @@ pub fn execute_freeze_balance_v2(
             amount: contract.frozen_balance,
         }),
     }
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     // Update chain-wide TOTAL_*_WEIGHT — mirrors java-tron's
     // `FreezeBalanceV2Actuator.execute`:
@@ -198,7 +198,7 @@ pub fn execute_unfreeze_balance_v2(
         unfreeze_amount: contract.unfreeze_balance,
         unfreeze_expire_time: withdraw_expire,
     });
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     // Shrink chain-wide weight by the freed amount. Java-tron:
     //   newWeight = (oldFrozen - unfreezeBalance) / TRX_PRECISION
@@ -256,7 +256,7 @@ pub fn execute_withdraw_expire_unfreeze(
         }
     });
     account.balance = check_add(account.balance, withdrawn)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
     Ok(ExecutionResult::default())
 }
 
@@ -341,7 +341,7 @@ pub fn execute_cancel_all_unfreeze_v2(
             }
         }
     }
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     // Bump chain-wide weight for any restored entries.
     let net_delta = (old_net + restored_net) / TRX_PRECISION - old_net / TRX_PRECISION;

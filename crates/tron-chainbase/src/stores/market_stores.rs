@@ -36,12 +36,13 @@ impl MarketAccountStore {
         Self { backend }
     }
 
-    pub fn put(&self, owner: &Address, order: &MarketAccountOrder) {
-        self.backend.put(owner.as_bytes(), &order.encode_to_vec());
+    pub fn put(&self, owner: &Address, order: &MarketAccountOrder) -> Result<(), StoreError> {
+        self.backend.put(owner.as_bytes(), &order.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, owner: &Address) -> Result<Option<MarketAccountOrder>, StoreError> {
-        let Some(bytes) = self.backend.get(owner.as_bytes()) else {
+        let Some(bytes) = self.backend.get(owner.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(MarketAccountOrder::decode(bytes.as_slice())?))
@@ -64,19 +65,21 @@ impl MarketOrderStore {
         Self { backend }
     }
 
-    pub fn put(&self, order_id: &[u8], order: &MarketOrder) {
-        self.backend.put(order_id, &order.encode_to_vec());
+    pub fn put(&self, order_id: &[u8], order: &MarketOrder) -> Result<(), StoreError> {
+        self.backend.put(order_id, &order.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, order_id: &[u8]) -> Result<Option<MarketOrder>, StoreError> {
-        let Some(bytes) = self.backend.get(order_id) else {
+        let Some(bytes) = self.backend.get(order_id)? else {
             return Ok(None);
         };
         Ok(Some(MarketOrder::decode(bytes.as_slice())?))
     }
 
-    pub fn delete(&self, order_id: &[u8]) {
-        self.backend.delete(order_id);
+    pub fn delete(&self, order_id: &[u8]) -> Result<(), StoreError> {
+        self.backend.delete(order_id)?;
+        Ok(())
     }
 }
 
@@ -98,12 +101,13 @@ impl MarketPairPriceToOrderStore {
         Self { backend }
     }
 
-    pub fn put(&self, key: &[u8], list: &MarketOrderIdList) {
-        self.backend.put(key, &list.encode_to_vec());
+    pub fn put(&self, key: &[u8], list: &MarketOrderIdList) -> Result<(), StoreError> {
+        self.backend.put(key, &list.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<MarketOrderIdList>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         Ok(Some(MarketOrderIdList::decode(bytes.as_slice())?))
@@ -126,7 +130,7 @@ impl MarketPairPriceToOrderStore {
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, MarketOrderIdList)>, StoreError> {
         self.backend
-            .scan_prefix(prefix)
+            .scan_prefix(prefix)?
             .into_iter()
             .map(|(k, v)| {
                 MarketOrderIdList::decode(v.as_slice()).map(|list| (k, list))
@@ -154,12 +158,13 @@ impl MarketPairToPriceStore {
         Self { backend }
     }
 
-    pub fn put(&self, pair_key: &[u8], count: i64) {
-        self.backend.put(pair_key, &count.to_be_bytes());
+    pub fn put(&self, pair_key: &[u8], count: i64) -> Result<(), StoreError> {
+        self.backend.put(pair_key, &count.to_be_bytes())?;
+        Ok(())
     }
 
     pub fn get(&self, pair_key: &[u8]) -> Result<Option<i64>, StoreError> {
-        let Some(bytes) = self.backend.get(pair_key) else {
+        let Some(bytes) = self.backend.get(pair_key)? else {
             return Ok(None);
         };
         if bytes.len() != 8 {
@@ -178,19 +183,28 @@ impl MarketPairToPriceStore {
     /// `sellTokenId(19) || buyTokenId(19)` (TOKEN_ID_LENGTH = 19, the
     /// decimal-string length of `Long.MAX_VALUE`). Used by
     /// `getMarketPairList`.
-    pub fn all(&self) -> Vec<(Vec<u8>, i64)> {
-        self.backend
-            .scan_all()
+    pub fn all(&self) -> Result<Vec<(Vec<u8>, i64)>, StoreError> {
+        Ok(self
+            .backend
+            .scan_all()?
             .into_iter()
             .filter_map(|(k, v)| {
                 if v.len() != 8 {
+                    // C-8: market price-counts are i64 (8 bytes); any
+                    // other length is corruption. Log, then skip.
+                    tracing::error!(
+                        store = "market-pair-price-to-order",
+                        key = %hex::encode(&k),
+                        value_len = v.len(),
+                        "skipping market-pair row whose value isn't an 8-byte count"
+                    );
                     return None;
                 }
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&v);
                 Some((k, i64::from_be_bytes(buf)))
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -223,11 +237,11 @@ mod tests {
         let pair_a = pair_prefix(0xaa);
         let pair_b = pair_prefix(0xbb);
 
-        store.put(&price_key(&pair_a, 0x05), &MarketOrderIdList::default());
-        store.put(&price_key(&pair_a, 0x10), &MarketOrderIdList::default());
-        store.put(&price_key(&pair_a, 0x20), &MarketOrderIdList::default());
+        store.put(&price_key(&pair_a, 0x05), &MarketOrderIdList::default()).unwrap();
+        store.put(&price_key(&pair_a, 0x10), &MarketOrderIdList::default()).unwrap();
+        store.put(&price_key(&pair_a, 0x20), &MarketOrderIdList::default()).unwrap();
         // Different pair — must NOT appear in the pair_a scan.
-        store.put(&price_key(&pair_b, 0x05), &MarketOrderIdList::default());
+        store.put(&price_key(&pair_b, 0x05), &MarketOrderIdList::default()).unwrap();
 
         let got = store.scan_prefix(&pair_a).expect("scan");
         assert_eq!(got.len(), 3, "exactly 3 pair_a price levels");
@@ -244,7 +258,7 @@ mod tests {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = MarketPairPriceToOrderStore::new(backend);
         let pair = pair_prefix(0xaa);
-        store.put(&price_key(&pair, 0x05), &MarketOrderIdList::default());
+        store.put(&price_key(&pair, 0x05), &MarketOrderIdList::default()).unwrap();
 
         let other = pair_prefix(0xff);
         let got = store.scan_prefix(&other).expect("scan");

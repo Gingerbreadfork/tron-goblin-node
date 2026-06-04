@@ -147,7 +147,7 @@ async fn eth_get_balance_returns_account_balance() {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Send the 20-byte form (eth-style); server prepends 0x41 automatically.
     let resp = call(
         addr,
@@ -175,7 +175,7 @@ async fn eth_get_balance_accepts_21_byte_tron_address_form() {
             balance: 7,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let resp = call(
         addr,
         json!({
@@ -225,8 +225,8 @@ async fn eth_get_block_by_number_with_latest() {
         }),
     };
     let block_id = block_id_from_block(&block).unwrap();
-    blocks.put(&block_id, &block);
-    idx.put(&block_id);
+    blocks.put(&block_id, &block).unwrap();
+    idx.put(&block_id).unwrap();
     dp.save_latest_block_header_number(5);
 
     let resp = call(
@@ -441,7 +441,7 @@ async fn get_account_returns_full_account_for_known_address() {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
     // 20-byte Ethereum-style hex (40 chars after 0x). parse_eth_address
     // will prepend 0x41 to reconstruct the 21-byte TRON address.
     let resp = call(
@@ -718,9 +718,9 @@ async fn eth_call_runs_simple_contract_when_evm_backends_attached() {
                 code_hash: code_hash.to_vec(),
                 ..Default::default()
             },
-        );
+        ).unwrap();
         let code = CodeStore::new(code_be.clone());
-        code.put(&code_hash, &bytecode);
+        code.put(&code_hash, &bytecode).unwrap();
     }
 
     let state = RpcState::new(
@@ -984,7 +984,7 @@ async fn eth_get_proof_returns_eip1186_shape_with_empty_proofs() {
             balance: 1_234,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let resp = call(
         addr,
         json!({"jsonrpc":"2.0","method":"eth_getProof",
@@ -1029,7 +1029,7 @@ async fn get_account_resource_returns_quota_view() {
         r#type: 1, // ENERGY
         amount: 3_000_000,
     });
-    accounts.put(&address, &acct);
+    accounts.put(&address, &acct).unwrap();
     dp.save_total_net_weight(100);
     dp.save_total_energy_weight(100);
     dp.save_total_energy_limit(100_000_000_000);
@@ -1067,7 +1067,7 @@ async fn get_account_net_returns_bandwidth_only_subset() {
             free_net_usage: 123,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let resp = call(
         addr,
         json!({"jsonrpc":"2.0","method":"getAccountNet",
@@ -1118,7 +1118,7 @@ async fn get_can_withdraw_unfreeze_amount_sums_expired_entries() {
         unfreeze_amount: 2_000_000,
         unfreeze_expire_time: 1_800_000_000_000, // future
     });
-    accounts.put(&address, &acct);
+    accounts.put(&address, &acct).unwrap();
 
     let resp = call(
         addr,
@@ -1149,7 +1149,7 @@ async fn get_available_unfreeze_count_respects_max_slots() {
             unfreeze_expire_time: 1_800_000_000_000,
         });
     }
-    accounts.put(&address, &acct);
+    accounts.put(&address, &acct).unwrap();
 
     let resp = call(
         addr,
@@ -1179,8 +1179,8 @@ async fn get_block_returns_block_for_numeric_arg() {
         transactions: vec![],
     };
     let id = block_id_from_block(&block).unwrap();
-    blocks.put(&id, &block);
-    block_index.put(&id);
+    blocks.put(&id, &block).unwrap();
+    block_index.put(&id).unwrap();
 
     let resp = call(
         addr,
@@ -1213,8 +1213,8 @@ async fn get_block_by_latest_num_returns_recent_blocks() {
             transactions: vec![],
         };
         let id = block_id_from_block(&block).unwrap();
-        blocks.put(&id, &block);
-        block_index.put(&id);
+        blocks.put(&id, &block).unwrap();
+        block_index.put(&id).unwrap();
     }
     dp.save_latest_block_header_number(12);
     let resp = call(
@@ -1249,8 +1249,8 @@ async fn get_block_by_limit_next_caps_at_100() {
             transactions: vec![],
         };
         let id = block_id_from_block(&block).unwrap();
-        blocks.put(&id, &block);
-        block_index.put(&id);
+        blocks.put(&id, &block).unwrap();
+        block_index.put(&id).unwrap();
     }
     // Ask for blocks [0, 10000). Cap kicks in at 100; only 3 exist,
     // so we get whatever overlaps.
@@ -1585,8 +1585,8 @@ async fn solidified_block_clamps_to_solid_head() {
             transactions: vec![],
         };
         let id = block_id_from_block(&block).unwrap();
-        blocks.put(&id, &block);
-        block_index.put(&id);
+        blocks.put(&id, &block).unwrap();
+        block_index.put(&id).unwrap();
     }
     dp.save_latest_block_header_number(2);
     // Solidified at block 1.
@@ -1627,8 +1627,8 @@ async fn get_now_block_solidity_returns_solid_head_block() {
         transactions: vec![],
     };
     let id = block_id_from_block(&block).unwrap();
-    blocks.put(&id, &block);
-    block_index.put(&id);
+    blocks.put(&id, &block).unwrap();
+    block_index.put(&id).unwrap();
     dp.save_latest_solidified_block_num(5);
     let resp = call(
         addr,
@@ -1651,7 +1651,7 @@ async fn get_account_solidity_flags_divergence_from_java_tron() {
             balance: 42,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let resp = call(
         addr,
         json!({"jsonrpc":"2.0","method":"getAccountSolidity",
@@ -1680,8 +1680,8 @@ async fn get_block_balance_trace_returns_empty_until_executor_writes() {
         transactions: vec![],
     };
     let id = block_id_from_block(&block).unwrap();
-    blocks.put(&id, &block);
-    block_index.put(&id);
+    blocks.put(&id, &block).unwrap();
+    block_index.put(&id).unwrap();
 
     // BalanceTraceStore not attached on the test RpcState → null.
     let resp = call(
@@ -2578,7 +2578,7 @@ async fn spawn_server_with_abi() -> (std::net::SocketAddr, [u8; 20]) {
     let mut contract_tron = [0u8; 21];
     contract_tron[0] = 0x41;
     contract_tron[1..].copy_from_slice(&contract_eth);
-    abis.put(&Address::from_raw(contract_tron), &abi);
+    abis.put(&Address::from_raw(contract_tron), &abi).unwrap();
 
     let state = RpcState::new(
         accounts_be,

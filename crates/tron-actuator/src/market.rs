@@ -71,7 +71,7 @@ pub fn execute_market_sell_asset(
     let fee = dyn_props.get_long(b"MARKET_SELL_FEE").unwrap_or(0);
     account.balance = check_sub(account.balance, fee)?;
     debit_token_impl(&mut account, &contract.sell_token_id, contract.sell_token_quantity)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let order_id = make_order_id(&owner, now);
@@ -89,7 +89,7 @@ pub fn execute_market_sell_asset(
         prev: Vec::new(),
         next: Vec::new(),
     };
-    orders.put(&order_id, &order);
+    orders.put(&order_id, &order)?;
 
     Ok(ExecutionResult {
         fee,
@@ -149,12 +149,12 @@ pub fn execute_market_cancel_order(
     account.balance = check_sub(account.balance, fee)?;
     // Return the unfilled sell quantity to the owner.
     credit_token_impl(&mut account, &order.sell_token_id, order.sell_token_quantity_remain)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     order.state = OrderState::Canceled as i32;
     order.sell_token_quantity_return = order.sell_token_quantity_remain;
     order.sell_token_quantity_remain = 0;
-    orders.put(&contract.order_id, &order);
+    orders.put(&contract.order_id, &order)?;
 
     Ok(ExecutionResult {
         fee,

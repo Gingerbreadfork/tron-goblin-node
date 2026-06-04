@@ -193,7 +193,7 @@ mod tests {
                 total_produced: 1_000,
                 ..Default::default()
             },
-        );
+        ).unwrap();
 
         let snap = snapshot(dp_be, ws_be);
         assert_eq!(snap.head.latest_block_number, 12_345);

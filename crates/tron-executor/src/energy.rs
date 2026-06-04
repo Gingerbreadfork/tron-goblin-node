@@ -164,7 +164,7 @@ pub fn consume_energy(
         pay_energy_fee(dyn_props, fee);
     }
     account.latest_opration_time = head_block_timestamp(dyn_props);
-    accounts.put(caller, &account);
+    accounts.put(caller, &account)?;
 
     // BLOCK_ENERGY_USAGE accumulator: drives the adaptive-energy
     // recalculation at every block boundary (or maintenance, depending

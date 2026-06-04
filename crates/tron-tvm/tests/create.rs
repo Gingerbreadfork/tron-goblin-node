@@ -47,7 +47,7 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Init code returns a runtime code of `[0x60, 0x00, 0x60, 0x00, 0xf3]`
     // (PUSH1 0, PUSH1 0, RETURN — a trivial valid runtime).
@@ -154,7 +154,7 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
     assert_eq!(acct.code_hash, expected_runtime_hash.as_slice());
 
     // CodeStore must contain the runtime code keyed by its hash.
-    let stored_code = stores.code.get(acct.code_hash.as_slice()).unwrap();
+    let stored_code = stores.code.get(acct.code_hash.as_slice()).unwrap().unwrap();
     assert_eq!(stored_code, runtime);
 }
 
@@ -172,7 +172,7 @@ fn execute_create_cleans_up_on_init_code_revert() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Init code: PUSH1 0 PUSH1 0 REVERT — reverts immediately.
     let init_code = vec![0x60, 0x00, 0x60, 0x00, 0xfd];
@@ -234,7 +234,7 @@ fn execute_create_halts_when_code_deposit_charge_exceeds_budget() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Init code that returns a LARGE runtime body — 1000 bytes of 0x00.
     // Code deposit = 1000 × 200 = 200_000 gas. With a tight 30_000 gas

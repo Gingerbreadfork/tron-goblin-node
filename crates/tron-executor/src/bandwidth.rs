@@ -151,7 +151,7 @@ pub fn consume_bandwidth(
         owner,
         bytes,
         now_slot,
-    ) {
+    )? {
         return Ok(charge);
     }
 
@@ -163,7 +163,7 @@ pub fn consume_bandwidth(
         owner,
         bytes,
         now_slot,
-    ) {
+    )? {
         return Ok(charge);
     }
 
@@ -178,7 +178,7 @@ pub fn consume_bandwidth(
     }
     account.balance -= fee;
     account.latest_opration_time = head_block_timestamp(stores.dyn_props);
-    stores.accounts.put(owner, &account);
+    stores.accounts.put(owner, &account)?;
     pay_bandwidth_fee(stores.dyn_props, fee);
     Ok(BandwidthCharge::Fee {
         bytes,
@@ -376,9 +376,9 @@ fn try_use_asset_account_net(
         if let Some(mut v2_row) = stores.asset_v2.get(token_id_num)? {
             v2_row.public_free_asset_net_usage = final_pub_usage;
             v2_row.public_latest_free_net_time = now_slot;
-            stores.asset_v2.put(token_id_num, &v2_row);
+            stores.asset_v2.put(token_id_num, &v2_row)?;
         }
-        stores.asset_v1.put(&asset.name.clone(), &asset);
+        stores.asset_v1.put(&asset.name.clone(), &asset)?;
     } else {
         account
             .latest_asset_operation_time_v2
@@ -386,12 +386,12 @@ fn try_use_asset_account_net(
         account
             .free_asset_net_usage_v2
             .insert(token_id_str.clone(), final_free_asset_usage);
-        stores.asset_v2.put(token_id_num, &asset);
+        stores.asset_v2.put(token_id_num, &asset)?;
     }
     account.latest_opration_time = head_block_timestamp(stores.dyn_props);
 
-    stores.accounts.put(owner, account);
-    stores.accounts.put(&issuer_addr, &issuer);
+    stores.accounts.put(owner, account)?;
+    stores.accounts.put(&issuer_addr, &issuer)?;
 
     Ok(Some(BandwidthCharge::AssetIssuer {
         bytes,
@@ -410,10 +410,10 @@ fn try_use_account_net(
     owner: &Address,
     bytes: i64,
     now_slot: i64,
-) -> Option<BandwidthCharge> {
+) -> Result<Option<BandwidthCharge>, StoreError> {
     let net_limit = calculate_global_net_limit(account, dyn_props);
     if net_limit <= 0 {
-        return None;
+        return Ok(None);
     }
     let last_consume = account.latest_consume_time;
     let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
@@ -423,7 +423,7 @@ fn try_use_account_net(
         increase_default(account.net_usage, 0, last_consume, now_slot)
     };
     if bytes > net_limit.saturating_sub(decayed) {
-        return None;
+        return Ok(None);
     }
 
     let new_usage = if support_unfreeze_delay {
@@ -434,11 +434,11 @@ fn try_use_account_net(
     account.net_usage = new_usage;
     account.latest_consume_time = now_slot;
     account.latest_opration_time = head_block_timestamp(dyn_props);
-    accounts.put(owner, account);
-    Some(BandwidthCharge::Frozen {
+    accounts.put(owner, account)?;
+    Ok(Some(BandwidthCharge::Frozen {
         bytes,
         new_net_usage: new_usage,
-    })
+    }))
 }
 
 /// Try the `useFreeNet` path. Mirrors `BandwidthProcessor.useFreeNet`,
@@ -450,12 +450,12 @@ fn try_use_free_net(
     owner: &Address,
     bytes: i64,
     now_slot: i64,
-) -> Option<BandwidthCharge> {
+) -> Result<Option<BandwidthCharge>, StoreError> {
     let free_limit = dyn_props.free_net_limit();
     let last_free = account.latest_consume_free_time;
     let decayed_free = increase_default(account.free_net_usage, 0, last_free, now_slot);
     if bytes > free_limit.saturating_sub(decayed_free) {
-        return None;
+        return Ok(None);
     }
 
     // Chain-wide public-net cap check.
@@ -464,7 +464,7 @@ fn try_use_free_net(
     let pub_time = dyn_props.public_net_time();
     let new_pub = increase_default(pub_usage, 0, pub_time, now_slot);
     if bytes > pub_limit.saturating_sub(new_pub) {
-        return None;
+        return Ok(None);
     }
 
     let new_free = increase_default(account.free_net_usage, bytes, last_free, now_slot);
@@ -472,13 +472,13 @@ fn try_use_free_net(
     account.free_net_usage = new_free;
     account.latest_consume_free_time = now_slot;
     account.latest_opration_time = head_block_timestamp(dyn_props);
-    accounts.put(owner, account);
+    accounts.put(owner, account)?;
     dyn_props.save_public_net_usage(final_pub);
     dyn_props.save_public_net_time(now_slot);
-    Some(BandwidthCharge::Free {
+    Ok(Some(BandwidthCharge::Free {
         bytes,
         new_free_usage: new_free,
-    })
+    }))
 }
 
 /// Serialized size of the transaction, excluding the `ret` field —

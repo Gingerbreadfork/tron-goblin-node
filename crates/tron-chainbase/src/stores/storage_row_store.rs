@@ -27,6 +27,7 @@ use tron_crypto::address::Address;
 use tron_crypto::hash::keccak256;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "storage-row";
 
@@ -67,12 +68,13 @@ impl StorageRowStore {
         out
     }
 
-    pub fn put(&self, key: &[u8; KEY_LEN], value: &[u8]) {
-        self.backend.put(key, value);
+    pub fn put(&self, key: &[u8; KEY_LEN], value: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(key, value)?;
+        Ok(())
     }
 
-    pub fn get(&self, key: &[u8; KEY_LEN]) -> Option<Vec<u8>> {
-        self.backend.get(key)
+    pub fn get(&self, key: &[u8; KEY_LEN]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(key)?)
     }
 
     /// Snapshot every storage row belonging to `contract_address`.
@@ -81,10 +83,14 @@ impl StorageRowStore {
     /// contract shares.
     ///
     /// Used by per-contract storage-root computation.
-    pub fn scan_for_contract(&self, address: &Address) -> Vec<([u8; KEY_LEN], Vec<u8>)> {
+    pub fn scan_for_contract(
+        &self,
+        address: &Address,
+    ) -> Result<Vec<([u8; KEY_LEN], Vec<u8>)>, StoreError> {
         let prefix = keccak256(address.as_bytes());
-        self.backend
-            .scan_all()
+        Ok(self
+            .backend
+            .scan_all()?
             .into_iter()
             .filter_map(|(k, v)| {
                 if k.len() != KEY_LEN || k[..PREFIX_BYTES] != prefix[..PREFIX_BYTES] {
@@ -94,6 +100,6 @@ impl StorageRowStore {
                 key.copy_from_slice(&k);
                 Some((key, v))
             })
-            .collect()
+            .collect())
     }
 }

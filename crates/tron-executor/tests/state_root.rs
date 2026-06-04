@@ -80,7 +80,7 @@ fn seed_account(state: &StateBackends, raw_address: [u8; 21], balance: i64) {
             balance,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn block_with_root(num: i64, parent: [u8; 32], state_root: Vec<u8>) -> Block {
@@ -109,8 +109,8 @@ fn state_root_is_deterministic_over_equal_account_sets() {
     seed_account(&state_b, addr(0xa1), 1_000);
     seed_account(&state_b, addr(0xa2), 2_000);
 
-    let root_a = compute_state_root(&state_a);
-    let root_b = compute_state_root(&state_b);
+    let root_a = compute_state_root(&state_a).unwrap();
+    let root_b = compute_state_root(&state_b).unwrap();
     assert_eq!(
         root_a, root_b,
         "two equal account sets must produce the same root"
@@ -123,9 +123,9 @@ fn state_root_is_deterministic_over_equal_account_sets() {
 fn state_root_changes_when_a_balance_changes() {
     let state = fresh_state();
     seed_account(&state, addr(0xa1), 1_000);
-    let before = compute_state_root(&state);
+    let before = compute_state_root(&state).unwrap();
     seed_account(&state, addr(0xa1), 1_001); // overwrite with new balance
-    let after = compute_state_root(&state);
+    let after = compute_state_root(&state).unwrap();
     assert_ne!(
         before, after,
         "changing a balance must change the state root"
@@ -197,7 +197,7 @@ fn execute_block_accepts_matching_state_root() {
 
     // Compute what the root SHOULD be (no txs in this block, so post-exec
     // state == pre-exec state), then put it in the header.
-    let expected = compute_state_root(&state);
+    let expected = compute_state_root(&state).unwrap();
     let block = block_with_root(1, [0u8; 32], expected.to_vec());
 
     let result = apply_unsigned(&state, &block, None);

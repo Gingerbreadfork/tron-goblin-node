@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use crate::backend::{KvBackend, WriteOp};
+use crate::backend::{KvBackend, KvError, WriteOp};
 
 /// A single pending mutation in a session's overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,13 +76,13 @@ impl SessionBackend {
     /// crash). A custom parent that doesn't override `write_batch`
     /// falls back to per-key `put`/`delete`, which is non-atomic — fine
     /// for test stubs, not for production stores.
-    pub fn commit(&self) {
+    pub fn commit(&self) -> Result<(), KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
             std::mem::take(&mut *g)
         };
         if drained.is_empty() {
-            return;
+            return Ok(());
         }
         let ops: Vec<WriteOp> = drained
             .into_iter()
@@ -91,7 +91,7 @@ impl SessionBackend {
                 Op::Delete => WriteOp::Delete(key),
             })
             .collect();
-        self.parent.write_batch(&ops);
+        self.parent.write_batch(&ops)
     }
 
     /// Same as [`commit`], but for every pending key, read the parent's
@@ -111,26 +111,26 @@ impl SessionBackend {
     /// itself is atomic per the same guarantees as [`commit`].
     ///
     /// [`commit`]: SessionBackend::commit
-    pub fn commit_with_undo(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    pub fn commit_with_undo(&self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
             std::mem::take(&mut *g)
         };
         if drained.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut undo = Vec::with_capacity(drained.len());
         let mut ops = Vec::with_capacity(drained.len());
         for (key, op) in drained {
-            let before = self.parent.get(&key);
+            let before = self.parent.get(&key)?;
             undo.push((key.clone(), before));
             ops.push(match op {
                 Op::Put(value) => WriteOp::Put(key, value),
                 Op::Delete => WriteOp::Delete(key),
             });
         }
-        self.parent.write_batch(&ops);
-        undo
+        self.parent.write_batch(&ops)?;
+        Ok(undo)
     }
 
     /// Drain pending writes WITHOUT applying them to the parent.
@@ -169,7 +169,9 @@ impl SessionBackend {
     /// state.
     ///
     /// [`drain_pending`]: SessionBackend::drain_pending
-    pub fn drain_pending_with_undo(&self) -> (Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+    pub fn drain_pending_with_undo(
+        &self,
+    ) -> Result<(Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>), KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
             std::mem::take(&mut *g)
@@ -177,14 +179,14 @@ impl SessionBackend {
         let mut ops = Vec::with_capacity(drained.len());
         let mut undo = Vec::with_capacity(drained.len());
         for (key, op) in drained {
-            let before = self.parent.get(&key);
+            let before = self.parent.get(&key)?;
             undo.push((key.clone(), before));
             ops.push(match op {
                 Op::Put(value) => WriteOp::Put(key, value),
                 Op::Delete => WriteOp::Delete(key),
             });
         }
-        (ops, undo)
+        Ok((ops, undo))
     }
 
     /// Discard all pending writes. The parent is unaffected.
@@ -210,11 +212,11 @@ impl SessionBackend {
 }
 
 impl KvBackend for SessionBackend {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
         let g = self.pending.read().expect("SessionBackend lock poisoned");
         match g.get(key) {
-            Some(Op::Put(v)) => Some(v.clone()),
-            Some(Op::Delete) => None,
+            Some(Op::Put(v)) => Ok(Some(v.clone())),
+            Some(Op::Delete) => Ok(None),
             None => {
                 // Drop the read guard before delegating to the parent —
                 // some parent implementations may take their own locks
@@ -225,25 +227,28 @@ impl KvBackend for SessionBackend {
         }
     }
 
-    fn put(&self, key: &[u8], value: &[u8]) {
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
         self.pending
             .write()
             .expect("SessionBackend lock poisoned")
             .insert(key.to_vec(), Op::Put(value.to_vec()));
+        Ok(())
     }
 
-    fn delete(&self, key: &[u8]) {
+    fn delete(&self, key: &[u8]) -> Result<(), KvError> {
         self.pending
             .write()
             .expect("SessionBackend lock poisoned")
             .insert(key.to_vec(), Op::Delete);
+        Ok(())
     }
 
     /// Snapshot: parent state with the pending overlay applied. Uses
     /// a `BTreeMap` to deduplicate and sort — pending writes shadow
     /// parent entries; pending deletes remove them.
-    fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = self.parent.scan_all().into_iter().collect();
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> =
+            self.parent.scan_all()?.into_iter().collect();
         let g = self.pending.read().expect("SessionBackend lock poisoned");
         for (k, op) in g.iter() {
             match op {
@@ -255,6 +260,6 @@ impl KvBackend for SessionBackend {
                 }
             }
         }
-        merged.into_iter().collect()
+        Ok(merged.into_iter().collect())
     }
 }

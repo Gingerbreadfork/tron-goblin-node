@@ -90,9 +90,9 @@ fn seed_head(state: &StateBackends, blocks_be: &Arc<dyn KvBackend>, khaos: &tron
     };
     sign_block(&mut block, &ALICE_PRIV).expect("sign");
     let block_id = tron_types::block_id_from_block(&block).unwrap();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
     if let Some(bi_be) = &state.block_index {
-        BlockIndexStore::new(bi_be.clone()).put(&block_id);
+        BlockIndexStore::new(bi_be.clone()).put(&block_id).unwrap();
     }
     execute_block(state, &block, None).expect("execute genesis");
     khaos.start(block).expect("seed khaos");
@@ -103,7 +103,7 @@ fn seed_head(state: &StateBackends, blocks_be: &Arc<dyn KvBackend>, khaos: &tron
 
 fn seed_active_witnesses(witness_schedule_be: &Arc<dyn KvBackend>, addrs: &[Address]) {
     let sched = WitnessScheduleStore::new(witness_schedule_be.clone());
-    sched.save_active(addrs);
+    sched.save_active(addrs).unwrap();
 }
 
 fn seed_witness_row(state: &StateBackends, addr: [u8; 21]) {
@@ -115,7 +115,7 @@ fn seed_witness_row(state: &StateBackends, addr: [u8; 21]) {
             vote_count: 100,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let accts = AccountStore::new(state.accounts.clone());
     accts.put(
         &Address::from_raw(addr),
@@ -124,7 +124,7 @@ fn seed_witness_row(state: &StateBackends, addr: [u8; 21]) {
             balance: 0,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn build_runtime(
@@ -324,7 +324,7 @@ async fn produced_block_evicts_its_txs_from_the_mempool() {
             .unwrap()
             .unwrap();
         acct.balance = 1_000_000_000;
-        accts.put(&Address::from_raw(ALICE_ADDR), &acct);
+        accts.put(&Address::from_raw(ALICE_ADDR), &acct).unwrap();
     }
     seed_head(&state, &blocks_be, &khaos);
     seed_active_witnesses(&witness_schedule_be, &[Address::from_raw(ALICE_ADDR)]);

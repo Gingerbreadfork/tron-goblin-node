@@ -29,19 +29,21 @@ impl ProposalStore {
         id.to_be_bytes()
     }
 
-    pub fn put(&self, id: i64, proposal: &Proposal) {
-        self.backend.put(&Self::key_for(id), &proposal.encode_to_vec());
+    pub fn put(&self, id: i64, proposal: &Proposal) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(id), &proposal.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Proposal>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::key_for(id)) else {
+        let Some(bytes) = self.backend.get(&Self::key_for(id))? else {
             return Ok(None);
         };
         Ok(Some(Proposal::decode(bytes.as_slice())?))
     }
 
-    pub fn delete(&self, id: i64) {
-        self.backend.delete(&Self::key_for(id));
+    pub fn delete(&self, id: i64) -> Result<(), StoreError> {
+        self.backend.delete(&Self::key_for(id))?;
+        Ok(())
     }
 
     /// Snapshot every proposal in the store. Used by the maintenance
@@ -49,7 +51,7 @@ impl ProposalStore {
     /// and that should transition to `Approved` / `Disapproved`.
     pub fn all(&self) -> Result<Vec<(i64, Proposal)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
+        for (k, v) in self.backend.scan_all()? {
             if k.len() != 8 {
                 continue;
             }

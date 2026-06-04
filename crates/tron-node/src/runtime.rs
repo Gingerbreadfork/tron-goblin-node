@@ -698,7 +698,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                         loop {
                             tokio::select! {
                                 _ = sd_persist.recv() => {
-                                    // Final flush on shutdown.
+                                    // Final flush on shutdown. `write_batch`
+                                    // returns a count and logs any store error
+                                    // internally, so discarding it is correct.
                                     let snap = snapshot_for_persist(&kad_handle);
                                     let _ = persist.write_batch(&snap);
                                     return;
@@ -1171,9 +1173,9 @@ fn initialize_genesis(stores: &OpenedStores) -> Result<(), crate::storage::Stora
     let id = genesis_block_id(&inputs);
 
     let block_store = BlockStore::new(stores.blocks.clone());
-    block_store.put(&id, &block);
+    block_store.put(&id, &block)?;
     let block_index = BlockIndexStore::new(stores.block_index.clone());
-    block_index.put(&id);
+    block_index.put(&id)?;
     let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
     dp.save_latest_block_header_number(0);
     if let Some(raw) = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref()) {
@@ -1193,7 +1195,7 @@ fn initialize_genesis(stores: &OpenedStores) -> Result<(), crate::storage::Stora
         &state,
         inputs.assets,
         tron_types::mainnet_witnesses(),
-    );
+    )?;
 
     info!(
         assets = inputs.assets.len(),

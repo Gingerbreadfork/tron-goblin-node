@@ -21,6 +21,21 @@
 //! per-property accessors). Only the consensus-critical and most-read keys
 //! are exposed as typed methods here; arbitrary keys can be reached via
 //! [`DynamicPropertiesStore::get_long`] / [`get_bytes`] etc.
+//!
+//! ## Error handling
+//!
+//! The public API on this store deliberately keeps the **infallible**
+//! shape (returning `Option<i64>` etc., not `Result<Option<i64>, _>`)
+//! despite [`crate::KvBackend`] now being fallible. Reason: this store
+//! is read on every block-apply by dozens of callers (executor, TVM,
+//! actuator, consensus, RPC). Propagating `Result` through every one of
+//! those would cascade across hundreds of call sites for a class of
+//! errors that — in practice — only ever occur on disk failure.
+//!
+//! Instead, backend errors here **panic with rich context** naming the
+//! store and the specific key. That keeps the IO-fault failure mode
+//! visible (you see exactly which key on which store failed in the
+//! stack trace) while not infecting every caller's signature.
 
 use std::sync::Arc;
 
@@ -127,6 +142,25 @@ impl DynamicPropertiesStore {
 
     // -------------------- Generic accessors ---------------------------
 
+    /// Internal helper — perform a backend read, panicking with rich
+    /// context if the backend fails. See the module-level "Error
+    /// handling" doc for the rationale.
+    fn read_or_panic(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.backend.get(key).unwrap_or_else(|e| {
+            let name = String::from_utf8_lossy(key);
+            panic!("dyn_props store: failed to read {name}: {e}")
+        })
+    }
+
+    /// Internal helper — perform a backend write, panicking with rich
+    /// context if the backend fails.
+    fn write_or_panic(&self, key: &[u8], value: &[u8]) {
+        self.backend.put(key, value).unwrap_or_else(|e| {
+            let name = String::from_utf8_lossy(key);
+            panic!("dyn_props store: failed to write {name}: {e}")
+        });
+    }
+
     /// Read a key as 8-byte big-endian signed long.
     ///
     /// java-tron's `ByteArray.toLong` is *permissive*: it accepts any
@@ -135,27 +169,27 @@ impl DynamicPropertiesStore {
     /// on edge cases (which in practice never happen — every write is
     /// canonical 8 bytes — but a hand-crafted DB entry could trip us).
     pub fn get_long(&self, key: &[u8]) -> Option<i64> {
-        let bytes = self.backend.get(key)?;
+        let bytes = self.read_or_panic(key)?;
         Some(parse_long_permissive(&bytes))
     }
 
     /// Write a key as 8-byte big-endian signed long.
     pub fn put_long(&self, key: &[u8], value: i64) {
-        self.backend.put(key, &value.to_be_bytes());
+        self.write_or_panic(key, &value.to_be_bytes());
     }
 
     /// Read raw bytes for a key (no length validation).
     pub fn get_bytes(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.backend.get(key)
+        self.read_or_panic(key)
     }
 
     pub fn put_bytes(&self, key: &[u8], value: &[u8]) {
-        self.backend.put(key, value);
+        self.write_or_panic(key, value);
     }
 
     /// Read a key as a 32-byte hash.
     pub fn get_hash(&self, key: &[u8]) -> Result<Option<[u8; 32]>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         if bytes.len() != 32 {
@@ -170,7 +204,7 @@ impl DynamicPropertiesStore {
     }
 
     pub fn put_hash(&self, key: &[u8], hash: &[u8; 32]) {
-        self.backend.put(key, hash);
+        self.write_or_panic(key, hash);
     }
 
     /// Read a boolean. java-tron writes `[1]` for true and `[0]` for false

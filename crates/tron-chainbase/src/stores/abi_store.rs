@@ -30,20 +30,22 @@ impl AbiStore {
         Self { backend }
     }
 
-    pub fn put(&self, address: &Address, abi: &Abi) {
-        self.backend.put(address.as_bytes(), &abi.encode_to_vec());
+    pub fn put(&self, address: &Address, abi: &Abi) -> Result<(), StoreError> {
+        self.backend.put(address.as_bytes(), &abi.encode_to_vec())?;
+        Ok(())
     }
 
     /// Convenience: write pre-encoded ABI bytes. java-tron's
     /// `AbiStore.put(byte[], byte[])` is used by call sites that already
     /// have the encoded bytes (e.g. when extracting from a SmartContract
     /// before clearing it for ContractStore).
-    pub fn put_raw(&self, address: &Address, abi_bytes: &[u8]) {
-        self.backend.put(address.as_bytes(), abi_bytes);
+    pub fn put_raw(&self, address: &Address, abi_bytes: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(address.as_bytes(), abi_bytes)?;
+        Ok(())
     }
 
     pub fn get(&self, address: &Address) -> Result<Option<Abi>, StoreError> {
-        let Some(bytes) = self.backend.get(address.as_bytes()) else {
+        let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(Abi::decode(bytes.as_slice())?))

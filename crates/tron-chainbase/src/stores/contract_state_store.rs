@@ -30,12 +30,13 @@ impl ContractStateStore {
         Self { backend }
     }
 
-    pub fn put(&self, address: &Address, state: &ContractState) {
-        self.backend.put(address.as_bytes(), &state.encode_to_vec());
+    pub fn put(&self, address: &Address, state: &ContractState) -> Result<(), StoreError> {
+        self.backend.put(address.as_bytes(), &state.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, address: &Address) -> Result<Option<ContractState>, StoreError> {
-        let Some(bytes) = self.backend.get(address.as_bytes()) else {
+        let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(ContractState::decode(bytes.as_slice())?))
@@ -87,7 +88,7 @@ impl ContractStateStore {
                     update_cycle: new_cycle,
                     ..Default::default()
                 };
-                self.put(address, &fresh);
+                self.put(address, &fresh)?;
                 return Ok(0);
             }
         };
@@ -100,7 +101,7 @@ impl ContractStateStore {
                 update_cycle: new_cycle,
                 ..Default::default()
             };
-            self.put(address, &state);
+            self.put(address, &state)?;
             return Ok(0);
         }
 
@@ -132,7 +133,7 @@ impl ContractStateStore {
             energy_factor: current_factor,
             energy_usage: 0,
         };
-        self.put(address, &state);
+        self.put(address, &state)?;
         Ok(current_factor)
     }
 
@@ -142,10 +143,11 @@ impl ContractStateStore {
     /// when `ALLOW_DYNAMIC_ENERGY` is on). A missing record is treated
     /// as fresh — usage starts at `amount`. No cycle stamp here; the
     /// next `catch_up_to_cycle` does that.
-    pub fn add_energy_usage(&self, address: &Address, amount: i64) {
+    pub fn add_energy_usage(&self, address: &Address, amount: i64) -> Result<(), StoreError> {
         let mut state = self.get(address).ok().flatten().unwrap_or_default();
         state.energy_usage = state.energy_usage.saturating_add(amount);
-        self.put(address, &state);
+        self.put(address, &state)?;
+        Ok(())
     }
 }
 
@@ -188,7 +190,7 @@ mod tests {
                 energy_factor: 3_000,
                 energy_usage: 42,
             },
-        );
+        ).unwrap();
         let factor = s.catch_up_to_cycle(&a, 50, 1_000_000, 50, 100_000).unwrap();
         assert_eq!(factor, 3_000);
         let stored = s.get(&a).unwrap().unwrap();
@@ -207,7 +209,7 @@ mod tests {
                 energy_factor: 0,
                 energy_usage: 2_000_000,
             },
-        );
+        ).unwrap();
         // newCycle = 100 (one cycle gap). Increase by 50 / 10_000 = 0.5%.
         // (0 + 10000) * 1.005 = 10049.999... (IEEE 754), truncates to
         // 10049; minus 10000 → 49. Java-tron does the same `(long)` cast.
@@ -230,7 +232,7 @@ mod tests {
                 energy_factor: 10_000,
                 energy_usage: 0,
             },
-        );
+        ).unwrap();
         // Jump to cycle 60: 10 idle cycles, no growth, only decay.
         let factor = s.catch_up_to_cycle(&a, 60, 1_000_000, 50, 100_000).unwrap();
         // base = 1 - 50/4/10000 = 0.99875; 0.99875^10 ≈ 0.98758
@@ -245,8 +247,8 @@ mod tests {
     fn add_energy_usage_accumulates() {
         let s = store();
         let a = addr(0x55);
-        s.add_energy_usage(&a, 1_000);
-        s.add_energy_usage(&a, 500);
+        s.add_energy_usage(&a, 1_000).unwrap();
+        s.add_energy_usage(&a, 500).unwrap();
         let stored = s.get(&a).unwrap().unwrap();
         assert_eq!(stored.energy_usage, 1_500);
     }

@@ -57,11 +57,11 @@ pub fn prune_before(stores: &OpenedStores, before: i64) -> Result<usize, AdminEr
             continue;
         };
         // Skip if already pruned (idempotent).
-        if !block_store.contains(&id) {
+        if !block_store.contains(&id)? {
             continue;
         }
-        block_store.delete(&id);
-        block_index.delete(num);
+        block_store.delete(&id)?;
+        block_index.delete(num)?;
         pruned += 1;
     }
     Ok(pruned)
@@ -285,7 +285,14 @@ pub(crate) fn compute_db_root(
 ) -> Result<[u8; 32], AdminError> {
     let storage_lookup = |addr: &Address| -> Option<[u8; 32]> {
         let rows_be = storage_row_be.as_ref()?;
-        let rows = StorageRowStore::new(rows_be.clone()).scan_for_contract(addr);
+        // Storage-row scan failures during db_root computation are
+        // surfaced as a panic — silently returning None would corrupt
+        // the root. The outer compute_db_root caller already returns
+        // Result and is invoked from the admin path (operator-driven),
+        // so the panic is observable.
+        let rows = StorageRowStore::new(rows_be.clone())
+            .scan_for_contract(addr)
+            .expect("storage_row.scan_for_contract failed in compute_db_root");
         if rows.is_empty() {
             None
         } else {
@@ -294,7 +301,7 @@ pub(crate) fn compute_db_root(
     };
 
     let mut accounts: Vec<(Address, Account)> = Vec::new();
-    for (key, value) in accounts_be.scan_all() {
+    for (key, value) in accounts_be.scan_all()? {
         if key.len() != 21 {
             continue;
         }
@@ -404,11 +411,11 @@ pub fn db_lite(
             let Ok(id) = index_store.get(num) else {
                 continue;
             };
-            if !block_store.contains(&id) {
+            if !block_store.contains(&id)? {
                 continue;
             }
-            block_store.delete(&id);
-            index_store.delete(num);
+            block_store.delete(&id)?;
+            index_store.delete(num)?;
             pruned += 1;
         }
     }
@@ -461,6 +468,18 @@ pub enum AdminError {
     Io(String),
     #[error("store: {0}")]
     Store(String),
+}
+
+impl From<tron_chainbase::StoreError> for AdminError {
+    fn from(e: tron_chainbase::StoreError) -> Self {
+        Self::Store(e.to_string())
+    }
+}
+
+impl From<tron_chainbase::KvError> for AdminError {
+    fn from(e: tron_chainbase::KvError) -> Self {
+        Self::Store(e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -546,8 +565,8 @@ mod tests {
         for n in 1..=10 {
             let block = make_block(n);
             let id = block_id_from_block(&block).unwrap();
-            bs.put(&id, &block);
-            bi.put(&id);
+            bs.put(&id, &block).unwrap();
+            bi.put(&id).unwrap();
         }
         // Sanity: all 10 present.
         for n in 1..=10 {
@@ -579,8 +598,8 @@ mod tests {
         for n in 1..=5 {
             let block = make_block(n);
             let id = block_id_from_block(&block).unwrap();
-            bs.put(&id, &block);
-            bi.put(&id);
+            bs.put(&id, &block).unwrap();
+            bi.put(&id).unwrap();
         }
         assert_eq!(prune_before(&stores, 4).unwrap(), 3);
         assert_eq!(
@@ -619,7 +638,7 @@ mod tests {
                 balance: 100,
                 ..Default::default()
             },
-        );
+        ).unwrap();
 
         // Plant some blocks + prune them.
         let bs = BlockStore::new(stores.blocks.clone());
@@ -627,8 +646,8 @@ mod tests {
         for n in 1..=5 {
             let block = make_block(n);
             let id = block_id_from_block(&block).unwrap();
-            bs.put(&id, &block);
-            bi.put(&id);
+            bs.put(&id, &block).unwrap();
+            bi.put(&id).unwrap();
         }
         prune_before(&stores, 5).unwrap();
 
@@ -778,8 +797,8 @@ mod tests {
             balance: 250,
             ..Default::default()
         };
-        store.put(&alice, &acct_a);
-        store.put(&bob, &acct_b);
+        store.put(&alice, &acct_a).unwrap();
+        store.put(&bob, &acct_b).unwrap();
 
         let via_admin = compute_db_root(accounts_be, None).expect("root");
 
@@ -805,14 +824,14 @@ mod tests {
                 balance: 1,
                 ..Default::default()
             },
-        );
+        ).unwrap();
 
         // Plant one storage row under alice.
         let rows = StorageRowStore::new(storage_be.clone());
         let mut slot = [0u8; 32];
         slot[31] = 0x01;
         let key = StorageRowStore::compose_key(&alice, &slot);
-        rows.put(&key, &[0x42][..]);
+        rows.put(&key, &[0x42][..]).unwrap();
 
         let without = compute_db_root(accounts_be.clone(), None).expect("no-storage");
         let with = compute_db_root(accounts_be, Some(storage_be)).expect("with-storage");

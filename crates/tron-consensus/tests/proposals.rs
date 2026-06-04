@@ -43,7 +43,7 @@ fn proposal_approved_when_meets_threshold_and_expired() {
             1_700_000_000_000,
             20, // > 19 threshold
         ),
-    );
+    ).unwrap();
 
     let now = 1_700_000_010_000; // past expiration
     let report = activate_expired_proposals(&proposals, &dp, now, 27).unwrap();
@@ -68,7 +68,7 @@ fn proposal_disapproved_when_under_threshold_and_expired() {
     proposals.put(
         2,
         &make_proposal(2, vec![(3, 99_000)], 1_700_000_000_000, 5),
-    );
+    ).unwrap();
 
     let now = 1_700_000_010_000;
     let report = activate_expired_proposals(&proposals, &dp, now, 27).unwrap();
@@ -91,7 +91,7 @@ fn proposal_not_yet_expired_stays_pending() {
     proposals.put(
         3,
         &make_proposal(3, vec![(3, 1)], 1_700_000_100_000, 25), // expires in future
-    );
+    ).unwrap();
 
     let now = 1_700_000_000_000; // before expiration
     let report = activate_expired_proposals(&proposals, &dp, now, 27).unwrap();
@@ -109,7 +109,7 @@ fn already_terminal_proposals_are_left_alone() {
 
     let mut already_approved = make_proposal(4, vec![(3, 5)], 1, 20);
     already_approved.state = ProposalState::Approved as i32;
-    proposals.put(4, &already_approved);
+    proposals.put(4, &already_approved).unwrap();
 
     let report = activate_expired_proposals(&proposals, &dp, 1_000, 27).unwrap();
     assert!(report.approved.is_empty());
@@ -129,11 +129,11 @@ fn multiple_proposals_processed_in_id_order() {
     proposals.put(
         1,
         &make_proposal(1, vec![(3, 10)], 1_700_000_000_000, 20),
-    );
+    ).unwrap();
     proposals.put(
         2,
         &make_proposal(2, vec![(3, 20)], 1_700_000_000_000, 20),
-    );
+    ).unwrap();
 
     let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, 27).unwrap();
     assert_eq!(report.approved, vec![1, 2]);
@@ -153,7 +153,7 @@ fn unknown_parameter_id_is_silently_dropped() {
             1_700_000_000_000,
             20,
         ),
-    );
+    ).unwrap();
 
     let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, 27).unwrap();
     assert_eq!(report.approved, vec![5]); // still approved

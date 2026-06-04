@@ -72,7 +72,7 @@ fn proposal_round_trip() {
         approvals: vec![bob().as_bytes().to_vec()],
         state: tron_proto::proposal::State::Pending as i32,
     };
-    store.put(42, &p);
+    store.put(42, &p).unwrap();
     assert_eq!(store.get(42).unwrap().unwrap(), p);
     assert!(store.get(43).unwrap().is_none());
 }
@@ -100,7 +100,7 @@ fn exchange_round_trip() {
         second_token_id: b"TEST".to_vec(),
         second_token_balance: 5_000_000_000,
     };
-    store.put(7, &exchange);
+    store.put(7, &exchange).unwrap();
     assert_eq!(store.get(7).unwrap().unwrap(), exchange);
 }
 
@@ -127,7 +127,7 @@ fn asset_issue_v1_uses_name_as_key() {
         id: "1000001".into(),
         ..Default::default()
     };
-    store.put(b"MyToken", &asset);
+    store.put(b"MyToken", &asset).unwrap();
     assert_eq!(store.get(b"MyToken").unwrap().unwrap(), asset);
     // Looking up by V2 id against the V1 store yields nothing.
     assert!(store.get(b"1000001").unwrap().is_none());
@@ -142,10 +142,10 @@ fn asset_issue_v2_uses_decimal_id_as_key() {
         id: "1000001".into(),
         ..Default::default()
     };
-    store.put(1_000_001, &asset);
+    store.put(1_000_001, &asset).unwrap();
     // The key on disk is the UTF-8 bytes of the decimal id.
-    assert!(backend.get(b"1000001").is_some());
-    assert!(backend.get(b"MyToken").is_none());
+    assert!(backend.get(b"1000001").unwrap().is_some());
+    assert!(backend.get(b"MyToken").unwrap().is_none());
     assert_eq!(store.get(1_000_001).unwrap().unwrap(), asset);
 }
 
@@ -167,7 +167,7 @@ fn contract_store_strips_abi_on_put() {
         bytecode: b"\x60\x80\x60\x40".to_vec(),
         ..Default::default()
     };
-    store.put(&bob(), &contract);
+    store.put(&bob(), &contract).unwrap();
     let got = store.get(&bob()).unwrap().unwrap();
     assert_eq!(got.bytecode, contract.bytecode);
     assert!(got.abi.is_none(), "ABI must be cleared on write");
@@ -180,8 +180,8 @@ fn code_store_writes_raw_bytecode() {
     let store = CodeStore::new(mem());
     let hash = [0xabu8; 32];
     let code = vec![0x60, 0x80, 0x60, 0x40, 0x52];
-    store.put(&hash, &code);
-    assert_eq!(store.get(&hash), Some(code));
+    store.put(&hash, &code).unwrap();
+    assert_eq!(store.get(&hash).unwrap(), Some(code));
 }
 
 #[test]
@@ -194,7 +194,7 @@ fn abi_store_round_trip() {
             ..Default::default()
         }],
     };
-    store.put(&bob(), &abi);
+    store.put(&bob(), &abi).unwrap();
     assert_eq!(store.get(&bob()).unwrap().unwrap(), abi);
 }
 
@@ -230,8 +230,8 @@ fn storage_row_round_trip() {
     let store = StorageRowStore::new(mem());
     let key = StorageRowStore::compose_key(&alice(), &[1u8; 32]);
     let value = vec![0xde, 0xad, 0xbe, 0xef];
-    store.put(&key, &value);
-    assert_eq!(store.get(&key), Some(value));
+    store.put(&key, &value).unwrap();
+    assert_eq!(store.get(&key).unwrap(), Some(value));
 }
 
 // --- WitnessScheduleStore --------------------------------------------------
@@ -257,7 +257,7 @@ fn witness_schedule_keys_pinned() {
 fn witness_schedule_packs_addresses_flat() {
     let store = WitnessScheduleStore::new(mem());
     let witnesses = vec![alice(), bob(), alice()];
-    store.save_active(&witnesses);
+    store.save_active(&witnesses).unwrap();
     let got = store.load_active().unwrap().unwrap();
     assert_eq!(got.len(), 3);
     assert_eq!(got[0], alice());
@@ -268,7 +268,7 @@ fn witness_schedule_packs_addresses_flat() {
 #[test]
 fn witness_schedule_rejects_misaligned_buffer() {
     let backend = mem();
-    backend.put(witness_schedule_keys::ACTIVE_WITNESSES, &[0u8; 20]); // not a multiple of 21
+    backend.put(witness_schedule_keys::ACTIVE_WITNESSES, &[0u8; 20]).unwrap(); // not a multiple of 21
     let store = WitnessScheduleStore::new(backend);
     assert!(store.load_active().is_err());
 }
@@ -278,7 +278,7 @@ fn witness_schedule_rejects_misaligned_buffer() {
 #[test]
 fn account_index_round_trip() {
     let store = AccountIndexStore::new(mem());
-    store.put(b"Alice", &alice());
+    store.put(b"Alice", &alice()).unwrap();
     assert_eq!(store.get(b"Alice").unwrap().unwrap(), alice());
     assert!(store.get(b"Bob").unwrap().is_none());
 }
@@ -286,7 +286,7 @@ fn account_index_round_trip() {
 #[test]
 fn account_index_rejects_wrong_length_value() {
     let backend = mem();
-    backend.put(b"Alice", &[0u8; 20]); // 20, not 21
+    backend.put(b"Alice", &[0u8; 20]).unwrap(); // 20, not 21
     let store = AccountIndexStore::new(backend);
     assert!(store.get(b"Alice").is_err());
 }
@@ -308,9 +308,9 @@ fn recent_block_key_is_low_16_bits_big_endian() {
 #[test]
 fn recent_block_round_trip_via_wrapping_key() {
     let store = RecentBlockStore::new(mem());
-    store.put(100, &[0xa1, 0xa2]);
-    assert_eq!(store.get(100), Some(vec![0xa1, 0xa2]));
+    store.put(100, &[0xa1, 0xa2]).unwrap();
+    assert_eq!(store.get(100).unwrap(), Some(vec![0xa1, 0xa2]));
     // A height 65,536 blocks later overwrites the earlier slot.
-    store.put(100 + 65_536, &[0xb1, 0xb2]);
-    assert_eq!(store.get(100), Some(vec![0xb1, 0xb2]));
+    store.put(100 + 65_536, &[0xb1, 0xb2]).unwrap();
+    assert_eq!(store.get(100).unwrap(), Some(vec![0xb1, 0xb2]));
 }

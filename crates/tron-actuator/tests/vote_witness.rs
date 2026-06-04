@@ -53,7 +53,7 @@ fn put_account(accounts: &AccountStore, address: [u8; 21], frozen_balance: i64) 
             },
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn register_witness(witnesses: &WitnessStore, address: [u8; 21]) {
@@ -70,7 +70,7 @@ fn register_witness(witnesses: &WitnessStore, address: [u8; 21]) {
             latest_slot_num: 0,
             is_jobs: false,
         },
-    );
+    ).unwrap();
 }
 
 fn vote(addr: [u8; 21], count: i64) -> ContractVote {
@@ -299,7 +299,7 @@ fn execute_preserves_old_votes_when_revoting() {
         }],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
 
     // First call to execute: creates VotesCapsule with old_votes = account.votes (SR1=2).
     let c1 = vote_contract(ALICE, vec![vote(SR2, 5)]);
@@ -358,7 +358,7 @@ fn execute_clears_old_votes_on_account_before_adding_new_ones() {
         ],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
 
     let c = vote_contract(ALICE, vec![vote(SR1, 5)]);
     execute_vote_witness(&accounts, &votes_store, &c).unwrap();

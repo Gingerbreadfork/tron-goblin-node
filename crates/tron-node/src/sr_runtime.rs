@@ -559,9 +559,9 @@ impl SrRuntime {
         }
 
         // Persist to BlockStore + BlockIndex.
-        BlockStore::new(self.blocks_backend.clone()).put(&block_id, &block);
+        BlockStore::new(self.blocks_backend.clone()).put(&block_id, &block)?;
         if let Some(bi_be) = &self.state.block_index {
-            BlockIndexStore::new(bi_be.clone()).put(&block_id);
+            BlockIndexStore::new(bi_be.clone()).put(&block_id)?;
         }
 
         // Apply state. When the snapshot coordinator is attached,
@@ -666,6 +666,18 @@ pub enum SrRuntimeError {
     Produce(String),
     #[error("execute: {0}")]
     Execute(String),
+}
+
+impl From<tron_chainbase::StoreError> for SrRuntimeError {
+    fn from(e: tron_chainbase::StoreError) -> Self {
+        Self::Storage(e.to_string())
+    }
+}
+
+impl From<tron_chainbase::KvError> for SrRuntimeError {
+    fn from(e: tron_chainbase::KvError) -> Self {
+        Self::Storage(e.to_string())
+    }
 }
 
 #[cfg(test)]

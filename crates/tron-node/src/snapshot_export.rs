@@ -325,8 +325,8 @@ mod tests {
         let inputs = mainnet_inputs();
         let block = build_genesis_block(&inputs);
         let id = genesis_block_id(&inputs);
-        BlockStore::new(stores.blocks.clone()).put(&id, &block);
-        BlockIndexStore::new(stores.block_index.clone()).put(&id);
+        BlockStore::new(stores.blocks.clone()).put(&id, &block).unwrap();
+        BlockIndexStore::new(stores.block_index.clone()).put(&id).unwrap();
         let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
         dp.save_latest_block_header_number(0);
         dp.save_latest_block_header_hash(id.as_bytes());
@@ -335,7 +335,7 @@ mod tests {
             &state,
             inputs.assets,
             tron_types::mainnet_witnesses(),
-        );
+        ).unwrap();
         drop(stores);
         data
     }

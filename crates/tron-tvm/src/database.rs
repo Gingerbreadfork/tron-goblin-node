@@ -218,7 +218,7 @@ impl DatabaseRef for TronDatabase {
         if code_hash == revm::primitives::KECCAK_EMPTY {
             return Ok(Bytecode::default());
         }
-        let bytes = self.code.get(code_hash.as_slice()).unwrap_or_default();
+        let bytes = self.code.get(code_hash.as_slice())?.unwrap_or_default();
         Ok(Bytecode::new_raw(bytes.into()))
     }
 
@@ -230,7 +230,7 @@ impl DatabaseRef for TronDatabase {
         let tron_addr = evm_to_tron_address(&address);
         let key_bytes: [u8; 32] = index.to_be_bytes();
         let composite = self.compose_storage_key(&tron_addr, &key_bytes);
-        let raw = self.storage.get(&composite).unwrap_or_default();
+        let raw = self.storage.get(&composite)?.unwrap_or_default();
         if raw.is_empty() {
             return Ok(StorageValue::ZERO);
         }
@@ -296,7 +296,9 @@ impl DatabaseCommit for TronDatabase {
             // java-tron's behavior — historical state isn't garbage-
             // collected on selfdestruct).
             if account.is_selfdestructed() {
-                self.accounts.delete(&tron_addr);
+                self.accounts
+                    .delete(&tron_addr)
+                    .expect("db error in DatabaseCommit::commit deleting selfdestructed account");
                 continue;
             }
 
@@ -333,7 +335,9 @@ impl DatabaseCommit for TronDatabase {
             if let Some(code) = &account.info.code {
                 let raw = code.original_byte_slice();
                 if !raw.is_empty() {
-                    self.code.put(account.info.code_hash.as_slice(), raw);
+                    self.code
+                        .put(account.info.code_hash.as_slice(), raw)
+                        .expect("db error in DatabaseCommit::commit writing code");
                     tron_account.code_hash = account.info.code_hash.to_vec();
                     // `code` is stored both on the account and in CodeStore
                     // in java-tron; we mirror that.
@@ -341,7 +345,9 @@ impl DatabaseCommit for TronDatabase {
                 }
             }
 
-            self.accounts.put(&tron_addr, &tron_account);
+            self.accounts
+                .put(&tron_addr, &tron_account)
+                .expect("db error in DatabaseCommit::commit writing account");
 
             // Apply storage diffs.
             for (slot_key, slot) in &account.storage {
@@ -351,7 +357,9 @@ impl DatabaseCommit for TronDatabase {
                 let slot_bytes: [u8; 32] = slot_key.to_be_bytes();
                 let composite = self.compose_storage_key(&tron_addr, &slot_bytes);
                 let value_bytes: [u8; 32] = slot.present_value.to_be_bytes();
-                self.storage.put(&composite, &value_bytes);
+                self.storage
+                    .put(&composite, &value_bytes)
+                    .expect("db error in DatabaseCommit::commit writing storage slot");
             }
         }
     }

@@ -42,6 +42,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 /// Stable per-store identifier used inside [`BlockUndoRecord`]. The
 /// numeric values are part of the on-disk wire format — **never
@@ -242,6 +243,16 @@ pub enum DecodeError {
     UnknownStoreId(u8),
     #[error("bad 'has before' flag {0} (must be 0 or 1)")]
     BadHasFlag(u8),
+    /// Wraps a [`crate::KvError`] surfaced from the underlying backend
+    /// while reading or scanning undo records.
+    #[error("kv backend: {0}")]
+    Backend(String),
+}
+
+impl From<crate::KvError> for DecodeError {
+    fn from(e: crate::KvError) -> Self {
+        DecodeError::Backend(e.to_string())
+    }
 }
 
 /// Typed wrapper over the raw KvBackend holding the per-block undo
@@ -270,38 +281,40 @@ impl BlockUndoStore {
     /// the cheapest API on `KvBackend` that exposes the sync option;
     /// the cost of one extra heap allocation per block is dwarfed
     /// by the fsync itself.
-    pub fn put(&self, block_num: i64, record: &BlockUndoRecord) {
+    pub fn put(&self, block_num: i64, record: &BlockUndoRecord) -> Result<(), StoreError> {
         let ops = [crate::backend::WriteOp::Put(
             num_key(block_num).to_vec(),
             record.encode(),
         )];
-        self.backend.write_batch_sync(&ops);
+        self.backend.write_batch_sync(&ops)?;
+        Ok(())
     }
 
     /// Read the undo log for `block_num`. `None` when there's no
     /// record (typically: block was never applied, or the record was
     /// pruned because the block is now beyond the reorg horizon).
     pub fn get(&self, block_num: i64) -> Result<Option<BlockUndoRecord>, DecodeError> {
-        match self.backend.get(&num_key(block_num)) {
+        match self.backend.get(&num_key(block_num))? {
             Some(bytes) => BlockUndoRecord::decode(&bytes).map(Some),
             None => Ok(None),
         }
     }
 
     /// Drop the record for `block_num`. Idempotent.
-    pub fn delete(&self, block_num: i64) {
-        self.backend.delete(&num_key(block_num));
+    pub fn delete(&self, block_num: i64) -> Result<(), StoreError> {
+        self.backend.delete(&num_key(block_num))?;
+        Ok(())
     }
 
     /// Drop every record with `block_num < threshold`. Used after a
     /// block is solidified beyond the reorg window — once a block is
     /// PBFT-confirmed by 2/3 of SRs, no reorg can pull it back, so the
     /// undo log is dead weight.
-    pub fn prune_below(&self, threshold: i64) {
+    pub fn prune_below(&self, threshold: i64) -> Result<(), StoreError> {
         // Scan keys via the backend's scan_all() — fine for the
         // expected sizes (a few thousand block_num entries at most;
         // pruning runs lazily, not in the hot path).
-        for (k, _) in self.backend.scan_all() {
+        for (k, _) in self.backend.scan_all()? {
             if k.len() != 8 {
                 continue;
             }
@@ -309,9 +322,10 @@ impl BlockUndoStore {
             buf.copy_from_slice(&k);
             let n = i64::from_be_bytes(buf);
             if n < threshold {
-                self.backend.delete(&k);
+                self.backend.delete(&k)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -399,10 +413,10 @@ mod tests {
                 before: Some(vec![9]),
             }],
         };
-        s.put(42, &rec);
+        s.put(42, &rec).unwrap();
         let got = s.get(42).unwrap().unwrap();
         assert_eq!(got, rec);
-        s.delete(42);
+        s.delete(42).unwrap();
         assert!(s.get(42).unwrap().is_none());
     }
 
@@ -412,9 +426,9 @@ mod tests {
         let s = BlockUndoStore::new(be);
         let rec = BlockUndoRecord::new();
         for n in 1..=10i64 {
-            s.put(n, &rec);
+            s.put(n, &rec).unwrap();
         }
-        s.prune_below(6);
+        s.prune_below(6).unwrap();
         for n in 1..=5 {
             assert!(s.get(n).unwrap().is_none(), "block {n} should be pruned");
         }

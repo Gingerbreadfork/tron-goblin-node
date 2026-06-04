@@ -45,7 +45,7 @@ pub fn validate_witness_create(
     let owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    if witnesses.contains(&owner) {
+    if witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessAlreadyExists);
     }
     let fee = dyn_props
@@ -76,7 +76,7 @@ pub fn execute_witness_create(
         .unwrap_or(9_999_000_000);
     owner_account.balance = check_sub(owner_account.balance, fee)?;
     owner_account.is_witness = true;
-    accounts.put(&owner, &owner_account);
+    accounts.put(&owner, &owner_account)?;
 
     let witness = Witness {
         address: owner.as_bytes().to_vec(),
@@ -89,7 +89,7 @@ pub fn execute_witness_create(
         latest_slot_num: 0,
         is_jobs: false,
     };
-    witnesses.put(&owner, &witness);
+    witnesses.put(&owner, &witness)?;
 
     Ok(ExecutionResult {
         fee,
@@ -113,7 +113,7 @@ pub fn validate_witness_update(
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
     }
-    if !witnesses.contains(&owner) {
+    if !witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessMissing);
     }
     Ok(())
@@ -128,7 +128,7 @@ pub fn execute_witness_update(
         .get(&owner)?
         .ok_or(ActuatorError::WitnessMissing)?;
     witness.url = String::from_utf8_lossy(&contract.update_url).into_owned();
-    witnesses.put(&owner, &witness);
+    witnesses.put(&owner, &witness)?;
     Ok(ExecutionResult::default())
 }
 
@@ -148,7 +148,7 @@ pub fn validate_update_brokerage(
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
     }
-    if !witnesses.contains(&owner) {
+    if !witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessMissing);
     }
     Ok(())
@@ -211,7 +211,7 @@ pub fn execute_withdraw_balance(
         .ok_or(ActuatorError::Overflow)?;
     account.allowance = 0;
     account.latest_withdraw_time = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     Ok(ExecutionResult::default())
 }

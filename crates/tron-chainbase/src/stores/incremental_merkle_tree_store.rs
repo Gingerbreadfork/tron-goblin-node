@@ -33,19 +33,20 @@ impl IncrementalMerkleTreeStore {
         Self { backend }
     }
 
-    pub fn put(&self, key: &[u8], tree: &IncrementalMerkleTree) {
-        self.backend.put(key, &tree.encode_to_vec());
+    pub fn put(&self, key: &[u8], tree: &IncrementalMerkleTree) -> Result<(), StoreError> {
+        self.backend.put(key, &tree.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<IncrementalMerkleTree>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         Ok(Some(IncrementalMerkleTree::decode(bytes.as_slice())?))
     }
 
-    pub fn contains(&self, key: &[u8]) -> bool {
-        self.backend.contains(key)
+    pub fn contains(&self, key: &[u8]) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(key)?)
     }
 }
 

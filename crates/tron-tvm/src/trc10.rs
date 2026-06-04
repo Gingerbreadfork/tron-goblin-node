@@ -246,7 +246,9 @@ impl Trc10Inspector {
             // cycle's threshold check sees the activity.
             let spent = gas_limit.saturating_sub(gas_remaining);
             if spent > 0 {
-                cs.add_energy_usage(&frame.target, spent as i64);
+                cs.add_energy_usage(&frame.target, spent as i64).expect(
+                    "db error in Trc10Inspector::record_frame_energy writing energy usage (factor=0)",
+                );
             }
             return;
         }
@@ -258,7 +260,9 @@ impl Trc10Inspector {
         let decimal: i128 = 10_000;
         let base = spent * decimal / (decimal + frame.factor as i128);
         if base > 0 {
-            cs.add_energy_usage(&frame.target, base as i64);
+            cs.add_energy_usage(&frame.target, base as i64).expect(
+                "db error in Trc10Inspector::record_frame_energy writing energy usage",
+            );
         }
     }
 }
@@ -454,8 +458,12 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         let new_target = target_pre.unwrap_or(0).saturating_add(transferred);
         target_account.asset_v2.insert(token_id_key.clone(), new_target);
 
-        accounts.put(&caller_addr, &caller_account);
-        accounts.put(&target_addr, &target_account);
+        accounts
+            .put(&caller_addr, &caller_account)
+            .expect("db error in Trc10Inspector::call writing caller account for CALLTOKEN transfer");
+        accounts
+            .put(&target_addr, &target_account)
+            .expect("db error in Trc10Inspector::call writing target account for CALLTOKEN transfer");
 
         self.pending.push(Some(PendingTransfer {
             caller_addr,
@@ -525,7 +533,9 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 caller_account.asset_v2.remove(&pending.token_id_key);
             }
         }
-        accounts.put(&pending.caller_addr, &caller_account);
+        accounts
+            .put(&pending.caller_addr, &caller_account)
+            .expect("db error in Trc10Inspector::call_end restoring caller account after revert");
 
         let mut target_account = accounts
             .get(&pending.target_addr)
@@ -542,7 +552,9 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 target_account.asset_v2.remove(&pending.token_id_key);
             }
         }
-        accounts.put(&pending.target_addr, &target_account);
+        accounts
+            .put(&pending.target_addr, &target_account)
+            .expect("db error in Trc10Inspector::call_end restoring target account after revert");
 
         // Suppress unused-field warning while not used.
         let _ = pending.transferred;

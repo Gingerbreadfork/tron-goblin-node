@@ -322,7 +322,9 @@ pub fn is_spend(
     )
     .map_err(Status::invalid_argument)?;
 
-    let is_spent = nullifiers.contains(&nf);
+    let is_spent = nullifiers
+        .contains(&nf)
+        .map_err(|e| Status::internal(format!("nullifier read: {e}")))?;
     let message = if is_spent {
         "Input note has been spent"
     } else {
@@ -1103,7 +1105,9 @@ pub fn scan_and_mark_note_by_ivk(
                         let is_spent = if bool::from(nk_point.is_some()) {
                             let nk = NullifierDerivingKey(nk_point.unwrap());
                             let nf = note.nf(&nk, leaf_position);
-                            nullifiers.contains(&nf.0)
+                            nullifiers
+                                .contains(&nf.0)
+                                .map_err(|e| Status::internal(format!("nullifier read: {e}")))?
                         } else {
                             false
                         };
@@ -1953,8 +1957,8 @@ mod scan_tests {
         let blocks_be = mem();
         let block_index_be = mem();
         let dp_be = mem();
-        BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-        BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+        BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+        BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
         let dp = DynamicPropertiesStore::new(dp_be.clone());
         dp.save_latest_block_header_number(1);
         dp.save_latest_block_header_hash(block_id.as_bytes());

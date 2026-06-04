@@ -39,15 +39,16 @@ impl BlockIndexStore {
         num.to_be_bytes()
     }
 
-    pub fn put(&self, id: &BlockId) {
+    pub fn put(&self, id: &BlockId) -> Result<(), StoreError> {
         self.backend
-            .put(&Self::key_for(id.num() as i64), id.as_bytes());
+            .put(&Self::key_for(id.num() as i64), id.as_bytes())?;
+        Ok(())
     }
 
     pub fn get(&self, num: i64) -> Result<BlockId, StoreError> {
         let bytes = self
             .backend
-            .get(&Self::key_for(num))
+            .get(&Self::key_for(num))?
             .ok_or(StoreError::NotFound)?;
         if bytes.len() != 32 {
             return Err(StoreError::InvalidValueLength {
@@ -60,8 +61,9 @@ impl BlockIndexStore {
         Ok(BlockId::from_raw(buf))
     }
 
-    pub fn delete(&self, num: i64) {
-        self.backend.delete(&Self::key_for(num));
+    pub fn delete(&self, num: i64) -> Result<(), StoreError> {
+        self.backend.delete(&Self::key_for(num))?;
+        Ok(())
     }
 
     /// Return up to `limit` consecutive `BlockId`s starting at block
@@ -112,7 +114,7 @@ mod tests {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = BlockIndexStore::new(backend);
         for n in 5..15 {
-            store.put(&id(n));
+            store.put(&id(n)).unwrap();
         }
         let out = store.get_limit_number(7, 4).unwrap();
         assert_eq!(out.len(), 4);
@@ -125,10 +127,10 @@ mod tests {
     fn get_limit_number_stops_at_first_gap() {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = BlockIndexStore::new(backend);
-        store.put(&id(10));
-        store.put(&id(11));
+        store.put(&id(10)).unwrap();
+        store.put(&id(11)).unwrap();
         // gap at 12
-        store.put(&id(13));
+        store.put(&id(13)).unwrap();
         let out = store.get_limit_number(10, 5).unwrap();
         assert_eq!(out.iter().map(|b| b.num()).collect::<Vec<_>>(), vec![10, 11]);
     }
@@ -137,7 +139,7 @@ mod tests {
     fn get_limit_number_zero_limit_returns_empty() {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = BlockIndexStore::new(backend);
-        store.put(&id(1));
+        store.put(&id(1)).unwrap();
         assert!(store.get_limit_number(1, 0).unwrap().is_empty());
     }
 }

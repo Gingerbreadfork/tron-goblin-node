@@ -127,7 +127,9 @@ impl TronDatabaseExt for TronDatabase {
                 expire_time: expire,
             });
         }
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_freeze writing owner account");
         let weight = frozen_balance / TRX_PRECISION;
         match resource_type {
             0 => dyn_props.add_total_net_weight(weight),
@@ -174,7 +176,9 @@ impl TronDatabaseExt for TronDatabase {
             Some(v) => v,
             None => return 0,
         };
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_unfreeze writing owner account");
         let weight = unlocked / TRX_PRECISION;
         match resource_type {
             0 => dyn_props.add_total_net_weight(-weight),
@@ -219,8 +223,12 @@ impl TronDatabaseExt for TronDatabase {
             });
             votes_capsule.new_votes.push(entry);
         }
-        self.accounts.put(&owner, &owner_account);
-        votes_store.put(&owner, &votes_capsule);
+        self.accounts
+            .put(&owner, &owner_account)
+            .expect("db error in TronDatabaseExt::tron_vote_witness writing owner account");
+        votes_store
+            .put(&owner, &votes_capsule)
+            .expect("db error in TronDatabaseExt::tron_vote_witness writing votes");
         1
     }
 
@@ -247,7 +255,9 @@ impl TronDatabaseExt for TronDatabase {
         };
         account.allowance = 0;
         account.latest_withdraw_time = now;
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_withdraw_reward writing owner account");
         // Credit the withdrawn allowance to the caller's journaled
         // balance.
         if allowance > 0 {
@@ -298,7 +308,9 @@ impl TronDatabaseExt for TronDatabase {
                 });
             }
         }
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_freeze_balance_v2 writing owner account");
         let new_resource_balance = old_resource_balance.saturating_add(frozen_balance);
         let weight_delta =
             new_resource_balance / TRX_PRECISION - old_resource_balance / TRX_PRECISION;
@@ -353,7 +365,9 @@ impl TronDatabaseExt for TronDatabase {
             unfreeze_amount: unfreeze_balance,
             unfreeze_expire_time: now + delay_ms,
         });
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_unfreeze_balance_v2 writing owner account");
         // Shrink chain-wide weight by the unfrozen amount.
         let weight_delta = (old_resource_balance - unfreeze_balance) / TRX_PRECISION
             - old_resource_balance / TRX_PRECISION;
@@ -390,7 +404,9 @@ impl TronDatabaseExt for TronDatabase {
                 }),
             }
         }
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_cancel_all_unfreeze_v2 writing owner account");
         1
     }
 
@@ -419,7 +435,9 @@ impl TronDatabaseExt for TronDatabase {
             Some(v) => v,
             None => return 0,
         };
-        self.accounts.put(&owner, &account);
+        self.accounts
+            .put(&owner, &account)
+            .expect("db error in TronDatabaseExt::tron_withdraw_expire_unfreeze writing owner account");
         // Credit the swept matured-unfreeze amount to the caller's
         // journaled balance.
         if withdrawn > 0 {
@@ -496,12 +514,24 @@ impl TronDatabaseExt for TronDatabase {
             }
             _ => {}
         }
-        self.accounts.put(&owner, &owner_account);
-        self.accounts.put(&receiver, &receiver_account);
+        self.accounts
+            .put(&owner, &owner_account)
+            .expect("db error in TronDatabaseExt::tron_delegate_resource writing owner account");
+        self.accounts
+            .put(&receiver, &receiver_account)
+            .expect("db error in TronDatabaseExt::tron_delegate_resource writing receiver account");
         // Write the DelegatedResource record so receiver-side reads see
         // the delegation. v2-unlocked key = (from, to).
         let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(&owner, &receiver);
-        let mut record = resources.get_raw(&key).ok().flatten().unwrap_or_default();
+        // `Ok(None)` (no prior record) legitimately starts from default, but a
+        // real IO error must NOT silently fabricate a fresh record — that would
+        // overwrite an existing delegation with divergent state. Fail-stop on
+        // IO error, consistent with the sibling `.put(...).expect(...)` writes
+        // below (the precompile host has no fallible-return channel).
+        let mut record = resources
+            .get_raw(&key)
+            .expect("db error in TronDatabaseExt::tron_delegate_resource reading delegated resource record")
+            .unwrap_or_default();
         record.from = owner.as_bytes().to_vec();
         record.to = receiver.as_bytes().to_vec();
         match resource {
@@ -517,7 +547,9 @@ impl TronDatabaseExt for TronDatabase {
             }
             _ => {}
         }
-        resources.put_raw(&key, &record);
+        resources
+            .put_raw(&key, &record)
+            .expect("db error in TronDatabaseExt::tron_delegate_resource writing delegated resource record");
         1
     }
 
@@ -556,7 +588,9 @@ impl TronDatabaseExt for TronDatabase {
             1 => record.frozen_balance_for_energy -= balance,
             _ => {}
         }
-        resources.put_raw(&key, &record);
+        resources
+            .put_raw(&key, &record)
+            .expect("db error in TronDatabaseExt::tron_undelegate_resource writing delegated resource record");
         // Credit owner's FreezeV2 back, debit receiver's acquired_*.
         if let Ok(Some(mut owner_account)) = self.accounts.get(&owner) {
             let slot = owner_account
@@ -584,7 +618,9 @@ impl TronDatabaseExt for TronDatabase {
                 }
                 _ => {}
             }
-            self.accounts.put(&owner, &owner_account);
+            self.accounts
+                .put(&owner, &owner_account)
+                .expect("db error in TronDatabaseExt::tron_undelegate_resource writing owner account");
         }
         if let Ok(Some(mut receiver_account)) = self.accounts.get(&receiver) {
             match resource {
@@ -603,7 +639,9 @@ impl TronDatabaseExt for TronDatabase {
                 }
                 _ => {}
             }
-            self.accounts.put(&receiver, &receiver_account);
+            self.accounts
+                .put(&receiver, &receiver_account)
+                .expect("db error in TronDatabaseExt::tron_undelegate_resource writing receiver account");
         }
         1
     }
@@ -704,7 +742,8 @@ mod tests {
         };
         acct.asset_v2.insert("1000001".to_string(), 12_345);
         db.accounts
-            .put(&TronAddress::from_raw(owner), &acct);
+            .put(&TronAddress::from_raw(owner), &acct)
+            .unwrap();
 
         let evm_addr = evm_addr_from_tron(owner);
         assert_eq!(
@@ -731,7 +770,8 @@ mod tests {
             ..Default::default()
         };
         db.accounts
-            .put(&TronAddress::from_raw(contract), &acct);
+            .put(&TronAddress::from_raw(contract), &acct)
+            .unwrap();
         assert!(
             TronDatabaseExt::tron_is_contract(&db, evm_addr_from_tron(contract)),
             "contract with non-empty code_hash must be is_contract == true"
@@ -742,14 +782,16 @@ mod tests {
     fn is_contract_returns_false_for_eoa_and_missing() {
         let db = make_db();
         let eoa = tron_addr(0xdd);
-        db.accounts.put(
-            &TronAddress::from_raw(eoa),
-            &Account {
-                address: eoa.to_vec(),
-                code_hash: vec![],
-                ..Default::default()
-            },
-        );
+        db.accounts
+            .put(
+                &TronAddress::from_raw(eoa),
+                &Account {
+                    address: eoa.to_vec(),
+                    code_hash: vec![],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(!TronDatabaseExt::tron_is_contract(&db, evm_addr_from_tron(eoa)));
         assert!(!TronDatabaseExt::tron_is_contract(
             &db,

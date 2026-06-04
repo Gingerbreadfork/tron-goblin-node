@@ -167,7 +167,7 @@ fn rejects_duplicate_nullifiers_within_tx() {
         ..Default::default()
     };
     // Pre-spend that nullifier.
-    nullifiers.put(&[0xaau8; 32]);
+    nullifiers.put(&[0xaau8; 32]).unwrap();
     let err = validate_shielded_transfer(&accounts, &dp, &nullifiers, None, &c, &[0u8; 32], 0)
         .unwrap_err();
     assert!(matches!(err, ActuatorError::Validate(s) if s.contains("spent")));
@@ -259,11 +259,11 @@ fn execute_records_nullifier() {
         ..Default::default()
     };
     // Nullifier not yet spent.
-    assert!(!nullifiers.contains(&[0x77u8; 32]));
+    assert!(!nullifiers.contains(&[0x77u8; 32]).unwrap());
     let result = execute_shielded_transfer(&accounts, &dp, &nullifiers, None, &c).unwrap();
     assert_eq!(result.fee, 0); // no SHIELDED_TRANSACTION_FEE set ⇒ 0.
     // Nullifier now recorded.
-    assert!(nullifiers.contains(&[0x77u8; 32]));
+    assert!(nullifiers.contains(&[0x77u8; 32]).unwrap());
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn execute_debits_zen_from_transparent_sender() {
     sender.asset_v2.insert(zen.to_string(), 1_000);
     let mut buf = [0u8; 21];
     buf.copy_from_slice(&from);
-    accounts.put(&tron_crypto::address::Address::from_raw(buf), &sender);
+    accounts.put(&tron_crypto::address::Address::from_raw(buf), &sender).unwrap();
 
     let c = ShieldedTransferContract {
         transparent_from_address: from.clone(),
@@ -341,7 +341,7 @@ fn execute_rejects_insufficient_zen_balance() {
     sender.asset_v2.insert(zen.to_string(), 100); // only 100 Zen
     let mut buf = [0u8; 21];
     buf.copy_from_slice(&from);
-    accounts.put(&tron_crypto::address::Address::from_raw(buf), &sender);
+    accounts.put(&tron_crypto::address::Address::from_raw(buf), &sender).unwrap();
 
     let c = ShieldedTransferContract {
         transparent_from_address: from,
@@ -371,7 +371,7 @@ fn execute_updates_total_shielded_pool_value() {
     sender.asset_v2.insert(zen.to_string(), 10_000);
     let mut buf = [0u8; 21];
     buf.copy_from_slice(&from);
-    accounts.put(&tron_crypto::address::Address::from_raw(buf), &sender);
+    accounts.put(&tron_crypto::address::Address::from_raw(buf), &sender).unwrap();
 
     let c = ShieldedTransferContract {
         transparent_from_address: from,
@@ -386,7 +386,7 @@ fn execute_updates_total_shielded_pool_value() {
 #[test]
 fn execute_rejects_double_spend() {
     let (accounts, dp, nullifiers) = enabled_stores();
-    nullifiers.put(&[0xccu8; 32]);
+    nullifiers.put(&[0xccu8; 32]).unwrap();
     let mut sd = minimal_spend(0xcc);
     sd.nullifier = vec![0xccu8; 32];
     let c = ShieldedTransferContract {

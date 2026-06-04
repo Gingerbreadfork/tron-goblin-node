@@ -29,12 +29,13 @@ impl AccountIndexStore {
         Self { backend }
     }
 
-    pub fn put(&self, name: &[u8], address: &Address) {
-        self.backend.put(name, address.as_bytes());
+    pub fn put(&self, name: &[u8], address: &Address) -> Result<(), StoreError> {
+        self.backend.put(name, address.as_bytes())?;
+        Ok(())
     }
 
     pub fn get(&self, name: &[u8]) -> Result<Option<Address>, StoreError> {
-        let Some(bytes) = self.backend.get(name) else {
+        let Some(bytes) = self.backend.get(name)? else {
             return Ok(None);
         };
         if bytes.len() != ADDRESS_LENGTH {

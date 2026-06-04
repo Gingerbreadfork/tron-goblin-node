@@ -43,14 +43,15 @@ impl AccountIdIndexStore {
         }
     }
 
-    pub fn put(&self, account_id: &[u8], address: &Address) {
+    pub fn put(&self, account_id: &[u8], address: &Address) -> Result<(), StoreError> {
         let key = Self::normalize_id(account_id);
-        self.backend.put(&key, address.as_bytes());
+        self.backend.put(&key, address.as_bytes())?;
+        Ok(())
     }
 
     pub fn get(&self, account_id: &[u8]) -> Result<Option<Address>, StoreError> {
         let key = Self::normalize_id(account_id);
-        let Some(bytes) = self.backend.get(&key) else {
+        let Some(bytes) = self.backend.get(&key)? else {
             return Ok(None);
         };
         if bytes.len() != ADDRESS_LENGTH {

@@ -73,7 +73,7 @@ pub fn execute_freeze_balance(
     } else {
         account.frozen.push(new_frozen);
     }
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     // Bump chain-wide weight. java-tron's `FreezeBalanceActuator.execute`:
     //   weight = freezeBalance / TRX_PRECISION
@@ -143,7 +143,7 @@ pub fn execute_unfreeze_balance(
         }
     });
     account.balance = check_add(account.balance, unlocked)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
 
     // Shrink chain-wide weight by the unlocked amount, for the
     // resource declared on the contract.

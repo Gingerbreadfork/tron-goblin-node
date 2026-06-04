@@ -42,7 +42,7 @@ async fn spawn_http_server() -> (std::net::SocketAddr, RpcState, AccountStore, B
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Seed a head block (num = 1) so getnowblock has something to return.
     let mut block = Block {
@@ -62,8 +62,8 @@ async fn spawn_http_server() -> (std::net::SocketAddr, RpcState, AccountStore, B
         transactions: Vec::new(),
     };
     let block_id = block_id_from_block(&block).unwrap();
-    blocks.put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    blocks.put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     let dp = DynamicPropertiesStore::new(dp_be.clone());
     dp.save_latest_block_header_number(1);
     dp.save_latest_block_header_hash(block_id.as_bytes());
@@ -86,7 +86,7 @@ async fn spawn_http_server() -> (std::net::SocketAddr, RpcState, AccountStore, B
             is_jobs: true,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Need access to the block as well so we can return it from spawn.
     let _ = block.block_header.as_mut();

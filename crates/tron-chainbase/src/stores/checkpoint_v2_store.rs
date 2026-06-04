@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub struct CheckPointV2Store {
     backend: Arc<dyn KvBackend>,
@@ -31,11 +32,12 @@ impl CheckPointV2Store {
         // Intentionally empty — matches java-tron upstream.
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.backend.get(key)
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(key)?)
     }
 
-    pub fn delete(&self, key: &[u8]) {
-        self.backend.delete(key);
+    pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.backend.delete(key)?;
+        Ok(())
     }
 }

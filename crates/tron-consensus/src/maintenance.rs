@@ -142,7 +142,7 @@ pub fn update_active_witnesses(
         };
         let delta = *deltas.get(addr).unwrap_or(&0);
         witness.vote_count = witness.vote_count.saturating_add(delta);
-        witnesses.put(addr, &witness);
+        witnesses.put(addr, &witness)?;
         ranked.push((*addr, witness.vote_count));
     }
 
@@ -157,7 +157,7 @@ pub fn update_active_witnesses(
     // 4. Compare to previous list and persist.
     let prev_active = schedule.load_active()?.unwrap_or_default();
     let changed = prev_active != new_active;
-    schedule.save_active(&new_active);
+    schedule.save_active(&new_active)?;
 
     // 5. Build the per-witness delta report (only entries with non-zero deltas).
     let mut vote_deltas: Vec<(Address, i64)> = deltas.into_iter().collect();
@@ -264,7 +264,7 @@ pub fn apply_maintenance(
     )?;
     // Clear the votes store so the next cycle starts fresh.
     for (voter, _) in &all_votes {
-        votes.delete(voter);
+        votes.delete(voter)?;
     }
 
     // ── Step 3: legacy IncentiveManager.reward (only when flag off).
@@ -289,7 +289,7 @@ pub fn apply_maintenance(
                 }
                 if let Some(mut acct) = accounts.get(addr)? {
                     acct.allowance = acct.allowance.saturating_add(pay);
-                    accounts.put(addr, &acct);
+                    accounts.put(addr, &acct)?;
                 }
             }
         }
@@ -302,13 +302,13 @@ pub fn apply_maintenance(
         for addr in prev_set.difference(&new_set) {
             if let Some(mut w) = witnesses.get(addr)? {
                 w.is_jobs = false;
-                witnesses.put(addr, &w);
+                witnesses.put(addr, &w)?;
             }
         }
         for addr in new_set.difference(&prev_set) {
             if let Some(mut w) = witnesses.get(addr)? {
                 w.is_jobs = true;
-                witnesses.put(addr, &w);
+                witnesses.put(addr, &w)?;
             }
         }
     }

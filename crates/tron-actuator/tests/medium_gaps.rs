@@ -50,7 +50,7 @@ fn put_account(accounts: &AccountStore, who: [u8; 21], balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 // ============================================================
@@ -166,7 +166,7 @@ fn market_cancel_rejects_order_owned_by_someone_else() {
         state: OrderState::Active as i32,
         ..Default::default()
     };
-    orders.put(&order_id, &order);
+    orders.put(&order_id, &order).unwrap();
     let c = MarketCancelOrderContract {
         owner_address: ALICE.to_vec(), // Alice tries to cancel Bob's order
         order_id,
@@ -189,7 +189,7 @@ fn market_cancel_rejects_already_canceled_order() {
         state: OrderState::Canceled as i32,
         ..Default::default()
     };
-    orders.put(&order_id, &order);
+    orders.put(&order_id, &order).unwrap();
     let c = MarketCancelOrderContract {
         owner_address: ALICE.to_vec(),
         order_id,
@@ -213,7 +213,7 @@ fn market_sell_then_cancel_returns_unfilled_quantity() {
             asset_v2: BTreeMap::from([("1000001".to_string(), 200i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     let sell = MarketSellAssetContract {
         owner_address: ALICE.to_vec(),
         sell_token_id: b"1000001".to_vec(),
@@ -366,7 +366,7 @@ fn set_account_id_rejects_account_with_existing_id() {
         ..Default::default()
     };
     alice.account_id = b"already-set".to_vec();
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = SetAccountIdContract {
         owner_address: ALICE.to_vec(),
         account_id: b"new-id-12345".to_vec(),
@@ -380,7 +380,7 @@ fn set_account_id_rejects_taken_id() {
     let accounts = AccountStore::new(mem());
     let idx = AccountIdIndexStore::new(mem());
     put_account(&accounts, ALICE, 0);
-    idx.put(b"my-id-12345", &addr(BOB));
+    idx.put(b"my-id-12345", &addr(BOB)).unwrap();
     let c = SetAccountIdContract {
         owner_address: ALICE.to_vec(),
         account_id: b"my-id-12345".to_vec(),
@@ -415,7 +415,7 @@ fn update_brokerage_rejects_out_of_range() {
     let accounts = AccountStore::new(mem());
     let witnesses = WitnessStore::new(mem());
     put_account(&accounts, ALICE, 0);
-    witnesses.put(&addr(ALICE), &Witness::default());
+    witnesses.put(&addr(ALICE), &Witness::default()).unwrap();
     for b in [-1, 101, 200, i32::MAX] {
         let c = UpdateBrokerageContract {
             owner_address: ALICE.to_vec(),
@@ -460,7 +460,7 @@ fn update_brokerage_accepts_boundary_values() {
     let witnesses = WitnessStore::new(mem());
     let delegation = DelegationStore::new(mem());
     put_account(&accounts, ALICE, 0);
-    witnesses.put(&addr(ALICE), &Witness::default());
+    witnesses.put(&addr(ALICE), &Witness::default()).unwrap();
     for b in [0, 100] {
         let c = UpdateBrokerageContract {
             owner_address: ALICE.to_vec(),
@@ -510,7 +510,7 @@ fn withdraw_rejects_too_soon_after_previous() {
         ..Default::default()
     };
     alice.latest_withdraw_time = 1_000_000 - 1; // very recent withdraw
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = WithdrawBalanceContract {
         owner_address: ALICE.to_vec(),
     };
@@ -530,7 +530,7 @@ fn withdraw_drains_allowance_into_balance() {
         allowance: 1_000_000,
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = WithdrawBalanceContract {
         owner_address: ALICE.to_vec(),
     };
@@ -583,7 +583,7 @@ fn unfreeze_asset_rejects_when_all_entries_still_locked() {
         }],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = UnfreezeAssetContract {
         owner_address: ALICE.to_vec(),
     };
@@ -612,7 +612,7 @@ fn unfreeze_asset_releases_only_expired_entries() {
             expire_time: 9_000, // future
         },
     ];
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = UnfreezeAssetContract {
         owner_address: ALICE.to_vec(),
     };

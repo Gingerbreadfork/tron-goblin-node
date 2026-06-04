@@ -29,12 +29,13 @@ impl TreeBlockIndexStore {
         block_num.to_be_bytes()
     }
 
-    pub fn put(&self, block_num: i64, block_id_bytes: &[u8]) {
-        self.backend.put(&Self::key_for(block_num), block_id_bytes);
+    pub fn put(&self, block_num: i64, block_id_bytes: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(block_num), block_id_bytes)?;
+        Ok(())
     }
 
     pub fn get(&self, block_num: i64) -> Result<Option<[u8; 32]>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::key_for(block_num)) else {
+        let Some(bytes) = self.backend.get(&Self::key_for(block_num))? else {
             return Ok(None);
         };
         if bytes.len() != 32 {

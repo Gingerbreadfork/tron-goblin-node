@@ -48,19 +48,20 @@ impl WitnessScheduleStore {
     /// Pack a witness list into the flat 21*N-byte buffer java-tron
     /// expects, and write it under `species`. Use [`keys::ACTIVE_WITNESSES`]
     /// or [`keys::CURRENT_SHUFFLED_WITNESSES`] for the species.
-    pub fn save(&self, species: &[u8], witnesses: &[Address]) {
+    pub fn save(&self, species: &[u8], witnesses: &[Address]) -> Result<(), StoreError> {
         let mut buf = Vec::with_capacity(witnesses.len() * ADDRESS_LENGTH);
         for addr in witnesses {
             buf.extend_from_slice(addr.as_bytes());
         }
-        self.backend.put(species, &buf);
+        self.backend.put(species, &buf)?;
+        Ok(())
     }
 
     /// Read a packed witness list. Returns `Ok(None)` if the species
     /// hasn't been written yet; errors if the stored buffer length isn't
     /// a multiple of 21.
     pub fn load(&self, species: &[u8]) -> Result<Option<Vec<Address>>, StoreError> {
-        let Some(bytes) = self.backend.get(species) else {
+        let Some(bytes) = self.backend.get(species)? else {
             return Ok(None);
         };
         if bytes.len() % ADDRESS_LENGTH != 0 {
@@ -78,16 +79,16 @@ impl WitnessScheduleStore {
         Ok(Some(out))
     }
 
-    pub fn save_active(&self, witnesses: &[Address]) {
-        self.save(keys::ACTIVE_WITNESSES, witnesses);
+    pub fn save_active(&self, witnesses: &[Address]) -> Result<(), StoreError> {
+        self.save(keys::ACTIVE_WITNESSES, witnesses)
     }
 
     pub fn load_active(&self) -> Result<Option<Vec<Address>>, StoreError> {
         self.load(keys::ACTIVE_WITNESSES)
     }
 
-    pub fn save_shuffled(&self, witnesses: &[Address]) {
-        self.save(keys::CURRENT_SHUFFLED_WITNESSES, witnesses);
+    pub fn save_shuffled(&self, witnesses: &[Address]) -> Result<(), StoreError> {
+        self.save(keys::CURRENT_SHUFFLED_WITNESSES, witnesses)
     }
 
     pub fn load_shuffled(&self) -> Result<Option<Vec<Address>>, StoreError> {

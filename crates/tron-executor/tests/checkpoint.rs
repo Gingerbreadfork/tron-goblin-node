@@ -103,7 +103,8 @@ fn seed_witness(state: &StateBackends) {
             address: addr(0xaa).to_vec(),
             ..Default::default()
         },
-    );
+    )
+    .unwrap();
 }
 
 fn tmp_checkpoint_root() -> PathBuf {
@@ -120,38 +121,38 @@ fn tmp_checkpoint_root() -> PathBuf {
 /// per store — sufficient to byte-compare two state trees.
 fn snapshot_state(state: &StateBackends) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
     let mut all: Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> = vec![
-        ("accounts", state.accounts.scan_all()),
-        ("witnesses", state.witnesses.scan_all()),
-        ("votes", state.votes.scan_all()),
-        ("delegation", state.delegation.scan_all()),
-        ("delegated_resources", state.delegated_resources.scan_all()),
-        ("dyn_props", state.dyn_props.scan_all()),
-        ("proposals", state.proposals.scan_all()),
-        ("name_index", state.name_index.scan_all()),
-        ("id_index", state.id_index.scan_all()),
-        ("asset_v1", state.asset_v1.scan_all()),
-        ("asset_v2", state.asset_v2.scan_all()),
-        ("contracts", state.contracts.scan_all()),
-        ("abi", state.abi.scan_all()),
-        ("exchange_v1", state.exchange_v1.scan_all()),
-        ("exchange_v2", state.exchange_v2.scan_all()),
-        ("market_orders", state.market_orders.scan_all()),
-        ("nullifiers", state.nullifiers.scan_all()),
+        ("accounts", state.accounts.scan_all().unwrap()),
+        ("witnesses", state.witnesses.scan_all().unwrap()),
+        ("votes", state.votes.scan_all().unwrap()),
+        ("delegation", state.delegation.scan_all().unwrap()),
+        ("delegated_resources", state.delegated_resources.scan_all().unwrap()),
+        ("dyn_props", state.dyn_props.scan_all().unwrap()),
+        ("proposals", state.proposals.scan_all().unwrap()),
+        ("name_index", state.name_index.scan_all().unwrap()),
+        ("id_index", state.id_index.scan_all().unwrap()),
+        ("asset_v1", state.asset_v1.scan_all().unwrap()),
+        ("asset_v2", state.asset_v2.scan_all().unwrap()),
+        ("contracts", state.contracts.scan_all().unwrap()),
+        ("abi", state.abi.scan_all().unwrap()),
+        ("exchange_v1", state.exchange_v1.scan_all().unwrap()),
+        ("exchange_v2", state.exchange_v2.scan_all().unwrap()),
+        ("market_orders", state.market_orders.scan_all().unwrap()),
+        ("nullifiers", state.nullifiers.scan_all().unwrap()),
     ];
     if let Some(b) = &state.code {
-        all.push(("code", b.scan_all()));
+        all.push(("code", b.scan_all().unwrap()));
     }
     if let Some(b) = &state.storage_row {
-        all.push(("storage_row", b.scan_all()));
+        all.push(("storage_row", b.scan_all().unwrap()));
     }
     if let Some(b) = &state.contract_state {
-        all.push(("contract_state", b.scan_all()));
+        all.push(("contract_state", b.scan_all().unwrap()));
     }
     if let Some(b) = &state.block_index {
-        all.push(("block_index", b.scan_all()));
+        all.push(("block_index", b.scan_all().unwrap()));
     }
     if let Some(b) = &state.witness_schedule {
-        all.push(("witness_schedule", b.scan_all()));
+        all.push(("witness_schedule", b.scan_all().unwrap()));
     }
     for (_, kvs) in &mut all {
         kvs.sort();
@@ -431,9 +432,9 @@ fn witness_schedule_writes_appear_in_the_manifest() {
 
     let parent = mem();
     let session = SessionBackend::new(parent.clone());
-    session.put(b"shuffled-witnesses", b"some-bytes");
+    session.put(b"shuffled-witnesses", b"some-bytes").unwrap();
 
-    let (ops, _undo) = session.drain_pending_with_undo();
+    let (ops, _undo) = session.drain_pending_with_undo().unwrap();
     assert_eq!(ops.len(), 1);
     let key = match &ops[0] {
         WriteOp::Put(k, _) => k.clone(),
@@ -455,7 +456,7 @@ fn witness_schedule_writes_appear_in_the_manifest() {
     let mut state = fresh_state();
     state.witness_schedule = Some(parent.clone());
     replay_pending_checkpoints(&state, &cp).unwrap();
-    assert_eq!(parent.get(&key), Some(b"some-bytes".to_vec()));
+    assert_eq!(parent.get(&key).unwrap(), Some(b"some-bytes".to_vec()));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -564,8 +565,8 @@ fn checkpoint_path_undo_log_matches_no_checkpoint_path() {
     }
 
     assert_eq!(
-        state.accounts.scan_all().len(),
-        state_ref.accounts.scan_all().len(),
+        state.accounts.scan_all().unwrap().len(),
+        state_ref.accounts.scan_all().unwrap().len(),
         "account store size should match between the two paths"
     );
 

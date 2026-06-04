@@ -137,7 +137,7 @@ pub fn execute_transfer(
         .balance
         .checked_sub(total_out)
         .ok_or(ActuatorError::Overflow)?;
-    accounts.put(&owner, &owner_account);
+    accounts.put(&owner, &owner_account)?;
 
     // Credit amount to recipient.
     let mut to_acct = to_account.expect("filled in above");
@@ -145,7 +145,7 @@ pub fn execute_transfer(
         .balance
         .checked_add(contract.amount)
         .ok_or(ActuatorError::Overflow)?;
-    accounts.put(&to, &to_acct);
+    accounts.put(&to, &to_acct)?;
 
     // The fee in java-tron is either burned (blackhole optimisation) or
     // credited to the blackhole account. For v1 we treat it as

@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "recent-transaction";
 
@@ -29,11 +30,12 @@ impl RecentTransactionStore {
         ((block_num & 0xFFFF) as u16).to_be_bytes()
     }
 
-    pub fn put(&self, block_num: i64, value: &[u8]) {
-        self.backend.put(&Self::key_for(block_num), value);
+    pub fn put(&self, block_num: i64, value: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(block_num), value)?;
+        Ok(())
     }
 
-    pub fn get(&self, block_num: i64) -> Option<Vec<u8>> {
-        self.backend.get(&Self::key_for(block_num))
+    pub fn get(&self, block_num: i64) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(&Self::key_for(block_num))?)
     }
 }

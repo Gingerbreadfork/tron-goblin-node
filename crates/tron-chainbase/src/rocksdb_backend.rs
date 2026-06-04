@@ -23,7 +23,13 @@ use std::sync::Arc;
 
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 
-use crate::backend::{KvBackend, WriteOp};
+use crate::backend::{KvBackend, KvError, WriteOp};
+
+impl From<rocksdb::Error> for KvError {
+    fn from(e: rocksdb::Error) -> Self {
+        KvError::Backend(format!("rocksdb: {e}"))
+    }
+}
 
 /// Build an `Options` with the parity-friendly defaults this crate
 /// applies to every RocksDB open path. Centralised so the four open
@@ -223,30 +229,21 @@ impl RocksDbBackend {
 }
 
 impl KvBackend for RocksDbBackend {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // `get` returns `Result<Option<Vec<u8>>, Error>`. We treat hard
-        // errors as "not found" here because the `KvBackend` trait
-        // doesn't expose a fallible read; higher-level code that needs
-        // error visibility should use the inner DB directly.
-        self.db.get(key).ok().flatten()
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        // Propagate RocksDB errors as `KvError::Backend` — no more
+        // silent error-as-None. Real "key not found" is `Ok(None)`.
+        self.db.get(key).map_err(Into::into)
     }
 
-    fn put(&self, key: &[u8], value: &[u8]) {
-        // Same here — surface failure through logs in production, panic
-        // in tests. The trait isn't fallible because most callsites
-        // can't usefully recover from a DB write error mid-flight.
-        if let Err(e) = self.db.put(key, value) {
-            panic!("rocksdb put failed: {e}");
-        }
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
+        self.db.put(key, value).map_err(Into::into)
     }
 
-    fn delete(&self, key: &[u8]) {
-        if let Err(e) = self.db.delete(key) {
-            panic!("rocksdb delete failed: {e}");
-        }
+    fn delete(&self, key: &[u8]) -> Result<(), KvError> {
+        self.db.delete(key).map_err(Into::into)
     }
 
-    fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
         let mut out = Vec::new();
         let mut iter = self.db.raw_iterator();
         iter.seek_to_first();
@@ -256,25 +253,23 @@ impl KvBackend for RocksDbBackend {
             out.push((k, v));
             iter.next();
         }
-        // Surface iterator status as a panic — same pattern as put/delete:
-        // higher-level callers can't usefully recover, and most stores
-        // would be left in an undefined state if scan returned partial
-        // data silently.
-        if let Err(e) = iter.status() {
-            panic!("rocksdb scan_all failed: {e}");
-        }
-        out
+        // Iterator may have stopped due to a real error rather than
+        // end-of-data. Propagate so the caller sees a partial scan
+        // as a fault, not as "the store happens to be empty after
+        // key K".
+        iter.status().map_err(KvError::from)?;
+        Ok(out)
     }
 
-    fn scan_from(&self, start: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.rocks_scan_from(start, limit)
+    fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self.rocks_scan_from(start, limit))
     }
 
-    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.rocks_scan_prefix(prefix)
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self.rocks_scan_prefix(prefix))
     }
 
-    fn write_batch(&self, ops: &[WriteOp]) {
+    fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         // Native RocksDB `WriteBatch` — atomic across the whole batch.
         // RocksDB writes the batch to its WAL before applying to the
         // MemTable, so a crash mid-write either replays the whole
@@ -284,18 +279,13 @@ impl KvBackend for RocksDbBackend {
         // on (one tx writing accounts A and B can't be split into
         // "wrote A but not B" by a crash).
         if ops.is_empty() {
-            return;
+            return Ok(());
         }
         let batch = build_batch(ops);
-        if let Err(e) = self.db.write(batch) {
-            // Same fail-loud policy as the per-call `put`/`delete`
-            // panics — see those for the rationale (no fallible-write
-            // path on the trait; the alternative is silent corruption).
-            panic!("rocksdb write_batch failed: {e}");
-        }
+        self.db.write(batch).map_err(Into::into)
     }
 
-    fn write_batch_sync(&self, ops: &[WriteOp]) {
+    fn write_batch_sync(&self, ops: &[WriteOp]) -> Result<(), KvError> {
         // Same as `write_batch` but with `WriteOptions { sync: true }`.
         // RocksDB fsyncs the WAL before returning, so a kernel panic
         // / power loss between this call and the next can't lose the
@@ -304,14 +294,12 @@ impl KvBackend for RocksDbBackend {
         // deleting the manifest is safe because the per-store WAL is
         // durably on disk.
         if ops.is_empty() {
-            return;
+            return Ok(());
         }
         let batch = build_batch(ops);
         let mut wopts = WriteOptions::default();
         wopts.set_sync(true);
-        if let Err(e) = self.db.write_opt(batch, &wopts) {
-            panic!("rocksdb write_batch_sync failed: {e}");
-        }
+        self.db.write_opt(batch, &wopts).map_err(Into::into)
     }
 }
 

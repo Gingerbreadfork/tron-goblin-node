@@ -110,7 +110,7 @@ pub fn execute_delegate_resource(
         }
         _ => unreachable!(),
     }
-    accounts.put(&owner, &owner_account);
+    accounts.put(&owner, &owner_account)?;
 
     // 3. Credit recipient's `acquired_*` bookkeeping fields.
     let mut to_account = accounts
@@ -132,7 +132,7 @@ pub fn execute_delegate_resource(
         }
         _ => unreachable!(),
     }
-    accounts.put(&to, &to_account);
+    accounts.put(&to, &to_account)?;
 
     // 4. Update DelegatedResourceStore with the per-(from,to) record.
     let key = DelegatedResourceStore::v2_unlocked_key(&owner, &to);
@@ -152,7 +152,7 @@ pub fn execute_delegate_resource(
         }
         _ => unreachable!(),
     }
-    resources.put_raw(&key, &resource);
+    resources.put_raw(&key, &resource)?;
 
     Ok(ExecutionResult::default())
 }
@@ -225,9 +225,9 @@ pub fn execute_undelegate_resource(
         _ => unreachable!(),
     }
     if resource.frozen_balance_for_bandwidth == 0 && resource.frozen_balance_for_energy == 0 {
-        resources.delete_raw(&key);
+        resources.delete_raw(&key)?;
     } else {
-        resources.put_raw(&key, &resource);
+        resources.put_raw(&key, &resource)?;
     }
 
     // 2. Decrement owner's `delegated_*` and credit owner's `frozen_v2`.
@@ -261,7 +261,7 @@ pub fn execute_undelegate_resource(
             amount: contract.balance,
         }),
     }
-    accounts.put(&owner, &owner_account);
+    accounts.put(&owner, &owner_account)?;
 
     // 3. Decrement recipient's `acquired_*`.
     let mut to_account = accounts
@@ -283,7 +283,7 @@ pub fn execute_undelegate_resource(
         }
         _ => unreachable!(),
     }
-    accounts.put(&to, &to_account);
+    accounts.put(&to, &to_account)?;
 
     Ok(ExecutionResult::default())
 }

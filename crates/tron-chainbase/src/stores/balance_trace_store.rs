@@ -31,12 +31,13 @@ impl BalanceTraceStore {
         block_num.to_be_bytes()
     }
 
-    pub fn put(&self, block_num: i64, trace: &BlockBalanceTrace) {
-        self.backend.put(&Self::key_for(block_num), &trace.encode_to_vec());
+    pub fn put(&self, block_num: i64, trace: &BlockBalanceTrace) -> Result<(), StoreError> {
+        self.backend.put(&Self::key_for(block_num), &trace.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, block_num: i64) -> Result<Option<BlockBalanceTrace>, StoreError> {
-        let Some(bytes) = self.backend.get(&Self::key_for(block_num)) else {
+        let Some(bytes) = self.backend.get(&Self::key_for(block_num))? else {
             return Ok(None);
         };
         Ok(Some(BlockBalanceTrace::decode(bytes.as_slice())?))

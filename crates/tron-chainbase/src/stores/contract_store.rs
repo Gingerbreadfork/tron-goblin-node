@@ -36,21 +36,22 @@ impl ContractStore {
     /// the ABI lives in `AbiStore`. Pass the contract through unchanged
     /// here; we strip it for you so the on-disk bytes match java-tron's
     /// convention.
-    pub fn put(&self, address: &Address, contract: &SmartContract) {
+    pub fn put(&self, address: &Address, contract: &SmartContract) -> Result<(), StoreError> {
         let mut to_write = contract.clone();
         to_write.abi = None;
         self.backend
-            .put(address.as_bytes(), &to_write.encode_to_vec());
+            .put(address.as_bytes(), &to_write.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, address: &Address) -> Result<Option<SmartContract>, StoreError> {
-        let Some(bytes) = self.backend.get(address.as_bytes()) else {
+        let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(SmartContract::decode(bytes.as_slice())?))
     }
 
-    pub fn contains(&self, address: &Address) -> bool {
-        self.backend.contains(address.as_bytes())
+    pub fn contains(&self, address: &Address) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(address.as_bytes())?)
     }
 }

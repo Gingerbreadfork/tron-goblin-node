@@ -213,12 +213,12 @@ pub fn validate_shielded_transfer(
             return Err(ActuatorError::Validate("anchor must be 32 bytes"));
         }
         if let Some(mt) = merkle_trees {
-            if !mt.contains(&sd.anchor) {
+            if !mt.contains(&sd.anchor)? {
                 return Err(ActuatorError::Validate("Rt is invalid."));
             }
         }
         // === 4b. Already-spent nullifier (against NullifierStore). ===
-        if nullifiers.contains(&sd.nullifier) {
+        if nullifiers.contains(&sd.nullifier)? {
             return Err(ActuatorError::Validate(
                 "note has been spent in this transaction",
             ));
@@ -274,12 +274,12 @@ pub fn execute_shielded_transfer(
 
     // 2. Record nullifiers — prevents future double-spends.
     for sd in &contract.spend_description {
-        if nullifiers.contains(&sd.nullifier) {
+        if nullifiers.contains(&sd.nullifier)? {
             return Err(ActuatorError::Execute(
                 "double spend (nullifier appeared between validate and execute)",
             ));
         }
-        nullifiers.put(&sd.nullifier);
+        nullifiers.put(&sd.nullifier)?;
     }
 
     // 3. Save commitments to MerkleContainer. We load the "current"
@@ -288,11 +288,15 @@ pub fn execute_shielded_transfer(
     //    `CURRENT_TREE_KEY`. The new root is also indexed under itself
     //    so future spend-anchor lookups succeed.
     if let Some(mt) = merkle_trees {
-        let mut tree = mt
-            .get(CURRENT_TREE_KEY)
-            .ok()
-            .flatten()
-            .or_else(|| mt.get(LAST_TREE_KEY).ok().flatten())
+        // Propagate store IO errors via `?` — a transient read fault must
+        // NOT be silently coerced to "no tree", which would rebuild the
+        // commitment tree from empty and persist a divergent merkle root.
+        // Genuine absence (`Ok(None)`) still falls back current → last → empty.
+        let proto = match mt.get(CURRENT_TREE_KEY)? {
+            Some(p) => Some(p),
+            None => mt.get(LAST_TREE_KEY)?,
+        };
+        let mut tree = proto
             .map(|proto| IncrementalMerkleTree::from_proto(&proto))
             .unwrap_or_default();
         for rd in &contract.receive_description {
@@ -307,9 +311,9 @@ pub fn execute_shielded_transfer(
                 .map_err(|_| ActuatorError::Execute("merkle tree append failed"))?;
         }
         let tree_proto = tree.to_proto();
-        mt.put(CURRENT_TREE_KEY, &tree_proto);
+        mt.put(CURRENT_TREE_KEY, &tree_proto)?;
         let new_root = tree.root();
-        mt.put(&new_root, &tree_proto);
+        mt.put(&new_root, &tree_proto)?;
     }
 
     // 4. Transparent credit (if any). Auto-create the recipient account
@@ -329,7 +333,7 @@ pub fn execute_shielded_transfer(
                     address: contract.transparent_to_address.clone(),
                     ..Default::default()
                 },
-            );
+            )?;
             created_recipient = true;
         }
         adjust_zen_balance(
@@ -390,7 +394,7 @@ fn adjust_zen_balance(
         return Err(ActuatorError::Execute("Zen balance insufficient"));
     }
     acct.asset_v2.insert(zen_token_id.to_string(), new_balance);
-    accounts.put(&a, &acct);
+    accounts.put(&a, &acct)?;
     Ok(())
 }
 

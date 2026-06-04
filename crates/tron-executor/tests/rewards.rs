@@ -115,7 +115,7 @@ fn producer_gets_brokerage_into_allowance_and_remainder_into_cycle_pool() {
             vote_count: 100,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let accts = AccountStore::new(state.accounts.clone());
     accts.put(
         &Address::from_raw(producer),
@@ -125,7 +125,7 @@ fn producer_gets_brokerage_into_allowance_and_remainder_into_cycle_pool() {
             allowance: 0,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Default DPS values: witness_pay_per_block = 32_000_000,
     //   witness_127_pay_per_block = 16_000_000.
@@ -173,14 +173,14 @@ fn standby_pool_distributes_proportionally_across_top_127() {
                 vote_count: votes,
                 ..Default::default()
             },
-        );
+        ).unwrap();
         accts.put(
             &Address::from_raw(addr_bytes),
             &Account {
                 address: addr_bytes.to_vec(),
                 ..Default::default()
             },
-        );
+        ).unwrap();
     }
 
     apply_unsigned(&state, &empty_block(1, [0u8; 32], b, 1_700_000_000_000), None)
@@ -235,7 +235,7 @@ fn maintenance_pass_advances_cycle_and_writes_vi() {
             vote_count: 1000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     let dlg = DelegationStore::new(state.delegation.clone());
     // Seed a known reward pool for cycle 0.
     dlg.add_reward(0, &Address::from_raw(w), 100_000_000);
@@ -319,7 +319,7 @@ fn voter_withdraws_reward_after_full_cycle() {
             vote_count: 1000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Voter holds 100 of those 1000 votes.
     let accts = AccountStore::new(state.accounts.clone());
@@ -335,7 +335,7 @@ fn voter_withdraws_reward_after_full_cycle() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Seed cycle 0 pool for W.
     let dlg = DelegationStore::new(state.delegation.clone());
@@ -407,7 +407,7 @@ fn maintenance_clears_votes_store_after_tally() {
             address: w.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     // Seed a vote.
     let vs = VotesStore::new(state.votes.clone());
@@ -421,8 +421,8 @@ fn maintenance_clears_votes_store_after_tally() {
                 vote_count: 42,
             }],
         },
-    );
-    assert!(vs.contains(&Address::from_raw(voter)));
+    ).unwrap();
+    assert!(vs.contains(&Address::from_raw(voter)).unwrap());
 
     apply_unsigned(
         &state,
@@ -440,7 +440,7 @@ fn maintenance_clears_votes_store_after_tally() {
 
     // After the maintenance pass, the vote row must be gone.
     assert!(
-        !vs.contains(&Address::from_raw(voter)),
+        !vs.contains(&Address::from_raw(voter)).unwrap(),
         "votes_store must be cleared after maintenance"
     );
 
@@ -473,7 +473,7 @@ fn block_one_skips_maintenance_but_advances_next_time() {
             address: w.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let t = 1_700_000_000_000;
     apply_unsigned(&state, &empty_block(1, [0u8; 32], w, t), None).expect("genesis");

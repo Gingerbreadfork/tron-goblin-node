@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "reward-vi";
 
@@ -25,11 +26,12 @@ impl RewardViStore {
         Self { backend }
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) {
-        self.backend.put(key, value);
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(key, value)?;
+        Ok(())
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.backend.get(key)
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(key)?)
     }
 }

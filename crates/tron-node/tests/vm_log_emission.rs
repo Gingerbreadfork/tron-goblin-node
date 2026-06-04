@@ -102,7 +102,7 @@ fn install_caller(state: &StateBackends, caller: [u8; 21]) {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn install_contract(
@@ -112,7 +112,7 @@ fn install_contract(
     deployer: [u8; 21],
 ) {
     let hash = tron_crypto::hash::keccak256(bytecode);
-    CodeStore::new(state.code.as_ref().unwrap().clone()).put(&hash, bytecode);
+    CodeStore::new(state.code.as_ref().unwrap().clone()).put(&hash, bytecode).unwrap();
     AccountStore::new(state.accounts.clone()).put(
         &Address::from_raw(addr),
         &Account {
@@ -122,7 +122,7 @@ fn install_contract(
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     // SmartContract record so the decoder's creator-address lookup
     // finds `origin_address`.
     ContractStore::new(state.contracts.clone()).put(
@@ -132,7 +132,7 @@ fn install_contract(
             contract_address: addr.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn install_transfer_abi(state: &StateBackends, addr: [u8; 21]) {
@@ -166,7 +166,7 @@ fn install_transfer_abi(state: &StateBackends, addr: [u8; 21]) {
                 state_mutability: 0,
             }],
         },
-    );
+    ).unwrap();
 }
 
 /// LOG3 with the Transfer event signature: emits Transfer(from=0x...11,
@@ -307,7 +307,7 @@ fn seed_witness_schedule(state: &StateBackends, witness: [u8; 21]) {
     // WitnessScheduleStore. Seed a single-witness schedule so our
     // hand-rolled block passes validation.
     let schedule = WitnessScheduleStore::new(state.witness_schedule.as_ref().unwrap().clone());
-    schedule.save_active(&[Address::from_raw(witness)]);
+    schedule.save_active(&[Address::from_raw(witness)]).unwrap();
 }
 
 #[tokio::test]

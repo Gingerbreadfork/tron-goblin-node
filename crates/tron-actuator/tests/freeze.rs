@@ -39,7 +39,7 @@ fn put_account(accounts: &AccountStore, address: [u8; 21], balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 // ============================================================
@@ -247,7 +247,7 @@ fn unfreeze_v1_rejects_when_all_entries_still_locked() {
         }],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = UnfreezeBalanceContract {
         owner_address: ALICE.to_vec(),
         resource: 0,
@@ -277,7 +277,7 @@ fn unfreeze_v1_returns_only_expired_entries() {
         ],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = UnfreezeBalanceContract {
         owner_address: ALICE.to_vec(),
         resource: 0,
@@ -513,7 +513,7 @@ fn unfreeze_v2_rejects_when_unfreeze_exceeds_frozen() {
         }],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = UnfreezeBalanceV2Contract {
         owner_address: ALICE.to_vec(),
         unfreeze_balance: 100 * PRECISION, // > frozen 50
@@ -537,7 +537,7 @@ fn unfreeze_v2_rejects_zero_or_negative_amount() {
         }],
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     for amt in [0i64, -PRECISION] {
         let c = UnfreezeBalanceV2Contract {
             owner_address: ALICE.to_vec(),
@@ -574,7 +574,7 @@ fn unfreeze_v2_rejects_too_many_concurrent_unfreezes() {
             unfreeze_expire_time: 1_000_000 + i as i64,
         });
     }
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     let c = UnfreezeBalanceV2Contract {
         owner_address: ALICE.to_vec(),
         unfreeze_balance: PRECISION,

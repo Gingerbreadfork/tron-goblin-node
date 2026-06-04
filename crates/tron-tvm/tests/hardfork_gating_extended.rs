@@ -54,13 +54,13 @@ fn install_caller(stores: &VmStores) -> [u8; 21] {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     caller
 }
 
 fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
     let hash = code_hash(&bytecode);
-    stores.code.put(hash.as_slice(), &bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(addr),
         &Account {
@@ -70,7 +70,7 @@ fn install_contract(stores: &VmStores, addr: [u8; 21], bytecode: Vec<u8>) {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn run(stores: &VmStores, caller: [u8; 21], contract: [u8; 21]) -> VmOutcome {

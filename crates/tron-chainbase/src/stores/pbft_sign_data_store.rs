@@ -47,12 +47,13 @@ impl PbftSignDataStore {
         format!("BLOCK{block_num}").into_bytes()
     }
 
-    pub fn put(&self, key: &[u8], value: &PbftRaw) {
-        self.backend.put(key, &value.encode_to_vec());
+    pub fn put(&self, key: &[u8], value: &PbftRaw) -> Result<(), StoreError> {
+        self.backend.put(key, &value.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<PbftRaw>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         Ok(Some(PbftRaw::decode(bytes.as_slice())?))
@@ -79,12 +80,13 @@ impl PbftSignDataStore {
         key: &[u8],
         raw: &PbftRaw,
         signatures: &BTreeMap<Address, Vec<u8>>,
-    ) {
+    ) -> Result<(), StoreError> {
         let result = tron_proto::PbftCommitResult {
             data: raw.encode_to_vec(),
             signature: signatures.values().cloned().collect(),
         };
-        self.backend.put(key, &result.encode_to_vec());
+        self.backend.put(key, &result.encode_to_vec())?;
+        Ok(())
     }
 
     /// Read back a commit-result: returns the (Raw, signatures) pair.
@@ -93,7 +95,7 @@ impl PbftSignDataStore {
         &self,
         key: &[u8],
     ) -> Result<Option<(PbftRaw, Vec<Vec<u8>>)>, StoreError> {
-        let Some(bytes) = self.backend.get(key) else {
+        let Some(bytes) = self.backend.get(key)? else {
             return Ok(None);
         };
         let outer = tron_proto::PbftCommitResult::decode(bytes.as_slice())?;

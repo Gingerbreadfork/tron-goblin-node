@@ -170,8 +170,8 @@ fn put_block_with_shielded_tx(
         transactions: vec![tx],
     };
     let block_id = tron_types::block_id_from_block(&block).unwrap();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     dp.save_latest_block_header_number(block_num);
     dp.save_latest_block_header_hash(block_id.as_bytes());
     tx_id
@@ -346,7 +346,7 @@ async fn scan_and_mark_marks_spent_when_nullifier_in_store() {
     let nk_point = jubjub::SubgroupPoint::from_bytes(&nk_arr).unwrap();
     let nf = note.nf(&NullifierDerivingKey(nk_point), 0);
     // Insert into nullifier backend before launching server.
-    tron_chainbase::NullifierStore::new(nullifiers_be).put(&nf.0);
+    tron_chainbase::NullifierStore::new(nullifiers_be).put(&nf.0).unwrap();
 
     let (addr, _shutdown, _server) = spawn_server(state).await;
     let mut client = WalletClient::connect(format!("http://{}", addr))
@@ -446,8 +446,8 @@ fn put_trc20_event_tx(
         transactions: vec![tx],
     };
     let block_id = tron_types::block_id_from_block(&block).unwrap();
-    BlockStore::new(blocks_be.clone()).put(&block_id, &block);
-    BlockIndexStore::new(block_index_be.clone()).put(&block_id);
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&block_id).unwrap();
     dp.save_latest_block_header_number(block_num);
     dp.save_latest_block_header_hash(block_id.as_bytes());
 
@@ -462,7 +462,7 @@ fn put_trc20_event_tx(
         }],
         ..Default::default()
     };
-    tx_history.put(&tx_id, &info);
+    tx_history.put(&tx_id, &info).unwrap();
     tx_id
 }
 

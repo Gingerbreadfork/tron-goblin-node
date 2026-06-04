@@ -84,8 +84,8 @@ pub fn execute_transfer_asset(
     debit_asset(&mut owner_account, &key, contract.amount)?;
     credit_asset(&mut to_account, &key, contract.amount)?;
 
-    accounts.put(&owner, &owner_account);
-    accounts.put(&to, &to_account);
+    accounts.put(&owner, &owner_account)?;
+    accounts.put(&to, &to_account)?;
     Ok(ExecutionResult::default())
 }
 
@@ -156,8 +156,8 @@ pub fn execute_asset_issue(
     to_store.id = next_token_id.to_string();
     to_store.owner_address = owner.as_bytes().to_vec();
 
-    v1.put(&contract.name, &to_store);
-    v2.put(next_token_id, &to_store);
+    v1.put(&contract.name, &to_store)?;
+    v2.put(next_token_id, &to_store)?;
 
     // Credit the issuer with the (non-frozen) supply.
     let frozen_supply: i64 = contract.frozen_supply.iter().map(|f| f.frozen_amount).sum();
@@ -170,7 +170,7 @@ pub fn execute_asset_issue(
         .or_insert(liquid);
     owner_account.asset_issued_name = contract.name.clone();
     owner_account.asset_issued_id = id_str.into_bytes();
-    accounts.put(&owner, &owner_account);
+    accounts.put(&owner, &owner_account)?;
 
     Ok(ExecutionResult {
         fee,
@@ -217,10 +217,10 @@ pub fn execute_update_asset(
         asset.description = contract.description.clone();
         asset.free_asset_net_limit = contract.new_limit;
         asset.public_free_asset_net_limit = contract.new_public_limit;
-        v2.put(id_num, &asset);
+        v2.put(id_num, &asset)?;
         // Mirror to V1 if a v1 entry exists (pre-fork compat).
         if v1.get(&asset.name)?.is_some() {
-            v1.put(&asset.name, &asset);
+            v1.put(&asset.name, &asset)?;
         }
     }
     Ok(ExecutionResult::default())
@@ -298,8 +298,8 @@ pub fn execute_participate_asset_issue(
     debit_asset(&mut to_account, &key, exchange_amount)?;
     credit_asset(&mut owner_account, &key, exchange_amount)?;
 
-    accounts.put(&owner, &owner_account);
-    accounts.put(&to, &to_account);
+    accounts.put(&owner, &owner_account)?;
+    accounts.put(&to, &to_account)?;
     Ok(ExecutionResult::default())
 }
 
@@ -348,7 +348,7 @@ pub fn execute_unfreeze_asset(
     });
     let key = String::from_utf8_lossy(&account.asset_issued_id).into_owned();
     credit_asset(&mut account, &key, unlocked)?;
-    accounts.put(&owner, &account);
+    accounts.put(&owner, &account)?;
     Ok(ExecutionResult::default())
 }
 

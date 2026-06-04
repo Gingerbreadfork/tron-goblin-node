@@ -47,18 +47,20 @@ impl TransactionStore {
     }
 
     /// Put a block-reference: the transaction lives in block `block_num`.
-    pub fn put_block_ref(&self, tx_id: &[u8; 32], block_num: i64) {
-        self.backend.put(tx_id, &block_num.to_be_bytes());
+    pub fn put_block_ref(&self, tx_id: &[u8; 32], block_num: i64) -> Result<(), StoreError> {
+        self.backend.put(tx_id, &block_num.to_be_bytes())?;
+        Ok(())
     }
 
     /// Put a full transaction (pre-inclusion).
-    pub fn put_full(&self, tx_id: &[u8; 32], tx: &Transaction) {
-        self.backend.put(tx_id, &tx.encode_to_vec());
+    pub fn put_full(&self, tx_id: &[u8; 32], tx: &Transaction) -> Result<(), StoreError> {
+        self.backend.put(tx_id, &tx.encode_to_vec())?;
+        Ok(())
     }
 
     /// Read the raw value. `None` if absent.
     pub fn get(&self, tx_id: &[u8; 32]) -> Result<Option<StoredTransaction>, StoreError> {
-        let Some(bytes) = self.backend.get(tx_id) else {
+        let Some(bytes) = self.backend.get(tx_id)? else {
             return Ok(None);
         };
         if bytes.len() == 8 {

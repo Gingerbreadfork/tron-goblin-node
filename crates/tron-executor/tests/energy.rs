@@ -34,7 +34,7 @@ impl Env {
 }
 
 fn put(accounts: &AccountStore, addr: [u8; 21], a: Account) {
-    accounts.put(&Address::from_raw(addr), &a);
+    accounts.put(&Address::from_raw(addr), &a).unwrap();
 }
 
 /// Set up the global energy parameters so the V2 limit formula yields

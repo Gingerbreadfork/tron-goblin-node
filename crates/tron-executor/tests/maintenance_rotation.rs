@@ -101,7 +101,7 @@ fn put_witness(state: &StateBackends, who: [u8; 21], votes: i64) {
             vote_count: votes,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn cast_vote(state: &StateBackends, voter: [u8; 21], for_who: [u8; 21], votes: i64) {
@@ -114,7 +114,7 @@ fn cast_vote(state: &StateBackends, voter: [u8; 21], for_who: [u8; 21], votes: i
             balance: 1_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     VotesStore::new(state.votes.clone()).put(
         &Address::from_raw(voter),
         &Votes {
@@ -125,7 +125,7 @@ fn cast_vote(state: &StateBackends, voter: [u8; 21], for_who: [u8; 21], votes: i
                 vote_count: votes,
             }],
         },
-    );
+    ).unwrap();
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn maintenance_block_surfaces_rotation_on_report() {
     // Seed the on-disk active set as [w_old] so apply_maintenance can
     // capture it as `prev_active`.
     WitnessScheduleStore::new(state.witness_schedule.as_ref().unwrap().clone())
-        .save_active(&[Address::from_raw(w_old)]);
+        .save_active(&[Address::from_raw(w_old)]).unwrap();
 
     // Genesis at num=1 doesn't run doMaintenance (java-tron's special
     // case) — apply it just to bump the head pointer.
@@ -237,7 +237,7 @@ fn non_boundary_block_has_no_maintenance_rotation() {
     let w = addr(0xaa);
     put_witness(&state, w, 100);
     WitnessScheduleStore::new(state.witness_schedule.as_ref().unwrap().clone())
-        .save_active(&[Address::from_raw(w)]);
+        .save_active(&[Address::from_raw(w)]).unwrap();
 
     apply_unsigned(
         &state,

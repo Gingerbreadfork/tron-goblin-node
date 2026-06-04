@@ -90,7 +90,7 @@ pub fn activate_expired_proposals(
             proposal.state = ProposalState::Disapproved as i32;
             report.disapproved.push(id);
         }
-        proposals.put(id, &proposal);
+        proposals.put(id, &proposal)?;
     }
 
     Ok(report)

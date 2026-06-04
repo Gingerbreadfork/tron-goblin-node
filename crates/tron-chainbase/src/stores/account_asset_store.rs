@@ -42,14 +42,15 @@ impl AccountAssetStore {
         out
     }
 
-    pub fn put(&self, address: &Address, asset_id: &[u8], balance: i64) {
+    pub fn put(&self, address: &Address, asset_id: &[u8], balance: i64) -> Result<(), StoreError> {
         let key = Self::key_for(address, asset_id);
-        self.backend.put(&key, &balance.to_be_bytes());
+        self.backend.put(&key, &balance.to_be_bytes())?;
+        Ok(())
     }
 
     pub fn get(&self, address: &Address, asset_id: &[u8]) -> Result<Option<i64>, StoreError> {
         let key = Self::key_for(address, asset_id);
-        let Some(bytes) = self.backend.get(&key) else {
+        let Some(bytes) = self.backend.get(&key)? else {
             return Ok(None);
         };
         if bytes.len() != 8 {
@@ -72,12 +73,22 @@ impl AccountAssetStore {
     ///
     /// Skips rows whose value isn't exactly 8 bytes (corrupted entries
     /// log + continue, matching java-tron).
-    pub fn get_all_assets(&self, owner: &Address) -> Vec<(Vec<u8>, i64)> {
-        self.backend
-            .scan_prefix(owner.as_bytes())
+    pub fn get_all_assets(&self, owner: &Address) -> Result<Vec<(Vec<u8>, i64)>, StoreError> {
+        Ok(self
+            .backend
+            .scan_prefix(owner.as_bytes())?
             .into_iter()
             .filter_map(|(k, v)| {
                 if v.len() != 8 {
+                    // C-8: asset balances are i64 (8 bytes); any other
+                    // length is corruption. Log + continue (java-tron
+                    // parity) — as the doc-comment above already promises.
+                    tracing::error!(
+                        store = "account-asset",
+                        key = %hex::encode(&k),
+                        value_len = v.len(),
+                        "skipping account-asset row whose value isn't an 8-byte balance"
+                    );
                     return None;
                 }
                 // Strip the 21-byte address prefix to leave the
@@ -87,7 +98,7 @@ impl AccountAssetStore {
                 buf.copy_from_slice(&v);
                 Some((asset_id, i64::from_be_bytes(buf)))
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -110,10 +121,10 @@ mod tests {
         let store = AccountAssetStore::new(backend);
         let alice = addr(0xaa);
         let bob = addr(0xbb);
-        store.put(&alice, b"1000001", 100);
-        store.put(&alice, b"1000002", 200);
-        store.put(&bob, b"1000003", 300);
-        let alice_assets = store.get_all_assets(&alice);
+        store.put(&alice, b"1000001", 100).unwrap();
+        store.put(&alice, b"1000002", 200).unwrap();
+        store.put(&bob, b"1000003", 300).unwrap();
+        let alice_assets = store.get_all_assets(&alice).unwrap();
         assert_eq!(alice_assets.len(), 2);
         let mut found = alice_assets
             .iter()
@@ -130,6 +141,6 @@ mod tests {
     fn get_all_assets_empty_for_unknown_owner() {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = AccountAssetStore::new(backend);
-        assert!(store.get_all_assets(&addr(0xff)).is_empty());
+        assert!(store.get_all_assets(&addr(0xff)).unwrap().is_empty());
     }
 }

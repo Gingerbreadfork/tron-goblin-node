@@ -27,23 +27,25 @@ impl WitnessStore {
         Self { backend }
     }
 
-    pub fn put(&self, address: &Address, witness: &Witness) {
-        self.backend.put(address.as_bytes(), &witness.encode_to_vec());
+    pub fn put(&self, address: &Address, witness: &Witness) -> Result<(), StoreError> {
+        self.backend.put(address.as_bytes(), &witness.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, address: &Address) -> Result<Option<Witness>, StoreError> {
-        let Some(bytes) = self.backend.get(address.as_bytes()) else {
+        let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);
         };
         Ok(Some(Witness::decode(bytes.as_slice())?))
     }
 
-    pub fn contains(&self, address: &Address) -> bool {
-        self.backend.contains(address.as_bytes())
+    pub fn contains(&self, address: &Address) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(address.as_bytes())?)
     }
 
-    pub fn delete(&self, address: &Address) {
-        self.backend.delete(address.as_bytes());
+    pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
+        self.backend.delete(address.as_bytes())?;
+        Ok(())
     }
 
     /// Snapshot every registered witness in the store.
@@ -57,8 +59,17 @@ impl WitnessStore {
     /// row can't poison the entire iteration.
     pub fn all(&self) -> Result<Vec<(Address, Witness)>, StoreError> {
         let mut out = Vec::new();
-        for (k, v) in self.backend.scan_all() {
+        for (k, v) in self.backend.scan_all()? {
             let Ok(addr_bytes): Result<[u8; 21], _> = k.as_slice().try_into() else {
+                // C-8: consensus store — a malformed key in the witness CF
+                // would silently drop an SR from the maintenance ranking.
+                // Log loudly; skip to match java-tron's iterate-and-continue.
+                tracing::error!(
+                    store = "witness",
+                    key = %hex::encode(&k),
+                    key_len = k.len(),
+                    "skipping witness row with non-address key (expected 21 bytes)"
+                );
                 continue;
             };
             let addr = Address::from_raw(addr_bytes);

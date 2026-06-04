@@ -58,7 +58,7 @@ fn put_account(ctx: &Ctx, who: [u8; 21]) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn put_contract(ctx: &Ctx, contract_addr: [u8; 21], owner: [u8; 21]) {
@@ -71,7 +71,7 @@ fn put_contract(ctx: &Ctx, contract_addr: [u8; 21], owner: [u8; 21]) {
             consume_user_resource_percent: 30,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn enable_constantinople(ctx: &Ctx) {
@@ -174,7 +174,7 @@ fn clear_abi_writes_empty_abi() {
                 ..Default::default()
             }],
         },
-    );
+    ).unwrap();
     let c = ClearAbiContract {
         owner_address: OWNER.to_vec(),
         contract_address: CONTRACT.to_vec(),

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "code";
 
@@ -23,15 +24,16 @@ impl CodeStore {
         Self { backend }
     }
 
-    pub fn put(&self, code_hash: &[u8], bytecode: &[u8]) {
-        self.backend.put(code_hash, bytecode);
+    pub fn put(&self, code_hash: &[u8], bytecode: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(code_hash, bytecode)?;
+        Ok(())
     }
 
-    pub fn get(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
-        self.backend.get(code_hash)
+    pub fn get(&self, code_hash: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(code_hash)?)
     }
 
-    pub fn contains(&self, code_hash: &[u8]) -> bool {
-        self.backend.contains(code_hash)
+    pub fn contains(&self, code_hash: &[u8]) -> Result<bool, StoreError> {
+        Ok(self.backend.contains(code_hash)?)
     }
 }

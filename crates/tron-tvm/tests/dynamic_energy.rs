@@ -50,7 +50,7 @@ fn install(stores: &VmStores, prefix: u8, code: &[u8]) -> [u8; 21] {
     addr[1..].fill(prefix);
     let tron = Address::from_raw(addr);
     let hash = code_hash(code);
-    stores.code.put(hash.as_slice(), code);
+    stores.code.put(hash.as_slice(), code).unwrap();
     stores.accounts.put(
         &tron,
         &Account {
@@ -60,7 +60,7 @@ fn install(stores: &VmStores, prefix: u8, code: &[u8]) -> [u8; 21] {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
     addr
 }
 
@@ -75,7 +75,7 @@ fn fund_user(stores: &VmStores, prefix: u8) -> [u8; 21] {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     addr
 }
 
@@ -141,7 +141,7 @@ fn dynamic_factor_zero_matches_baseline() {
             energy_factor: 0,
             update_cycle: 0,
         },
-    );
+    ).unwrap();
     let explicit_zero = run(&stores, owner, contract);
     assert_eq!(
         baseline, explicit_zero,
@@ -173,7 +173,7 @@ fn dynamic_factor_decimal_doubles_gas_consumption() {
                 energy_factor: 10_000, // = DECIMAL → 2× multiplier
                 update_cycle: 0,
             },
-        );
+        ).unwrap();
         run(&stores, owner, contract)
     };
 
@@ -218,7 +218,7 @@ fn dynamic_factor_half_decimal_adds_50_percent() {
                 energy_factor: 5_000, // 0.5 × DECIMAL → +50%
                 update_cycle: 0,
             },
-        );
+        ).unwrap();
         run(&stores, owner, contract)
     };
 
@@ -314,7 +314,7 @@ fn allow_dynamic_energy_off_skips_penalty_even_with_stored_factor() {
                 energy_factor: 10_000,
                 update_cycle: 0,
             },
-        );
+        ).unwrap();
         run(&stores, owner, contract)
     };
 
@@ -330,7 +330,7 @@ fn allow_dynamic_energy_off_skips_penalty_even_with_stored_factor() {
                 energy_factor: 10_000, // present but must be ignored
                 update_cycle: 0,
             },
-        );
+        ).unwrap();
         run(&stores, owner, contract)
     };
 

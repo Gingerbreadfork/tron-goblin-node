@@ -32,12 +32,13 @@ impl TransactionHistoryStore {
         Self { backend }
     }
 
-    pub fn put(&self, tx_id: &[u8; 32], info: &TransactionInfo) {
-        self.backend.put(tx_id, &info.encode_to_vec());
+    pub fn put(&self, tx_id: &[u8; 32], info: &TransactionInfo) -> Result<(), StoreError> {
+        self.backend.put(tx_id, &info.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(&self, tx_id: &[u8; 32]) -> Result<Option<TransactionInfo>, StoreError> {
-        let Some(bytes) = self.backend.get(tx_id) else {
+        let Some(bytes) = self.backend.get(tx_id)? else {
             return Ok(None);
         };
         Ok(Some(TransactionInfo::decode(bytes.as_slice())?))

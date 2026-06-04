@@ -93,11 +93,11 @@ fn freezeexpiretime_is_wired_and_returns_zero_with_default_host() {
             balance: 1_000_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
     // Contract with the FREEZEEXPIRETIME-using bytecode.
     let bytecode = build_freeze_expire_time_caller(target);
     let hash = code_hash(&bytecode);
-    stores.code.put(hash.as_slice(), &bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
     stores.accounts.put(
         &Address::from_raw(caller_contract),
         &Account {
@@ -107,7 +107,7 @@ fn freezeexpiretime_is_wired_and_returns_zero_with_default_host() {
             code_hash: hash.as_slice().to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let trigger = TriggerSmartContract {
         owner_address: caller_user.to_vec(),
@@ -140,7 +140,7 @@ fn freezeexpiretime_is_wired_and_returns_zero_with_default_host() {
     // Host behavior pending the Host-on-Context integration.
     let slot0_key =
         StorageRowStore::compose_key(&Address::from_raw(caller_contract), &[0u8; 32]);
-    match stores.storage.get(&slot0_key) {
+    match stores.storage.get(&slot0_key).unwrap() {
         Some(bytes) => {
             assert_eq!(bytes, vec![0u8; 32], "default Host returns 0");
         }

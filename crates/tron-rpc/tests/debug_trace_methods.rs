@@ -31,7 +31,7 @@ fn build_state_with_contract(addr: [u8; 21], bytecode: Vec<u8>) -> RpcState {
     let acc = AccountStore::new(accounts.clone());
     let code_store = CodeStore::new(code.clone());
     let hash = tron_crypto::hash::keccak256(&bytecode);
-    code_store.put(&hash, &bytecode);
+    code_store.put(&hash, &bytecode).unwrap();
     acc.put(
         &Address::from_raw(addr),
         &Account {
@@ -41,7 +41,7 @@ fn build_state_with_contract(addr: [u8; 21], bytecode: Vec<u8>) -> RpcState {
             code_hash: hash.to_vec(),
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let backends = EthCallBackends {
         accounts: accounts.clone(),

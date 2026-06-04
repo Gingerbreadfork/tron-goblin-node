@@ -114,7 +114,7 @@ fn dump_then_verify_against_real_rocksdb() {
             };
             sign_block(&mut block, &priv_key).unwrap();
             let id = block_id_from_block(&block).unwrap();
-            store.put(&id, &block);
+            store.put(&id, &block).unwrap();
             prev_id = *id.as_bytes();
         }
         // Drop the backend so the DB lock is released before we open it

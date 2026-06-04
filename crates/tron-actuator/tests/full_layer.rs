@@ -42,7 +42,7 @@ fn put_account(store: &AccountStore, address: [u8; 21], balance: i64) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn put_funded_witness(
@@ -59,7 +59,7 @@ fn put_funded_witness(
             url: String::from("https://witness.test"),
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 // =============================================================================
@@ -81,7 +81,7 @@ fn witness_create_round_trip() {
     assert!(witness::validate_witness_create(&accounts, &witnesses, &dp, &c).is_ok());
     let result = witness::execute_witness_create(&accounts, &witnesses, &dp, &c).unwrap();
     assert_eq!(result.fee, 9_999_000_000);
-    assert!(witnesses.contains(&addr(ALICE)));
+    assert!(witnesses.contains(&addr(ALICE)).unwrap());
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn withdraw_balance_round_trip() {
         latest_withdraw_time: 0,
         ..Default::default()
     };
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     dp.save_latest_block_header_timestamp(1_700_000_000_000);
 
     let c = tron_proto::WithdrawBalanceContract {
@@ -175,7 +175,7 @@ fn create_account_round_trip() {
     account::validate_create_account(&accounts, &dp, &c).unwrap();
     let res = account::execute_create_account(&accounts, &dp, &c).unwrap();
     assert!(res.created_recipient);
-    assert!(accounts.contains(&addr(BOB)));
+    assert!(accounts.contains(&addr(BOB)).unwrap());
 }
 
 #[test]
@@ -421,7 +421,7 @@ fn freeze_v2_below_one_trx_increment_yields_zero_weight_delta() {
         r#type: 0,
         amount: 1_500_000,
     });
-    accounts.put(&addr(ALICE), &alice);
+    accounts.put(&addr(ALICE), &alice).unwrap();
     // Pretend an earlier freeze bumped the weight to 1.
     dp.save_total_net_weight(1);
 
@@ -453,7 +453,7 @@ fn unfreeze_balance_v2_then_withdraw_after_expiry() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let unfreeze = tron_proto::UnfreezeBalanceV2Contract {
         owner_address: ALICE.to_vec(),
@@ -498,7 +498,7 @@ fn delegate_resource_round_trip() {
             }],
             ..Default::default()
         },
-    );
+    ).unwrap();
     put_account(&accounts, BOB, 0);
 
     let c = tron_proto::DelegateResourceContract {
@@ -538,7 +538,7 @@ fn exchange_create_round_trip() {
             asset_v2: std::collections::BTreeMap::from([("1000001".to_string(), 1_000_000_000i64)]),
             ..Default::default()
         },
-    );
+    ).unwrap();
     dp.put_long(b"EXCHANGE_CREATE_FEE", 0);
 
     let c = tron_proto::ExchangeCreateContract {
@@ -571,7 +571,7 @@ fn market_sell_then_cancel() {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let sell = tron_proto::MarketSellAssetContract {
         owner_address: ALICE.to_vec(),
@@ -675,7 +675,7 @@ fn update_setting_round_trip() {
         consume_user_resource_percent: 50,
         ..Default::default()
     };
-    contracts.put(&contract_addr, &sc);
+    contracts.put(&contract_addr, &sc).unwrap();
 
     let c = tron_proto::UpdateSettingContract {
         owner_address: ALICE.to_vec(),

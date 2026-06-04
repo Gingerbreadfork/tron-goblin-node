@@ -155,7 +155,7 @@ fn adjust_allowance(
         return Ok(());
     };
     account.allowance = account.allowance.saturating_add(amount).max(0);
-    accounts.put(address, &account);
+    accounts.put(address, &account)?;
     Ok(())
 }
 
@@ -438,7 +438,7 @@ pub fn withdraw_reward(
         delegation.set_begin_cycle(address, end_cycle + 1);
         if paid > 0 {
             account.allowance = account.allowance.saturating_add(paid);
-            accounts.put(address, &account);
+            accounts.put(address, &account)?;
         }
         return Ok(paid);
     }
@@ -451,7 +451,7 @@ pub fn withdraw_reward(
     // ── 3. Apply allowance + record this cycle's snapshot ──────────────
     if paid > 0 {
         account.allowance = account.allowance.saturating_add(paid);
-        accounts.put(address, &account);
+        accounts.put(address, &account)?;
     }
     delegation.set_begin_cycle(address, end_cycle);
     delegation.set_end_cycle(address, end_cycle + 1);
@@ -463,7 +463,7 @@ pub fn withdraw_reward(
         votes: account.votes.clone(),
         ..Default::default()
     };
-    delegation.set_account_vote(end_cycle, address, &snapshot);
+    delegation.set_account_vote(end_cycle, address, &snapshot)?;
 
     Ok(paid)
 }

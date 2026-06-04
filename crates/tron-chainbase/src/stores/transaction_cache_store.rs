@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crate::backend::KvBackend;
+use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "trans-cache";
 
@@ -27,22 +28,24 @@ impl TransactionCacheStore {
 
     /// Mark `tx_id` as seen. Idempotent — re-inserting the same key
     /// is a no-op at the storage layer.
-    pub fn put(&self, tx_id: &[u8; 32]) {
+    pub fn put(&self, tx_id: &[u8; 32]) -> Result<(), StoreError> {
         // java-tron stores an empty-bytes value (BytesCapsule wrapping
         // 0 bytes). Match the on-disk shape so a snapshot from
         // java-tron is readable as-is.
-        self.backend.put(tx_id, &[]);
+        self.backend.put(tx_id, &[])?;
+        Ok(())
     }
 
     /// `true` if `tx_id` has been recorded.
-    pub fn contains(&self, tx_id: &[u8; 32]) -> bool {
-        self.backend.get(tx_id).is_some()
+    pub fn contains(&self, tx_id: &[u8; 32]) -> Result<bool, StoreError> {
+        Ok(self.backend.get(tx_id)?.is_some())
     }
 
     /// Remove an entry. Used by tooling (`prune-historical`) that
     /// trims the cache after a block ages out.
-    pub fn remove(&self, tx_id: &[u8; 32]) {
-        self.backend.delete(tx_id);
+    pub fn remove(&self, tx_id: &[u8; 32]) -> Result<(), StoreError> {
+        self.backend.delete(tx_id)?;
+        Ok(())
     }
 }
 
@@ -56,11 +59,11 @@ mod tests {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = TransactionCacheStore::new(backend);
         let id = [0xab; 32];
-        assert!(!store.contains(&id));
-        store.put(&id);
-        assert!(store.contains(&id));
-        store.remove(&id);
-        assert!(!store.contains(&id));
+        assert!(!store.contains(&id).unwrap());
+        store.put(&id).unwrap();
+        assert!(store.contains(&id).unwrap());
+        store.remove(&id).unwrap();
+        assert!(!store.contains(&id).unwrap());
     }
 
     #[test]

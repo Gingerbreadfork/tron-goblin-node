@@ -24,7 +24,7 @@ fn mem() -> Arc<dyn KvBackend> {
 }
 
 fn put_account(accounts: &AccountStore, addr: [u8; 21], account: Account) {
-    accounts.put(&Address::from_raw(addr), &account);
+    accounts.put(&Address::from_raw(addr), &account).unwrap();
 }
 
 fn make_transfer_tx(owner: [u8; 21], to: [u8; 21], permission_id: i32) -> Transaction {

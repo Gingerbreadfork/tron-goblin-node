@@ -84,7 +84,7 @@ fn put_account(accounts: &AccountStore, address: &[u8], is_witness: bool) {
             is_witness,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 #[test]
@@ -370,7 +370,7 @@ fn accepts_valid_contract_and_executes_with_fee() {
             balance: 200_000_000,
             ..Default::default()
         },
-    );
+    ).unwrap();
 
     let c = valid_contract(&owner);
     validate_account_permission_update(&accounts, &dp, &c).expect("valid contract");

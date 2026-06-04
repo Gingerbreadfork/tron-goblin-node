@@ -70,7 +70,7 @@ fn seed_alice(state: &StateBackends) {
             r#type: AccountType::Normal as i32,
             ..Default::default()
         },
-    );
+    ).unwrap();
 }
 
 fn build_block(num: i64, parent_hash: [u8; 32]) -> Block {

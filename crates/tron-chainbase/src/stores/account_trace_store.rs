@@ -52,9 +52,10 @@ impl AccountTraceStore {
         out
     }
 
-    pub fn put(&self, address: &Address, block_num: i64, trace: &AccountTrace) {
+    pub fn put(&self, address: &Address, block_num: i64, trace: &AccountTrace) -> Result<(), StoreError> {
         let key = Self::key_for(address, block_num);
-        self.backend.put(&key, &trace.encode_to_vec());
+        self.backend.put(&key, &trace.encode_to_vec())?;
+        Ok(())
     }
 
     pub fn get(
@@ -63,7 +64,7 @@ impl AccountTraceStore {
         block_num: i64,
     ) -> Result<Option<AccountTrace>, StoreError> {
         let key = Self::key_for(address, block_num);
-        let Some(bytes) = self.backend.get(&key) else {
+        let Some(bytes) = self.backend.get(&key)? else {
             return Ok(None);
         };
         Ok(Some(AccountTrace::decode(bytes.as_slice())?))
@@ -85,7 +86,7 @@ impl AccountTraceStore {
         block_num: i64,
     ) -> Result<(i64, i64), StoreError> {
         let start_key = Self::key_for(address, block_num);
-        let rows = self.backend.scan_from(&start_key, 1);
+        let rows = self.backend.scan_from(&start_key, 1)?;
         let Some((k, v)) = rows.into_iter().next() else {
             return Err(StoreError::NotFound);
         };
@@ -129,7 +130,7 @@ mod tests {
                 balance: 5_000,
                 ..Default::default()
             },
-        );
+        ).unwrap();
         let (block_found, balance) = store.get_prev_balance(&alice, 100).unwrap();
         assert_eq!(block_found, 100);
         assert_eq!(balance, 5_000);
@@ -149,7 +150,7 @@ mod tests {
                     balance: bal,
                     ..Default::default()
                 },
-            );
+            ).unwrap();
         }
         let (b, bal) = store.get_prev_balance(&alice, 150).unwrap();
         assert_eq!(b, 100);
