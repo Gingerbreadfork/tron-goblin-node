@@ -22,6 +22,7 @@
 
 use std::convert::TryInto;
 
+use group::ff::Field;
 use group::GroupEncoding;
 use prost::Message as _;
 use rand_core::{CryptoRng, RngCore};
@@ -37,6 +38,21 @@ use tron_proto::{ReceiveDescription, ShieldedTransferContract, SpendDescription}
 use tron_rpc::RpcState;
 
 use crate::prover::SaplingProver;
+
+/// Sample a fresh `alpha` (spend-authorization randomizer) when the
+/// client doesn't supply one — matching java-tron, which samples it
+/// server-side via `librustzcashSaplingGenerateR`.
+///
+/// The previous code drew 32 random bytes and fed them to
+/// `jubjub::Fr::from_bytes`, which only accepts a *canonical* scalar.
+/// `Fr` is a ~252-bit field, so a uniform 32-byte draw is in range only
+/// ~6% of the time — meaning server-sampled spends returned
+/// `Status::internal("non-canonical jubjub scalar")` on ~94% of calls
+/// (gRPC C1). `Fr::random` rejection-samples (uniform over the whole
+/// field) and never fails.
+fn sample_alpha() -> jubjub::Fr {
+    jubjub::Fr::random(rand::rngs::OsRng)
+}
 
 /// Inputs the builder needs for ONE spend. Mirrors java-tron's
 /// `SpendDescriptionInfo`.
@@ -236,19 +252,9 @@ impl ZenTransactionBuilder {
         let rcm = parse_scalar_32(&note.rcm, "spend.note.rcm")?;
 
         let alpha = if spend.alpha.is_empty() {
-            // java-tron's SpendDescriptionInfo samples alpha via
-            // librustzcashSaplingGenerateR when not supplied. We
-            // mirror with a fresh OS-entropy scalar.
-            let mut alpha_bytes = [0u8; 32];
-            getrandom::getrandom(&mut alpha_bytes)
-                .map_err(|e| Status::internal(format!("CSPRNG: {e}")))?;
-            let opt = jubjub::Fr::from_bytes(&alpha_bytes);
-            if !bool::from(opt.is_some()) {
-                return Err(Status::internal(
-                    "CSPRNG produced non-canonical jubjub scalar (retry)",
-                ));
-            }
-            opt.unwrap()
+            // java-tron samples alpha server-side when the client omits
+            // it. See `sample_alpha` for why a raw byte draw was wrong.
+            sample_alpha()
         } else {
             parse_scalar_32(&spend.alpha, "spend.alpha")?
         };
@@ -909,18 +915,9 @@ impl ShieldedTrc20Builder {
         let diversifier = Diversifier(d_bytes);
         let rcm = parse_scalar_32(&note.rcm, "trc20 spend.note.rcm")?;
         let alpha = if spend.alpha.is_empty() {
-            // Generate fresh alpha — java-tron does the same when not
-            // supplied.
-            let mut alpha_bytes = [0u8; 32];
-            getrandom::getrandom(&mut alpha_bytes)
-                .map_err(|e| Status::internal(format!("CSPRNG: {e}")))?;
-            let opt = jubjub::Fr::from_bytes(&alpha_bytes);
-            if !bool::from(opt.is_some()) {
-                return Err(Status::internal(
-                    "CSPRNG produced non-canonical jubjub scalar",
-                ));
-            }
-            opt.unwrap()
+            // Fresh alpha when the client omits it — same as the native
+            // spend path above (the old raw-byte draw failed ~94% here too).
+            sample_alpha()
         } else {
             parse_scalar_32(&spend.alpha, "trc20 spend.alpha")?
         };
@@ -1340,4 +1337,40 @@ fn encrypt_burn_message_by_ovk(
     out[..64].copy_from_slice(&buffer);
     out[64..80].copy_from_slice(&tag);
     Ok(out)
+}
+
+#[cfg(test)]
+mod c1_alpha_tests {
+    use super::*;
+    use rand::{RngCore, SeedableRng};
+
+    /// gRPC C1 regression. `sample_alpha` must always yield a scalar (the
+    /// fix), whereas the `from_bytes(random_bytes)` approach it replaces
+    /// produced a canonical scalar only a small fraction of the time —
+    /// which is why server-sampled spends used to fail on almost every
+    /// call.
+    #[test]
+    fn sample_alpha_is_total_unlike_raw_byte_draws() {
+        // The fix never fails, across many draws.
+        for _ in 0..256 {
+            let _: jubjub::Fr = sample_alpha();
+        }
+
+        // Document the property that made the old path broken: a uniform
+        // 32-byte draw is a canonical `Fr` only a small fraction of the
+        // time (well under half).
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC1);
+        let (mut canonical, trials) = (0u32, 2000u32);
+        for _ in 0..trials {
+            let mut b = [0u8; 32];
+            rng.fill_bytes(&mut b);
+            if bool::from(jubjub::Fr::from_bytes(&b).is_some()) {
+                canonical += 1;
+            }
+        }
+        assert!(
+            canonical * 4 < trials,
+            "raw-byte canonical rate unexpectedly high: {canonical}/{trials}"
+        );
+    }
 }
