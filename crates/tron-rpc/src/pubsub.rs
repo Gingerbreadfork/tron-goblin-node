@@ -301,17 +301,26 @@ pub async fn ws_upgrade_handler(
 #[derive(Debug, Clone)]
 struct Notification(String);
 
+/// Per-connection bound on queued-but-unsent notifications. Caps memory
+/// when a slow or stalled WS client can't keep up: once this many
+/// notifications are buffered, the fan-out tasks backpressure (and the
+/// upstream broadcast ring drops its oldest) instead of the channel
+/// growing without limit (C3). At ~1 KiB/notification that's ≤ ~1 MiB
+/// per stuck connection rather than unbounded → OOM.
+const NOTIFY_BUFFER: usize = 1024;
+
 /// Run a single WS connection until the client disconnects or sends
 /// a close frame. Owns:
 ///   * The split WS sender/receiver.
-///   * An `mpsc::UnboundedSender` shared with every sub-task so they
-///     can fan notifications back to the writer half.
+///   * A bounded `mpsc::Sender` shared with every sub-task so they
+///     can fan notifications back to the writer half (backpressured,
+///     so a slow client can't make the queue grow without bound).
 ///   * A per-sub `tokio::task::JoinHandle` map for clean cancel on
 ///     `eth_unsubscribe` / connection close.
 async fn handle_ws(socket: WebSocket, state: crate::RpcState) {
     use futures_util::{SinkExt, StreamExt};
     let (mut tx, mut rx) = socket.split();
-    let (note_tx, mut note_rx) = tokio::sync::mpsc::unbounded_channel::<Notification>();
+    let (note_tx, mut note_rx) = tokio::sync::mpsc::channel::<Notification>(NOTIFY_BUFFER);
 
     // Per-sub cancellation handles.
     let mut subs: HashMap<SubId, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -361,7 +370,7 @@ fn dispatch_ws_request(
     text: &str,
     state: &crate::RpcState,
     subs: &mut HashMap<SubId, tokio::task::JoinHandle<()>>,
-    note_tx: &tokio::sync::mpsc::UnboundedSender<Notification>,
+    note_tx: &tokio::sync::mpsc::Sender<Notification>,
 ) -> String {
     let Ok(req): Result<Value, _> = serde_json::from_str(text) else {
         return json!({
@@ -446,7 +455,7 @@ fn handle_subscribe(
     state: &crate::RpcState,
     params: &Value,
     subs: &mut HashMap<SubId, tokio::task::JoinHandle<()>>,
-    note_tx: &tokio::sync::mpsc::UnboundedSender<Notification>,
+    note_tx: &tokio::sync::mpsc::Sender<Notification>,
 ) -> Result<SubId, crate::methods::RpcError> {
     let Some(broker) = state.pubsub.clone() else {
         return Err(crate::methods::RpcError::method_not_found(
@@ -538,14 +547,14 @@ fn parse_log_filter_arg(v: Option<&Value>) -> LogFilter {
 fn spawn_heads_sub(
     sub_id: SubId,
     mut rx: broadcast::Receiver<HeadEvent>,
-    note_tx: tokio::sync::mpsc::UnboundedSender<Notification>,
+    note_tx: tokio::sync::mpsc::Sender<Notification>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(HeadEvent(value)) => {
                     let payload = notification_envelope(sub_id, value);
-                    if note_tx.send(Notification(payload)).is_err() {
+                    if note_tx.send(Notification(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -559,7 +568,7 @@ fn spawn_heads_sub(
 fn spawn_pending_tx_sub(
     sub_id: SubId,
     mut rx: broadcast::Receiver<[u8; 32]>,
-    note_tx: tokio::sync::mpsc::UnboundedSender<Notification>,
+    note_tx: tokio::sync::mpsc::Sender<Notification>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -569,7 +578,7 @@ fn spawn_pending_tx_sub(
                         sub_id,
                         Value::String(format!("0x{}", hex::encode(tx_id))),
                     );
-                    if note_tx.send(Notification(payload)).is_err() {
+                    if note_tx.send(Notification(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -583,14 +592,14 @@ fn spawn_pending_tx_sub(
 fn spawn_syncing_sub(
     sub_id: SubId,
     mut rx: broadcast::Receiver<SyncEvent>,
-    note_tx: tokio::sync::mpsc::UnboundedSender<Notification>,
+    note_tx: tokio::sync::mpsc::Sender<Notification>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(SyncEvent::CaughtUp) => {
                     let payload = notification_envelope(sub_id, Value::Bool(false));
-                    if note_tx.send(Notification(payload)).is_err() {
+                    if note_tx.send(Notification(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -603,7 +612,7 @@ fn spawn_syncing_sub(
                             "highestBlock": format!("0x{:x}", highest),
                         }),
                     );
-                    if note_tx.send(Notification(payload)).is_err() {
+                    if note_tx.send(Notification(payload)).await.is_err() {
                         break;
                     }
                 }
@@ -618,7 +627,7 @@ fn spawn_logs_sub(
     sub_id: SubId,
     mut rx: broadcast::Receiver<LogEvent>,
     filter: LogFilter,
-    note_tx: tokio::sync::mpsc::UnboundedSender<Notification>,
+    note_tx: tokio::sync::mpsc::Sender<Notification>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -628,7 +637,7 @@ fn spawn_logs_sub(
                         continue;
                     }
                     let payload = notification_envelope(sub_id, value);
-                    if note_tx.send(Notification(payload)).is_err() {
+                    if note_tx.send(Notification(payload)).await.is_err() {
                         break;
                     }
                 }
