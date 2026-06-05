@@ -792,10 +792,9 @@ fn run_start(args: &[String]) -> ExitCode {
     let shutdown = ShutdownSignal::new();
     let shutdown_sigint = shutdown.clone();
     rt.spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            eprintln!("\ntron-node: Ctrl-C received");
-            shutdown_sigint.shutdown();
-        }
+        let sig = wait_for_shutdown_signal().await;
+        eprintln!("\ntron-node: {sig} received, shutting down");
+        shutdown_sigint.shutdown();
     });
 
     let result: Result<(), RunError> = rt.block_on(run(config, shutdown));
@@ -807,6 +806,35 @@ fn run_start(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Block until the process receives a termination signal, returning its
+/// name. Handles `SIGINT` (Ctrl-C) **and** `SIGTERM` — the signal
+/// systemd / docker / k8s send to stop a service (F-01). Without SIGTERM,
+/// those runtimes would kill the process before the graceful
+/// `shutdown_timeout` drain + clean RocksDB flush could run.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        },
+        Err(e) => {
+            // Couldn't install the SIGTERM handler — fall back to Ctrl-C
+            // only rather than failing to start.
+            eprintln!("tron-node: failed to install SIGTERM handler ({e}); SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
 }
 
 fn run_init(args: &[String]) -> ExitCode {
