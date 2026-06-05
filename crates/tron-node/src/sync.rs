@@ -731,9 +731,17 @@ impl SyncDriver {
                     } else if is_other_rate_limit {
                         debug!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
                             "peer rate-limited; rotating");
+                    } else if is_expected_peer_failure(&reason) {
+                        // Unreachable / full / deduped peers from the
+                        // discovery pool — normal churn, not a fault on our
+                        // side. Keep at debug so a genuine protocol rejection
+                        // (BAD_PROTOCOL / INCOMPATIBLE_VERSION / BAD_MESSAGE)
+                        // stands out at warn instead of drowning in noise.
+                        debug!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
+                            "peer unavailable; rotating");
                     } else {
                         warn!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
-                            "peer failed; backing off");
+                            "peer rejected us; backing off");
                     }
                     tokio::select! {
                         _ = shutdown.recv() => return self.stats.clone(),
@@ -1670,22 +1678,33 @@ impl SyncDriver {
                     tracing::trace!("keepalive pong from peer");
                 }
                 MessageType::Libp2pDisconnect => {
-                    // Decode the reason byte to surface the rejection.
+                    // Decode the reason byte AND its enum name so the log is
+                    // human-readable, not a bare number. This is the libp2p
+                    // connection-layer enum (`DisconnectReasonCode`), distinct
+                    // from the app-layer `ReasonCode` used by P2pDisconnect.
                     let reason = tron_proto::libp2p::P2pDisconnectMessage::decode(
                         frame.payload,
                     )
                     .map(|d| d.reason)
                     .unwrap_or(-1);
+                    let name = tron_proto::libp2p::DisconnectReasonCode::try_from(reason)
+                        .map(|r| r.as_str_name())
+                        .unwrap_or("UNKNOWN");
                     return PeerOutcome::PeerFailure(format!(
-                        "peer libp2p-disconnected with reason code {reason}"
+                        "peer libp2p-disconnected with reason code {reason} ({name})"
                     ));
                 }
                 MessageType::P2pDisconnect => {
+                    // App-layer `ReasonCode` (e.g. 4 = TOO_MANY_PEERS — the
+                    // peer is at capacity, not a fault on our side).
                     let reason = tron_proto::DisconnectMessage::decode(frame.payload)
                         .map(|d| d.reason)
                         .unwrap_or(-1);
+                    let name = tron_proto::ReasonCode::try_from(reason)
+                        .map(|r| r.as_str_name())
+                        .unwrap_or("UNKNOWN");
                     return PeerOutcome::PeerFailure(format!(
-                        "peer app-disconnected with reason code {reason}"
+                        "peer app-disconnected with reason code {reason} ({name})"
                     ));
                 }
                 MessageType::Trx => {
@@ -3617,6 +3636,31 @@ fn extract_owner_address_hex(any_value: &[u8]) -> String {
     hex::encode(&any_value[2..2 + 21])
 }
 
+/// Classify a `PeerFailure` reason as *expected* discovery-pool churn —
+/// peers that are unreachable, at capacity, or deduping us — rather than a
+/// rejection that suggests a problem on OUR side. Expected churn is logged
+/// at debug so the steady-state log stays readable; everything else (a
+/// protocol/version/message rejection) stays at warn, where a real
+/// incompatibility is actually visible.
+///
+/// Reason strings carry the decoded enum name (e.g. `TOO_MANY_PEERS`), so we
+/// match on those rather than raw numbers. The default is "treat as a real
+/// rejection" — better to over-warn on an unrecognised reason than hide a
+/// genuine "they don't like us" signal.
+fn is_expected_peer_failure(reason: &str) -> bool {
+    // Never even established a TCP connection — dead / firewalled host.
+    reason.starts_with("dial:")
+        // Peer accepted TCP but dropped us before/at handshake for its own
+        // capacity / policy reasons (their choice, not our bug).
+        || reason.contains("connection closed before peer Hello")
+        || reason.contains("TOO_MANY_PEERS")          // peer is full
+        || reason.contains("DUPLICATE_PEER")          // already connected to our id
+        || reason.contains("RANDOM_ELIMINATION")      // peer trimmed its peer set
+        || reason.contains("RECENT_DISCONNECT")       // peer's reconnect cooldown
+        || reason.contains("DISCOVER_MODE")           // peer is discovery-only
+        || reason.contains("TIME_OUT")                // peer-side idle/ping timeout
+}
+
 /// Per-peer backoff: `initial × 2^failures`, capped at 5 minutes.
 pub fn backoff_for(initial: Duration, failures: u32) -> Duration {
     let f = failures.min(8); // 2^8 = 256× initial
@@ -4738,5 +4782,58 @@ mod solidify_tests {
             Some(head),
             "the head pointer must be left untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod peer_failure_log_tests {
+    use super::is_expected_peer_failure;
+
+    #[test]
+    fn disconnect_codes_decode_to_readable_names() {
+        // The two enums the two disconnect paths use. "reason code 4" means
+        // different things in each — which is exactly why the raw number was
+        // confusing and we now log the name.
+        assert_eq!(
+            tron_proto::ReasonCode::try_from(4).unwrap().as_str_name(),
+            "TOO_MANY_PEERS",
+            "app-layer P2pDisconnect code 4 = peer is full"
+        );
+        assert_eq!(
+            tron_proto::ReasonCode::try_from(2).unwrap().as_str_name(),
+            "BAD_PROTOCOL"
+        );
+        assert_eq!(
+            tron_proto::libp2p::DisconnectReasonCode::try_from(4)
+                .unwrap()
+                .as_str_name(),
+            "DIFFERENT_VERSION",
+            "libp2p-layer code 4 = version mismatch (a DIFFERENT enum)"
+        );
+    }
+
+    #[test]
+    fn expected_churn_is_quiet_real_rejections_are_loud() {
+        // Unreachable / full / deduped peers → expected churn (debug).
+        for r in [
+            "dial: Connection refused (os error 111)",
+            "dial: No route to host (os error 113)",
+            "dial: Connection timed out (os error 110)",
+            "peer app-disconnected with reason code 4 (TOO_MANY_PEERS)",
+            "peer app-disconnected with reason code 5 (DUPLICATE_PEER)",
+            "handshake: connection closed before peer Hello arrived",
+        ] {
+            assert!(is_expected_peer_failure(r), "should be quiet: {r}");
+        }
+        // Protocol/version/message rejections → real signal (warn): these are
+        // the ones that mean "we're doing something peers don't like".
+        for r in [
+            "peer app-disconnected with reason code 2 (BAD_PROTOCOL)",
+            "peer app-disconnected with reason code 24 (INCOMPATIBLE_VERSION)",
+            "peer libp2p-disconnected with reason code 11 (BAD_MESSAGE)",
+            "libp2p_handshake: frame error: unknown message type byte: 0x54",
+        ] {
+            assert!(!is_expected_peer_failure(r), "should be loud: {r}");
+        }
     }
 }
