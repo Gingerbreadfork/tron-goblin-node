@@ -83,6 +83,49 @@ pub fn parse_hex_quantity(s: &str) -> Result<u64, RpcError> {
         .map_err(|e| RpcError::invalid_params(format!("invalid hex quantity: {e}")))
 }
 
+/// Parse a `0x…` quantity into the `i64` the block stores use, rejecting
+/// values that don't fit `i64`. The old `parse_hex_quantity(..) as i64`
+/// silently turned e.g. `0x8000000000000000` into a negative number —
+/// see [`resolve_log_block_range`] for why that was a DoS (C2).
+fn parse_block_number(s: &str) -> Result<i64, RpcError> {
+    i64::try_from(parse_hex_quantity(s)?)
+        .map_err(|_| RpcError::invalid_params("block number out of range"))
+}
+
+/// Resolve and validate the `[from, to]` block window for the log-query
+/// methods. `Ok(None)` means an empty window (`to < from`); `Ok(Some(..))`
+/// a valid in-cap window.
+///
+/// `from`/`to` are parsed as `u64` then *checked* into `i64`. The old
+/// `as i64` cast let `fromBlock=0x8000000000000000` become `i64::MIN`;
+/// with a positive `toBlock` the span check `to - from` overflowed (debug
+/// panic / release wrap), slipped past the 10k cap, and drove a
+/// ~9.2e18-iteration scan loop. The span is also computed in `i128` so it
+/// can't overflow regardless of inputs. (C2)
+fn resolve_log_block_range(
+    obj: &serde_json::Map<String, Value>,
+    head: i64,
+) -> Result<Option<(i64, i64)>, RpcError> {
+    fn tag(v: Option<&str>, head: i64) -> Result<i64, RpcError> {
+        match v {
+            Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => Ok(head),
+            Some("earliest") => Ok(0),
+            Some(hex) => parse_block_number(hex),
+        }
+    }
+    let from_block = tag(obj.get("fromBlock").and_then(|v| v.as_str()), head)?;
+    let to_block = tag(obj.get("toBlock").and_then(|v| v.as_str()), head)?;
+    if to_block < from_block {
+        return Ok(None);
+    }
+    if (to_block as i128 - from_block as i128) > 10_000 {
+        return Err(RpcError::invalid_params(
+            "block range too large (max 10000)",
+        ));
+    }
+    Ok(Some((from_block, to_block)))
+}
+
 /// Parse hex bytes. Accepts `"0xabcd"` and produces `[0xab, 0xcd]`.
 pub fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RpcError> {
     let stripped = s
@@ -1862,27 +1905,13 @@ pub fn eth_get_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .and_then(|v| v.as_object())
         .ok_or_else(|| RpcError::invalid_params("missing filter object"))?;
     let head = s.dyn_props.latest_block_header_number().unwrap_or(0);
-    let from_block = match obj.get("fromBlock").and_then(|v| v.as_str()) {
-        Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => head,
-        Some("earliest") => 0,
-        Some(hex) => parse_hex_quantity(hex)? as i64,
+    // Resolve + cap the window (rejects the signed-cast bypass) BEFORE the
+    // history-store fallback so misbehaved callers are rejected regardless
+    // of whether receipts are wired.
+    let (from_block, to_block) = match resolve_log_block_range(obj, head)? {
+        Some(window) => window,
+        None => return Ok(Value::Array(vec![])),
     };
-    let to_block = match obj.get("toBlock").and_then(|v| v.as_str()) {
-        Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => head,
-        Some("earliest") => 0,
-        Some(hex) => parse_hex_quantity(hex)? as i64,
-    };
-    if to_block < from_block {
-        return Ok(Value::Array(vec![]));
-    }
-    // Cap the window to prevent runaway scans — checked BEFORE the
-    // history-store fallback so misbehaved callers get rejected
-    // regardless of whether receipts are wired.
-    if (to_block - from_block) > 10_000 {
-        return Err(RpcError::invalid_params(
-            "block range too large (max 10000)",
-        ));
-    }
     let Some(history) = &s.tx_history else {
         return Ok(Value::Array(vec![]));
     };
@@ -2196,12 +2225,12 @@ fn parse_log_filter(obj: &serde_json::Map<String, Value>, head: i64) -> Result<L
     let from_block = match obj.get("fromBlock").and_then(|v| v.as_str()) {
         Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => head,
         Some("earliest") => 0,
-        Some(hex) => parse_hex_quantity(hex)? as i64,
+        Some(hex) => parse_block_number(hex)?,
     };
     let to_block = match obj.get("toBlock").and_then(|v| v.as_str()) {
         Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => i64::MAX,
         Some("earliest") => 0,
-        Some(hex) => parse_hex_quantity(hex)? as i64,
+        Some(hex) => parse_block_number(hex)?,
     };
     let addresses: Vec<Vec<u8>> = match obj.get("address") {
         Some(Value::String(s)) => vec![parse_eth_address(s)?.as_bytes().to_vec()],
@@ -5594,6 +5623,47 @@ pub fn eth_compile_lll(_p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
 
 pub fn eth_compile_serpent(_p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
     Err(RpcError::method_not_found("eth_compileSerpent"))
+}
+
+#[cfg(test)]
+mod log_range_tests {
+    use super::*;
+
+    fn obj(v: Value) -> serde_json::Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn rejects_out_of_range_from_block_instead_of_overflowing() {
+        // C2: 0x8000000000000000 (u64 2^63) used to cast to i64::MIN; with
+        // a positive toBlock the span check overflowed past the 10k cap.
+        let o = obj(json!({"fromBlock": "0x8000000000000000", "toBlock": "0x1"}));
+        let err = resolve_log_block_range(&o, 100).unwrap_err();
+        assert_eq!(err.code, -32602, "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_span_over_cap() {
+        let o = obj(json!({"fromBlock": "0x0", "toBlock": "0x4e21"})); // 0..=20001
+        let err = resolve_log_block_range(&o, 1_000_000).unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn accepts_in_cap_window_and_empty_when_reversed() {
+        let o = obj(json!({"fromBlock": "0xa", "toBlock": "0x14"})); // 10..=20
+        assert_eq!(resolve_log_block_range(&o, 100).unwrap(), Some((10, 20)));
+        let rev = obj(json!({"fromBlock": "0x14", "toBlock": "0xa"}));
+        assert_eq!(resolve_log_block_range(&rev, 100).unwrap(), None);
+    }
+
+    #[test]
+    fn defaults_unspecified_bounds_to_head() {
+        assert_eq!(
+            resolve_log_block_range(&obj(json!({})), 42).unwrap(),
+            Some((42, 42))
+        );
+    }
 }
 
 #[cfg(test)]
