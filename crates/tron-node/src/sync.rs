@@ -484,6 +484,17 @@ impl SyncDriver {
 
     /// Run the driver until shutdown or until `max_blocks` is reached.
     pub async fn run(&mut self, mut shutdown: broadcast::Receiver<()>) -> DriverStats {
+        // Restore the block-store/head invariant first: drop any blocks
+        // persisted-but-never-executed by a prior stall (M-19), so the
+        // gap is re-fetched rather than skipped as already-held.
+        self.reconcile_stores_to_head();
+        // Then advance the solidified pointer from already-applied on-disk
+        // blocks before processing anything new. A node resumed at/near
+        // `solid + WALK_HORIZON` (e.g. one synced by a pre-M-18 binary)
+        // would otherwise deadlock — the head-promotion gate rejects the
+        // next block before any apply could advance solidity.
+        self.seed_solidified_from_disk();
+
         if self.config.peers.is_empty() {
             warn!("no peers configured; sync driver idle");
             return self.stats.clone();
@@ -2413,6 +2424,15 @@ impl SyncDriver {
             self.recent_witnesses.pop_back();
         }
 
+        self.advance_solid_from_window();
+    }
+
+    /// Compute the DPoS solidified block from the current rolling window
+    /// and advance `LATEST_SOLIDIFIED_BLOCK_NUM` if it moved forward (never
+    /// backward — a higher PBFT-set value wins). Shared by
+    /// [`Self::update_solidified`] (per applied block) and
+    /// [`Self::seed_solidified_from_disk`] (startup).
+    fn advance_solid_from_window(&self) {
         // Active-witness count drives the ⌈2/3⌉ threshold; read it from the
         // witness schedule (27 on mainnet). No schedule store / empty list
         // → can't size the threshold, so leave solidity untouched.
@@ -2424,10 +2444,10 @@ impl SyncDriver {
             _ => return,
         };
 
-        // The window is already newest-first, exactly what
-        // `latest_solid_block` walks. It returns `None` until the window
-        // holds `threshold` distinct witnesses (the first ~19 blocks after
-        // a snapshot boot) — leave the pointer alone in that case.
+        // The window is newest-first, exactly what `latest_solid_block`
+        // walks. It returns `None` until the window holds `threshold`
+        // distinct witnesses (the first ~19 blocks after a snapshot boot)
+        // — leave the pointer alone in that case.
         let window: Vec<tron_consensus::RecentBlock> =
             self.recent_witnesses.iter().cloned().collect();
         let Some(solid) = tron_consensus::latest_solid_block(&window, active_count) else {
@@ -2441,6 +2461,112 @@ impl SyncDriver {
             if let Some(m) = &self.metrics {
                 m.set_solidified_block_number(solid);
             }
+        }
+    }
+
+    /// Seed the rolling window and the solidified pointer from the most
+    /// recent on-disk blocks at startup.
+    ///
+    /// Without this a node resumed at or near `solid + WALK_HORIZON`
+    /// deadlocks: `gate_new_head_against_solidified` rejects the next block
+    /// before any apply can run [`Self::update_solidified`], and the
+    /// in-memory window starts empty across restarts — so the pointer can
+    /// never catch up. Reads at most [`Self::SOLID_WINDOW`] blocks back
+    /// from the persisted head; cheap, and reorg-safe (always reflects the
+    /// current canonical chain).
+    fn seed_solidified_from_disk(&mut self) {
+        let head = self.head_number();
+        if head < 1 {
+            return;
+        }
+        let Some(bi_backend) = self.state.block_index.clone() else {
+            return;
+        };
+        let block_index = BlockIndexStore::new(bi_backend);
+        let block_store = BlockStore::new(self.blocks_backend.clone());
+
+        let lowest = (head - Self::SOLID_WINDOW as i64 + 1).max(1);
+        let mut window: VecDeque<tron_consensus::RecentBlock> = VecDeque::new();
+        // Newest-first: walk head down to `lowest`. Stop at the first gap
+        // (a pruned / missing index entry) — the newest contiguous run is
+        // what solidification needs.
+        for num in (lowest..=head).rev() {
+            let Ok(id) = block_index.get(num) else { break };
+            let Ok(block) = block_store.get(&id) else { break };
+            let Some(w) = block
+                .block_header
+                .as_ref()
+                .and_then(|h| h.raw_data.as_ref())
+                .map(|raw| raw.witness_address.clone())
+                .filter(|w| w.len() == 21)
+            else {
+                continue;
+            };
+            let mut buf = [0u8; 21];
+            buf.copy_from_slice(&w);
+            window.push_back(tron_consensus::RecentBlock {
+                num,
+                witness: tron_crypto::address::Address::from_raw(buf),
+            });
+        }
+        let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
+        let before = dp.latest_solidified_block_num().unwrap_or(0);
+        self.recent_witnesses = window;
+        self.advance_solid_from_window();
+        let after = dp.latest_solidified_block_num().unwrap_or(0);
+        // Only the first driver to seed actually moves the pointer; the
+        // rest find it already advanced. Log just the real advance.
+        if after > before {
+            info!(head, solidified = after, "seeded DPoS solidified block from disk at startup");
+        }
+    }
+
+    /// Prune any `block_store` / `block_index` entries ahead of the executed
+    /// head at startup (M-19).
+    ///
+    /// `accept_block` persists a block (`block_store` + `block_index`)
+    /// *before* the solidified-containment gate and before execution, so a
+    /// block that is persisted then gate-rejected — e.g. by a pre-M-18
+    /// binary stalled at the `solid + WALK_HORIZON` jam — is left on disk
+    /// yet never executed. `block_index` then leads the executed head; the
+    /// inventory-dedup treats the orphan as already-held and never
+    /// re-fetches it, so the head can't advance past it and every later
+    /// block fails parent-link.
+    ///
+    /// Removing the orphans restores the invariant that the block stores
+    /// never lead the executed head, so the gap is cleanly re-fetched and
+    /// re-executed. Runs once at startup before any peer work, so nothing
+    /// races the deletes; bounded by the reversible window as a backstop.
+    fn reconcile_stores_to_head(&mut self) {
+        let head = self.head_number();
+        let Some(bi_backend) = self.state.block_index.clone() else {
+            return;
+        };
+        let block_index = BlockIndexStore::new(bi_backend);
+        let block_store = BlockStore::new(self.blocks_backend.clone());
+
+        let mut pruned = 0i64;
+        let mut num = head + 1;
+        while pruned <= 1024 {
+            let id = match block_index.get(num) {
+                Ok(id) => id,
+                Err(_) => break, // first gap → no more orphans
+            };
+            // Remove the bytes first, then the index entry. Best-effort on
+            // the bytes; stop if the index delete fails so we don't spin.
+            let _ = block_store.delete(&id);
+            if block_index.delete(num).is_err() {
+                break;
+            }
+            pruned += 1;
+            num += 1;
+        }
+        if pruned > 0 {
+            warn!(
+                head,
+                pruned,
+                "pruned persist-before-gate block(s) ahead of the executed head; they will be re-fetched and re-executed"
+            );
         }
     }
 
@@ -4360,13 +4486,13 @@ mod solidify_tests {
         }
     }
 
-    fn driver_with(state: StateBackends) -> SyncDriver {
+    fn driver_with(state: StateBackends, blocks_be: Arc<dyn KvBackend>) -> SyncDriver {
         let cfg = SyncConfig {
             peers: vec![],
             max_blocks: None,
             tail_interval: Duration::from_millis(1),
             initial_backoff: Duration::from_millis(1),
-            blocks_backend: mem(),
+            blocks_backend: blocks_be,
             progress_log_interval: 0,
             advertise_port: 18_888,
             tip_test: false,
@@ -4411,7 +4537,7 @@ mod solidify_tests {
         const N: usize = 27; // mainnet active witness count
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone());
+        let mut driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         let threshold = tron_consensus::solidity_threshold(N) as i64;
@@ -4438,7 +4564,7 @@ mod solidify_tests {
         const N: usize = 27;
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone());
+        let mut driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
         let threshold = tron_consensus::solidity_threshold(N) as i64;
 
@@ -4459,7 +4585,7 @@ mod solidify_tests {
         const N: usize = 27;
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone());
+        let mut driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         // A higher solid is already on disk (e.g. from PBFT finality).
@@ -4482,7 +4608,7 @@ mod solidify_tests {
         // No active list seeded → can't size the ⌈2/3⌉ threshold → leave
         // the pointer untouched rather than guess.
         let state = mem_state();
-        let mut driver = driver_with(state.clone());
+        let mut driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         for num in 1..=40i64 {
@@ -4490,5 +4616,89 @@ mod solidify_tests {
             driver.update_solidified(&block_by(num, &w), num);
             assert_eq!(dp.latest_solidified_block_num(), None);
         }
+    }
+
+    #[test]
+    fn seed_from_disk_recovers_a_stuck_node() {
+        // Reproduces the deadlock: a node synced by a pre-M-18 binary has a
+        // full block chain on disk but a frozen solid pointer. Startup must
+        // recompute solid from the on-disk blocks, or the head-promotion
+        // gate rejects the next block forever (apply gated on solid, solid
+        // advanced only by apply).
+        const N: usize = 27;
+        let state = mem_state();
+        seed_witnesses(&state, N);
+        let blocks_be = mem();
+
+        let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+        let bs = BlockStore::new(blocks_be.clone());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+
+        let head = 40i64;
+        for num in 1..=head {
+            let w = witness(((num - 1) as usize) % N);
+            let block = block_by(num, &w);
+            let id = block_id_from_block(&block).unwrap();
+            bs.put(&id, &block).unwrap();
+            bi.put(&id).unwrap();
+        }
+        dp.save_latest_block_header_number(head);
+        // Stuck state: solid never advanced.
+        assert_eq!(dp.latest_solidified_block_num(), None);
+
+        // Startup seeding (what `run()` calls before the peer loop).
+        let mut driver = driver_with(state.clone(), blocks_be);
+        driver.seed_solidified_from_disk();
+
+        let threshold = tron_consensus::solidity_threshold(N) as i64;
+        assert_eq!(
+            dp.latest_solidified_block_num().unwrap_or(0),
+            head - threshold + 1,
+            "seed must advance solid to head-(threshold-1), unjamming the gate"
+        );
+    }
+
+    #[test]
+    fn reconcile_prunes_blocks_ahead_of_executed_head() {
+        // M-19: a persist-before-gate orphan (block on disk, never executed)
+        // leads the executed head and gets skipped on re-sync. Startup
+        // reconciliation must drop it so it's re-fetched.
+        const N: usize = 27;
+        let state = mem_state();
+        let blocks_be = mem();
+        let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+        let bs = BlockStore::new(blocks_be.clone());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+
+        // Executed head = 100, but blocks 101..=103 are persisted orphans.
+        let head = 100i64;
+        let mut orphans = vec![];
+        for num in 1..=103i64 {
+            let w = witness(((num - 1) as usize) % N);
+            let block = block_by(num, &w);
+            let id = block_id_from_block(&block).unwrap();
+            bs.put(&id, &block).unwrap();
+            bi.put(&id).unwrap();
+            if num > head {
+                orphans.push((num, id));
+            }
+        }
+        dp.save_latest_block_header_number(head);
+        assert!(bi.get(101).is_ok() && bi.get(103).is_ok());
+
+        let mut driver = driver_with(state.clone(), blocks_be);
+        driver.reconcile_stores_to_head();
+
+        // Orphans gone from both stores; head + in-window entries intact.
+        for (num, id) in orphans {
+            assert!(bi.get(num).is_err(), "index orphan {num} pruned");
+            assert!(bs.get(&id).is_err(), "block-bytes orphan {num} pruned");
+        }
+        assert!(bi.get(head).is_ok(), "head index entry must remain");
+        assert_eq!(
+            dp.latest_block_header_number(),
+            Some(head),
+            "the head pointer must be left untouched"
+        );
     }
 }
