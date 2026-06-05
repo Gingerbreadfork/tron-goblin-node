@@ -187,6 +187,23 @@ impl RocksDbBackend {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Like [`open_as_secondary`](Self::open_as_secondary) but registers a
+    /// custom comparator — RocksDB enforces the MANIFEST comparator-name
+    /// check on secondary opens too, so the live-import read path needs
+    /// this for `market_pair_price_to_order`. See
+    /// [`open_with_comparator`](Self::open_with_comparator).
+    pub fn open_as_secondary_with_comparator(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        comparator_name: &str,
+        compare_fn: fn(&[u8], &[u8]) -> Ordering,
+    ) -> Result<Self, RocksDbError> {
+        let mut opts = safety_baseline();
+        opts.set_comparator(comparator_name, Box::new(compare_fn));
+        let db = DB::open_as_secondary(&opts, primary_path.as_ref(), secondary_path.as_ref())?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
     /// Open with a custom [`Options`] block. Use for byte-for-byte parity
     /// with a specific java-tron `dbSettings`.
     pub fn open_with(path: impl AsRef<Path>, opts: Options) -> Result<Self, RocksDbError> {

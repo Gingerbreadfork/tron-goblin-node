@@ -38,6 +38,7 @@
 //! * Parallel header-then-body fetch across multiple peers.
 //! * Pruning / snapshot import.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,7 +46,9 @@ use bytes::Bytes;
 use prost::Message as _;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use tron_chainbase::{BlockIndexStore, BlockStore, DynamicPropertiesStore, KvBackend};
+use tron_chainbase::{
+    BlockIndexStore, BlockStore, DynamicPropertiesStore, KvBackend, WitnessScheduleStore,
+};
 use tron_executor::{expected_block_signer, StateBackends};
 use tron_eventer::EventBus;
 use tron_mempool::{MempoolError, TxMempool};
@@ -262,6 +265,16 @@ pub struct SyncDriver {
     /// `with_strict_ref_block_check()` to turn it on. See
     /// `crate::ref_block` for the validator implementation.
     strict_ref_block: bool,
+    /// Newest-first rolling window of recently-applied `(block_num,
+    /// witness)` pairs, used to advance the DPoS solidified-block
+    /// pointer as blocks sync (`update_solidified`). java-tron advances
+    /// solidity every block via `updateLatestSolidifiedBlock`; without
+    /// this the pointer only moves on PBFT commit traffic, and the head
+    /// jams ~1024 blocks past the last solidified block once the
+    /// reversible window fills (`gate_new_head_against_solidified`).
+    /// Capped at [`Self::SOLID_WINDOW`] entries — enough to always
+    /// contain ⌈2/3⌉ distinct active witnesses.
+    recent_witnesses: VecDeque<tron_consensus::RecentBlock>,
 }
 
 impl SyncDriver {
@@ -299,6 +312,7 @@ impl SyncDriver {
             snapshot_stack: None,
             pubsub: None,
             strict_ref_block: false,
+            recent_witnesses: VecDeque::new(),
         }
     }
 
@@ -2026,6 +2040,7 @@ impl SyncDriver {
                     m.set_head_block_number(id.num() as i64);
                 }
                 self.apply_sr_rotation(&report);
+                self.update_solidified(block, id.num() as i64);
                 self.emit_block_events(block, &id, &report);
                 self.publish_block_to_pubsub(block, &id, &report);
                 self.drop_included_txs_from_mempool(block);
@@ -2074,6 +2089,7 @@ impl SyncDriver {
                     m.set_head_block_number(id.num() as i64);
                 }
                 self.apply_sr_rotation(&report);
+                self.update_solidified(block, id.num() as i64);
                 self.emit_block_events(block, &id, &report);
                 self.publish_block_to_pubsub(block, &id, &report);
                 self.drop_included_txs_from_mempool(block);
@@ -2354,6 +2370,78 @@ impl SyncDriver {
             rot.new_active.clone(),
             rot.before_maintenance_time_ms,
         );
+    }
+
+    /// Maximum entries held in [`Self::recent_witnesses`]. ⌈2/3⌉ of 27
+    /// mainnet SRs is 19 distinct witnesses; 64 leaves ample slack for
+    /// skipped slots / occasional repeats within one rotation.
+    const SOLID_WINDOW: usize = 64;
+
+    /// Advance the DPoS solidified-block pointer after applying `block`.
+    ///
+    /// Ports java-tron's `Manager.updateLatestSolidifiedBlock`: a block is
+    /// solid once ⌈2/3⌉ of the active witnesses have produced it or a
+    /// descendant. We feed the rolling newest-first `(num, witness)` window
+    /// to [`tron_consensus::latest_solid_block`] and bump
+    /// `LATEST_SOLIDIFIED_BLOCK_NUM` whenever it moves forward (never
+    /// backward). Without this the pointer only advances on PBFT commit
+    /// traffic, so a plain block sync jams ~1024 blocks past the snapshot's
+    /// solidified head once the reversible window fills
+    /// (`gate_new_head_against_solidified`).
+    fn update_solidified(&mut self, block: &Block, block_num: i64) {
+        // Producing witness for this block.
+        let witness = match block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|raw| raw.witness_address.as_slice())
+        {
+            Some(w) if w.len() == 21 => {
+                let mut buf = [0u8; 21];
+                buf.copy_from_slice(w);
+                tron_crypto::address::Address::from_raw(buf)
+            }
+            // The block already passed signature validation, so a
+            // malformed witness address shouldn't reach here; skip safely.
+            _ => return,
+        };
+
+        // Push newest-first and cap the window.
+        self.recent_witnesses
+            .push_front(tron_consensus::RecentBlock { num: block_num, witness });
+        while self.recent_witnesses.len() > Self::SOLID_WINDOW {
+            self.recent_witnesses.pop_back();
+        }
+
+        // Active-witness count drives the ⌈2/3⌉ threshold; read it from the
+        // witness schedule (27 on mainnet). No schedule store / empty list
+        // → can't size the threshold, so leave solidity untouched.
+        let Some(ws) = &self.state.witness_schedule else {
+            return;
+        };
+        let active_count = match WitnessScheduleStore::new(ws.clone()).load_active() {
+            Ok(Some(list)) if !list.is_empty() => list.len(),
+            _ => return,
+        };
+
+        // The window is already newest-first, exactly what
+        // `latest_solid_block` walks. It returns `None` until the window
+        // holds `threshold` distinct witnesses (the first ~19 blocks after
+        // a snapshot boot) — leave the pointer alone in that case.
+        let window: Vec<tron_consensus::RecentBlock> =
+            self.recent_witnesses.iter().cloned().collect();
+        let Some(solid) = tron_consensus::latest_solid_block(&window, active_count) else {
+            return;
+        };
+
+        let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
+        let current = dp.latest_solidified_block_num().unwrap_or(0);
+        if solid > current {
+            dp.save_latest_solidified_block_num(solid);
+            if let Some(m) = &self.metrics {
+                m.set_solidified_block_number(solid);
+            }
+        }
     }
 
     /// Enforce TRON's solidified-containment rule on a head switch:
@@ -4221,5 +4309,186 @@ mod trx_inventory_tests {
             matches!(f, Ok(None) | Err(_)),
             "empty id list → no Trx or ItemNotFound frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod solidify_tests {
+    //! DPoS solidified-block advancement during sync
+    //! (`SyncDriver::update_solidified`). The consensus math itself lives
+    //! in `tron_consensus::latest_solid_block`; here we pin the wiring:
+    //! the rolling window advances `LATEST_SOLIDIFIED_BLOCK_NUM` to
+    //! head − (threshold − 1) once enough distinct witnesses are seen,
+    //! never moves it backward, and stays put when it can't size the
+    //! threshold.
+
+    use super::*;
+    use tron_chainbase::MemBackend;
+    use tron_crypto::address::Address;
+    use tron_proto::block_header::Raw as BlockHeaderRaw;
+    use tron_proto::BlockHeader;
+
+    fn mem() -> Arc<dyn KvBackend> {
+        Arc::new(MemBackend::new())
+    }
+
+    fn mem_state() -> StateBackends {
+        StateBackends {
+            accounts: mem(),
+            witnesses: mem(),
+            votes: mem(),
+            delegation: mem(),
+            delegated_resources: mem(),
+            dyn_props: mem(),
+            proposals: mem(),
+            name_index: mem(),
+            id_index: mem(),
+            asset_v1: mem(),
+            asset_v2: mem(),
+            contracts: mem(),
+            abi: mem(),
+            exchange_v1: mem(),
+            exchange_v2: mem(),
+            market_orders: mem(),
+            nullifiers: mem(),
+            merkle_trees: None,
+            code: Some(mem()),
+            storage_row: Some(mem()),
+            contract_state: Some(mem()),
+            block_index: Some(mem()),
+            witness_schedule: Some(mem()),
+        }
+    }
+
+    fn driver_with(state: StateBackends) -> SyncDriver {
+        let cfg = SyncConfig {
+            peers: vec![],
+            max_blocks: None,
+            tail_interval: Duration::from_millis(1),
+            initial_backoff: Duration::from_millis(1),
+            blocks_backend: mem(),
+            progress_log_interval: 0,
+            advertise_port: 18_888,
+            tip_test: false,
+            p2p_rate_limits: Default::default(),
+            fetch_block_timeout: Duration::from_millis(200),
+            peer_is_fast_forward: false,
+        };
+        SyncDriver::new(state, cfg)
+    }
+
+    fn witness(i: usize) -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1] = (i >> 8) as u8;
+        a[2] = i as u8;
+        a
+    }
+
+    fn block_by(num: i64, witness_addr: &[u8; 21]) -> Block {
+        Block {
+            transactions: Vec::new(),
+            block_header: Some(BlockHeader {
+                raw_data: Some(BlockHeaderRaw {
+                    number: num,
+                    witness_address: witness_addr.to_vec(),
+                    ..Default::default()
+                }),
+                witness_signature: Vec::new(),
+            }),
+        }
+    }
+
+    /// Seed `n` distinct active witnesses into the schedule store.
+    fn seed_witnesses(state: &StateBackends, n: usize) {
+        let ws = WitnessScheduleStore::new(state.witness_schedule.clone().unwrap());
+        let list: Vec<Address> = (0..n).map(|i| Address::from_raw(witness(i))).collect();
+        ws.save_active(&list).unwrap();
+    }
+
+    #[test]
+    fn solid_advances_to_head_minus_threshold_over_a_rotation() {
+        const N: usize = 27; // mainnet active witness count
+        let state = mem_state();
+        seed_witnesses(&state, N);
+        let mut driver = driver_with(state.clone());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+
+        let threshold = tron_consensus::solidity_threshold(N) as i64;
+        assert!(threshold > 1);
+
+        // Feed a clean rotation: block `num` is produced by witness
+        // `(num-1) % N`, so the newest `threshold` blocks always hold
+        // `threshold` distinct witnesses.
+        for num in 1..=40i64 {
+            let w = witness(((num - 1) as usize) % N);
+            driver.update_solidified(&block_by(num, &w), num);
+
+            let solid = dp.latest_solidified_block_num().unwrap_or(0);
+            let expected = if num < threshold { 0 } else { num - threshold + 1 };
+            assert_eq!(
+                solid, expected,
+                "after block {num}: solid={solid}, expected={expected} (threshold={threshold})"
+            );
+        }
+    }
+
+    #[test]
+    fn solid_holds_until_threshold_distinct_witnesses_seen() {
+        const N: usize = 27;
+        let state = mem_state();
+        seed_witnesses(&state, N);
+        let mut driver = driver_with(state.clone());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        let threshold = tron_consensus::solidity_threshold(N) as i64;
+
+        // Feed threshold-1 blocks from DISTINCT witnesses — not enough.
+        for num in 1..threshold {
+            let w = witness((num - 1) as usize);
+            driver.update_solidified(&block_by(num, &w), num);
+            assert_eq!(dp.latest_solidified_block_num().unwrap_or(0), 0);
+        }
+        // The threshold-th distinct witness tips it over → solid = 1.
+        let w = witness((threshold - 1) as usize);
+        driver.update_solidified(&block_by(threshold, &w), threshold);
+        assert_eq!(dp.latest_solidified_block_num().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn solid_never_regresses() {
+        const N: usize = 27;
+        let state = mem_state();
+        seed_witnesses(&state, N);
+        let mut driver = driver_with(state.clone());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+
+        // A higher solid is already on disk (e.g. from PBFT finality).
+        dp.save_latest_solidified_block_num(1000);
+
+        // Feed a rotation that computes a much lower DPoS solid (~head-18).
+        for num in 1..=40i64 {
+            let w = witness(((num - 1) as usize) % N);
+            driver.update_solidified(&block_by(num, &w), num);
+            assert_eq!(
+                dp.latest_solidified_block_num().unwrap_or(0),
+                1000,
+                "solid must never move backward"
+            );
+        }
+    }
+
+    #[test]
+    fn solid_unchanged_without_an_active_witness_list() {
+        // No active list seeded → can't size the ⌈2/3⌉ threshold → leave
+        // the pointer untouched rather than guess.
+        let state = mem_state();
+        let mut driver = driver_with(state.clone());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+
+        for num in 1..=40i64 {
+            let w = witness((num as usize) % 27);
+            driver.update_solidified(&block_by(num, &w), num);
+            assert_eq!(dp.latest_solidified_block_num(), None);
+        }
     }
 }

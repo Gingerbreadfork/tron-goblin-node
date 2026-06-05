@@ -211,6 +211,20 @@ pub fn market_order_price_comparator(a: &[u8], b: &[u8]) -> Ordering {
     (buy1 * sell2).cmp(&(buy2 * sell1))
 }
 
+/// The custom RocksDB comparator a java-tron store directory requires, if
+/// any, keyed by its directory name. Centralises the
+/// `market_pair_price_to_order` special-case so every open path — the live
+/// store opener (`storage::open_store`), live snapshot import (secondary
+/// read + read-write write), and checkpoint export — registers the same
+/// comparator and never trips RocksDB's MANIFEST comparator-name check.
+pub fn comparator_for_store(name: &str) -> Option<(&'static str, fn(&[u8], &[u8]) -> Ordering)> {
+    if name == MARKET_PAIR_PRICE_TO_ORDER_DB_NAME {
+        Some((MARKET_ORDER_PRICE_COMPARATOR_NAME, market_order_price_comparator))
+    } else {
+        None
+    }
+}
+
 /// Read an 8-byte big-endian `i64` at `off`, treating any bytes past the
 /// end of `key` as zero. Mirrors java-tron's `ByteArray.toLong(
 /// Arrays.copyOfRange(key, off, off + 8))`, whose `copyOfRange` zero-fills

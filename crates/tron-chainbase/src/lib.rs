@@ -32,7 +32,7 @@ pub use stores::{
     BlockUndoRecord, BlockUndoStore, CheckPointV2Store,
     CheckTmpStore, CodeStore, CommonDataBaseStore, CommonStore, ContractStateStore, ContractStore,
     DelegatedResourceAccountIndexStore, DelegatedResourceStore, DelegationStore,
-    market_order_price_comparator, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
+    comparator_for_store, market_order_price_comparator, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
     IncrementalMerkleTreeStore, MarketAccountStore, MarketOrderStore, MarketPairPriceToOrderStore,
     MarketPairToPriceStore, MARKET_ORDER_PRICE_COMPARATOR_NAME, MARKET_PAIR_PRICE_TO_ORDER_DB_NAME,
     NullifierStore, PbftSignDataStore, ProposalStore, RecentBlockStore, RecentTransactionStore,

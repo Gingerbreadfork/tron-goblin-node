@@ -735,26 +735,20 @@ fn open_store(
     tuning: Option<(usize, i32)>,
 ) -> Result<Arc<dyn KvBackend>, StorageError> {
     let path = root.join(name);
-    let result = if name == tron_chainbase::MARKET_PAIR_PRICE_TO_ORDER_DB_NAME {
-        // java-tron writes this one store with a custom RocksDB comparator
-        // (`MarketOrderPriceComparator`, price-ordered). RocksDB records
-        // the name in the MANIFEST and refuses a default-comparator open,
-        // so we must register an equivalent one — otherwise any mainnet
-        // snapshot containing DEX orders fails to open. Every other store
-        // uses the default bytewise comparator.
-        RocksDbBackend::open_with_comparator(
-            &path,
-            tuning,
-            tron_chainbase::MARKET_ORDER_PRICE_COMPARATOR_NAME,
-            tron_chainbase::market_order_price_comparator,
-        )
-    } else {
-        match tuning {
+    // java-tron writes a few stores (today just `market_pair_price_to_order`)
+    // with a custom RocksDB comparator whose name is recorded in the MANIFEST;
+    // a default-comparator open is refused. `comparator_for_store` is the
+    // single registry every open path consults so they can't drift.
+    let result = match tron_chainbase::comparator_for_store(name) {
+        Some((cmp_name, cmp_fn)) => {
+            RocksDbBackend::open_with_comparator(&path, tuning, cmp_name, cmp_fn)
+        }
+        None => match tuning {
             Some((write_buffer_mb, max_open_files)) => {
                 RocksDbBackend::open_tuned(&path, write_buffer_mb, max_open_files)
             }
             None => RocksDbBackend::open(&path),
-        }
+        },
     };
     result
         .map(|b| Arc::new(b) as Arc<dyn KvBackend>)

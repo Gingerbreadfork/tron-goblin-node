@@ -273,7 +273,15 @@ pub fn export_via_checkpoint(
         // and unflushed writes would be invisible in the snapshot.
         // Safe on a live node only when no OTHER primary holds the
         // dir; callers in `start`-time code take a brief lock.
-        let backend = RocksDbBackend::open(src).map_err(|e| ExportError::Io {
+        // `market_pair_price_to_order` carries a custom comparator whose
+        // name RocksDB checks at open; register it or the open is refused.
+        let open_result = match tron_chainbase::comparator_for_store(name) {
+            Some((cmp_name, cmp_fn)) => {
+                RocksDbBackend::open_with_comparator(src, None, cmp_name, cmp_fn)
+            }
+            None => RocksDbBackend::open(src),
+        };
+        let backend = open_result.map_err(|e| ExportError::Io {
             path: src.clone(),
             source: std::io::Error::new(
                 std::io::ErrorKind::Other,

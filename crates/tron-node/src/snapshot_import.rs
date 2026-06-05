@@ -566,13 +566,30 @@ pub fn import_live(
             source: e,
         })?;
 
-        let src = RocksDbBackend::open_as_secondary(subdir, &secondary_meta).map_err(|e| {
-            ImportError::RocksDb {
-                store: name.clone(),
-                source: e,
-            }
+        // `market_pair_price_to_order` is written with a custom comparator;
+        // both the secondary read handle and the read-write destination must
+        // register it or RocksDB refuses the open (MANIFEST name check).
+        let comparator = tron_chainbase::comparator_for_store(&name);
+        let src = match comparator {
+            Some((cmp_name, cmp_fn)) => RocksDbBackend::open_as_secondary_with_comparator(
+                subdir,
+                &secondary_meta,
+                cmp_name,
+                cmp_fn,
+            ),
+            None => RocksDbBackend::open_as_secondary(subdir, &secondary_meta),
+        }
+        .map_err(|e| ImportError::RocksDb {
+            store: name.clone(),
+            source: e,
         })?;
-        let dst = RocksDbBackend::open(&dest).map_err(|e| ImportError::RocksDb {
+        let dst = match comparator {
+            Some((cmp_name, cmp_fn)) => {
+                RocksDbBackend::open_with_comparator(&dest, None, cmp_name, cmp_fn)
+            }
+            None => RocksDbBackend::open(&dest),
+        }
+        .map_err(|e| ImportError::RocksDb {
             store: name.clone(),
             source: e,
         })?;
