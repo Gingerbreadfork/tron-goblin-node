@@ -3012,6 +3012,17 @@ impl Wallet for WalletService {
 // Server bootstrap
 // =============================================================================
 
+/// gRPC transport limits (C3). Without these, a single connection can
+/// open unlimited concurrent HTTP/2 streams and run requests with no time
+/// bound, letting one peer exhaust the blocking pool / memory (amplifies
+/// the prover and per-call scan RPCs). Values are generous for legit
+/// wallet / query traffic. `max_decoding` matches tonic's 4 MiB default —
+/// set explicitly so it's bounded regardless of upstream defaults.
+const GRPC_MAX_DECODING_BYTES: usize = 4 * 1024 * 1024;
+const GRPC_CONCURRENCY_PER_CONN: usize = 256;
+const GRPC_MAX_CONCURRENT_STREAMS: u32 = 256;
+const GRPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn start_server(
     state: RpcState,
     addr: SocketAddr,
@@ -3027,11 +3038,22 @@ pub async fn start_server(
         "gRPC server listening (Wallet + WalletSolidity + Monitor + Database + WalletExtension)"
     );
     Server::builder()
-        .add_service(WalletServer::new(wallet))
-        .add_service(WalletSolidityServer::new(wallet_solidity))
-        .add_service(MonitorServer::new(monitor))
-        .add_service(DatabaseServer::new(database))
-        .add_service(WalletExtensionServer::new(wallet_extension))
+        .timeout(GRPC_REQUEST_TIMEOUT)
+        .concurrency_limit_per_connection(GRPC_CONCURRENCY_PER_CONN)
+        .max_concurrent_streams(Some(GRPC_MAX_CONCURRENT_STREAMS))
+        .add_service(WalletServer::new(wallet).max_decoding_message_size(GRPC_MAX_DECODING_BYTES))
+        .add_service(
+            WalletSolidityServer::new(wallet_solidity)
+                .max_decoding_message_size(GRPC_MAX_DECODING_BYTES),
+        )
+        .add_service(MonitorServer::new(monitor).max_decoding_message_size(GRPC_MAX_DECODING_BYTES))
+        .add_service(
+            DatabaseServer::new(database).max_decoding_message_size(GRPC_MAX_DECODING_BYTES),
+        )
+        .add_service(
+            WalletExtensionServer::new(wallet_extension)
+                .max_decoding_message_size(GRPC_MAX_DECODING_BYTES),
+        )
         .serve_with_shutdown(addr, shutdown)
         .await?;
     Ok(())
