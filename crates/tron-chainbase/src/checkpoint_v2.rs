@@ -116,6 +116,10 @@ impl CheckPointV2 {
             f.sync_all()?;
         }
         std::fs::rename(&staging, &dest)?;
+        // fsync the parent dir so the rename — the atomic commit point —
+        // survives a crash; without it the new directory entry can be lost
+        // even though the manifest bytes were synced (C-4).
+        sync_dir(&self.root);
         Ok(id)
     }
 
@@ -217,7 +221,21 @@ impl CheckPointV2 {
         if all.len() <= retain_last {
             return Ok(0);
         }
-        let to_drop = &all[..all.len() - retain_last];
+        let (to_drop, retained) = all.split_at(all.len() - retain_last);
+        // Integrity gate (C-4): only delete the older fallback generation
+        // once every retained (newer) checkpoint reads back cleanly. If a
+        // retained manifest is corrupt, keep the older ones as a recovery
+        // fallback instead of dropping our last good copy.
+        for &id in retained {
+            if let Err(e) = self.read(id) {
+                tracing::error!(
+                    checkpoint = id,
+                    error = %e,
+                    "checkpoint integrity check failed; skipping prune to preserve older fallback"
+                );
+                return Ok(0);
+            }
+        }
         let mut deleted = 0;
         for id in to_drop {
             if self.delete(*id).is_ok() {
@@ -228,11 +246,35 @@ impl CheckPointV2 {
     }
 }
 
+/// Monotonic, process-unique checkpoint id. A plain millisecond timestamp
+/// collided when two checkpoints were written within the same ms (or under
+/// a backwards clock step) — the second silently overwrote the first's
+/// directory (C-5). We hand out `max(now_ms, last + 1)` so ids never repeat
+/// and stay ordered, while staying ~timestamp-valued under normal load.
 fn unique_ms() -> u64 {
-    SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev.wrapping_add(1));
+        match LAST.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+/// Best-effort fsync of a directory handle so a rename *into* it is durable
+/// across a crash. Silently a no-op where the platform can't fsync a
+/// directory (e.g. Windows).
+fn sync_dir(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 /// Length-prefixed binary encoding for a checkpoint manifest.
@@ -385,6 +427,58 @@ mod tests {
             decode_manifest(bytes),
             Err(CheckpointError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn rapid_writes_get_distinct_ids_without_overwriting() {
+        // C-5: many writes in a tight loop land in the same millisecond,
+        // but each must get a distinct, monotonic, still-readable id.
+        let root = tmp_root();
+        let cpv2 = CheckPointV2::new(&root);
+        let mut ids = Vec::new();
+        for i in 0..50u8 {
+            ids.push(cpv2.write(&[entry("account", &[i], Some(b"v"))]).unwrap());
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "checkpoint ids collided: {ids:?}");
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids not monotonic: {ids:?}");
+        assert_eq!(cpv2.list().unwrap().len(), ids.len());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_keeps_old_fallback_when_a_retained_manifest_is_corrupt() {
+        // C-4: prune must not drop the older generation if a retained
+        // (newer) checkpoint is unreadable — that's our recovery fallback.
+        let root = tmp_root();
+        let cpv2 = CheckPointV2::new(&root);
+        let id0 = cpv2.write(&[entry("account", b"a", Some(b"0"))]).unwrap();
+        let _id1 = cpv2.write(&[entry("account", b"a", Some(b"1"))]).unwrap();
+        let id2 = cpv2.write(&[entry("account", b"a", Some(b"2"))]).unwrap();
+        // Corrupt the newest (retained) manifest.
+        std::fs::write(
+            cpv2.root_path().join(format!("{id2}")).join(MANIFEST_NAME),
+            b"GARBAGE",
+        )
+        .unwrap();
+        assert_eq!(cpv2.prune_keep_last(1).unwrap(), 0, "pruned despite corrupt newest");
+        assert!(
+            cpv2.root_path().join(format!("{id0}")).exists(),
+            "old fallback was dropped"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_keeps_last_n_when_all_readable() {
+        let root = tmp_root();
+        let cpv2 = CheckPointV2::new(&root);
+        for i in 0..4u8 {
+            cpv2.write(&[entry("account", &[i], Some(b"v"))]).unwrap();
+        }
+        assert_eq!(cpv2.prune_keep_last(2).unwrap(), 2);
+        assert_eq!(cpv2.list().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -110,6 +110,22 @@ impl SessionBackend {
     /// submitting the batch — captures the true pre-images. The batch
     /// itself is atomic per the same guarantees as [`commit`].
     ///
+    /// # Serialization requirement (C-7)
+    ///
+    /// The pending overlay is drained atomically (under the `pending`
+    /// lock), but the before-image read at [`KvBackend::get`] and the
+    /// final [`KvBackend::write_batch`] are **two separate steps against
+    /// the parent**. The captured undo log is only correct if no other
+    /// writer mutates the parent between them — otherwise a concurrent
+    /// commit could change a value after we snapshot its "before image",
+    /// and a later rollback would restore the wrong value.
+    ///
+    /// The block-apply pipeline provides this invariant: blocks are
+    /// applied one at a time, so a block's undo-commit is the sole writer
+    /// to the parent for its duration. Callers that share a parent across
+    /// genuinely concurrent committers must serialize them externally
+    /// (e.g. a parent-level exclusive lock) before calling this.
+    ///
     /// [`commit`]: SessionBackend::commit
     pub fn commit_with_undo(&self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, KvError> {
         let drained = {

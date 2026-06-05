@@ -570,6 +570,19 @@ impl OpenedStores {
         let delegation = wrap("delegation")?;
         let delegated_resources = wrap("DelegatedResource")?;
         let dyn_props = wrap("properties")?;
+        // Schema-version gate (M-14): stamp a fresh / pre-versioning DB,
+        // or refuse to open one written by an incompatible future schema
+        // rather than silently mis-decoding it. At open time no tentative
+        // layer is active, so this write-throughs to the properties store.
+        {
+            let dp = tron_chainbase::DynamicPropertiesStore::new(dyn_props.clone());
+            if let Err(found) = dp.check_or_stamp_schema_version() {
+                return Err(StorageError::SchemaVersion {
+                    found,
+                    expected: tron_chainbase::DynamicPropertiesStore::CURRENT_SCHEMA_VERSION,
+                });
+            }
+        }
         let proposals = wrap("proposal")?;
         let name_index = wrap("accountid-index")?;
         let id_index = wrap("account-index")?;
@@ -752,6 +765,8 @@ pub enum StorageError {
     Store(#[from] tron_chainbase::StoreError),
     #[error("kv backend error: {0}")]
     Kv(#[from] tron_chainbase::KvError),
+    #[error("incompatible chainbase schema version: on-disk {found}, this binary expects {expected}")]
+    SchemaVersion { found: i64, expected: i64 },
 }
 
 #[cfg(test)]

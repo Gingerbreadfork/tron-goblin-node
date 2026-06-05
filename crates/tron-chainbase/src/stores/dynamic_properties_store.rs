@@ -187,6 +187,41 @@ impl DynamicPropertiesStore {
         self.write_or_panic(key, value);
     }
 
+    // -------------------- Schema version (M-14) -----------------------
+
+    /// Current chainbase schema version. Bump whenever a wire/disk format
+    /// change makes a DB written by an older binary undecodable, so
+    /// [`Self::check_or_stamp_schema_version`] refuses to open it instead
+    /// of silently mis-decoding.
+    pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+    /// The schema version stamped on this DB, or `None` if it predates
+    /// schema-stamping.
+    pub fn schema_version(&self) -> Option<i64> {
+        self.get_long(keys::VERSION_NUMBER)
+    }
+
+    /// Stamp `version` (overwrites any existing).
+    pub fn save_schema_version(&self, version: i64) {
+        self.put_long(keys::VERSION_NUMBER, version);
+    }
+
+    /// Stamp [`Self::CURRENT_SCHEMA_VERSION`] on a DB with no version
+    /// (fresh, or pre-versioning — grandfathered as current), or verify a
+    /// stamped DB matches. `Err(found)` means the DB was written by an
+    /// incompatible schema; the caller should refuse to open it rather
+    /// than mis-decode. (M-14)
+    pub fn check_or_stamp_schema_version(&self) -> Result<(), i64> {
+        match self.schema_version() {
+            None => {
+                self.save_schema_version(Self::CURRENT_SCHEMA_VERSION);
+                Ok(())
+            }
+            Some(v) if v == Self::CURRENT_SCHEMA_VERSION => Ok(()),
+            Some(v) => Err(v),
+        }
+    }
+
     /// Read a key as a 32-byte hash.
     pub fn get_hash(&self, key: &[u8]) -> Result<Option<[u8; 32]>, StoreError> {
         let Some(bytes) = self.backend.get(key)? else {
@@ -621,4 +656,32 @@ fn parse_long_permissive(bytes: &[u8]) -> i64 {
         buf[8 - len..].copy_from_slice(bytes);
     }
     i64::from_be_bytes(buf)
+}
+
+#[cfg(test)]
+mod schema_version_tests {
+    use super::*;
+    use crate::MemBackend;
+    use std::sync::Arc;
+
+    #[test]
+    fn stamps_fresh_db_then_accepts_match_and_rejects_mismatch() {
+        // M-14: schema-version stamp + open-time compatibility gate.
+        let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+        // Fresh DB has no stamp; the check stamps CURRENT and succeeds.
+        assert_eq!(dp.schema_version(), None);
+        assert!(dp.check_or_stamp_schema_version().is_ok());
+        assert_eq!(
+            dp.schema_version(),
+            Some(DynamicPropertiesStore::CURRENT_SCHEMA_VERSION)
+        );
+        // Re-opening a DB stamped with the matching version: ok.
+        assert!(dp.check_or_stamp_schema_version().is_ok());
+        // A DB stamped by an incompatible (future) schema is rejected.
+        dp.save_schema_version(DynamicPropertiesStore::CURRENT_SCHEMA_VERSION + 1);
+        assert_eq!(
+            dp.check_or_stamp_schema_version(),
+            Err(DynamicPropertiesStore::CURRENT_SCHEMA_VERSION + 1)
+        );
+    }
 }
