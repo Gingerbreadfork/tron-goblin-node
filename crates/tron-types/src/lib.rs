@@ -23,13 +23,15 @@ pub use account_state_root::{
 };
 pub use block_id::{block_id_from_block, block_id_from_header_raw, BlockId, BlockIdError};
 pub use block_validate::{
-    block_raw_hash, sign_block, verify_parent_link, verify_tx_trie_root, verify_witness_signature,
-    BlockValidateError,
+    block_raw_hash, sign_block, verify_parent_link, verify_tx_trie_root, verify_tx_trie_root_raw,
+    verify_witness_signature, BlockValidateError,
 };
 pub use genesis::{
     build_genesis_block, genesis_block_id, mainnet_inputs, mainnet_witnesses, GenesisAsset,
     GenesisInputs, GenesisWitness, GENESIS_OWNER_ADDRESS, MAINNET_ASSETS, MAINNET_PARENT_HASH,
     MAINNET_WITNESS_QUOTE,
 };
-pub use tx_id::{calc_tx_trie_root, tx_id, tx_merkle_hash, TxIdError};
+pub use tx_id::{
+    calc_tx_trie_root, tx_id, tx_merkle_hash, tx_trie_root_from_block_bytes, TxIdError,
+};
 pub use tx_sign::{recover_all_signers, recover_signer_address, sign_transaction, SignError};

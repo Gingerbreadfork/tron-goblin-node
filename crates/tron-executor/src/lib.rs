@@ -106,6 +106,14 @@ pub struct ExecConfig {
     /// every node will compute a different energy charge than its
     /// peers for the same tx (consensus break).
     pub require_fee_limit: bool,
+    /// Recompute and check the block's `txTrieRoot` during execution.
+    /// Defaults to `true`. The **sync driver sets this `false`**: it
+    /// validates `txTrieRoot` against each block's *original wire bytes*
+    /// in `accept_block` (M-20), whereas the executor only sees the
+    /// decoded block, whose prost re-encode reorders `ret` map entries and
+    /// would spuriously mismatch. Genesis / replay / direct `execute_block`
+    /// callers keep it on (their blocks are canonical).
+    pub verify_tx_trie: bool,
 }
 
 impl Default for ExecConfig {
@@ -127,6 +135,9 @@ impl Default for ExecConfig {
             // production should be deriving the VM's budget from the
             // caller's stated `fee_limit`.
             require_fee_limit: true,
+            // Strict by default; the sync driver opts out because it does
+            // the authoritative raw-bytes check itself (see field docs).
+            verify_tx_trie: true,
         }
     }
 }
@@ -1471,7 +1482,9 @@ fn execute_block_logic(
     if let Some(parent) = expected_parent {
         verify_parent_link(block, parent)?;
     }
-    verify_tx_trie_root(block)?;
+    if config.verify_tx_trie {
+        verify_tx_trie_root(block)?;
+    }
     // Witness-signature gate. `config.require_signature` defaults to
     // `true`; the block-production dry-run path (and a few tests that
     // build synthetic unsigned blocks) opt out via `ExecConfig::unsigned`.

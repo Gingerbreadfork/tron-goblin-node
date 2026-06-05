@@ -331,6 +331,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // a hardcoded fallback. A consensus break
                     // otherwise.
                     require_fee_limit: true,
+                    // Strict default; `SyncDriver::with_exec_config` forces
+                    // this off for the sync path (it owns the raw-bytes
+                    // `txTrieRoot` check). Self-produced/canonical blocks on
+                    // any other consumer keep the check.
+                    verify_tx_trie: true,
                 };
                 (
                     vm.support_constant,

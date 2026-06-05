@@ -32,7 +32,7 @@ use tron_crypto::signature::{RecoverableSignature, SigError};
 use tron_proto::Block;
 
 use crate::block_id::BlockId;
-use crate::tx_id::calc_tx_trie_root;
+use crate::tx_id::{calc_tx_trie_root, tx_trie_root_from_block_bytes};
 
 /// `sha256(block.block_header.raw_data.encode())` — the digest the witness
 /// signs. Distinct from the [`BlockId`], which overwrites the first 8
@@ -136,15 +136,48 @@ pub fn verify_tx_trie_root(block: &Block) -> Result<(), BlockValidateError> {
         .as_ref()
         .ok_or(BlockValidateError::MissingHeader)?;
 
-    let header_root = &raw.tx_trie_root;
-    let computed = calc_tx_trie_root(&block.transactions);
+    compare_tx_trie_root(calc_tx_trie_root(&block.transactions), &raw.tx_trie_root)
+}
 
-    match (computed, header_root.as_slice()) {
+/// Like [`verify_tx_trie_root`] but computes the root from the block's
+/// **original wire bytes** ([`tx_trie_root_from_block_bytes`]) instead of a
+/// prost re-encode, so it matches java-tron for transactions whose encoding
+/// isn't canonical under a decode→re-encode (notably map-field ordering in
+/// `ret`). Use this on blocks received from the network — the only place
+/// the raw bytes still exist (block storage re-encodes, dropping the order).
+///
+/// `block_bytes` must be the exact serialized `Block` the header's
+/// `txTrieRoot` was computed over.
+pub fn verify_tx_trie_root_raw(
+    block: &Block,
+    block_bytes: &[u8],
+) -> Result<(), BlockValidateError> {
+    let header = block
+        .block_header
+        .as_ref()
+        .ok_or(BlockValidateError::MissingHeader)?;
+    let raw = header
+        .raw_data
+        .as_ref()
+        .ok_or(BlockValidateError::MissingHeader)?;
+
+    compare_tx_trie_root(tx_trie_root_from_block_bytes(block_bytes), &raw.tx_trie_root)
+}
+
+/// Shared comparison for [`verify_tx_trie_root`] / [`verify_tx_trie_root_raw`]:
+/// reconcile a computed root (`None` = no transactions) against the header's
+/// declared `tx_trie_root`. java-tron writes the empty-block root as either
+/// an empty `bytes` field or 32 zero bytes; both are accepted.
+fn compare_tx_trie_root(
+    computed: Option<[u8; 32]>,
+    header_root: &[u8],
+) -> Result<(), BlockValidateError> {
+    match (computed, header_root) {
         // Empty txs + empty header root: ok.
         (None, h) if h.is_empty() || h == [0u8; 32].as_slice() => Ok(()),
         // Empty txs but header says non-empty: bad.
         (None, _) => Err(BlockValidateError::TxTrieRootMismatch {
-            header_has: header_root.clone(),
+            header_has: header_root.to_vec(),
             computed: None,
         }),
         // Non-empty txs but header is empty: bad.

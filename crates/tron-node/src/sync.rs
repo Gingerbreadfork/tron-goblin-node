@@ -58,7 +58,7 @@ use tron_net::{
 use tron_proto::{Block, Endpoint};
 use tron_types::{
     block_id_from_block, genesis_block_id, mainnet_inputs, verify_parent_link, verify_tx_trie_root,
-    verify_witness_signature, BlockId,
+    verify_tx_trie_root_raw, verify_witness_signature, BlockId,
 };
 
 /// Per-driver configuration.
@@ -275,6 +275,15 @@ pub struct SyncDriver {
     /// Capped at [`Self::SOLID_WINDOW`] entries — enough to always
     /// contain ⌈2/3⌉ distinct active witnesses.
     recent_witnesses: VecDeque<tron_consensus::RecentBlock>,
+    /// Raw wire bytes of the block currently being handed to
+    /// [`Self::accept_block`], set by the peer loop right before the call
+    /// and consumed inside it. Lets `accept_block` validate `txTrieRoot`
+    /// against the *original* transaction bytes (M-20) — prost's
+    /// `BTreeMap` map round-trip reorders `ret` map entries and would
+    /// otherwise spuriously fail the merkle. `None` for in-memory callers
+    /// (tests / SR runtime), which fall back to the decoded check (their
+    /// blocks re-encode canonically anyway).
+    pending_raw_block: Option<Bytes>,
 }
 
 impl SyncDriver {
@@ -308,11 +317,19 @@ impl SyncDriver {
             node_statistics: None,
             peer_registry: None,
             eviction_tx: None,
-            exec_config: tron_executor::ExecConfig::default(),
+            // The sync driver validates `txTrieRoot` against each block's
+            // original wire bytes in `accept_block` (M-20); the executor
+            // only sees the decoded block, so disable its (re-encode-based)
+            // tx-trie check to avoid a spurious mismatch on `ret` maps.
+            exec_config: tron_executor::ExecConfig {
+                verify_tx_trie: false,
+                ..tron_executor::ExecConfig::default()
+            },
             snapshot_stack: None,
             pubsub: None,
             strict_ref_block: false,
             recent_witnesses: VecDeque::new(),
+            pending_raw_block: None,
         }
     }
 
@@ -356,6 +373,11 @@ impl SyncDriver {
     /// etc. Defaults to java-tron parity (all off).
     pub fn with_exec_config(mut self, config: tron_executor::ExecConfig) -> Self {
         self.exec_config = config;
+        // The sync driver always owns `txTrieRoot` validation (raw-bytes
+        // check in `accept_block`), so keep the executor's decoded check off
+        // regardless of what the runtime threads in — otherwise it would
+        // spuriously reject blocks whose `ret` carries a non-sorted map.
+        self.exec_config.verify_tx_trie = false;
         self
     }
 
@@ -1437,6 +1459,11 @@ impl SyncDriver {
                     }
                 }
                 MessageType::Block => {
+                    // Retain the raw wire bytes before prost consumes them on
+                    // decode — `accept_block` validates `txTrieRoot` against
+                    // these original bytes (M-20). `Bytes::clone` is a cheap
+                    // refcount bump.
+                    let raw_block_bytes = frame.payload.clone();
                     let block = match Block::decode(frame.payload) {
                         Ok(b) => b,
                         Err(e) => {
@@ -1496,6 +1523,7 @@ impl SyncDriver {
                         }
                         continue;
                     }
+                    self.pending_raw_block = Some(raw_block_bytes);
                     match self.accept_block(&block, prev_id) {
                         AcceptOutcome::Accepted(id) => {
                             prev_id = Some(id);
@@ -1792,7 +1820,17 @@ impl SyncDriver {
     ///     the SR runtime and a future reorg implementation can use
     ///     it.
     pub fn accept_block(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
-        if let Err(e) = verify_tx_trie_root(block) {
+        // `txTrieRoot`: for blocks received from the network the peer loop
+        // stashes the raw wire bytes, so we hash each transaction's original
+        // bytes (M-20 — prost's `BTreeMap` map round-trip reorders `ret` map
+        // entries and would otherwise spuriously fail the merkle). In-memory
+        // callers (tests / SR runtime) leave it `None` and fall back to the
+        // decoded check, which is exact for their canonically-encoded blocks.
+        let trie_check = match self.pending_raw_block.take() {
+            Some(raw) => verify_tx_trie_root_raw(block, &raw),
+            None => verify_tx_trie_root(block),
+        };
+        if let Err(e) = trie_check {
             return AcceptOutcome::RejectedValidation(format!("tx_trie: {e:?}"));
         }
         // Block-signature authorization, per java-tron's
