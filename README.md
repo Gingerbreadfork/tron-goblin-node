@@ -285,6 +285,14 @@ from a recent state):
     --data-dir ./mainnet-data
 ```
 
+> **The snapshot must be RocksDB.** This node is RocksDB-only — there is
+> no LevelDB backend. A java-tron **LevelDB** snapshot (`db.engine =
+> LEVELDB`, the older default) will not open: RocksDB reads LevelDB SSTs
+> only partially (you'll see `Cannot find Properties block from file` in
+> the logs) and can crash trying to rewrite them. Use a RocksDB snapshot
+> (`db.engine = ROCKSDB` — java-tron's recommended engine), or convert a
+> LevelDB one first with java-tron's `Toolkit db convert`.
+
 `tron-node --help` lists every subcommand with its flags.
 
 Configuration is **TOML**, not java-tron's HOCON — config files are
@@ -293,8 +301,10 @@ compatible; runtime config is its own surface.
 
 ## Compatibility notes
 
-- **Database**: byte-exact, per-store RocksDB layout. A java-tron
-  snapshot is a `tron-node` data directory after `import-snapshot`.
+- **Database**: byte-exact, per-store **RocksDB** layout — RocksDB-only,
+  no LevelDB backend. A java-tron snapshot is a `tron-node` data directory
+  after `import-snapshot`, **provided it was written with `db.engine =
+  ROCKSDB`**; LevelDB snapshots are not supported.
 - **P2P**: byte-exact handshake + adv-broadcast. The node identifies
   itself on the wire as `tron-goblin/0.0.1`.
 - **JSON-RPC + gRPC**: response shapes match java-tron's. Deliberate

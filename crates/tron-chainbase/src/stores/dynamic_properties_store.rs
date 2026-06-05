@@ -126,7 +126,14 @@ pub mod keys {
     pub const ALLOW_SAME_TOKEN_NAME: &[u8] = b" ALLOW_SAME_TOKEN_NAME";
 
     pub const TOTAL_SIGN_NUM: &[u8] = b"TOTAL_SIGN_NUM";
+    /// java-tron's own database/protocol version (e.g. `34` on current
+    /// mainnet). Reserved for parity — **not** our schema stamp.
     pub const VERSION_NUMBER: &[u8] = b"VERSION_NUMBER";
+    /// Goblin-private chainbase schema version (M-14). A distinct key so
+    /// it never collides with java-tron's `VERSION_NUMBER` above: a real
+    /// snapshot already stores its protocol version (34) there, which must
+    /// not be read as — or overwritten by — our schema version.
+    pub const GOBLIN_SCHEMA_VERSION: &[u8] = b"GOBLIN_SCHEMA_VERSION";
 }
 
 pub struct DynamicPropertiesStore {
@@ -198,12 +205,12 @@ impl DynamicPropertiesStore {
     /// The schema version stamped on this DB, or `None` if it predates
     /// schema-stamping.
     pub fn schema_version(&self) -> Option<i64> {
-        self.get_long(keys::VERSION_NUMBER)
+        self.get_long(keys::GOBLIN_SCHEMA_VERSION)
     }
 
     /// Stamp `version` (overwrites any existing).
     pub fn save_schema_version(&self, version: i64) {
-        self.put_long(keys::VERSION_NUMBER, version);
+        self.put_long(keys::GOBLIN_SCHEMA_VERSION, version);
     }
 
     /// Stamp [`Self::CURRENT_SCHEMA_VERSION`] on a DB with no version
@@ -667,6 +674,27 @@ mod schema_version_tests {
     use super::*;
     use crate::MemBackend;
     use std::sync::Arc;
+
+    #[test]
+    fn java_tron_version_number_does_not_collide_with_schema_stamp() {
+        // Regression: a real java-tron snapshot stores its protocol version
+        // (e.g. 34) under VERSION_NUMBER. Our schema stamp uses a DISTINCT
+        // key, so the gate must NOT read 34 as our version — it stamps its
+        // own and opens cleanly, leaving java-tron's value untouched.
+        let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+        dp.put_long(keys::VERSION_NUMBER, 34); // java-tron's value
+
+        assert!(
+            dp.check_or_stamp_schema_version().is_ok(),
+            "must not read java-tron's VERSION_NUMBER as our schema version"
+        );
+        assert_eq!(
+            dp.schema_version(),
+            Some(DynamicPropertiesStore::CURRENT_SCHEMA_VERSION)
+        );
+        // java-tron's VERSION_NUMBER is left exactly as it was.
+        assert_eq!(dp.get_long(keys::VERSION_NUMBER), Some(34));
+    }
 
     #[test]
     fn stamps_fresh_db_then_accepts_match_and_rejects_mismatch() {
