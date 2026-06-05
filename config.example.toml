@@ -1,0 +1,206 @@
+# =============================================================================
+# tron-goblin-node — example configuration
+# =============================================================================
+#
+# Usage:
+#   tron-node start --config config.toml
+#
+# Every value below is set to its built-in default, so this file is a safe
+# starting point: copy it, then change only what you need. Anything you delete
+# falls back to the same default. CLI flags (e.g. --data-dir, --rpc-port,
+# --peer) OVERRIDE whatever is set here.
+#
+# Keys are snake_case; java-tron's camelCase aliases (e.g. `maxOpenFiles`) are
+# also accepted so a `config.conf` can be ported across. Unknown keys are
+# accepted and ignored.
+#
+# Security note: every server below binds to 127.0.0.1 by default. Change a
+# host to "0.0.0.0" ONLY when you intend to expose that port — the HTTP REST
+# and gRPC surfaces include broadcast/writer methods.
+# =============================================================================
+
+# On-disk state lives under <data_dir>/db/. Relative paths are resolved from
+# the working directory. Overridden by --data-dir.
+data_dir = "./tron-data"
+
+
+# -----------------------------------------------------------------------------
+# [storage] — RocksDB tuning + DB lifecycle
+# -----------------------------------------------------------------------------
+[storage]
+# Per-store write-buffer (memtable) size, MiB. Larger = fewer flushes / higher
+# write throughput while syncing, at the cost of RAM (this is PER store, and
+# there are ~60 stores). 64 suits a mainnet node with a few GB to spare; drop
+# to 16–32 on small VMs.
+write_buffer_size_mb = 64
+
+# Max open SST file descriptors PER store. Each chainbase store is its own
+# RocksDB instance (~60 of them), so the process-wide ceiling is roughly
+# this value × 60. 1024 → ~60k aggregate, comfortably under a typical
+# RLIMIT_NOFILE; the daemon also raises its own soft FD limit to the hard
+# ceiling at startup. Do NOT set this to tens of thousands — multiplied across
+# ~60 stores it exhausts the process and sync dies with "Too many open files".
+max_open_files = 1024
+
+# Run one full manual compaction across every store at startup. Off by
+# default; only useful right after a `prune-before` to reclaim disk now.
+compact_on_start = false
+
+# Reorg engine. false = battle-tested BlockUndoStore undo-log path.
+# true = java-tron-style SnapshotManager overlay (per-block tentative-write
+# layers). The overlay path passes integration tests but hasn't been validated
+# under multi-peer concurrency at mainnet scale — leave false unless testing.
+snapshot_reorg = false
+
+# Max reorg depth when snapshot_reorg = true: blocks older than this many from
+# the head get merged into the root and become un-reorgable. Mainnet rarely
+# reorgs past ~10 blocks, so 64 is ample while bounding per-layer RAM.
+snapshot_horizon = 64
+
+# --- [storage.db_settings] -------------------------------------------------
+# Per-CF RocksDB knobs mirroring java-tron's `storage.dbSettings.*`. Parsed for
+# config-file compatibility but NOT yet applied to the open path — changing
+# these has no effect today. Listed so a java-tron config.conf round-trips.
+[storage.db_settings]
+level_number = 7
+compact_threads = 0                       # 0 = auto (host CPU count)
+blocksize = 16                            # KiB
+max_bytes_for_level_base = 256            # MiB
+max_bytes_for_level_multiplier = 10.0
+level0_file_num_compaction_trigger = 2
+target_file_size_base = 64                # MiB
+target_file_size_multiplier = 1
+max_open_files = 5000                     # java-tron parity only; the EFFECTIVE
+                                          # cap is [storage].max_open_files above
+
+# --- [storage.tx_cache] ----------------------------------------------------
+# java-tron `storage.txCache.*`. Parsed for parity; not yet wired.
+[storage.tx_cache]
+estimated_transactions = 1000             # clamped to [100, 10000]
+init_optimization = false
+
+
+# -----------------------------------------------------------------------------
+# [p2p] — peer discovery + block sync
+# -----------------------------------------------------------------------------
+[p2p]
+# Explicit peers to sync from, each "HOST:PORT". Empty = rely on discovery
+# (and the built-in mainnet seeds). Add your own full node for a fast, stable
+# sync source, e.g. peers = ["192.168.0.36:18888"]. Also settable via --peer.
+peers = []
+
+# Also mix the built-in MAINNET_SEEDS into the pool. When `peers` is empty the
+# seeds are used regardless; this only matters when you also list explicit peers.
+use_mainnet_seeds = false
+
+# Kademlia DHT discovery (UDP). On = bootstrap from peers/seeds then widen the
+# dial list to the broader network (recommended for public mainnet). Turn OFF
+# if you sync only from your own `peers` — it removes a lot of dial churn.
+discover_enable = true
+
+# Startup wait for the DHT routing table to populate before snapshotting it.
+discover_bootstrap_ms = 5000
+
+# EIP-1459 DNS-discovery trees (walked once at startup). The official mainnet
+# tree is enabled by default — without it you'd be limited to the hard-coded
+# seeds, which much of the network rejects. Set to [] to disable.
+discover_tree_urls = [
+  "tree://AKMQMNAJJBL73LXWPXDI4I5ZWWIZ4AWO34DWQ636QOBBXNFXH3LQS@main.trondisco.net",
+]
+discover_tree_query_timeout_ms = 5000
+
+# Persist the discovered peer set to disk so a restart re-dials known-good
+# peers without waiting on bootstrap (java-tron's NodePersistService).
+node_discovery_persist = true
+node_discovery_persist_interval_ms = 60000
+
+# Port advertised to peers in Hello messages. 18888 is mainnet's P2P port.
+# A valid non-zero port is required even for sync-only nodes that don't listen.
+advertise_port = 18888
+
+# Max concurrent peer connections (each = one tokio task + one TCP socket).
+# 60 spreads thinly across many ASNs to find archive-capable peers without
+# tripping any single host's same-IP cap.
+max_peers = 60
+
+# Heartbeat: log an "applied block" line every N blocks. 0 = quiet (failures
+# only), 1 = every block, 100 = a usable progress trail during a long sync.
+progress_log_interval = 100
+
+# Per-block live-tip fetch timeout, ms (clamped to [100, 1000]).
+fetch_block_timeout_ms = 200
+
+# fastForwardNodes: peers that receive full Block frames directly on production
+# (lowest latency) instead of an inventory advertisement. SR/relay operators only.
+fast_forward_nodes = []
+
+# Set true to skip the sync loop entirely (RPC-only / archive-serving mode).
+disabled = false
+
+
+# -----------------------------------------------------------------------------
+# [rpc] — Ethereum-compatible JSON-RPC (eth_*, net_*)
+# -----------------------------------------------------------------------------
+[rpc]
+host = "127.0.0.1"          # "0.0.0.0" to expose publicly
+port = 8545
+disabled = false
+# EIP-155 chain id surfaced via eth_chainId / net_version.
+chain_id = 11111
+# Per-call gas cap for eth_call / eth_estimateGas. 50M covers heavy read-only
+# calls (DEX simulations, multi-hop swaps); lower it for public-facing nodes.
+eth_call_gas_cap = 50000000
+
+
+# -----------------------------------------------------------------------------
+# [http] — TronWeb / TronGrid REST API (/wallet/*)
+# -----------------------------------------------------------------------------
+[http]
+host = "127.0.0.1"          # includes broadcasttransaction — open up deliberately
+port = 8090
+disabled = false
+
+
+# -----------------------------------------------------------------------------
+# [grpc] — Wallet / WalletSolidity gRPC (what TRON client libs speak)
+# -----------------------------------------------------------------------------
+[grpc]
+host = "127.0.0.1"          # includes writer methods — open up deliberately
+port = 50051
+disabled = false
+
+
+# -----------------------------------------------------------------------------
+# [metrics] — Prometheus scrape endpoint
+# -----------------------------------------------------------------------------
+[metrics]
+host = "127.0.0.1"
+port = 9090
+disabled = false
+
+
+# -----------------------------------------------------------------------------
+# [witness] — Super Representative block production (OPTIONAL)
+# -----------------------------------------------------------------------------
+# Uncomment to run as a block producer. Without this section the node is
+# sync-only. Provide the signing key by exactly ONE method; key_env / keystore
+# are preferred over an inline key_hex.
+#
+# [witness]
+# key_env = "TRON_WITNESS_KEY"            # env var holding the raw private key hex
+# # key_hex = "0x..."                     # DISCOURAGED: inline private key
+# # keystore = "/path/to/keystore.json"   # v3 keystore (java-tron compatible)
+# # keystore_password_env = "TRON_KEYSTORE_PASSWORD"
+# max_txs_per_block = 1000                # mempool txs pulled per produced block
+
+
+# -----------------------------------------------------------------------------
+# Schema-only sections (parsed for java-tron config.conf compatibility, but
+# their runtimes are not yet wired — setting them is currently a no-op):
+#   [event]        — event.subscribe.* plugin loader
+#   [node_backup]  — node.backup.* SR active/standby election
+#   [vm]           — vm.* TVM knobs (only a subset is consulted today)
+#   [rate_limiter] — rate.limiter.* per-endpoint limits
+#   [committee]    — committee.* governance bootstrap values
+#   [local_witness]— top-level localwitness* key sources
+# -----------------------------------------------------------------------------

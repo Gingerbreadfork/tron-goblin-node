@@ -1535,6 +1535,32 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shipped_example_config_parses_and_matches_defaults() {
+        // `config.example.toml` (repo root) is documented as "every value is
+        // the built-in default". Parse it through the real loader and pin a
+        // few load-bearing values so the shipped file can't silently drift
+        // from the schema.
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config.example.toml"
+        ));
+        let cfg = NodeConfig::from_file(path).expect("config.example.toml must parse");
+        assert_eq!(cfg.storage.max_open_files, 1024);
+        assert_eq!(cfg.storage.write_buffer_size_mb, 64);
+        assert_eq!(cfg.storage.snapshot_horizon, 64);
+        assert_eq!(cfg.rpc.port, 8545);
+        assert_eq!(cfg.rpc.eth_call_gas_cap, 50_000_000);
+        assert_eq!(cfg.http.port, 8090);
+        assert_eq!(cfg.grpc.port, 50051);
+        assert_eq!(cfg.metrics.port, 9090);
+        assert_eq!(cfg.p2p.advertise_port, 18888);
+        assert_eq!(cfg.p2p.max_peers, 60);
+        assert!(cfg.p2p.discover_enable);
+        // No [witness] table → sync-only.
+        assert!(cfg.witness.is_none());
+    }
+
     // ---- event.subscribe.* schema ----
 
     #[test]
