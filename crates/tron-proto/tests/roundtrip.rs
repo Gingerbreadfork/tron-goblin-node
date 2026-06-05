@@ -191,3 +191,28 @@ fn block_with_no_transactions_roundtrips() {
     let decoded = Block::decode(bytes.as_slice()).unwrap();
     assert_eq!(decoded, block);
 }
+
+/// M-15: round-trip + deterministic-encoding for the `Witness` proto — a
+/// consensus-critical message (its encoded bytes are what the witness
+/// store persists and what maintenance-cycle ranking reads back).
+#[test]
+fn witness_roundtrips_and_encodes_deterministically() {
+    use tron_proto::Witness;
+
+    let w = Witness {
+        address: hex::decode("412e988a386a799f506693793c6a5af6b54dfaabfb").unwrap(),
+        vote_count: 1_234_567,
+        url: "https://sr.example/profile".to_string(),
+        is_jobs: true,
+        ..Default::default()
+    };
+
+    // Encoding is stable across calls.
+    let bytes_a = w.encode_to_vec();
+    assert_eq!(bytes_a, w.encode_to_vec(), "Witness encoding must be deterministic");
+
+    // Decode → equal value → re-encode → byte-identical.
+    let decoded = Witness::decode(bytes_a.as_slice()).unwrap();
+    assert_eq!(decoded, w);
+    assert_eq!(decoded.encode_to_vec(), bytes_a, "re-encode must be byte-exact");
+}

@@ -443,11 +443,15 @@ impl DynamicPropertiesStore {
     }
     /// Bump (or shrink) the chain-wide net weight by `delta`. Called
     /// from the freeze/unfreeze actuators. Mirrors java-tron's
-    /// `DynamicPropertiesStore.addTotalNetWeight(long amount)`. The
-    /// delta is added with saturating arithmetic to avoid wrap.
+    /// `DynamicPropertiesStore.addTotalNetWeight(long amount)`. Adds with
+    /// `wrapping_add` to match java-tron's plain `long +=`, which wraps on
+    /// i64 overflow rather than throwing — exact parity at the (in-practice
+    /// impossible) overflow boundary, where saturating would have diverged
+    /// to `i64::MAX` while java wraps negative (M-9). The other
+    /// `add_total_*` accumulators below do the same.
     pub fn add_total_net_weight(&self, delta: i64) {
         let cur = self.total_net_weight();
-        self.save_total_net_weight(cur.saturating_add(delta));
+        self.save_total_net_weight(cur.wrapping_add(delta));
     }
 
     /// `TOTAL_NET_LIMIT` — global per-block byte cap distributed across
@@ -533,7 +537,7 @@ impl DynamicPropertiesStore {
     /// Mirrors `DynamicPropertiesStore.addTotalEnergyWeight`.
     pub fn add_total_energy_weight(&self, delta: i64) {
         let cur = self.total_energy_weight();
-        self.save_total_energy_weight(cur.saturating_add(delta));
+        self.save_total_energy_weight(cur.wrapping_add(delta));
     }
 
     pub fn block_energy_usage(&self) -> i64 {
@@ -603,7 +607,7 @@ impl DynamicPropertiesStore {
 
     pub fn add_transaction_fee_pool(&self, amount: i64) {
         let cur = self.get_long(keys::TRANSACTION_FEE_POOL).unwrap_or(0);
-        self.put_long(keys::TRANSACTION_FEE_POOL, cur.saturating_add(amount));
+        self.put_long(keys::TRANSACTION_FEE_POOL, cur.wrapping_add(amount));
     }
 
     // -------------------- Fee accumulators -----------------------------
@@ -613,7 +617,7 @@ impl DynamicPropertiesStore {
     }
     pub fn add_total_transaction_cost(&self, amount: i64) {
         let cur = self.total_transaction_cost();
-        self.put_long(keys::TOTAL_TRANSACTION_COST, cur.saturating_add(amount));
+        self.put_long(keys::TOTAL_TRANSACTION_COST, cur.wrapping_add(amount));
     }
 
     pub fn burn_trx_amount(&self) -> i64 {
@@ -622,7 +626,7 @@ impl DynamicPropertiesStore {
     /// Mirrors `DynamicPropertiesStore.burnTrx(amount)`.
     pub fn burn_trx(&self, amount: i64) {
         let cur = self.burn_trx_amount();
-        self.put_long(keys::BURN_TRX_AMOUNT, cur.saturating_add(amount));
+        self.put_long(keys::BURN_TRX_AMOUNT, cur.wrapping_add(amount));
     }
 
     pub fn total_create_account_cost(&self) -> i64 {
@@ -630,7 +634,7 @@ impl DynamicPropertiesStore {
     }
     pub fn add_total_create_account_cost(&self, amount: i64) {
         let cur = self.total_create_account_cost();
-        self.put_long(keys::TOTAL_CREATE_ACCOUNT_COST, cur.saturating_add(amount));
+        self.put_long(keys::TOTAL_CREATE_ACCOUNT_COST, cur.wrapping_add(amount));
     }
 }
 
