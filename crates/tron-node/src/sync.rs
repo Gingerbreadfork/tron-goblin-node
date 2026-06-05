@@ -1005,16 +1005,23 @@ impl SyncDriver {
         // first send doesn't wait.
         const REQ_MIN_INTERVAL: Duration = Duration::from_millis(400);
         let mut last_request_at: Option<Instant>;
-        // Kick off chain sync with the genesis (or resumed-head) id as
-        // our summary. This flips the peer's `needSyncFromUs = true`
-        // flag, which is what gates `AdvService.broadcast` — without
-        // it the peer never pushes us BlockInventory adv frames
-        // (we'd sit silent forever post-handshake). The genesis id is
-        // always in mainnet peers' main chain, so `containBlockInMainChain`
-        // passes. The peer replies with a `ChainInventory` carrying up to
-        // SYNC_FETCH_BATCH_NUM (~2000) block hashes; the queue + select!
-        // send branch drives the rest of the loop from there.
-        let summary = [prev_id.unwrap_or(genesis)];
+        // Kick off chain sync with a java-tron-style locator (a geometric
+        // back-off of our recent block ids, oldest first). This flips the
+        // peer's `needSyncFromUs = true` flag, which gates `AdvService
+        // .broadcast` — without it the peer never pushes us BlockInventory
+        // adv frames (we'd sit silent forever post-handshake). The locator's
+        // first id is a deep block the peer is sure to have, so
+        // `containBlockInMainChain` passes; the peer then serves blocks after
+        // the highest id we share. A bare `[head]` summary (the old behavior)
+        // failed that check on any peer not at our exact head — which is why
+        // only our own node served us. The peer replies with a
+        // `ChainInventory` carrying up to SYNC_FETCH_BATCH_NUM (~2000) block
+        // hashes; the queue + select! send branch drives the rest from there.
+        let mut summary = self.build_chain_summary();
+        if summary.is_empty() {
+            // Fresh node / no index — genesis is in every peer's main chain.
+            summary.push(prev_id.unwrap_or(genesis));
+        }
         last_request_at = Some(Instant::now());
         if let Err(e) = tron_net::sync::send_sync_request(&mut conn, &summary).await {
             return PeerOutcome::PeerFailure(format!("send_sync_request: {e}"));
@@ -1812,6 +1819,53 @@ impl SyncDriver {
     pub fn head_number(&self) -> i64 {
         let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
         dp.latest_block_header_number().unwrap_or(0)
+    }
+
+    /// Build a java-tron-style block-chain "locator" for the `SyncBlockChain`
+    /// request: a geometric back-off of our recent block ids (head, head-1,
+    /// head-3, head-7, …, doubling the gap) down to the deepest block we
+    /// still have, returned **ascending** (oldest first).
+    ///
+    /// Why not just `[head]`: java-tron's `SyncBlockChainMsgHandler` rejects a
+    /// summary whose FIRST id isn't in the peer's main chain (BAD_PROTOCOL /
+    /// reason code 2) and serves blocks after the HIGHEST summary id it shares
+    /// with us. A one-element `[head]` summary only works when the peer has
+    /// our exact head — so a peer even slightly forked/behind at the
+    /// reversible tip refuses to sync to us (our own node served fine only
+    /// because its head matched ours). A locator anchored at a deep block the
+    /// peer is sure to have, denser near the head, lets any peer find the
+    /// common ancestor and serve us — exactly how java-tron does it.
+    ///
+    /// Returns empty when there's no usable index (fresh node) — the caller
+    /// falls back to the genesis/head id.
+    fn build_chain_summary(&self) -> Vec<BlockId> {
+        let head_num = self.head_number();
+        let Some(bi) = &self.state.block_index else {
+            return Vec::new();
+        };
+        let block_index = BlockIndexStore::new(bi.clone());
+
+        let mut ids: Vec<BlockId> = Vec::new();
+        let mut n = head_num;
+        let mut step = 1i64;
+        // Walk head → downward, doubling the gap, collecting ids that exist.
+        // Stop at the first gap (below our earliest stored block), at genesis,
+        // or once the locator is comfortably dense (cap the frame size).
+        while n > 0 && ids.len() < 128 {
+            match block_index.get(n) {
+                Ok(id) => ids.push(id),
+                Err(_) => break,
+            }
+            if n <= step {
+                break;
+            }
+            n -= step;
+            step = step.saturating_mul(2);
+        }
+        // java-tron expects ascending order: ids[0] (deepest, in the peer's
+        // main chain) gates the request; the last id is our head.
+        ids.reverse();
+        ids
     }
 
     /// Validate + persist + execute a single block. Returns the
@@ -4782,6 +4836,39 @@ mod solidify_tests {
             Some(head),
             "the head pointer must be left untouched"
         );
+    }
+
+    #[test]
+    fn chain_summary_is_an_ascending_geometric_locator() {
+        // The SyncBlockChain locator must be ascending, end at our head, and
+        // anchor deep enough (below the reversible tip) that its first id is
+        // in any synced peer's main chain — unlike the old bare `[head]`.
+        let state = mem_state();
+        let blocks_be = mem();
+        let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+
+        let head = 1000i64; // snapshot-like base of 1 with a 1000-block chain
+        for num in 1..=head {
+            let block = block_by(num, &witness((num as usize) % 27));
+            bi.put(&block_id_from_block(&block).unwrap()).unwrap();
+        }
+        dp.save_latest_block_header_number(head);
+
+        let driver = driver_with(state.clone(), blocks_be);
+        let summary = driver.build_chain_summary();
+
+        let nums: Vec<i64> = summary.iter().map(|id| id.num() as i64).collect();
+        assert!(nums.len() > 2, "locator should have several anchors: {nums:?}");
+        assert!(nums.windows(2).all(|w| w[0] < w[1]), "ascending: {nums:?}");
+        assert_eq!(*nums.last().unwrap(), head, "last id is our head");
+        // First id is deep — well below the ~18-block reversible tip — so a
+        // peer that forked only recently still has it in its main chain.
+        assert!(*nums.first().unwrap() <= head - 100, "anchor too shallow: {nums:?}");
+        // Every id resolves to the matching block_index entry.
+        for id in &summary {
+            assert_eq!(bi.get(id.num() as i64).unwrap(), *id);
+        }
     }
 }
 
