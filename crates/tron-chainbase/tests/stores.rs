@@ -7,17 +7,20 @@ use std::sync::Arc;
 use hex_literal::hex;
 use prost::Message;
 use tron_chainbase::{
-    dynamic_properties_keys as dp_keys, AccountStore, BlockIndexStore, BlockStore,
-    DelegatedResourceAccountIndexStore, DelegatedResourceStore, DelegationStore,
-    DynamicPropertiesStore, KvBackend, MemBackend, RocksDbBackend, StoreError, StoredTransaction,
-    TransactionStore, VotesStore, WitnessStore, DEFAULT_BROKERAGE, REMARK, V1_FROM_PREFIX,
-    V1_TO_PREFIX, V2_FROM_PREFIX, V2_PREFIX_LOCKED, V2_PREFIX_UNLOCKED, V2_TO_PREFIX,
+    dynamic_properties_keys as dp_keys, market_order_price_comparator, AccountStore,
+    BlockIndexStore, BlockStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
+    DelegationStore, DynamicPropertiesStore, KvBackend, MarketPairPriceToOrderStore, MemBackend,
+    RocksDbBackend, StoreError, StoredTransaction, TransactionStore, VotesStore, WitnessStore,
+    DEFAULT_BROKERAGE, MARKET_ORDER_PRICE_COMPARATOR_NAME, REMARK, V1_FROM_PREFIX, V1_TO_PREFIX,
+    V2_FROM_PREFIX, V2_PREFIX_LOCKED, V2_PREFIX_UNLOCKED, V2_TO_PREFIX,
 };
 use tron_crypto::address::Address;
 use tron_proto::block_header::Raw as BlockHeaderRaw;
 use tron_proto::transaction::contract::ContractType;
 use tron_proto::transaction::{Contract, Raw as TxRaw};
-use tron_proto::{Account, Block, BlockHeader, Transaction, TransferContract, Votes, Witness};
+use tron_proto::{
+    Account, Block, BlockHeader, MarketOrderIdList, Transaction, TransferContract, Votes, Witness,
+};
 use tron_types::{block_id_from_block, tx_id};
 
 fn mem() -> Arc<MemBackend> {
@@ -896,5 +899,111 @@ fn rocksdb_paranoid_checks_does_not_change_happy_path_behavior() {
     let be = RocksDbBackend::open(&dir).unwrap();
     assert_eq!(be.get(b"alpha").unwrap(), Some(b"1".to_vec()));
     assert_eq!(be.get(b"beta").unwrap(), Some(b"2".to_vec()));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- market_pair_price_to_order custom comparator (M-16) --------------------
+
+/// Build a full 54-byte `market_pair_price_to_order` key:
+/// `pair(38) || sellQuantity(8 BE) || buyQuantity(8 BE)`.
+fn market_price_key(pair_label: u8, sell: i64, buy: i64) -> Vec<u8> {
+    let mut k = vec![pair_label; 38];
+    k.extend_from_slice(&sell.to_be_bytes());
+    k.extend_from_slice(&buy.to_be_bytes());
+    k
+}
+
+/// The real end-to-end M-16 path: a store opened with
+/// `MarketOrderPriceComparator` returns each pair's price ladder in
+/// ascending *price* order (not bytewise), the comparator name is
+/// persisted to the MANIFEST and survives a reopen, and the price-ladder
+/// `scan_prefix` walk relies on that ordering.
+#[test]
+fn market_pair_price_to_order_iterates_in_price_order_via_comparator() {
+    let dir = rocks_tempdir();
+
+    // Insert four price levels for pair 0xaa, deliberately NOT in price
+    // order, plus one entry for a different pair that must be excluded.
+    // price = buy/sell, so ascending price is 0.5, 1.0, 1.5, 2.0.
+    {
+        let backend: Arc<dyn KvBackend> = Arc::new(
+            RocksDbBackend::open_with_comparator(
+                &dir,
+                None,
+                MARKET_ORDER_PRICE_COMPARATOR_NAME,
+                market_order_price_comparator,
+            )
+            .unwrap(),
+        );
+        let store = MarketPairPriceToOrderStore::new(backend);
+        store.put(&market_price_key(0xaa, 10, 20), &MarketOrderIdList::default()).unwrap(); // 2.0
+        store.put(&market_price_key(0xaa, 20, 10), &MarketOrderIdList::default()).unwrap(); // 0.5
+        store.put(&market_price_key(0xaa, 10, 15), &MarketOrderIdList::default()).unwrap(); // 1.5
+        store.put(&market_price_key(0xaa, 10, 10), &MarketOrderIdList::default()).unwrap(); // 1.0
+        store.put(&market_price_key(0xbb, 1, 1), &MarketOrderIdList::default()).unwrap();
+    }
+
+    // Re-open: this is what failed for a default-comparator open ("does not
+    // match existing comparator"). It must succeed because the name matches.
+    let backend: Arc<dyn KvBackend> = Arc::new(
+        RocksDbBackend::open_with_comparator(
+            &dir,
+            None,
+            MARKET_ORDER_PRICE_COMPARATOR_NAME,
+            market_order_price_comparator,
+        )
+        .unwrap(),
+    );
+    let store = MarketPairPriceToOrderStore::new(backend);
+
+    // scan_prefix seeks with the bare 38-byte pair and walks the ladder.
+    let pair_a = vec![0xaa; 38];
+    let ladder = store.scan_prefix(&pair_a).expect("scan");
+    assert_eq!(ladder.len(), 4, "exactly the four pair-0xaa levels (0xbb excluded)");
+    let prices: Vec<(i64, i64)> = ladder
+        .iter()
+        .map(|(k, _)| {
+            let mut s = [0u8; 8];
+            let mut b = [0u8; 8];
+            s.copy_from_slice(&k[38..46]);
+            b.copy_from_slice(&k[46..54]);
+            (i64::from_be_bytes(s), i64::from_be_bytes(b))
+        })
+        .collect();
+    // Ascending price (buy/sell): 0.5, 1.0, 1.5, 2.0 — NOT insertion or
+    // bytewise order.
+    assert_eq!(prices, vec![(20, 10), (10, 10), (10, 15), (10, 20)]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Guards the open contract from the other side: a store written with the
+/// custom comparator CANNOT be opened with the default bytewise one —
+/// reproducing the exact failure a java-tron mainnet snapshot hits before
+/// the M-16 fix. Proves the comparator name is genuinely persisted and
+/// enforced, so the special-case in `open_store` is load-bearing.
+#[test]
+fn market_pair_price_to_order_default_open_rejects_custom_comparator_store() {
+    let dir = rocks_tempdir();
+    {
+        let be = RocksDbBackend::open_with_comparator(
+            &dir,
+            None,
+            MARKET_ORDER_PRICE_COMPARATOR_NAME,
+            market_order_price_comparator,
+        )
+        .unwrap();
+        be.put(&market_price_key(0xaa, 1, 1), b"v").unwrap();
+    }
+    // Default comparator open must fail on the MANIFEST name mismatch.
+    let msg = match RocksDbBackend::open(&dir) {
+        Ok(_) => panic!("default-comparator open should have been rejected"),
+        Err(e) => format!("{e:?}"),
+    };
+    assert!(
+        msg.contains("does not match existing comparator")
+            && msg.contains("MarketOrderPriceComparator"),
+        "expected comparator-mismatch error, got: {msg}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

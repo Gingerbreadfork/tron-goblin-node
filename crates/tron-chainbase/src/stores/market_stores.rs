@@ -11,6 +11,7 @@
 //! rather than the project-wide `-`. java-tron's `Constant` interface
 //! holds the canonical strings — pinning them here as `pub const`.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use prost::Message;
@@ -140,6 +141,91 @@ impl MarketPairPriceToOrderStore {
     }
 }
 
+// === MarketOrderPriceComparator =============================================
+//
+// java-tron does NOT open `market_pair_price_to_order` with the default
+// bytewise comparator — it registers a custom RocksDB comparator named
+// `MarketOrderPriceComparator` (port of `MarketUtils.comparePriceKey`).
+// RocksDB persists that name in the store's MANIFEST and refuses to open
+// unless the comparator we supply reports an identical name, so we MUST
+// re-register an equivalent one. Two reasons it has to be byte-exact:
+//
+//   1. Open-time: name mismatch → `does not match existing comparator`.
+//   2. Read correctness: the SSTs were physically ordered by this
+//      comparator, and RocksDB binary-searches data/index blocks with it.
+//      Any disagreement with java-tron's ordering makes lookups silently
+//      miss keys — not an error, just wrong reads.
+//
+// Because the order book is grouped by trading pair (the comparator sorts
+// by pair bytes first), registering it also makes `scan_prefix`'s seek +
+// `starts_with` walk return each pair's price ladder in true price order
+// rather than lexicographic order — which is what java-tron's matching
+// engine and `getMarketOrderListByPair` rely on.
+
+/// java-tron's RocksDB comparator name for `market_pair_price_to_order`,
+/// as stored in that store's MANIFEST. The registered comparator must
+/// report exactly this or RocksDB refuses the open.
+pub const MARKET_ORDER_PRICE_COMPARATOR_NAME: &str = "MarketOrderPriceComparator";
+
+/// One token-id field in a market pair key is fixed at the decimal-string
+/// length of `Long.MAX_VALUE` (9223372036854775807 → 19 chars), matching
+/// java-tron's `MarketUtils.TOKEN_ID_LENGTH`.
+const TOKEN_ID_LENGTH: usize = 19;
+/// A market pair key is `sellTokenId(19) || buyTokenId(19)`.
+const PAIR_KEY_LEN: usize = TOKEN_ID_LENGTH * 2; // 38
+/// A full price key appends `sellQuantity(8) || buyQuantity(8)`, each a
+/// big-endian `i64` (java-tron's `ByteArray.fromLong`).
+const SELL_QTY_OFF: usize = PAIR_KEY_LEN; // 38
+const BUY_QTY_OFF: usize = PAIR_KEY_LEN + 8; // 46
+
+/// Port of java-tron's `MarketUtils.comparePriceKey` — the ordering the
+/// `market_pair_price_to_order` SSTs were written with.
+///
+/// Key layout: `pair(38) || sellQuantity(8 BE) || buyQuantity(8 BE)`.
+/// Ordering: the 38-byte pair prefix lexicographically first (so all
+/// orders for one pair stay contiguous); within a pair, by price, where
+/// price = `buyQuantity / sellQuantity` compared via cross-multiplication
+/// (`buy1*sell2` vs `buy2*sell1`). i128 holds any `i64 * i64` product
+/// exactly, so — unlike java-tron's `long` path — there is never an
+/// overflow that needs a `BigInteger` fallback; the result is identical.
+///
+/// Robust to short keys: a bare 38-byte pair prefix (used as a seek
+/// target by [`MarketPairPriceToOrderStore::scan_prefix`]) reads its
+/// absent quantities as 0, so it compares equal to every full key of the
+/// same pair and the seek lands on that pair's lowest-priced order —
+/// exactly where the ladder walk must start.
+pub fn market_order_price_comparator(a: &[u8], b: &[u8]) -> Ordering {
+    // 1. Trading pair, unsigned-byte lexicographic (java's FastByteComparisons
+    //    and Rust's slice `cmp` both treat bytes as unsigned — they agree).
+    let pa = &a[..PAIR_KEY_LEN.min(a.len())];
+    let pb = &b[..PAIR_KEY_LEN.min(b.len())];
+    match pa.cmp(pb) {
+        Ordering::Equal => {}
+        non_eq => return non_eq,
+    }
+    // 2. Same pair → compare by price via cross-multiplication.
+    let buy1 = read_be_i64(a, BUY_QTY_OFF) as i128;
+    let sell1 = read_be_i64(a, SELL_QTY_OFF) as i128;
+    let buy2 = read_be_i64(b, BUY_QTY_OFF) as i128;
+    let sell2 = read_be_i64(b, SELL_QTY_OFF) as i128;
+    (buy1 * sell2).cmp(&(buy2 * sell1))
+}
+
+/// Read an 8-byte big-endian `i64` at `off`, treating any bytes past the
+/// end of `key` as zero. Mirrors java-tron's `ByteArray.toLong(
+/// Arrays.copyOfRange(key, off, off + 8))`, whose `copyOfRange` zero-fills
+/// (right-pads) when the source runs short — the case that arises only for
+/// the 38-byte pair-prefix seek target, never for a stored 54-byte key.
+fn read_be_i64(key: &[u8], off: usize) -> i64 {
+    let mut buf = [0u8; 8];
+    let end = (off + 8).min(key.len());
+    if off < end {
+        let avail = &key[off..end];
+        buf[..avail.len()].copy_from_slice(avail);
+    }
+    i64::from_be_bytes(buf)
+}
+
 // === MarketPairToPriceStore =================================================
 
 pub const MARKET_PAIR_TO_PRICE_DB_NAME: &str = "market_pair_to_price";
@@ -246,9 +332,12 @@ mod tests {
         let got = store.scan_prefix(&pair_a).expect("scan");
         assert_eq!(got.len(), 3, "exactly 3 pair_a price levels");
 
-        // Lexicographic order — the 0x05/0x10/0x20 markers come back
-        // sorted, which matters for the price ladder semantics that
-        // java-tron's getMarketOrderListByPair relies on.
+        // This is the `MemBackend` (bytewise) path, so the synthetic
+        // single-byte suffixes come back lexicographically. The real
+        // RocksDB store is opened with `market_order_price_comparator`
+        // and returns each pair's ladder in *price* order — see the
+        // `market_order_price_comparator_*` unit tests and the
+        // `market_pair_price_to_order_*` RocksDB end-to-end test.
         let suffixes: Vec<u8> = got.iter().map(|(k, _)| *k.last().unwrap()).collect();
         assert_eq!(suffixes, vec![0x05, 0x10, 0x20]);
     }
@@ -263,5 +352,85 @@ mod tests {
         let other = pair_prefix(0xff);
         let got = store.scan_prefix(&other).expect("scan");
         assert!(got.is_empty(), "no entries for unknown pair");
+    }
+
+    // --- MarketOrderPriceComparator -----------------------------------------
+
+    /// Build a full 54-byte price key: `pair(38) || sell(8 BE) || buy(8 BE)`.
+    fn full_price_key(pair_label: u8, sell: i64, buy: i64) -> Vec<u8> {
+        let mut k = vec![pair_label; PAIR_KEY_LEN];
+        k.extend_from_slice(&sell.to_be_bytes());
+        k.extend_from_slice(&buy.to_be_bytes());
+        k
+    }
+
+    #[test]
+    fn market_order_price_comparator_orders_same_pair_by_ascending_price() {
+        // price = buy / sell. Insert deliberately out of price order.
+        let mut keys = vec![
+            full_price_key(0xaa, 10, 20), // 2.0
+            full_price_key(0xaa, 20, 10), // 0.5
+            full_price_key(0xaa, 10, 15), // 1.5
+            full_price_key(0xaa, 10, 10), // 1.0
+        ];
+        keys.sort_by(|a, b| market_order_price_comparator(a, b));
+        // Expected ascending price: 0.5, 1.0, 1.5, 2.0 → identified by buy/sell.
+        let prices: Vec<(i64, i64)> = keys
+            .iter()
+            .map(|k| (read_be_i64(k, SELL_QTY_OFF), read_be_i64(k, BUY_QTY_OFF)))
+            .collect();
+        assert_eq!(prices, vec![(20, 10), (10, 10), (10, 15), (10, 20)]);
+    }
+
+    #[test]
+    fn market_order_price_comparator_orders_by_pair_before_price() {
+        // pair 0xaa with a very high price must still sort before pair 0xbb
+        // with a very low price — the pair prefix dominates.
+        let a = full_price_key(0xaa, 1, i64::MAX); // huge price, pair aa
+        let b = full_price_key(0xbb, i64::MAX, 1); // tiny price, pair bb
+        assert_eq!(market_order_price_comparator(&a, &b), Ordering::Less);
+        assert_eq!(market_order_price_comparator(&b, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn market_order_price_comparator_treats_equal_ratios_as_equal() {
+        // 2/1 and 4/2 are the same price — java-tron's comparator returns 0,
+        // and so must ours (java-tron canonicalises so two such keys never
+        // actually coexist; we just have to agree on the ordering).
+        let a = full_price_key(0xaa, 1, 2);
+        let b = full_price_key(0xaa, 2, 4);
+        assert_eq!(market_order_price_comparator(&a, &b), Ordering::Equal);
+    }
+
+    #[test]
+    fn market_order_price_comparator_is_exact_for_huge_quantities() {
+        // Cross-multiplication of two i64 near MAX overflows i64 (java-tron
+        // falls back to BigInteger here); our i128 path is exact with no
+        // fallback. buy/sell: (MAX-1)/MAX  <  MAX/MAX.
+        let a = full_price_key(0xaa, i64::MAX, i64::MAX - 1);
+        let b = full_price_key(0xaa, i64::MAX, i64::MAX);
+        assert_eq!(market_order_price_comparator(&a, &b), Ordering::Less);
+        assert_eq!(market_order_price_comparator(&b, &a), Ordering::Greater);
+        // Same numbers → equal, no panic.
+        assert_eq!(market_order_price_comparator(&a, &a), Ordering::Equal);
+    }
+
+    #[test]
+    fn market_order_price_comparator_bare_pair_prefix_seeks_to_ladder_head() {
+        // A bare 38-byte pair prefix is what `scan_prefix` seeks with. It
+        // must compare equal to every full key of the same pair (so the
+        // RocksDB seek lands on that pair's lowest-priced order) and order
+        // strictly by pair against other pairs.
+        let prefix = vec![0xaa; PAIR_KEY_LEN];
+        let same_pair = full_price_key(0xaa, 7, 3);
+        assert_eq!(
+            market_order_price_comparator(&prefix, &same_pair),
+            Ordering::Equal,
+            "bare prefix sorts at the head of its own pair's ladder"
+        );
+        let later_pair = full_price_key(0xbb, 1, 1);
+        assert_eq!(market_order_price_comparator(&prefix, &later_pair), Ordering::Less);
+        let earlier_pair = full_price_key(0x09, 1, 1);
+        assert_eq!(market_order_price_comparator(&prefix, &earlier_pair), Ordering::Greater);
     }
 }

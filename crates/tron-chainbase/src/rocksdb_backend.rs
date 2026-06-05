@@ -18,6 +18,7 @@
 //! files written with different tuning. Operators who need exotic
 //! tuning can plumb their own `Options` through [`RocksDbBackend::open_with`].
 
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,6 +91,37 @@ impl RocksDbBackend {
         opts.create_if_missing(true);
         opts.set_write_buffer_size(write_buffer_mb * 1024 * 1024);
         opts.set_max_open_files(max_open_files); // overrides safety_baseline default
+        Self::open_with(path, opts)
+    }
+
+    /// Open a store that java-tron created with a **custom key
+    /// comparator**, registering an equivalent one so RocksDB will open it
+    /// and order keys the way the on-disk SSTs were written.
+    ///
+    /// `comparator_name` MUST match the name recorded in the store's
+    /// MANIFEST — RocksDB compares it at open and errors with `does not
+    /// match existing comparator <name>` otherwise — and `compare_fn` MUST
+    /// reproduce java-tron's ordering byte-for-byte, since RocksDB
+    /// binary-searches the SST data/index blocks with it (a mismatch makes
+    /// point/range reads silently miss keys rather than fail loudly).
+    ///
+    /// Only `market_pair_price_to_order` needs this today; see
+    /// [`crate::market_order_price_comparator`]. `tuning` mirrors
+    /// [`open_tuned`](Self::open_tuned) — `Some((write_buffer_mb,
+    /// max_open_files))` to apply operator knobs, `None` for defaults.
+    pub fn open_with_comparator(
+        path: impl AsRef<Path>,
+        tuning: Option<(usize, i32)>,
+        comparator_name: &str,
+        compare_fn: fn(&[u8], &[u8]) -> Ordering,
+    ) -> Result<Self, RocksDbError> {
+        let mut opts = safety_baseline();
+        opts.create_if_missing(true);
+        if let Some((write_buffer_mb, max_open_files)) = tuning {
+            opts.set_write_buffer_size(write_buffer_mb * 1024 * 1024);
+            opts.set_max_open_files(max_open_files); // overrides safety_baseline default
+        }
+        opts.set_comparator(comparator_name, Box::new(compare_fn));
         Self::open_with(path, opts)
     }
 

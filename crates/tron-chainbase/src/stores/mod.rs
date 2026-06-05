@@ -76,7 +76,9 @@ pub use dynamic_properties_store::{keys as dynamic_properties_keys, DynamicPrope
 pub use exchange_store::{ExchangeStore, ExchangeV2Store};
 pub use incremental_merkle_tree_store::IncrementalMerkleTreeStore;
 pub use market_stores::{
-    MarketAccountStore, MarketOrderStore, MarketPairPriceToOrderStore, MarketPairToPriceStore,
+    market_order_price_comparator, MarketAccountStore, MarketOrderStore,
+    MarketPairPriceToOrderStore, MarketPairToPriceStore, MARKET_ORDER_PRICE_COMPARATOR_NAME,
+    MARKET_PAIR_PRICE_TO_ORDER_DB_NAME,
 };
 pub use nullifier_store::NullifierStore;
 pub use pbft_sign_data_store::PbftSignDataStore;
