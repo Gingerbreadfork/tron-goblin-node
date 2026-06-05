@@ -36,6 +36,7 @@ tracing-subscriber.workspace = true
 tar.workspace = true
 flate2.workspace = true
 rand = "0.8"
+libc = "0.2"
 
 [dev-dependencies]
 hex-literal.workspace = true

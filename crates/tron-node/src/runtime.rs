@@ -71,7 +71,54 @@ pub enum RunError {
 ///
 /// On shutdown: every task gets `signal.subscribe().recv().await` and
 /// exits cleanly. RocksDB instances flush on `Drop` of `Arc<RocksDbBackend>`.
+/// Decide the new soft FD limit given current `(soft, hard)`: raise to the
+/// hard ceiling when below it, else leave unchanged. Pure (testable) half of
+/// [`raise_fd_limit`].
+fn fd_limit_target(soft: u64, hard: u64) -> Option<u64> {
+    (soft < hard).then_some(hard)
+}
+
+/// Raise the process open-file soft limit to the hard ceiling at startup.
+///
+/// A full node opens one RocksDB instance per store (~60 here), each holding
+/// up to `max_open_files` SST handles, plus peer sockets — easily 15k+
+/// descriptors once every store is warmed by sync. A 1024/4096 default soft
+/// limit then trips `EMFILE` ("Too many open files") part-way through a sync
+/// (M-21). Databases raise this themselves; soft→hard needs no privilege.
+fn raise_fd_limit() {
+    // SAFETY: `get/setrlimit` with `RLIMIT_NOFILE` and a stack-owned
+    // `rlimit`; no aliasing, both return codes checked.
+    unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            warn!("could not read RLIMIT_NOFILE; leaving the open-file limit as inherited");
+            return;
+        }
+        let Some(target) = fd_limit_target(rl.rlim_cur as u64, rl.rlim_max as u64) else {
+            // Surface the effective limit: if a sync still hits EMFILE with
+            // this already high, the cause is descriptor *leakage*, not the
+            // ceiling.
+            info!(limit = rl.rlim_cur as u64, "open-file limit (RLIMIT_NOFILE) already at hard ceiling");
+            return;
+        };
+        let prev = rl.rlim_cur as u64;
+        rl.rlim_cur = target as libc::rlim_t;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+            warn!(
+                soft = prev,
+                hard = rl.rlim_max as u64,
+                "could not raise RLIMIT_NOFILE; sync may hit 'Too many open files'"
+            );
+            return;
+        }
+        info!(from = prev, to = target, "raised open-file limit (RLIMIT_NOFILE soft → hard)");
+    }
+}
+
 pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), RunError> {
+    // Give RocksDB (one instance per store) + peer sockets enough file
+    // descriptors before anything opens one (M-21).
+    raise_fd_limit();
     info!(data_dir = ?config.data_dir, "opening stores");
     let mut stores = OpenedStores::open_tuned(
         &config.data_dir,
@@ -1376,5 +1423,15 @@ mod assemble_peers_tests {
         assert_eq!(peers.iter().filter(|p| **p == seed0).count(), 1);
         // Length = explicit (2) + remaining seeds.
         assert_eq!(peers.len(), 1 + tron_net::MAINNET_SEEDS.len());
+    }
+
+    #[test]
+    fn fd_limit_raises_only_when_below_hard() {
+        // Typical: low default soft, high hard → raise to hard.
+        assert_eq!(super::fd_limit_target(1024, 1_048_576), Some(1_048_576));
+        // Already at the ceiling → no-op.
+        assert_eq!(super::fd_limit_target(1_048_576, 1_048_576), None);
+        // Defensive: never lower an already-generous soft limit.
+        assert_eq!(super::fd_limit_target(4096, 1024), None);
     }
 }

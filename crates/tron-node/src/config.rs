@@ -113,9 +113,13 @@ pub struct StorageConfig {
     /// the cost of memory.
     #[serde(default = "default_write_buffer_mb")]
     pub write_buffer_size_mb: usize,
-    /// Per-process max open file descriptors. RocksDB opens one fd
-    /// per SST + a few per CF; for ~30 stores this is comfortably
-    /// under typical 65 535 / 1 048 576 user limits.
+    /// Max open SST file descriptors **per store**. Each chainbase store
+    /// is its own RocksDB instance (~60 of them), so the process-wide
+    /// ceiling is this value × the store count — set it with that
+    /// multiplication in mind. The default (1024 → ~60k aggregate) stays
+    /// well under typical `RLIMIT_NOFILE` while keeping a syncing node's
+    /// working set resident; the daemon also raises its soft FD limit to
+    /// the hard ceiling at startup (`raise_fd_limit`).
     #[serde(default = "default_max_open_files")]
     pub max_open_files: i32,
     /// Run a manual compaction (across every store) on startup. Off
@@ -304,7 +308,11 @@ fn default_write_buffer_mb() -> usize {
     64
 }
 fn default_max_open_files() -> i32 {
-    65_535
+    // Per-store (each store is its own RocksDB instance). ~60 stores ×
+    // 1024 ≈ 60k aggregate FDs — safe under typical limits, unlike the
+    // old 65_535 which multiplied out to millions and exhausted the
+    // process mid-sync (M-21).
+    1024
 }
 
 /// Configuration for the SR block-production runtime.
