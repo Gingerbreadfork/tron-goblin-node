@@ -46,7 +46,7 @@ use prost::Message as _;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use tron_chainbase::{BlockIndexStore, BlockStore, DynamicPropertiesStore, KvBackend};
-use tron_executor::StateBackends;
+use tron_executor::{expected_block_signer, StateBackends};
 use tron_eventer::EventBus;
 use tron_mempool::{MempoolError, TxMempool};
 use tron_net::{
@@ -1770,13 +1770,22 @@ impl SyncDriver {
         if let Err(e) = verify_tx_trie_root(block) {
             return AcceptOutcome::RejectedValidation(format!("tx_trie: {e:?}"));
         }
-        // `verify_witness_signature(block, None)` recovers the signer
-        // from the BLS sig without checking it against an expected
-        // address — we don't know who's scheduled for this slot yet
-        // (that's a `tron-consensus::verify_block_witness` job, which
-        // needs the active witness list at the block's slot). For v1
-        // we accept any structurally-valid signature.
-        if let Err(e) = verify_witness_signature(block, None) {
+        // Block-signature authorization, per java-tron's
+        // `BlockCapsule.validateSignature`: the signature must recover to
+        // the producer's witness-permission key when `ALLOW_MULTI_SIGN` is
+        // on (mainnet — SRs may sign with a delegated cold/hot key), else
+        // to the witness account address. `expected_block_signer` reads the
+        // producer account from current (parent) state to pick the right
+        // one; passing `None` here would unconditionally demand the account
+        // key and reject every delegated-signer block (~1/4 of mainnet).
+        // This does NOT check slot scheduling — who's *due* this slot is a
+        // separate consensus concern (`tron-consensus`); here we only prove
+        // the block was signed by a key authorized for its claimed witness.
+        let expected = match expected_block_signer(block, &self.state) {
+            Ok(addr) => addr,
+            Err(e) => return AcceptOutcome::RejectedValidation(format!("witness sig: {e}")),
+        };
+        if let Err(e) = verify_witness_signature(block, Some(&expected)) {
             return AcceptOutcome::RejectedValidation(format!("witness sig: {e:?}"));
         }
         let id = match block_id_from_block(block) {

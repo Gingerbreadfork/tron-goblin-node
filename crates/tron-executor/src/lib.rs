@@ -1395,6 +1395,68 @@ pub enum RollbackError {
     Store(#[from] tron_chainbase::StoreError),
 }
 
+/// The address whose key must have produced `block`'s signature, per
+/// java-tron's `BlockCapsule.validateSignature`.
+///
+/// When `ALLOW_MULTI_SIGN == 1` (the mainnet default for years) a witness
+/// may sign blocks with a delegated **witness-permission** key rather than
+/// its account key — cold/hot key separation. In that mode the signature
+/// must recover to `witness_permission.keys[0].address`, falling back to
+/// the account address when the producer set no witness permission (or its
+/// account row is somehow absent). When multi-sign is off, the witness
+/// account address itself must have signed.
+///
+/// The producer is `block.witness_address`; its account is read from
+/// current state — i.e. as of the parent block, before this block is
+/// applied — exactly as java-tron reads `accountStore` at `pushBlock`.
+///
+/// Pass the result as the `expected_signer` override to
+/// [`verify_witness_signature`]. Passing `None` there instead silently
+/// demands the account key and so rejects every delegated-signer block —
+/// roughly a quarter of mainnet's blocks.
+pub fn expected_block_signer(
+    block: &Block,
+    state: &StateBackends,
+) -> Result<tron_crypto::address::Address, BlockExecError> {
+    use tron_crypto::address::Address;
+
+    let raw = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+        .ok_or(BlockValidateError::MissingHeader)?;
+    if raw.witness_address.len() != 21 {
+        return Err(BlockValidateError::WitnessAddressLength(raw.witness_address.len()).into());
+    }
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(&raw.witness_address);
+    let witness_address = Address::from_raw(buf);
+
+    // Multi-sign disabled → the witness account key signs directly.
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    if dp.get_long(b"ALLOW_MULTI_SIGN") != Some(1) {
+        return Ok(witness_address);
+    }
+
+    // Multi-sign enabled → the witness-permission key signs. Fall back to
+    // the account address if no witness permission is set, the key list is
+    // empty, the key is malformed, or the account row is absent.
+    let accounts = AccountStore::new(state.accounts.clone());
+    let signer = accounts
+        .get(&witness_address)?
+        .and_then(|acct| acct.witness_permission)
+        .and_then(|perm| perm.keys.into_iter().next())
+        .map(|key| key.address)
+        .filter(|addr| addr.len() == 21)
+        .map(|addr| {
+            let mut b = [0u8; 21];
+            b.copy_from_slice(&addr);
+            Address::from_raw(b)
+        })
+        .unwrap_or(witness_address);
+    Ok(signer)
+}
+
 /// Pure executor logic — operates on whatever [`StateBackends`] is
 /// handed in. The top-level [`execute_block_inner`] dispatches here
 /// either against base backends directly (no undo) or against a
@@ -1418,7 +1480,12 @@ fn execute_block_logic(
     // — so under strict mode an unsigned block is rejected here, not
     // silently applied.
     if config.require_signature {
-        verify_witness_signature(block, None)?;
+        // Authorize against the producer's witness-permission key when
+        // `ALLOW_MULTI_SIGN` is on (mainnet), else the account key. Passing
+        // `None` would demand the account key unconditionally and reject
+        // every delegated cold/hot-key SR. See [`expected_block_signer`].
+        let expected = expected_block_signer(block, state)?;
+        verify_witness_signature(block, Some(&expected))?;
     }
 
     // Lift the header out once — needed both by the per-tx loop (for
