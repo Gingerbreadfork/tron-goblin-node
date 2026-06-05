@@ -1852,7 +1852,10 @@ impl SyncDriver {
         let prev_head_arc = self.khaos.head();
         let prev_head_num = prev_head_arc.as_ref().map(|h| h.num).unwrap_or(0);
         let khaos_head = match self.khaos.push(block.clone()) {
-            Ok(h) => h,
+            // `PushOutcome` also classifies extension vs reorg vs sibling;
+            // we only need the resulting head here. Acting on the reorg
+            // signal is the sync-reorg follow-up (review §9).
+            Ok(outcome) => outcome.into_head(),
             Err(tron_consensus::KhaosPushError::Unlinked) => {
                 if !self.khaos_started {
                     // No head yet — first-block push is allowed even

@@ -44,7 +44,9 @@ pub mod sr_epoch;
 pub mod validate;
 
 pub use fork_choice::{best_head, best_head_with_solidified, ForkChoice, ForkChoiceError};
-pub use khaos::{KhaosBlock, KhaosDb, NonCommonBlockError, PushError as KhaosPushError};
+pub use khaos::{
+    KhaosBlock, KhaosDb, NonCommonBlockError, PushError as KhaosPushError, PushOutcome,
+};
 pub use pbft::{
     agree_node_count, block_data_payload, cast_commit, cast_prepare, parse_block_data_payload,
     recover_signer, sign_pbft_raw, BlockVoteTally, PbftVoteTally,

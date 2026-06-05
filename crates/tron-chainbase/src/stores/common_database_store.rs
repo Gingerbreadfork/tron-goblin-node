@@ -63,7 +63,15 @@ impl CommonDataBaseStore {
             return 0;
         };
         if bytes.len() != 8 {
-            return 0;
+            // A present-but-wrong-length value is corruption, not "unset".
+            // Returning 0 here would report the PBFT pointer as 0 and let
+            // `save_latest_pbft_block_num` accept a smaller write, moving
+            // the committed pointer *backwards* (H-10). Fail loud instead,
+            // consistent with this store's other corruption handling.
+            panic!(
+                "common-database store: LATEST_PBFT_BLOCK_NUM is {} bytes, expected 8 (corrupt)",
+                bytes.len()
+            );
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes);

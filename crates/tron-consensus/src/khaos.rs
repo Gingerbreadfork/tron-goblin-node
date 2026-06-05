@@ -137,6 +137,53 @@ pub enum PushError {
     Malformed,
 }
 
+/// Classification of a successful [`KhaosDb::push`] (H-1).
+///
+/// Every variant carries the resulting head, so a caller that only needs
+/// "the head after this push" can use [`PushOutcome::into_head`]. The
+/// `Reorg` variant additionally signals that the head jumped to a
+/// *different* fork — the caller must roll back the old chain and re-apply
+/// the new one (derive the exact branches via [`KhaosDb::get_branch`]).
+#[derive(Debug, Clone)]
+pub enum PushOutcome {
+    /// The head advanced linearly: the new block (or a promoted-orphan
+    /// chain it unblocked) extends the previous head.
+    Extended { head: Arc<KhaosBlock> },
+    /// The head moved to a different fork. `from` is the previous head,
+    /// `to` the new one; their common ancestor + the rollback/reapply
+    /// branches come from [`KhaosDb::get_branch`].
+    Reorg {
+        from: Arc<KhaosBlock>,
+        to: Arc<KhaosBlock>,
+    },
+    /// The block was added to the tree but did NOT become the head — a
+    /// side/sibling fork at lower-or-equal height. `head` is unchanged.
+    Sibling { head: Arc<KhaosBlock> },
+}
+
+impl PushOutcome {
+    /// The head after this push, regardless of variant.
+    pub fn head(&self) -> &Arc<KhaosBlock> {
+        match self {
+            PushOutcome::Extended { head } | PushOutcome::Sibling { head } => head,
+            PushOutcome::Reorg { to, .. } => to,
+        }
+    }
+
+    /// Consume the outcome, returning the head after this push.
+    pub fn into_head(self) -> Arc<KhaosBlock> {
+        match self {
+            PushOutcome::Extended { head } | PushOutcome::Sibling { head } => head,
+            PushOutcome::Reorg { to, .. } => to,
+        }
+    }
+
+    /// `true` if the head jumped to a different fork (rollback needed).
+    pub fn is_reorg(&self) -> bool {
+        matches!(self, PushOutcome::Reorg { .. })
+    }
+}
+
 /// In-memory fork-tree.
 ///
 /// Construct with [`KhaosDb::new`] (no head) and seed via [`start`]
@@ -153,6 +200,10 @@ struct Inner {
     head: Option<Arc<KhaosBlock>>,
     mini_store: KhaosStore,
     mini_unlinked_store: KhaosStore,
+    /// Orphan index (H-3): maps a not-yet-seen parent id → the ids of
+    /// unlinked blocks waiting on it, so they can be promoted the moment
+    /// that parent links into the tree.
+    by_parent: HashMap<BlockId, Vec<BlockId>>,
     max_capacity: usize,
 }
 
@@ -164,6 +215,7 @@ impl KhaosDb {
                 head: None,
                 mini_store: KhaosStore::default(),
                 mini_unlinked_store: KhaosStore::default(),
+                by_parent: HashMap::new(),
                 max_capacity: 1024,
             }),
         }
@@ -219,24 +271,29 @@ impl KhaosDb {
         self.inner.lock().unwrap().head.clone()
     }
 
-    /// Push a block into the fork tree. Returns the new head after
-    /// insertion — which may be the same as before (extension on a
-    /// non-best fork) or change (extension on the longest fork).
-    pub fn push(&self, block: Block) -> Result<Arc<KhaosBlock>, PushError> {
+    /// Push a block into the fork tree. On success returns a
+    /// [`PushOutcome`] classifying how the head changed: `Extended` on the
+    /// best fork, `Reorg` when the head jumps to a different fork, or
+    /// `Sibling` when the block is added but doesn't move the head. Any
+    /// orphans waiting on this block (or on blocks it transitively links)
+    /// are promoted automatically (H-3).
+    pub fn push(&self, block: Block) -> Result<PushOutcome, PushError> {
         let kblock = KhaosBlock::new(block).ok_or(PushError::Malformed)?;
         let mut g = self.inner.lock().unwrap();
 
-        // If we already know about this block, return the current head
-        // unchanged — `containBlock` dedup matches java-tron behavior.
+        // Dedup — already known. `containBlock` matches java-tron.
         if g.mini_store.by_hash.contains_key(&kblock.id)
             || g.mini_unlinked_store.by_hash.contains_key(&kblock.id)
         {
-            return Ok(g.head.clone().unwrap_or_else(|| kblock.clone()));
+            let head = g.head.clone().unwrap_or_else(|| kblock.clone());
+            return Ok(PushOutcome::Sibling { head });
         }
 
-        // If we have a head, validate the parent linkage. Genesis-like
-        // pushes (parent_hash all zero) skip this check, matching the
-        // `block.parent_hash != ZERO_HASH` short-circuit in java-tron.
+        let prev_head = g.head.clone();
+
+        // Validate parent linkage. Genesis-like pushes (parent_hash all
+        // zero) skip this, matching java-tron's `parent_hash != ZERO_HASH`
+        // short-circuit.
         let parent_id_opt = kblock.parent_id();
         let has_nonzero_parent = parent_id_opt
             .as_ref()
@@ -253,38 +310,52 @@ impl KhaosDb {
                 }
                 kblock.set_parent(&parent);
             } else {
+                // Orphan: stash it and remember which parent it waits on
+                // so it's promoted the moment that parent links (H-3).
                 g.mini_unlinked_store.insert(&kblock);
-                // Run pruning even on the orphan path so the orphan
-                // store can't grow unbounded.
+                g.by_parent
+                    .entry(parent_id)
+                    .or_default()
+                    .push(kblock.id.clone());
                 let head_num = g.head.as_ref().map(|h| h.num).unwrap_or(0);
                 let cap = g.max_capacity;
-                g.mini_unlinked_store.prune_below(head_num.saturating_sub(cap as i64));
+                g.mini_unlinked_store
+                    .prune_below(head_num.saturating_sub(cap as i64));
                 return Err(PushError::Unlinked);
             }
         }
 
+        // Link it, advance the head if it tops the tree (strict `>`, so a
+        // tie keeps the first-arrived head — java-tron parity), then
+        // cascade-promote any orphans waiting on it.
         g.mini_store.insert(&kblock);
+        promote_head_if_higher(&mut g, &kblock);
+        promote_orphans(&mut g, &kblock);
 
-        // Promote head if this block extends the longest fork. Java
-        // uses a strict `>` here: ties don't change the head, which
-        // means the first-arriving block at a given height wins. We
-        // mirror that.
-        let promote = match &g.head {
-            None => true,
-            Some(h) => kblock.num > h.num,
-        };
-        if promote {
-            g.head = Some(kblock.clone());
-        }
+        // Classify BEFORE pruning so the ancestor walk sees intact parents.
+        let head = g.head.clone().unwrap();
+        let outcome = classify_outcome(prev_head, head);
 
-        // LRU prune both stores against the new head's number.
+        // LRU prune both stores, then drop fully-evicted orphan-index keys.
         let head_num = g.head.as_ref().map(|h| h.num).unwrap_or(0);
         let cap = g.max_capacity;
         let threshold = head_num.saturating_sub(cap as i64);
         g.mini_store.prune_below(threshold);
         g.mini_unlinked_store.prune_below(threshold);
+        let dead: Vec<BlockId> = g
+            .by_parent
+            .iter()
+            .filter(|(_, kids)| {
+                kids.iter()
+                    .all(|c| !g.mini_unlinked_store.by_hash.contains_key(c))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in dead {
+            g.by_parent.remove(&k);
+        }
 
-        Ok(g.head.clone().unwrap())
+        Ok(outcome)
     }
 
     /// Pop the current head: head = head.parent. Returns `true` if the
@@ -385,6 +456,61 @@ impl KhaosDb {
         Ok((list1, list2))
     }
 
+    /// Like [`get_branch`], but falls back to `fetch` (typically a
+    /// `BlockStore` lookup) for any block not in the in-memory linked
+    /// store (H-2). [`get_branch`] errors `NonCommonBlockError` the moment
+    /// a fork diverges past the LRU-eviction boundary — `get_branch_deep`
+    /// keeps walking onto disk. It walks by the header `parent_hash` (not
+    /// the in-memory weak parent pointers, which don't exist for
+    /// disk-loaded blocks). Returns the same child-to-parent branch pair,
+    /// common ancestor excluded.
+    pub fn get_branch_deep<F>(
+        &self,
+        id1: &BlockId,
+        id2: &BlockId,
+        mut fetch: F,
+    ) -> Result<(VecDeque<Arc<KhaosBlock>>, VecDeque<Arc<KhaosBlock>>), NonCommonBlockError>
+    where
+        F: FnMut(&BlockId) -> Option<Block>,
+    {
+        let g = self.inner.lock().unwrap();
+        // Resolve a block by id: in-memory linked store first, else disk.
+        let resolve = |id: &BlockId, fetch: &mut F| -> Option<Arc<KhaosBlock>> {
+            g.mini_store
+                .by_hash
+                .get(id)
+                .cloned()
+                .or_else(|| fetch(id).and_then(KhaosBlock::new))
+        };
+
+        let mut list1 = VecDeque::new();
+        let mut list2 = VecDeque::new();
+        let mut b1 = resolve(id1, &mut fetch).ok_or(NonCommonBlockError)?;
+        let mut b2 = resolve(id2, &mut fetch).ok_or(NonCommonBlockError)?;
+
+        // Equalize heights (each step strictly lowers num, so bounded).
+        while b1.num > b2.num {
+            list1.push_back(b1.clone());
+            let pid = b1.parent_id().ok_or(NonCommonBlockError)?;
+            b1 = resolve(&pid, &mut fetch).ok_or(NonCommonBlockError)?;
+        }
+        while b2.num > b1.num {
+            list2.push_back(b2.clone());
+            let pid = b2.parent_id().ok_or(NonCommonBlockError)?;
+            b2 = resolve(&pid, &mut fetch).ok_or(NonCommonBlockError)?;
+        }
+        // Walk together until they meet.
+        while b1.id != b2.id {
+            list1.push_back(b1.clone());
+            list2.push_back(b2.clone());
+            let p1 = b1.parent_id().ok_or(NonCommonBlockError)?;
+            let p2 = b2.parent_id().ok_or(NonCommonBlockError)?;
+            b1 = resolve(&p1, &mut fetch).ok_or(NonCommonBlockError)?;
+            b2 = resolve(&p2, &mut fetch).ok_or(NonCommonBlockError)?;
+        }
+        Ok((list1, list2))
+    }
+
     /// Number of blocks in the linked store. Useful for tests + the
     /// `dump-state` snapshot.
     pub fn linked_size(&self) -> usize {
@@ -394,6 +520,79 @@ impl KhaosDb {
     /// Number of orphans (unlinked blocks) currently buffered.
     pub fn unlinked_size(&self) -> usize {
         self.inner.lock().unwrap().mini_unlinked_store.by_hash.len()
+    }
+}
+
+/// Promote `block` to head if it's strictly higher than the current head
+/// (or there's no head). Strict `>` keeps the first-arrived block at a
+/// given height — java-tron parity.
+fn promote_head_if_higher(inner: &mut Inner, block: &Arc<KhaosBlock>) {
+    let higher = match &inner.head {
+        None => true,
+        Some(h) => block.num > h.num,
+    };
+    if higher {
+        inner.head = Some(block.clone());
+    }
+}
+
+/// Cascade-promote orphans (H-3): when `linked` joins the linked store,
+/// any unlinked block waiting on it (and, recursively, blocks waiting on
+/// THOSE) is linked, parented, and considered for head promotion. Without
+/// this an out-of-order arrival (`N+1` before `N`) leaves `N+1` stranded
+/// in the orphan store forever.
+fn promote_orphans(inner: &mut Inner, linked: &Arc<KhaosBlock>) {
+    let mut queue = vec![linked.clone()];
+    while let Some(parent) = queue.pop() {
+        let waiting = inner.by_parent.remove(&parent.id).unwrap_or_default();
+        for child_id in waiting {
+            let Some(child) = inner.mini_unlinked_store.by_hash.get(&child_id).cloned() else {
+                continue; // already pruned/removed
+            };
+            if child.num != parent.num + 1 {
+                // Malformed orphan — drop it rather than link a bad chain.
+                inner.mini_unlinked_store.remove(&child_id);
+                continue;
+            }
+            child.set_parent(&parent);
+            inner.mini_unlinked_store.remove(&child_id);
+            inner.mini_store.insert(&child);
+            promote_head_if_higher(inner, &child);
+            queue.push(child); // its own waiters may now be promotable
+        }
+    }
+}
+
+/// Classify a head transition for [`PushOutcome`]. `Extended` when the
+/// previous head is an ancestor of the new head (or there was none);
+/// `Sibling` when the head didn't move; `Reorg` otherwise.
+fn classify_outcome(prev_head: Option<Arc<KhaosBlock>>, head: Arc<KhaosBlock>) -> PushOutcome {
+    let Some(prev) = prev_head else {
+        return PushOutcome::Extended { head };
+    };
+    if prev.id == head.id {
+        return PushOutcome::Sibling { head };
+    }
+    if is_ancestor(&prev.id, &head) {
+        PushOutcome::Extended { head }
+    } else {
+        PushOutcome::Reorg { from: prev, to: head }
+    }
+}
+
+/// Walk `descendant`'s parent chain looking for `ancestor_id`. `false` if
+/// the chain ends (genesis or pruned parent) before reaching it — for a
+/// head change that means the new head sits on a different fork.
+fn is_ancestor(ancestor_id: &BlockId, descendant: &Arc<KhaosBlock>) -> bool {
+    let mut cur = descendant.clone();
+    loop {
+        if cur.id == *ancestor_id {
+            return true;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return false,
+        }
     }
 }
 
@@ -527,7 +726,7 @@ mod tests {
         parent_bytes.copy_from_slice(&id1.as_bytes()[..]);
         let b2 = mk_block(2, parent_bytes, 0);
         let id2 = id_of(&b2);
-        let head = db.push(b2).unwrap();
+        let head = db.push(b2).unwrap().into_head();
         assert_eq!(head.id, id2);
         assert_eq!(db.linked_size(), 2);
 
@@ -573,7 +772,7 @@ mod tests {
         db.start(b1.clone()).unwrap();
         // Re-pushing genesis must NOT throw — java-tron's containBlock
         // dedup short-circuits cleanly.
-        let head = db.push(b1).unwrap();
+        let head = db.push(b1).unwrap().into_head();
         assert_eq!(head.num, 1);
         assert_eq!(db.linked_size(), 1);
     }
@@ -592,7 +791,7 @@ mod tests {
         let id_a = id_of(&a);
         let _id_b = id_of(&b);
         db.push(a).unwrap();
-        let head = db.push(b).unwrap();
+        let head = db.push(b).unwrap().into_head();
         // Tie at num=2 → head stays at the first-seen (A).
         assert_eq!(head.id, id_a);
         // Both blocks are in the linked store.
@@ -621,8 +820,113 @@ mod tests {
         // ... but a child of b2 at num=3 does (longer fork wins).
         let b3 = mk_block(3, b2_bytes, 2);
         let id_b3 = id_of(&b3);
-        let head = db.push(b3).unwrap();
+        let head = db.push(b3).unwrap().into_head();
         assert_eq!(head.id, id_b3, "longer fork (b-chain) becomes head");
+    }
+
+    #[test]
+    fn out_of_order_arrival_promotes_orphan_when_parent_links() {
+        // H-3: block 3 arrives before block 2. Once 2 links, 3 must be
+        // promoted off the orphan store automatically and the head advance.
+        let db = KhaosDb::new();
+        let g = mk_block(1, [0u8; 32], 0);
+        let mut g_bytes = [0u8; 32];
+        g_bytes.copy_from_slice(&id_of(&g).as_bytes()[..]);
+        db.start(g).unwrap();
+
+        let b2 = mk_block(2, g_bytes, 0);
+        let mut b2_bytes = [0u8; 32];
+        b2_bytes.copy_from_slice(&id_of(&b2).as_bytes()[..]);
+        let b3 = mk_block(3, b2_bytes, 0);
+        let id_b3 = id_of(&b3);
+
+        // b3 first → orphaned (parent b2 unknown), head stays at genesis.
+        assert!(matches!(db.push(b3).unwrap_err(), PushError::Unlinked));
+        assert_eq!(db.unlinked_size(), 1);
+        assert_eq!(db.head().unwrap().num, 1);
+
+        // b2 links → b3 is promoted, head advances to 3.
+        let outcome = db.push(b2).unwrap();
+        assert_eq!(db.unlinked_size(), 0, "orphan b3 should be promoted");
+        assert_eq!(db.head().unwrap().id, id_b3, "head advances to promoted b3");
+        assert!(db.contains_in_linked(&id_b3));
+        assert!(matches!(outcome, PushOutcome::Extended { .. }));
+    }
+
+    #[test]
+    fn head_jump_to_sibling_fork_is_classified_as_reorg() {
+        // H-1: g → a2 → a3 (head). A longer b-chain (b2,b3,b4) overtakes,
+        // so the head jumps forks → PushOutcome::Reorg{from:a3, to:b4}.
+        let db = KhaosDb::new();
+        let g = mk_block(1, [0u8; 32], 0);
+        let mut g_bytes = [0u8; 32];
+        g_bytes.copy_from_slice(&id_of(&g).as_bytes()[..]);
+        db.start(g).unwrap();
+
+        let a2 = mk_block(2, g_bytes, 1);
+        let mut a2_bytes = [0u8; 32];
+        a2_bytes.copy_from_slice(&id_of(&a2).as_bytes()[..]);
+        assert!(matches!(db.push(a2).unwrap(), PushOutcome::Extended { .. }));
+        let a3 = mk_block(3, a2_bytes, 1);
+        let id_a3 = id_of(&a3);
+        assert!(matches!(db.push(a3).unwrap(), PushOutcome::Extended { .. }));
+
+        let b2 = mk_block(2, g_bytes, 2);
+        let mut b2_bytes = [0u8; 32];
+        b2_bytes.copy_from_slice(&id_of(&b2).as_bytes()[..]);
+        assert!(matches!(db.push(b2).unwrap(), PushOutcome::Sibling { .. }));
+        let b3 = mk_block(3, b2_bytes, 2);
+        let mut b3_bytes = [0u8; 32];
+        b3_bytes.copy_from_slice(&id_of(&b3).as_bytes()[..]);
+        assert!(matches!(db.push(b3).unwrap(), PushOutcome::Sibling { .. }));
+        let b4 = mk_block(4, b3_bytes, 2);
+        let id_b4 = id_of(&b4);
+        match db.push(b4).unwrap() {
+            PushOutcome::Reorg { from, to } => {
+                assert_eq!(from.id, id_a3, "reorg from old head a3");
+                assert_eq!(to.id, id_b4, "reorg to new head b4");
+            }
+            other => panic!("expected Reorg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_branch_deep_falls_back_to_disk_for_evicted_blocks() {
+        // H-2: g→a2→a3 and g→b2→b3 live only "on disk" (a HashMap fetch);
+        // the in-memory KhaosDb is empty. plain get_branch fails, but
+        // get_branch_deep finds the common ancestor g via the fallback.
+        use std::collections::HashMap;
+        let g = mk_block(1, [0u8; 32], 0);
+        let mut g_b = [0u8; 32];
+        g_b.copy_from_slice(&id_of(&g).as_bytes()[..]);
+        let a2 = mk_block(2, g_b, 1);
+        let mut a2_b = [0u8; 32];
+        a2_b.copy_from_slice(&id_of(&a2).as_bytes()[..]);
+        let a3 = mk_block(3, a2_b, 1);
+        let id_a3 = id_of(&a3);
+        let b2 = mk_block(2, g_b, 2);
+        let mut b2_b = [0u8; 32];
+        b2_b.copy_from_slice(&id_of(&b2).as_bytes()[..]);
+        let b3 = mk_block(3, b2_b, 2);
+        let id_b3 = id_of(&b3);
+
+        let mut disk: HashMap<BlockId, Block> = HashMap::new();
+        for blk in [&g, &a2, &a3, &b2, &b3] {
+            disk.insert(id_of(blk), blk.clone());
+        }
+
+        let db = KhaosDb::new(); // empty in-memory store
+        assert!(
+            db.get_branch(&id_a3, &id_b3).is_err(),
+            "plain get_branch can't see disk-only blocks"
+        );
+        let (l1, l2) = db
+            .get_branch_deep(&id_a3, &id_b3, |id| disk.get(id).cloned())
+            .expect("deep branch resolves via disk");
+        assert_eq!(l1.len(), 2);
+        assert_eq!(l2.len(), 2);
+        assert_eq!(l1.front().unwrap().id, id_a3);
+        assert_eq!(l2.front().unwrap().id, id_b3);
     }
 
     #[test]

@@ -74,7 +74,11 @@ use tron_proto::protocol::PbftMessage;
 #[inline]
 pub fn agree_node_count(active_witness_count: usize) -> usize {
     if active_witness_count == 0 {
-        return 0;
+        // No active SRs → no quorum is reachable. Return an impossible
+        // threshold so `votes.len() >= threshold` is never satisfied;
+        // returning 0 here meant `len() >= 0` was always true and PBFT
+        // would solidify every block with zero votes (H-6).
+        return usize::MAX;
     }
     active_witness_count * 2 / 3 + 1
 }
@@ -222,8 +226,11 @@ pub fn parse_srl_data_payload(data: &[u8]) -> Option<Vec<Address>> {
 pub enum VoteRecord {
     Fresh,
     Duplicate,
-    /// SR equivocated. The kept signature is the FIRST one observed
-    /// (matches java-tron — the second is dropped).
+    /// SR equivocated — voted again at the same height with a different
+    /// signature. The vote is **dropped** from the tally entirely (H-5),
+    /// so a double-signer contributes nothing toward the threshold;
+    /// `first_signature` + `conflicting_signature` are kept as
+    /// double-sign evidence.
     Equivocation {
         signer: Address,
         first_signature: Vec<u8>,
@@ -261,42 +268,44 @@ impl BlockVoteTally {
     /// the caller can distinguish a fresh vote from a duplicate or
     /// an equivocation (double-sign).
     pub fn record_prepare(&mut self, signer: Address, signature: Vec<u8>) -> VoteRecord {
-        match self.prepare_votes.get(&signer) {
-            Some(existing) if existing == &signature => VoteRecord::Duplicate,
-            Some(existing) => {
-                let conflicting = signature;
-                let first = existing.clone();
-                // Java-tron keeps the FIRST signature; the second is
-                // dropped — that way one byzantine SR can't flip the
-                // tally between rounds. We mirror.
-                VoteRecord::Equivocation {
-                    signer,
-                    first_signature: first,
-                    conflicting_signature: conflicting,
-                }
+        if let Some(existing) = self.prepare_votes.get(&signer) {
+            if existing == &signature {
+                return VoteRecord::Duplicate;
             }
-            None => {
-                self.prepare_votes.insert(signer, signature);
-                VoteRecord::Fresh
-            }
+            let first = existing.clone();
+            // H-5: drop the equivocating signer's vote entirely. Keeping
+            // the first signature (the old behavior) let one byzantine SR
+            // who signed first still count toward a solid decision — a
+            // double-signer must contribute nothing.
+            self.prepare_votes.remove(&signer);
+            return VoteRecord::Equivocation {
+                signer,
+                first_signature: first,
+                conflicting_signature: signature,
+            };
         }
+        self.prepare_votes.insert(signer, signature);
+        VoteRecord::Fresh
     }
 
     /// Record an observed Commit vote. Same semantics as
     /// [`record_prepare`].
     pub fn record_commit(&mut self, signer: Address, signature: Vec<u8>) -> VoteRecord {
-        match self.commit_votes.get(&signer) {
-            Some(existing) if existing == &signature => VoteRecord::Duplicate,
-            Some(existing) => VoteRecord::Equivocation {
-                signer,
-                first_signature: existing.clone(),
-                conflicting_signature: signature,
-            },
-            None => {
-                self.commit_votes.insert(signer, signature);
-                VoteRecord::Fresh
+        if let Some(existing) = self.commit_votes.get(&signer) {
+            if existing == &signature {
+                return VoteRecord::Duplicate;
             }
+            let first = existing.clone();
+            // H-5: drop the equivocating signer's vote (see record_prepare).
+            self.commit_votes.remove(&signer);
+            return VoteRecord::Equivocation {
+                signer,
+                first_signature: first,
+                conflicting_signature: signature,
+            };
         }
+        self.commit_votes.insert(signer, signature);
+        VoteRecord::Fresh
     }
 
     /// True if the prepare-phase threshold is reached.
@@ -597,7 +606,7 @@ mod tests {
         // 5 SRs: 5*2/3 = 3 (truncated); threshold = 4.
         assert_eq!(agree_node_count(5), 4);
         // 0 SRs: no quorum possible.
-        assert_eq!(agree_node_count(0), 0);
+        assert_eq!(agree_node_count(0), usize::MAX); // H-6: unreachable, not 0
         // 1 SR: 0 + 1 = 1.
         assert_eq!(agree_node_count(1), 1);
     }
@@ -692,8 +701,8 @@ mod tests {
             }
             other => panic!("expected Equivocation, got {other:?}"),
         }
-        // First signature is preserved.
-        assert_eq!(t.prepare_votes.get(&addr), Some(&vec![0; 65]));
+        // H-5: the equivocating signer's vote is dropped entirely.
+        assert_eq!(t.prepare_votes.get(&addr), None);
     }
 
     #[test]
