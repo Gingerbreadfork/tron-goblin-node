@@ -28,6 +28,48 @@ fn resource_valid(r: i32) -> bool {
     r == 0 || r == 1 // BANDWIDTH or ENERGY (TRON_POWER cannot be delegated)
 }
 
+/// `ChainConstant.BLOCK_PRODUCED_INTERVAL` — 3 s, in ms.
+const BLOCK_PRODUCED_INTERVAL: i64 = 3000;
+/// `ChainConstant.DELEGATE_PERIOD` — the default lock duration, 3 days in ms.
+const DELEGATE_PERIOD_MS: i64 = 3 * 86_400_000;
+/// Default lock period in *blocks*: `DELEGATE_PERIOD / BLOCK_PRODUCED_INTERVAL`
+/// = 86 400. Used both as the `lockPeriod==0` default and as the baseline
+/// that `supportMaxDelegateLockPeriod` compares against.
+const DEFAULT_LOCK_PERIOD_BLOCKS: i64 = DELEGATE_PERIOD_MS / BLOCK_PRODUCED_INTERVAL;
+
+/// `DynamicPropertiesStore.getMaxDelegateLockPeriod` — the committee-set
+/// cap on a delegation's lock period (in blocks); defaults to the baseline
+/// 86 400 when the proposal hasn't set `MAX_DELEGATE_LOCK_PERIOD`.
+fn max_delegate_lock_period(dyn_props: &DynamicPropertiesStore) -> i64 {
+    dyn_props
+        .get_long(b"MAX_DELEGATE_LOCK_PERIOD")
+        .unwrap_or(DEFAULT_LOCK_PERIOD_BLOCKS)
+}
+
+/// `DynamicPropertiesStore.supportMaxDelegateLockPeriod` — the lock-period
+/// feature is live once the committee raised `MAX_DELEGATE_LOCK_PERIOD`
+/// above the baseline AND unfreeze-delay is on (mainnet: true).
+fn support_max_delegate_lock_period(dyn_props: &DynamicPropertiesStore) -> bool {
+    max_delegate_lock_period(dyn_props) > DEFAULT_LOCK_PERIOD_BLOCKS
+        && dyn_props.get_long(b"UNFREEZE_DELAY_DAYS").unwrap_or(0) > 0
+}
+
+/// `DelegateResourceActuator.getLockPeriod` — the lock period (in blocks)
+/// applied to a `lock = true` delegation. With the feature live a zero
+/// `lock_period` means "use the 3-day default"; without it the contract's
+/// value is ignored and the default is always used.
+fn resolved_lock_period(dyn_props: &DynamicPropertiesStore, contract_lock_period: i64) -> i64 {
+    if support_max_delegate_lock_period(dyn_props) {
+        if contract_lock_period == 0 {
+            DEFAULT_LOCK_PERIOD_BLOCKS
+        } else {
+            contract_lock_period
+        }
+    } else {
+        DEFAULT_LOCK_PERIOD_BLOCKS
+    }
+}
+
 // =============================================================================
 // DelegateResourceActuator
 // =============================================================================
@@ -70,12 +112,22 @@ pub fn validate_delegate_resource(
     if to_account.r#type == tron_proto::AccountType::Contract as i32 {
         return Err(ActuatorError::DelegationToContract);
     }
+    // java-tron bounds the requested lock period once the feature is live.
+    if support_max_delegate_lock_period(dyn_props) {
+        let max = max_delegate_lock_period(dyn_props);
+        if contract.lock_period < 0 || contract.lock_period > max {
+            return Err(ActuatorError::Validate(
+                "lock period must be in 0..=maxDelegateLockPeriod",
+            ));
+        }
+    }
     Ok(())
 }
 
 pub fn execute_delegate_resource(
     accounts: &AccountStore,
     resources: &DelegatedResourceStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &DelegateResourceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -135,20 +187,46 @@ pub fn execute_delegate_resource(
     accounts.put(&to, &to_account)?;
 
     // 4. Update DelegatedResourceStore with the per-(from,to) record.
-    let key = DelegatedResourceStore::v2_unlocked_key(&owner, &to);
+    //    java-tron stores a `lock = true` delegation under the LOCKED key
+    //    (0x02) with a per-resource expiry of `now + lockPeriod *
+    //    BLOCK_PRODUCED_INTERVAL`; an unlocked delegation goes under the
+    //    UNLOCKED key (0x01) with expiry 0. The old code always used the
+    //    unlocked key and never set an expiry, so a locked delegation was
+    //    mis-stored and immediately undelegate-able — diverging from
+    //    java-tron (silently, since TRON headers have no state root).
+    let expire_time = if contract.lock {
+        let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+        let lock_period = resolved_lock_period(dyn_props, contract.lock_period);
+        check_add(
+            now,
+            lock_period
+                .checked_mul(BLOCK_PRODUCED_INTERVAL)
+                .ok_or(ActuatorError::Overflow)?,
+        )?
+    } else {
+        0
+    };
+    let key = if contract.lock {
+        DelegatedResourceStore::v2_locked_key(&owner, &to)
+    } else {
+        DelegatedResourceStore::v2_unlocked_key(&owner, &to)
+    };
     let mut resource = resources.get_raw(&key)?.unwrap_or_else(|| DelegatedResource {
         from: owner.as_bytes().to_vec(),
         to: to.as_bytes().to_vec(),
         ..Default::default()
     });
+    // `addFrozenBalanceFor*` adds the balance and OVERWRITES the expiry.
     match contract.resource {
         0 => {
             resource.frozen_balance_for_bandwidth =
                 check_add(resource.frozen_balance_for_bandwidth, contract.balance)?;
+            resource.expire_time_for_bandwidth = expire_time;
         }
         1 => {
             resource.frozen_balance_for_energy =
                 check_add(resource.frozen_balance_for_energy, contract.balance)?;
+            resource.expire_time_for_energy = expire_time;
         }
         _ => unreachable!(),
     }

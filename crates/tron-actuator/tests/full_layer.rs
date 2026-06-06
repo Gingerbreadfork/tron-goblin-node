@@ -510,7 +510,7 @@ fn delegate_resource_round_trip() {
         lock_period: 0,
     };
     delegate::validate_delegate_resource(&accounts, &dp, &c).unwrap();
-    delegate::execute_delegate_resource(&accounts, &resources, &c).unwrap();
+    delegate::execute_delegate_resource(&accounts, &resources, &dp, &c).unwrap();
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.frozen_v2[0].amount, 5_000_000);

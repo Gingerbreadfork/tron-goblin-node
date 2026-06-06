@@ -237,7 +237,7 @@ fn delegate_bandwidth_moves_frozen_to_delegated_and_credits_recipient_acquired()
         lock_period: 0,
     };
     delegate::validate_delegate_resource(&ctx.accounts, &ctx.dp, &c).unwrap();
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c).unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = ctx.accounts.get(&addr(BOB)).unwrap().unwrap();
     // Alice's frozen pool dropped 30 TRX; delegated counter +30.
@@ -262,7 +262,7 @@ fn delegate_energy_uses_account_resource_fields() {
         lock_period: 0,
     };
     delegate::validate_delegate_resource(&ctx.accounts, &ctx.dp, &c).unwrap();
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c).unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = ctx.accounts.get(&addr(BOB)).unwrap().unwrap();
     let alice_res = alice.account_resource.unwrap_or_default();
@@ -289,7 +289,7 @@ fn multiple_delegations_accumulate_in_per_pair_record() {
     };
     for _ in 0..3 {
         delegate::validate_delegate_resource(&ctx.accounts, &ctx.dp, &c).unwrap();
-        delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c).unwrap();
+        delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c).unwrap();
     }
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.delegated_frozen_v2_balance_for_bandwidth, 30 * PRECISION);
@@ -367,7 +367,7 @@ fn undelegate_rejects_amount_exceeding_record() {
         lock: false,
         lock_period: 0,
     };
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c_del).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_del).unwrap();
     let c_undel = UnDelegateResourceContract {
         owner_address: ALICE.to_vec(),
         receiver_address: BOB.to_vec(),
@@ -393,7 +393,7 @@ fn undelegate_returns_balance_to_frozen_pool_and_decrements_bookkeeping() {
         lock: false,
         lock_period: 0,
     };
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c_del).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_del).unwrap();
     let c_undel = UnDelegateResourceContract {
         owner_address: ALICE.to_vec(),
         receiver_address: BOB.to_vec(),
@@ -431,7 +431,7 @@ fn undelegate_full_amount_deletes_pair_record() {
         lock: false,
         lock_period: 0,
     };
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c_del).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_del).unwrap();
     let c_undel = UnDelegateResourceContract {
         owner_address: ALICE.to_vec(),
         receiver_address: BOB.to_vec(),
@@ -474,8 +474,8 @@ fn undelegate_keeps_record_when_other_resource_type_still_has_balance() {
         lock: false,
         lock_period: 0,
     };
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c_del_bw).unwrap();
-    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &c_del_energy).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_del_bw).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_del_energy).unwrap();
     // Fully undelegate bandwidth — record persists because energy is still delegated.
     let c_undel_bw = UnDelegateResourceContract {
         owner_address: ALICE.to_vec(),
@@ -600,6 +600,91 @@ fn undelegate_rejects_locked_delegation_not_yet_expired() {
     // The record exists but none of it is available yet → InsufficientBalance,
     // not NothingToUndelegate.
     assert!(matches!(err, ActuatorError::InsufficientBalance { .. }), "got {err:?}");
+}
+
+// ============================================================
+// DelegateResource — lock = true (write path)
+//
+// A `lock = true` delegation must go under the LOCKED key (0x02) with a
+// per-resource expiry of `now + lockPeriod * 3000ms`; the old code ignored
+// the lock field and wrote everything to the unlocked key (immediately
+// undelegate-able). `MAX_DELEGATE_LOCK_PERIOD > 86400` + `UNFREEZE_DELAY
+// _DAYS > 0` turns on `supportMaxDelegateLockPeriod`, which makes an
+// explicit lock_period take effect.
+// ============================================================
+
+#[test]
+fn delegate_with_lock_stores_under_locked_key_with_expiry() {
+    let ctx = ctx_enabled();
+    ctx.dp.put_long(b"MAX_DELEGATE_LOCK_PERIOD", 10_512_000); // > 86400 → support on
+    ctx.dp.save_latest_block_header_timestamp(1_000_000);
+    put_account_with_frozen(&ctx, ALICE, 0, 100 * PRECISION);
+    put_basic_account(&ctx, BOB);
+    let lock_period: i64 = 100; // blocks
+    let c = DelegateResourceContract {
+        owner_address: ALICE.to_vec(),
+        receiver_address: BOB.to_vec(),
+        resource: 0,
+        balance: 30 * PRECISION,
+        lock: true,
+        lock_period,
+    };
+    delegate::validate_delegate_resource(&ctx.accounts, &ctx.dp, &c).unwrap();
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c).unwrap();
+
+    let locked_key = DelegatedResourceStore::v2_locked_key(&addr(ALICE), &addr(BOB));
+    let unlocked_key = DelegatedResourceStore::v2_unlocked_key(&addr(ALICE), &addr(BOB));
+    assert!(
+        ctx.resources.get_raw(&unlocked_key).unwrap().is_none(),
+        "a locked delegation must NOT land under the unlocked key"
+    );
+    let rec = ctx.resources.get_raw(&locked_key).unwrap().expect("under the locked key");
+    assert_eq!(rec.frozen_balance_for_bandwidth, 30 * PRECISION);
+    // expire = now + lock_period * BLOCK_PRODUCED_INTERVAL(3000)
+    assert_eq!(rec.expire_time_for_bandwidth, 1_000_000 + lock_period * 3000);
+}
+
+#[test]
+fn locked_delegation_is_undelegatable_only_after_expiry() {
+    let ctx = ctx_enabled();
+    ctx.dp.put_long(b"MAX_DELEGATE_LOCK_PERIOD", 10_512_000);
+    ctx.dp.save_latest_block_header_timestamp(1_000_000);
+    put_account_with_frozen(&ctx, ALICE, 0, 100 * PRECISION);
+    put_basic_account(&ctx, BOB);
+    let c_del = DelegateResourceContract {
+        owner_address: ALICE.to_vec(),
+        receiver_address: BOB.to_vec(),
+        resource: 0,
+        balance: 30 * PRECISION,
+        lock: true,
+        lock_period: 100, // expires at 1_000_000 + 300_000 = 1_300_000
+    };
+    delegate::execute_delegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_del).unwrap();
+    let c_undel = UnDelegateResourceContract {
+        owner_address: ALICE.to_vec(),
+        receiver_address: BOB.to_vec(),
+        resource: 0,
+        balance: 30 * PRECISION,
+    };
+    // Still locked (now=1_000_000 < expiry 1_300_000) → rejected.
+    assert!(
+        delegate::validate_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel)
+            .is_err(),
+        "a still-locked delegation can't be undelegated"
+    );
+    // Advance past expiry → now undelegate-able end-to-end.
+    ctx.dp.save_latest_block_header_timestamp(2_000_000);
+    delegate::validate_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel)
+        .unwrap();
+    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel)
+        .unwrap();
+    // Full recall drains both records.
+    let locked_key = DelegatedResourceStore::v2_locked_key(&addr(ALICE), &addr(BOB));
+    let unlocked_key = DelegatedResourceStore::v2_unlocked_key(&addr(ALICE), &addr(BOB));
+    assert!(ctx.resources.get_raw(&locked_key).unwrap().is_none());
+    assert!(ctx.resources.get_raw(&unlocked_key).unwrap().is_none());
+    let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(alice.delegated_frozen_v2_balance_for_bandwidth, 0);
 }
 
 // Reference unused import so module-level warnings stay quiet across refactors.
