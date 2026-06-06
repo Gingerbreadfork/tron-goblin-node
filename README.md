@@ -7,8 +7,10 @@ goal.
 
 > **Status: pre-release, experimental.** The protocol stack syncs
 > blocks from live mainnet peers and applies them into RocksDB
-> chainbase state. Reorg-driven state rollback, long-running mainnet
-> soak, and a few smaller polish items still need work. See
+> chainbase state, and rebuilds head state on a fork-switch
+> (reorg-driven rollback). Full state-exactness parity with java-tron,
+> long-running mainnet soak, and a few smaller polish items still need
+> work. See
 > [Status](#status) below for specifics. This is **not** a drop-in
 > production replacement for java-tron today — though that is the
 > goal.
@@ -94,9 +96,14 @@ What works today:
 - ✅ PBFT vote runtime: Prepare → Commit → solidify state machine
   driven off the SR runtime; signatures persist to
   `PbftSignDataStore` and `LATEST_SOLIDIFIED_BLOCK_NUM` advances.
-- ✅ Snapshot-stack reorg primitives in chainbase
-  (`SnapshotManager`-style overlay layers, revoked on reorg) — the
-  storage layer is ready for runtime-driven rollback.
+- ✅ Reorg-driven state rollback in the sync path. On a sibling-fork
+  overtake the driver rolls the losing branch's state back (per-block
+  undo records restore every mutated store, incl. head pointers),
+  re-applies the winning branch, re-pushes reverted txs to the mempool,
+  and recovers atomically if a re-apply fails. Two backends:
+  `BlockUndoStore` (default) and a `SnapshotManager`-style overlay
+  stack (`--snapshot-reorg`). The solidified/irreversible block is
+  never crossed (forks diverging below it are rejected).
 - ✅ Prometheus `/metrics` endpoint (`--metrics-port`, default 9090)
   exposes ~29 metrics across chain head, sync flow, reorg / fork-tree
   outcomes, SR block production, PBFT message traffic, mempool
@@ -105,12 +112,6 @@ What works today:
 
 What doesn't work yet (real, currently-open gaps):
 
-- ❌ **Automatic reorg-driven state rollback in the sync path.**
-  When a sibling fork overtakes the canonical head, the node
-  detects it and warns loudly but doesn't yet rebuild head — the
-  snapshot-stack primitives are wired in chainbase, but the sync
-  driver doesn't pull the trigger (see the `AcceptOutcome::ReorgRequired`
-  arm in `tron-node/src/sync.rs`).
 - ❌ **Long-running mainnet soak / endurance.** Short live sessions
   pass; multi-hour, multi-day stability under realistic peer churn
   hasn't been characterized.
@@ -178,10 +179,11 @@ Notable test categories:
 
 What coverage **doesn't** include yet:
 
-- End-to-end reorg-driven state rollback under live conditions —
-  the snapshot-stack primitives are unit-tested, but the sync-path
-  trigger that drives them on a sibling-fork overtake is the open
-  gap (see Status above).
+- Reorg-driven state rollback is unit-tested at the sync-driver level
+  (fork-switch head move, per-block state rollback, mempool re-push,
+  mid-reorg failure recovery, both undo-store and snapshot-stack
+  backends), but not yet exercised under a *live* sibling-fork overtake
+  on mainnet.
 - Long-running soak / load tests against mainnet snapshots. Manual
   for now; CI integration is on the observability backlog.
 

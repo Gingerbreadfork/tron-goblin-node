@@ -2429,17 +2429,22 @@ impl SyncDriver {
             self.khaos_started = true;
         }
 
-        // Persist BEFORE executing so even a partial executor failure
-        // leaves the block bytes recoverable for the RPC layer.
+        // Persist the block bytes BEFORE executing so even a partial
+        // executor failure leaves them recoverable for the RPC layer and
+        // for reorg re-application. `block_store` is keyed by id (hash),
+        // so storing a sibling fork can't clobber the canonical block.
+        //
+        // `block_index` (num → id), by contrast, IS a canonical map that
+        // RPC `getblockbynum` and ref_block validation read — so it must
+        // NOT be written here, before we know whether this block is on
+        // the canonical chain. A side fork at height N would otherwise
+        // repoint `block_index[N]` away from the canonical block. The
+        // index is written only once the block is confirmed canonical:
+        // below for a clean head extension, and in `perform_reorg*` for a
+        // block promoted by a fork switch.
         let block_store = BlockStore::new(self.blocks_backend.clone());
         if let Err(e) = block_store.put(&id, block) {
             return AcceptOutcome::RejectedExecution(format!("block_store.put: {e}"));
-        }
-        if let Some(bi) = &self.state.block_index {
-            let block_index = BlockIndexStore::new(bi.clone());
-            if let Err(e) = block_index.put(&id) {
-                return AcceptOutcome::RejectedExecution(format!("block_index.put: {e}"));
-            }
         }
 
         // Solidified-containment gate: KhaosDb already picked
@@ -2509,6 +2514,19 @@ impl SyncDriver {
             return AcceptOutcome::ReorgRequired(id, khaos_head.num);
         }
         let _ = prev_head_num;
+
+        // Clean canonical extension: this block's parent is the executed
+        // head, so it's on the main chain. Record it in the num → id
+        // index now (before execute, mirroring the old persist-before-gate
+        // ordering — a `reconcile_stores_to_head` pass prunes the entry on
+        // startup if execution then fails). Side forks returned above and
+        // never reach here, so they don't pollute the index.
+        if let Some(bi) = &self.state.block_index {
+            let block_index = BlockIndexStore::new(bi.clone());
+            if let Err(e) = block_index.put(&id) {
+                return AcceptOutcome::RejectedExecution(format!("block_index.put: {e}"));
+            }
+        }
 
         // When the snapshot stack is attached, every block runs under
         // its own tentative-write layer so a future reorg can revoke
@@ -2720,6 +2738,9 @@ impl SyncDriver {
                     self.publish_block_to_pubsub(block_to_apply, &block_id, report);
                     self.drop_included_txs_from_mempool(block_to_apply);
                 }
+                // Repoint num → id at the new canonical branch (side-fork
+                // blocks never indexed themselves).
+                self.reindex_canonical_branch(new_oldest_first.iter().copied());
                 info!(
                     old_chain_revoked = path_old.len(),
                     new_chain_applied = new_oldest_first.len(),
@@ -3360,6 +3381,29 @@ impl SyncDriver {
     /// original chain blocks so the executed head returns to its
     /// pre-reorg state. Matches java-tron's `Manager.switchFork`
     /// try/catch-and-rebuild logic.
+    /// Point `block_index` (num → id) at every block on a freshly-promoted
+    /// canonical branch after a reorg. Side-fork blocks deliberately never
+    /// wrote their index entry (only canonical blocks do), so the winning
+    /// branch's heights — which until now still pointed at the losing
+    /// branch — must be (re)written here. A reorg only fires when the new
+    /// tip is strictly higher than the old head, so these writes overwrite
+    /// every stale old-branch height and no deletes are needed. Best-effort:
+    /// a put failure is logged, not fatal — the blocks are already applied.
+    fn reindex_canonical_branch<'a>(
+        &self,
+        blocks: impl IntoIterator<Item = &'a std::sync::Arc<tron_consensus::KhaosBlock>>,
+    ) {
+        let Some(bi) = &self.state.block_index else {
+            return;
+        };
+        let block_index = BlockIndexStore::new(bi.clone());
+        for kb in blocks {
+            if let Err(e) = block_index.put(&kb.id) {
+                warn!(num = kb.num, ?e, "block_index.put failed during reorg reindex");
+            }
+        }
+    }
+
     fn perform_reorg(
         &mut self,
         new_block: &Block,
@@ -3566,6 +3610,10 @@ impl SyncDriver {
                 }
             }
         }
+
+        // Repoint num → id at the new canonical branch (side-fork blocks
+        // never indexed themselves).
+        self.reindex_canonical_branch(new_path_oldest_first.iter().copied());
 
         info!(
             old_chain_rolled_back = path_old.len(),

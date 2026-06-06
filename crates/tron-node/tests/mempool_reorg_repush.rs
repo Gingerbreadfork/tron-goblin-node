@@ -133,6 +133,41 @@ fn signed_transfer(seed: u8, expiration_offset_ms: i64) -> (Transaction, [u8; 32
     (tx, id, raw)
 }
 
+/// A transfer signed by ALICE (who is funded by `seed_alice`), so it
+/// actually executes and mutates state — unlike `signed_transfer`, whose
+/// seed-derived owner is unfunded and whose tx fails execution. Used to
+/// prove a reorg rolls the resulting *state* back, not just the head.
+fn alice_transfer(to: [u8; 21], amount: i64, expiration_offset_ms: i64) -> Transaction {
+    let tc = TransferContract {
+        owner_address: ALICE.to_vec(),
+        to_address: to.to_vec(),
+        amount,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TransferContract as i32,
+                parameter: Some(prost_types::Any {
+                    type_url: "type.googleapis.com/protocol.TransferContract".into(),
+                    value: tc.encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            expiration: now_ms + expiration_offset_ms,
+            timestamp: now_ms,
+            ..Default::default()
+        }),
+        signature: vec![],
+        ret: vec![],
+    };
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
+    tx
+}
+
 fn block_with_tx(num: i64, parent_hash: [u8; 32], ts: i64, tx: Transaction) -> Block {
     let txs = vec![tx];
     let tx_trie = tron_types::calc_tx_trie_root(&txs)
@@ -498,6 +533,64 @@ fn legacy_reorg_path_drops_expired_tx_during_repush() {
         "expired tx must be dropped, not re-pushed"
     );
     assert!(mempool.get(&tx_id_bytes).is_none());
+}
+
+#[test]
+fn legacy_reorg_rolls_back_account_state_to_the_winning_fork() {
+    // The core of "reorg-driven state rollback": prove that a block's
+    // STATE effect (not just the head pointer) is undone when the block
+    // is reorged off the chain. Branch A applies a real ALICE→BOB
+    // transfer that creates BOB; branch B (taller, no transfer) wins.
+    // After the reorg BOB's account must be gone — block 2a's writes
+    // were reversed via its undo record (`rollback_block`).
+    let (state, blocks_be) = legacy_state();
+    seed_alice(&state); // ALICE balance = 1_000_000_000
+    let mempool = Arc::new(TxMempool::new(MempoolConfig::default()));
+    let mut driver = make_driver_legacy(state.clone(), blocks_be, mempool.clone());
+    let accounts = AccountStore::new(state.accounts.clone());
+
+    let mut bob = [0u8; 21];
+    bob[0] = 0x41;
+    bob[1..].fill(0xbb);
+    let bob_addr = Address::from_raw(bob);
+
+    // Genesis.
+    let g = empty_block(1, [0u8; 32], 1_700_000_000_000);
+    let gid = block_id_from_block(&g).unwrap();
+    assert!(matches!(driver.accept_block(&g, None), AcceptOutcome::Accepted(_)));
+    assert!(accounts.get(&bob_addr).unwrap().is_none(), "BOB absent at genesis");
+
+    // Branch A — block 2a carries an ALICE→BOB transfer that creates BOB.
+    let tx = alice_transfer(bob, 500_000, 600_000);
+    let b2a = block_with_tx(2, *gid.as_bytes(), 1_700_000_003_000, tx);
+    assert!(
+        matches!(driver.accept_block(&b2a, Some(gid)), AcceptOutcome::Accepted(_)),
+        "block 2a applied"
+    );
+    assert_eq!(driver.head_number(), 2);
+    assert_eq!(
+        accounts.get(&bob_addr).unwrap().map(|a| a.balance),
+        Some(500_000),
+        "branch A executed the transfer → BOB funded"
+    );
+
+    // Branch B — taller (2b + 3b), no transfer → triggers the reorg.
+    let b2b = empty_block(2, *gid.as_bytes(), 1_700_000_000_999);
+    let id_2b = block_id_from_block(&b2b).unwrap();
+    driver.accept_block(&b2b, Some(gid));
+    let b3b = empty_block(3, *id_2b.as_bytes(), 1_700_000_005_000);
+    assert!(
+        matches!(driver.accept_block(&b3b, Some(id_2b)), AcceptOutcome::Accepted(_)),
+        "reorg to branch B succeeded"
+    );
+
+    // Head switched AND block 2a's state effect was rolled back: BOB,
+    // created only on branch A, no longer exists.
+    assert_eq!(driver.head_number(), 3, "head is on branch B");
+    assert!(
+        accounts.get(&bob_addr).unwrap().is_none(),
+        "BOB's account creation was rolled back by the reorg (state, not just head)"
+    );
 }
 
 #[test]

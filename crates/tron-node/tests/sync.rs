@@ -474,6 +474,51 @@ fn reorg_with_undo_actually_switches_canonical_head() {
 }
 
 #[test]
+fn block_index_tracks_canonical_chain_across_reorg() {
+    use tron_chainbase::BlockUndoStore;
+    // The num → id index must follow the *canonical* chain: a side fork
+    // must NOT repoint it, and a reorg must repoint it at the winning
+    // branch. (Regression test for the block_index caveat — side-fork
+    // pollution + reorg not reindexing.)
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let undo_be: Arc<dyn KvBackend> = mem();
+    let mut driver = make_driver(state.clone(), blocks_be)
+        .with_undo_store(BlockUndoStore::new(undo_be));
+    let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+
+    // g (1) → 2a (canonical head).
+    let g = build_block(1, [0u8; 32]);
+    let gid = block_id_from_block(&g).unwrap();
+    driver.accept_block(&g, None);
+    let b2a = build_block(2, *gid.as_bytes());
+    let id_2a = block_id_from_block(&b2a).unwrap();
+    driver.accept_block(&b2a, Some(gid));
+    assert_eq!(bi.get(2).unwrap(), id_2a, "block_index[2] = canonical 2a");
+
+    // Sibling 2b (SideFork) must NOT touch block_index[2].
+    let b2b = build_sibling(2, *gid.as_bytes(), 31);
+    let id_2b = block_id_from_block(&b2b).unwrap();
+    driver.accept_block(&b2b, Some(gid));
+    assert_eq!(
+        bi.get(2).unwrap(),
+        id_2a,
+        "side fork must NOT repoint block_index[2] away from canonical 2a"
+    );
+
+    // 3b extends the b-chain → reorg. block_index must now track b.
+    let b3b = build_sibling(3, *id_2b.as_bytes(), 0);
+    let id_3b = block_id_from_block(&b3b).unwrap();
+    assert!(matches!(
+        driver.accept_block(&b3b, Some(id_2b)),
+        AcceptOutcome::Accepted(_)
+    ));
+    assert_eq!(driver.head_number(), 3);
+    assert_eq!(bi.get(2).unwrap(), id_2b, "reorg repointed block_index[2] → 2b");
+    assert_eq!(bi.get(3).unwrap(), id_3b, "reorg indexed the new tip 3b");
+}
+
+#[test]
 fn reorg_without_undo_still_flags_only() {
     // Same test as above but WITHOUT an undo store attached. Driver
     // must still flag ReorgRequired (preserving the informational
