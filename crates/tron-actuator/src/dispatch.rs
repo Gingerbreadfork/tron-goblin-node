@@ -65,12 +65,13 @@ pub struct ActuatorTxCtx {
 /// Dispatch validate by contract type.
 ///
 /// **VM-bound contracts** (`CreateSmartContract`, `TriggerSmartContract`)
-/// return `ActuatorError::NotImplemented` here — they must go through
-/// `tron_executor::execute_vm_tx`, which provides the additional EVM
-/// stores (`code`, `storage_row`, `contract_state`, `block_index`) that
-/// `ActuatorStores` doesn't carry. Callers using this dispatcher in
-/// isolation (preview / inspection / non-block code) get the error
-/// surface they need to fix the routing.
+/// run only their *precondition* gate here (via [`crate::vm::validate_vm`])
+/// — owner/contract existence and value-range checks, no EVM. Full
+/// execution still goes through `tron_executor::execute_vm_tx`, which
+/// provides the EVM stores (`code`, `storage_row`, `contract_state`,
+/// `block_index`) that `ActuatorStores` doesn't carry. This split lets
+/// non-executor callers (the mempool admission validator) accept valid
+/// contract txs instead of rejecting every one.
 pub fn dispatch_validate(
     stores: &ActuatorStores<'_>,
     tx_ctx: &ActuatorTxCtx,
@@ -280,7 +281,14 @@ pub fn dispatch_validate(
             let c = unpack::<tron_proto::UpdateSettingContract>(parameter)?;
             crate::contract_admin::validate_update_setting(stores.accounts, stores.contracts, &c)
         }
-        ContractType::CreateSmartContract | ContractType::TriggerSmartContract => crate::deferred::validate_vm(),
+        ContractType::CreateSmartContract | ContractType::TriggerSmartContract => {
+            // Precondition gate only (owner/contract existence, value
+            // ranges). Execution still runs through the executor's
+            // `execute_vm_tx`; this lets non-executor callers (the mempool
+            // admission validator) accept valid contract txs instead of
+            // rejecting every one. See `crate::vm`.
+            crate::vm::validate_vm(stores.accounts, stores.contracts, ty, parameter)
+        }
         ContractType::ShieldedTransferContract => {
             let c = unpack::<tron_proto::ShieldedTransferContract>(parameter)?;
             // Fee is read by the actuator from DynamicPropertiesStore;

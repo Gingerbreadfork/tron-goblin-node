@@ -29,6 +29,7 @@ pub mod permission;
 pub mod proposal;
 pub mod shielded_transfer;
 pub mod transfer;
+pub mod vm;
 pub mod vote_witness;
 pub mod witness;
 
