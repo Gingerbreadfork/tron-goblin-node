@@ -1,0 +1,14 @@
+[package]
+name = "tron-state-diff"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Diagnostic tool: diff RPC-level state (getaccount, getaccountresource, ...) between a tron-goblin-node and a reference java-tron node, settling on a common head. The way to verify state-exactness parity when block headers carry no state root."
+
+[[bin]]
+name = "tron-state-diff"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true

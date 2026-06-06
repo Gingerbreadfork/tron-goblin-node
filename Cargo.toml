@@ -15,6 +15,7 @@ members = [
     "crates/tron-tvm",
     "crates/tron-node",
     "crates/tron-mempool",
+    "crates/tron-state-diff",
     "crates/tron-wallet",
     "crates/tron-eventer",
     # Vendored forks of two revm component crates — needed so we can:

@@ -5389,6 +5389,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tron-state-diff"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "tron-tvm"
 version = "0.0.1"
 dependencies = [
