@@ -195,30 +195,39 @@ disabled = false
 
 
 # -----------------------------------------------------------------------------
-# TVM knobs. Keys accept both snake_case and java-tron's camelCase
-# (e.g. support_constant / supportConstant). Most of this section parses for
-# config.conf compatibility, but the knobs flagged [wired] below are honored.
-#
-# [vm]
-# support_constant = false              # [wired] enable read-only view calls
-#                                       #   (triggerConstantContract / eth_call)
-#                                       #   without a signature. Mainnet operators
-#                                       #   that expose it publicly leave it off.
-#                                       #   Must be TRUE on BOTH nodes for the
-#                                       #   tron-state-diff constant-call probes.
-# max_energy_limit_for_constant = 100000000  # [wired] energy ceiling per constant
-#                                            #   call (clamped up to 3_000_000 min,
-#                                            #   matching java-tron).
-# constant_call_timeout_ms = 0          # [wired] wall-clock cap on one constant
-#                                       #   call; 0 = no timeout (opt-in).
-# vm_trace = false                      # [wired] emit per-opcode VM trace (huge).
-# save_internal_tx = false              # [wired] persist internal txs
-#                                       #   (CALL / CREATE / SELFDESTRUCT).
-# save_featured_internal_tx = false     # [wired] persist system-contract internal
-#                                       #   txs (delegate / freeze / etc.).
-# estimate_energy = false               # enable the eth-style estimateGas RPC.
-# lru_cache_size = 500                  # compiled-bytecode LRU cache size.
+# [vm] — TVM knobs. Keys accept snake_case and java-tron's camelCase aliases
+# (e.g. support_constant / supportConstant). The knobs flagged [wired] are
+# honored today; other java-tron vm.* keys parse for config.conf compatibility
+# but aren't all consulted yet. Shown at their built-in defaults.
 # -----------------------------------------------------------------------------
+[vm]
+# Enable read-only view calls (triggerConstantContract / eth_call) WITHOUT a
+# signature. Default off; turn ON to serve view calls — and REQUIRED on BOTH
+# nodes for tron-state-diff's constant-call (TVM-exactness) probing. Expose
+# publicly only deliberately.
+support_constant = false                  # [wired]
+
+# Energy ceiling a single constant call may consume (java-tron clamps inputs
+# up to a 3_000_000 floor).
+max_energy_limit_for_constant = 100000000 # [wired]
+
+# Wall-clock cap (ms) on one constant call; 0 = no timeout (opt-in).
+constant_call_timeout_ms = 0              # [wired]
+
+# Emit the per-opcode VM trace alongside contract receipts (huge; leave off).
+vm_trace = false                          # [wired]
+
+# Persist internal transactions (every CALL / CREATE / SELFDESTRUCT).
+save_internal_tx = false                  # [wired]
+
+# Persist "featured" internal txs: system-contract calls (delegate / freeze …).
+save_featured_internal_tx = false         # [wired]
+
+# Enable the eth-style estimateGas RPC.
+estimate_energy = false
+
+# Compiled-bytecode LRU cache size.
+lru_cache_size = 500
 
 
 # -----------------------------------------------------------------------------
@@ -229,5 +238,4 @@ disabled = false
 #   [rate_limiter] — rate.limiter.* per-endpoint limits
 #   [committee]    — committee.* governance bootstrap values
 #   [local_witness]— top-level localwitness* key sources
-# (The [vm] section above is partially wired — see its [wired] flags.)
 # -----------------------------------------------------------------------------
