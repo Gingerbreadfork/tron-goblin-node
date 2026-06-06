@@ -1053,6 +1053,51 @@ async fn get_account_resource_returns_quota_view() {
 }
 
 #[tokio::test]
+async fn get_account_resource_decays_usage_and_reports_tron_power() {
+    // Regression for the getaccountresource read path: usage must decay at
+    // read using java's head_slot (timestamp/3000, NOT block height) — with
+    // an old consume-time it fully decays to 0 (the old code returned it
+    // stale). Plus tronPowerUsed = sum of votes, tronPowerLimit = AllTronPower.
+    let (addr, accounts, _bs, _bi, _tx, dp) = spawn_server().await;
+    // Head far in the future of the (epoch-0) genesis so head_slot is large.
+    dp.save_genesis_block_timestamp(0);
+    dp.save_latest_block_header_timestamp(1_800_000_000_000); // head_slot = 6e8
+    dp.save_unfreeze_delay_days(1);
+
+    let mut a_bytes = [0u8; 21];
+    a_bytes[0] = 0x41;
+    a_bytes[1..].fill(0xcd);
+    let address = Address::from_raw(a_bytes);
+    let mut acct = Account {
+        address: a_bytes.to_vec(),
+        balance: 10_000_000,
+        net_usage: 5_000_000,
+        latest_consume_time: 0, // ancient → fully decayed at the current head
+        old_tron_power: -1,     // AllTronPower = V1 + V2 TRON_POWER frozen
+        ..Default::default()
+    };
+    // 20 TRX frozen for TRON_POWER → tronPowerLimit 20.
+    acct.frozen_v2.push(tron_proto::account::FreezeV2 { r#type: 2, amount: 20_000_000 });
+    // Two votes totalling 7 → tronPowerUsed 7.
+    acct.votes.push(tron_proto::Vote { vote_address: a_bytes.to_vec(), vote_count: 5 });
+    acct.votes.push(tron_proto::Vote { vote_address: a_bytes.to_vec(), vote_count: 2 });
+    accounts.put(&address, &acct).unwrap();
+
+    let resp = call(
+        addr,
+        json!({"jsonrpc":"2.0","method":"getAccountResource",
+               "params":["0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"],"id":1}),
+    )
+    .await;
+    let r = &resp["result"];
+    // Ancient usage decays to 0 at the (correct, timestamp-based) head slot.
+    assert_eq!(r["NetUsed"], 0, "stale net usage must decay to 0, not return raw: {r}");
+    // TRON power derived from votes + frozen-V2 TRON_POWER.
+    assert_eq!(r["tronPowerUsed"], 7);
+    assert_eq!(r["tronPowerLimit"], 20);
+}
+
+#[tokio::test]
 async fn get_account_net_returns_bandwidth_only_subset() {
     let (addr, accounts, ..) = spawn_server().await;
     let mut a = [0u8; 21];

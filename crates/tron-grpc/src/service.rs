@@ -1257,33 +1257,27 @@ impl Wallet for WalletService {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let dp = &self.state.dyn_props;
-        let acct_resource =
-            acct.account_resource.as_ref().cloned().unwrap_or_default();
+        // Shared computation with the JSON-RPC handler: per-account limits,
+        // read-time usage decay (java's head_slot), tron-power, storage.
+        let v = tron_rpc::methods::account_resource_view(&acct, &self.state.dyn_props);
         Ok(Response::new(protocol::AccountResourceMessage {
-            free_net_used: acct.free_net_usage,
-            free_net_limit: dp.get_long(b"FREE_NET_LIMIT").unwrap_or(5000),
-            net_used: acct.net_usage,
-            net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
+            free_net_used: v.free_net_used,
+            free_net_limit: v.free_net_limit,
+            net_used: v.net_used,
+            net_limit: v.net_limit,
             asset_net_used: std::collections::BTreeMap::new(),
             asset_net_limit: std::collections::BTreeMap::new(),
-            total_net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
-            total_net_weight: dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0),
-            total_tron_power_weight: dp.get_long(b"TOTAL_TRON_POWER_WEIGHT").unwrap_or(0),
-            tron_power_used: 0,
-            tron_power_limit: 0,
-            energy_used: acct_resource.energy_usage,
-            energy_limit: dp
-                .get_long(b"TOTAL_CURRENT_ENERGY_LIMIT")
-                .or_else(|| dp.get_long(b"TOTAL_ENERGY_LIMIT"))
-                .unwrap_or(0),
-            total_energy_limit: dp
-                .get_long(b"TOTAL_CURRENT_ENERGY_LIMIT")
-                .or_else(|| dp.get_long(b"TOTAL_ENERGY_LIMIT"))
-                .unwrap_or(0),
-            total_energy_weight: dp.get_long(b"TOTAL_ENERGY_WEIGHT").unwrap_or(0),
-            storage_used: 0,
-            storage_limit: 0,
+            total_net_limit: v.total_net_limit,
+            total_net_weight: v.total_net_weight,
+            total_tron_power_weight: v.total_tron_power_weight,
+            tron_power_used: v.tron_power_used,
+            tron_power_limit: v.tron_power_limit,
+            energy_used: v.energy_used,
+            energy_limit: v.energy_limit,
+            total_energy_limit: v.total_energy_limit,
+            total_energy_weight: v.total_energy_weight,
+            storage_used: v.storage_used,
+            storage_limit: v.storage_limit,
         }))
     }
 

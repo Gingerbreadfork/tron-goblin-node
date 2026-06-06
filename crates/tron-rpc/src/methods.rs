@@ -2837,6 +2837,84 @@ pub fn eth_get_proof(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// Returns a flat JSON object with the same field names java-tron
 /// emits, so existing clients (TronWeb, TRON-Grid wrappers) cross-decode
 /// without translation.
+/// Computed `getAccountResource` view for one account — the single source of
+/// truth shared by the JSON-RPC/HTTP handler and the gRPC service, so both
+/// transports report identical (java-tron-faithful) values. Mirrors
+/// `Wallet.getAccountResource`. (Per-asset `assetNet*` maps are not included
+/// yet — see the note in `get_account_resource`.)
+pub struct AccountResourceView {
+    pub free_net_used: i64,
+    pub free_net_limit: i64,
+    pub net_used: i64,
+    pub net_limit: i64,
+    pub energy_used: i64,
+    pub energy_limit: i64,
+    pub total_net_limit: i64,
+    pub total_net_weight: i64,
+    pub total_energy_limit: i64,
+    pub total_energy_weight: i64,
+    pub total_tron_power_weight: i64,
+    pub tron_power_used: i64,
+    pub tron_power_limit: i64,
+    pub storage_used: i64,
+    pub storage_limit: i64,
+}
+
+/// Compute the resource view for `account`. Usage is decayed at read with
+/// java's `getHeadSlot()` (timestamp/3000, NOT block height) — account-window
+/// recovery for net + energy, default-window for free-net — and per-account
+/// limits come from `calculate_global_*_limit` (NOT the chain totals).
+pub fn account_resource_view(
+    account: &tron_proto::Account,
+    dp: &tron_chainbase::DynamicPropertiesStore,
+) -> AccountResourceView {
+    use tron_executor::resource::{increase_default, recovery_account, ResourceKind};
+    let now_slot = dp.head_slot();
+
+    let net_limit = tron_executor::bandwidth::calculate_global_net_limit(account, dp);
+    let net_used = recovery_account(
+        account,
+        ResourceKind::Bandwidth,
+        account.net_usage,
+        account.latest_consume_time,
+        now_slot,
+    );
+    let free_net_used =
+        increase_default(account.free_net_usage, 0, account.latest_consume_free_time, now_slot);
+
+    let energy_limit = tron_executor::energy::calculate_global_energy_limit(account, dp);
+    let (energy_usage, last_energy, storage_limit, storage_used) =
+        match account.account_resource.as_ref() {
+            Some(r) => (
+                r.energy_usage,
+                r.latest_consume_time_for_energy,
+                r.storage_limit,
+                r.storage_usage,
+            ),
+            None => (0, 0, 0, 0),
+        };
+    let energy_used =
+        recovery_account(account, ResourceKind::Energy, energy_usage, last_energy, now_slot);
+
+    AccountResourceView {
+        free_net_used,
+        free_net_limit: dp.free_net_limit(),
+        net_used,
+        net_limit,
+        energy_used,
+        energy_limit,
+        total_net_limit: dp.total_net_limit(),
+        total_net_weight: dp.total_net_weight(),
+        total_energy_limit: dp.total_energy_current_limit(),
+        total_energy_weight: dp.total_energy_weight(),
+        total_tron_power_weight: dp.total_tron_power_weight(),
+        tron_power_used: tron_power_usage(account),
+        tron_power_limit: all_tron_power(account) / 1_000_000,
+        storage_used,
+        storage_limit,
+    }
+}
+
 pub fn get_account_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let addr_str = p
         .get(0)
@@ -2855,66 +2933,28 @@ pub fn get_account_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
         None => return Ok(json!({})),
     };
 
-    let now_slot = s.dyn_props.latest_block_header_number().unwrap_or(0);
-
-    // Bandwidth side: decay current `net_usage` against
-    // `calculate_global_net_limit`. Free quota: `free_net_usage`
-    // against `FREE_NET_LIMIT`.
-    let net_limit = tron_executor::bandwidth::calculate_global_net_limit(&account, &s.dyn_props);
-    let net_usage = tron_executor::resource::increase_default(
-        account.net_usage,
-        0,
-        account.latest_consume_time,
-        now_slot,
-    );
-    let free_net_limit = s.dyn_props.free_net_limit();
-    let free_net_usage = tron_executor::resource::increase_default(
-        account.free_net_usage,
-        0,
-        account.latest_consume_free_time,
-        now_slot,
-    );
-
-    // Energy side: same shape but reads through AccountResource.
-    let energy_limit = tron_executor::energy::calculate_global_energy_limit(&account, &s.dyn_props);
-    let (energy_usage_decayed, _energy_window) = match account.account_resource.as_ref() {
-        Some(r) => (
-            tron_executor::resource::increase_default(
-                r.energy_usage,
-                0,
-                r.latest_consume_time_for_energy,
-                now_slot,
-            ),
-            r.energy_window_size,
-        ),
-        None => (0, 0),
-    };
-
-    // Chain-wide totals — useful for clients to derive their own
-    // share-of-pool calculations.
-    let total_net_limit = s.dyn_props.total_net_limit();
-    let total_net_weight = s.dyn_props.total_net_weight();
-    let total_energy_limit = s.dyn_props.total_energy_current_limit();
-    let total_energy_weight = s.dyn_props.total_energy_weight();
-
+    let v = account_resource_view(&account, &s.dyn_props);
     Ok(json!({
-        "freeNetUsed": free_net_usage,
-        "freeNetLimit": free_net_limit,
-        "NetUsed": net_usage,
-        "NetLimit": net_limit,
-        "EnergyUsed": energy_usage_decayed,
-        "EnergyLimit": energy_limit,
-        "TotalNetLimit": total_net_limit,
-        "TotalNetWeight": total_net_weight,
-        "TotalEnergyLimit": total_energy_limit,
-        "TotalEnergyWeight": total_energy_weight,
-        // TRON-Power view — tronPower is `frozen_v2[TRON_POWER].amount`
-        // in TRX units; java-tron also surfaces tronPowerUsed (votes
-        // cast so far). We don't yet track tronPowerUsed separately so
-        // it returns 0; the limit is the frozen TRON_POWER stake.
-        "tronPowerLimit": tron_power_limit(&account),
-        "tronPowerUsed": 0_i64,
+        "freeNetUsed": v.free_net_used,
+        "freeNetLimit": v.free_net_limit,
+        "NetUsed": v.net_used,
+        "NetLimit": v.net_limit,
+        "EnergyUsed": v.energy_used,
+        "EnergyLimit": v.energy_limit,
+        "TotalNetLimit": v.total_net_limit,
+        "TotalNetWeight": v.total_net_weight,
+        "TotalEnergyLimit": v.total_energy_limit,
+        "TotalEnergyWeight": v.total_energy_weight,
+        "TotalTronPowerWeight": v.total_tron_power_weight,
+        "tronPowerLimit": v.tron_power_limit,
+        "tronPowerUsed": v.tron_power_used,
+        "storageLimit": v.storage_limit,
+        "storageUsed": v.storage_used,
     }))
+    // NOTE: assetNetLimit / assetNetUsed (per-TRC10 free-bandwidth maps) are
+    // not emitted yet — they need per-asset decay + AssetIssue free-limit
+    // lookups (java-tron's `setAssetNetLimit`). Tracked as the remaining
+    // getaccountresource gap; affects only TRC10-holding accounts' display.
 }
 
 /// `getAccountNet(address)` — bandwidth-only subset of
@@ -2966,13 +3006,40 @@ pub fn get_account_net(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     }))
 }
 
-fn tron_power_limit(account: &tron_proto::Account) -> i64 {
-    account
-        .frozen_v2
-        .iter()
-        .filter(|f| f.r#type == 2) // ResourceCode::TronPower
-        .map(|f| f.amount)
-        .sum()
+/// java-tron `AccountCapsule.getTronPowerUsage` — voting power already cast,
+/// i.e. the sum of the account's vote counts.
+fn tron_power_usage(account: &tron_proto::Account) -> i64 {
+    account.votes.iter().map(|v| v.vote_count).sum()
+}
+
+/// java-tron `AccountCapsule.getAllTronPower` (in sun). The `old_tron_power`
+/// field selects how legacy power folds in:
+///   -1 → V1 + V2 TRON_POWER frozen;
+///    0 → legacy `getTronPower()` (all frozen sources) + V1 + V2;
+///   >0 → stored old power + V1 + V2.
+fn all_tron_power(a: &tron_proto::Account) -> i64 {
+    let v1 = a.tron_power.as_ref().map(|f| f.frozen_balance).unwrap_or(0);
+    let v2: i64 = a.frozen_v2.iter().filter(|f| f.r#type == 2).map(|f| f.amount).sum();
+    match a.old_tron_power {
+        -1 => v1 + v2,
+        0 => legacy_tron_power(a) + v1 + v2,
+        old => old + v1 + v2,
+    }
+}
+
+/// java-tron `AccountCapsule.getTronPower` — the pre-Stake-2.0 "tron power"
+/// sum across every frozen/delegated source except TRON_POWER-typed V2.
+fn legacy_tron_power(a: &tron_proto::Account) -> i64 {
+    let mut tp: i64 = a.frozen.iter().map(|f| f.frozen_balance).sum();
+    if let Some(r) = a.account_resource.as_ref() {
+        tp += r.frozen_balance_for_energy.as_ref().map(|f| f.frozen_balance).unwrap_or(0);
+        tp += r.delegated_frozen_balance_for_energy;
+        tp += r.delegated_frozen_v2_balance_for_energy;
+    }
+    tp += a.delegated_frozen_balance_for_bandwidth;
+    tp += a.frozen_v2.iter().filter(|f| f.r#type != 2).map(|f| f.amount).sum::<i64>();
+    tp += a.delegated_frozen_v2_balance_for_bandwidth;
+    tp
 }
 
 // =============================================================================
