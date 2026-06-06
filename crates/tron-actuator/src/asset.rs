@@ -49,9 +49,12 @@ pub fn validate_transfer_asset(
     if contract.asset_name.is_empty() || contract.asset_name.len() > MAX_ASSET_NAME_BYTES {
         return Err(ActuatorError::AssetMissing);
     }
-    let owner_account = accounts
+    let mut owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
+    // Optimized accounts hold TRC10 balances in the account-asset store, not
+    // inline — merge them in (java's importAllAsset) before reading.
+    tron_chainbase::import_all_asset(&mut owner_account);
 
     let key = String::from_utf8_lossy(&contract.asset_name);
     let asset_balance = lookup_asset_balance(&owner_account, &key);
@@ -80,6 +83,19 @@ pub fn execute_transfer_asset(
         r#type: tron_proto::AccountType::Normal as i32,
         ..Default::default()
     });
+
+    // Merge optimized accounts' TRC10 balances inline before mutating, so the
+    // debit sees the real balance and the credit adds to (not overwrites) any
+    // existing store balance for the receiver (java's importAllAsset). New
+    // (non-optimized) accounts are a no-op. We then write the balances back
+    // inline; the RPC read-merge (store ∪ inline, inline wins) keeps reads
+    // correct. NOTE: this does NOT re-split back to the account-asset store on
+    // commit the way java's SnapshotRoot does — functionally correct
+    // (balances right, RPC consistent) but the on-disk layout drifts from
+    // java's (optimized accounts accumulate inline asset_v2). Pending: a
+    // store-write-back to restore byte-exact storage parity.
+    tron_chainbase::import_all_asset(&mut owner_account);
+    tron_chainbase::import_all_asset(&mut to_account);
 
     debit_asset(&mut owner_account, &key, contract.amount)?;
     credit_asset(&mut to_account, &key, contract.amount)?;
@@ -293,7 +309,11 @@ pub fn execute_participate_asset_issue(
     owner_account.balance = check_sub(owner_account.balance, contract.amount)?;
     to_account.balance = check_add(to_account.balance, contract.amount)?;
 
-    // Asset flow: to -> owner.
+    // Asset flow: to -> owner. Merge optimized accounts' TRC10 balances inline
+    // first (java's importAllAsset) so the issuer's debit sees its real
+    // balance and the participant's credit adds to any existing one.
+    tron_chainbase::import_all_asset(&mut to_account);
+    tron_chainbase::import_all_asset(&mut owner_account);
     let key = String::from_utf8_lossy(&contract.asset_name).into_owned();
     debit_asset(&mut to_account, &key, exchange_amount)?;
     credit_asset(&mut owner_account, &key, exchange_amount)?;
@@ -346,6 +366,9 @@ pub fn execute_unfreeze_asset(
             true
         }
     });
+    // Merge optimized balances inline so the credit adds to (not overwrites)
+    // any existing store balance for this asset (java's importAllAsset).
+    tron_chainbase::import_all_asset(&mut account);
     let key = String::from_utf8_lossy(&account.asset_issued_id).into_owned();
     credit_asset(&mut account, &key, unlocked)?;
     accounts.put(&owner, &account)?;

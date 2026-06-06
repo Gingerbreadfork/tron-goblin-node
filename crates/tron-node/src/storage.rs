@@ -655,6 +655,12 @@ impl OpenedStores {
 
     /// Build the `StateBackends` handle for the executor.
     pub fn to_state_backends(&self) -> tron_executor::StateBackends {
+        // Install the process-wide account-asset backend (java-tron's static
+        // `AssetUtil.accountAssetStore`, set at ChainBaseManager init) so the
+        // asset actuators can merge an optimized account's TRC10 balances on
+        // read. Set-once / idempotent; harmless in tests (they hold no
+        // asset-optimized accounts, so the merge is a no-op).
+        tron_chainbase::set_account_asset_backend(self.account_asset.clone());
         tron_executor::StateBackends {
             accounts: self.accounts.clone(),
             witnesses: self.witnesses.clone(),

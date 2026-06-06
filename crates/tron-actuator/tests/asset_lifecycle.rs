@@ -15,8 +15,8 @@ use std::sync::Arc;
 use hex_literal::hex;
 use tron_actuator::{asset, ActuatorError};
 use tron_chainbase::{
-    AccountStore, AssetIssueStore, AssetIssueV2Store, DynamicPropertiesStore, KvBackend,
-    MemBackend,
+    set_account_asset_backend, AccountAssetStore, AccountStore, AssetIssueStore, AssetIssueV2Store,
+    DynamicPropertiesStore, KvBackend, MemBackend,
 };
 use tron_crypto::address::Address;
 use tron_proto::account::Frozen;
@@ -349,6 +349,47 @@ fn update_writes_v1_and_v2_when_both_exist() {
 // ============================================================
 // TransferAsset
 // ============================================================
+
+#[test]
+fn transfer_asset_from_optimized_account_sees_store_balance() {
+    // Consensus regression: an asset-optimized account keeps its TRC10
+    // balances in the account-asset store with an EMPTY inline `asset_v2`.
+    // The actuator must merge them (java's importAllAsset) before the debit,
+    // else it sees 0 and wrongly rejects / mis-accounts the transfer.
+    let asset_backend = mem();
+    let store = AccountAssetStore::new(asset_backend.clone());
+    store.put(&addr(ALICE), b"1000001", 1000).unwrap();
+    // Install the global backend the actuator reads through.
+    set_account_asset_backend(asset_backend);
+
+    let accounts = AccountStore::new(mem());
+    // Optimized owner: balances in the store, inline asset_v2 empty.
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                asset_optimized: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let c = TransferAssetContract {
+        owner_address: ALICE.to_vec(),
+        to_address: BOB.to_vec(),
+        asset_name: b"1000001".to_vec(),
+        amount: 300,
+    };
+    // validate must see the store balance (1000), not the empty inline 0.
+    asset::validate_transfer_asset(&accounts, &c).expect("validate sees store balance");
+    asset::execute_transfer_asset(&accounts, &c).expect("execute");
+
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
+    assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 700, "1000 - 300 debited");
+    assert_eq!(*bob.asset_v2.get("1000001").unwrap(), 300, "300 credited");
+}
 
 #[test]
 fn transfer_asset_rejects_self() {

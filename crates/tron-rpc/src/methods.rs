@@ -1175,23 +1175,9 @@ fn merge_account_assets(
     account: &mut tron_proto::Account,
     store: &tron_chainbase::AccountAssetStore,
 ) {
-    if !account.asset_optimized || account.address.len() != 21 {
-        return;
-    }
-    let mut addr = [0u8; 21];
-    addr.copy_from_slice(&account.address);
-    let owner = tron_crypto::address::Address::from_raw(addr);
-    let Ok(rows) = store.get_all_assets(&owner) else {
-        return;
-    };
-    let mut merged: std::collections::BTreeMap<String, i64> = rows
-        .into_iter()
-        .map(|(id, bal)| (String::from_utf8_lossy(&id).into_owned(), bal))
-        .collect();
-    for (k, v) in &account.asset_v2 {
-        merged.insert(k.clone(), *v);
-    }
-    account.asset_v2 = merged;
+    // Single source of truth lives on the store (shared with the consensus
+    // actuator path via tron_chainbase::import_all_asset).
+    store.import_all_asset(account);
 }
 
 fn encode_account_for_rpc(a: &tron_proto::Account, genesis_ms: i64) -> Value {

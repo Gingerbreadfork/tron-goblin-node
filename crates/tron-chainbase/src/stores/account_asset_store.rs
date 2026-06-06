@@ -12,14 +12,43 @@
 //!
 //! Source: `org.tron.core.store.AccountAssetStore`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use tron_crypto::address::Address;
+use tron_crypto::address::{Address, ADDRESS_LENGTH};
+use tron_proto::Account;
 
 use crate::backend::KvBackend;
 use crate::stores::StoreError;
 
 pub const DB_NAME: &str = "account-asset";
+
+/// Process-wide account-asset backend, mirroring java-tron's static
+/// `AssetUtil.accountAssetStore` (installed once at `ChainBaseManager` init).
+/// Lets consensus actuators merge an optimized account's TRC10 balances
+/// without threading the store through every `StateBackends`/dispatch call —
+/// java takes exactly this shortcut for the same reason.
+static ACCOUNT_ASSET_BACKEND: OnceLock<Arc<dyn KvBackend>> = OnceLock::new();
+
+/// Install the global account-asset backend (java-tron's
+/// `AssetUtil.setAccountAssetStore`). Set once at node startup; subsequent
+/// calls are ignored. Never set in unit tests, so [`import_all_asset`] stays
+/// a no-op there.
+pub fn set_account_asset_backend(backend: Arc<dyn KvBackend>) {
+    let _ = ACCOUNT_ASSET_BACKEND.set(backend);
+}
+
+/// java-tron's `AssetUtil.importAllAsset`: when `account` is asset-optimized
+/// and the global backend is installed, merge its TRC10 balances out of the
+/// account-asset store back into `asset_v2` so reads/debits see the real
+/// balance. No-op for non-optimized accounts and when no backend is set.
+pub fn import_all_asset(account: &mut Account) {
+    if !account.asset_optimized {
+        return;
+    }
+    if let Some(backend) = ACCOUNT_ASSET_BACKEND.get() {
+        AccountAssetStore::new(backend.clone()).import_all_asset(account);
+    }
+}
 
 pub struct AccountAssetStore {
     backend: Arc<dyn KvBackend>,
@@ -99,6 +128,31 @@ impl AccountAssetStore {
                 Some((asset_id, i64::from_be_bytes(buf)))
             })
             .collect())
+    }
+
+    /// java-tron's `AssetUtil.importAllAsset`: merge this account's TRC10
+    /// balances out of the store back into `asset_v2` — store rows first,
+    /// then inline entries override (so an in-flight modification kept inline
+    /// wins). Gated on `asset_optimized`; otherwise the balances are already
+    /// inline and there's nothing to merge.
+    pub fn import_all_asset(&self, account: &mut Account) {
+        if !account.asset_optimized || account.address.len() != ADDRESS_LENGTH {
+            return;
+        }
+        let mut addr = [0u8; ADDRESS_LENGTH];
+        addr.copy_from_slice(&account.address);
+        let owner = Address::from_raw(addr);
+        let Ok(rows) = self.get_all_assets(&owner) else {
+            return;
+        };
+        let mut merged: std::collections::BTreeMap<String, i64> = rows
+            .into_iter()
+            .map(|(id, bal)| (String::from_utf8_lossy(&id).into_owned(), bal))
+            .collect();
+        for (k, v) in &account.asset_v2 {
+            merged.insert(k.clone(), *v);
+        }
+        account.asset_v2 = merged;
     }
 }
 

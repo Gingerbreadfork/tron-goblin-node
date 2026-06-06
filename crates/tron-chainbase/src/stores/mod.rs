@@ -45,7 +45,7 @@ mod witness_store;
 mod zk_proof_store;
 
 pub use abi_store::AbiStore;
-pub use account_asset_store::AccountAssetStore;
+pub use account_asset_store::{import_all_asset, set_account_asset_backend, AccountAssetStore};
 pub use account_id_index_store::AccountIdIndexStore;
 pub use account_index_store::AccountIndexStore;
 pub use account_store::AccountStore;
