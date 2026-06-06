@@ -2134,20 +2134,25 @@ impl SyncDriver {
             .unwrap_or(0)
     }
 
-    /// Build a java-tron-style block-chain "locator" for the `SyncBlockChain`
-    /// request: a geometric back-off of our recent block ids (head, head-1,
-    /// head-3, head-7, …, doubling the gap) down to the deepest block we
-    /// still have, returned **ascending** (oldest first).
+    /// Build the `SyncBlockChain` locator — a direct port of java-tron's
+    /// `SyncService.getBlockChainSummary`.
     ///
-    /// Why not just `[head]`: java-tron's `SyncBlockChainMsgHandler` rejects a
-    /// summary whose FIRST id isn't in the peer's main chain (BAD_PROTOCOL /
-    /// reason code 2) and serves blocks after the HIGHEST summary id it shares
-    /// with us. A one-element `[head]` summary only works when the peer has
-    /// our exact head — so a peer even slightly forked/behind at the
-    /// reversible tip refuses to sync to us (our own node served fine only
-    /// because its head matched ours). A locator anchored at a deep block the
-    /// peer is sure to have, denser near the head, lets any peer find the
-    /// common ancestor and serve us — exactly how java-tron does it.
+    /// Anchor at our **lowest** stored block (java-tron's `syncBeginNumber`)
+    /// and walk **up** to head, halving the remaining gap each step
+    /// (`low += (high - low + 2) / 2`). The result is ascending, dense near
+    /// head, and — critically — `ids[0]` is the *deepest* block we hold.
+    ///
+    /// Why the deepest-anchor matters: java-tron's `SyncBlockChainMsgHandler`
+    /// `check()` validates `containBlockInMainChain(blockIds.get(0))` and
+    /// disconnects with `BAD_PROTOCOL` if that first/deepest id isn't on the
+    /// peer's main chain; it then serves blocks after the *highest* summary id
+    /// it shares. The old version anchored at an arbitrary `head − 2^k` point
+    /// (wherever the doubling back-off bottomed out), which stricter peers
+    /// refused. Matching java-tron — anchor at our true lowest block — makes
+    /// `ids[0]` the block most certain to be in any peer's main chain.
+    ///
+    /// The halving cadence keeps the id count ~log2(head − lowest) regardless
+    /// of range, so no explicit frame cap is needed.
     ///
     /// Returns empty when there's no usable index (fresh node) — the caller
     /// falls back to the genesis/head id.
@@ -2158,26 +2163,23 @@ impl SyncDriver {
         };
         let block_index = BlockIndexStore::new(bi.clone());
 
+        // `low` = our sync-begin point (lowest stored block). Bail if we can't
+        // size it or it's somehow past head.
+        let low = match block_index.lowest() {
+            Ok(Some(n)) if n <= head_num => n,
+            _ => return Vec::new(),
+        };
+
         let mut ids: Vec<BlockId> = Vec::new();
-        let mut n = head_num;
-        let mut step = 1i64;
-        // Walk head → downward, doubling the gap, collecting ids that exist.
-        // Stop at the first gap (below our earliest stored block), at genesis,
-        // or once the locator is comfortably dense (cap the frame size).
-        while n > 0 && ids.len() < 128 {
-            match block_index.get(n) {
-                Ok(id) => ids.push(id),
-                Err(_) => break,
+        let mut n = low;
+        while n <= head_num {
+            if let Ok(id) = block_index.get(n) {
+                ids.push(id);
             }
-            if n <= step {
-                break;
-            }
-            n -= step;
-            step = step.saturating_mul(2);
+            // Halve the remaining gap to head; the `+2` keeps the step ≥ 1
+            // (no infinite loop) and lands exactly on head as the final id.
+            n += (head_num - n + 2) / 2;
         }
-        // java-tron expects ascending order: ids[0] (deepest, in the peer's
-        // main chain) gates the request; the last id is our head.
-        ids.reverse();
         ids
     }
 
@@ -5208,17 +5210,21 @@ mod solidify_tests {
     }
 
     #[test]
-    fn chain_summary_is_an_ascending_geometric_locator() {
-        // The SyncBlockChain locator must be ascending, end at our head, and
-        // anchor deep enough (below the reversible tip) that its first id is
-        // in any synced peer's main chain — unlike the old bare `[head]`.
+    fn chain_summary_anchors_at_lowest_block_and_halves_to_head() {
+        // Ports java-tron's SyncService.getBlockChainSummary: the locator is
+        // ascending, ends at our head, and its FIRST id is our LOWEST stored
+        // block (java-tron's syncBeginNumber) — the deepest, most-certainly-
+        // canonical anchor, which the peer validates via
+        // containBlockInMainChain(blockIds.get(0)). The gap halves toward head.
         let state = mem_state();
         let blocks_be = mem();
         let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
-        let head = 1000i64; // snapshot-like base of 1 with a 1000-block chain
-        for num in 1..=head {
+        // Snapshot-like base: a chain that starts well above genesis.
+        let base = 83_278_566i64;
+        let head = base + 65_535;
+        for num in base..=head {
             let block = block_by(num, &witness((num as usize) % 27));
             bi.put(&block_id_from_block(&block).unwrap()).unwrap();
         }
@@ -5231,9 +5237,14 @@ mod solidify_tests {
         assert!(nums.len() > 2, "locator should have several anchors: {nums:?}");
         assert!(nums.windows(2).all(|w| w[0] < w[1]), "ascending: {nums:?}");
         assert_eq!(*nums.last().unwrap(), head, "last id is our head");
-        // First id is deep — well below the ~18-block reversible tip — so a
-        // peer that forked only recently still has it in its main chain.
-        assert!(*nums.first().unwrap() <= head - 100, "anchor too shallow: {nums:?}");
+        // The anchor is our true lowest block, NOT an arbitrary head-2^k point.
+        assert_eq!(
+            *nums.first().unwrap(),
+            base,
+            "first id must be the lowest stored block: {nums:?}"
+        );
+        // Dense near head: the final gap is a single block.
+        assert_eq!(nums[nums.len() - 2], head - 1, "tail must be dense: {nums:?}");
         // Every id resolves to the matching block_index entry.
         for id in &summary {
             assert_eq!(bi.get(id.num() as i64).unwrap(), *id);
