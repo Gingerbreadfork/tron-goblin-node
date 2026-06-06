@@ -477,7 +477,7 @@ fn freeze_v2_different_resources_accumulate_in_separate_buckets() {
 }
 
 #[test]
-fn freeze_v2_tron_power_does_not_touch_global_net_or_energy_weights() {
+fn freeze_v2_tron_power_updates_only_total_tron_power_weight() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     enable_v2(&dp);
@@ -488,6 +488,15 @@ fn freeze_v2_tron_power_does_not_touch_global_net_or_energy_weights() {
         resource: 2,
     };
     freeze_v2::execute_freeze_balance_v2(&accounts, &dp, &c).unwrap();
+    // TRON_POWER freeze updates TOTAL_TRON_POWER_WEIGHT (java parity) — this
+    // accumulator was previously never written (apply_weight_delta no-op'd
+    // resource=2), so it silently drifted.
+    assert_eq!(
+        dp.get_long(b"TOTAL_TRON_POWER_WEIGHT").unwrap_or(0),
+        100,
+        "TRON_POWER freeze must bump TOTAL_TRON_POWER_WEIGHT"
+    );
+    // ...and leaves net/energy untouched.
     assert_eq!(dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0), 0);
     assert_eq!(dp.get_long(b"TOTAL_ENERGY_WEIGHT").unwrap_or(0), 0);
 }

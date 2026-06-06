@@ -139,10 +139,11 @@ fn frozen_v2_with_delegated(account: &Account, resource: i32) -> i64 {
     held.saturating_add(delegated)
 }
 
-/// Apply `delta` (TRX-unit weight) to the chain-wide
-/// `TOTAL_NET_WEIGHT` or `TOTAL_ENERGY_WEIGHT` keyed by `resource`:
-/// 0 = BANDWIDTH, 1 = ENERGY. (TRON_POWER, resource=2, has no global
-/// weight key — voting doesn't scale resources.)
+/// Apply `delta` (TRX-unit weight) to the chain-wide weight accumulator
+/// keyed by `resource`: 0 = BANDWIDTH (`TOTAL_NET_WEIGHT`), 1 = ENERGY
+/// (`TOTAL_ENERGY_WEIGHT`), 2 = TRON_POWER (`TOTAL_TRON_POWER_WEIGHT`).
+/// java-tron's `FreezeBalanceV2Actuator` updates all three (including
+/// `addTotalTronPowerWeight` for voting power).
 fn apply_weight_delta(dyn_props: &DynamicPropertiesStore, resource: i32, delta: i64) {
     if delta == 0 {
         return;
@@ -150,7 +151,8 @@ fn apply_weight_delta(dyn_props: &DynamicPropertiesStore, resource: i32, delta: 
     match resource {
         0 => dyn_props.add_total_net_weight(delta),
         1 => dyn_props.add_total_energy_weight(delta),
-        _ => {} // TRON_POWER: no chain-wide cap to update
+        2 => dyn_props.add_total_tron_power_weight(delta),
+        _ => {}
     }
 }
 
@@ -325,10 +327,12 @@ pub fn execute_cancel_all_unfreeze_v2(
     // unfreeze_balance_v2 was called).
     let mut restored_net: i64 = 0;
     let mut restored_energy: i64 = 0;
+    let mut restored_tron_power: i64 = 0;
     // Old weight basis = held frozen-V2 + delegated-out (java-tron's
     // `getFrozenV2BalanceWithDelegated`), captured before restoring.
     let old_net = frozen_v2_with_delegated(&account, 0);
     let old_energy = frozen_v2_with_delegated(&account, 1);
+    let old_tron_power = frozen_v2_with_delegated(&account, 2);
 
     let pending = std::mem::take(&mut account.unfrozen_v2);
     for entry in pending {
@@ -340,6 +344,7 @@ pub fn execute_cancel_all_unfreeze_v2(
             match entry.r#type {
                 0 => restored_net = restored_net.saturating_add(entry.unfreeze_amount),
                 1 => restored_energy = restored_energy.saturating_add(entry.unfreeze_amount),
+                2 => restored_tron_power = restored_tron_power.saturating_add(entry.unfreeze_amount),
                 _ => {}
             }
             match account
@@ -357,10 +362,13 @@ pub fn execute_cancel_all_unfreeze_v2(
     }
     accounts.put(&owner, &account)?;
 
-    // Bump chain-wide weight for any restored entries.
+    // Bump chain-wide weight for any restored entries (all three resources).
     let net_delta = (old_net + restored_net) / TRX_PRECISION - old_net / TRX_PRECISION;
     let energy_delta = (old_energy + restored_energy) / TRX_PRECISION - old_energy / TRX_PRECISION;
+    let tp_delta =
+        (old_tron_power + restored_tron_power) / TRX_PRECISION - old_tron_power / TRX_PRECISION;
     apply_weight_delta(dyn_props, 0, net_delta);
     apply_weight_delta(dyn_props, 1, energy_delta);
+    apply_weight_delta(dyn_props, 2, tp_delta);
     Ok(ExecutionResult::default())
 }

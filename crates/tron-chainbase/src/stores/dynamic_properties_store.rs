@@ -109,6 +109,9 @@ pub mod keys {
     pub const TOTAL_ENERGY_AVERAGE_USAGE: &[u8] = b"TOTAL_ENERGY_AVERAGE_USAGE";
     pub const TOTAL_ENERGY_AVERAGE_TIME: &[u8] = b"TOTAL_ENERGY_AVERAGE_TIME";
     pub const TOTAL_ENERGY_WEIGHT: &[u8] = b"TOTAL_ENERGY_WEIGHT";
+    /// Chain-wide TRON_POWER (voting) frozen weight, in TRX units. Updated
+    /// by FreezeBalanceV2/UnfreezeBalanceV2 for `resource = TRON_POWER`.
+    pub const TOTAL_TRON_POWER_WEIGHT: &[u8] = b"TOTAL_TRON_POWER_WEIGHT";
     pub const BLOCK_ENERGY_USAGE: &[u8] = b"BLOCK_ENERGY_USAGE";
     pub const ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER: &[u8] = b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER";
     pub const ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO: &[u8] = b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO";
@@ -463,6 +466,21 @@ impl DynamicPropertiesStore {
     pub fn add_total_net_weight(&self, delta: i64) {
         let cur = self.total_net_weight();
         self.save_total_net_weight(cur.wrapping_add(delta));
+    }
+
+    /// Chain-wide TRON_POWER (voting) frozen weight. Mirrors java-tron's
+    /// `addTotalTronPowerWeight` — bumped by FreezeBalanceV2/UnfreezeBalanceV2
+    /// for `resource = TRON_POWER`. (TRON_POWER can't be delegated, so the
+    /// basis is just the account's TRON_POWER frozen-V2 sum.)
+    pub fn total_tron_power_weight(&self) -> i64 {
+        self.get_long(keys::TOTAL_TRON_POWER_WEIGHT).unwrap_or(0)
+    }
+    pub fn save_total_tron_power_weight(&self, v: i64) {
+        self.put_long(keys::TOTAL_TRON_POWER_WEIGHT, v);
+    }
+    pub fn add_total_tron_power_weight(&self, delta: i64) {
+        let cur = self.total_tron_power_weight();
+        self.save_total_tron_power_weight(cur.wrapping_add(delta));
     }
 
     /// `TOTAL_NET_LIMIT` — global per-block byte cap distributed across
