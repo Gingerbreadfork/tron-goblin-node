@@ -102,6 +102,46 @@ impl DelegatedResourceAccountIndexStore {
         self.backend.delete(key)?;
         Ok(())
     }
+
+    // -------------------- V2 delegate/undelegate ----------------------
+
+    /// java-tron `DelegatedResourceAccountIndexStore.delegateV2` — write
+    /// the bidirectional V2 index rows for a `from → to` delegation. The
+    /// from-side row (`0x03 ‖ from ‖ to`) holds the counterparty `to`; the
+    /// to-side row (`0x04 ‖ to ‖ from`) holds `from`. Both stamp `time`.
+    /// Overwrites any existing rows (java-tron `put`).
+    pub fn delegate_v2(
+        &self,
+        from: &Address,
+        to: &Address,
+        time: i64,
+    ) -> Result<(), StoreError> {
+        self.put_raw(
+            &Self::v2_from_key(from, to),
+            &DelegatedResourceAccountIndex {
+                account: to.as_bytes().to_vec(),
+                timestamp: time,
+                ..Default::default()
+            },
+        )?;
+        self.put_raw(
+            &Self::v2_to_key(from, to),
+            &DelegatedResourceAccountIndex {
+                account: from.as_bytes().to_vec(),
+                timestamp: time,
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    /// java-tron `DelegatedResourceAccountIndexStore.unDelegateV2` — drop
+    /// both V2 index rows once a `from → to` delegation is fully gone.
+    pub fn undelegate_v2(&self, from: &Address, to: &Address) -> Result<(), StoreError> {
+        self.delete_raw(&Self::v2_from_key(from, to))?;
+        self.delete_raw(&Self::v2_to_key(from, to))?;
+        Ok(())
+    }
 }
 
 fn prefixed_pair(prefix: u8, a: &Address, b: &Address) -> [u8; 1 + ADDRESS_LENGTH * 2] {
@@ -110,4 +150,49 @@ fn prefixed_pair(prefix: u8, a: &Address, b: &Address) -> [u8; 1 + ADDRESS_LENGT
     out[1..1 + ADDRESS_LENGTH].copy_from_slice(a.as_bytes());
     out[1 + ADDRESS_LENGTH..].copy_from_slice(b.as_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::MemBackend;
+
+    fn addr(b: u8) -> Address {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1..].fill(b);
+        Address::from_raw(a)
+    }
+
+    #[test]
+    fn delegate_v2_writes_both_sides_and_undelegate_v2_clears_them() {
+        let store = DelegatedResourceAccountIndexStore::new(Arc::new(MemBackend::new()));
+        let from = addr(0xaa);
+        let to = addr(0xbb);
+
+        store.delegate_v2(&from, &to, 1_234).unwrap();
+        // From-side row (0x03 ‖ from ‖ to) holds the counterparty `to`.
+        let from_row = store
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&from, &to))
+            .unwrap()
+            .expect("from-side row");
+        assert_eq!(from_row.account, to.as_bytes().to_vec());
+        assert_eq!(from_row.timestamp, 1_234);
+        // To-side row (0x04 ‖ to ‖ from) holds `from`.
+        let to_row = store
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_to_key(&from, &to))
+            .unwrap()
+            .expect("to-side row");
+        assert_eq!(to_row.account, from.as_bytes().to_vec());
+
+        store.undelegate_v2(&from, &to).unwrap();
+        assert!(store
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&from, &to))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_to_key(&from, &to))
+            .unwrap()
+            .is_none());
+    }
 }
