@@ -19,8 +19,8 @@ goal.
 `tron-goblin-node` is a workspace of small, focused crates that
 reproduce java-tron's behaviour piece by piece. The goal is one
 binary you can point at a peer and have it stay in lockstep with the
-java-tron reference implementation — same hashes, same state roots,
-same RPC responses.
+java-tron reference implementation — same hashes, same state, same
+RPC responses.
 
 Concretely, this means:
 
@@ -71,13 +71,23 @@ What works today:
   / Network services — no `Status::unimplemented` stubs left.
 - ✅ Mempool with signer recovery + dedup + expiration eviction +
   on-disk persistence (java-tron's pending queue is volatile;
-  `tron-goblin-node` reloads pending txs across restarts).
+  `tron-goblin-node` reloads pending txs across restarts), plus
+  **state-aware admission validation** — the same precondition checks a
+  peer runs on receive (fee / permission / balance / ref-block, and
+  smart-contract `Trigger`/`Create` preconditions) so we don't relay
+  transactions a peer would reject.
 - ✅ Snapshot import / export (`import-snapshot`, `import-live`,
   `export-snapshot`, `verify-snapshot`) for moving state to and
   from a java-tron data directory.
-- ✅ Multi-batch peer sync: `SyncBlockChain` → drain queue →
-  re-request → transition to live-tip `BlockInventory` advertise
-  mode at head. Pipelined with rate-limit + keepalive parity.
+- ✅ Multi-peer sync from **public mainnet**: a java-tron-style
+  block-chain locator (`SyncBlockChain` → drain queue → re-request →
+  live-tip `BlockInventory` advertise at head), pipelined with
+  rate-limit + keepalive parity. A single **active syncer** is elected
+  across the per-peer driver fleet (the rest stay connected as standby
+  and fail over if it stalls), inbound `SyncBlockChain` is **served** so
+  peers can sync *from* us, and the Hello advertises a truthful
+  solid/lowest block. Validated pulling real blocks from public mainnet
+  peers, not just a local reference node.
 - ✅ SR block production: when `[witness]` is configured, the
   daemon runs java-tron's `DposTask` loop — slot ownership check,
   drain mempool, produce + sign + apply + broadcast.
@@ -99,10 +109,20 @@ What doesn't work yet (real, currently-open gaps):
   When a sibling fork overtakes the canonical head, the node
   detects it and warns loudly but doesn't yet rebuild head — the
   snapshot-stack primitives are wired in chainbase, but the sync
-  driver doesn't pull the trigger. See `tron-node/src/sync.rs:1483`.
+  driver doesn't pull the trigger (see the `AcceptOutcome::ReorgRequired`
+  arm in `tron-node/src/sync.rs`).
 - ❌ **Long-running mainnet soak / endurance.** Short live sessions
   pass; multi-hour, multi-day stability under realistic peer churn
   hasn't been characterized.
+- ❌ **A couple of delegated-resource (Stake 2.0) refinements.** The
+  locked-delegation lifecycle is correct (delegate-with-lock, lock
+  expiry, undelegate-after-expiry), but two java-tron behaviours aren't
+  ported yet: the receiver bandwidth/energy *usage-transfer* on
+  undelegate (a transient gap — the usage counters self-heal over the
+  ~1-day decay window), and on-write maintenance of the
+  `DelegatedResourceAccountIndex` lookup that backs
+  `getdelegatedresourceaccountindex` (the store methods exist but aren't
+  wired into the actuators).
 - ❌ **Probably a number of other things.** java-tron is large
   and old; some quirks will only surface when a specific client or
   workload hits them. This list will be updated as new items are
@@ -118,25 +138,24 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **1837** |
+| Workspace tests passing | **1883** |
 | Ignored (gated on Sapling proving, ~50 MB params + 1–2 s each) | 9 |
-| Test binaries | 151 |
-| Integration test files (`crates/*/tests/`) | 106 |
-| Source modules with `#[cfg(test)]` blocks | 62 |
+| Integration test files (`crates/*/tests/`) | 109 |
+| Source modules with `#[cfg(test)]` blocks | 94 |
 
 Per-crate breakdown of the test surface (where coverage lives is
 where parity risk lives):
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `tron-actuator`  | 300 | `tron-net`      |  50 |
-| `tron-rpc`       | 285 | `tron-types`    |  43 |
-| `tron-tvm`       | 278 | `tron-crypto`   |  34 |
-| `tron-node`      | 272 | `tron-mempool`  |  22 |
-| `tron-chainbase` | 166 | `tron-wallet`   |  22 |
-| `tron-executor`  |  86 | `tron-eventer`  |  14 |
-| `tron-consensus` |  84 | `tron-replay`   |   6 |
-| `tron-grpc`      |  62 | `tron-proto`    |   5 |
+| `tron-actuator`  | 317 | `tron-net`      |  56 |
+| `tron-rpc`       | 289 | `tron-types`    |  46 |
+| `tron-tvm`       | 280 | `tron-crypto`   |  34 |
+| `tron-node`      | 308 | `tron-mempool`  |  25 |
+| `tron-chainbase` | 207 | `tron-wallet`   |  22 |
+| `tron-executor`  | 121 | `tron-eventer`  |  14 |
+| `tron-consensus` |  87 | `tron-replay`   |   6 |
+| `tron-grpc`      |  63 | `tron-proto`    |   8 |
 
 Notable test categories:
 
@@ -297,7 +316,10 @@ from a recent state):
 
 Configuration is **TOML**, not java-tron's HOCON — config files are
 intentionally not drop-in. State directories are byte-exact
-compatible; runtime config is its own surface.
+compatible; runtime config is its own surface. A fully-annotated
+starting point ships at [`config.example.toml`](config.example.toml)
+(every key set to its built-in default); copy it and pass it with
+`--config`.
 
 ## Compatibility notes
 
@@ -313,6 +335,14 @@ compatible; runtime config is its own surface.
   call site.
 - **Config**: TOML, not HOCON. Pull settings explicitly when porting
   from a java-tron `config.conf`.
+- **State parity is verified by reads, not by block hashes.** TRON
+  block headers commit to the transaction Merkle root but **not** to an
+  enforced state root, so a state-computation bug can hide behind
+  block hashes that are byte-for-byte identical to the reference chain.
+  Parity of the resulting state is therefore checked by comparing RPC
+  reads (`getaccount`, delegated-resource queries, …) against a
+  java-tron node — not by hash equality alone. (This is exactly how the
+  delegated-resource divergence in [Status](#status) was found.)
 
 ## Reference implementation
 
