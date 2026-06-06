@@ -171,25 +171,30 @@ impl SyncLeadership {
     }
 
     /// Claim or retain leadership for `peer`. Returns `true` if `peer` is
-    /// the active syncer after the call. A challenger wins only when the
-    /// slot is free or the incumbent has made no progress within `stale`;
-    /// the incumbent retains without resetting its own progress timer (so
-    /// a busy-looping-but-not-applying leader can still be displaced).
-    pub fn claim_or_check(&self, peer: &str, stale: Duration) -> bool {
+    /// the active syncer after the call. A challenger wins only when it's
+    /// `eligible` (a useful sync source — not dramatically behind us) AND
+    /// the slot is free or the incumbent has made no progress within
+    /// `stale`. The incumbent always retains regardless of `eligible` (it
+    /// may have caught up past its own handshake head while leading) and
+    /// without resetting its progress timer (so a busy-looping-but-not-
+    /// applying leader can still be displaced).
+    pub fn claim_or_check(&self, peer: &str, stale: Duration, eligible: bool) -> bool {
         let mut g = self.inner.lock().expect("SyncLeadership poisoned");
-        match g.leader.as_deref() {
-            Some(l) if l == peer => true,
-            Some(_) if g.last_progress.elapsed() >= stale => {
-                g.leader = Some(peer.to_string());
-                g.last_progress = Instant::now();
-                true
-            }
-            Some(_) => false,
-            None => {
-                g.leader = Some(peer.to_string());
-                g.last_progress = Instant::now();
-                true
-            }
+        // Already the leader → retain unconditionally.
+        if g.leader.as_deref() == Some(peer) {
+            return true;
+        }
+        // A challenger must be a useful sync source to take the slot.
+        if !eligible {
+            return false;
+        }
+        let free_or_stale = g.leader.is_none() || g.last_progress.elapsed() >= stale;
+        if free_or_stale {
+            g.leader = Some(peer.to_string());
+            g.last_progress = Instant::now();
+            true
+        } else {
+            false
         }
     }
 
@@ -447,9 +452,9 @@ impl SyncDriver {
     /// Whether this driver may act as the active syncer right now —
     /// claiming or retaining leadership if it can. With no coordinator
     /// attached, always `true` (original behavior).
-    fn is_active_syncer(&self, peer: &str) -> bool {
+    fn is_active_syncer(&self, peer: &str, eligible: bool) -> bool {
         match &self.leadership {
-            Some(l) => l.claim_or_check(peer, LEADERSHIP_STALE),
+            Some(l) => l.claim_or_check(peer, LEADERSHIP_STALE, eligible),
             None => true,
         }
     }
@@ -1064,15 +1069,31 @@ impl SyncDriver {
             ),
             None => (-1, -1, -1, -1),
         };
+        let our_head_at_handshake = self.head_number();
         info!(
             peer,
-            our_head = self.head_number(),
+            our_head = our_head_at_handshake,
             peer_head,
             peer_solid,
             peer_node_type,
             peer_lowest,
             "handshake ok"
         );
+
+        // Leadership eligibility, decided once here from the peer's
+        // advertised head. We only ever lead-sync from a peer that can
+        // actually serve us — i.e. one that ISN'T dramatically behind us.
+        // A fresh node (head 0) or one millions of blocks back is a
+        // dead-end: it returns empty inventories forever, and without
+        // this gate it could win the active-syncer slot and stall us for
+        // a full LEADERSHIP_STALE window. The margin is generous (one
+        // sync window) so caught-up / live-tip / slightly-behind peers
+        // stay eligible; an unknown head (`-1`, peer skipped its Hello)
+        // defaults to eligible. Computed once so head drift over a long
+        // connection can't later flip a good leader off.
+        const LEAD_LAG_MARGIN: i64 = 65_536;
+        let leader_eligible =
+            !(peer_head >= 0 && peer_head + LEAD_LAG_MARGIN < our_head_at_handshake);
 
         // Register this peer with the live registry (if attached) so
         // the resilience scheduler can see it as a candidate. Fields
@@ -1347,8 +1368,10 @@ impl SyncDriver {
             // blocks; standbys stay connected (keepalive above, inbound
             // sync served in the dispatch loop) and take over only if the
             // leader stalls. `is_active_syncer` claims/retains the shared
-            // leadership slot.
-            let am_leader = self.is_active_syncer(peer);
+            // leadership slot — but only an eligible (not dramatically
+            // behind) peer may take it, so a fresh node can't win the slot
+            // and stall us.
+            let am_leader = self.is_active_syncer(peer, leader_eligible);
             if am_leader && !sync_started {
                 // We're the active syncer and haven't kicked off yet —
                 // send the locator to start the block stream.
@@ -1692,16 +1715,17 @@ impl SyncDriver {
                         remain = chain_inv.remain_num,
                         "ChainInventory queued"
                     );
-                    // Tip-test mode: an empty inventory + `remain_num=0`
-                    // means the peer says "you're caught up". Throttle
-                    // before the outer loop fires another SyncBlockChain
-                    // (otherwise the AskInventory branch would re-fire
-                    // immediately and we'd hammer the peer with empty
-                    // round-trips).
-                    if self.config.tip_test
-                        && appended == 0
-                        && chain_inv.remain_num == 0
-                    {
+                    // An empty inventory + `remain_num=0` means the peer
+                    // says "you're caught up" — there are no blocks after
+                    // our common ancestor. New tip blocks arrive via
+                    // Inventory adverts, NOT this loop, so throttle before
+                    // the outer loop's AskInventory branch re-fires;
+                    // otherwise it spins at `REQ_MIN_INTERVAL` (~0.4s) and
+                    // hammers the peer with empty round-trips. (Previously
+                    // gated on `tip_test`, but the spin happens in normal
+                    // sync too — every caught-up peer and every dead-end
+                    // peer we briefly lead from.)
+                    if appended == 0 && chain_inv.remain_num == 0 {
                         tokio::time::sleep(self.config.tail_interval).await;
                     }
                 }
@@ -5435,54 +5459,71 @@ mod leadership_tests {
     #[test]
     fn first_claimant_leads_and_blocks_others() {
         let l = SyncLeadership::new();
-        assert!(l.claim_or_check("A", STALE), "first claimant wins the slot");
-        assert!(l.claim_or_check("A", STALE), "incumbent retains");
-        assert!(!l.claim_or_check("B", STALE), "challenger blocked while leader fresh");
+        assert!(l.claim_or_check("A", STALE, true), "first claimant wins the slot");
+        assert!(l.claim_or_check("A", STALE, true), "incumbent retains");
+        assert!(!l.claim_or_check("B", STALE, true), "challenger blocked while leader fresh");
     }
 
     #[test]
     fn progress_keeps_a_standby_from_preempting() {
         let l = SyncLeadership::new();
-        assert!(l.claim_or_check("A", STALE));
+        assert!(l.claim_or_check("A", STALE, true));
         // Sleep past STALE but keep noting progress — A must keep the slot.
         for _ in 0..3 {
             std::thread::sleep(STALE / 2);
             l.note_progress("A");
-            assert!(!l.claim_or_check("B", STALE), "fresh progress blocks preemption");
+            assert!(!l.claim_or_check("B", STALE, true), "fresh progress blocks preemption");
         }
-        assert!(l.claim_or_check("A", STALE), "A still leads");
+        assert!(l.claim_or_check("A", STALE, true), "A still leads");
     }
 
     #[test]
     fn standby_takes_over_after_leader_stalls() {
         let l = SyncLeadership::new();
-        assert!(l.claim_or_check("A", STALE));
+        assert!(l.claim_or_check("A", STALE, true));
         std::thread::sleep(STALE + Duration::from_millis(10));
         // A made no progress for > STALE → B preempts.
-        assert!(l.claim_or_check("B", STALE), "B steals a stalled leader");
-        assert!(!l.claim_or_check("A", STALE), "A is now the standby");
+        assert!(l.claim_or_check("B", STALE, true), "B steals a stalled leader");
+        assert!(!l.claim_or_check("A", STALE, true), "A is now the standby");
     }
 
     #[test]
     fn release_frees_the_slot_immediately() {
         let l = SyncLeadership::new();
-        assert!(l.claim_or_check("A", STALE));
+        assert!(l.claim_or_check("A", STALE, true));
         l.release("A");
         // No need to wait out STALE — the slot is free.
-        assert!(l.claim_or_check("B", STALE), "B leads right after A releases");
+        assert!(l.claim_or_check("B", STALE, true), "B leads right after A releases");
         // A releasing again (it no longer holds the slot) is a harmless no-op.
         l.release("A");
-        assert!(l.claim_or_check("B", STALE), "B still leads");
+        assert!(l.claim_or_check("B", STALE, true), "B still leads");
     }
 
     #[test]
     fn note_progress_by_non_leader_is_a_noop() {
         let l = SyncLeadership::new();
-        assert!(l.claim_or_check("A", STALE));
+        assert!(l.claim_or_check("A", STALE, true));
         // B isn't the leader; its (bogus) progress must not refresh A's timer.
         std::thread::sleep(STALE / 2);
         l.note_progress("B");
         std::thread::sleep(STALE / 2 + Duration::from_millis(10));
-        assert!(l.claim_or_check("B", STALE), "A's timer was untouched, so B preempts");
+        assert!(l.claim_or_check("B", STALE, true), "A's timer was untouched, so B preempts");
+    }
+
+    #[test]
+    fn ineligible_peer_cannot_take_the_slot() {
+        let l = SyncLeadership::new();
+        // A free slot is NOT handed to an ineligible (dramatically-behind)
+        // peer — that's the fresh-node-at-head-0 case.
+        assert!(!l.claim_or_check("fresh", STALE, false), "ineligible can't claim free slot");
+        // An eligible peer takes it.
+        assert!(l.claim_or_check("good", STALE, true));
+        // Even after the leader goes stale, an ineligible challenger still
+        // can't preempt it.
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        assert!(!l.claim_or_check("fresh", STALE, false), "ineligible can't preempt a stalled leader");
+        // The stalled leader still nominally holds it until an *eligible*
+        // peer takes over.
+        assert!(l.claim_or_check("good", STALE, false), "incumbent retains regardless of eligibility");
     }
 }
