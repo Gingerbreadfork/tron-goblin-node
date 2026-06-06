@@ -6,14 +6,63 @@
 //! another account without giving up ownership of the underlying TRX.
 
 use tron_chainbase::{
-    AccountStore, DelegatedResourceStore, DynamicPropertiesStore,
+    AccountStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
+    DynamicPropertiesStore,
 };
-use tron_proto::{DelegateResourceContract, DelegatedResource, UnDelegateResourceContract};
+use tron_proto::{
+    Account, DelegateResourceContract, DelegatedResource, UnDelegateResourceContract,
+};
+use tron_types::resource::{
+    all_frozen_balance_for_bandwidth, all_frozen_balance_for_energy, set_latest_time, set_usage,
+    undelegate_increase, update_usage, usage, ResourceGates, ResourceKind,
+};
 
 use crate::freeze::TRX_PRECISION;
 use crate::helpers::{check_add, check_sub, require_owner, require_to};
 use crate::transfer::ExecutionResult;
 use crate::ActuatorError;
+
+/// Map the contract's resource code (0 = bandwidth, 1 = energy) to the
+/// shared [`ResourceKind`].
+fn resource_kind(resource: i32) -> ResourceKind {
+    if resource == 0 {
+        ResourceKind::Bandwidth
+    } else {
+        ResourceKind::Energy
+    }
+}
+
+/// java-tron `AccountCapsule.getAcquiredDelegatedFrozenV2BalanceFor{Bandwidth,
+/// Energy}` — the v2 balance this account has *received* from delegators.
+fn acquired_delegated_v2(account: &Account, kind: ResourceKind) -> i64 {
+    match kind {
+        ResourceKind::Bandwidth => account.acquired_delegated_frozen_v2_balance_for_bandwidth,
+        ResourceKind::Energy => account
+            .account_resource
+            .as_ref()
+            .map(|r| r.acquired_delegated_frozen_v2_balance_for_energy)
+            .unwrap_or(0),
+    }
+}
+
+fn set_acquired_delegated_v2(account: &mut Account, kind: ResourceKind, v: i64) {
+    match kind {
+        ResourceKind::Bandwidth => account.acquired_delegated_frozen_v2_balance_for_bandwidth = v,
+        ResourceKind::Energy => {
+            account
+                .account_resource
+                .get_or_insert_with(Default::default)
+                .acquired_delegated_frozen_v2_balance_for_energy = v;
+        }
+    }
+}
+
+fn resource_gates(dyn_props: &DynamicPropertiesStore) -> ResourceGates {
+    ResourceGates {
+        support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
+        support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+    }
+}
 
 fn require_delegation_enabled(dyn_props: &DynamicPropertiesStore) -> Result<(), ActuatorError> {
     if dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) != 1
@@ -127,11 +176,19 @@ pub fn validate_delegate_resource(
 pub fn execute_delegate_resource(
     accounts: &AccountStore,
     resources: &DelegatedResourceStore,
+    index: Option<&DelegatedResourceAccountIndexStore>,
     dyn_props: &DynamicPropertiesStore,
     contract: &DelegateResourceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
     let to = require_to(&contract.receiver_address)?;
+    let now_ts = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+
+    // 0. Unlock any expired locked delegation first — java-tron's
+    //    `delegateResource` calls `unLockExpireResource` before reading the
+    //    per-(from,to) record, so an expired locked record is folded into
+    //    the unlocked record before the new balance is added.
+    resources.unlock_expire_resource(&owner, &to, now_ts)?;
 
     // 1. Debit owner's frozen-V2 pool.
     let mut owner_account = accounts
@@ -195,10 +252,9 @@ pub fn execute_delegate_resource(
     //    mis-stored and immediately undelegate-able — diverging from
     //    java-tron (silently, since TRON headers have no state root).
     let expire_time = if contract.lock {
-        let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
         let lock_period = resolved_lock_period(dyn_props, contract.lock_period);
         check_add(
-            now,
+            now_ts,
             lock_period
                 .checked_mul(BLOCK_PRODUCED_INTERVAL)
                 .ok_or(ActuatorError::Overflow)?,
@@ -231,6 +287,12 @@ pub fn execute_delegate_resource(
         _ => unreachable!(),
     }
     resources.put_raw(&key, &resource)?;
+
+    // 5. Update the bidirectional account index — java-tron
+    //    `DelegatedResourceAccountIndexStore.delegateV2(owner, to, now)`.
+    if let Some(index) = index {
+        index.delegate_v2(&owner, &to, now_ts)?;
+    }
 
     Ok(ExecutionResult::default())
 }
@@ -326,99 +388,156 @@ fn undelegatable_balance(
 pub fn execute_undelegate_resource(
     accounts: &AccountStore,
     resources: &DelegatedResourceStore,
+    index: Option<&DelegatedResourceAccountIndexStore>,
     dyn_props: &DynamicPropertiesStore,
     contract: &UnDelegateResourceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
     let to = require_to(&contract.receiver_address)?;
+    let balance = contract.balance;
+    let kind = resource_kind(contract.resource);
+    let gates = resource_gates(dyn_props);
+    // `now_ts` (block timestamp) gates the locked-record expiry;
+    // `now_slot` (java `getHeadSlot`) is the usage-window time unit.
+    let now_ts = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+    let now_slot = dyn_props.head_slot();
 
-    // 0. Fold any expired *locked* delegation into the unlocked record
-    //    before drawing on it — java-tron's
-    //    `DelegatedResourceStore.unLockExpireResource`. Without this an
-    //    undelegate of a once-locked (now-expired) delegation fails as
-    //    "nothing to undelegate" and our delegated-resource state silently
-    //    diverges from java-tron.
-    let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-    resources.unlock_expire_resource(&owner, &to, now)?;
+    // 1. Receiver: transfer the usage attributable to the un-delegated
+    //    balance back to the owner. java-tron decays the receiver's usage
+    //    (`updateUsageForDelegated` / `updateUsage`), computes
+    //    `transferUsage = min(unDelegateMaxUsage, netUsage * balance/allFrozen)`,
+    //    then debits the receiver's `acquired_*` and usage. Skipped entirely
+    //    if the receiver account no longer exists (TVM suicide/re-create).
+    let mut transfer_usage = 0i64;
+    let mut receiver_account = accounts.get(&to)?;
+    if let Some(receiver) = receiver_account.as_mut() {
+        // Decay the receiver's usage to `now_slot` (writes its window back).
+        update_usage(receiver, kind, now_slot, gates);
+        let acquired = acquired_delegated_v2(receiver, kind);
+        if acquired < balance {
+            // A TVM contract suicide + re-create can leave acquired < balance.
+            set_acquired_delegated_v2(receiver, kind, 0);
+        } else {
+            let (total_limit, total_weight) = match kind {
+                ResourceKind::Bandwidth => {
+                    (dyn_props.total_net_limit(), dyn_props.total_net_weight())
+                }
+                ResourceKind::Energy => (
+                    dyn_props.total_energy_current_limit(),
+                    dyn_props.total_energy_weight(),
+                ),
+            };
+            // java: `(long)((double)balance / TRX_PRECISION
+            //               * ((double)totalLimit / totalWeight))`.
+            let undelegate_max_usage = if total_weight > 0 {
+                ((balance as f64 / TRX_PRECISION as f64)
+                    * (total_limit as f64 / total_weight as f64)) as i64
+            } else {
+                0
+            };
+            // java: `(long)(netUsage * ((double)balance / allFrozenBalance))`
+            // — `allFrozenBalance` still includes the `acquired_*` being
+            // removed (read before the debit below).
+            let all_frozen = match kind {
+                ResourceKind::Bandwidth => all_frozen_balance_for_bandwidth(receiver),
+                ResourceKind::Energy => all_frozen_balance_for_energy(receiver),
+            };
+            let recv_usage = usage(receiver, kind); // decayed
+            transfer_usage = if all_frozen > 0 {
+                (recv_usage as f64 * (balance as f64 / all_frozen as f64)) as i64
+            } else {
+                0
+            };
+            transfer_usage = undelegate_max_usage.min(transfer_usage);
+            set_acquired_delegated_v2(receiver, kind, acquired - balance);
+        }
+        let new_recv_usage = usage(receiver, kind) - transfer_usage;
+        set_usage(receiver, kind, new_recv_usage);
+        set_latest_time(receiver, kind, now_slot);
+    }
 
-    // 1. Decrement the per-(owner, to) record.
-    let key = DelegatedResourceStore::v2_unlocked_key(&owner, &to);
-    let mut resource = resources
-        .get_raw(&key)?
+    // 2. Fold any expired *locked* delegation into the unlocked record
+    //    before drawing on it — java-tron's `unLockExpireResource`.
+    resources.unlock_expire_resource(&owner, &to, now_ts)?;
+
+    // 3. Decrement the unlocked per-(owner, to) record (java sets its
+    //    expiry to 0 on every `addFrozenBalanceFor*(-balance, 0)`).
+    let unlock_key = DelegatedResourceStore::v2_unlocked_key(&owner, &to);
+    let mut unlock_resource = resources
+        .get_raw(&unlock_key)?
         .ok_or(ActuatorError::NothingToUndelegate)?;
-    match contract.resource {
-        0 => {
-            resource.frozen_balance_for_bandwidth =
-                check_sub(resource.frozen_balance_for_bandwidth, contract.balance)?;
+    match kind {
+        ResourceKind::Bandwidth => {
+            unlock_resource.frozen_balance_for_bandwidth =
+                check_sub(unlock_resource.frozen_balance_for_bandwidth, balance)?;
+            unlock_resource.expire_time_for_bandwidth = 0;
         }
-        1 => {
-            resource.frozen_balance_for_energy =
-                check_sub(resource.frozen_balance_for_energy, contract.balance)?;
+        ResourceKind::Energy => {
+            unlock_resource.frozen_balance_for_energy =
+                check_sub(unlock_resource.frozen_balance_for_energy, balance)?;
+            unlock_resource.expire_time_for_energy = 0;
         }
-        _ => unreachable!(),
-    }
-    if resource.frozen_balance_for_bandwidth == 0 && resource.frozen_balance_for_energy == 0 {
-        resources.delete_raw(&key)?;
-    } else {
-        resources.put_raw(&key, &resource)?;
     }
 
-    // 2. Decrement owner's `delegated_*` and credit owner's `frozen_v2`.
+    // 4. Owner: decrement `delegated_*`, credit back `frozen_v2`, then fold
+    //    the transferred usage in via `unDelegateIncrease`.
     let mut owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    match contract.resource {
-        0 => {
+    match kind {
+        ResourceKind::Bandwidth => {
             owner_account.delegated_frozen_v2_balance_for_bandwidth = check_sub(
                 owner_account.delegated_frozen_v2_balance_for_bandwidth,
-                contract.balance,
+                balance,
             )?;
         }
-        1 => {
-            let r = owner_account
-                .account_resource
-                .get_or_insert_with(Default::default);
+        ResourceKind::Energy => {
+            let r = owner_account.account_resource.get_or_insert_with(Default::default);
             r.delegated_frozen_v2_balance_for_energy =
-                check_sub(r.delegated_frozen_v2_balance_for_energy, contract.balance)?;
+                check_sub(r.delegated_frozen_v2_balance_for_energy, balance)?;
         }
-        _ => unreachable!(),
     }
     match owner_account
         .frozen_v2
         .iter_mut()
         .find(|f| f.r#type == contract.resource)
     {
-        Some(slot) => slot.amount = check_add(slot.amount, contract.balance)?,
+        Some(slot) => slot.amount = check_add(slot.amount, balance)?,
         None => owner_account.frozen_v2.push(tron_proto::account::FreezeV2 {
             r#type: contract.resource,
-            amount: contract.balance,
+            amount: balance,
         }),
+    }
+    if let Some(receiver) = receiver_account.as_ref() {
+        if transfer_usage > 0 {
+            undelegate_increase(&mut owner_account, receiver, transfer_usage, kind, now_slot, gates);
+        }
     }
     accounts.put(&owner, &owner_account)?;
 
-    // 3. Decrement recipient's `acquired_*`. java-tron guards the entire
-    //    receiver update with `if (receiverCapsule != null)` — a receiver
-    //    whose account was since deleted is simply skipped, not an error.
-    if let Some(mut to_account) = accounts.get(&to)? {
-        match contract.resource {
-            0 => {
-                to_account.acquired_delegated_frozen_v2_balance_for_bandwidth = check_sub(
-                    to_account.acquired_delegated_frozen_v2_balance_for_bandwidth,
-                    contract.balance,
-                )?;
-            }
-            1 => {
-                let r = to_account
-                    .account_resource
-                    .get_or_insert_with(Default::default);
-                r.acquired_delegated_frozen_v2_balance_for_energy = check_sub(
-                    r.acquired_delegated_frozen_v2_balance_for_energy,
-                    contract.balance,
-                )?;
-            }
-            _ => unreachable!(),
+    // 5. Delete or persist the (now-decremented) unlocked record.
+    let unlock_gone = unlock_resource.frozen_balance_for_bandwidth == 0
+        && unlock_resource.frozen_balance_for_energy == 0;
+    if unlock_gone {
+        resources.delete_raw(&unlock_key)?;
+    } else {
+        resources.put_raw(&unlock_key, &unlock_resource)?;
+    }
+
+    // 6. Once both the locked and unlocked records are gone, drop the
+    //    bidirectional index rows — java-tron `unDelegateV2`.
+    let lock_key = DelegatedResourceStore::v2_locked_key(&owner, &to);
+    let lock_exists = resources.get_raw(&lock_key)?.is_some();
+    if unlock_gone && !lock_exists {
+        if let Some(index) = index {
+            index.undelegate_v2(&owner, &to)?;
         }
-        accounts.put(&to, &to_account)?;
+    }
+
+    // 7. Persist the receiver (mutated in step 1) last — java puts it
+    //    earlier, but it is not modified after, so the end state matches.
+    if let Some(receiver) = receiver_account.as_ref() {
+        accounts.put(&to, receiver)?;
     }
 
     Ok(ExecutionResult::default())

@@ -335,6 +335,7 @@ fn cmd_execute(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         votes: m(),
         delegation: m(),
         delegated_resources: m(),
+        delegated_resource_account_index: None,
         dyn_props: m(),
         proposals: m(),
         name_index: m(),

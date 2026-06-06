@@ -13,9 +13,9 @@ use tron_actuator::{
 };
 use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
-    AssetIssueV2Store, ContractStore, DelegatedResourceStore, DelegationStore,
-    DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, KvBackend, MarketOrderStore,
-    MemBackend, ProposalStore, VotesStore, WitnessStore,
+    AssetIssueV2Store, ContractStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
+    DelegationStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, KvBackend,
+    MarketOrderStore, MemBackend, ProposalStore, VotesStore, WitnessStore,
 };
 use tron_crypto::address::Address;
 use tron_proto::account::Frozen;
@@ -509,8 +509,9 @@ fn delegate_resource_round_trip() {
         lock: false,
         lock_period: 0,
     };
+    let dr_index = DelegatedResourceAccountIndexStore::new(mem());
     delegate::validate_delegate_resource(&accounts, &dp, &c).unwrap();
-    delegate::execute_delegate_resource(&accounts, &resources, &dp, &c).unwrap();
+    delegate::execute_delegate_resource(&accounts, &resources, Some(&dr_index), &dp, &c).unwrap();
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.frozen_v2[0].amount, 5_000_000);

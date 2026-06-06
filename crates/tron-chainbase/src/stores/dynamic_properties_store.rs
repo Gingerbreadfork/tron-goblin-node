@@ -83,6 +83,10 @@ pub mod keys {
     pub const ALLOW_BLACKHOLE_OPTIMIZATION: &[u8] = b"ALLOW_BLACKHOLE_OPTIMIZATION";
     /// `getUnfreezeDelayDays() > 0` ⇒ `supportUnfreezeDelay()`.
     pub const UNFREEZE_DELAY_DAYS: &[u8] = b"UNFREEZE_DELAY_DAYS";
+    /// `getAllowCancelAllUnfreezeV2() == 1 && supportUnfreezeDelay()` ⇒
+    /// `supportAllowCancelAllUnfreezeV2()` — selects the precision-scaled
+    /// (V2) per-account window math in `ResourceProcessor`.
+    pub const ALLOW_CANCEL_ALL_UNFREEZE_V2: &[u8] = b"ALLOW_CANCEL_ALL_UNFREEZE_V2";
 
     // --- Resource quota / pricing -------------------------------------
     pub const ENERGY_FEE: &[u8] = b"ENERGY_FEE";
@@ -604,6 +608,32 @@ impl DynamicPropertiesStore {
     }
     pub fn support_unfreeze_delay(&self) -> bool {
         self.unfreeze_delay_days() > 0
+    }
+
+    /// `getAllowCancelAllUnfreezeV2()` — 0 when unset.
+    pub fn allow_cancel_all_unfreeze_v2(&self) -> i64 {
+        self.get_long(keys::ALLOW_CANCEL_ALL_UNFREEZE_V2).unwrap_or(0)
+    }
+    pub fn save_allow_cancel_all_unfreeze_v2(&self, v: i64) {
+        self.put_long(keys::ALLOW_CANCEL_ALL_UNFREEZE_V2, v);
+    }
+    /// java-tron `supportAllowCancelAllUnfreezeV2()` — gates the
+    /// precision-scaled (V2) per-account usage-window math.
+    pub fn support_allow_cancel_all_unfreeze_v2(&self) -> bool {
+        self.allow_cancel_all_unfreeze_v2() == 1 && self.unfreeze_delay_days() > 0
+    }
+
+    /// java-tron `getHeadSlot()` =
+    /// `(latestBlockHeaderTimestamp - genesisBlockTimestamp) /
+    /// BLOCK_PRODUCED_INTERVAL`. The slot unit used by the windowed-average
+    /// resource math (`latest_consume_time(_for_energy)` are stored in it).
+    /// Note this is **not** the block height (genesis ts is 0 on mainnet, so
+    /// the slot counts from the unix epoch and far exceeds the height).
+    pub fn head_slot(&self) -> i64 {
+        const BLOCK_PRODUCED_INTERVAL_MS: i64 = 3_000;
+        let ts = self.latest_block_header_timestamp().unwrap_or(0);
+        let genesis = self.genesis_block_timestamp().unwrap_or(0);
+        (ts - genesis) / BLOCK_PRODUCED_INTERVAL_MS
     }
 
     /// `TRANSACTION_FEE_POOL` accumulator: when on, bandwidth fees flow

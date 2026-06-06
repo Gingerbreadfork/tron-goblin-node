@@ -37,8 +37,8 @@ use tron_proto::account::AccountResource;
 use tron_proto::Account;
 
 use crate::resource::{
-    calculate_global_limit_v1, calculate_global_limit_v2, increase_default, recovery,
-    TRX_PRECISION,
+    calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
+    recovery, ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
 /// What happened during a `consume_energy` call.
@@ -107,7 +107,9 @@ pub fn consume_energy(
     // uses `recovery()` when supportUnfreezeDelay is on (preserves the
     // per-account window), else `increase()` with the default window.
     let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
-    let res = account.account_resource.unwrap_or_default();
+    // Clone (not move) so `account.account_resource` stays intact: the
+    // account-aware growth path mutates the window fields on it in place.
+    let res = account.account_resource.clone().unwrap_or_default();
     let current_usage = res.energy_usage;
     let latest_consume = res.latest_consume_time_for_energy;
     let decayed_usage = if support_unfreeze_delay {
@@ -134,25 +136,45 @@ pub fn consume_energy(
 
     // Apply the frozen-quota slice, if any.
     let new_energy_usage = if energy_from_frozen > 0 {
-        let new = if support_unfreeze_delay {
-            increase_default(current_usage, energy_from_frozen, latest_consume, now_slot)
+        if support_unfreeze_delay {
+            // java-tron `useEnergy`: the account-aware `increase()`
+            // recomputes AND writes back the per-account energy window
+            // (energy_window_size / energy_window_optimized) in place.
+            let gates = ResourceGates {
+                support_unfreeze_delay: true,
+                support_allow_cancel_all_unfreeze_v2: dyn_props
+                    .support_allow_cancel_all_unfreeze_v2(),
+            };
+            let new = increase_account(
+                &mut account,
+                ResourceKind::Energy,
+                current_usage,
+                energy_from_frozen,
+                latest_consume,
+                now_slot,
+                gates,
+            );
+            let r = account.account_resource.get_or_insert_with(Default::default);
+            r.energy_usage = new;
+            r.latest_consume_time_for_energy = now_slot;
+            new
         } else {
-            increase_default(decayed_usage, energy_from_frozen, now_slot, now_slot)
-        };
-        let new_res = AccountResource {
-            energy_usage: new,
-            latest_consume_time_for_energy: now_slot,
-            ..res
-        };
-        account.account_resource = Some(new_res);
-        new
+            let new = increase_default(decayed_usage, energy_from_frozen, now_slot, now_slot);
+            let new_res = AccountResource {
+                energy_usage: new,
+                latest_consume_time_for_energy: now_slot,
+                ..res.clone()
+            };
+            account.account_resource = Some(new_res);
+            new
+        }
     } else {
         // No quota slice — still bump latest_consume_time_for_energy
         // so the next consume call sees up-to-date state. java-tron's
         // useEnergy always updates this.
         let new_res = AccountResource {
             latest_consume_time_for_energy: now_slot,
-            ..res
+            ..res.clone()
         };
         account.account_resource = Some(new_res);
         current_usage

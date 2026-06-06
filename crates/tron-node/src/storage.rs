@@ -654,6 +654,7 @@ impl OpenedStores {
             votes: self.votes.clone(),
             delegation: self.delegation.clone(),
             delegated_resources: self.delegated_resources.clone(),
+            delegated_resource_account_index: Some(self.delegated_resource_account_index.clone()),
             dyn_props: self.dyn_props.clone(),
             proposals: self.proposals.clone(),
             name_index: self.name_index.clone(),

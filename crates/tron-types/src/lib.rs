@@ -14,6 +14,7 @@ pub mod account_state_root;
 pub mod block_id;
 pub mod block_validate;
 pub mod genesis;
+pub mod resource;
 pub mod tx_id;
 pub mod tx_sign;
 

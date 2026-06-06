@@ -150,6 +150,7 @@ impl StateBundle {
             votes: self.votes_be.clone(),
             delegation: self.delegation_be.clone(),
             delegated_resources: self.delegated_resources_be.clone(),
+            delegated_resource_account_index: None,
             dyn_props: self.dyn_props_be.clone(),
             proposals: self.proposals_be.clone(),
             name_index: self.name_index_be.clone(),

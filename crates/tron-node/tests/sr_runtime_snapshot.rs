@@ -47,6 +47,7 @@ fn fresh_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, Arc<dyn KvBacke
         votes: snapshot_wrap(&mut backends),
         delegation: snapshot_wrap(&mut backends),
         delegated_resources: snapshot_wrap(&mut backends),
+        delegated_resource_account_index: None,
         dyn_props: snapshot_wrap(&mut backends),
         proposals: snapshot_wrap(&mut backends),
         name_index: snapshot_wrap(&mut backends),

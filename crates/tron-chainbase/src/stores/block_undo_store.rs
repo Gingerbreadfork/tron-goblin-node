@@ -73,6 +73,7 @@ pub enum StoreId {
     ContractState = 20,
     BlockIndex = 21,
     WitnessSchedule = 22,
+    DelegatedResourceAccountIndex = 23,
 }
 
 impl StoreId {
@@ -105,6 +106,7 @@ impl StoreId {
             20 => Self::ContractState,
             21 => Self::BlockIndex,
             22 => Self::WitnessSchedule,
+            23 => Self::DelegatedResourceAccountIndex,
             _ => return None,
         })
     }
@@ -138,6 +140,7 @@ impl StoreId {
             Self::ContractState => "contract-state",
             Self::BlockIndex => "block-index",
             Self::WitnessSchedule => "witness_schedule",
+            Self::DelegatedResourceAccountIndex => "DelegatedResourceAccountIndex",
         }
     }
 }

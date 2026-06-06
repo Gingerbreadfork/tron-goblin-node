@@ -77,6 +77,7 @@ fn build_state() -> StateBackends {
         votes: mem(),
         delegation: mem(),
         delegated_resources: mem(),
+        delegated_resource_account_index: None,
         dyn_props: mem(),
         proposals: mem(),
         name_index: mem(),

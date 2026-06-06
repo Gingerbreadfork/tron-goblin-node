@@ -42,6 +42,7 @@ fn build_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, SnapshotStack) 
         votes: snapshot_state(&mut stores),
         delegation: snapshot_state(&mut stores),
         delegated_resources: snapshot_state(&mut stores),
+        delegated_resource_account_index: None,
         dyn_props: snapshot_state(&mut stores),
         proposals: snapshot_state(&mut stores),
         name_index: snapshot_state(&mut stores),

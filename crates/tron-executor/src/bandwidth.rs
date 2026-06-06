@@ -42,8 +42,8 @@ use tron_proto::transaction::Contract;
 use tron_proto::{Account, Transaction, TransferAssetContract};
 
 use crate::resource::{
-    calculate_global_limit_v1, calculate_global_limit_v2, increase_default, recovery,
-    TRX_PRECISION,
+    calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
+    recovery, ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
 // Re-export the shared constants here so existing callers (and tests
@@ -426,8 +426,17 @@ fn try_use_account_net(
         return Ok(None);
     }
 
+    // Growth. java-tron's `useAccountNet`: with supportUnfreezeDelay the
+    // account-aware `increase()` recomputes AND writes back the per-account
+    // net window size (net_window_size / net_window_optimized); without it,
+    // a plain default-window increase on the decayed value.
+    let cur_usage = account.net_usage;
     let new_usage = if support_unfreeze_delay {
-        increase_default(account.net_usage, bytes, last_consume, now_slot)
+        let gates = ResourceGates {
+            support_unfreeze_delay: true,
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+        increase_account(account, ResourceKind::Bandwidth, cur_usage, bytes, last_consume, now_slot, gates)
     } else {
         increase_default(decayed, bytes, now_slot, now_slot)
     };

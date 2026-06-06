@@ -104,6 +104,10 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
             votes: &votes,
             delegation: &delegation,
             delegated_resources: &delegated_resources,
+            // Mempool admission only runs `validate_*`, which doesn't touch
+            // the delegation index — the executor wires the real index on
+            // the block-execution path.
+            delegated_resource_account_index: None,
             dyn_props: &dyn_props,
             proposals: &proposals,
             name_index: &name_index,

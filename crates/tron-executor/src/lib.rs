@@ -330,6 +330,10 @@ pub struct StateBackends {
     pub votes: Arc<dyn KvBackend>,
     pub delegation: Arc<dyn KvBackend>,
     pub delegated_resources: Arc<dyn KvBackend>,
+    /// Bidirectional `(from, to)` delegation index. `None` in unit-test
+    /// setups that don't exercise delegate/undelegate; the production node
+    /// always attaches it so the RPC index stays in sync with java-tron.
+    pub delegated_resource_account_index: Option<Arc<dyn KvBackend>>,
     pub dyn_props: Arc<dyn KvBackend>,
     pub proposals: Arc<dyn KvBackend>,
     pub name_index: Arc<dyn KvBackend>,
@@ -373,6 +377,7 @@ struct TxSession {
     votes: Arc<SessionBackend>,
     delegation: Arc<SessionBackend>,
     delegated_resources: Arc<SessionBackend>,
+    delegated_resource_account_index: Option<Arc<SessionBackend>>,
     dyn_props: Arc<SessionBackend>,
     proposals: Arc<SessionBackend>,
     name_index: Arc<SessionBackend>,
@@ -402,6 +407,10 @@ impl TxSession {
             votes: Arc::new(SessionBackend::new(base.votes.clone())),
             delegation: Arc::new(SessionBackend::new(base.delegation.clone())),
             delegated_resources: Arc::new(SessionBackend::new(base.delegated_resources.clone())),
+            delegated_resource_account_index: base
+                .delegated_resource_account_index
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
             dyn_props: Arc::new(SessionBackend::new(base.dyn_props.clone())),
             proposals: Arc::new(SessionBackend::new(base.proposals.clone())),
             name_index: Arc::new(SessionBackend::new(base.name_index.clone())),
@@ -455,6 +464,9 @@ impl TxSession {
         self.exchange_v2.commit()?;
         self.market_orders.commit()?;
         self.nullifiers.commit()?;
+        if let Some(s) = &self.delegated_resource_account_index {
+            s.commit()?;
+        }
         if let Some(s) = &self.merkle_trees {
             s.commit()?;
         }
@@ -491,6 +503,9 @@ impl TxSession {
         self.exchange_v2.revert();
         self.market_orders.revert();
         self.nullifiers.revert();
+        if let Some(s) = &self.delegated_resource_account_index {
+            s.revert();
+        }
         if let Some(s) = &self.merkle_trees {
             s.revert();
         }
@@ -518,6 +533,7 @@ struct SessionStoreOwners {
     votes: VotesStore,
     delegation: DelegationStore,
     delegated_resources: DelegatedResourceStore,
+    delegated_resource_account_index: Option<tron_chainbase::DelegatedResourceAccountIndexStore>,
     dyn_props: DynamicPropertiesStore,
     proposals: ProposalStore,
     name_index: AccountIndexStore,
@@ -541,6 +557,10 @@ impl SessionStoreOwners {
             votes: VotesStore::new(sess.votes.clone()),
             delegation: DelegationStore::new(sess.delegation.clone()),
             delegated_resources: DelegatedResourceStore::new(sess.delegated_resources.clone()),
+            delegated_resource_account_index: sess
+                .delegated_resource_account_index
+                .as_ref()
+                .map(|b| tron_chainbase::DelegatedResourceAccountIndexStore::new(b.clone())),
             dyn_props: DynamicPropertiesStore::new(sess.dyn_props.clone()),
             proposals: ProposalStore::new(sess.proposals.clone()),
             name_index: AccountIndexStore::new(sess.name_index.clone()),
@@ -567,6 +587,7 @@ impl SessionStoreOwners {
             votes: &self.votes,
             delegation: &self.delegation,
             delegated_resources: &self.delegated_resources,
+            delegated_resource_account_index: self.delegated_resource_account_index.as_ref(),
             dyn_props: &self.dyn_props,
             proposals: &self.proposals,
             name_index: &self.name_index,
@@ -953,6 +974,7 @@ struct BlockSession {
     votes: Arc<SessionBackend>,
     delegation: Arc<SessionBackend>,
     delegated_resources: Arc<SessionBackend>,
+    delegated_resource_account_index: Option<Arc<SessionBackend>>,
     dyn_props: Arc<SessionBackend>,
     proposals: Arc<SessionBackend>,
     name_index: Arc<SessionBackend>,
@@ -981,6 +1003,10 @@ impl BlockSession {
             votes: Arc::new(SessionBackend::new(state.votes.clone())),
             delegation: Arc::new(SessionBackend::new(state.delegation.clone())),
             delegated_resources: Arc::new(SessionBackend::new(state.delegated_resources.clone())),
+            delegated_resource_account_index: state
+                .delegated_resource_account_index
+                .as_ref()
+                .map(|b| Arc::new(SessionBackend::new(b.clone()))),
             dyn_props: Arc::new(SessionBackend::new(state.dyn_props.clone())),
             proposals: Arc::new(SessionBackend::new(state.proposals.clone())),
             name_index: Arc::new(SessionBackend::new(state.name_index.clone())),
@@ -1027,6 +1053,10 @@ impl BlockSession {
             votes: self.votes.clone(),
             delegation: self.delegation.clone(),
             delegated_resources: self.delegated_resources.clone(),
+            delegated_resource_account_index: self
+                .delegated_resource_account_index
+                .clone()
+                .map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
             dyn_props: self.dyn_props.clone(),
             proposals: self.proposals.clone(),
             name_index: self.name_index.clone(),
@@ -1082,6 +1112,9 @@ impl BlockSession {
         push(Id::ExchangeV2, self.exchange_v2.commit_with_undo()?);
         push(Id::MarketOrders, self.market_orders.commit_with_undo()?);
         push(Id::Nullifiers, self.nullifiers.commit_with_undo()?);
+        if let Some(s) = self.delegated_resource_account_index {
+            push(Id::DelegatedResourceAccountIndex, s.commit_with_undo()?);
+        }
         if let Some(s) = self.merkle_trees {
             push(Id::MerkleTrees, s.commit_with_undo()?);
         }
@@ -1164,6 +1197,12 @@ impl BlockSession {
         take(Id::ExchangeV2, self.exchange_v2, state.exchange_v2.clone())?;
         take(Id::MarketOrders, self.market_orders, state.market_orders.clone())?;
         take(Id::Nullifiers, self.nullifiers, state.nullifiers.clone())?;
+        if let (Some(s), Some(b)) = (
+            self.delegated_resource_account_index,
+            state.delegated_resource_account_index.clone(),
+        ) {
+            take(Id::DelegatedResourceAccountIndex, s, b)?;
+        }
         if let (Some(s), Some(b)) = (self.merkle_trees, state.merkle_trees.clone()) {
             take(Id::MerkleTrees, s, b)?;
         }
@@ -1274,6 +1313,9 @@ pub fn replay_pending_checkpoints(
     by_name.insert(Id::ExchangeV2.db_name(), state.exchange_v2.clone());
     by_name.insert(Id::MarketOrders.db_name(), state.market_orders.clone());
     by_name.insert(Id::Nullifiers.db_name(), state.nullifiers.clone());
+    if let Some(b) = state.delegated_resource_account_index.clone() {
+        by_name.insert(Id::DelegatedResourceAccountIndex.db_name(), b);
+    }
     if let Some(b) = state.merkle_trees.clone() {
         by_name.insert(Id::MerkleTrees.db_name(), b);
     }
@@ -1382,6 +1424,12 @@ pub fn rollback_block(
                 .witness_schedule
                 .as_ref()
                 .ok_or(RollbackError::OptionalStoreNotAttached("witness_schedule"))?,
+            Id::DelegatedResourceAccountIndex => state
+                .delegated_resource_account_index
+                .as_ref()
+                .ok_or(RollbackError::OptionalStoreNotAttached(
+                    "delegated_resource_account_index",
+                ))?,
         };
         match &entry.before {
             Some(v) => backend.put(&entry.key, v)?,
@@ -2287,7 +2335,7 @@ fn execute_vm_tx(
     // The fee_limit (TRX-denominated cap) gates how much energy the VM
     // is allowed to spend; this caps `energy_limit_for_vm = fee_limit /
     // energy_fee`. Until that flow lands we keep the 10M cap.
-    let now_slot = dp.latest_block_header_number().unwrap_or(0);
+    let now_slot = head_slot(&dp);
 
     let (caller_addr, trigger_contract_addr, outcome, vm_traces) = match ty {
         ContractType::TriggerSmartContract => {
@@ -2701,9 +2749,15 @@ fn extract_owner_for_bandwidth(
 }
 
 /// Current head slot, used as `now_slot` for the windowed-average math.
-/// Java-tron's `getHeadSlot()`; we approximate as
-/// `latest_block_header_number` (close enough — blocks are 1 slot
-/// each on a healthy chain).
+/// Java-tron's `getHeadSlot()` =
+/// `(latestBlockHeaderTimestamp - genesisBlockTimestamp) / BLOCK_PRODUCED_INTERVAL`.
+///
+/// This is **not** the block number: mainnet's genesis timestamp is 0, so a
+/// head at ~1.75e12 ms yields a slot of ~5.8e8 — far above the ~8.3e7 block
+/// height (the gap is every slot ever skipped). The per-account
+/// `latest_consume_time(_for_energy)` values written by java-tron are in
+/// these slot units, so the windowed-average decay must use the same formula
+/// or it mixes unit systems and decays usage incorrectly.
 fn head_slot(dyn_props_be: &tron_chainbase::DynamicPropertiesStore) -> i64 {
-    dyn_props_be.latest_block_header_number().unwrap_or(0)
+    dyn_props_be.head_slot()
 }

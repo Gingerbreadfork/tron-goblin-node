@@ -12,9 +12,10 @@
 use prost_types::Any;
 use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
-    AssetIssueV2Store, ContractStore, DelegatedResourceStore, DelegationStore,
-    DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, IncrementalMerkleTreeStore,
-    MarketOrderStore, NullifierStore, ProposalStore, VotesStore, WitnessStore,
+    AssetIssueV2Store, ContractStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
+    DelegationStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
+    IncrementalMerkleTreeStore, MarketOrderStore, NullifierStore, ProposalStore, VotesStore,
+    WitnessStore,
 };
 use tron_proto::transaction::contract::ContractType;
 
@@ -31,6 +32,11 @@ pub struct ActuatorStores<'a> {
     pub votes: &'a VotesStore,
     pub delegation: &'a DelegationStore,
     pub delegated_resources: &'a DelegatedResourceStore,
+    /// Bidirectional `(from, to)` delegation index. Updated on
+    /// delegate/undelegate so the RPC `getdelegatedresourceaccountindex`
+    /// queries match java-tron. `None` only in unit-test / validate-only
+    /// setups that don't exercise the index (production always provides it).
+    pub delegated_resource_account_index: Option<&'a DelegatedResourceAccountIndexStore>,
     pub dyn_props: &'a DynamicPropertiesStore,
     pub proposals: &'a ProposalStore,
     pub name_index: &'a AccountIndexStore,
@@ -453,6 +459,7 @@ pub fn dispatch_execute(
             crate::delegate::execute_delegate_resource(
                 stores.accounts,
                 stores.delegated_resources,
+                stores.delegated_resource_account_index,
                 stores.dyn_props,
                 &c,
             )
@@ -462,6 +469,7 @@ pub fn dispatch_execute(
             crate::delegate::execute_undelegate_resource(
                 stores.accounts,
                 stores.delegated_resources,
+                stores.delegated_resource_account_index,
                 stores.dyn_props,
                 &c,
             )
