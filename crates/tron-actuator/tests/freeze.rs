@@ -411,6 +411,47 @@ fn freeze_v2_re_freezing_same_resource_only_adds_delta_to_global_weight() {
 }
 
 #[test]
+fn freeze_v2_weight_basis_includes_delegated_out_frozen() {
+    // Regression for the TOTAL_*_WEIGHT drift (caught by tron-state-diff):
+    // the chain-weight basis is java-tron's `getFrozenV2BalanceWithDelegated`
+    // = held frozen-V2 + delegated-OUT, not just the held portion. Because
+    // weight = floor(basis / TRX_PRECISION), omitting the delegated 1.5 TRX
+    // shifts the rounding boundary and the freeze delta comes out wrong.
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    enable_v2(&dp);
+    // ALICE holds no frozen-V2 bandwidth, but has 1.5 TRX delegated out.
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 1000 * PRECISION,
+                r#type: AccountType::Normal as i32,
+                delegated_frozen_v2_balance_for_bandwidth: 1_500_000, // 1.5 TRX
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Freeze another 1.5 TRX of bandwidth.
+    let c = FreezeBalanceV2Contract {
+        owner_address: ALICE.to_vec(),
+        frozen_balance: 1_500_000,
+        resource: 0,
+    };
+    freeze_v2::execute_freeze_balance_v2(&accounts, &dp, &c).unwrap();
+
+    // java: floor((1.5+1.5 TRX)/TRX) - floor(1.5 TRX/TRX) = 3 - 1 = 2.
+    // The held-only bug would have given floor(1.5/1) - floor(0/1) = 1.
+    assert_eq!(
+        dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0),
+        2,
+        "weight delta must use the with-delegated basis (java parity), not held-only"
+    );
+}
+
+#[test]
 fn freeze_v2_different_resources_accumulate_in_separate_buckets() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());

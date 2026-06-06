@@ -7,7 +7,7 @@
 use tron_chainbase::{AccountStore, DynamicPropertiesStore};
 use tron_proto::account::{FreezeV2, UnFreezeV2};
 use tron_proto::{
-    CancelAllUnfreezeV2Contract, FreezeBalanceV2Contract, UnfreezeBalanceV2Contract,
+    Account, CancelAllUnfreezeV2Contract, FreezeBalanceV2Contract, UnfreezeBalanceV2Contract,
     WithdrawExpireUnfreezeContract,
 };
 
@@ -78,15 +78,9 @@ pub fn execute_freeze_balance_v2(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     account.balance = check_sub(account.balance, contract.frozen_balance)?;
 
-    // Capture old frozen balance for this resource — needed for the
-    // chain-wide weight delta (weight is in TRX units, computed as
-    // `frozen / TRX_PRECISION`).
-    let old_resource_balance = account
-        .frozen_v2
-        .iter()
-        .find(|f| f.r#type == contract.resource)
-        .map(|f| f.amount)
-        .unwrap_or(0);
+    // Capture the old weight basis BEFORE mutating frozen_v2 — java-tron's
+    // `getFrozenV2BalanceWithDelegated(resource)` (held + delegated-out).
+    let old_basis = frozen_v2_with_delegated(&account, contract.resource);
 
     let slot = account
         .frozen_v2
@@ -103,14 +97,46 @@ pub fn execute_freeze_balance_v2(
 
     // Update chain-wide TOTAL_*_WEIGHT — mirrors java-tron's
     // `FreezeBalanceV2Actuator.execute`:
-    //   newWeight = newFrozen / TRX_PRECISION
-    //   oldWeight = oldFrozen / TRX_PRECISION
+    //   oldWeight = getFrozenV2BalanceWithDelegated(res) / TRX_PRECISION
+    //   newWeight = (that + frozenBalance)             / TRX_PRECISION
     //   addTotal*Weight(newWeight - oldWeight)
-    let new_resource_balance = old_resource_balance.saturating_add(contract.frozen_balance);
-    let weight_delta =
-        new_resource_balance / TRX_PRECISION - old_resource_balance / TRX_PRECISION;
+    // The basis includes the delegated-out portion (freeze only grows the
+    // held part, so `new = old + frozenBalance`).
+    let new_basis = old_basis.saturating_add(contract.frozen_balance);
+    let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
     apply_weight_delta(dyn_props, contract.resource, weight_delta);
     Ok(ExecutionResult::default())
+}
+
+/// The weight *basis* for `resource` (0 = bandwidth, 1 = energy): the
+/// account's held frozen-V2 for that resource **plus what it has delegated
+/// out**. Mirrors java-tron's `AccountCapsule.getFrozenV2BalanceWithDelegated`
+/// — the value `Freeze/UnfreezeBalanceV2Actuator` divides by `TRX_PRECISION`
+/// to get the chain-weight contribution.
+///
+/// Using only the held `frozen_v2` (excluding the delegated portion) is a
+/// **consensus bug**: because the weight is `floor(basis / TRX_PRECISION)`,
+/// dropping the delegated amount shifts the rounding boundary, so every
+/// freeze/unfreeze by an account that has delegated resources out computes a
+/// different `floor(new) - floor(old)` delta than java-tron — and the
+/// chain-global `TOTAL_*_WEIGHT` drifts (caught by `tron-state-diff`).
+fn frozen_v2_with_delegated(account: &Account, resource: i32) -> i64 {
+    let held: i64 = account
+        .frozen_v2
+        .iter()
+        .filter(|f| f.r#type == resource)
+        .map(|f| f.amount)
+        .sum();
+    let delegated = match resource {
+        0 => account.delegated_frozen_v2_balance_for_bandwidth,
+        1 => account
+            .account_resource
+            .as_ref()
+            .map(|r| r.delegated_frozen_v2_balance_for_energy)
+            .unwrap_or(0),
+        _ => 0,
+    };
+    held.saturating_add(delegated)
 }
 
 /// Apply `delta` (TRX-unit weight) to the chain-wide
@@ -175,13 +201,9 @@ pub fn execute_unfreeze_balance_v2(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
 
-    // Capture old frozen balance for the weight delta.
-    let old_resource_balance = account
-        .frozen_v2
-        .iter()
-        .find(|f| f.r#type == contract.resource)
-        .map(|f| f.amount)
-        .unwrap_or(0);
+    // Capture the old weight basis BEFORE deducting — java-tron's
+    // `getFrozenV2BalanceWithDelegated(resource)` (held + delegated-out).
+    let old_basis = frozen_v2_with_delegated(&account, contract.resource);
 
     // Deduct from the resource-typed FreezeV2 entry.
     if let Some(slot) = account
@@ -201,11 +223,11 @@ pub fn execute_unfreeze_balance_v2(
     accounts.put(&owner, &account)?;
 
     // Shrink chain-wide weight by the freed amount. Java-tron:
-    //   newWeight = (oldFrozen - unfreezeBalance) / TRX_PRECISION
+    //   oldWeight = getFrozenV2BalanceWithDelegated(res) / TRX_PRECISION
+    //   newWeight = (that - unfreezeBalance)            / TRX_PRECISION
     //   addTotal*Weight(newWeight - oldWeight)  // negative
-    let new_resource_balance = old_resource_balance.saturating_sub(contract.unfreeze_balance);
-    let weight_delta =
-        new_resource_balance / TRX_PRECISION - old_resource_balance / TRX_PRECISION;
+    let new_basis = old_basis.saturating_sub(contract.unfreeze_balance);
+    let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
     apply_weight_delta(dyn_props, contract.resource, weight_delta);
     Ok(ExecutionResult::default())
 }
@@ -303,18 +325,10 @@ pub fn execute_cancel_all_unfreeze_v2(
     // unfreeze_balance_v2 was called).
     let mut restored_net: i64 = 0;
     let mut restored_energy: i64 = 0;
-    let old_net = account
-        .frozen_v2
-        .iter()
-        .find(|f| f.r#type == 0)
-        .map(|f| f.amount)
-        .unwrap_or(0);
-    let old_energy = account
-        .frozen_v2
-        .iter()
-        .find(|f| f.r#type == 1)
-        .map(|f| f.amount)
-        .unwrap_or(0);
+    // Old weight basis = held frozen-V2 + delegated-out (java-tron's
+    // `getFrozenV2BalanceWithDelegated`), captured before restoring.
+    let old_net = frozen_v2_with_delegated(&account, 0);
+    let old_energy = frozen_v2_with_delegated(&account, 1);
 
     let pending = std::mem::take(&mut account.unfrozen_v2);
     for entry in pending {
