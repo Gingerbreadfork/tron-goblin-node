@@ -39,6 +39,7 @@ use bytes::Bytes;
 use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tron_proto::block_inventory;
+use tron_proto::chain_inventory;
 use tron_proto::inventory::InventoryType;
 use tron_proto::{Block, BlockInventory, ChainInventory, Inventory};
 use tron_types::BlockId;
@@ -165,6 +166,24 @@ where
         payload: Bytes::from(inv.encode_to_vec()),
     })
     .await
+}
+
+/// Build the `ChainInventory` reply for a peer syncing FROM us.
+///
+/// `ids` runs from the common ancestor onward — java-tron includes the
+/// shared block as the first id so the peer can verify the link — and
+/// `remain_num` is how many further blocks we hold beyond this batch.
+pub fn chain_inventory_from_ids(ids: &[BlockId], remain_num: i64) -> ChainInventory {
+    ChainInventory {
+        ids: ids
+            .iter()
+            .map(|id| chain_inventory::BlockId {
+                hash: id.as_bytes().to_vec(),
+                number: id.num() as i64,
+            })
+            .collect(),
+        remain_num,
+    }
 }
 
 /// Await a `SyncBlockChain` request (provider side). Returns the

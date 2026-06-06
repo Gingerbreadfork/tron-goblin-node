@@ -886,9 +886,27 @@ impl SyncDriver {
             }
             Err(e) => return PeerOutcome::PeerFailure(format!("handshake: {e}")),
         }
+        // Surface the peer's advertised chain state so we can tell whether a
+        // peer that then refuses to serve us is genuinely ahead (a real
+        // sync-protocol bug on our side) or just behind / a non-serving lite
+        // node (peer-quality, expected). `node_type != 0` ⇒ a lite/fullnode
+        // variant that may not serve archive sync. (M-22b diagnostics.)
+        let (peer_head, peer_solid, peer_node_type, peer_lowest) = match conn.peer_hello() {
+            Some(h) => (
+                h.head_block_id.as_ref().map(|b| b.number).unwrap_or(-1),
+                h.solid_block_id.as_ref().map(|b| b.number).unwrap_or(-1),
+                h.node_type,
+                h.lowest_block_num,
+            ),
+            None => (-1, -1, -1, -1),
+        };
         info!(
             peer,
-            head = self.head_number(),
+            our_head = self.head_number(),
+            peer_head,
+            peer_solid,
+            peer_node_type,
+            peer_lowest,
             "handshake ok"
         );
 
@@ -1022,6 +1040,16 @@ impl SyncDriver {
             // Fresh node / no index — genesis is in every peer's main chain.
             summary.push(prev_id.unwrap_or(genesis));
         }
+        // M-22b: the locator we ask with — its first id must be in the peer's
+        // main chain, its last id is our head. Verifiable against the
+        // subsequent accept/reject.
+        debug!(
+            peer,
+            len = summary.len(),
+            first_num = summary.first().map(|id| id.num()).unwrap_or(0),
+            last_num = summary.last().map(|id| id.num()).unwrap_or(0),
+            "sent SyncBlockChain locator"
+        );
         last_request_at = Some(Instant::now());
         if let Err(e) = tron_net::sync::send_sync_request(&mut conn, &summary).await {
             return PeerOutcome::PeerFailure(format!("send_sync_request: {e}"));
@@ -1288,6 +1316,12 @@ impl SyncDriver {
                 }
                 continue;
             }
+
+            // M-22b: trace every inbound frame so the exact post-handshake
+            // exchange with a peer that then rejects us is visible (run with
+            // `RUST_LOG=tron_node::sync=debug`). Pairs with the outbound
+            // "sent SyncBlockChain locator" / fetch logs.
+            debug!(peer, frame = ?frame.ty, len = frame.payload.len(), "rx frame");
 
             match frame.ty {
                 MessageType::Inventory => {
@@ -1795,6 +1829,41 @@ impl SyncDriver {
                         }
                     }
                 }
+                MessageType::SyncBlockChain => {
+                    // A peer wants to sync FROM us: it sent its chain locator
+                    // and expects a `BlockChainInventory` of the ids we hold
+                    // past the highest block we share. Without this reply the
+                    // peer waits a few hundred ms, gets nothing, and drops us
+                    // with BAD_PROTOCOL (reason 2) — java-tron's
+                    // SyncBlockChainMsgHandler is mandatory, not optional, and
+                    // its absence was why public peers rejected us while our
+                    // own node (whose head matched ours) tolerated it. (M-22b)
+                    let inv = match tron_proto::BlockInventory::decode(frame.payload)
+                    {
+                        Ok(i) => i,
+                        Err(e) => {
+                            debug!(peer, error = %e, "decode inbound SyncBlockChain");
+                            continue;
+                        }
+                    };
+                    let (ids, remain) = self.serve_sync_block_chain(&inv.ids);
+                    let reply =
+                        tron_net::sync::chain_inventory_from_ids(&ids, remain);
+                    if let Err(e) =
+                        tron_net::sync::send_chain_inventory(&mut conn, &reply).await
+                    {
+                        return PeerOutcome::PeerFailure(format!(
+                            "send_chain_inventory: {e}"
+                        ));
+                    }
+                    debug!(
+                        peer,
+                        served = ids.len(),
+                        remain,
+                        locator = inv.ids.len(),
+                        "served SyncBlockChain"
+                    );
+                }
                 other => {
                     debug!(ty = ?other, "unhandled frame in dispatch loop");
                 }
@@ -1866,6 +1935,62 @@ impl SyncDriver {
         // main chain) gates the request; the last id is our head.
         ids.reverse();
         ids
+    }
+
+    /// Build the `BlockChainInventory` reply for a peer that sent us a
+    /// `SyncBlockChain` locator (it wants to catch up FROM us).
+    ///
+    /// Finds the highest block in the peer's locator that sits on our main
+    /// chain — the common ancestor — and returns our block ids from there
+    /// onward (the shared block first, so the peer can verify the link),
+    /// capped at `SYNC_FETCH_BATCH_NUM`, plus how many more blocks we hold
+    /// beyond the batch (`remain_num`).
+    ///
+    /// Returns `(empty, 0)` when we have no index or share no block with the
+    /// peer — still a valid "nothing for you" reply, which is what keeps the
+    /// peer from timing out and dropping us with BAD_PROTOCOL. (M-22b)
+    fn serve_sync_block_chain(
+        &self,
+        locator: &[tron_proto::block_inventory::BlockId],
+    ) -> (Vec<BlockId>, i64) {
+        let our_head = self.head_number();
+        let Some(bi) = &self.state.block_index else {
+            return (Vec::new(), 0);
+        };
+        let block_index = BlockIndexStore::new(bi.clone());
+
+        // The locator is dense near the peer's head and sparse below; keep the
+        // highest entry whose id matches our main-chain block at that number.
+        let mut common: Option<i64> = None;
+        for entry in locator {
+            if entry.hash.len() != 32 {
+                continue;
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&entry.hash);
+            let their_id = BlockId::from_raw(raw);
+            if block_index
+                .get(entry.number)
+                .map(|ours| ours == their_id)
+                .unwrap_or(false)
+            {
+                common = Some(common.map_or(entry.number, |c| c.max(entry.number)));
+            }
+        }
+        let Some(start) = common else {
+            return (Vec::new(), 0);
+        };
+
+        const SYNC_FETCH_BATCH_NUM: i64 = 2000;
+        let end = (start + SYNC_FETCH_BATCH_NUM).min(our_head);
+        let mut ids = Vec::new();
+        for num in start..=end {
+            match block_index.get(num) {
+                Ok(id) => ids.push(id),
+                Err(_) => break,
+            }
+        }
+        (ids, (our_head - end).max(0))
     }
 
     /// Validate + persist + execute a single block. Returns the
@@ -4869,6 +4994,123 @@ mod solidify_tests {
         for id in &summary {
             assert_eq!(bi.get(id.num() as i64).unwrap(), *id);
         }
+    }
+
+    /// Build a peer locator (`block_inventory::BlockId` list) from the
+    /// canonical ids at the given numbers, mimicking what a peer sends in a
+    /// `SyncBlockChain`.
+    fn locator_of(
+        ids_by_num: &std::collections::HashMap<i64, BlockId>,
+        nums: &[i64],
+    ) -> Vec<tron_proto::block_inventory::BlockId> {
+        nums.iter()
+            .map(|&n| tron_proto::block_inventory::BlockId {
+                hash: ids_by_num[&n].as_bytes().to_vec(),
+                number: n,
+            })
+            .collect()
+    }
+
+    /// Index a `head`-long chain into `state`, set the head pointer, and
+    /// return the driver plus the num→id map for building locators.
+    fn driver_with_chain(
+        head: i64,
+    ) -> (SyncDriver, std::collections::HashMap<i64, BlockId>) {
+        let state = mem_state();
+        let blocks_be = mem();
+        let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        let mut ids_by_num = std::collections::HashMap::new();
+        for num in 1..=head {
+            let block = block_by(num, &witness((num as usize) % 27));
+            let id = block_id_from_block(&block).unwrap();
+            bi.put(&id).unwrap();
+            ids_by_num.insert(num, id);
+        }
+        dp.save_latest_block_header_number(head);
+        (driver_with(state, blocks_be), ids_by_num)
+    }
+
+    #[test]
+    fn serve_sync_block_chain_serves_from_shared_block_to_head() {
+        // A peer 200 blocks behind sends its locator (tops out at 300). We
+        // must reply with our ids from the shared block 300 onward — the
+        // shared block first so it can verify the link — contiguous to head.
+        let head = 500i64;
+        let (driver, ids) = driver_with_chain(head);
+        let locator = locator_of(&ids, &[300, 299, 297, 293, 285, 269, 237, 173, 45, 1]);
+
+        let (served, remain) = driver.serve_sync_block_chain(&locator);
+
+        assert_eq!(served.first().unwrap().num() as i64, 300, "shared block first");
+        assert_eq!(served.last().unwrap().num() as i64, head, "served up to head");
+        assert_eq!(served.len(), (head - 300 + 1) as usize);
+        assert!(
+            served.windows(2).all(|w| w[1].num() == w[0].num() + 1),
+            "contiguous run"
+        );
+        assert_eq!(remain, 0, "nothing beyond our head");
+    }
+
+    #[test]
+    fn serve_sync_block_chain_caps_batch_and_reports_remain() {
+        // From a deep common ancestor we send at most SYNC_FETCH_BATCH_NUM
+        // (2000) ids and report the rest via remain_num so the peer keeps
+        // asking.
+        let head = 5000i64;
+        let (driver, ids) = driver_with_chain(head);
+        let locator = locator_of(&ids, &[1000, 999, 997, 993, 1]);
+
+        let (served, remain) = driver.serve_sync_block_chain(&locator);
+
+        // 1000..=3000 inclusive = 2001 ids (shared block + 2000-block batch).
+        assert_eq!(served.first().unwrap().num() as i64, 1000);
+        assert_eq!(served.last().unwrap().num() as i64, 3000);
+        assert_eq!(served.len(), 2001);
+        assert_eq!(remain, head - 3000, "remaining blocks beyond the batch");
+    }
+
+    #[test]
+    fn serve_sync_block_chain_empty_when_no_shared_block() {
+        // A locator whose ids don't match our chain (wrong hashes / a fork we
+        // don't have) yields an empty reply — a valid "nothing for you" that
+        // still keeps the peer from timing out.
+        let head = 100i64;
+        let (driver, _ids) = driver_with_chain(head);
+        // Numbers we have, but bogus hashes → no match.
+        let bogus: Vec<tron_proto::block_inventory::BlockId> = [50i64, 25, 1]
+            .iter()
+            .map(|&n| tron_proto::block_inventory::BlockId {
+                hash: vec![0xab; 32],
+                number: n,
+            })
+            .collect();
+
+        let (served, remain) = driver.serve_sync_block_chain(&bogus);
+
+        assert!(served.is_empty(), "no shared block → empty reply");
+        assert_eq!(remain, 0);
+    }
+
+    #[test]
+    fn serve_sync_block_chain_handles_peer_ahead_of_us() {
+        // A peer ahead of us sends a locator with blocks above our head plus
+        // some we share. The common ancestor is our head (highest shared), so
+        // we serve just [head] with remain 0 — telling it we have nothing new.
+        let head = 300i64;
+        let (driver, ids) = driver_with_chain(head);
+        // Locator: phantom future blocks (we don't have them) + our head + deep.
+        let mut locator = vec![
+            tron_proto::block_inventory::BlockId { hash: vec![0x11; 32], number: 305 },
+            tron_proto::block_inventory::BlockId { hash: vec![0x22; 32], number: 303 },
+        ];
+        locator.extend(locator_of(&ids, &[300, 296, 288, 1]));
+
+        let (served, remain) = driver.serve_sync_block_chain(&locator);
+
+        assert_eq!(served.len(), 1, "only the shared head");
+        assert_eq!(served[0].num() as i64, head);
+        assert_eq!(remain, 0);
     }
 }
 
