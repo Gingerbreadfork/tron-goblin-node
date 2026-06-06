@@ -1063,25 +1063,247 @@ pub fn get_energy_prices(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 // Account-encoding helper
 // =============================================================================
 
+/// Render an [`Account`] in java-tron's `wallet/getaccount` JSON shape.
+///
+/// Matches java-tron's protobuf `JsonFormat`: the **proto field names**
+/// verbatim (snake_case for most, camelCase for the proto's `frozenV2` /
+/// `assetV2` / `…frozenV2…` / `codeHash` fields), default-valued fields
+/// **omitted**, nested messages (`account_resource`, permissions) rendered
+/// recursively, and map fields rendered as `[{key, value}]` arrays. Bytes are
+/// hex; address-bearing fields (`address`, `vote_address`, permission key
+/// `address`) are rewritten to base58 by `http_rest::rewrite_addresses` when
+/// `visible=true`. `account_name` / `asset_issued_name` / `asset_issued_ID`
+/// render as text, as java-tron does.
+///
+/// (The previous encoder emitted an ETH-style camelCase/`0x`-hex subset,
+/// which diverged from java-tron on ~every field — caught by `tron-state-diff`.)
 fn encode_account_for_rpc(a: &tron_proto::Account) -> Value {
-    json!({
-        "address": hex_bytes(&a.address),
-        "balance": a.balance,
-        "createTime": a.create_time,
-        "latestOprationTime": a.latest_opration_time,
-        "allowance": a.allowance,
-        "latestWithdrawTime": a.latest_withdraw_time,
-        "isWitness": a.is_witness,
-        "isCommittee": a.is_committee,
-        "type": a.r#type,
-        "netUsage": a.net_usage,
-        "freeNetUsage": a.free_net_usage,
-        "latestConsumeTime": a.latest_consume_time,
-        "latestConsumeFreeTime": a.latest_consume_free_time,
-        "codeHash": hex_bytes(&a.code_hash),
-        "assetV2": a.asset_v2.iter().map(|(k, v)| json!({"key": k, "value": v})).collect::<Vec<_>>(),
-        "votesCount": a.votes.len(),
-    })
+    use serde_json::Map;
+    let mut m = Map::new();
+
+    // address is always present (rewritten to base58 by the http layer).
+    m.insert("address".into(), json!(hex_bytes(&a.address)));
+    let put = |m: &mut Map<String, Value>, k: &str, present: bool, v: Value| {
+        if present {
+            m.insert(k.to_string(), v);
+        }
+    };
+
+    if !a.account_name.is_empty() {
+        m.insert("account_name".into(), json!(String::from_utf8_lossy(&a.account_name)));
+    }
+    put(&mut m, "type", a.r#type != 0, json!(account_type_name(a.r#type)));
+    put(&mut m, "balance", a.balance != 0, json!(a.balance));
+    put(&mut m, "create_time", a.create_time != 0, json!(a.create_time));
+    put(&mut m, "latest_opration_time", a.latest_opration_time != 0, json!(a.latest_opration_time));
+    put(&mut m, "allowance", a.allowance != 0, json!(a.allowance));
+    put(&mut m, "latest_withdraw_time", a.latest_withdraw_time != 0, json!(a.latest_withdraw_time));
+    put(&mut m, "is_witness", a.is_witness, json!(true));
+    put(&mut m, "is_committee", a.is_committee, json!(true));
+    put(&mut m, "net_usage", a.net_usage != 0, json!(a.net_usage));
+    put(&mut m, "free_net_usage", a.free_net_usage != 0, json!(a.free_net_usage));
+    put(&mut m, "latest_consume_time", a.latest_consume_time != 0, json!(a.latest_consume_time));
+    put(&mut m, "latest_consume_free_time", a.latest_consume_free_time != 0, json!(a.latest_consume_free_time));
+    put(&mut m, "net_window_size", a.net_window_size != 0, json!(a.net_window_size));
+    put(&mut m, "net_window_optimized", a.net_window_optimized, json!(true));
+    put(&mut m, "asset_optimized", a.asset_optimized, json!(true));
+    put(&mut m, "old_tron_power", a.old_tron_power != 0, json!(a.old_tron_power));
+    if !a.code_hash.is_empty() {
+        m.insert("codeHash".into(), json!(hex::encode(&a.code_hash)));
+    }
+    if !a.account_id.is_empty() {
+        m.insert("account_id".into(), json!(hex::encode(&a.account_id)));
+    }
+    if !a.asset_issued_name.is_empty() {
+        m.insert("asset_issued_name".into(), json!(String::from_utf8_lossy(&a.asset_issued_name)));
+    }
+    if !a.asset_issued_id.is_empty() {
+        m.insert("asset_issued_ID".into(), json!(String::from_utf8_lossy(&a.asset_issued_id)));
+    }
+
+    // Delegated / acquired bandwidth balances (v1 + v2).
+    put(&mut m, "acquired_delegated_frozen_balance_for_bandwidth",
+        a.acquired_delegated_frozen_balance_for_bandwidth != 0,
+        json!(a.acquired_delegated_frozen_balance_for_bandwidth));
+    put(&mut m, "delegated_frozen_balance_for_bandwidth",
+        a.delegated_frozen_balance_for_bandwidth != 0,
+        json!(a.delegated_frozen_balance_for_bandwidth));
+    put(&mut m, "acquired_delegated_frozenV2_balance_for_bandwidth",
+        a.acquired_delegated_frozen_v2_balance_for_bandwidth != 0,
+        json!(a.acquired_delegated_frozen_v2_balance_for_bandwidth));
+    put(&mut m, "delegated_frozenV2_balance_for_bandwidth",
+        a.delegated_frozen_v2_balance_for_bandwidth != 0,
+        json!(a.delegated_frozen_v2_balance_for_bandwidth));
+
+    // Frozen / vote arrays.
+    if !a.frozen.is_empty() {
+        m.insert("frozen".into(), json!(a.frozen.iter().map(frozen_json).collect::<Vec<_>>()));
+    }
+    if !a.frozen_v2.is_empty() {
+        m.insert("frozenV2".into(), json!(a.frozen_v2.iter().map(freeze_v2_json).collect::<Vec<_>>()));
+    }
+    if !a.frozen_supply.is_empty() {
+        m.insert("frozen_supply".into(), json!(a.frozen_supply.iter().map(frozen_json).collect::<Vec<_>>()));
+    }
+    if let Some(tp) = &a.tron_power {
+        if tp.frozen_balance != 0 || tp.expire_time != 0 {
+            m.insert("tron_power".into(), frozen_json(tp));
+        }
+    }
+    if !a.votes.is_empty() {
+        m.insert("votes".into(), json!(a.votes.iter().map(vote_json).collect::<Vec<_>>()));
+    }
+
+    // Map fields → [{key, value}] arrays (java-tron's rendering).
+    if !a.asset_v2.is_empty() {
+        m.insert("assetV2".into(), kv_array(&a.asset_v2));
+    }
+    if !a.free_asset_net_usage_v2.is_empty() {
+        m.insert("free_asset_net_usageV2".into(), kv_array(&a.free_asset_net_usage_v2));
+    }
+    if !a.latest_asset_operation_time_v2.is_empty() {
+        m.insert("latest_asset_operation_timeV2".into(), kv_array(&a.latest_asset_operation_time_v2));
+    }
+
+    // Permissions.
+    if let Some(p) = &a.owner_permission {
+        m.insert("owner_permission".into(), permission_json(p));
+    }
+    if let Some(p) = &a.witness_permission {
+        m.insert("witness_permission".into(), permission_json(p));
+    }
+    if !a.active_permission.is_empty() {
+        m.insert("active_permission".into(), json!(a.active_permission.iter().map(permission_json).collect::<Vec<_>>()));
+    }
+
+    // Nested energy/storage block.
+    if let Some(r) = &a.account_resource {
+        let ar = account_resource_json(r);
+        if ar.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            m.insert("account_resource".into(), ar);
+        }
+    }
+
+    Value::Object(m)
+}
+
+fn account_type_name(t: i32) -> &'static str {
+    match t {
+        1 => "AssetIssue",
+        2 => "Contract",
+        _ => "Normal",
+    }
+}
+
+fn resource_code_name(t: i32) -> &'static str {
+    match t {
+        1 => "ENERGY",
+        2 => "TRON_POWER",
+        _ => "BANDWIDTH",
+    }
+}
+
+fn permission_type_name(t: i32) -> &'static str {
+    match t {
+        1 => "Witness",
+        2 => "Active",
+        _ => "Owner",
+    }
+}
+
+fn frozen_json(f: &tron_proto::account::Frozen) -> Value {
+    let mut m = serde_json::Map::new();
+    if f.frozen_balance != 0 {
+        m.insert("frozen_balance".into(), json!(f.frozen_balance));
+    }
+    if f.expire_time != 0 {
+        m.insert("expire_time".into(), json!(f.expire_time));
+    }
+    Value::Object(m)
+}
+
+fn freeze_v2_json(f: &tron_proto::account::FreezeV2) -> Value {
+    let mut m = serde_json::Map::new();
+    if f.r#type != 0 {
+        m.insert("type".into(), json!(resource_code_name(f.r#type)));
+    }
+    if f.amount != 0 {
+        m.insert("amount".into(), json!(f.amount));
+    }
+    Value::Object(m)
+}
+
+fn vote_json(v: &tron_proto::Vote) -> Value {
+    json!({ "vote_address": hex_bytes(&v.vote_address), "vote_count": v.vote_count })
+}
+
+/// Render a `map<string,int64>` proto field as java-tron does: a
+/// `[{key, value}]` array. The proto maps decode to `BTreeMap`, so iteration
+/// is already key-sorted (deterministic output).
+fn kv_array(map: &std::collections::BTreeMap<String, i64>) -> Value {
+    json!(map
+        .iter()
+        .map(|(k, v)| json!({ "key": k, "value": v }))
+        .collect::<Vec<_>>())
+}
+
+fn permission_json(p: &tron_proto::Permission) -> Value {
+    let mut m = serde_json::Map::new();
+    if p.r#type != 0 {
+        m.insert("type".into(), json!(permission_type_name(p.r#type)));
+    }
+    if p.id != 0 {
+        m.insert("id".into(), json!(p.id));
+    }
+    if !p.permission_name.is_empty() {
+        m.insert("permission_name".into(), json!(p.permission_name));
+    }
+    if p.threshold != 0 {
+        m.insert("threshold".into(), json!(p.threshold));
+    }
+    if p.parent_id != 0 {
+        m.insert("parent_id".into(), json!(p.parent_id));
+    }
+    if !p.operations.is_empty() {
+        m.insert("operations".into(), json!(hex::encode(&p.operations)));
+    }
+    if !p.keys.is_empty() {
+        m.insert(
+            "keys".into(),
+            json!(p
+                .keys
+                .iter()
+                .map(|k| json!({ "address": hex_bytes(&k.address), "weight": k.weight }))
+                .collect::<Vec<_>>()),
+        );
+    }
+    Value::Object(m)
+}
+
+fn account_resource_json(r: &tron_proto::account::AccountResource) -> Value {
+    let mut m = serde_json::Map::new();
+    let put = |m: &mut serde_json::Map<String, Value>, k: &str, present: bool, v: Value| {
+        if present {
+            m.insert(k.to_string(), v);
+        }
+    };
+    put(&mut m, "energy_usage", r.energy_usage != 0, json!(r.energy_usage));
+    if let Some(f) = &r.frozen_balance_for_energy {
+        if f.frozen_balance != 0 || f.expire_time != 0 {
+            m.insert("frozen_balance_for_energy".into(), frozen_json(f));
+        }
+    }
+    put(&mut m, "latest_consume_time_for_energy", r.latest_consume_time_for_energy != 0, json!(r.latest_consume_time_for_energy));
+    put(&mut m, "acquired_delegated_frozen_balance_for_energy", r.acquired_delegated_frozen_balance_for_energy != 0, json!(r.acquired_delegated_frozen_balance_for_energy));
+    put(&mut m, "delegated_frozen_balance_for_energy", r.delegated_frozen_balance_for_energy != 0, json!(r.delegated_frozen_balance_for_energy));
+    put(&mut m, "storage_limit", r.storage_limit != 0, json!(r.storage_limit));
+    put(&mut m, "storage_usage", r.storage_usage != 0, json!(r.storage_usage));
+    put(&mut m, "latest_exchange_storage_time", r.latest_exchange_storage_time != 0, json!(r.latest_exchange_storage_time));
+    put(&mut m, "energy_window_size", r.energy_window_size != 0, json!(r.energy_window_size));
+    put(&mut m, "delegated_frozenV2_balance_for_energy", r.delegated_frozen_v2_balance_for_energy != 0, json!(r.delegated_frozen_v2_balance_for_energy));
+    put(&mut m, "acquired_delegated_frozenV2_balance_for_energy", r.acquired_delegated_frozen_v2_balance_for_energy != 0, json!(r.acquired_delegated_frozen_v2_balance_for_energy));
+    put(&mut m, "energy_window_optimized", r.energy_window_optimized, json!(true));
+    Value::Object(m)
 }
 
 // =============================================================================
@@ -5663,6 +5885,56 @@ mod log_range_tests {
             resolve_log_block_range(&obj(json!({})), 42).unwrap(),
             Some((42, 42))
         );
+    }
+}
+
+#[cfg(test)]
+mod account_encoding_tests {
+    use super::*;
+    use tron_proto::account::{AccountResource, FreezeV2};
+
+    #[test]
+    fn account_json_matches_java_tron_shape() {
+        let a = tron_proto::Account {
+            address: vec![0x41; 21],
+            balance: 1_000,
+            create_time: 1_606_989_672_000_i64,
+            net_usage: 250,
+            is_witness: true,
+            net_window_size: 28_800_000,
+            net_window_optimized: true,
+            account_name: b"Ant Investment Group".to_vec(),
+            frozen_v2: vec![FreezeV2 { r#type: 1, amount: 5_000 }],
+            account_resource: Some(AccountResource {
+                energy_usage: 999,
+                energy_window_size: 28_800_000,
+                energy_window_optimized: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let v = encode_account_for_rpc(&a);
+        let o = v.as_object().unwrap();
+
+        // java-tron proto field names (snake_case), NOT the old eth camelCase.
+        assert_eq!(o.get("create_time"), Some(&json!(1_606_989_672_000_i64)));
+        assert_eq!(o.get("net_usage"), Some(&json!(250)));
+        assert_eq!(o.get("is_witness"), Some(&json!(true)));
+        assert_eq!(o.get("net_window_size"), Some(&json!(28_800_000)));
+        assert!(o.get("createTime").is_none(), "no eth-style camelCase keys");
+        assert!(o.get("netUsage").is_none());
+        assert!(o.get("votesCount").is_none());
+        // account_name rendered as text, like java-tron.
+        assert_eq!(o.get("account_name"), Some(&json!("Ant Investment Group")));
+        // frozenV2 keeps the proto's camelCase key + ResourceCode enum name.
+        assert_eq!(o["frozenV2"], json!([{ "type": "ENERGY", "amount": 5_000 }]));
+        // Nested account_resource block, snake_case fields.
+        assert_eq!(o["account_resource"]["energy_usage"], json!(999));
+        assert_eq!(o["account_resource"]["energy_window_size"], json!(28_800_000));
+        assert_eq!(o["account_resource"]["energy_window_optimized"], json!(true));
+        // Default-valued fields omitted (proto3 omission, like java).
+        assert!(o.get("allowance").is_none());
+        assert!(o.get("frozen").is_none());
     }
 }
 
