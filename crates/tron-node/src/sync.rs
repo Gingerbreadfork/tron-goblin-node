@@ -129,6 +129,96 @@ pub struct DriverStats {
     pub reconnects: usize,
 }
 
+/// How long the active syncer may make no block-apply progress before a
+/// standby driver is allowed to take leadership. Comfortably above
+/// mainnet's ~3s block cadence (a healthy leader applies a block well
+/// within this), but well under the 120s keepalive deadline so failover
+/// from a dead/stuck leader is prompt.
+const LEADERSHIP_STALE: Duration = Duration::from_secs(30);
+
+/// Coordinates the single active block-applying `SyncDriver` across the
+/// per-peer driver fleet. The runtime spawns one driver per peer, all
+/// sharing the same RocksDB state; without coordination every driver
+/// applies the same blocks concurrently — racing the head and flooding
+/// spurious `unlinked` / `ParentLinkMismatch` rejections (each driver has
+/// its own in-memory fork tree). Exactly one driver leads (requests +
+/// applies blocks); the rest stay connected as standby — serving inbound
+/// sync, answering keepalives — and take over only if the leader stops
+/// making progress for [`LEADERSHIP_STALE`] or disconnects.
+#[derive(Debug)]
+pub struct SyncLeadership {
+    inner: std::sync::Mutex<LeaderState>,
+}
+
+#[derive(Debug)]
+struct LeaderState {
+    /// Peer key of the current active syncer, or `None` when the slot is
+    /// free (startup, or just after the leader released it).
+    leader: Option<String>,
+    /// When the leader last applied a block (or, for a fresh claimant,
+    /// when it took the slot). Drives the staleness check.
+    last_progress: Instant,
+}
+
+impl SyncLeadership {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(LeaderState {
+                leader: None,
+                last_progress: Instant::now(),
+            }),
+        }
+    }
+
+    /// Claim or retain leadership for `peer`. Returns `true` if `peer` is
+    /// the active syncer after the call. A challenger wins only when the
+    /// slot is free or the incumbent has made no progress within `stale`;
+    /// the incumbent retains without resetting its own progress timer (so
+    /// a busy-looping-but-not-applying leader can still be displaced).
+    pub fn claim_or_check(&self, peer: &str, stale: Duration) -> bool {
+        let mut g = self.inner.lock().expect("SyncLeadership poisoned");
+        match g.leader.as_deref() {
+            Some(l) if l == peer => true,
+            Some(_) if g.last_progress.elapsed() >= stale => {
+                g.leader = Some(peer.to_string());
+                g.last_progress = Instant::now();
+                true
+            }
+            Some(_) => false,
+            None => {
+                g.leader = Some(peer.to_string());
+                g.last_progress = Instant::now();
+                true
+            }
+        }
+    }
+
+    /// Reset the staleness timer — the leader just applied a block.
+    /// No-op if `peer` isn't the current leader.
+    pub fn note_progress(&self, peer: &str) {
+        let mut g = self.inner.lock().expect("SyncLeadership poisoned");
+        if g.leader.as_deref() == Some(peer) {
+            g.last_progress = Instant::now();
+        }
+    }
+
+    /// Relinquish leadership if `peer` holds it (on disconnect), freeing
+    /// the slot so a standby can take over immediately rather than waiting
+    /// out [`LEADERSHIP_STALE`].
+    pub fn release(&self, peer: &str) {
+        let mut g = self.inner.lock().expect("SyncLeadership poisoned");
+        if g.leader.as_deref() == Some(peer) {
+            g.leader = None;
+        }
+    }
+}
+
+impl Default for SyncLeadership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Block-sync driver. Hold one per node; spawn it on a task.
 pub struct SyncDriver {
     state: StateBackends,
@@ -284,6 +374,15 @@ pub struct SyncDriver {
     /// (tests / SR runtime), which fall back to the decoded check (their
     /// blocks re-encode canonically anyway).
     pending_raw_block: Option<Bytes>,
+    /// Optional shared single-active-syncer coordinator. The runtime
+    /// spawns one driver per peer; without coordination they all apply
+    /// the same blocks against shared state concurrently, racing the head
+    /// and flooding spurious `unlinked` / `ParentLinkMismatch` rejections.
+    /// When attached, exactly one driver leads (requests + applies); the
+    /// rest stay connected as standby and take over only if the leader
+    /// stalls or drops. `None` ⇒ no coordination (tests / SR / single
+    /// peer), preserving the original always-active behavior.
+    leadership: Option<Arc<SyncLeadership>>,
 }
 
 impl SyncDriver {
@@ -330,6 +429,44 @@ impl SyncDriver {
             strict_ref_block: false,
             recent_witnesses: VecDeque::new(),
             pending_raw_block: None,
+            leadership: None,
+        }
+    }
+
+    /// Attach the shared single-active-syncer coordinator. All per-peer
+    /// drivers in a node share one [`SyncLeadership`]; exactly one leads
+    /// (requests + applies blocks) while the rest stand by. Without it,
+    /// every driver applies the same blocks concurrently and races the
+    /// shared head. Omitted by tests / the SR runtime / single-peer setups,
+    /// which keep the always-active behavior.
+    pub fn with_leadership(mut self, leadership: Arc<SyncLeadership>) -> Self {
+        self.leadership = Some(leadership);
+        self
+    }
+
+    /// Whether this driver may act as the active syncer right now —
+    /// claiming or retaining leadership if it can. With no coordinator
+    /// attached, always `true` (original behavior).
+    fn is_active_syncer(&self, peer: &str) -> bool {
+        match &self.leadership {
+            Some(l) => l.claim_or_check(peer, LEADERSHIP_STALE),
+            None => true,
+        }
+    }
+
+    /// Record that the active syncer applied a block, resetting the
+    /// leadership staleness timer. No-op without a coordinator.
+    fn note_sync_progress(&self, peer: &str) {
+        if let Some(l) = &self.leadership {
+            l.note_progress(peer);
+        }
+    }
+
+    /// Free the leadership slot if this driver's `peer` holds it (called
+    /// when the connection drops). No-op without a coordinator.
+    fn release_leadership(&self, peer: &str) {
+        if let Some(l) = &self.leadership {
+            l.release(peer);
         }
     }
 
@@ -605,6 +742,11 @@ impl SyncDriver {
                     if let Some(m) = &self.metrics {
                         m.inc_peer_failures();
                     }
+                    // The connection dropped — if we were the active
+                    // syncer, free the leadership slot now so a standby
+                    // takes over immediately instead of waiting out
+                    // LEADERSHIP_STALE. (CaughtUp/CapReached retain it.)
+                    self.release_leadership(&peer);
                     // Classify the failure into a NodeStatistics
                     // DisconnectReason for the resilience scheduler.
                     // The lossy "best effort" mapping below mirrors
@@ -1044,38 +1186,21 @@ impl SyncDriver {
         // Initial token is granted on the first call, so the very
         // first send doesn't wait.
         const REQ_MIN_INTERVAL: Duration = Duration::from_millis(400);
-        let mut last_request_at: Option<Instant>;
-        // Kick off chain sync with a java-tron-style locator (a geometric
-        // back-off of our recent block ids, oldest first). This flips the
-        // peer's `needSyncFromUs = true` flag, which gates `AdvService
-        // .broadcast` — without it the peer never pushes us BlockInventory
-        // adv frames (we'd sit silent forever post-handshake). The locator's
-        // first id is a deep block the peer is sure to have, so
-        // `containBlockInMainChain` passes; the peer then serves blocks after
-        // the highest id we share. A bare `[head]` summary (the old behavior)
-        // failed that check on any peer not at our exact head — which is why
-        // only our own node served us. The peer replies with a
-        // `ChainInventory` carrying up to SYNC_FETCH_BATCH_NUM (~2000) block
-        // hashes; the queue + select! send branch drives the rest from there.
-        let mut summary = self.build_chain_summary();
-        if summary.is_empty() {
-            // Fresh node / no index — genesis is in every peer's main chain.
-            summary.push(prev_id.unwrap_or(genesis));
-        }
-        // M-22b: the locator we ask with — its first id must be in the peer's
-        // main chain, its last id is our head. Verifiable against the
-        // subsequent accept/reject.
-        debug!(
-            peer,
-            len = summary.len(),
-            first_num = summary.first().map(|id| id.num()).unwrap_or(0),
-            last_num = summary.last().map(|id| id.num()).unwrap_or(0),
-            "sent SyncBlockChain locator"
-        );
-        last_request_at = Some(Instant::now());
-        if let Err(e) = tron_net::sync::send_sync_request(&mut conn, &summary).await {
-            return PeerOutcome::PeerFailure(format!("send_sync_request: {e}"));
-        }
+        let mut last_request_at: Option<Instant> = None;
+        // Chain sync is kicked off from inside the loop, gated on
+        // leadership: only the single active syncer sends the locator (a
+        // java-tron-style geometric back-off of our recent block ids,
+        // oldest first). That locator flips the peer's `needSyncFromUs =
+        // true`, gating `AdvService.broadcast` — without it the peer never
+        // pushes us BlockInventory adv frames. Its first id is a deep block
+        // the peer is sure to have, so `containBlockInMainChain` passes and
+        // the peer serves blocks after the highest id we share; the peer
+        // replies with a `ChainInventory` of up to ~2000 hashes that the
+        // queue + select! send branch drains. Standby drivers never send
+        // it, so they never pull a redundant block stream.
+        // `sync_started` flips once we've sent it as leader; if we later
+        // lose leadership we reset it (and drop queued work) and go quiet.
+        let mut sync_started = false;
         // Pipelining threshold: when in-flight blocks drop below this,
         // try to queue the next FetchInvData chunk so the peer is
         // continuously processing while we're draining the current
@@ -1218,12 +1343,55 @@ impl SyncDriver {
                 }
             }
 
+            // Single active syncer. Only the leader requests + applies
+            // blocks; standbys stay connected (keepalive above, inbound
+            // sync served in the dispatch loop) and take over only if the
+            // leader stalls. `is_active_syncer` claims/retains the shared
+            // leadership slot.
+            let am_leader = self.is_active_syncer(peer);
+            if am_leader && !sync_started {
+                // We're the active syncer and haven't kicked off yet —
+                // send the locator to start the block stream.
+                let mut summary = self.build_chain_summary();
+                if summary.is_empty() {
+                    // Fresh node / no index — genesis is in every peer's
+                    // main chain.
+                    summary.push(prev_id.unwrap_or(genesis));
+                }
+                debug!(
+                    peer,
+                    len = summary.len(),
+                    first_num = summary.first().map(|id| id.num()).unwrap_or(0),
+                    last_num = summary.last().map(|id| id.num()).unwrap_or(0),
+                    "sent SyncBlockChain locator (active syncer)"
+                );
+                last_request_at = Some(Instant::now());
+                if let Err(e) =
+                    tron_net::sync::send_sync_request(&mut conn, &summary).await
+                {
+                    return PeerOutcome::PeerFailure(format!("send_sync_request: {e}"));
+                }
+                sync_started = true;
+            } else if !am_leader && sync_started {
+                // We led, then a peer took the slot (we stalled ≥
+                // LEADERSHIP_STALE). Stop driving sync and drop queued work
+                // so we don't apply against a head the new leader is now
+                // advancing; we'll re-kick if we reclaim leadership.
+                debug!(peer, "yielded active-syncer role; going standby");
+                sync_started = false;
+                pending_fetch_queue.clear();
+                blocks_in_flight = 0;
+            }
+
             // Determine if there's outbound work waiting (queued
             // fetches to issue, or queue-empty-need-inventory). Compute
             // the earliest time we're rate-allowed to issue it. Used
             // by the `select!` below to race the request timer against
             // the next inbound frame — this is what enables pipelining.
-            let pending: Option<PendingAction> = if !pending_fetch_queue.is_empty()
+            // Standby drivers issue nothing.
+            let pending: Option<PendingAction> = if !am_leader {
+                None
+            } else if !pending_fetch_queue.is_empty()
                 && blocks_in_flight < PIPELINE_LOW_WATER
             {
                 Some(PendingAction::FetchChunk)
@@ -1285,6 +1453,14 @@ impl SyncDriver {
                     // Loop around to re-evaluate `pending` (we may need
                     // to queue another request immediately, e.g. when
                     // a fresh ChainInventory just landed).
+                    continue;
+                }
+                // Standby wakeup: a non-leader otherwise blocks on the
+                // 60s frame read, which is too slow to notice the leader
+                // stalling. Tick every 5s so it re-checks leadership and
+                // can take over promptly. Leaders skip this (their loop is
+                // already driven by the constant block stream).
+                _ = tokio::time::sleep(Duration::from_secs(5)), if !am_leader => {
                     continue;
                 }
                 // Read branch: wait up to 60s for the next frame. The
@@ -1594,10 +1770,28 @@ impl SyncDriver {
                         }
                         continue;
                     }
+                    // Standby drivers don't apply blocks — the active
+                    // syncer owns the head. We shouldn't receive any
+                    // (we never requested), but drop defensively so a
+                    // late-arriving or broadcast block can't race the
+                    // shared head and spawn spurious unlinked/parent
+                    // rejections.
+                    if !am_leader {
+                        blocks_in_flight = blocks_in_flight.saturating_sub(1);
+                        debug!(
+                            peer,
+                            block = block_num,
+                            "standby; dropping block (active syncer owns the head)"
+                        );
+                        continue;
+                    }
                     self.pending_raw_block = Some(raw_block_bytes);
                     match self.accept_block(&block, prev_id) {
                         AcceptOutcome::Accepted(id) => {
                             prev_id = Some(id);
+                            // Reset the leadership staleness timer — we're
+                            // making progress, so no standby should preempt.
+                            self.note_sync_progress(peer);
                             if self.config.progress_log_interval > 0
                                 && self.stats.blocks_applied
                                     % self.config.progress_log_interval
@@ -5214,5 +5408,70 @@ mod peer_failure_log_tests {
         ] {
             assert!(!is_expected_peer_failure(r), "should be loud: {r}");
         }
+    }
+}
+
+#[cfg(test)]
+mod leadership_tests {
+    //! Single-active-syncer coordination (`SyncLeadership`): exactly one
+    //! driver leads at a time; a standby takes over only after the leader
+    //! stalls past the threshold or releases.
+    use super::SyncLeadership;
+    use std::time::Duration;
+
+    const STALE: Duration = Duration::from_millis(40);
+
+    #[test]
+    fn first_claimant_leads_and_blocks_others() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE), "first claimant wins the slot");
+        assert!(l.claim_or_check("A", STALE), "incumbent retains");
+        assert!(!l.claim_or_check("B", STALE), "challenger blocked while leader fresh");
+    }
+
+    #[test]
+    fn progress_keeps_a_standby_from_preempting() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE));
+        // Sleep past STALE but keep noting progress — A must keep the slot.
+        for _ in 0..3 {
+            std::thread::sleep(STALE / 2);
+            l.note_progress("A");
+            assert!(!l.claim_or_check("B", STALE), "fresh progress blocks preemption");
+        }
+        assert!(l.claim_or_check("A", STALE), "A still leads");
+    }
+
+    #[test]
+    fn standby_takes_over_after_leader_stalls() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE));
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        // A made no progress for > STALE → B preempts.
+        assert!(l.claim_or_check("B", STALE), "B steals a stalled leader");
+        assert!(!l.claim_or_check("A", STALE), "A is now the standby");
+    }
+
+    #[test]
+    fn release_frees_the_slot_immediately() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE));
+        l.release("A");
+        // No need to wait out STALE — the slot is free.
+        assert!(l.claim_or_check("B", STALE), "B leads right after A releases");
+        // A releasing again (it no longer holds the slot) is a harmless no-op.
+        l.release("A");
+        assert!(l.claim_or_check("B", STALE), "B still leads");
+    }
+
+    #[test]
+    fn note_progress_by_non_leader_is_a_noop() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE));
+        // B isn't the leader; its (bogus) progress must not refresh A's timer.
+        std::thread::sleep(STALE / 2);
+        l.note_progress("B");
+        std::thread::sleep(STALE / 2 + Duration::from_millis(10));
+        assert!(l.claim_or_check("B", STALE), "A's timer was untouched, so B preempts");
     }
 }

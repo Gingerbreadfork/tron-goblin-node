@@ -908,6 +908,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         let peer_registry = crate::PeerRegistry::new();
         let (eviction_tx, _eviction_rx_keep_alive) =
             tokio::sync::broadcast::channel::<String>(64);
+        // Single-active-syncer coordinator shared by every per-peer driver:
+        // exactly one leads (requests + applies blocks) while the rest
+        // stand by, so concurrent drivers don't race the shared head.
+        let leadership = std::sync::Arc::new(crate::sync::SyncLeadership::new());
 
         // Active-peers gauge sampler. Reads `peer_registry.len()` every
         // 5 s and pushes it into the metrics handle so a Prometheus
@@ -1005,6 +1009,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             let node_stats_for_peer = node_stats.clone();
             let peer_registry_for_peer = peer_registry.clone();
             let eviction_tx_for_peer = eviction_tx.clone();
+            let leadership_for_peer = leadership.clone();
             let exec_config_for_peer = exec_config;
             let snapshot_stack_for_peer = if config.storage.snapshot_reorg {
                 Some(stores.snapshots.clone())
@@ -1031,6 +1036,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     .with_eviction_signal(eviction_tx_for_peer)
                     .with_exec_config(exec_config_for_peer)
                     .with_pubsub(pubsub_for_peer)
+                    .with_leadership(leadership_for_peer)
                     // Production runs the per-tx replay gate. The
                     // `BlockIndexStore` is populated from
                     // `initialize_genesis` onward, so the validator
