@@ -669,10 +669,20 @@ impl SyncDriver {
                     // TIME_BANNED is special: the peer has put our IP
                     // in a `bannedNodes` cache with a 60s expiry (see
                     // `ChannelManager.notifyDisconnect`). Retrying
-                    // within that window is just wasted dials. Other
-                    // rate-limits (slot full, dup id) can clear in
-                    // seconds when another peer disconnects, so we
-                    // keep the short skip for those.
+                    // within that window is just wasted dials.
+                    //
+                    // The other rate-limits (slot full, dup id) are NOT
+                    // bans on arrival — but re-dialing inside that same
+                    // ~60s reconnect window is exactly what *creates* a
+                    // TIME_BANNED. With one single-peer driver per peer
+                    // (~60 of them) and a 500ms backoff here, every
+                    // driver assigned to a full peer re-dialed it twice a
+                    // second and got the whole fleet banned — the
+                    // "excessive issues connecting to peers" churn. So we
+                    // back these off past the reconnect window too (a
+                    // full public peer almost never frees a slot in under
+                    // a minute anyway), which prevents the ban instead of
+                    // serving it out afterwards.
                     let is_time_banned = reason.contains("(TIME_BANNED)");
                     let is_other_rate_limit = reason.contains("(TOO_MANY_PEERS)")
                         || reason.contains("(DUPLICATE_PEER)")
@@ -719,7 +729,10 @@ impl SyncDriver {
                             std::time::Duration::from_secs(90)
                         }
                     } else if is_other_rate_limit {
-                        std::time::Duration::from_millis(500)
+                        // Past the upstream's ~60s reconnect window (with
+                        // margin) so re-dialing a full peer can't escalate
+                        // into a TIME_BANNED. Matches the TIME_BANNED wait.
+                        std::time::Duration::from_secs(90)
                     } else {
                         peer_failures[peer_idx] = peer_failures[peer_idx].saturating_add(1);
                         backoff_for(self.config.initial_backoff, peer_failures[peer_idx])
@@ -855,6 +868,15 @@ impl SyncDriver {
 
         // STEP 2: application-layer Hello (frame P2pHello). Carries
         // genesis / solid / head block ids for chain compatibility.
+        //
+        // Advertise our TRUE solid block (lags head by the finalization
+        // gap) and TRUE lowest-held block (our snapshot base, not
+        // genesis). The old `solid = head` / `lowest_block_num = 0`
+        // defaults are protocol lies that a strict peer can reject — and
+        // lite peers (node_type=1) were the ones disconnecting us right
+        // after serving an inventory.
+        let solid = self.solid_block_id().unwrap_or(head);
+        let lowest = self.lowest_block_num();
         let hello = HelloInputs {
             from: Endpoint {
                 address: b"127.0.0.1".to_vec(),
@@ -865,10 +887,10 @@ impl SyncDriver {
             version: MAINNET_P2P_VERSION,
             timestamp_ms: now,
             genesis,
-            solid: head,
+            solid,
             head,
             node_type: 0,
-            lowest_block_num: 0,
+            lowest_block_num: lowest,
             code_version: b"tron-goblin/0.0.1",
         };
         match conn.handshake(hello).await {
@@ -1888,6 +1910,34 @@ impl SyncDriver {
     pub fn head_number(&self) -> i64 {
         let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
         dp.latest_block_header_number().unwrap_or(0)
+    }
+
+    /// The id of our latest solidified block, for the P2P Hello `solid`
+    /// field. `None` on a fresh node (no solid pointer yet, or its index
+    /// entry is missing) so the caller can fall back to head.
+    ///
+    /// Advertising `solid = head` (the old default) is a protocol lie:
+    /// under DPoS the solidified block always lags head by the
+    /// finalization gap, so a peer that validates `solid <= head -` gap
+    /// could treat an equal-to-head solid as malformed.
+    fn solid_block_id(&self) -> Option<BlockId> {
+        let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
+        let num = dp.latest_solidified_block_num()?;
+        let bi = self.state.block_index.as_ref()?;
+        BlockIndexStore::new(bi.clone()).get(num).ok()
+    }
+
+    /// Our lowest-held block number, for the P2P Hello `lowest_block_num`
+    /// field. Falls back to 0 when we can't size the index. A
+    /// snapshot-synced node holds blocks only from its base forward, so
+    /// advertising 0 (archive-from-genesis) misleads peers about what we
+    /// can actually serve.
+    fn lowest_block_num(&self) -> i64 {
+        self.state
+            .block_index
+            .as_ref()
+            .and_then(|bi| BlockIndexStore::new(bi.clone()).lowest().ok().flatten())
+            .unwrap_or(0)
     }
 
     /// Build a java-tron-style block-chain "locator" for the `SyncBlockChain`

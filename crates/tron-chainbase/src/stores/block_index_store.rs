@@ -94,6 +94,24 @@ impl BlockIndexStore {
         }
         Ok(out)
     }
+
+    /// The lowest block number currently indexed — the deepest block we
+    /// can serve — or `None` if the index is empty. O(log n): a single
+    /// native iterator seek to the first key (block heights are >= 0, so
+    /// the all-zero key is a valid lower bound). Used to advertise an
+    /// honest `lowest_block_num` in the P2P Hello: a snapshot-synced node
+    /// holds blocks only from its base forward, not from genesis.
+    pub fn lowest(&self) -> Result<Option<i64>, StoreError> {
+        let first = self.backend.scan_from(&[0u8; 8], 1)?;
+        match first.first() {
+            Some((k, _)) if k.len() == 8 => {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(k);
+                Ok(Some(i64::from_be_bytes(buf)))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +159,17 @@ mod tests {
         let store = BlockIndexStore::new(backend);
         store.put(&id(1)).unwrap();
         assert!(store.get_limit_number(1, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lowest_returns_none_when_empty_and_first_key_otherwise() {
+        let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let store = BlockIndexStore::new(backend);
+        assert_eq!(store.lowest().unwrap(), None);
+        // Snapshot-base style: a chain starting well above genesis.
+        for n in [83_274_649, 83_274_650, 83_280_000] {
+            store.put(&id(n)).unwrap();
+        }
+        assert_eq!(store.lowest().unwrap(), Some(83_274_649));
     }
 }
