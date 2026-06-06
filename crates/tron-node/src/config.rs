@@ -867,11 +867,14 @@ pub struct P2pConfig {
     /// Set to `true` to skip the sync loop entirely (RPC-only mode).
     #[serde(default)]
     pub disabled: bool,
-    /// Emit a heartbeat log line every N applied blocks during sync.
-    /// `0` = silent (only failures logged). `1` = log every block. The
-    /// default of `100` keeps idle steady-state quiet but produces a
-    /// usable progress trail when syncing from genesis or triaging
-    /// divergences against live mainnet.
+    /// Enable the human-readable sync-progress log line (height + block
+    /// wall-clock + lag behind real time + apply rate + peer). `0` =
+    /// silent (only failures logged); any non-zero value enables it. The
+    /// cadence is **time-throttled** — roughly every 5s while catching up,
+    /// every 30s once following the tip — so it stays readable at any sync
+    /// speed rather than flooding during catch-up and going silent at the
+    /// tip. (In `--tip-test` mode the value is still used as a per-N-block
+    /// count gate.) Default `100` ⇒ enabled.
     #[serde(default = "default_progress_log_interval")]
     pub progress_log_interval: usize,
     /// Mix `tron_net::MAINNET_SEEDS` into the peer pool, in addition

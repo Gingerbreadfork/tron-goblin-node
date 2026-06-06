@@ -218,6 +218,26 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
+    // Startup head summary — where we're resuming from, in human terms:
+    // height, the block's wall-clock time, and how far behind real time it
+    // is. Tells the operator at a glance whether this is a fresh genesis, a
+    // deep snapshot resume, or a node that's nearly at the tip.
+    {
+        let dp = tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone());
+        let num = dp.latest_block_header_number().unwrap_or(0);
+        let ts = dp.latest_block_header_timestamp().unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        info!(
+            "head at startup: #{} ({}, {} behind)",
+            crate::logfmt::commas(num),
+            crate::logfmt::utc_millis(ts),
+            crate::logfmt::duration_ms((now_ms - ts).max(0)),
+        );
+    }
+
     // Tip-test mode: spoof the local head pointer so SyncBlockChain
     // requests use a recent block ID, letting peers that pruned the
     // archive serve us their post-pruning tail. The chain state is

@@ -61,6 +61,8 @@ use tron_types::{
     verify_tx_trie_root_raw, verify_witness_signature, BlockId,
 };
 
+use crate::logfmt;
+
 /// Per-driver configuration.
 #[derive(Clone)]
 pub struct SyncConfig {
@@ -388,6 +390,14 @@ pub struct SyncDriver {
     /// stalls or drops. `None` ⇒ no coordination (tests / SR / single
     /// peer), preserving the original always-active behavior.
     leadership: Option<Arc<SyncLeadership>>,
+    /// Progress-log throttle + rate state: `(when, blocks_applied_then)` at
+    /// the last emitted sync line. Time-gated so the cadence is readable at
+    /// any sync speed (a count gate is a flood during catch-up and silent at
+    /// the tip).
+    last_progress_log: Option<(Instant, usize)>,
+    /// Whether the last progress line reported us caught up to the tip. Used
+    /// to log the catch-up→tip and tip→falling-behind transitions once each.
+    at_tip: bool,
 }
 
 impl SyncDriver {
@@ -411,6 +421,8 @@ impl SyncDriver {
             mempool: None,
             khaos: Arc::new(tron_consensus::KhaosDb::new()),
             khaos_started: false,
+            last_progress_log: None,
+            at_tip: false,
             undo_store: None,
             checkpoint: None,
             produced_blocks_tx: None,
@@ -465,6 +477,97 @@ impl SyncDriver {
         if let Some(l) = &self.leadership {
             l.note_progress(peer);
         }
+    }
+
+    /// Emit a human-readable sync-progress line for a freshly-applied block.
+    ///
+    /// Answers the three questions an operator actually has while watching a
+    /// sync: *what is the node doing* (syncing vs. following the tip), *how
+    /// fast are blocks coming in* (blk/s), and *what time are these blocks
+    /// from* (the block's UTC wall-clock + how far behind real time). It's
+    /// time-throttled — a count gate floods during catch-up and goes silent
+    /// at the tip — and logs the catch-up→tip transition once.
+    ///
+    /// `progress_log_interval == 0` disables it entirely.
+    fn log_sync_progress(&mut self, block: &Block, block_num: i64, peer: &str) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        if self.config.progress_log_interval == 0 {
+            return;
+        }
+
+        let block_ts = block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|r| r.timestamp)
+            .unwrap_or(0);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let behind_ms = (now_ms - block_ts).max(0);
+        // Within ~90s of real time (a few block intervals) counts as "at the
+        // tip" — past that we're catching up.
+        const TIP_MS: i64 = 90_000;
+        let is_tip = behind_ms <= TIP_MS;
+
+        // Transition lines fire once, regardless of the throttle.
+        if is_tip && !self.at_tip {
+            info!(
+                "caught up to chain tip at #{} ({}) — now following live blocks",
+                logfmt::commas(block_num),
+                logfmt::utc_millis(block_ts),
+            );
+            self.at_tip = true;
+        } else if !is_tip && self.at_tip {
+            info!(
+                "fell behind the tip at #{} — re-syncing ({} behind)",
+                logfmt::commas(block_num),
+                logfmt::duration_ms(behind_ms),
+            );
+            self.at_tip = false;
+        }
+
+        // Recurring progress line: frequent while catching up, sparse once
+        // we're just following the tip.
+        let now = Instant::now();
+        let min_interval = if is_tip {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        if let Some((last, _)) = self.last_progress_log {
+            if now.duration_since(last) < min_interval {
+                return;
+            }
+        }
+        let rate = match self.last_progress_log {
+            Some((last, prev_blocks)) => {
+                let secs = now.duration_since(last).as_secs_f64();
+                if secs > 0.0 {
+                    self.stats.blocks_applied.saturating_sub(prev_blocks) as f64 / secs
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+
+        let height = logfmt::commas(block_num);
+        let when = logfmt::utc_millis(block_ts);
+        let behind = logfmt::duration_ms(behind_ms);
+        let mut line = if is_tip {
+            format!("at tip  #{height}  {when}  ({behind} behind)  ·  via {peer}")
+        } else {
+            format!("syncing #{height}  {when}  ({behind} behind)  ·  {rate:.0} blk/s  ·  via {peer}")
+        };
+        let vr = self.stats.blocks_rejected_validation;
+        let er = self.stats.blocks_rejected_execution;
+        if vr > 0 || er > 0 {
+            line.push_str(&format!("  ·  {vr} val-rej  {er} exec-rej"));
+        }
+        info!("{line}");
+        self.last_progress_log = Some((now, self.stats.blocks_applied));
     }
 
     /// Free the leadership slot if this driver's `peer` holds it (called
@@ -1816,21 +1919,9 @@ impl SyncDriver {
                             // Reset the leadership staleness timer — we're
                             // making progress, so no standby should preempt.
                             self.note_sync_progress(peer);
-                            if self.config.progress_log_interval > 0
-                                && self.stats.blocks_applied
-                                    % self.config.progress_log_interval
-                                    == 0
-                            {
-                                info!(
-                                    block = block_num,
-                                    hash = %hex::encode(&id.as_bytes()[..8]),
-                                    txs = tx_count,
-                                    applied = self.stats.blocks_applied,
-                                    val_rej = self.stats.blocks_rejected_validation,
-                                    exec_rej = self.stats.blocks_rejected_execution,
-                                    "applied block"
-                                );
-                            }
+                            // Human-readable, time-throttled progress line
+                            // (height + block wall-clock + lag + rate + peer).
+                            self.log_sync_progress(&block, block_num, peer);
                         }
                         AcceptOutcome::RejectedValidation(reason) => {
                             self.stats.blocks_rejected_validation += 1;

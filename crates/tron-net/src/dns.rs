@@ -28,18 +28,25 @@
 //! ## Implementation choices vs java-tron
 //!
 //! * **Root signature: verified, fail-open (N-15).** Java-tron signs the
-//!   root's secp256k1 signature over the Java-protobuf `textFormat` of
-//!   the inner `TreeRoot` message. [`verify_root_signature`] reconstructs
-//!   that content and checks the signature recovers the tree's compressed
-//!   pubkey (carried base32 in the URL). Because the exact Java textFormat
-//!   can't be validated against the live tree offline, a mismatch
-//!   currently **logs a loud warning and continues** rather than
-//!   rejecting — discovery is a *hint*, and every peer is still validated
-//!   at the TCP handshake (genesis / chain check, see N-5/N-30). To make
-//!   it fail-closed, have [`resolve`] return `DnsError::InvalidRoot` on
-//!   the `Err` arm — do that once the format is confirmed against the
-//!   live mainnet tree (`live_dns_tree.rs`), or it would reject the real
-//!   tree on a format mismatch.
+//!   root's secp256k1 signature over the Java-protobuf `textFormat` of the
+//!   inner `TreeRoot` message, and stores it in the `DnsRoot.signature`
+//!   field **base64url-encoded** (`ECDSASignature.toBase64`, the
+//!   `v||r||s` header-prefix layout). [`verify_root_signature`] therefore
+//!   base64url-decodes the field ([`decode_root_signature`]) and parses
+//!   *both* the header-prefix and on-chain (`r||s||v`) layouts before
+//!   recovering and comparing against the tree's compressed pubkey
+//!   (carried base32 in the URL). The one detail that still can't be
+//!   validated offline is the exact Java `textFormat` of `TreeRoot`
+//!   ([`tree_root_sign_content`]) — `toString()`'s multi-line, default-
+//!   omitted, field-number-ordered rendering, which we reconstruct and try
+//!   with/without the trailing newline. So a mismatch still **logs a loud
+//!   warning and continues** rather than rejecting — discovery is a *hint*,
+//!   and every peer is re-validated at the TCP handshake (genesis / chain
+//!   check, see N-5/N-30). To go fail-closed, return `DnsError::InvalidRoot`
+//!   on the `Err` arm of [`resolve`] once verification is confirmed against
+//!   the live mainnet tree (`live_dns_tree.rs`). (Before this fix the field
+//!   was fed raw to `from_bytes`, which needs exactly 65 bytes — hence the
+//!   "invalid signature encoding" the root verify always hit.)
 //! * **No link-tree following.** Tree URLs encountered in entries are
 //!   logged and skipped. Mainnet's main tree is self-contained and
 //!   doesn't appear to use link-trees in production.
@@ -168,21 +175,36 @@ fn verify_root_signature(
             expected.len()
         ));
     }
-    let sig =
-        RecoverableSignature::from_bytes(signature).map_err(|e| format!("signature parse: {e}"))?;
+    let sig_bytes = decode_root_signature(signature)?;
+    // java-tron's `ECDSASignature.toBase64` emits the **header-prefix**
+    // layout (`v||r||s`, v∈27..30); our own round-trip helper uses the
+    // on-chain layout (`r||s||v`). Parse both and try each — a forger still
+    // needs the real key to recover the advertised pubkey under either.
+    let candidates: Vec<RecoverableSignature> = [
+        RecoverableSignature::from_header_prefix_bytes(&sig_bytes),
+        RecoverableSignature::from_bytes(&sig_bytes),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if candidates.is_empty() {
+        return Err("signature parse: not a 65-byte recoverable signature in either layout".to_string());
+    }
     // Hedge the one offline-unverifiable detail (Java's trailing newline)
     // by accepting either variant — a forger still needs the real key to
     // produce a valid signature for *either* content.
-    for trailing in [true, false] {
-        let content = tree_root_sign_content(e_root, l_root, seq, trailing);
-        let hash = keccak256(&content);
-        if let Ok(uncompressed) = sig.recover_uncompressed_pubkey(&hash) {
-            // Compress the recovered key: [0x02|Y-parity] || X.
-            let mut compressed = [0u8; 33];
-            compressed[0] = 0x02 | (uncompressed[64] & 1);
-            compressed[1..].copy_from_slice(&uncompressed[1..33]);
-            if compressed[..] == expected[..] {
-                return Ok(());
+    for sig in &candidates {
+        for trailing in [true, false] {
+            let content = tree_root_sign_content(e_root, l_root, seq, trailing);
+            let hash = keccak256(&content);
+            if let Ok(uncompressed) = sig.recover_uncompressed_pubkey(&hash) {
+                // Compress the recovered key: [0x02|Y-parity] || X.
+                let mut compressed = [0u8; 33];
+                compressed[0] = 0x02 | (uncompressed[64] & 1);
+                compressed[1..].copy_from_slice(&uncompressed[1..33]);
+                if compressed[..] == expected[..] {
+                    return Ok(());
+                }
             }
         }
     }
@@ -386,6 +408,23 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed)
 }
 
+/// Decode the `DnsRoot.signature` field into raw signature bytes.
+///
+/// java-tron stores it **base64url-encoded** (`ECDSASignature.toBase64`), so
+/// the proto's `bytes` field carries ASCII, not the raw 65-byte signature —
+/// feeding it straight to `from_bytes` was the "invalid signature encoding"
+/// failure (the ~87-char base64 text is never 65 bytes). A raw 65-byte field
+/// is also accepted so a self-produced root (tests, or a node that stores it
+/// un-encoded) still verifies.
+fn decode_root_signature(field: &[u8]) -> Result<Vec<u8>, String> {
+    if field.len() == tron_crypto::signature::SIGNATURE_BYTES {
+        return Ok(field.to_vec());
+    }
+    let s = std::str::from_utf8(field)
+        .map_err(|_| "signature field is neither 65 raw bytes nor UTF-8 base64".to_string())?;
+    base64_url_decode(s.trim()).map_err(|e| format!("base64 decode: {e}"))
+}
+
 /// Build a `SocketAddr` from a proto `Endpoint`. IPv4 only. Returns
 /// `None` for invalid ports, unparseable IP strings, or IPv6-only
 /// entries.
@@ -435,6 +474,43 @@ mod tests {
         // Wrong advertised pubkey → rejected.
         let other = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &[0x02u8; 33]);
         assert!(verify_root_signature(e_root, l_root, seq, &sig.to_bytes(), &other).is_err());
+    }
+
+    #[test]
+    fn verifies_java_style_base64url_header_prefix_signature() {
+        // The live `DnsRoot.signature` field carries `ECDSASignature.toBase64`
+        // output: the header-prefix layout (v||r||s) base64url-encoded. Feeding
+        // that ~87-char ASCII straight into `from_bytes` was the
+        // "invalid signature encoding" failure this test guards against.
+        let priv_key = [0x11u8; 32];
+        let e_root = b"FDXN3SN67NA5DKA4J2GOK7BVQI";
+        let l_root: &[u8] = b"";
+        let seq = 42i32;
+
+        let content = tree_root_sign_content(e_root, l_root, seq, true);
+        let hash = keccak256(&content);
+        let sig = RecoverableSignature::sign_prehash(&priv_key, &hash).unwrap();
+        let uncompressed = sig.recover_uncompressed_pubkey(&hash).unwrap();
+        let mut compressed = [0u8; 33];
+        compressed[0] = 0x02 | (uncompressed[64] & 1);
+        compressed[1..].copy_from_slice(&uncompressed[1..33]);
+        let url_pubkey = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &compressed);
+
+        // java-tron's exact wire encoding: header-prefix bytes, base64url, no pad.
+        let wire = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sig.to_header_prefix_bytes());
+        assert!(
+            verify_root_signature(e_root, l_root, seq, wire.as_bytes(), &url_pubkey).is_ok(),
+            "base64url header-prefix signature (the live format) must verify"
+        );
+
+        // Tampering still rejected through the decode path.
+        assert!(
+            verify_root_signature(e_root, l_root, seq + 1, wire.as_bytes(), &url_pubkey).is_err()
+        );
+        // And a raw 65-byte on-chain-layout signature still verifies (a
+        // self-produced root that stores it un-encoded).
+        assert!(verify_root_signature(e_root, l_root, seq, &sig.to_bytes(), &url_pubkey).is_ok());
     }
 
     #[test]

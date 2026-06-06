@@ -104,9 +104,15 @@ per-session.
 --no-metrics               disable the Prometheus metrics endpoint.
 
 Set RUST_LOG to control log verbosity:
-  RUST_LOG=info                  (default — chain lifecycle + warnings)
-  RUST_LOG=debug                 verbose per-peer activity
+  RUST_LOG=info                  (default — startup head, sync progress, warnings)
+  RUST_LOG=debug                 verbose per-peer + per-block activity
   RUST_LOG=tron_node=debug,info  module-targeted: tron-node only
+
+At the default `info` level the node prints its startup head (height + UTC
+block time + how far behind real time) and a throttled sync-progress line,
+e.g. `syncing #83,344,101  2026-06-05 14:23:09Z  (3d 2h behind)  ·  142 blk/s
+·  via 8.217.215.241`, then `caught up to chain tip …` once it's following
+live blocks.
 ";
 
 fn main() -> ExitCode {

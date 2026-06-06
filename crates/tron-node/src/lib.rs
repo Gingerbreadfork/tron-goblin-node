@@ -10,6 +10,7 @@ pub mod config;
 pub mod dump_state;
 pub mod event_loader;
 pub mod fetch_block;
+pub mod logfmt;
 pub mod mempool_validator;
 pub mod node_persist;
 pub mod node_statistics;
