@@ -182,15 +182,23 @@ pub fn validate_undelegate_resource(
     if !resource_valid(contract.resource) {
         return Err(ActuatorError::InvalidResourceCode);
     }
-    let key = DelegatedResourceStore::v2_unlocked_key(&owner, &to);
-    let resource = resources
-        .get_raw(&key)?
-        .ok_or(ActuatorError::NothingToUndelegate)?;
-    let available = match contract.resource {
-        0 => resource.frozen_balance_for_bandwidth,
-        1 => resource.frozen_balance_for_energy,
-        _ => 0,
-    };
+    // java-tron's UnDelegateResourceActuator.validate reads BOTH the
+    // unlocked and the locked record and counts the locked balance once
+    // its per-resource lock has expired (`expire < now`). Reading only the
+    // unlocked record wrongly rejected every undelegate of a still-recorded
+    // *locked* (e.g. snapshot-imported) delegation as "nothing to
+    // undelegate" — a mempool-reject flood and a silent execute-time state
+    // divergence (TRON headers carry no state root). `unLockExpireResource`
+    // in execute then folds the expired-locked balance into the unlocked
+    // record before drawing on it.
+    let unlocked = resources.get_raw(&DelegatedResourceStore::v2_unlocked_key(&owner, &to))?;
+    let locked = resources.get_raw(&DelegatedResourceStore::v2_locked_key(&owner, &to))?;
+    if unlocked.is_none() && locked.is_none() {
+        return Err(ActuatorError::NothingToUndelegate);
+    }
+    let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+    let available =
+        undelegatable_balance(unlocked.as_ref(), locked.as_ref(), contract.resource, now);
     if available < contract.balance {
         return Err(ActuatorError::InsufficientBalance {
             balance: available,
@@ -200,13 +208,60 @@ pub fn validate_undelegate_resource(
     Ok(())
 }
 
+/// Undelegate-able balance for `resource` (0 = bandwidth, 1 = energy): the
+/// unlocked record's frozen balance plus the locked record's, but the
+/// locked part only once its per-resource lock has expired. Mirrors
+/// java-tron's `UnDelegateResourceActuator.validate`.
+fn undelegatable_balance(
+    unlocked: Option<&DelegatedResource>,
+    locked: Option<&DelegatedResource>,
+    resource: i32,
+    now: i64,
+) -> i64 {
+    let mut total = 0i64;
+    match resource {
+        0 => {
+            if let Some(u) = unlocked {
+                total += u.frozen_balance_for_bandwidth;
+            }
+            if let Some(l) = locked {
+                if l.expire_time_for_bandwidth < now {
+                    total += l.frozen_balance_for_bandwidth;
+                }
+            }
+        }
+        1 => {
+            if let Some(u) = unlocked {
+                total += u.frozen_balance_for_energy;
+            }
+            if let Some(l) = locked {
+                if l.expire_time_for_energy < now {
+                    total += l.frozen_balance_for_energy;
+                }
+            }
+        }
+        _ => {}
+    }
+    total
+}
+
 pub fn execute_undelegate_resource(
     accounts: &AccountStore,
     resources: &DelegatedResourceStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &UnDelegateResourceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
     let to = require_to(&contract.receiver_address)?;
+
+    // 0. Fold any expired *locked* delegation into the unlocked record
+    //    before drawing on it — java-tron's
+    //    `DelegatedResourceStore.unLockExpireResource`. Without this an
+    //    undelegate of a once-locked (now-expired) delegation fails as
+    //    "nothing to undelegate" and our delegated-resource state silently
+    //    diverges from java-tron.
+    let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+    resources.unlock_expire_resource(&owner, &to, now)?;
 
     // 1. Decrement the per-(owner, to) record.
     let key = DelegatedResourceStore::v2_unlocked_key(&owner, &to);
@@ -263,27 +318,30 @@ pub fn execute_undelegate_resource(
     }
     accounts.put(&owner, &owner_account)?;
 
-    // 3. Decrement recipient's `acquired_*`.
-    let mut to_account = accounts
-        .get(&to)?
-        .ok_or(ActuatorError::TargetAccountMissing)?;
-    match contract.resource {
-        0 => {
-            to_account.acquired_delegated_frozen_v2_balance_for_bandwidth = check_sub(
-                to_account.acquired_delegated_frozen_v2_balance_for_bandwidth,
-                contract.balance,
-            )?;
+    // 3. Decrement recipient's `acquired_*`. java-tron guards the entire
+    //    receiver update with `if (receiverCapsule != null)` — a receiver
+    //    whose account was since deleted is simply skipped, not an error.
+    if let Some(mut to_account) = accounts.get(&to)? {
+        match contract.resource {
+            0 => {
+                to_account.acquired_delegated_frozen_v2_balance_for_bandwidth = check_sub(
+                    to_account.acquired_delegated_frozen_v2_balance_for_bandwidth,
+                    contract.balance,
+                )?;
+            }
+            1 => {
+                let r = to_account
+                    .account_resource
+                    .get_or_insert_with(Default::default);
+                r.acquired_delegated_frozen_v2_balance_for_energy = check_sub(
+                    r.acquired_delegated_frozen_v2_balance_for_energy,
+                    contract.balance,
+                )?;
+            }
+            _ => unreachable!(),
         }
-        1 => {
-            let r = to_account
-                .account_resource
-                .get_or_insert_with(Default::default);
-            r.acquired_delegated_frozen_v2_balance_for_energy =
-                check_sub(r.acquired_delegated_frozen_v2_balance_for_energy, contract.balance)?;
-        }
-        _ => unreachable!(),
+        accounts.put(&to, &to_account)?;
     }
-    accounts.put(&to, &to_account)?;
 
     Ok(ExecutionResult::default())
 }

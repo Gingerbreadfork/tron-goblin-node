@@ -461,6 +461,7 @@ pub fn dispatch_execute(
             crate::delegate::execute_undelegate_resource(
                 stores.accounts,
                 stores.delegated_resources,
+                stores.dyn_props,
                 &c,
             )
         }

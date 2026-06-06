@@ -94,6 +94,63 @@ impl DelegatedResourceStore {
         Ok(())
     }
 
+    /// Fold an *expired* locked delegation into the unlocked record for
+    /// `(from, to)` — a direct port of java-tron's
+    /// `DelegatedResourceStore.unLockExpireResource`.
+    ///
+    /// A `DelegateResourceContract` with `lock = true` is stored under the
+    /// locked key (`0x02`) with a per-resource expiry. Once `now` passes
+    /// that expiry the frozen balance becomes undelegate-able, but only
+    /// after it's moved into the unlocked record (`0x01`) — which is the
+    /// record an undelegate actually draws from. No-op when there's no
+    /// locked record or neither resource has expired yet.
+    ///
+    /// Without this merge an undelegate of a once-locked (now-expired)
+    /// delegation fails with "nothing to undelegate": a mempool-reject
+    /// flood and, in block execution, a SILENT state divergence from
+    /// java-tron — TRON block headers carry no state root, so a wrong
+    /// delegated-resource balance never surfaces as a block-hash mismatch.
+    pub fn unlock_expire_resource(
+        &self,
+        from: &Address,
+        to: &Address,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        let lock_key = Self::v2_locked_key(from, to);
+        let Some(mut lock) = self.get_raw(&lock_key)? else {
+            return Ok(());
+        };
+        // Neither resource's lock has expired → nothing to move.
+        if lock.expire_time_for_energy >= now && lock.expire_time_for_bandwidth >= now {
+            return Ok(());
+        }
+        let unlock_key = Self::v2_unlocked_key(from, to);
+        let mut unlock = self.get_raw(&unlock_key)?.unwrap_or_else(|| DelegatedResource {
+            from: from.as_bytes().to_vec(),
+            to: to.as_bytes().to_vec(),
+            ..Default::default()
+        });
+        if lock.expire_time_for_energy < now {
+            unlock.frozen_balance_for_energy += lock.frozen_balance_for_energy;
+            unlock.expire_time_for_energy = 0;
+            lock.frozen_balance_for_energy = 0;
+            lock.expire_time_for_energy = 0;
+        }
+        if lock.expire_time_for_bandwidth < now {
+            unlock.frozen_balance_for_bandwidth += lock.frozen_balance_for_bandwidth;
+            unlock.expire_time_for_bandwidth = 0;
+            lock.frozen_balance_for_bandwidth = 0;
+            lock.expire_time_for_bandwidth = 0;
+        }
+        if lock.frozen_balance_for_bandwidth == 0 && lock.frozen_balance_for_energy == 0 {
+            self.delete_raw(&lock_key)?;
+        } else {
+            self.put_raw(&lock_key, &lock)?;
+        }
+        self.put_raw(&unlock_key, &unlock)?;
+        Ok(())
+    }
+
     /// Return every V1 delegation row where `from` is the sender.
     /// Mirrors java-tron's iteration pattern (no dedicated
     /// `getByFrom` method in upstream; the prefix walk is open-coded
@@ -215,5 +272,77 @@ mod tests {
         assert!(amounts.contains(&100));
         assert!(amounts.contains(&200));
         assert!(!amounts.contains(&999));
+    }
+
+    #[test]
+    fn unlock_expire_resource_merges_only_expired_resources() {
+        let store = DelegatedResourceStore::new(Arc::new(MemBackend::new()));
+        let from = addr(0xaa);
+        let to = addr(0xbb);
+        // Locked: energy expired (100 < now), bandwidth still locked (900 > now).
+        store
+            .put_raw(
+                &DelegatedResourceStore::v2_locked_key(&from, &to),
+                &DelegatedResource {
+                    from: from.as_bytes().to_vec(),
+                    to: to.as_bytes().to_vec(),
+                    frozen_balance_for_bandwidth: 50,
+                    frozen_balance_for_energy: 70,
+                    expire_time_for_bandwidth: 900,
+                    expire_time_for_energy: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        store.unlock_expire_resource(&from, &to, 500).unwrap();
+
+        // Energy (expired) moved to the unlocked record; bandwidth stayed locked.
+        let unlocked = store
+            .get_raw(&DelegatedResourceStore::v2_unlocked_key(&from, &to))
+            .unwrap()
+            .expect("unlocked record created");
+        assert_eq!(unlocked.frozen_balance_for_energy, 70);
+        assert_eq!(unlocked.frozen_balance_for_bandwidth, 0);
+        let locked = store
+            .get_raw(&DelegatedResourceStore::v2_locked_key(&from, &to))
+            .unwrap()
+            .expect("locked record persists (bandwidth still locked)");
+        assert_eq!(locked.frozen_balance_for_energy, 0);
+        assert_eq!(locked.frozen_balance_for_bandwidth, 50);
+    }
+
+    #[test]
+    fn unlock_expire_resource_is_a_noop_when_nothing_expired() {
+        let store = DelegatedResourceStore::new(Arc::new(MemBackend::new()));
+        let from = addr(0xaa);
+        let to = addr(0xbb);
+        // BOTH expiries must be >= now to hit the early return — matching
+        // java-tron, a zero expire_time counts as "expired" (it merges a
+        // zero balance), so set both explicitly.
+        store
+            .put_raw(
+                &DelegatedResourceStore::v2_locked_key(&from, &to),
+                &DelegatedResource {
+                    from: from.as_bytes().to_vec(),
+                    to: to.as_bytes().to_vec(),
+                    frozen_balance_for_bandwidth: 50,
+                    frozen_balance_for_energy: 70,
+                    expire_time_for_bandwidth: 900,
+                    expire_time_for_energy: 900,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // now=500 < both expiries → no merge, no unlocked record created.
+        store.unlock_expire_resource(&from, &to, 500).unwrap();
+        assert!(store
+            .get_raw(&DelegatedResourceStore::v2_unlocked_key(&from, &to))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_raw(&DelegatedResourceStore::v2_locked_key(&from, &to))
+            .unwrap()
+            .is_some());
     }
 }

@@ -18,7 +18,7 @@ use tron_crypto::address::Address;
 use tron_proto::account::FreezeV2 as FreezeV2Entry;
 use tron_proto::account::AccountResource;
 use tron_proto::{
-    Account, AccountType, DelegateResourceContract, UnDelegateResourceContract,
+    Account, AccountType, DelegateResourceContract, DelegatedResource, UnDelegateResourceContract,
 };
 
 const ALICE: [u8; 21] = hex!("412e988a386a799f506693793c6a5af6b54dfaabfb");
@@ -402,7 +402,7 @@ fn undelegate_returns_balance_to_frozen_pool_and_decrements_bookkeeping() {
     };
     delegate::validate_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel)
         .unwrap();
-    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &c_undel).unwrap();
+    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel).unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = ctx.accounts.get(&addr(BOB)).unwrap().unwrap();
     // Alice: frozen pool +20 (back to 90 from 70 post-delegate);
@@ -438,7 +438,7 @@ fn undelegate_full_amount_deletes_pair_record() {
         resource: 0,
         balance: 30 * PRECISION, // full
     };
-    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &c_undel).unwrap();
+    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel).unwrap();
     let key = DelegatedResourceStore::v2_unlocked_key(&addr(ALICE), &addr(BOB));
     assert!(
         ctx.resources.get_raw(&key).unwrap().is_none(),
@@ -483,11 +483,123 @@ fn undelegate_keeps_record_when_other_resource_type_still_has_balance() {
         resource: 0,
         balance: 10 * PRECISION,
     };
-    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &c_undel_bw).unwrap();
+    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel_bw).unwrap();
     let key = DelegatedResourceStore::v2_unlocked_key(&addr(ALICE), &addr(BOB));
     let rec = ctx.resources.get_raw(&key).unwrap().expect("record persists");
     assert_eq!(rec.frozen_balance_for_bandwidth, 0);
     assert_eq!(rec.frozen_balance_for_energy, 20 * PRECISION);
+}
+
+// ============================================================
+// UnDelegateResource — locked (expired) delegations
+//
+// java-tron stores a `lock = true` delegation under the locked key
+// (0x02) with a per-resource expiry, and an undelegate folds the
+// EXPIRED-locked balance into the unlocked record before drawing on it
+// (`DelegatedResourceStore.unLockExpireResource`). The old code read only
+// the unlocked key, so every undelegate of a still-recorded locked
+// delegation (e.g. one imported from a mainnet snapshot) was wrongly
+// rejected as "nothing to undelegate".
+// ============================================================
+
+/// Seed a locked-key delegation record + the matching owner/receiver
+/// bookkeeping, as if ALICE had delegated `amount` bandwidth to BOB with
+/// `lock = true`, expiring at `expire`.
+fn seed_locked_bandwidth_delegation(ctx: &Ctx, amount: i64, expire: i64) {
+    ctx.accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                delegated_frozen_v2_balance_for_bandwidth: amount,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    ctx.accounts
+        .put(
+            &addr(BOB),
+            &Account {
+                address: BOB.to_vec(),
+                acquired_delegated_frozen_v2_balance_for_bandwidth: amount,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let lock_key = DelegatedResourceStore::v2_locked_key(&addr(ALICE), &addr(BOB));
+    ctx.resources
+        .put_raw(
+            &lock_key,
+            &DelegatedResource {
+                from: ALICE.to_vec(),
+                to: BOB.to_vec(),
+                frozen_balance_for_bandwidth: amount,
+                expire_time_for_bandwidth: expire,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn undelegate_accepts_expired_locked_delegation() {
+    let ctx = ctx_enabled();
+    ctx.dp.save_latest_block_header_timestamp(1_000);
+    // Locked delegation that expired at t=500 (< now=1000).
+    seed_locked_bandwidth_delegation(&ctx, 30 * PRECISION, 500);
+
+    let c_undel = UnDelegateResourceContract {
+        owner_address: ALICE.to_vec(),
+        receiver_address: BOB.to_vec(),
+        resource: 0,
+        balance: 20 * PRECISION,
+    };
+    // Previously this returned NothingToUndelegate — the bug.
+    delegate::validate_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel)
+        .expect("an expired locked delegation IS undelegate-able");
+    delegate::execute_undelegate_resource(&ctx.accounts, &ctx.resources, &ctx.dp, &c_undel)
+        .unwrap();
+
+    // The locked balance was folded into the unlocked record, then 20
+    // recalled, leaving 10 under the unlocked key and the locked key gone.
+    let lock_key = DelegatedResourceStore::v2_locked_key(&addr(ALICE), &addr(BOB));
+    let unlock_key = DelegatedResourceStore::v2_unlocked_key(&addr(ALICE), &addr(BOB));
+    assert!(ctx.resources.get_raw(&lock_key).unwrap().is_none(), "locked record drained");
+    let rec = ctx.resources.get_raw(&unlock_key).unwrap().expect("unlocked record exists");
+    assert_eq!(rec.frozen_balance_for_bandwidth, 10 * PRECISION);
+    // Bookkeeping decremented on both sides.
+    let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
+    let bob = ctx.accounts.get(&addr(BOB)).unwrap().unwrap();
+    assert_eq!(alice.delegated_frozen_v2_balance_for_bandwidth, 10 * PRECISION);
+    assert_eq!(bob.acquired_delegated_frozen_v2_balance_for_bandwidth, 10 * PRECISION);
+    // The recalled 20 is returned to ALICE's frozen-V2 pool.
+    let bw = alice.frozen_v2.iter().find(|f| f.r#type == 0).unwrap();
+    assert_eq!(bw.amount, 20 * PRECISION);
+}
+
+#[test]
+fn undelegate_rejects_locked_delegation_not_yet_expired() {
+    let ctx = ctx_enabled();
+    ctx.dp.save_latest_block_header_timestamp(1_000);
+    // Locked until t=2000 (> now=1000) — still locked, not undelegate-able.
+    seed_locked_bandwidth_delegation(&ctx, 30 * PRECISION, 2_000);
+
+    let c_undel = UnDelegateResourceContract {
+        owner_address: ALICE.to_vec(),
+        receiver_address: BOB.to_vec(),
+        resource: 0,
+        balance: 20 * PRECISION,
+    };
+    let err = delegate::validate_undelegate_resource(
+        &ctx.accounts,
+        &ctx.resources,
+        &ctx.dp,
+        &c_undel,
+    )
+    .unwrap_err();
+    // The record exists but none of it is available yet → InsufficientBalance,
+    // not NothingToUndelegate.
+    assert!(matches!(err, ActuatorError::InsufficientBalance { .. }), "got {err:?}");
 }
 
 // Reference unused import so module-level warnings stay quiet across refactors.
