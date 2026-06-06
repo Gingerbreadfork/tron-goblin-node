@@ -297,6 +297,53 @@ fn maintenance_pass_advances_cycle_and_writes_vi() {
 }
 
 #[test]
+fn maintenance_propagates_explicit_zero_brokerage_verbatim() {
+    // Regression: an SR that deliberately sets brokerage = 0% (gives
+    // 100% of rewards to voters) must have that 0 propagated verbatim
+    // into the next cycle's per-cycle brokerage row. A prior bug
+    // rewrote 0 → DEFAULT_BROKERAGE (20) at the maintenance boundary,
+    // which then credited the SR 20% of every cycle's reward into its
+    // `allowance` where java-tron credits nothing — the dominant cause
+    // of "java allowance = 0, ours = billions" divergence on mainnet.
+    let state = fresh_state();
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    dp.save_allow_change_delegation(1);
+    dp.save_maintenance_time_interval(6 * 3600 * 1000);
+    dp.save_next_maintenance_time(1_700_000_000_000);
+
+    let w = addr(0xbb);
+    let ws = WitnessStore::new(state.witnesses.clone());
+    ws.put(
+        &Address::from_raw(w),
+        &Witness {
+            address: w.to_vec(),
+            vote_count: 1000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let dlg = DelegationStore::new(state.delegation.clone());
+    // SR explicitly chooses 0% brokerage (cycle = -1 global row).
+    dlg.set_brokerage_global(&Address::from_raw(w), 0);
+
+    apply_unsigned(&state, &empty_block(1, [0u8; 32], w, 1_699_999_997_000), None)
+        .expect("genesis");
+    let dp2 = DynamicPropertiesStore::new(state.dyn_props.clone());
+    let head_hash = dp2.latest_block_header_hash().unwrap().unwrap();
+    apply_unsigned(&state, &empty_block(2, head_hash, w, 1_700_000_000_000), None)
+        .expect("block 2 at boundary");
+
+    assert_eq!(dp.current_cycle_number(), 1, "cycle number must advance");
+
+    // The crux: the next cycle's brokerage row must be 0, NOT 20.
+    let b1 = dlg.get_brokerage(1, &Address::from_raw(w));
+    assert_eq!(
+        b1, 0,
+        "explicit 0% brokerage must propagate verbatim, not be rewritten to DEFAULT_BROKERAGE"
+    );
+}
+
+#[test]
 fn voter_withdraws_reward_after_full_cycle() {
     // The end-to-end happy path: voter has 100 votes for witness W.
     // We seed cycle 0's reward pool for W, run maintenance to roll

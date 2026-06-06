@@ -1727,6 +1727,27 @@ fn execute_block_logic(
                     tron_tvm::reward::pay_standby_witness(&accts, &dlg, &dp, &ranked);
             }
         }
+
+        // 5c-iii. Transaction-fee reward to the producer.
+        //
+        // Mirrors java-tron's `Manager.payReward`: when the fee pool is
+        // active, each block pays the producer `floorDiv(pool,
+        // TRANSACTION_FEE_POOL_PERIOD)` then drains that amount from the
+        // pool. `Constant.TRANSACTION_FEE_POOL_PERIOD == 1`, so the
+        // producer receives the entire accumulated pool every block and
+        // it resets to zero. The reward flows through the same brokerage
+        // / cycle-pool split as the block reward. Without this, fees
+        // charged into the pool (bandwidth/energy) accumulated forever
+        // and witnesses never received their tx-fee share.
+        if dp.support_transaction_fee_pool() {
+            const TRANSACTION_FEE_POOL_PERIOD: i64 = 1;
+            let pool = dp.transaction_fee_pool();
+            let tx_fee_reward = pool / TRANSACTION_FEE_POOL_PERIOD;
+            let _ = tron_tvm::reward::pay_transaction_fee_reward(
+                &accts, &dlg, &dp, &producer, tx_fee_reward,
+            );
+            dp.save_transaction_fee_pool(pool - tx_fee_reward);
+        }
     }
 
     // === 5d. Maintenance-period pass ===

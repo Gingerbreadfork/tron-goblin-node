@@ -9,6 +9,12 @@
 //! for a list of addresses (supplied or auto-discovered from recent blocks),
 //! and reports per-field divergences.
 //!
+//! Beyond static state, it can also diff **read-only contract execution**
+//! (`triggerconstantcontract`): calling the same view function on both nodes
+//! and comparing the returned data + `energy_used`. This is how TVM execution
+//! exactness gets validated (the resulting state of a real call is otherwise
+//! invisible). Both nodes must have `vm.supportConstant = true`.
+//!
 //! Head handling: both nodes advance independently, so a probe taken while
 //! the head moves can show a one-block-stale difference that isn't a real
 //! divergence. We only trust a *mismatch* observed while both nodes held the
@@ -22,6 +28,7 @@
 //!       [--accounts T...,T...] [--accounts-file addrs.txt] \
 //!       [--from-recent-blocks N] \
 //!       [--probes account,resource,contract] \
+//!       [--constant] [--call T...:decimals()] [--constant-owner T...] \
 //!       [--settle-timeout-secs 30] [--max-rounds 3] [--http-timeout-secs 10] \
 //!       [--json]
 
@@ -47,6 +54,12 @@ OPTIONS:
   --accounts-file <path>    file of base58 addresses, one per line ('#' comments ok)
   --from-recent-blocks <N>  also probe every address touched in the last N blocks
   --probes <list>           any of: account,resource,contract  [default account,resource]
+  --constant                diff triggerconstantcontract for standard TRC20 view calls
+                            (decimals/name/symbol/totalSupply) on every discovered contract;
+                            both nodes need vm.supportConstant = true
+  --call <addr:sig[:param]> diff one explicit constant call, e.g. T...:balanceOf(address):<64hex>
+                            (repeatable; param is bare hex ABI args, optional)
+  --constant-owner <addr>   caller (msg.sender) for constant calls [default: the contract itself]
   --settle-timeout-secs <n> max wait for both nodes to share a head [default 30]
   --max-rounds <n>          re-check rounds for head-unstable mismatches [default 3]
   --http-timeout-secs <n>   per-request timeout                 [default 10]
@@ -61,6 +74,9 @@ struct Args {
     accounts_file: Option<String>,
     from_recent_blocks: u64,
     probes: Vec<Probe>,
+    constant: bool,
+    calls: Vec<(String, String, String)>, // (contract, signature, param-hex)
+    constant_owner: Option<String>,
     settle_timeout: Duration,
     max_rounds: u32,
     http_timeout: Duration,
@@ -104,6 +120,63 @@ impl Probe {
             _ => format!("{{\"address\":\"{address}\",\"visible\":true}}"),
         }
     }
+}
+
+/// A read-only contract view call to compare between nodes.
+#[derive(Clone)]
+struct CallSpec {
+    /// Human label / java `function_selector` signature, e.g. `decimals()`.
+    signature: String,
+    /// ABI-encoded argument bytes as bare hex (may be empty).
+    parameter: String,
+}
+
+/// One unit of work — either a static-state probe or a constant call.
+#[derive(Clone)]
+enum Job {
+    State { address: String, probe: Probe },
+    Constant { contract: String, owner: String, call: CallSpec },
+}
+
+impl Job {
+    /// Stable identity used to dedup and match across retry rounds.
+    fn id(&self) -> String {
+        match self {
+            Job::State { address, probe } => format!("{address}|{}", probe.name()),
+            Job::Constant { contract, call, .. } => {
+                format!("{contract}|constant:{}", call.signature)
+            }
+        }
+    }
+    /// The subject address (account or contract).
+    fn address(&self) -> &str {
+        match self {
+            Job::State { address, .. } => address,
+            Job::Constant { contract, .. } => contract,
+        }
+    }
+    /// The probe-kind label for reporting.
+    fn kind(&self) -> String {
+        match self {
+            Job::State { probe, .. } => probe.name().to_string(),
+            Job::Constant { call, .. } => format!("constant:{}", call.signature),
+        }
+    }
+}
+
+/// Standard zero-argument TRC20/ERC20 view functions. Calling these on every
+/// discovered contract exercises a uint8 (decimals), two strings (name,
+/// symbol), and a uint256 (totalSupply) return — a good spread for TVM
+/// exactness. Non-TRC20 contracts revert identically on both nodes (still a
+/// match), so it's safe to call them broadly.
+fn standard_view_calls() -> Vec<CallSpec> {
+    ["decimals()", "name()", "symbol()", "totalSupply()"]
+        .iter()
+        .map(|sig| CallSpec {
+            signature: sig.to_string(),
+            parameter: String::new(),
+        })
+        .collect()
 }
 
 fn main() {
@@ -170,24 +243,74 @@ fn run(args: Args) -> i32 {
         }
     }
 
-    if addrs.is_empty() {
-        eprintln!("error: no addresses to probe (use --accounts, --accounts-file, or --from-recent-blocks)");
+    // 4. Build the work list: static-state jobs + constant-call jobs.
+    let mut jobs: Vec<Job> = Vec::new();
+    for a in &addrs {
+        for p in &args.probes {
+            jobs.push(Job::State {
+                address: a.clone(),
+                probe: *p,
+            });
+        }
+    }
+    // Explicit --call jobs.
+    for (contract, sig, param) in &args.calls {
+        let owner = args.constant_owner.clone().unwrap_or_else(|| contract.clone());
+        jobs.push(Job::Constant {
+            contract: contract.clone(),
+            owner,
+            call: CallSpec {
+                signature: sig.clone(),
+                parameter: param.clone(),
+            },
+        });
+    }
+    // Auto --constant: standard view calls on every discovered contract.
+    if args.constant {
+        let candidates: Vec<String> = addrs.iter().cloned().collect();
+        if !args.json {
+            eprintln!(
+                "scanning {} address(es) for contracts (getcontract on A)…",
+                candidates.len()
+            );
+        }
+        let mut n_contracts = 0usize;
+        for a in &candidates {
+            if is_contract(&args.a, a, args.http_timeout) {
+                n_contracts += 1;
+                let owner = args.constant_owner.clone().unwrap_or_else(|| a.clone());
+                for call in standard_view_calls() {
+                    jobs.push(Job::Constant {
+                        contract: a.clone(),
+                        owner: owner.clone(),
+                        call,
+                    });
+                }
+            }
+        }
+        if !args.json {
+            eprintln!(
+                "found {n_contracts} contract(s) → {} constant call(s)",
+                n_contracts * 4
+            );
+        }
+    }
+
+    if jobs.is_empty() {
+        eprintln!(
+            "error: nothing to probe (use --accounts, --accounts-file, --from-recent-blocks, --constant, or --call)"
+        );
         return 2;
     }
 
-    // 4. Probe with head-stability rounds.
-    let work: Vec<(String, Probe)> = addrs
-        .iter()
-        .flat_map(|a| args.probes.iter().map(move |p| (a.clone(), *p)))
-        .collect();
-
-    let mut matched: Vec<(String, Probe)> = Vec::new();
-    let mut confirmed: Vec<(String, Probe, Vec<Mismatch>)> = Vec::new();
-    let mut errors: Vec<(String, Probe, String)> = Vec::new();
+    // 5. Probe with head-stability rounds.
+    let mut matched: Vec<Job> = Vec::new();
+    let mut confirmed: Vec<(Job, Vec<Mismatch>)> = Vec::new();
+    let mut errors: Vec<(Job, String)> = Vec::new();
     // Items whose mismatch was seen only under a moving head — retried.
-    let mut pending: Vec<(String, Probe, Vec<Mismatch>)> = Vec::new();
+    let mut pending: Vec<(Job, Vec<Mismatch>)> = Vec::new();
 
-    let mut queue = work;
+    let mut queue = jobs;
     for round in 0..args.max_rounds.max(1) {
         if queue.is_empty() {
             break;
@@ -197,20 +320,18 @@ fn run(args: Args) -> i32 {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("error: lost common head before round {}: {e}", round + 1);
-                // Whatever is still queued becomes inconclusive.
-                pending = queue.into_iter().map(|(a, p)| (a, p, Vec::new())).collect();
+                pending = queue.into_iter().map(|j| (j, Vec::new())).collect();
                 queue = Vec::new();
                 break;
             }
         };
 
-        let mut next: Vec<(String, Probe)> = Vec::new();
-        let mut round_mismatches: Vec<(String, Probe, Vec<Mismatch>)> = Vec::new();
-        for (addr, probe) in &queue {
-            match probe_pair(&args, *probe, addr) {
-                Ok(ms) if ms.is_empty() => matched.push((addr.clone(), *probe)),
-                Ok(ms) => round_mismatches.push((addr.clone(), *probe, ms)),
-                Err(e) => errors.push((addr.clone(), *probe, e)),
+        let mut round_mismatches: Vec<(Job, Vec<Mismatch>)> = Vec::new();
+        for job in &queue {
+            match run_job(&args, job) {
+                Ok(ms) if ms.is_empty() => matched.push(job.clone()),
+                Ok(ms) => round_mismatches.push((job.clone(), ms)),
+                Err(e) => errors.push((job.clone(), e)),
             }
         }
 
@@ -220,6 +341,7 @@ fn run(args: Args) -> i32 {
             .unwrap_or((-1, String::new()));
         let stable = h_id2 == h_id && h_num2 == h_num;
 
+        let mut next: Vec<Job> = Vec::new();
         if stable {
             // Every mismatch this round is real.
             for m in round_mismatches {
@@ -227,10 +349,11 @@ fn run(args: Args) -> i32 {
             }
         } else {
             // Mismatches may be one-block-stale artifacts — retry them.
-            for (a, p, ms) in round_mismatches {
-                next.push((a.clone(), p));
-                pending.retain(|(pa, pp, _)| !(pa == &a && *pp == p));
-                pending.push((a, p, ms));
+            for (job, ms) in round_mismatches {
+                let id = job.id();
+                pending.retain(|(pj, _)| pj.id() != id);
+                pending.push((job.clone(), ms));
+                next.push(job);
             }
             if !args.json {
                 eprintln!(
@@ -242,15 +365,28 @@ fn run(args: Args) -> i32 {
         }
         queue = next;
     }
-    // Anything still pending (never observed under a stable head) stays
-    // inconclusive — surface it with its last-seen diff.
-    for (a, p) in queue {
-        if !pending.iter().any(|(pa, pp, _)| pa == &a && *pp == p) {
-            pending.push((a, p, Vec::new()));
+    // Anything still queued (never observed under a stable head) stays
+    // inconclusive — surface it with its last-seen diff (or none).
+    for job in queue {
+        let id = job.id();
+        if !pending.iter().any(|(pj, _)| pj.id() == id) {
+            pending.push((job, Vec::new()));
         }
     }
 
     report(&args, head_num, &head_id, &matched, &confirmed, &pending, &errors)
+}
+
+/// Dispatch one job against both nodes and diff.
+fn run_job(args: &Args, job: &Job) -> Result<Vec<Mismatch>, String> {
+    match job {
+        Job::State { address, probe } => probe_pair(args, *probe, address),
+        Job::Constant {
+            contract,
+            owner,
+            call,
+        } => probe_constant(args, contract, owner, call),
+    }
 }
 
 /// Probe one (probe, address) pair on both nodes and diff. Treats "account
@@ -264,6 +400,80 @@ fn probe_pair(args: &Args, probe: Probe, address: &str) -> Result<Vec<Mismatch>,
     let va: Value = serde_json::from_slice(&ra).map_err(|e| format!("A: bad JSON: {e}"))?;
     let vb: Value = serde_json::from_slice(&rb).map_err(|e| format!("B: bad JSON: {e}"))?;
     Ok(diff::diff(&va, &vb))
+}
+
+/// Call a contract view function on both nodes via triggerconstantcontract
+/// and diff only the execution-relevant fields (return data + energy + status).
+fn probe_constant(
+    args: &Args,
+    contract: &str,
+    owner: &str,
+    call: &CallSpec,
+) -> Result<Vec<Mismatch>, String> {
+    let body = constant_body(contract, owner, call);
+    let path = "/wallet/triggerconstantcontract";
+    let ra =
+        http::post_json(&args.a, path, &body, args.http_timeout).map_err(|e| format!("A: {e}"))?;
+    let rb =
+        http::post_json(&args.b, path, &body, args.http_timeout).map_err(|e| format!("B: {e}"))?;
+    let va: Value = serde_json::from_slice(&ra).map_err(|e| format!("A: bad JSON: {e}"))?;
+    let vb: Value = serde_json::from_slice(&rb).map_err(|e| format!("B: bad JSON: {e}"))?;
+    Ok(diff::diff(&constant_exec_fields(&va), &constant_exec_fields(&vb)))
+}
+
+/// java-tron-shaped triggerconstantcontract request body (visible:true so
+/// both nodes accept base58 addresses).
+fn constant_body(contract: &str, owner: &str, call: &CallSpec) -> String {
+    if call.parameter.is_empty() {
+        format!(
+            "{{\"owner_address\":\"{owner}\",\"contract_address\":\"{contract}\",\"function_selector\":\"{}\",\"visible\":true}}",
+            call.signature
+        )
+    } else {
+        format!(
+            "{{\"owner_address\":\"{owner}\",\"contract_address\":\"{contract}\",\"function_selector\":\"{}\",\"parameter\":\"{}\",\"visible\":true}}",
+            call.signature, call.parameter
+        )
+    }
+}
+
+/// Extract just the execution-relevant fields from a triggerconstantcontract
+/// response. The full response carries a transaction envelope (ref_block,
+/// expiration, timestamp, txID) that legitimately differs between nodes and
+/// is NOT an execution result — diffing it would be pure noise. We compare:
+/// the return data, the energy spent, the success flag, and the contract ret.
+fn constant_exec_fields(v: &Value) -> Value {
+    serde_json::json!({
+        "constant_result": v.get("constant_result").cloned().unwrap_or(Value::Null),
+        "energy_used": v.get("energy_used").cloned().unwrap_or(Value::Null),
+        "result_ok": v.get("result").and_then(|r| r.get("result")).cloned().unwrap_or(Value::Null),
+        "contract_ret": v
+            .get("transaction")
+            .and_then(|t| t.get("ret"))
+            .and_then(|r| r.get(0))
+            .and_then(|r0| r0.get("contractRet"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
+/// True if `address` is a deployed contract on `url` (getcontract returns
+/// bytecode / a contract_address). Used to target constant calls.
+fn is_contract(url: &str, address: &str, timeout: Duration) -> bool {
+    let body = format!("{{\"value\":\"{address}\",\"visible\":true}}");
+    let Ok(raw) = http::post_json(url, "/wallet/getcontract", &body, timeout) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let nonempty = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    };
+    nonempty("bytecode") || nonempty("contract_address")
 }
 
 /// Poll both nodes' head until they report the same block id, or the
@@ -332,19 +542,17 @@ fn collect_addresses(v: &Value, out: &mut BTreeSet<String>) {
 
 fn is_base58_address(s: &str) -> bool {
     const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    s.len() == 34
-        && s.starts_with('T')
-        && s.bytes().all(|c| B58.contains(&c))
+    s.len() == 34 && s.starts_with('T') && s.bytes().all(|c| B58.contains(&c))
 }
 
 fn report(
     args: &Args,
     head_num: i64,
     head_id: &str,
-    matched: &[(String, Probe)],
-    confirmed: &[(String, Probe, Vec<Mismatch>)],
-    pending: &[(String, Probe, Vec<Mismatch>)],
-    errors: &[(String, Probe, String)],
+    matched: &[Job],
+    confirmed: &[(Job, Vec<Mismatch>)],
+    pending: &[(Job, Vec<Mismatch>)],
+    errors: &[(Job, String)],
 ) -> i32 {
     if args.json {
         let report = serde_json::json!({
@@ -355,20 +563,20 @@ fn report(
                 "inconclusive": pending.len(),
                 "errors": errors.len(),
             },
-            "mismatches": confirmed.iter().map(|(a, p, ms)| serde_json::json!({
-                "address": a, "probe": p.name(),
+            "mismatches": confirmed.iter().map(|(j, ms)| serde_json::json!({
+                "address": j.address(), "probe": j.kind(),
                 "fields": ms.iter().map(|m| serde_json::json!({
                     "path": m.path, "a": m.a, "b": m.b,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
-            "inconclusive": pending.iter().map(|(a, p, ms)| serde_json::json!({
-                "address": a, "probe": p.name(),
+            "inconclusive": pending.iter().map(|(j, ms)| serde_json::json!({
+                "address": j.address(), "probe": j.kind(),
                 "fields": ms.iter().map(|m| serde_json::json!({
                     "path": m.path, "a": m.a, "b": m.b,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
-            "errors": errors.iter().map(|(a, p, e)| serde_json::json!({
-                "address": a, "probe": p.name(), "error": e,
+            "errors": errors.iter().map(|(j, e)| serde_json::json!({
+                "address": j.address(), "probe": j.kind(), "error": e,
             })).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -383,8 +591,8 @@ fn report(
         );
         if !confirmed.is_empty() {
             println!("\n-- MISMATCHES (real; observed under a stable head) --");
-            for (addr, probe, ms) in confirmed {
-                println!("  {} [{}]", addr, probe.name());
+            for (job, ms) in confirmed {
+                println!("  {} [{}]", job.address(), job.kind());
                 for m in ms {
                     println!("      {} :  A={}  B={}", m.path, m.a, m.b);
                 }
@@ -392,8 +600,13 @@ fn report(
         }
         if !pending.is_empty() {
             println!("\n-- INCONCLUSIVE (head kept moving; account may change every block) --");
-            for (addr, probe, ms) in pending {
-                println!("  {} [{}]{}", addr, probe.name(), if ms.is_empty() { " (no stable read)" } else { "" });
+            for (job, ms) in pending {
+                println!(
+                    "  {} [{}]{}",
+                    job.address(),
+                    job.kind(),
+                    if ms.is_empty() { " (no stable read)" } else { "" }
+                );
                 for m in ms {
                     println!("      {} :  A={}  B={}", m.path, m.a, m.b);
                 }
@@ -401,8 +614,8 @@ fn report(
         }
         if !errors.is_empty() {
             println!("\n-- ERRORS --");
-            for (addr, probe, e) in errors {
-                println!("  {} [{}]: {}", addr, probe.name(), e);
+            for (job, e) in errors {
+                println!("  {} [{}]: {}", job.address(), job.kind(), e);
             }
         }
         if confirmed.is_empty() && errors.is_empty() {
@@ -424,6 +637,25 @@ fn short(id: &str) -> String {
     id.chars().take(16).collect()
 }
 
+/// Parse a `--call` spec: `CONTRACT:SIGNATURE[:PARAMHEX]`. Solidity
+/// signatures contain no `:`, and base58 addresses / hex params don't either,
+/// so a 3-way split on `:` is unambiguous.
+fn parse_call_spec(spec: &str) -> Result<(String, String, String), String> {
+    let mut it = spec.splitn(3, ':');
+    let contract = it.next().unwrap_or("").trim().to_string();
+    let sig = it.next().map(|s| s.trim().to_string()).unwrap_or_default();
+    let param = it
+        .next()
+        .map(|s| s.trim().trim_start_matches("0x").to_string())
+        .unwrap_or_default();
+    if contract.is_empty() || sig.is_empty() {
+        return Err(format!(
+            "bad --call spec '{spec}' (want CONTRACT:SIGNATURE[:PARAMHEX])"
+        ));
+    }
+    Ok((contract, sig, param))
+}
+
 fn parse_args() -> Result<Option<Args>, String> {
     let mut a = "http://127.0.0.1:8090".to_string();
     let mut b: Option<String> = None;
@@ -431,6 +663,9 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut accounts_file: Option<String> = None;
     let mut from_recent_blocks: u64 = 0;
     let mut probes_raw = "account,resource".to_string();
+    let mut constant = false;
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut constant_owner: Option<String> = None;
     let mut settle = 30u64;
     let mut max_rounds = 3u32;
     let mut http_timeout = 10u64;
@@ -451,6 +686,9 @@ fn parse_args() -> Result<Option<Args>, String> {
                 from_recent_blocks = next()?.parse().map_err(|_| "bad --from-recent-blocks".to_string())?
             }
             "--probes" => probes_raw = next()?,
+            "--constant" => constant = true,
+            "--call" => calls.push(parse_call_spec(&next()?)?),
+            "--constant-owner" => constant_owner = Some(next()?),
             "--settle-timeout-secs" => settle = next()?.parse().map_err(|_| "bad --settle-timeout-secs".to_string())?,
             "--max-rounds" => max_rounds = next()?.parse().map_err(|_| "bad --max-rounds".to_string())?,
             "--http-timeout-secs" => http_timeout = next()?.parse().map_err(|_| "bad --http-timeout-secs".to_string())?,
@@ -467,8 +705,9 @@ fn parse_args() -> Result<Option<Args>, String> {
         }
         probes.push(Probe::parse(p).ok_or_else(|| format!("unknown probe: {p}"))?);
     }
-    if probes.is_empty() {
-        return Err("no valid probes selected".into());
+    // Probes may legitimately be empty if the user only wants constant calls.
+    if probes.is_empty() && !constant && calls.is_empty() {
+        return Err("no probes and no constant calls selected".into());
     }
 
     Ok(Some(Args {
@@ -478,6 +717,9 @@ fn parse_args() -> Result<Option<Args>, String> {
         accounts_file,
         from_recent_blocks,
         probes,
+        constant,
+        calls,
+        constant_owner,
         settle_timeout: Duration::from_secs(settle),
         max_rounds,
         http_timeout: Duration::from_secs(http_timeout),
@@ -523,5 +765,109 @@ mod tests {
         assert!(Probe::Account.body("TX").contains("\"address\":\"TX\""));
         assert!(Probe::Contract.body("TX").contains("\"value\":\"TX\""));
         assert!(Probe::Account.body("TX").contains("\"visible\":true"));
+    }
+
+    #[test]
+    fn constant_body_has_selector_and_optional_parameter() {
+        let no_arg = constant_body(
+            "TContract",
+            "TOwner",
+            &CallSpec { signature: "decimals()".into(), parameter: String::new() },
+        );
+        assert!(no_arg.contains("\"contract_address\":\"TContract\""));
+        assert!(no_arg.contains("\"owner_address\":\"TOwner\""));
+        assert!(no_arg.contains("\"function_selector\":\"decimals()\""));
+        assert!(!no_arg.contains("parameter"));
+        assert!(no_arg.contains("\"visible\":true"));
+
+        let with_arg = constant_body(
+            "TContract",
+            "TOwner",
+            &CallSpec { signature: "balanceOf(address)".into(), parameter: "00aa".into() },
+        );
+        assert!(with_arg.contains("\"parameter\":\"00aa\""));
+    }
+
+    #[test]
+    fn constant_exec_fields_drops_tx_envelope_keeps_execution() {
+        let resp = json!({
+            "result": { "result": true },
+            "energy_used": 1234,
+            "constant_result": ["0000000000000000000000000000000000000000000000000000000000000006"],
+            "transaction": {
+                "ret": [{ "contractRet": "SUCCESS" }],
+                "txID": "deadbeef",
+                "raw_data": { "ref_block_bytes": "abcd", "expiration": 999, "timestamp": 111 }
+            }
+        });
+        let ex = constant_exec_fields(&resp);
+        // Execution fields preserved.
+        assert_eq!(ex["energy_used"], json!(1234));
+        assert_eq!(ex["result_ok"], json!(true));
+        assert_eq!(ex["contract_ret"], json!("SUCCESS"));
+        assert!(ex["constant_result"].is_array());
+        // Envelope dropped.
+        assert!(ex.get("transaction").is_none());
+    }
+
+    #[test]
+    fn two_identical_constant_responses_diff_clean_despite_different_envelopes() {
+        // Same execution result; different tx envelopes (ref_block/txID) →
+        // must NOT be reported as a divergence.
+        let a = json!({
+            "result": { "result": true }, "energy_used": 500,
+            "constant_result": ["00ff"],
+            "transaction": { "ret": [{ "contractRet": "SUCCESS" }], "txID": "aaaa",
+                             "raw_data": { "ref_block_bytes": "1111" } }
+        });
+        let b = json!({
+            "result": { "result": true }, "energy_used": 500,
+            "constant_result": ["00ff"],
+            "transaction": { "ret": [{ "contractRet": "SUCCESS" }], "txID": "bbbb",
+                             "raw_data": { "ref_block_bytes": "2222" } }
+        });
+        assert!(diff::diff(&constant_exec_fields(&a), &constant_exec_fields(&b)).is_empty());
+    }
+
+    #[test]
+    fn constant_diff_flags_energy_and_return_data_divergence() {
+        let a = json!({ "result": { "result": true }, "energy_used": 500, "constant_result": ["0006"] });
+        let b = json!({ "result": { "result": true }, "energy_used": 512, "constant_result": ["0008"] });
+        let d = diff::diff(&constant_exec_fields(&a), &constant_exec_fields(&b));
+        let paths: Vec<&str> = d.iter().map(|m| m.path.as_str()).collect();
+        assert!(paths.contains(&"energy_used"), "energy divergence flagged: {paths:?}");
+        assert!(
+            paths.iter().any(|p| p.starts_with("constant_result")),
+            "return-data divergence flagged: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn parse_call_spec_handles_signature_and_optional_param() {
+        let (c, s, p) = parse_call_spec("TXcontract:decimals()").unwrap();
+        assert_eq!(c, "TXcontract");
+        assert_eq!(s, "decimals()");
+        assert_eq!(p, "");
+
+        let (c, s, p) = parse_call_spec("TXc:balanceOf(address):0x00aa").unwrap();
+        assert_eq!(c, "TXc");
+        assert_eq!(s, "balanceOf(address)");
+        assert_eq!(p, "00aa"); // 0x stripped
+
+        assert!(parse_call_spec("justone").is_err());
+    }
+
+    #[test]
+    fn job_identity_is_stable_per_kind() {
+        let s = Job::State { address: "TX".into(), probe: Probe::Account };
+        let c = Job::Constant {
+            contract: "TX".into(),
+            owner: "TX".into(),
+            call: CallSpec { signature: "decimals()".into(), parameter: String::new() },
+        };
+        assert_eq!(s.id(), "TX|account");
+        assert_eq!(c.id(), "TX|constant:decimals()");
+        assert_ne!(s.id(), c.id());
+        assert_eq!(c.kind(), "constant:decimals()");
     }
 }

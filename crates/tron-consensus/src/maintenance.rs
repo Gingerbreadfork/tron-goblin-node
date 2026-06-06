@@ -319,15 +319,15 @@ pub fn apply_maintenance(
         let next = cur + 1;
         dyn_props.save_current_cycle_number(next);
         for (addr, w) in witnesses.all()? {
-            let brokerage_global = delegation.get_brokerage_global(&addr);
-            // java-tron seeds DEFAULT_BROKERAGE (20%) on first read;
-            // mirror that. The global brokerage is set by SR config;
-            // the per-cycle brokerage is what reward calc reads.
-            let brokerage_for_cycle = if brokerage_global == 0 {
-                tron_chainbase::DEFAULT_BROKERAGE
-            } else {
-                brokerage_global
-            };
+            // java-tron (MaintenanceManager): propagate the SR-configured
+            // global brokerage (cycle = -1) verbatim into the next cycle:
+            //   setBrokerage(nextCycle, w, getBrokerage(w))
+            // `get_brokerage_global` already returns DEFAULT_BROKERAGE (20%)
+            // when no row exists, and the stored value otherwise — including
+            // a deliberate 0% (SR gives 100% of rewards to voters). We must
+            // NOT rewrite 0 → 20: doing so credited such SRs 20% of every
+            // cycle's reward into `allowance`, where java credits nothing.
+            let brokerage_for_cycle = delegation.get_brokerage_global(&addr);
             delegation.set_brokerage(next, &addr, brokerage_for_cycle);
             delegation.set_witness_vote(next, &addr, w.vote_count);
         }

@@ -42,6 +42,27 @@ RPC-level diff against a live java-tron node confirms byte-equality.
 window-machinery work. (The `DelegatedResource` records and the account index
 aren't REST-exposed by this node yet, so they're out of v1 scope.)
 
+### Constant calls (TVM execution exactness)
+
+Static state isn't enough to validate the **TVM**: two nodes can hold identical
+stored state yet execute a contract call differently. `triggerconstantcontract`
+runs a read-only call and returns the result without mutating state, so diffing
+it across nodes validates execution exactness — the otherwise-invisible
+frontier.
+
+| flag | what it does |
+|------|--------------|
+| `--constant` | for every **discovered contract** (filtered via `getcontract`), call the standard zero-arg TRC20 views `decimals()` / `name()` / `symbol()` / `totalSupply()` on both nodes and diff |
+| `--call <addr:sig[:param]>` | diff one explicit call, e.g. `--call T...:balanceOf(address):<64-hex>` (repeatable; `param` is bare-hex ABI args) |
+| `--constant-owner <addr>` | caller (`msg.sender`); defaults to the contract itself (always a valid, existing address) |
+
+Only the **execution-relevant** fields are compared — `constant_result`
+(return data), `energy_used` (energy model), `result.result` (success), and
+`transaction.ret[].contractRet`. The transaction *envelope* (ref-block,
+expiration, timestamp, txID) legitimately differs between nodes and is dropped
+so it doesn't create noise. **Both nodes must have `vm.supportConstant = true`**;
+otherwise the node with it off returns an error and every call diverges.
+
 ### Diff normalization
 
 TRON renders protobuf to JSON with **default-valued fields omitted**, and two
@@ -69,6 +90,14 @@ tron-state-diff --b http://192.168.0.36:8090 \
 
 # Accounts from a file, machine-readable output
 tron-state-diff --b http://192.168.0.36:8090 --accounts-file addrs.txt --json
+
+# Validate TVM execution: diff standard TRC20 view calls on every contract
+# touched in the last 200 blocks (both nodes need vm.supportConstant = true)
+tron-state-diff --b http://192.168.0.36:8090 --from-recent-blocks 200 --constant
+
+# One explicit call: USDT balanceOf for a padded address argument
+tron-state-diff --b http://192.168.0.36:8090 \
+    --call TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t:balanceOf(address):000000000000000000000000<40hex>
 ```
 
 ### Flags
@@ -81,6 +110,9 @@ tron-state-diff --b http://192.168.0.36:8090 --accounts-file addrs.txt --json
 | `--accounts-file <path>` | — | one base58 address per line (`#` comments ok) |
 | `--from-recent-blocks <N>` | `0` | also probe every address touched in the last N blocks |
 | `--probes <list>` | `account,resource` | any of `account,resource,contract` |
+| `--constant` | off | diff standard TRC20 view calls on every discovered contract |
+| `--call <addr:sig[:param]>` | — | diff one explicit constant call (repeatable) |
+| `--constant-owner <addr>` | the contract | caller (`msg.sender`) for constant calls |
 | `--settle-timeout-secs <n>` | `30` | max wait for a common head |
 | `--max-rounds <n>` | `3` | re-check rounds for head-unstable mismatches |
 | `--http-timeout-secs <n>` | `10` | per-request timeout |

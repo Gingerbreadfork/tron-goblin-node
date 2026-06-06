@@ -2375,6 +2375,157 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// `triggerConstantContract(addr, owner_addr, data)` — TRON's name
 /// for `eth_call`. Accepts a flat-positional-args form for
 /// compatibility with tronweb-style clients.
+/// Parse a `triggerConstantContract` request. Accepts BOTH java-tron's
+/// native body shape (`contract_address` / `owner_address` /
+/// `function_selector` + `parameter`, or raw `data`) AND the eth_call
+/// object shape (`to` / `from` / `data`) so existing eth-style callers
+/// keep working. Addresses arrive here already translated to hex by the
+/// REST layer (or supplied as hex by JSON-RPC callers). `function_selector`
+/// is keccak256-hashed (first 4 bytes) and prepended to `parameter`,
+/// exactly as java-tron's `Util.getSelector` + parameter concat does.
+fn parse_constant_call_request(p: &Value, gas_cap: u64) -> Result<EthCallRequest, RpcError> {
+    let obj = p
+        .get(0)
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| RpcError::invalid_params("missing call object"))?;
+
+    let to_str = obj
+        .get("to")
+        .or_else(|| obj.get("contract_address"))
+        .or_else(|| obj.get("contractAddress"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("missing `contract_address`"))?;
+    let to = parse_eth_address(to_str)?.as_bytes().to_owned();
+    let mut to_arr = [0u8; 21];
+    to_arr.copy_from_slice(&to);
+
+    // `owner_address`/`from` is optional for a read-only call; default to
+    // a bare `0x41`-prefixed zero address (msg.sender unused by view fns).
+    let from_arr = match obj
+        .get("from")
+        .or_else(|| obj.get("owner_address"))
+        .or_else(|| obj.get("ownerAddress"))
+        .and_then(|v| v.as_str())
+    {
+        Some(s) => {
+            let a = parse_eth_address(s)?.as_bytes().to_owned();
+            let mut buf = [0u8; 21];
+            buf.copy_from_slice(&a);
+            buf
+        }
+        None => {
+            let mut buf = [0u8; 21];
+            buf[0] = 0x41;
+            buf
+        }
+    };
+
+    // Calldata: prefer `function_selector` (+ optional `parameter`),
+    // else fall back to raw `data`/`input` hex. `data`/`parameter` are
+    // decoded leniently (with or without a `0x` prefix) because java-tron's
+    // HTTP API sends bare hex while eth-style callers send `0x...`.
+    fn decode_hex_lenient(s: &str) -> Result<Vec<u8>, RpcError> {
+        let s = s.trim();
+        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+        if s.is_empty() {
+            return Ok(Vec::new());
+        }
+        hex::decode(s).map_err(|e| RpcError::invalid_params(format!("invalid hex: {e}")))
+    }
+    let data = if let Some(sig) = obj.get("function_selector").and_then(|v| v.as_str()) {
+        let selector = keccak256(sig.trim().as_bytes());
+        let mut d = selector[..4].to_vec();
+        if let Some(param) = obj.get("parameter").and_then(|v| v.as_str()) {
+            d.extend_from_slice(&decode_hex_lenient(param)?);
+        }
+        d
+    } else {
+        match obj.get("data").or_else(|| obj.get("input")).and_then(|v| v.as_str()) {
+            Some(sx) => decode_hex_lenient(sx)?,
+            None => Vec::new(),
+        }
+    };
+
+    // `value` may be eth-style hex or java-style `call_value` integer.
+    let value = if let Some(s) = obj.get("value").and_then(|v| v.as_str()) {
+        parse_hex_quantity(s)? as i64
+    } else if let Some(n) = obj.get("call_value").and_then(|v| v.as_i64()) {
+        n
+    } else {
+        0
+    };
+
+    let default_gas = (gas_cap.saturating_sub(1_000_000)).min(15_000_000);
+    let gas = obj
+        .get("gas")
+        .and_then(|v| v.as_str())
+        .map(parse_hex_quantity)
+        .transpose()?
+        .map(|g| g as u64)
+        .unwrap_or(default_gas)
+        .min(gas_cap);
+
+    Ok(EthCallRequest {
+        from: from_arr,
+        to: to_arr,
+        data,
+        value,
+        gas,
+    })
+}
+
+/// Render a constant-call `VmOutcome` into java-tron's
+/// `triggerConstantContract` response shape: `constant_result` (bare-hex
+/// return data), `energy_used`, `result.{result,code,message}`, and a
+/// minimal `transaction.ret[].contractRet`. The energy + return-data are
+/// what a state-diff harness compares to validate TVM execution exactness.
+fn constant_outcome_to_json(outcome: tron_tvm::execute::VmOutcome) -> Value {
+    use tron_tvm::execute::VmOutcome;
+    match outcome {
+        VmOutcome::Success {
+            return_data,
+            energy_used,
+            ..
+        } => json!({
+            "result": { "result": true },
+            "energy_used": energy_used,
+            "constant_result": [hex::encode(&return_data)],
+            "transaction": { "ret": [{ "contractRet": "SUCCESS" }] },
+        }),
+        VmOutcome::Revert {
+            return_data,
+            energy_used,
+            ..
+        } => json!({
+            "result": { "result": false, "code": "CONTRACT_EXE_ERROR", "message": "REVERT opcode executed" },
+            "energy_used": energy_used,
+            "constant_result": [hex::encode(&return_data)],
+            "transaction": { "ret": [{ "contractRet": "REVERT" }] },
+        }),
+        VmOutcome::Halt {
+            energy_used,
+            reason,
+            ..
+        } => json!({
+            "result": { "result": false, "code": "CONTRACT_EXE_ERROR", "message": format!("halt: {reason}") },
+            "energy_used": energy_used,
+            "constant_result": [""],
+            "transaction": { "ret": [{ "contractRet": "FAILED" }] },
+        }),
+        VmOutcome::PreflightError(msg) => json!({
+            "result": { "result": false, "code": "CONTRACT_VALIDATE_ERROR", "message": msg },
+        }),
+        VmOutcome::Timeout { deadline_ms, .. } => json!({
+            "result": { "result": false, "code": "CONTRACT_EXE_ERROR",
+                        "message": format!("constant call timed out after {deadline_ms}ms") },
+        }),
+        VmOutcome::CallTokenIgnored { .. } => json!({
+            "result": { "result": false, "code": "CONTRACT_VALIDATE_ERROR",
+                        "message": "CALLTOKEN at top level is not supported in a constant call" },
+        }),
+    }
+}
+
 pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     // `vm.supportConstant` gate. java-tron rejects the RPC with
     // `CONTRACT_VALIDATE_ERROR` when this is off; the closest analog
@@ -2385,35 +2536,45 @@ pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcEr
              (set vm.supportConstant = true to enable)",
         ));
     }
-    // Accept either the object-form (matching eth_call) or a
-    // positional `[ownerAddr, contractAddr, data]` form.
-    if p.get(0).and_then(|v| v.as_object()).is_some() {
-        let result = eth_call(p, s)?;
-        return Ok(json!({
-            "constant_result": [result.as_str().unwrap_or("0x").trim_start_matches("0x").to_string()],
-            "result": { "result": true },
-        }));
-    }
-    // Positional form — repack into the eth_call object shape.
-    let owner = p
-        .get(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("missing owner address"))?;
-    let contract_addr = p
-        .get(1)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("missing contract address"))?;
-    let data = p.get(2).and_then(|v| v.as_str()).unwrap_or("0x").to_string();
-    let repacked = json!([{
-        "from": owner,
-        "to": contract_addr,
-        "data": data,
-    }]);
-    let result = eth_call(&repacked, s)?;
-    Ok(json!({
-        "constant_result": [result.as_str().unwrap_or("0x").trim_start_matches("0x").to_string()],
-        "result": { "result": true },
-    }))
+    let Some(b) = &s.eth_call_backends else {
+        return Err(RpcError::internal(
+            "triggerConstantContract not available: server built without EVM call backends",
+        ));
+    };
+    // Positional `[owner, contract, data]` form → repack into an object
+    // so the single parser handles every shape.
+    let params_obj;
+    let params = if p.get(0).and_then(|v| v.as_object()).is_some() {
+        p
+    } else {
+        let owner = p.get(0).and_then(|v| v.as_str()).unwrap_or("");
+        let contract_addr = p
+            .get(1)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError::invalid_params("missing contract address"))?;
+        let data = p.get(2).and_then(|v| v.as_str()).unwrap_or("0x");
+        params_obj = json!([{ "from": owner, "to": contract_addr, "data": data }]);
+        &params_obj
+    };
+
+    let req = parse_constant_call_request(params, s.eth_call_gas_cap)?;
+    let vm_stores = build_call_vm_stores(b);
+    let block_number = s.dyn_props.latest_block_header_number().unwrap_or(0);
+    let block_timestamp_ms = s.dyn_props.latest_block_header_timestamp().unwrap_or(0);
+    let block_env = tron_tvm::execute::VmBlockEnv {
+        block_number,
+        block_timestamp_ms,
+    };
+    let trigger = tron_proto::TriggerSmartContract {
+        owner_address: req.from.to_vec(),
+        contract_address: req.to.to_vec(),
+        call_value: req.value,
+        data: req.data,
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
+    Ok(constant_outcome_to_json(outcome))
 }
 
 /// `broadcastTransaction(tx)` — accepts a transaction but doesn't

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use tron_chainbase::{KvBackend, MemBackend};
-use tron_rpc::{methods, RpcState};
+use tron_rpc::{methods, EthCallBackends, RpcState};
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -16,6 +16,24 @@ fn mem() -> Arc<dyn KvBackend> {
 fn fresh_state(support_constant: bool) -> RpcState {
     RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111)
         .with_support_constant(support_constant)
+}
+
+fn fresh_state_with_evm(support_constant: bool) -> RpcState {
+    let backends = EthCallBackends {
+        accounts: mem(),
+        code: mem(),
+        storage: mem(),
+        witnesses: mem(),
+        contract_state: mem(),
+        dyn_props: mem(),
+        delegated_resources: mem(),
+        delegation: mem(),
+        contracts: mem(),
+        block_index: Some(mem()),
+    };
+    RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111)
+        .with_support_constant(support_constant)
+        .with_eth_call_backends(backends)
 }
 
 #[test]
@@ -67,4 +85,36 @@ fn positional_form_also_gated_by_support_constant() {
     ]);
     let err = methods::trigger_constant_contract(&p, &s).unwrap_err();
     assert_eq!(err.code, -32600);
+}
+
+#[test]
+fn tron_native_body_shape_returns_java_response_shape() {
+    // java-tron's native /wallet/triggerconstantcontract body uses
+    // `contract_address` + `function_selector` (not eth_call's `to`/`data`).
+    // Our endpoint must accept it and reply in java-tron's response shape
+    // (constant_result array + result.result + energy_used) so a state-diff
+    // harness can compare TVM execution between the two nodes.
+    let s = fresh_state_with_evm(true);
+    // Addresses arrive here already 0x-normalized by the REST layer
+    // (translate_addresses_to_hex); this test calls the method directly.
+    let p = serde_json::json!([{
+        "owner_address": "0x411111111111111111111111111111111111111111",
+        "contract_address": "0x412222222222222222222222222222222222222222",
+        "function_selector": "decimals()",
+    }]);
+    let v = methods::trigger_constant_contract(&p, &s)
+        .expect("java-tron native body must be accepted");
+    assert!(
+        v.get("constant_result").and_then(|x| x.as_array()).is_some(),
+        "must return a constant_result array; got {v}"
+    );
+    assert_eq!(
+        v["result"]["result"],
+        serde_json::json!(true),
+        "a call to a no-code address succeeds with empty data; got {v}"
+    );
+    assert!(
+        v.get("energy_used").is_some(),
+        "must report energy_used for TVM-exactness diffing; got {v}"
+    );
 }

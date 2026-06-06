@@ -665,6 +665,18 @@ impl DynamicPropertiesStore {
         self.put_long(keys::TRANSACTION_FEE_POOL, cur.wrapping_add(amount));
     }
 
+    /// Current `TRANSACTION_FEE_POOL` balance (0 when the key is absent).
+    pub fn transaction_fee_pool(&self) -> i64 {
+        self.get_long(keys::TRANSACTION_FEE_POOL).unwrap_or(0)
+    }
+
+    /// Overwrite the `TRANSACTION_FEE_POOL` balance — mirrors
+    /// `DynamicPropertiesStore.saveTransactionFeePool`. Used by the
+    /// per-block payout to drain the pool after rewarding the producer.
+    pub fn save_transaction_fee_pool(&self, amount: i64) {
+        self.put_long(keys::TRANSACTION_FEE_POOL, amount);
+    }
+
     // -------------------- Fee accumulators -----------------------------
 
     pub fn total_transaction_cost(&self) -> i64 {
