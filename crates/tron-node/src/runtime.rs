@@ -21,24 +21,47 @@ use crate::storage::OpenedStores;
 
 /// Cooperative shutdown handle. Cloneable; each clone observes the
 /// same signal.
+///
+/// The broadcast channel only delivers a `send()` to receivers that were
+/// already subscribed — a receiver created *after* shutdown fired would
+/// never see it and block forever on `recv()`. Because the signal can fire
+/// at any time (the Ctrl-C task is spawned before `run`, so it can trip
+/// during the multi-second startup), we also keep a sticky `fired` flag:
+/// any code about to block on `recv()` must first check [`is_shutdown`] so
+/// an already-delivered shutdown isn't missed.
 #[derive(Clone)]
 pub struct ShutdownSignal {
     tx: broadcast::Sender<()>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ShutdownSignal {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(8);
-        Self { tx }
+        Self {
+            tx,
+            fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
-    /// Trigger shutdown. Idempotent — multiple calls coalesce.
+    /// Trigger shutdown. Idempotent — multiple calls coalesce. Sets the
+    /// sticky flag *before* sending so any concurrent
+    /// `subscribe()`-then-[`is_shutdown`] sees it.
     pub fn shutdown(&self) {
+        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.tx.send(());
     }
 
+    /// True once [`shutdown`] has been called. Sticky — unlike a fresh
+    /// broadcast receiver, it reflects a shutdown that already happened.
+    pub fn is_shutdown(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Get a fresh receiver. Each subsystem holds one and `.recv()`s
-    /// to know when to exit.
+    /// to know when to exit. NOTE: a receiver only sees `send()`s that
+    /// happen after it subscribes — pair a blocking `recv()` with an
+    /// [`is_shutdown`] check if the receiver may be created late.
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.tx.subscribe()
     }
@@ -1128,8 +1151,15 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     }
 
     // === Block until shutdown ===
+    // Subscribe *before* checking the sticky flag: if shutdown already
+    // fired during startup (Ctrl-C before we got here), the broadcast
+    // message is gone, but `is_shutdown()` still reports it — so we skip
+    // the `recv()` that would otherwise block forever. If it hasn't fired,
+    // the subscription guarantees we catch the next `send()`.
     let mut sd = shutdown.subscribe();
-    let _ = sd.recv().await;
+    if !shutdown.is_shutdown() {
+        let _ = sd.recv().await;
+    }
     info!("shutdown observed; waiting up to 5s for subsystems");
 
     // Give subsystems a moment to drain.
@@ -1439,5 +1469,49 @@ mod assemble_peers_tests {
         assert_eq!(super::fd_limit_target(1_048_576, 1_048_576), None);
         // Defensive: never lower an already-generous soft limit.
         assert_eq!(super::fd_limit_target(4096, 1024), None);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_signal_tests {
+    use super::ShutdownSignal;
+
+    #[test]
+    fn is_shutdown_is_sticky_and_survives_late_subscribe() {
+        let sig = ShutdownSignal::new();
+        assert!(!sig.is_shutdown());
+        sig.shutdown();
+        assert!(sig.is_shutdown(), "flag is set even with no live receivers");
+        // A receiver created AFTER shutdown fired never sees the broadcast
+        // message (this is the bug that wedged `run`) — but the sticky flag
+        // still reports it, which is what the guarded `recv()` relies on.
+        let mut late = sig.subscribe();
+        assert!(sig.is_shutdown());
+        assert!(late.try_recv().is_err(), "late subscriber missed the send");
+    }
+
+    #[test]
+    fn clones_share_the_flag() {
+        let sig = ShutdownSignal::new();
+        let clone = sig.clone();
+        clone.shutdown();
+        assert!(sig.is_shutdown(), "shutdown via a clone is visible everywhere");
+    }
+
+    #[tokio::test]
+    async fn guarded_wait_returns_when_shutdown_fired_before_subscribe() {
+        // Reproduces the run()-level fix: shutdown fires, THEN we subscribe
+        // and would-block on recv() — the is_shutdown() guard must let us
+        // through instead of hanging. A timeout proves we don't block.
+        let sig = ShutdownSignal::new();
+        sig.shutdown(); // fired before the "final wait" subscribes
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut sd = sig.subscribe();
+            if !sig.is_shutdown() {
+                let _ = sd.recv().await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "guarded wait must not block when shutdown already fired");
     }
 }
