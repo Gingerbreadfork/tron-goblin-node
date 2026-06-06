@@ -34,6 +34,17 @@ fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<Mismatch>) {
     match (a, b) {
         (Value::Object(ma), Value::Object(mb)) => walk_objects(path, ma, mb, out),
         (Value::Array(aa), Value::Array(ba)) => {
+            // TRON renders protobuf `map<…>` fields as JSON arrays of
+            // `{"key":…, "value":…}` in nondeterministic (HashMap) order, so
+            // a positional compare would flag pure reordering as a divergence.
+            // When both sides are such kv-arrays, compare them as unordered
+            // maps keyed by `key` (with the same default-omission rules as
+            // objects). Real arrays (frozenV2, votes — no `key` field) keep
+            // the order-sensitive positional compare below.
+            if let (Some(ma), Some(mb)) = (as_kv_map(aa), as_kv_map(ba)) {
+                walk_objects(path, &ma, &mb, out);
+                return;
+            }
             if aa.len() != ba.len() {
                 out.push(Mismatch {
                     path: path.to_string(),
@@ -94,6 +105,25 @@ fn walk_objects(path: &str, ma: &Map<String, Value>, mb: &Map<String, Value>, ou
             (None, None) => {}
         }
     }
+}
+
+/// Recognize a TRON-style proto-map rendering: a non-empty array where every
+/// element is an object carrying a string `key`. Returns the `key → value`
+/// map (value defaults to null if absent) so two such arrays can be compared
+/// order-insensitively. `None` if the array isn't a kv-map (so the caller
+/// falls back to an order-sensitive positional compare).
+fn as_kv_map(arr: &[Value]) -> Option<Map<String, Value>> {
+    if arr.is_empty() {
+        return None;
+    }
+    let mut m = Map::new();
+    for el in arr {
+        let obj = el.as_object()?;
+        let key = obj.get("key")?.as_str()?;
+        let val = obj.get("value").cloned().unwrap_or(Value::Null);
+        m.insert(key.to_string(), val);
+    }
+    Some(m)
 }
 
 /// Scalar equality. Numbers compare by value (so `5` and `5.0` are equal);
@@ -204,5 +234,31 @@ mod tests {
     #[test]
     fn number_value_equality_ignores_float_repr() {
         assert!(diff(&json!({ "a": 5 }), &json!({ "a": 5.0 })).is_empty());
+    }
+
+    #[test]
+    fn kv_map_arrays_compare_order_insensitively() {
+        // TRON renders proto maps as [{key,value}] in nondeterministic order.
+        // Same set, different order ⇒ match.
+        let a = json!({ "assetV2": [{"key":"1000001","value":100},{"key":"1000002","value":200}] });
+        let b = json!({ "assetV2": [{"key":"1000002","value":200},{"key":"1000001","value":100}] });
+        assert!(diff(&a, &b).is_empty(), "reordered kv-map must match: {:?}", diff(&a, &b));
+
+        // Differing value ⇒ mismatch reported at the key path.
+        let a = json!({ "assetV2": [{"key":"1000001","value":100}] });
+        let b = json!({ "assetV2": [{"key":"1000001","value":101}] });
+        let d = diff(&a, &b);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path, "assetV2.1000001");
+
+        // Same keys, one side omits a zero-valued entry ⇒ match (default-omission).
+        let a = json!({ "m": [{"key":"a","value":5},{"key":"b","value":0}] });
+        let b = json!({ "m": [{"key":"a","value":5}] });
+        assert!(diff(&a, &b).is_empty(), "omitted zero entry must match: {:?}", diff(&a, &b));
+
+        // Real ordered arrays (no `key` field) stay order-sensitive.
+        let a = json!({ "frozenV2": [{"type":"ENERGY","amount":5}] });
+        let b = json!({ "frozenV2": [{"amount":5}] });
+        assert!(!diff(&a, &b).is_empty());
     }
 }

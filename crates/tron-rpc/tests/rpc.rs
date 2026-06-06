@@ -1098,6 +1098,46 @@ async fn get_account_resource_decays_usage_and_reports_tron_power() {
 }
 
 #[tokio::test]
+async fn get_account_decays_stored_usage_at_read() {
+    // java-tron's Wallet.getAccount decays net_usage / free_net_usage at read
+    // (BandwidthProcessor.updateUsage). With an ancient consume time they
+    // fully decay to 0, so proto-default omission drops them. The old code
+    // returned the raw stored value (e.g. net_usage 250 where java reports 0).
+    let (addr, accounts, _bs, _bi, _tx, dp) = spawn_server().await;
+    dp.save_genesis_block_timestamp(0);
+    dp.save_latest_block_header_timestamp(1_800_000_000_000); // large head_slot
+    let mut a = [0u8; 21];
+    a[0] = 0x41;
+    a[1..].fill(0xce);
+    let address = Address::from_raw(a);
+    accounts
+        .put(
+            &address,
+            &Account {
+                address: a.to_vec(),
+                net_usage: 250,
+                free_net_usage: 250,
+                latest_consume_time: 0,      // ancient → decays to 0
+                latest_consume_free_time: 0, // ancient → decays to 0
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let resp = call(
+        addr,
+        json!({"jsonrpc":"2.0","method":"getAccount",
+               "params":["0xcececececececececececececececececececece"],"id":1}),
+    )
+    .await;
+    let r = &resp["result"];
+    assert!(r.get("net_usage").is_none(), "stale net_usage must decay to 0: {r}");
+    assert!(
+        r.get("free_net_usage").is_none(),
+        "stale free_net_usage must decay to 0: {r}"
+    );
+}
+
+#[tokio::test]
 async fn get_account_net_returns_bandwidth_only_subset() {
     let (addr, accounts, ..) = spawn_server().await;
     let mut a = [0u8; 21];

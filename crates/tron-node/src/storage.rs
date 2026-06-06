@@ -26,6 +26,7 @@ pub struct OpenedStores {
     pub id_index: Arc<dyn KvBackend>,
     pub asset_v1: Arc<dyn KvBackend>,
     pub asset_v2: Arc<dyn KvBackend>,
+    pub account_asset: Arc<dyn KvBackend>,
     pub contracts: Arc<dyn KvBackend>,
     pub abi: Arc<dyn KvBackend>,
     pub exchange_v1: Arc<dyn KvBackend>,
@@ -617,6 +618,12 @@ impl OpenedStores {
             id_index,
             asset_v1,
             asset_v2,
+            // Read-only for us: the executor writes TRC10 balances inline to
+            // `Account.asset_v2`, never to this store. java-tron's snapshot
+            // splits optimized accounts' balances out to here, so the RPC
+            // merges it back on getAccount. Opened raw (no snapshot layer) —
+            // block-apply never mutates it.
+            account_asset: open("account-asset")?,
             contracts,
             abi,
             exchange_v1,
@@ -709,6 +716,7 @@ impl OpenedStores {
         )
         .with_balance_trace(self.balance_trace.clone())
         .with_assets_v1(self.asset_v1.clone())
+        .with_account_assets(self.account_asset.clone())
         .with_nullifiers(self.nullifiers.clone())
         .with_eth_call_backends(tron_rpc::EthCallBackends {
             accounts: self.accounts.clone(),

@@ -695,8 +695,16 @@ pub fn get_account(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .accounts
         .get(&addr)
         .map_err(|e| RpcError::internal(format!("account read: {e}")))?;
+    let genesis_ms = s.dyn_props.genesis_block_timestamp().unwrap_or(0);
     match account {
-        Some(a) => Ok(encode_account_for_rpc(&a)),
+        Some(mut a) => {
+            // java order: importAllAsset (merge asset_v2) THEN updateUsage (decay).
+            if let Some(store) = &s.account_assets {
+                merge_account_assets(&mut a, store);
+            }
+            apply_read_usage_recovery(&mut a, &s.dyn_props);
+            Ok(encode_account_for_rpc(&a, genesis_ms))
+        }
         None => Ok(Value::Null),
     }
 }
@@ -1077,7 +1085,116 @@ pub fn get_energy_prices(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 ///
 /// (The previous encoder emitted an ETH-style camelCase/`0x`-hex subset,
 /// which diverged from java-tron on ~every field — caught by `tron-state-diff`.)
-fn encode_account_for_rpc(a: &tron_proto::Account) -> Value {
+/// Convert a stored resource-consume *slot* to the wall-clock millisecond
+/// timestamp java-tron's `Wallet.getAccount` emits: `genesis + 3000 * slot`
+/// (java-tron `Wallet.java`). We store `latest_consume_time(_for_energy)` /
+/// `latest_consume_free_time` as slots (`(blockTs - genesis)/3000`, matching
+/// java's internal `getHeadSlot()`), but java rewrites them to ms on RPC
+/// output — so we must too, or the field reads ~3000x too small.
+fn consume_slot_to_ms(slot: i64, genesis_ms: i64) -> i64 {
+    const BLOCK_PRODUCED_INTERVAL_MS: i64 = 3_000;
+    genesis_ms + BLOCK_PRODUCED_INTERVAL_MS * slot
+}
+
+/// java-tron's `Wallet.getAccount` decays the stored usage counters at read
+/// time — `BandwidthProcessor.updateUsage` / `EnergyProcessor.updateUsage`
+/// recover `net_usage` / `free_net_usage` / `energy_usage` toward 0 over the
+/// elapsed window BEFORE returning the account. We store the raw
+/// post-last-consume value, so without this the RPC reports stale usage where
+/// java reports the decayed value (usually 0). Mirrors java exactly: net +
+/// energy use the account-windowed recovery, free-net the default window;
+/// `latest_consume_time*` is left untouched (its ms conversion happens later
+/// in the serializer). Per-asset free-net usage maps are part of the deferred
+/// asset-optimization work and are not decayed here.
+fn apply_read_usage_recovery(
+    account: &mut tron_proto::Account,
+    dp: &tron_chainbase::DynamicPropertiesStore,
+) {
+    use tron_executor::resource::{increase_default, recovery_account, ResourceKind};
+    let now_slot = dp.head_slot();
+    let net = recovery_account(
+        account,
+        ResourceKind::Bandwidth,
+        account.net_usage,
+        account.latest_consume_time,
+        now_slot,
+    );
+    let free_net =
+        increase_default(account.free_net_usage, 0, account.latest_consume_free_time, now_slot);
+    // Read energy fields out first so the recovery borrow doesn't overlap the
+    // later mutable write-back.
+    let energy_in = account
+        .account_resource
+        .as_ref()
+        .map(|r| (r.energy_usage, r.latest_consume_time_for_energy));
+    let energy = energy_in
+        .map(|(eu, lt)| recovery_account(account, ResourceKind::Energy, eu, lt, now_slot));
+    account.net_usage = net;
+    account.free_net_usage = free_net;
+    if let (Some(e), Some(r)) = (energy, account.account_resource.as_mut()) {
+        r.energy_usage = e;
+    }
+
+    // Per-asset free-net usage (java updateUsage's V2 asset loop): materialize
+    // one decayed `free_asset_net_usageV2` entry per asset (run AFTER the
+    // asset_v2 merge so the merged balances drive the key set).
+    let asset_usage = materialized_asset_net_usage(account, now_slot);
+    if !asset_usage.is_empty() {
+        account.free_asset_net_usage_v2 = asset_usage;
+    }
+}
+
+/// Materialize the per-asset `free_asset_net_usageV2` map java's `updateUsage`
+/// produces: one decayed entry for every asset the account holds (its merged
+/// `asset_v2` keys) ∪ any existing usage key, recovered (default window) via
+/// that asset's `latest_asset_operation_timeV2`. Assets never used for free
+/// bandwidth still get a (zero) entry, matching java.
+fn materialized_asset_net_usage(
+    account: &tron_proto::Account,
+    now_slot: i64,
+) -> std::collections::BTreeMap<String, i64> {
+    use tron_executor::resource::increase_default;
+    let mut keys: std::collections::BTreeSet<String> = account.asset_v2.keys().cloned().collect();
+    keys.extend(account.free_asset_net_usage_v2.keys().cloned());
+    let mut out = std::collections::BTreeMap::new();
+    for k in keys {
+        let old = account.free_asset_net_usage_v2.get(&k).copied().unwrap_or(0);
+        let last = account.latest_asset_operation_time_v2.get(&k).copied().unwrap_or(0);
+        out.insert(k, increase_default(old, 0, last, now_slot));
+    }
+    out
+}
+
+/// java-tron's `AssetUtil.importAllAsset`: when an account is asset-optimized,
+/// merge its TRC10 balances out of the `account-asset` store back into the
+/// `asset_v2` map (store rows first, then inline entries override — matching
+/// java's `getAllAssets` then `getAssetV2Map().forEach(put)`). No-op for
+/// non-optimized accounts (their balances are already inline) and when the
+/// store isn't attached.
+fn merge_account_assets(
+    account: &mut tron_proto::Account,
+    store: &tron_chainbase::AccountAssetStore,
+) {
+    if !account.asset_optimized || account.address.len() != 21 {
+        return;
+    }
+    let mut addr = [0u8; 21];
+    addr.copy_from_slice(&account.address);
+    let owner = tron_crypto::address::Address::from_raw(addr);
+    let Ok(rows) = store.get_all_assets(&owner) else {
+        return;
+    };
+    let mut merged: std::collections::BTreeMap<String, i64> = rows
+        .into_iter()
+        .map(|(id, bal)| (String::from_utf8_lossy(&id).into_owned(), bal))
+        .collect();
+    for (k, v) in &account.asset_v2 {
+        merged.insert(k.clone(), *v);
+    }
+    account.asset_v2 = merged;
+}
+
+fn encode_account_for_rpc(a: &tron_proto::Account, genesis_ms: i64) -> Value {
     use serde_json::Map;
     let mut m = Map::new();
 
@@ -1088,6 +1205,8 @@ fn encode_account_for_rpc(a: &tron_proto::Account) -> Value {
             m.insert(k.to_string(), v);
         }
     };
+    let consume_ms_a = consume_slot_to_ms(a.latest_consume_time, genesis_ms);
+    let consume_free_ms = consume_slot_to_ms(a.latest_consume_free_time, genesis_ms);
 
     if !a.account_name.is_empty() {
         m.insert("account_name".into(), json!(String::from_utf8_lossy(&a.account_name)));
@@ -1102,8 +1221,8 @@ fn encode_account_for_rpc(a: &tron_proto::Account) -> Value {
     put(&mut m, "is_committee", a.is_committee, json!(true));
     put(&mut m, "net_usage", a.net_usage != 0, json!(a.net_usage));
     put(&mut m, "free_net_usage", a.free_net_usage != 0, json!(a.free_net_usage));
-    put(&mut m, "latest_consume_time", a.latest_consume_time != 0, json!(a.latest_consume_time));
-    put(&mut m, "latest_consume_free_time", a.latest_consume_free_time != 0, json!(a.latest_consume_free_time));
+    put(&mut m, "latest_consume_time", consume_ms_a != 0, json!(consume_ms_a));
+    put(&mut m, "latest_consume_free_time", consume_free_ms != 0, json!(consume_free_ms));
     put(&mut m, "net_window_size", a.net_window_size != 0, json!(a.net_window_size));
     put(&mut m, "net_window_optimized", a.net_window_optimized, json!(true));
     put(&mut m, "asset_optimized", a.asset_optimized, json!(true));
@@ -1139,9 +1258,12 @@ fn encode_account_for_rpc(a: &tron_proto::Account) -> Value {
     if !a.frozen.is_empty() {
         m.insert("frozen".into(), json!(a.frozen.iter().map(frozen_json).collect::<Vec<_>>()));
     }
-    if !a.frozen_v2.is_empty() {
-        m.insert("frozenV2".into(), json!(a.frozen_v2.iter().map(freeze_v2_json).collect::<Vec<_>>()));
-    }
+    // java-tron's `Wallet.sortFrozenV2List`: getAccount ALWAYS returns one
+    // FreezeV2 entry per ResourceCode (BANDWIDTH, ENERGY, TRON_POWER) in that
+    // order, padding absent resources with amount 0 — an unconditional RPC
+    // presentation step (the stored list only carries actually-frozen
+    // resources). Emit it the same way so the field matches byte-for-byte.
+    m.insert("frozenV2".into(), json!(normalized_frozen_v2_json(a)));
     if !a.frozen_supply.is_empty() {
         m.insert("frozen_supply".into(), json!(a.frozen_supply.iter().map(frozen_json).collect::<Vec<_>>()));
     }
@@ -1178,7 +1300,7 @@ fn encode_account_for_rpc(a: &tron_proto::Account) -> Value {
 
     // Nested energy/storage block.
     if let Some(r) = &a.account_resource {
-        let ar = account_resource_json(r);
+        let ar = account_resource_json(r, genesis_ms);
         if ar.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
             m.insert("account_resource".into(), ar);
         }
@@ -1233,6 +1355,26 @@ fn freeze_v2_json(f: &tron_proto::account::FreezeV2) -> Value {
     Value::Object(m)
 }
 
+/// Build the getAccount `frozenV2` array exactly as java-tron's
+/// `Wallet.sortFrozenV2List` does: one entry per ResourceCode in canonical
+/// order (BANDWIDTH=0, ENERGY=1, TRON_POWER=2; UNRECOGNIZED skipped), carrying
+/// the stored amount for that resource or 0 if the account has no entry for
+/// it. Always three entries, regardless of what's actually frozen.
+fn normalized_frozen_v2_json(a: &tron_proto::Account) -> Vec<Value> {
+    [0_i32, 1, 2]
+        .iter()
+        .map(|&code| {
+            let amount = a
+                .frozen_v2
+                .iter()
+                .find(|f| f.r#type == code)
+                .map(|f| f.amount)
+                .unwrap_or(0);
+            freeze_v2_json(&tron_proto::account::FreezeV2 { r#type: code, amount })
+        })
+        .collect()
+}
+
 fn vote_json(v: &tron_proto::Vote) -> Value {
     json!({ "vote_address": hex_bytes(&v.vote_address), "vote_count": v.vote_count })
 }
@@ -1280,7 +1422,7 @@ fn permission_json(p: &tron_proto::Permission) -> Value {
     Value::Object(m)
 }
 
-fn account_resource_json(r: &tron_proto::account::AccountResource) -> Value {
+fn account_resource_json(r: &tron_proto::account::AccountResource, genesis_ms: i64) -> Value {
     let mut m = serde_json::Map::new();
     let put = |m: &mut serde_json::Map<String, Value>, k: &str, present: bool, v: Value| {
         if present {
@@ -1293,7 +1435,8 @@ fn account_resource_json(r: &tron_proto::account::AccountResource) -> Value {
             m.insert("frozen_balance_for_energy".into(), frozen_json(f));
         }
     }
-    put(&mut m, "latest_consume_time_for_energy", r.latest_consume_time_for_energy != 0, json!(r.latest_consume_time_for_energy));
+    let consume_energy_ms = consume_slot_to_ms(r.latest_consume_time_for_energy, genesis_ms);
+    put(&mut m, "latest_consume_time_for_energy", consume_energy_ms != 0, json!(consume_energy_ms));
     put(&mut m, "acquired_delegated_frozen_balance_for_energy", r.acquired_delegated_frozen_balance_for_energy != 0, json!(r.acquired_delegated_frozen_balance_for_energy));
     put(&mut m, "delegated_frozen_balance_for_energy", r.delegated_frozen_balance_for_energy != 0, json!(r.delegated_frozen_balance_for_energy));
     put(&mut m, "storage_limit", r.storage_limit != 0, json!(r.storage_limit));
@@ -2366,8 +2509,15 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Ok(Some(addr)) = idx.get(&id_bytes) else {
         return Ok(Value::Null);
     };
+    let genesis_ms = s.dyn_props.genesis_block_timestamp().unwrap_or(0);
     match s.accounts.get(&addr) {
-        Ok(Some(a)) => Ok(encode_account_for_rpc(&a)),
+        Ok(Some(mut a)) => {
+            if let Some(store) = &s.account_assets {
+                merge_account_assets(&mut a, store);
+            }
+            apply_read_usage_recovery(&mut a, &s.dyn_props);
+            Ok(encode_account_for_rpc(&a, genesis_ms))
+        }
         _ => Ok(Value::Null),
     }
 }
@@ -3085,7 +3235,7 @@ pub fn get_account_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
 
     // Look up account; return an empty quota view for unknown
     // addresses (java-tron does the same — empty body, not an error).
-    let account = match s
+    let mut account = match s
         .accounts
         .get(&addr)
         .map_err(|e| RpcError::internal(format!("account read: {e}")))?
@@ -3093,6 +3243,28 @@ pub fn get_account_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
         Some(a) => a,
         None => return Ok(json!({})),
     };
+
+    // java's `getAssetMapV2()` (called from updateUsage) lazily importsAllAsset,
+    // so the asset-net maps are keyed by the MERGED asset set. Merge first.
+    if let Some(store) = &s.account_assets {
+        merge_account_assets(&mut account, store);
+    }
+    let now_slot = s.dyn_props.head_slot();
+
+    // assetNetUsed = per-asset free-net usage (decayed); assetNetLimit =
+    // each asset's AssetIssue `free_asset_net_limit` (java's setAssetNetLimit).
+    let asset_net_used = materialized_asset_net_usage(&account, now_slot);
+    let mut asset_net_limit: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for key in asset_net_used.keys() {
+        let limit = key
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| s.assets_v2.as_ref().and_then(|st| st.get(id).ok().flatten()))
+            .map(|issue| issue.free_asset_net_limit)
+            .unwrap_or(0);
+        asset_net_limit.insert(key.clone(), limit);
+    }
 
     let v = account_resource_view(&account, &s.dyn_props);
     Ok(json!({
@@ -3111,11 +3283,9 @@ pub fn get_account_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
         "tronPowerUsed": v.tron_power_used,
         "storageLimit": v.storage_limit,
         "storageUsed": v.storage_used,
+        "assetNetUsed": kv_array(&asset_net_used),
+        "assetNetLimit": kv_array(&asset_net_limit),
     }))
-    // NOTE: assetNetLimit / assetNetUsed (per-TRC10 free-bandwidth maps) are
-    // not emitted yet — they need per-asset decay + AssetIssue free-limit
-    // lookups (java-tron's `setAssetNetLimit`). Tracked as the remaining
-    // getaccountresource gap; affects only TRC10-holding accounts' display.
 }
 
 /// `getAccountNet(address)` — bandwidth-only subset of
@@ -6141,7 +6311,7 @@ mod account_encoding_tests {
             }),
             ..Default::default()
         };
-        let v = encode_account_for_rpc(&a);
+        let v = encode_account_for_rpc(&a, 0);
         let o = v.as_object().unwrap();
 
         // java-tron proto field names (snake_case), NOT the old eth camelCase.
@@ -6154,8 +6324,13 @@ mod account_encoding_tests {
         assert!(o.get("votesCount").is_none());
         // account_name rendered as text, like java-tron.
         assert_eq!(o.get("account_name"), Some(&json!("Ant Investment Group")));
-        // frozenV2 keeps the proto's camelCase key + ResourceCode enum name.
-        assert_eq!(o["frozenV2"], json!([{ "type": "ENERGY", "amount": 5_000 }]));
+        // frozenV2 is normalized to all 3 ResourceCodes in canonical order
+        // (java-tron's Wallet.sortFrozenV2List), padding absent ones with 0:
+        // BANDWIDTH:0 → {}, ENERGY:5000, TRON_POWER:0 → {"type":"TRON_POWER"}.
+        assert_eq!(
+            o["frozenV2"],
+            json!([{}, { "type": "ENERGY", "amount": 5_000 }, { "type": "TRON_POWER" }])
+        );
         // Nested account_resource block, snake_case fields.
         assert_eq!(o["account_resource"]["energy_usage"], json!(999));
         assert_eq!(o["account_resource"]["energy_window_size"], json!(28_800_000));
@@ -6163,6 +6338,106 @@ mod account_encoding_tests {
         // Default-valued fields omitted (proto3 omission, like java).
         assert!(o.get("allowance").is_none());
         assert!(o.get("frozen").is_none());
+    }
+
+    #[test]
+    fn frozen_v2_is_padded_to_all_three_resources() {
+        // java-tron's Wallet.getAccount always returns all 3 ResourceCodes
+        // (zero-padded, canonical order), even for accounts that never froze.
+        // Empty stored list → [BANDWIDTH:0, ENERGY:0, TRON_POWER:0].
+        let empty = tron_proto::Account { address: vec![0x41; 21], ..Default::default() };
+        assert_eq!(
+            encode_account_for_rpc(&empty, 0)["frozenV2"],
+            json!([{}, { "type": "ENERGY" }, { "type": "TRON_POWER" }])
+        );
+
+        // A single non-zero bandwidth freeze keeps its amount and pads the rest.
+        let bw = tron_proto::Account {
+            address: vec![0x41; 21],
+            frozen_v2: vec![FreezeV2 { r#type: 0, amount: 1_000_000 }],
+            ..Default::default()
+        };
+        assert_eq!(
+            encode_account_for_rpc(&bw, 0)["frozenV2"],
+            json!([{ "amount": 1_000_000 }, { "type": "ENERGY" }, { "type": "TRON_POWER" }])
+        );
+    }
+
+    #[test]
+    fn latest_consume_times_are_converted_from_slot_to_ms() {
+        // We store latest_consume_time(_for_energy) / latest_consume_free_time
+        // as slots (matching java's internal getHeadSlot()), but java-tron's
+        // Wallet.getAccount emits them in ms: genesis + 3000 * slot.
+        let a = tron_proto::Account {
+            address: vec![0x41; 21],
+            latest_consume_time: 591_849_058,
+            latest_consume_free_time: 561_158_347,
+            account_resource: Some(AccountResource {
+                latest_consume_time_for_energy: 592_316_558,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Mainnet genesis = 0 → value is exactly slot * 3000.
+        let o = encode_account_for_rpc(&a, 0);
+        assert_eq!(o["latest_consume_time"], json!(1_775_547_174_000_i64));
+        assert_eq!(o["latest_consume_free_time"], json!(1_683_475_041_000_i64));
+        assert_eq!(
+            o["account_resource"]["latest_consume_time_for_energy"],
+            json!(1_776_949_674_000_i64)
+        );
+
+        // Non-zero genesis offsets the result: genesis + 3000 * slot.
+        let o2 = encode_account_for_rpc(&a, 1_000);
+        assert_eq!(o2["latest_consume_time"], json!(1_775_547_174_000_i64 + 1_000));
+    }
+
+    #[test]
+    fn merge_account_assets_imports_store_balances_when_optimized() {
+        use std::sync::Arc;
+        use tron_chainbase::{AccountAssetStore, KvBackend, MemBackend};
+        let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let store = AccountAssetStore::new(backend);
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1..].fill(0xaa);
+        let owner = tron_crypto::address::Address::from_raw(a);
+        store.put(&owner, b"1000001", 100).unwrap();
+        store.put(&owner, b"1000002", 200).unwrap();
+
+        // Optimized account, empty inline asset_v2 → store balances merge in.
+        let mut acct = tron_proto::Account {
+            address: a.to_vec(),
+            asset_optimized: true,
+            ..Default::default()
+        };
+        merge_account_assets(&mut acct, &store);
+        assert_eq!(acct.asset_v2.get("1000001"), Some(&100));
+        assert_eq!(acct.asset_v2.get("1000002"), Some(&200));
+        assert_eq!(acct.asset_v2.len(), 2);
+
+        // Non-optimized account → no merge (balances already inline).
+        let mut plain = tron_proto::Account {
+            address: a.to_vec(),
+            asset_optimized: false,
+            ..Default::default()
+        };
+        merge_account_assets(&mut plain, &store);
+        assert!(plain.asset_v2.is_empty());
+    }
+
+    #[test]
+    fn materialized_asset_net_usage_pads_one_zero_entry_per_asset() {
+        // java materializes a free_asset_net_usageV2 entry per held asset,
+        // decayed to 0 when the asset was never used for free bandwidth.
+        let mut acct = tron_proto::Account::default();
+        acct.asset_v2.insert("1000001".into(), 100);
+        acct.asset_v2.insert("1000002".into(), 200);
+        let m = materialized_asset_net_usage(&acct, 1_000_000);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("1000001"), Some(&0));
+        assert_eq!(m.get("1000002"), Some(&0));
     }
 }
 

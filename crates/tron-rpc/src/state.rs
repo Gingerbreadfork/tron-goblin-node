@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AbiStore, AccountIdIndexStore, AccountStore, AssetIssueStore, AssetIssueV2Store,
+    AbiStore, AccountAssetStore, AccountIdIndexStore, AccountStore, AssetIssueStore, AssetIssueV2Store,
     BalanceTraceStore, NullifierStore,
     BlockIndexStore, BlockStore, CodeStore, ContractStore, DelegatedResourceAccountIndexStore,
     DelegatedResourceStore, DelegationStore, DynamicPropertiesStore, ExchangeV2Store, KvBackend,
@@ -40,6 +40,12 @@ pub struct RpcState {
     /// java-tron writes to both stores so the same row is reachable
     /// by either key.
     pub assets_v1: Option<Arc<AssetIssueStore>>,
+    /// Per-account TRC10 balances split out of `Account` when
+    /// `AllowAccountAssetOptimization` is active (the snapshot stores them
+    /// here, with `Account.asset_v2` left empty + `asset_optimized=true`).
+    /// `getAccount` merges them back (java-tron's `importAllAsset`). Absent
+    /// ⇒ getAccount returns whatever inline `asset_v2` the account carries.
+    pub account_assets: Option<Arc<AccountAssetStore>>,
     /// Shielded nullifier set — populated by ShieldedTransferActuator
     /// at apply-time. Needed by `is_spend` and the shielded TRC-20
     /// spent-check helpers. Absent on non-shielded configurations.
@@ -157,6 +163,7 @@ impl RpcState {
             proposals: None,
             assets_v2: None,
             assets_v1: None,
+            account_assets: None,
             nullifiers: None,
             exchanges_v2: None,
             eth_call_backends: None,
@@ -337,6 +344,14 @@ impl RpcState {
     /// that proposal activated.
     pub fn with_assets_v1(mut self, backend: Arc<dyn KvBackend>) -> Self {
         self.assets_v1 = Some(Arc::new(AssetIssueStore::new(backend)));
+        self
+    }
+
+    /// Attach the per-account TRC10 balance store (`account-asset`) so
+    /// `getAccount` can merge optimized assets back into `asset_v2`
+    /// (java-tron's `importAllAsset`).
+    pub fn with_account_assets(mut self, backend: Arc<dyn KvBackend>) -> Self {
+        self.account_assets = Some(Arc::new(AccountAssetStore::new(backend)));
         self
     }
 
