@@ -934,6 +934,20 @@ fn parse_args(args: &[String]) -> Result<NodeConfig, String> {
     }
     if let Some(path) = &config_file {
         config = NodeConfig::from_file(path).map_err(|e| e.to_string())?;
+    } else {
+        // No explicit --config: auto-load ./config.toml from the working
+        // directory if it exists (the common operator expectation — otherwise
+        // a present config silently does nothing and every setting falls back
+        // to its default). Logged so it's never a surprise; pass --config to
+        // point elsewhere. Later CLI flags (--data-dir, --peer, …) still
+        // override whatever the file sets.
+        let default_path = PathBuf::from("config.toml");
+        if default_path.is_file() {
+            config = NodeConfig::from_file(&default_path).map_err(|e| e.to_string())?;
+            eprintln!(
+                "tron-node: loaded ./config.toml (no --config given); pass --config to override"
+            );
+        }
     }
 
     // Second pass: apply every flag.

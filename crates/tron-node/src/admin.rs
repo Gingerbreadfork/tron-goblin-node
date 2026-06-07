@@ -526,6 +526,7 @@ mod tests {
             id_index: mem(),
             asset_v1: mem(),
             asset_v2: mem(),
+            account_asset: mem(),
             contracts: mem(),
             abi: mem(),
             exchange_v1: mem(),
