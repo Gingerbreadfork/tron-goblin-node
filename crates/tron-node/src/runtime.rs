@@ -1354,15 +1354,31 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     if !shutdown.is_shutdown() {
         let _ = sd.recv().await;
     }
-    info!("shutdown observed; waiting up to 5s for subsystems");
+    info!("shutdown observed; waiting up to 3s for subsystems to drain");
 
-    // Give subsystems a moment to drain.
-    let drain = tokio::time::timeout(Duration::from_secs(5), async {
+    // Give subsystems a grace window to drain gracefully, then force-abort
+    // any stragglers. Most tasks observe the shutdown broadcast and return
+    // within ~1s, but a server doing a graceful HTTP/gRPC shutdown can sit
+    // waiting on an idle keep-alive connection from a monitoring client
+    // (Prometheus scraping :9090, a wallet polling :8090) until that client
+    // disconnects. Aborting the stragglers — rather than waiting out the
+    // runtime's own shutdown timeout — keeps Ctrl-C/SIGTERM snappy. Aborting
+    // is safe here: the only task that writes to disk (the peer_state
+    // flusher) is shutdown-driven and exits well inside the grace window, so
+    // it is never in the straggler set; the rest are network servers and
+    // periodic samplers with no durable mid-operation state.
+    let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+    let drain = tokio::time::timeout(Duration::from_secs(3), async {
         for h in handles {
             let _ = h.await;
         }
     });
-    let _ = drain.await;
+    if drain.await.is_err() {
+        warn!("subsystems did not drain in 3s; aborting stragglers");
+        for ah in &abort_handles {
+            ah.abort();
+        }
+    }
     info!("bye");
     Ok(())
 }
