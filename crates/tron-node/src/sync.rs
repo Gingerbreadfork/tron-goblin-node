@@ -272,6 +272,17 @@ struct FetchPoolInner {
     /// Dedup set over want+inflight+ready so `push_wants` never enqueues an
     /// id already being handled.
     seen: std::collections::HashSet<[u8; 32]>,
+    /// Block number for every live id (want/inflight/ready), so a late
+    /// delivery of a reclaimed id can be located back in `want`.
+    num_of: std::collections::HashMap<[u8; 32], i64>,
+    /// Per-id set of connection tokens that have already been handed this id
+    /// to fetch. java-tron's `FetchInvDataMsgHandler` caches every block hash
+    /// it serves a connection and disconnects (BAD_PROTOCOL) on a re-request,
+    /// so we must NEVER ask the same connection for the same id twice — even
+    /// after a stall-reclaim. A reclaimed id is therefore re-offered only to a
+    /// *different* connection; its original (slow-but-alive) peer's late
+    /// delivery is still accepted by `deliver`.
+    claimers: std::collections::HashMap<[u8; 32], Vec<u64>>,
 }
 
 impl SyncFetchPool {
@@ -289,6 +300,8 @@ impl SyncFetchPool {
         g.inflight.clear();
         g.ready.clear();
         g.seen.clear();
+        g.num_of.clear();
+        g.claimers.clear();
     }
 
     /// Leader: enqueue `(num, id)` wants in chain order. Ids already being
@@ -299,6 +312,7 @@ impl SyncFetchPool {
         for (num, id) in items {
             if g.seen.insert(id) {
                 g.want.insert(num, id);
+                g.num_of.insert(id, num);
             }
         }
     }
@@ -310,6 +324,7 @@ impl SyncFetchPool {
     /// stalled in-flight ids. Returns empty under `ready_cap` back-pressure.
     pub fn claim(
         &self,
+        conn_token: u64,
         max_num: i64,
         max: usize,
         ready_cap: usize,
@@ -330,10 +345,18 @@ impl SyncFetchPool {
         if g.ready.len() >= ready_cap {
             return Vec::new();
         }
-        // Lowest eligible numbers (≤ max_num) first.
+        // Lowest eligible numbers (≤ max_num) first, skipping any id this
+        // connection has already been handed (re-requesting it would trip the
+        // peer's served-hash cache → BAD_PROTOCOL).
         let picked: Vec<(i64, [u8; 32])> = g
             .want
             .range(..=max_num)
+            .filter(|(_, id)| {
+                g.claimers
+                    .get(*id)
+                    .map(|c| !c.contains(&conn_token))
+                    .unwrap_or(true)
+            })
             .take(max)
             .map(|(n, id)| (*n, *id))
             .collect();
@@ -342,18 +365,26 @@ impl SyncFetchPool {
         for (n, id) in picked {
             g.want.remove(&n);
             g.inflight.insert(id, (n, now));
+            g.claimers.entry(id).or_default().push(conn_token);
             out.push(id);
         }
         out
     }
 
-    /// Worker: a claimed block arrived → move it to `ready`. A body for an
-    /// id not in-flight (stale re-delivery after reclaim, or a duplicate) is
-    /// dropped.
+    /// Worker: a claimed block arrived → move it to `ready`. Accepts a late
+    /// delivery of a reclaimed id (still wanted but no longer in-flight after a
+    /// stall-reclaim) so a slow-but-alive peer's block is used rather than
+    /// dropped + re-fetched. A body for an id already ready/applied (a true
+    /// duplicate) is dropped.
     pub fn deliver(&self, id: [u8; 32], bytes: Vec<u8>) {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
         if g.inflight.remove(&id).is_some() {
             g.ready.insert(id, bytes);
+        } else if let Some(n) = g.num_of.get(&id).copied() {
+            // Reclaimed back into `want` but its original fetch landed late.
+            if g.want.remove(&n).is_some() && !g.ready.contains_key(&id) {
+                g.ready.insert(id, bytes);
+            }
         }
     }
 
@@ -362,6 +393,8 @@ impl SyncFetchPool {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
         if let Some(bytes) = g.ready.remove(id) {
             g.seen.remove(id);
+            g.num_of.remove(id);
+            g.claimers.remove(id);
             Some(bytes)
         } else {
             None
@@ -378,6 +411,8 @@ impl SyncFetchPool {
         }
         g.want.retain(|_, v| v != id);
         g.ready.remove(id);
+        g.num_of.remove(id);
+        g.claimers.remove(id);
     }
 
     /// Count of ids still to fetch or in flight (not yet ready).
@@ -390,9 +425,15 @@ impl SyncFetchPool {
     /// serve (block num ≤ `max_num`) while the ready buffer is under
     /// `ready_cap` (back-pressure)? Lets a worker choose fetch-vs-refresh
     /// without claiming.
-    pub fn claimable_within(&self, max_num: i64, ready_cap: usize) -> bool {
+    pub fn claimable_within(&self, conn_token: u64, max_num: i64, ready_cap: usize) -> bool {
         let g = self.inner.lock().expect("SyncFetchPool poisoned");
-        g.ready.len() < ready_cap && g.want.range(..=max_num).next().is_some()
+        g.ready.len() < ready_cap
+            && g.want.range(..=max_num).any(|(_, id)| {
+                g.claimers
+                    .get(id)
+                    .map(|c| !c.contains(&conn_token))
+                    .unwrap_or(true)
+            })
     }
 }
 
@@ -416,24 +457,26 @@ mod fetch_pool_tests {
         (n as i64, id(n))
     }
     const HI: i64 = i64::MAX; // claim with no window ceiling (own peer at tip)
+    const T1: u64 = 1; // connection token A
+    const T2: u64 = 2; // connection token B (a different peer)
 
     #[test]
     fn claims_lowest_first_and_dedups() {
         let p = SyncFetchPool::new();
         p.push_wants([w(3), w(1), w(2)]); // out of order in → claimed low-first
         p.push_wants([w(2), w(3)]); // dups ignored
-        let c = p.claim(HI, 10, 100, Duration::from_secs(5));
+        let c = p.claim(T1, HI, 10, 100, Duration::from_secs(5));
         assert_eq!(c, vec![id(1), id(2), id(3)]);
         assert_eq!(p.outstanding(), 3); // all in-flight now
-        assert!(p.claim(HI, 10, 100, Duration::from_secs(5)).is_empty());
+        assert!(p.claim(T1, HI, 10, 100, Duration::from_secs(5)).is_empty());
     }
 
     #[test]
     fn claim_respects_max() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3), w(4)]);
-        assert_eq!(p.claim(HI, 2, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
-        assert_eq!(p.claim(HI, 2, 100, Duration::from_secs(5)), vec![id(3), id(4)]);
+        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
+        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(5)), vec![id(3), id(4)]);
     }
 
     #[test]
@@ -444,16 +487,16 @@ mod fetch_pool_tests {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3)]);
         // Worker whose peer only reaches block 2.
-        assert_eq!(p.claim(2, 10, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
+        assert_eq!(p.claim(T1, 2, 10, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
         // Block 3 still unclaimed — a higher-window peer takes it.
-        assert_eq!(p.claim(HI, 10, 100, Duration::from_secs(5)), vec![id(3)]);
+        assert_eq!(p.claim(T2, HI, 10, 100, Duration::from_secs(5)), vec![id(3)]);
     }
 
     #[test]
     fn deliver_and_take_in_order() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
-        let _ = p.claim(HI, 2, 100, Duration::from_secs(5));
+        let _ = p.claim(T1, HI, 2, 100, Duration::from_secs(5));
         // Deliver out of order; leader still takes in its own order.
         p.deliver(id(2), vec![2]);
         assert!(p.take_ready(&id(1)).is_none(), "gap blocks until id(1) lands");
@@ -467,22 +510,49 @@ mod fetch_pool_tests {
     fn back_pressure_stops_claims_when_applier_behind() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3)]);
-        let c = p.claim(HI, 1, 100, Duration::from_secs(5));
+        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(5));
         p.deliver(c[0], vec![0]);
         // ready holds 1; with ready_cap=1 no further claims are allowed.
-        assert!(p.claim(HI, 10, 1, Duration::from_secs(5)).is_empty());
+        assert!(p.claim(T1, HI, 10, 1, Duration::from_secs(5)).is_empty());
         let _ = p.take_ready(&id(1));
-        assert_eq!(p.claim(HI, 10, 1, Duration::from_secs(5)), vec![id(2), id(3)]);
+        assert_eq!(p.claim(T1, HI, 10, 1, Duration::from_secs(5)), vec![id(2), id(3)]);
     }
 
     #[test]
-    fn stalled_inflight_is_reclaimed() {
+    fn reclaimed_id_is_not_reoffered_to_the_same_conn() {
+        // The java-tron `syncBlockIdCache` guard: a stall-reclaimed id must
+        // NEVER be re-handed to the connection that already requested it
+        // (re-requesting trips the peer's served-hash cache → BAD_PROTOCOL).
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
-        let _ = p.claim(HI, 1, 100, Duration::from_secs(5)); // id(1) in flight
-        // 0 reclaim window → next claim reclaims id(1) and claims both.
-        let c = p.claim(HI, 2, 100, Duration::from_millis(0));
-        assert_eq!(c, vec![id(1), id(2)], "stalled id reclaimed");
+        assert_eq!(p.claim(T1, HI, 1, 100, Duration::from_secs(5)), vec![id(1)]);
+        // 0 reclaim window → id(1) is reclaimed back into `want`.
+        // Same connection re-claims: it gets id(2), NOT the reclaimed id(1).
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_millis(0)),
+            vec![id(2)],
+            "reclaimed id(1) must not be re-offered to the conn that has it"
+        );
+        // A DIFFERENT connection may take the reclaimed id(1). (Use a normal
+        // reclaim window so id(2), just claimed by T1, isn't pulled back.)
+        assert_eq!(p.claim(T2, HI, 2, 100, Duration::from_secs(5)), vec![id(1)]);
+    }
+
+    #[test]
+    fn late_delivery_of_reclaimed_id_is_accepted() {
+        // A slow-but-alive peer: its block is reclaimed (timer) but then lands
+        // late. The late body must be accepted (used), not dropped — otherwise
+        // the id would need a re-fetch (BAD_PROTOCOL) or stall forever.
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1)]);
+        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(5)); // id(1) in flight
+        // Reclaim it (a later claim with a 0 window pulls it back to `want`),
+        // but T1 won't re-take it (previous test); it sits in `want`.
+        assert!(p.claim(T1, HI, 1, 100, Duration::from_millis(0)).is_empty());
+        // The original (slow) fetch lands late — accepted into `ready`.
+        p.deliver(id(1), vec![9]);
+        assert_eq!(p.take_ready(&id(1)), Some(vec![9]));
+        assert_eq!(p.outstanding(), 0);
     }
 
     #[test]
@@ -491,18 +561,18 @@ mod fetch_pool_tests {
         p.push_wants([w(1), w(2)]);
         // Leader fetched id(1) itself → forget it so no worker re-fetches.
         p.forget(&id(1));
-        assert_eq!(p.claim(HI, 10, 100, Duration::from_secs(5)), vec![id(2)]);
+        assert_eq!(p.claim(T1, HI, 10, 100, Duration::from_secs(5)), vec![id(2)]);
     }
 
     #[test]
     fn reset_clears_everything() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
-        let _ = p.claim(HI, 1, 100, Duration::from_secs(5));
+        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(5));
         p.reset();
         assert_eq!(p.outstanding(), 0);
         p.push_wants([w(1)]);
-        assert_eq!(p.claim(HI, 10, 100, Duration::from_secs(5)), vec![id(1)]);
+        assert_eq!(p.claim(T1, HI, 10, 100, Duration::from_secs(5)), vec![id(1)]);
     }
 }
 
@@ -1834,6 +1904,15 @@ impl SyncDriver {
         // first send doesn't wait.
         const REQ_MIN_INTERVAL: Duration = Duration::from_millis(400);
         let mut last_request_at: Option<Instant> = None;
+        // Unique token for THIS connection, used by the shared `SyncFetchPool`
+        // so a stall-reclaimed block id is never re-requested from the same
+        // connection (java-tron caches served hashes per connection and
+        // disconnects on a re-request). A fresh token per connection is correct:
+        // a reconnect resets the peer's cache, so re-requesting is fine again.
+        let conn_token: u64 = {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
         // Chain sync is kicked off from inside the loop, gated on
         // leadership: only the single active syncer sends the locator (a
         // java-tron-style geometric back-off of our recent block ids,
@@ -1888,9 +1967,14 @@ impl SyncDriver {
             std::collections::VecDeque::new();
         let mut offered_max: i64 = 0;
         // Back-pressure ceiling on fetched-but-unapplied blocks, and how long
-        // before a stalled in-flight claim is re-offered to another peer.
+        // before a stalled in-flight claim is re-offered to (a DIFFERENT) peer.
+        // This is a dead-peer backstop, not a normal-operation timer: during an
+        // apply-bound backlog the in-flight pipeline can take far longer than a
+        // few seconds to drain, and the block IS still coming — re-offering it
+        // early just wastes a fetch. The per-connection claimer guard makes a
+        // re-offer safe regardless, but a generous timeout avoids the churn.
         const POOL_READY_CAP: usize = 400;
-        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(8);
+        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(30);
 
         // KeepAlive heartbeat. Mirrors java-tron's
         // `KeepAliveService` — every `KEEPALIVE_INTERVAL` we send the
@@ -2101,7 +2185,7 @@ impl SyncDriver {
                     && self
                         .fetch_pool
                         .as_ref()
-                        .map(|p| p.claimable_within(offered_max, POOL_READY_CAP))
+                        .map(|p| p.claimable_within(conn_token, offered_max, POOL_READY_CAP))
                         .unwrap_or(false);
                 if can_fetch {
                     Some(PendingAction::FetchChunk)
@@ -2166,6 +2250,7 @@ impl SyncDriver {
                                     .as_ref()
                                     .map(|p| {
                                         p.claim(
+                                            conn_token,
                                             offered_max,
                                             FETCH_CHUNK_SIZE,
                                             POOL_READY_CAP,
