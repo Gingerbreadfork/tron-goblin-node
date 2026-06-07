@@ -226,6 +226,249 @@ impl Default for SyncLeadership {
     }
 }
 
+/// Shared, in-order block-fetch pool that lets the whole connected peer
+/// fleet fetch a sync backlog cooperatively while a single driver still
+/// APPLIES blocks in chain order (preserving the single-active-syncer
+/// invariant that avoids the multi-driver head race). The leader publishes
+/// the block ids it needs (`push_wants`, in chain order); every eligible
+/// driver — leader and standbys alike — claims unfetched ids, downloads
+/// them from ITS OWN peer, and deposits the bodies back (`deliver`); the
+/// leader drains them in order (`take_ready`) and applies.
+///
+/// **Network-polite by construction** (we want speed, not to bother anyone):
+///   * Every id is fetched from exactly ONE peer at a time — `claim` moves
+///     it to `inflight`, so no two peers (and no wasted bandwidth) ever
+///     fetch the same block. Total bytes pulled from the network equals the
+///     backlog, once — identical to single-peer sync, just spread out.
+///   * A claimed id is only re-offered to another peer if its original
+///     fetcher didn't `deliver` within `reclaim_after` (a slow/dead peer),
+///     so a healthy peer is never double-asked.
+///   * `claim` honours a `ready_cap` back-pressure bound: once that many
+///     fetched-but-not-yet-applied blocks are buffered, workers stop
+///     claiming. We never pull faster than we can apply, so we don't
+///     over-request from peers or balloon memory.
+///   * Per-peer request pacing (each driver's `REQ_MIN_INTERVAL`, and the
+///     peer's own rate limit) is unchanged — each peer sees the exact same
+///     polite cadence as before. We simply make use of the peers we're
+///     already connected to instead of leaving them idle.
+#[derive(Debug)]
+pub struct SyncFetchPool {
+    inner: std::sync::Mutex<FetchPoolInner>,
+}
+
+#[derive(Debug, Default)]
+struct FetchPoolInner {
+    /// Ids the leader wants, in chain order, not yet claimed.
+    want: std::collections::VecDeque<[u8; 32]>,
+    /// Claimed ids currently being fetched: id → when it was claimed.
+    inflight: std::collections::HashMap<[u8; 32], Instant>,
+    /// Fetched block bodies awaiting in-order apply: id → raw wire bytes.
+    ready: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    /// Membership set spanning want+inflight+ready, so `push_wants` can
+    /// dedup in O(1) and never enqueue an id we're already handling.
+    seen: std::collections::HashSet<[u8; 32]>,
+}
+
+impl SyncFetchPool {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(FetchPoolInner::default()),
+        }
+    }
+
+    /// Clear everything. Called by the leader when it (re)starts a sync
+    /// session, on a reorg, or when leadership changes — so stale wants
+    /// from a previous leader can't be applied out of context. Cheap and
+    /// safe: anything dropped is simply re-requested.
+    pub fn reset(&self) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        g.want.clear();
+        g.inflight.clear();
+        g.ready.clear();
+        g.seen.clear();
+    }
+
+    /// Leader: enqueue ids to fetch, in chain order. Ids already being
+    /// handled (want/inflight/ready) are skipped, so no block is ever
+    /// fetched twice.
+    pub fn push_wants(&self, ids: impl IntoIterator<Item = [u8; 32]>) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        for id in ids {
+            if g.seen.insert(id) {
+                g.want.push_back(id);
+            }
+        }
+    }
+
+    /// Worker: claim up to `max` ids to fetch from this peer. First reclaims
+    /// any in-flight ids older than `reclaim_after` (their fetcher stalled)
+    /// back to the front of the queue. Returns empty when `ready` already
+    /// holds `ready_cap`+ blocks (back-pressure: the applier is behind, so
+    /// don't pull more) or there's nothing to do.
+    pub fn claim(
+        &self,
+        max: usize,
+        ready_cap: usize,
+        reclaim_after: Duration,
+    ) -> Vec<[u8; 32]> {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        // Reclaim stalled in-flight ids (a slow/dead fetcher) to the front,
+        // preserving chain order ahead of not-yet-claimed wants.
+        let stalled: Vec<[u8; 32]> = g
+            .inflight
+            .iter()
+            .filter(|(_, t)| t.elapsed() >= reclaim_after)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stalled {
+            g.inflight.remove(&id);
+            g.want.push_front(id);
+        }
+        // Back-pressure: don't out-run the applier.
+        if g.ready.len() >= ready_cap {
+            return Vec::new();
+        }
+        let take = max.min(g.want.len());
+        let mut out = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(id) = g.want.pop_front() {
+                g.inflight.insert(id, Instant::now());
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Worker: a claimed block arrived. Moves it to `ready`. A body for an
+    /// id we didn't have in-flight (a stale re-delivery after reclaim, or a
+    /// duplicate) is dropped — no wasted work propagates.
+    pub fn deliver(&self, id: [u8; 32], bytes: Vec<u8>) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        if g.inflight.remove(&id).is_some() {
+            g.ready.insert(id, bytes);
+        }
+    }
+
+    /// Leader: take a fetched body for in-order apply, if present.
+    pub fn take_ready(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        if let Some(bytes) = g.ready.remove(id) {
+            g.seen.remove(id);
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    /// Count of ids still to fetch or in flight (not yet ready). Lets the
+    /// leader tell whether the fleet still has fetch work outstanding.
+    pub fn outstanding(&self) -> usize {
+        let g = self.inner.lock().expect("SyncFetchPool poisoned");
+        g.want.len() + g.inflight.len()
+    }
+}
+
+impl Default for SyncFetchPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod fetch_pool_tests {
+    use super::SyncFetchPool;
+    use std::time::Duration;
+
+    fn id(n: u8) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[0] = n;
+        a
+    }
+
+    #[test]
+    fn claims_in_order_and_dedups() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1), id(2), id(3)]);
+        p.push_wants([id(2), id(3)]); // dups ignored
+        let c = p.claim(10, 100, Duration::from_secs(5));
+        assert_eq!(c, vec![id(1), id(2), id(3)]);
+        assert_eq!(p.outstanding(), 3); // all in-flight now
+        // Nothing left to claim.
+        assert!(p.claim(10, 100, Duration::from_secs(5)).is_empty());
+    }
+
+    #[test]
+    fn claim_respects_max() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1), id(2), id(3), id(4)]);
+        assert_eq!(p.claim(2, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
+        assert_eq!(p.claim(2, 100, Duration::from_secs(5)), vec![id(3), id(4)]);
+    }
+
+    #[test]
+    fn deliver_and_take_in_order() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1), id(2)]);
+        let _ = p.claim(2, 100, Duration::from_secs(5));
+        // Deliver out of order; leader still takes in its own order.
+        p.deliver(id(2), vec![2]);
+        assert!(p.take_ready(&id(1)).is_none(), "gap blocks until id(1) lands");
+        p.deliver(id(1), vec![1]);
+        assert_eq!(p.take_ready(&id(1)), Some(vec![1]));
+        assert_eq!(p.take_ready(&id(2)), Some(vec![2]));
+        assert_eq!(p.outstanding(), 0);
+    }
+
+    #[test]
+    fn back_pressure_stops_claims_when_applier_behind() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1), id(2), id(3)]);
+        let c = p.claim(1, 100, Duration::from_secs(5));
+        p.deliver(c[0], vec![0]);
+        // ready now holds 1; with ready_cap=1 no further claims are allowed.
+        assert!(p.claim(10, 1, Duration::from_secs(5)).is_empty());
+        // Drain it → claims resume.
+        let _ = p.take_ready(&id(1));
+        assert_eq!(p.claim(10, 1, Duration::from_secs(5)), vec![id(2), id(3)]);
+    }
+
+    #[test]
+    fn stalled_inflight_is_reclaimed_to_front() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1), id(2)]);
+        let _ = p.claim(1, 100, Duration::from_secs(5)); // id(1) in flight
+        // With a 0 reclaim window, the next claim reclaims id(1) first.
+        let c = p.claim(2, 100, Duration::from_millis(0));
+        assert_eq!(c, vec![id(1), id(2)], "stalled id reclaimed ahead of fresh wants");
+    }
+
+    #[test]
+    fn stale_deliver_is_dropped() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1)]);
+        let _ = p.claim(1, 100, Duration::from_millis(0));
+        // Reclaim id(1) (now back in want, not in-flight).
+        let _ = p.claim(0, 100, Duration::from_millis(0));
+        // A late delivery from the original (slow) fetcher: id(1) isn't
+        // in-flight under THIS claim, so it's dropped rather than wrongly
+        // marked ready. (Belt-and-braces; a real re-claim would re-inflight.)
+        p.deliver(id(1), vec![9]);
+        assert!(p.take_ready(&id(1)).is_none());
+    }
+
+    #[test]
+    fn reset_clears_everything() {
+        let p = SyncFetchPool::new();
+        p.push_wants([id(1), id(2)]);
+        let _ = p.claim(1, 100, Duration::from_secs(5));
+        p.reset();
+        assert_eq!(p.outstanding(), 0);
+        // After reset the same ids can be re-enqueued (seen was cleared).
+        p.push_wants([id(1)]);
+        assert_eq!(p.claim(10, 100, Duration::from_secs(5)), vec![id(1)]);
+    }
+}
+
 /// Block-sync driver. Hold one per node; spawn it on a task.
 pub struct SyncDriver {
     state: StateBackends,
