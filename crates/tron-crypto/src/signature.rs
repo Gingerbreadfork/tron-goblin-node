@@ -17,6 +17,15 @@ use ecdsa::hazmat::SignPrimitive;
 use ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 
+/// Process-wide libsecp256k1 context for the hot recovery path. Built once
+/// (it precomputes the generator multiplication tables); shared read-only
+/// across threads (the rayon recovery pre-pass runs on many threads at once).
+fn secp256k1_ctx() -> &'static secp256k1::Secp256k1<secp256k1::All> {
+    static CTX: std::sync::OnceLock<secp256k1::Secp256k1<secp256k1::All>> =
+        std::sync::OnceLock::new();
+    CTX.get_or_init(secp256k1::Secp256k1::new)
+}
+
 /// secp256k1 curve order N.
 const SECP256K1_N_HEX: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
 
@@ -80,24 +89,25 @@ impl RecoverableSignature {
     /// from this signature and the message digest. Matches
     /// `ECKey.recoverPubBytesFromSignature`.
     pub fn recover_uncompressed_pubkey(&self, prehash: &[u8; 32]) -> Result<[u8; 65], SigError> {
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[0..32].copy_from_slice(&self.r);
-        sig_bytes[32..64].copy_from_slice(&self.s);
-        let sig = Signature::from_slice(&sig_bytes).map_err(|_| SigError::InvalidSignature)?;
-        let recid =
-            RecoveryId::from_byte(self.recovery_id).ok_or(SigError::InvalidRecoveryId)?;
-
-        let vk = VerifyingKey::recover_from_prehash(prehash, &sig, recid)
+        // Recovery is the dominant CPU cost during catch-up (~50% of apply,
+        // profiled), so it uses libsecp256k1 (Bitcoin Core's assembly-
+        // optimized C lib, ~5-10x faster than the pure-Rust k256). The math
+        // is identical secp256k1 ECDSA recovery, so the recovered key — and
+        // thus the derived address — is byte-for-byte the same as k256
+        // produced (the signature/recovery tests verify this). Signing +
+        // verification stay on k256 (cold paths).
+        let mut rs = [0u8; 64];
+        rs[0..32].copy_from_slice(&self.r);
+        rs[32..64].copy_from_slice(&self.s);
+        let recid = secp256k1::ecdsa::RecoveryId::from_i32(self.recovery_id as i32)
+            .map_err(|_| SigError::InvalidRecoveryId)?;
+        let sig = secp256k1::ecdsa::RecoverableSignature::from_compact(&rs, recid)
+            .map_err(|_| SigError::InvalidSignature)?;
+        let msg = secp256k1::Message::from_digest(*prehash);
+        let pk = secp256k1_ctx()
+            .recover_ecdsa(&msg, &sig)
             .map_err(|_| SigError::RecoveryFailed)?;
-
-        let encoded = vk.to_encoded_point(false);
-        let bytes = encoded.as_bytes();
-        if bytes.len() != 65 {
-            return Err(SigError::RecoveryFailed);
-        }
-        let mut out = [0u8; 65];
-        out.copy_from_slice(bytes);
-        Ok(out)
+        Ok(pk.serialize_uncompressed())
     }
 
     /// Verify a signature against a known public key and prehash. Useful for

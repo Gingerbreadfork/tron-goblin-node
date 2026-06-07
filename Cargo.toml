@@ -53,6 +53,10 @@ ripemd = "0.1"
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic", "expose-field"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "rfc6979"] }
 elliptic-curve = "0.13"
+# libsecp256k1 (Bitcoin Core C lib) — used for the hot ECDSA *recovery*
+# path: same secp256k1 math as k256 (identical results) but assembly-
+# optimized, ~5-10x faster. Recovery is ~50% of catch-up apply CPU.
+secp256k1 = { version = "0.29", features = ["recovery"] }
 # SM2 (Chinese national-standard signature curve, pure Rust from
 # RustCrypto org — same maintainers as k256 above). Used for the
 # optional SM2 signing path TRON exposes alongside secp256k1.

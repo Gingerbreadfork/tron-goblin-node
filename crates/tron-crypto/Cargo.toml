@@ -13,6 +13,7 @@ ripemd.workspace = true
 k256.workspace = true
 ecdsa.workspace = true
 elliptic-curve.workspace = true
+secp256k1.workspace = true
 sm2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
