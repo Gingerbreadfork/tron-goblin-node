@@ -1168,10 +1168,14 @@ fn insert_leaves(frontier: &mut [[u8; 32]; 33], leaf_count: i64, leaves: &[[u8; 
         .map(|i| frontier_slot(leaf_count as u64 + i as u64))
         .collect();
 
+    // Output layout (java-tron `VerifyProof.insertLeaves`):
+    //   32 (success marker) + Σ (slotᵢ+1)·32 (per-leaf frontier path) +
+    //   32 (the single new root appended at the end).
     let mut result_len = 32usize;
     for s in &slots {
         result_len += (s + 1) * 32;
     }
+    result_len += 32; // final root, written at the end (line below).
     let mut result = vec![0u8; result_len];
     result[31] = 0x01; // success marker (a 32-byte big-endian 1).
     let mut offset = 32usize;
@@ -1255,4 +1259,56 @@ fn data_word_u8(b: u8) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[31] = b;
     out
+}
+
+#[cfg(test)]
+mod insert_leaves_tests {
+    use super::*;
+
+    /// Independent computation of the root of a depth-32 tree holding a
+    /// single leaf at index 0 — that leaf is the LEFT child at every level,
+    /// so each right sibling is the uncommitted node for that depth.
+    fn single_leaf_root(leaf: [u8; 32]) -> [u8; 32] {
+        let uncommitted = uncommitted_tree();
+        let mut node = leaf;
+        for depth in 0..32 {
+            node = merkle_hash(depth, &node, &uncommitted[depth]);
+        }
+        node
+    }
+
+    // Regression: a single leaf landing in frontier slot 0 (leaf_count even)
+    // produced a 64-byte buffer while the final root was written at 64..96,
+    // panicking the sync driver with "range end index 96 out of range for
+    // slice of length 64". The output must budget for the appended root.
+    #[test]
+    fn insert_single_leaf_slot0_appends_root_without_panic() {
+        let mut frontier = [[0u8; 32]; 33];
+        let leaf = [0x42u8; 32];
+        let out = insert_leaves(&mut frontier, 0, &[leaf]);
+
+        // 32 (marker) + (0+1)*32 (slot word) + 32 (root).
+        assert_eq!(out.len(), 96, "slot-0 single-leaf output must be 96 bytes");
+        assert!(out[..31].iter().all(|&b| b == 0));
+        assert_eq!(out[31], 1, "success marker");
+        assert!(out[32..64].iter().all(|&b| b == 0), "slot index word == 0");
+        assert_eq!(
+            &out[64..96],
+            single_leaf_root(leaf).as_slice(),
+            "appended root must match the independent IMT computation"
+        );
+        assert_eq!(frontier[0], leaf, "frontier slot 0 updated to the new leaf");
+    }
+
+    // A leaf in a non-zero slot (leaf_count odd) must also reserve the root.
+    #[test]
+    fn insert_single_leaf_slot1_has_room_for_root() {
+        // leaf_count = 1 → frontier_slot(1) == 1.
+        assert_eq!(frontier_slot(1), 1);
+        let mut frontier = [[0u8; 32]; 33];
+        let out = insert_leaves(&mut frontier, 1, &[[0x07u8; 32]]);
+        // 32 (marker) + (1+1)*32 (slot word + one level hash) + 32 (root).
+        assert_eq!(out.len(), 128);
+        assert_eq!(out[31], 1);
+    }
 }
