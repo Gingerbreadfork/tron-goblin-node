@@ -398,6 +398,14 @@ pub struct SyncDriver {
     /// Whether the last progress line reported us caught up to the tip. Used
     /// to log the catch-up→tip and tip→falling-behind transitions once each.
     at_tip: bool,
+    /// Optional shared, continuously-growing peer pool for ROTATION drivers
+    /// (java-tron-like always-active discovery). A background feeder keeps
+    /// appending freshly-discovered peers (deduped) to it; the driver merges
+    /// any new entries into its working set each loop so a months-long run
+    /// keeps finding peers as the startup set ages — without this, the dial
+    /// list is frozen at the startup snapshot. `None` for pinned drivers
+    /// (configured `--peer`s), which keep their fixed `config.peers`.
+    dynamic_pool: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl SyncDriver {
@@ -445,6 +453,7 @@ impl SyncDriver {
             pubsub: None,
             strict_ref_block: false,
             recent_witnesses: VecDeque::new(),
+            dynamic_pool: None,
             pending_raw_block: None,
             leadership: None,
         }
@@ -458,6 +467,15 @@ impl SyncDriver {
     /// which keep the always-active behavior.
     pub fn with_leadership(mut self, leadership: Arc<SyncLeadership>) -> Self {
         self.leadership = Some(leadership);
+        self
+    }
+
+    /// Attach a shared, continuously-grown discovery pool. ROTATION
+    /// drivers merge newly-discovered peers from it each loop iteration so
+    /// the dial set stays fresh over long runs. Pinned (configured) drivers
+    /// leave this unset and keep their fixed `config.peers`.
+    pub fn with_dynamic_pool(mut self, pool: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        self.dynamic_pool = Some(pool);
         self
     }
 
@@ -762,10 +780,27 @@ impl SyncDriver {
         // next block before any apply could advance solidity.
         self.seed_solidified_from_disk();
 
-        if self.config.peers.is_empty() {
+        if self.config.peers.is_empty() && self.dynamic_pool.is_none() {
             warn!("no peers configured; sync driver idle");
             return self.stats.clone();
         }
+
+        // Working dial list. For pinned drivers this is just `config.peers`
+        // (fixed). For rotation drivers it starts from `config.peers` (the
+        // startup discovery snapshot) and GROWS as the shared `dynamic_pool`
+        // feeder appends freshly-discovered peers — merged in at the top of
+        // each loop iteration so a long-running node keeps a fresh dial set.
+        let mut peers: Vec<String> = self.config.peers.clone();
+        if let Some(dp) = &self.dynamic_pool {
+            if let Ok(g) = dp.lock() {
+                for p in g.iter() {
+                    if !peers.contains(p) {
+                        peers.push(p.clone());
+                    }
+                }
+            }
+        }
+        let mut known: std::collections::HashSet<String> = peers.iter().cloned().collect();
 
         // Randomize peer dial order per-session. Two reasons:
         //  1. Without it, every restart hammers the same seed first —
@@ -775,11 +810,11 @@ impl SyncDriver {
         //     instead of `+1 % len`, so a misbehaving peer in the
         //     middle of the list doesn't gate the whole pool.
         let mut rng = XorShift64::seed_from_clock();
-        let mut shuffled: Vec<usize> = (0..self.config.peers.len()).collect();
+        let mut shuffled: Vec<usize> = (0..peers.len()).collect();
         rng.shuffle(&mut shuffled);
         // Per-peer failure counter for exponential backoff (indexed by
-        // original `config.peers` position, not by shuffle order).
-        let mut peer_failures: Vec<u32> = vec![0; self.config.peers.len()];
+        // original `peers` position, not by shuffle order).
+        let mut peer_failures: Vec<u32> = vec![0; peers.len()];
         // Per-peer FETCH_FAIL count. When a peer responds to our
         // `SyncBlockChain` with a `ChainInventory` and then immediately
         // disconnects with `FETCH_FAIL (19)` on the subsequent
@@ -788,15 +823,15 @@ impl SyncDriver {
         // such failures we mark them `archive_incapable` and exclude
         // them from rotation until *all* peers are excluded (at which
         // point we reset, since something fundamental is wrong).
-        let mut fetch_fail_count: Vec<u32> = vec![0; self.config.peers.len()];
-        let mut archive_incapable: Vec<bool> = vec![false; self.config.peers.len()];
+        let mut fetch_fail_count: Vec<u32> = vec![0; peers.len()];
+        let mut archive_incapable: Vec<bool> = vec![false; peers.len()];
         // Per-peer TIME_BANNED retry count. After 3 consecutive
         // TIME_BANNED rejections (with 90s waits between, so 4.5 min
         // of trying), the peer has us in something stronger than the
         // 60s `bannedNodes` cache — likely an operator anti-abuse
         // shelf. Stop hammering: shelve for 30 min so the deeper ban
         // can decay.
-        let mut time_banned_strikes: Vec<u32> = vec![0; self.config.peers.len()];
+        let mut time_banned_strikes: Vec<u32> = vec![0; peers.len()];
         let mut cursor = 0usize; // index into `shuffled`
 
         loop {
@@ -805,8 +840,39 @@ impl SyncDriver {
                 info!("shutdown observed; sync driver exiting");
                 return self.stats.clone();
             }
+            // Always-active discovery: pull any peers the shared feeder has
+            // found since we last looked into our working set, extending the
+            // per-peer state vectors + shuffle order in lockstep. Bounded in
+            // practice (the Kad table is capped), so `peers` doesn't grow
+            // without limit over a months-long run.
+            if let Some(dp) = &self.dynamic_pool {
+                if let Ok(g) = dp.lock() {
+                    for p in g.iter() {
+                        if known.insert(p.clone()) {
+                            peers.push(p.clone());
+                            peer_failures.push(0);
+                            fetch_fail_count.push(0);
+                            archive_incapable.push(false);
+                            time_banned_strikes.push(0);
+                            shuffled.push(peers.len() - 1);
+                        }
+                    }
+                }
+            }
+            // If we have no peers yet (rotation driver waiting for the
+            // feeder), idle briefly rather than busy-spin or index-panic.
+            if peers.is_empty() {
+                tokio::select! {
+                    _ = shutdown.recv() => return self.stats.clone(),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
+                continue;
+            }
+            if cursor >= shuffled.len() {
+                cursor = 0;
+            }
             let peer_idx = shuffled[cursor];
-            let peer = self.config.peers[peer_idx].clone();
+            let peer = peers[peer_idx].clone();
             // Stamp the dial-recency tracker before we dial, so even
             // if we crash mid-attempt the next restart knows we tried
             // this peer recently.

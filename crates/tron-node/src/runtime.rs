@@ -729,6 +729,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
+    // Shared, continuously-grown discovery pool for rotation drivers
+    // (java-tron-like always-active discovery). The Kad feeder below
+    // appends freshly-discovered peers to it on a timer; each rotation
+    // driver merges new entries into its working dial set so a long-running
+    // node keeps finding peers as the startup snapshot ages. Bounded so a
+    // months-long run can't grow it without limit.
+    const DYNAMIC_POOL_CAP: usize = 4096;
+    let dynamic_pool: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     if !config.p2p.disabled && config.p2p.discover_enable && !seed_peers.is_empty() {
         let seed_socks: Vec<std::net::SocketAddr> = seed_peers
             .iter()
@@ -806,6 +816,51 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                                 _ = ticker.tick() => {
                                     let snap = snapshot_for_persist(&kad_handle);
                                     let _ = persist.write_batch(&snap);
+                                }
+                            }
+                        }
+                    }));
+                }
+
+                // Always-active discovery feeder: every 30s, fold the
+                // KadService's freshly-discovered peers into the shared
+                // rotation pool (deduped, capped). Rotation drivers pick
+                // these up on their next loop, so the dial set keeps
+                // refreshing for the life of the process — no restart
+                // needed to reach peers found after startup. Mirrors
+                // java-tron's continuously-refreshed node table.
+                {
+                    let feeder_handle = handle.clone();
+                    let feeder_pool = dynamic_pool.clone();
+                    let mut sd_feeder = shutdown.subscribe();
+                    handles.push(tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                        ticker.tick().await; // skip immediate tick
+                        loop {
+                            tokio::select! {
+                                _ = sd_feeder.recv() => return,
+                                _ = ticker.tick() => {
+                                    let discovered = feeder_handle.known_peers();
+                                    if let Ok(mut g) = feeder_pool.lock() {
+                                        let mut added = 0usize;
+                                        for addr in discovered {
+                                            let s = addr.to_string();
+                                            if g.len() >= DYNAMIC_POOL_CAP {
+                                                break;
+                                            }
+                                            if !g.contains(&s) {
+                                                g.push(s);
+                                                added += 1;
+                                            }
+                                        }
+                                        if added > 0 {
+                                            debug!(
+                                                added,
+                                                pool = g.len(),
+                                                "discovery feeder: new peers folded into rotation pool"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -895,12 +950,17 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
-    // Cap to `max_peers` — each driver task owns one socket and one
-    // KhaosDb; runaway peer lists from misconfiguration shouldn't
-    // blow out the FD table. Shuffle the *non-seed tail* first so that
-    // (a) explicit seeds always get a slot, (b) the discovered pool
-    // (DNS + kad) is sampled diversely across ASNs/regions on each
-    // restart rather than always taking the first 30 alphabetically.
+    // The FULL discovered set — every peer DNS + Kad + persistence found
+    // (typically 2500+). Rotation drivers hunt across ALL of these for an
+    // available peer; `max_peers` bounds the number of concurrent
+    // CONNECTIONS (rotation driver count) below, NOT the size of the pool
+    // they search. Capping the pool here (as the old code did) starved
+    // rotation down to a handful of mostly-saturated peers — the reason
+    // public-peer sync didn't work.
+    let full_discovered_pool: Vec<String> = combined_peers.clone();
+    // Keep `combined_peers` capped only as the bound on driver COUNT (the
+    // emptiness check below + the rotation-driver budget). Shuffle the
+    // non-seed tail so the sample is diverse.
     if combined_peers.len() > config.p2p.max_peers {
         let seed_count = seed_peers.len().min(combined_peers.len());
         let (head, tail) = combined_peers.split_at_mut(seed_count);
@@ -1027,9 +1087,65 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     .await;
             }));
         }
-        for peer in combined_peers {
+        // Peer connectivity model (java-tron-like). Explicitly-configured
+        // peers (`--peer` / `config.peers`) each get a DEDICATED driver
+        // pinned to that one peer, so a reliable configured peer (e.g. a
+        // LAN node) is always dialed. The rest of the connection budget is
+        // filled with ROTATION drivers, each handed the FULL discovered
+        // pool — the driver's built-in rotation then hunts across every
+        // known peer for an available one instead of being pinned to a
+        // single (usually-saturated) peer. This is what makes syncing from
+        // public peers work even with no configured peer; without it each
+        // driver re-dialed one fixed peer forever (a 1-element pool makes
+        // the rotation logic a no-op).
+        let configured_set: std::collections::HashSet<String> =
+            config.p2p.peers.iter().cloned().collect();
+        // Rotation drivers search the FULL discovered pool (not the
+        // driver-count-capped `combined_peers`), so they can hunt across
+        // thousands of peers for an available one.
+        let rotation_pool: Vec<String> = full_discovered_pool
+            .iter()
+            .filter(|p| !configured_set.contains(*p))
+            .cloned()
+            .collect();
+        // `(peers_for_driver, pinned)` — pinned drivers keep the exact
+        // single-peer behaviour; rotation drivers share the full pool.
+        let mut driver_specs: Vec<(Vec<String>, bool)> = config
+            .p2p
+            .peers
+            .iter()
+            .map(|p| (vec![p.clone()], true))
+            .collect();
+        let n_rotation = config.p2p.max_peers.saturating_sub(driver_specs.len());
+        if !rotation_pool.is_empty() {
+            for _ in 0..n_rotation.max(1) {
+                driver_specs.push((rotation_pool.clone(), false));
+            }
+        }
+        info!(
+            pinned = config.p2p.peers.len(),
+            rotation_drivers = driver_specs.iter().filter(|(_, p)| !p).count(),
+            pool_size = rotation_pool.len(),
+            "peer drivers: configured peers pinned, rest rotate the full discovered pool"
+        );
+        for (driver_peers, pinned) in driver_specs {
+            let peer_is_fast_forward = pinned
+                && driver_peers
+                    .first()
+                    .map(|p| fast_forward_set.contains(p))
+                    .unwrap_or(false);
+            // Label for stats aggregation: the peer for a pinned driver,
+            // or a generic tag for a rotation driver (which cycles many).
+            let driver_label = if pinned {
+                driver_peers
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "pinned".to_string())
+            } else {
+                "rotation".to_string()
+            };
             let cfg = crate::sync::SyncConfig {
-                peers: vec![peer.clone()],
+                peers: driver_peers,
                 max_blocks: config.p2p.max_blocks,
                 tail_interval: std::time::Duration::from_secs(3),
                 initial_backoff: std::time::Duration::from_secs(5),
@@ -1041,7 +1157,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 fetch_block_timeout: std::time::Duration::from_millis(
                     config.p2p.fetch_block_timeout_ms.clamp(100, 1000),
                 ),
-                peer_is_fast_forward: fast_forward_set.contains(&peer),
+                peer_is_fast_forward,
             };
             let sd = shutdown.subscribe();
             let state_for_peer = state.clone();
@@ -1071,6 +1187,14 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 Some(checkpoint_dir.clone())
             };
             let pubsub_for_peer = pubsub.clone();
+            // Rotation drivers (not pinned to a configured peer) share the
+            // continuously-grown discovery pool; pinned drivers keep their
+            // fixed single peer.
+            let dynamic_pool_for_peer = if pinned {
+                None
+            } else {
+                Some(dynamic_pool.clone())
+            };
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
                     .with_metrics(metrics_for_peer)
@@ -1088,6 +1212,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // `initialize_genesis` onward, so the validator
                     // has chain history to compare against.
                     .with_strict_ref_block_check();
+                if let Some(dp) = dynamic_pool_for_peer {
+                    driver = driver.with_dynamic_pool(dp);
+                }
                 if let Some(stack) = snapshot_stack_for_peer {
                     driver = driver.with_snapshot_stack(stack);
                 }
@@ -1103,7 +1230,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 if let Some(snap) = sr_snapshot_for_peer {
                     driver = driver.with_sr_snapshot(snap);
                 }
-                (peer, driver.run(sd).await)
+                (driver_label, driver.run(sd).await)
             }));
         }
         // Periodic peer-state flush — every 30s the dial-recency
