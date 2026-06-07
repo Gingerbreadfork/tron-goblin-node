@@ -177,17 +177,14 @@ fn dynamic_factor_decimal_doubles_gas_consumption() {
         run(&stores, owner, contract)
     };
 
-    // Account for the fixed 21_000-gas transaction base that doesn't
-    // scale with the dynamic factor (it's charged before the
-    // interpreter runs). Compare only the in-contract portion.
-    const TX_BASE: u64 = 21_000;
-    let baseline_contract = baseline.saturating_sub(TX_BASE);
-    let doubled_contract = doubled.saturating_sub(TX_BASE);
+    // TRON energy is execution-only — there is no per-tx 21000 base — so the
+    // dynamic factor scales the entire reported energy_used.
+    let baseline_contract = baseline;
+    let doubled_contract = doubled;
 
-    // The in-contract work should approximately double. Allow ±5%
-    // because some bookkeeping bytes (memory expansion thresholds,
-    // intrinsic charges) may not all flow through the multiplier on
-    // this revm version. The key invariant is the ~2× factor.
+    // The work should approximately double. Allow ±5% because per-opcode
+    // flooring of `base × (1 + factor)` loses sub-unit fractions. The key
+    // invariant is the ~2× factor.
     let ratio = doubled_contract as f64 / baseline_contract.max(1) as f64;
     assert!(
         ratio >= 1.90 && ratio <= 2.10,
@@ -222,15 +219,14 @@ fn dynamic_factor_half_decimal_adds_50_percent() {
         run(&stores, owner, contract)
     };
 
-    const TX_BASE: u64 = 21_000;
-    let baseline_c = baseline.saturating_sub(TX_BASE) as f64;
-    let plus_half_c = plus_half.saturating_sub(TX_BASE) as f64;
+    // TRON energy is execution-only (no per-tx 21000 base), so the factor
+    // scales the entire reported energy_used.
+    let baseline_c = baseline as f64;
+    let plus_half_c = plus_half as f64;
     let ratio = plus_half_c / baseline_c.max(1.0);
-    // Wider window than the 2× case because some gas charges (e.g.,
-    // EVM intrinsic gas charged before the interpreter starts; certain
-    // EIP-3529 refund accounting) bypass our `record_*_cost` hooks.
-    // The 2× test confirms the multiplier is wired correctly; this
-    // test confirms it scales monotonically with the factor.
+    // Slightly wider window than the 2× case: per-opcode flooring of
+    // `base × (1 + factor/2)` loses sub-unit fractions. The 2× test confirms
+    // the multiplier is wired correctly; this confirms it scales with the factor.
     assert!(
         ratio > 1.30 && ratio < 1.55,
         "expected scaling 1.3–1.55× with factor=DECIMAL/2; \

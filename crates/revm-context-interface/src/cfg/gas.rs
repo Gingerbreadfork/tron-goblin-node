@@ -526,6 +526,46 @@ pub fn calculate_initial_tx_gas_for_tx(
     )
 }
 
+/// Like [`calculate_initial_tx_gas_for_tx`] but uses an explicit [`GasParams`]
+/// instead of rebuilding one from a [`SpecId`].
+///
+/// TRON fork: the node's energy schedule lives in `Cfg::gas_params` (a Frontier
+/// table with the per-tx 21000 base + calldata token cost zeroed), decoupled
+/// from the opcode spec. The intrinsic must be taken from that table — not from
+/// `GasParams::new_spec(opcode_spec)` — otherwise every constant call / tx would
+/// be charged Ethereum's 21000 base that TRON does not levy as energy.
+pub fn calculate_initial_tx_gas_for_tx_with_params(
+    tx: impl Transaction,
+    gas_params: &GasParams,
+    cpsb: u64,
+) -> InitialAndFloorGas {
+    let mut accounts = 0;
+    let mut storages = 0;
+    // legacy is only tx type that does not have access list.
+    if tx.tx_type() != TransactionType::Legacy {
+        (accounts, storages) = tx
+            .access_list()
+            .map(|al| {
+                al.fold((0, 0), |(mut num_accounts, mut num_storage_slots), item| {
+                    num_accounts += 1;
+                    num_storage_slots += item.storage_slots().count();
+
+                    (num_accounts, num_storage_slots)
+                })
+            })
+            .unwrap_or_default();
+    }
+
+    gas_params.initial_tx_gas(
+        tx.input(),
+        tx.kind().is_create(),
+        accounts as u64,
+        storages as u64,
+        tx.authorization_list_len() as u64,
+        cpsb,
+    )
+}
+
 /// Retrieve the total number of tokens in calldata.
 #[inline]
 pub fn get_tokens_in_calldata_istanbul(input: &[u8]) -> u64 {

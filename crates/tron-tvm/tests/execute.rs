@@ -295,18 +295,21 @@ fn execute_trigger_rejects_bad_address() {
     assert!(matches!(outcome, VmOutcome::PreflightError(_)), "got {outcome:?}");
 }
 
-/// Proof that EVM gas refunds (SSTORE clear → refund) flow through to
-/// `VmOutcome::Success.energy_used`. revm records the refund in
-/// `Gas::record_refund` from the SSTORE instruction handler, and
-/// `tx_gas_used()` returns `max(spent − refunded, floor_gas)` — so a
-/// transaction that triggers a refund should report lower energy_used
-/// than an otherwise-identical one that doesn't.
+/// TRON has **no** SSTORE-clear energy refund, unlike Ethereum.
 ///
-/// Closes the stale PARITY entry that flagged `gas_refunded: 0` on
-/// the precompile output (which is correct — TRON precompiles don't
-/// refund) and conflated it with the main EVM refund flow.
+/// java-tron removed the EthereumJ refund machinery: `Program.java` has
+/// `futureRefundEnergy`/`resetFutureRefund` commented out, `storageSave`
+/// performs no refund, and `EnergyCost.getSstoreCost` returns a flat
+/// `CLEAR_SSTORE = 5000` for clearing a slot to zero — the same as a
+/// `RESET_SSTORE`, with no offsetting refund. So clearing a slot and
+/// overwriting it with another non-zero value cost the *same* energy.
+///
+/// (A previous revision of this test asserted the opposite — that a clear
+/// refunds — which was Ethereum behaviour leaking through revm's gas model;
+/// that was the energy-parity bug. The TRON gas schedule pins gas decisions
+/// to Frontier and zeroes the clear refund, matching java-tron.)
 #[test]
-fn ssstore_clear_refund_reduces_energy_used_vs_no_clear() {
+fn sstore_clear_does_not_refund_matching_java_tron() {
     fn run_contract(prefix: u8, bytecode: &[u8]) -> u64 {
         let stores = fresh_stores();
         let contract_addr = install_contract(&stores, prefix, bytecode);
@@ -362,8 +365,10 @@ fn ssstore_clear_refund_reduces_energy_used_vs_no_clear() {
         ],
     );
 
-    assert!(
-        with_clear < no_clear,
-        "SSTORE-clear should refund: with_clear={with_clear} no_clear={no_clear}"
+    // TRON gives no SSTORE-clear refund: CLEAR_SSTORE (5000) == RESET_SSTORE
+    // (5000), so the two contracts spend identical energy.
+    assert_eq!(
+        with_clear, no_clear,
+        "TRON has no SSTORE-clear refund: with_clear={with_clear} no_clear={no_clear}"
     );
 }

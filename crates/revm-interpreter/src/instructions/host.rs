@@ -161,7 +161,9 @@ pub fn blockhash<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result 
 /// Loads a word from storage.
 pub fn sload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn_top!([], index, context.interpreter);
-    let spec_id = context.interpreter.runtime_flag.spec_id();
+    // TRON fork: gas decisions follow the *gas* spec (Frontier for TRON), not the
+    // opcode spec. Frontier → take the plain (no warm/cold) sload path.
+    let spec_id = context.host.gas_params().spec();
     let target = context.interpreter.input.target_address();
 
     if spec_id.is_enabled_in(BERLIN) {
@@ -192,7 +194,10 @@ pub fn sstore<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn!([index, value], context.interpreter);
 
     let target = context.interpreter.input.target_address();
-    let spec_id = context.interpreter.runtime_flag.spec_id();
+    // TRON fork: SSTORE metering style, the EIP-2200 stipend sentry and the
+    // warm/cold split all follow the *gas* spec (Frontier for TRON), not the
+    // opcode spec. Frontier → simple SET/CLEAR/RESET, no sentry, no cold cost.
+    let spec_id = context.host.gas_params().spec();
 
     // EIP-2200: Structured Definitions for Net Gas Metering
     // If gasleft is less than or equal to gas stipend, fail the current call frame with 'out of gas' exception.
@@ -334,7 +339,9 @@ pub fn selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resu
     require_non_staticcall!(context.interpreter);
     popn!([target], context.interpreter);
     let target = target.into_address();
-    let spec = context.interpreter.runtime_flag.spec_id();
+    // TRON fork: the new-account topup / cold rules follow the *gas* spec
+    // (Frontier for TRON), not the opcode spec.
+    let spec = context.host.gas_params().spec();
 
     let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
 

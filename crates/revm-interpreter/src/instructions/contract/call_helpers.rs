@@ -125,9 +125,14 @@ pub fn load_account_delegated_handle_error<H: Host + ?Sized>(
 ) -> Result<(u64, u64, Bytecode, B256), InstructionResult> {
     // move this to static gas.
     let remaining_gas = context.interpreter.gas.remaining();
+    // TRON fork: warm/cold (EIP-2929) and the new-account rule follow the *gas*
+    // spec (Frontier for TRON), not the opcode spec. The 63/64 gas-forwarding
+    // rule (EIP-150) stays on the opcode spec in `load_acc_and_calc_gas` — TRON
+    // does apply it.
+    let gas_spec = context.host.gas_params().spec();
     Ok(load_account_delegated(
         context.host,
-        context.interpreter.runtime_flag.spec_id(),
+        gas_spec,
         remaining_gas,
         to,
         transfers_value,

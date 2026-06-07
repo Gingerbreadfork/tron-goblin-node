@@ -323,6 +323,10 @@ fn execute_trigger_inner(
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
+            // TRON fork: the opcode set comes from `spec` (proposal-resolved),
+            // but the *energy* schedule is TRON's Frontier-era table with a
+            // Frontier-pinned gas spec. Keep the two decoupled.
+            cfg.gas_params = crate::tron_gas_params();
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -342,6 +346,11 @@ fn execute_trigger_inner(
         proposals,
     );
     let mut instructions = EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(spec);
+    // TRON fork: replace the spec-adjusted static gas table with TRON's static
+    // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
+    // MLOAD/MSTORE/MSTORE8 at base 1). Done before installing the TRON opcode
+    // stubs so their gas entries (0xd0..0xd4) survive.
+    *instructions.gas_table_mut() = crate::tron_static_gas_table();
     crate::evm::install_tron_opcode_stubs(&mut instructions, &proposals);
     let mut trc10_inspector = crate::trc10::Trc10Inspector::new(Arc::clone(&stores.accounts));
     if dynamic_energy_active(&stores.dynamic_properties) {
@@ -521,6 +530,10 @@ fn execute_trigger_inner_with_tracer(
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
+            // TRON fork: the opcode set comes from `spec` (proposal-resolved),
+            // but the *energy* schedule is TRON's Frontier-era table with a
+            // Frontier-pinned gas spec. Keep the two decoupled.
+            cfg.gas_params = crate::tron_gas_params();
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -540,6 +553,11 @@ fn execute_trigger_inner_with_tracer(
         proposals,
     );
     let mut instructions = EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(spec);
+    // TRON fork: replace the spec-adjusted static gas table with TRON's static
+    // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
+    // MLOAD/MSTORE/MSTORE8 at base 1). Done before installing the TRON opcode
+    // stubs so their gas entries (0xd0..0xd4) survive.
+    *instructions.gas_table_mut() = crate::tron_static_gas_table();
     crate::evm::install_tron_opcode_stubs(&mut instructions, &proposals);
     let mut trc10_inspector =
         crate::trc10::Trc10Inspector::new(Arc::clone(&stores.accounts)).with_tracer(tracer);
@@ -844,6 +862,10 @@ pub fn execute_create_with_trace(
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
+            // TRON fork: the opcode set comes from `spec` (proposal-resolved),
+            // but the *energy* schedule is TRON's Frontier-era table with a
+            // Frontier-pinned gas spec. Keep the two decoupled.
+            cfg.gas_params = crate::tron_gas_params();
         });
     let precompiles = TronPrecompiles::new(
         spec,
@@ -858,6 +880,11 @@ pub fn execute_create_with_trace(
         proposals,
     );
     let mut instructions = EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(spec);
+    // TRON fork: replace the spec-adjusted static gas table with TRON's static
+    // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
+    // MLOAD/MSTORE/MSTORE8 at base 1). Done before installing the TRON opcode
+    // stubs so their gas entries (0xd0..0xd4) survive.
+    *instructions.gas_table_mut() = crate::tron_static_gas_table();
     crate::evm::install_tron_opcode_stubs(&mut instructions, &proposals);
     let mut trc10 = crate::trc10::Trc10Inspector::new(Arc::clone(&stores.accounts));
     if dynamic_energy_active(&stores.dynamic_properties) {

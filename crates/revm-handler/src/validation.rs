@@ -3,8 +3,11 @@ use context_interface::{
     transaction::{Transaction, TransactionType},
     Block, Cfg, ContextTr,
 };
+use context_interface::cfg::GasParams;
 use core::cmp;
-use interpreter::{instructions::calculate_initial_tx_gas_for_tx, InitialAndFloorGas};
+use interpreter::{
+    instructions::calculate_initial_tx_gas_for_tx_with_params, InitialAndFloorGas,
+};
 use primitives::{eip4844, hardfork::SpecId, B256};
 
 /// Validates the execution environment including block and transaction parameters.
@@ -239,12 +242,15 @@ pub fn validate_tx_env<CTX: ContextTr>(
 pub fn validate_initial_tx_gas(
     tx: impl Transaction,
     spec: SpecId,
+    gas_params: &GasParams,
     is_eip7623_disabled: bool,
     is_amsterdam_eip8037_enabled: bool,
     tx_gas_limit_cap: u64,
     cpsb: u64,
 ) -> Result<InitialAndFloorGas, InvalidTransaction> {
-    let mut gas = calculate_initial_tx_gas_for_tx(&tx, spec, cpsb);
+    // TRON fork: the intrinsic comes from the cfg's gas_params (Frontier table
+    // with a zeroed per-tx base + calldata cost), not from the opcode spec.
+    let mut gas = calculate_initial_tx_gas_for_tx_with_params(&tx, gas_params, cpsb);
 
     if is_eip7623_disabled {
         gas.set_floor_gas(0);

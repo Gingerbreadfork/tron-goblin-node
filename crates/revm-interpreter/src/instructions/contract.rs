@@ -41,11 +41,15 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
 
     let mut code = Bytes::new();
     if len != 0 {
-        // EIP-3860: Limit and meter initcode
+        // EIP-3860: Limit and meter initcode.
+        // TRON fork: this is a *gas* decision, so it follows the gas spec
+        // (Frontier for TRON, which has no EIP-3860 initcode metering) rather
+        // than the opcode spec. TRON enforces its own deployed-code size limit
+        // separately at code deposit.
         if context
-            .interpreter
-            .runtime_flag
-            .spec_id()
+            .host
+            .gas_params()
+            .spec()
             .is_enabled_in(SpecId::SHANGHAI)
         {
             // Limit is set as double of max contract bytecode size

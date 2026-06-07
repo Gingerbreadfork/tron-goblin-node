@@ -17,23 +17,37 @@ use std::sync::Arc;
 pub struct GasParams {
     /// Table of gas costs for operations
     table: Arc<[u64; 256]>,
+    /// Spec that governs *gas* decisions: warm/cold access (EIP-2929), SSTORE
+    /// metering style + the EIP-2200 stipend sentry, and the new-account rules.
+    ///
+    /// TRON fork: this is deliberately decoupled from the *opcode* spec
+    /// ([`crate::Cfg::spec`]). TRON froze its energy schedule at Frontier-era
+    /// gas while adopting modern opcodes, so the interpreter reads
+    /// `gas_params().spec()` for every gas decision and `runtime_flag.spec_id()`
+    /// only for opcode availability. For non-TRON hosts the two are equal.
+    spec: SpecId,
 }
 
 impl PartialEq<GasParams> for GasParams {
     fn eq(&self, other: &GasParams) -> bool {
-        self.table == other.table
+        self.table == other.table && self.spec == other.spec
     }
 }
 
 impl Hash for GasParams {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
         self.table.hash(hasher);
+        self.spec.hash(hasher);
     }
 }
 
 impl core::fmt::Debug for GasParams {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "GasParams {{ table: {:?} }}", self.table)
+        write!(
+            f,
+            "GasParams {{ spec: {:?}, table: {:?} }}",
+            self.spec, self.table
+        )
     }
 }
 
@@ -47,12 +61,14 @@ pub const fn num_words(len: usize) -> usize {
 impl Eq for GasParams {}
 #[cfg(feature = "serde")]
 mod serde {
-    use super::{Arc, GasParams};
+    use super::{Arc, GasParams, SpecId};
     use std::vec::Vec;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     struct GasParamsSerde {
         table: Vec<u64>,
+        #[serde(default)]
+        spec: SpecId,
     }
 
     #[cfg(feature = "serde")]
@@ -63,6 +79,7 @@ mod serde {
         {
             GasParamsSerde {
                 table: self.table.to_vec(),
+                spec: self.spec,
             }
             .serialize(serializer)
         }
@@ -77,7 +94,7 @@ mod serde {
             if table.table.len() != 256 {
                 return Err(serde::de::Error::custom("Invalid gas params length"));
             }
-            Ok(Self::new(Arc::new(table.table.try_into().unwrap())))
+            Ok(Self::new(Arc::new(table.table.try_into().unwrap()), table.spec))
         }
     }
 }
@@ -90,10 +107,27 @@ impl Default for GasParams {
 }
 
 impl GasParams {
-    /// Creates a new `GasParams` with the given table.
+    /// Creates a new `GasParams` with the given table and gas spec.
     #[inline]
-    pub const fn new(table: Arc<[u64; 256]>) -> Self {
-        Self { table }
+    pub const fn new(table: Arc<[u64; 256]>, spec: SpecId) -> Self {
+        Self { table, spec }
+    }
+
+    /// The spec that governs gas decisions (warm/cold access, SSTORE metering,
+    /// stipend sentry, new-account rules). TRON decouples this from the opcode
+    /// spec — see the field docs on [`GasParams`].
+    #[inline]
+    pub const fn spec(&self) -> SpecId {
+        self.spec
+    }
+
+    /// Returns a copy with the gas spec overridden, leaving the cost table
+    /// untouched. Used by the TRON fork to pin gas decisions to Frontier while
+    /// the cost table / opcode set come from a later spec.
+    #[inline]
+    pub fn with_spec(mut self, spec: SpecId) -> Self {
+        self.spec = spec;
+        self
     }
 
     /// Overrides the gas cost for the given gas id.
@@ -116,7 +150,7 @@ impl GasParams {
         for (id, value) in values.into_iter() {
             table[id.as_usize()] = value;
         }
-        *self = Self::new(Arc::new(table));
+        *self = Self::new(Arc::new(table), self.spec);
     }
 
     /// Returns the table.
@@ -366,7 +400,7 @@ impl GasParams {
             table[GasId::tx_access_list_floor_byte_multiplier().as_usize()] = 4;
         }
 
-        Self::new(Arc::new(table))
+        Self::new(Arc::new(table), spec)
     }
 
     /// Gets the gas cost for the given gas id.
