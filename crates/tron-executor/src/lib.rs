@@ -38,9 +38,10 @@ pub mod resource;
 use std::sync::Arc;
 
 use prost::Message;
+use rayon::prelude::*;
 use tron_actuator::{
-    dispatch_execute, dispatch_validate, permission::check_transaction_permission, ActuatorError,
-    ActuatorStores,
+    dispatch_execute, dispatch_validate,
+    permission::check_transaction_permission_with_signers, ActuatorError, ActuatorStores,
 };
 use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
@@ -53,9 +54,10 @@ use tron_crypto::hash::sha256;
 use tron_proto::transaction::contract::ContractType;
 use tron_proto::{Block, Transaction};
 use tron_types::{
-    block_id_from_block, verify_parent_link, verify_tx_trie_root, verify_witness_signature,
-    BlockId, BlockValidateError,
+    block_id_from_block, recover_all_signers, verify_parent_link, verify_tx_trie_root,
+    verify_witness_signature, BlockId, BlockValidateError,
 };
+use tron_crypto::address::Address;
 
 // =============================================================================
 // Exec config
@@ -114,6 +116,20 @@ pub struct ExecConfig {
     /// would spuriously mismatch. Genesis / replay / direct `execute_block`
     /// callers keep it on (their blocks are canonical).
     pub verify_tx_trie: bool,
+    /// Defer per-store fsync on block commit (catch-up fast path).
+    ///
+    /// Defaults to `false` → every block fsyncs each mutated store's WAL
+    /// (full per-block durability). The **sync driver sets this `true`
+    /// while catching up** (block timestamp far behind wall-clock): the
+    /// per-block cross-store manifest is still written and fsync'd (the
+    /// durable consistency anchor), but the per-store WAL fsyncs — the
+    /// expensive part — are batched into a barrier every
+    /// [`DEFER_FSYNC_BARRIER_BLOCKS`] blocks. A crash loses nothing: on
+    /// restart `replay_pending_checkpoints` replays the retained manifests
+    /// (idempotent, cross-store-atomic) so the stores reach the latest
+    /// committed block. Only the WAL-fsync *frequency* changes, never
+    /// durability or consistency. Reverts to per-block fsync at the tip.
+    pub defer_store_fsync: bool,
 }
 
 impl Default for ExecConfig {
@@ -138,9 +154,21 @@ impl Default for ExecConfig {
             // Strict by default; the sync driver opts out because it does
             // the authoritative raw-bytes check itself (see field docs).
             verify_tx_trie: true,
+            // Full per-block durability by default; the sync driver opts
+            // into deferral only while catching up (see field docs).
+            defer_store_fsync: false,
         }
     }
 }
+
+/// During catch-up (`defer_store_fsync`), flush every store's WAL + clear
+/// the retained cross-store manifests once this many blocks have
+/// accumulated. Bounds how much WAL replay a crash-recovery has to do and
+/// how many manifest dirs pile up, while keeping the expensive per-store
+/// fsync amortized ~1/N. Recovery is correct for any value (replay handles
+/// whatever is retained); this only trades barrier frequency vs. accumulated
+/// manifests.
+pub const DEFER_FSYNC_BARRIER_BLOCKS: usize = 64;
 
 impl ExecConfig {
     /// Convenience: do any of the trace knobs require populating
@@ -945,7 +973,7 @@ fn execute_block_inner(
         let report = execute_block_logic(&wrapped, block, expected_parent, config)?;
         let record = if let Some(checkpoint) = checkpoint {
             block_session
-                .commit_with_checkpoint_and_undo(checkpoint, state)
+                .commit_with_checkpoint_and_undo(checkpoint, state, config.defer_store_fsync)
                 .map_err(BlockExecError::Checkpoint)?
         } else {
             block_session.commit_with_undo()?
@@ -1160,6 +1188,7 @@ impl BlockSession {
         self,
         checkpoint: &tron_chainbase::CheckPointV2,
         state: &StateBackends,
+        defer_store_fsync: bool,
     ) -> Result<tron_chainbase::BlockUndoRecord, tron_chainbase::CheckpointError> {
         use tron_chainbase::{CheckpointEntry, KvBackend, UndoStoreId as Id, WriteOp};
 
@@ -1250,26 +1279,133 @@ impl BlockSession {
         let checkpoint_id = checkpoint.write(&entries)?;
 
         // (4) Per-store flush. Each call goes straight to the base
-        //     backend (not the drained session) and uses
+        //     backend (not the drained session).
+        //
+        //     Steady state (`defer_store_fsync == false`): use
         //     `write_batch_sync` — RocksDB native WriteBatch with
-        //     `WriteOptions { sync: true }`. The fsync is required
-        //     so step (5)'s manifest delete is safe: once we return
-        //     from write_batch_sync the per-store WAL is on disk, so
-        //     losing the manifest no longer means losing the writes.
+        //     `WriteOptions { sync: true }`. The fsync is required so
+        //     step (5)'s manifest delete is safe: once we return from
+        //     write_batch_sync the per-store WAL is on disk, so losing
+        //     the manifest no longer means losing the writes.
+        //
+        //     Catch-up (`defer_store_fsync == true`): use the non-sync
+        //     `write_batch`. The writes still go to each store's WAL
+        //     (just without the fsync); the manifest written in step (3)
+        //     IS fsync'd, so it remains a complete, durable record of
+        //     this block's cross-store writes. We therefore RETAIN the
+        //     manifest (skip step 5) — on a crash the startup replay
+        //     re-applies it idempotently, so nothing is lost. The
+        //     expensive per-store fsync is amortized by the barrier below.
         for (id, base, ops, undo) in drained {
-            base.write_batch_sync(&ops)
-                .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+            if defer_store_fsync {
+                base.write_batch(&ops)
+                    .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+            } else {
+                base.write_batch_sync(&ops)
+                    .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+            }
             for (key, before) in undo {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
             }
         }
 
-        // (5) All per-store writes succeeded; the checkpoint is no
-        //     longer needed. A crash here just leaves the dir for the
-        //     next startup to replay idempotently.
-        checkpoint.delete(checkpoint_id)?;
+        if defer_store_fsync {
+            // (5-defer) Retain THIS block's manifest (writes aren't fsync'd
+            //     yet). Every DEFER_FSYNC_BARRIER_BLOCKS accumulated
+            //     manifests, run the durability barrier: fsync every base
+            //     store's WAL FIRST, THEN drop all retained manifests.
+            //     Order is critical — fsync before delete — so a crash
+            //     mid-barrier (stores durable, manifests still present)
+            //     only causes a harmless idempotent replay, never loss.
+            if checkpoint.list()?.len() >= DEFER_FSYNC_BARRIER_BLOCKS {
+                flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
+            }
+        } else {
+            // (5) Steady state: this block's writes are durable.
+            checkpoint.delete(checkpoint_id)?;
+            // If we just transitioned out of catch-up, deferred manifests
+            // from earlier blocks may still be retained. This block's
+            // per-store write_batch_sync only fsync'd the stores IT wrote,
+            // so explicitly barrier (fsync ALL stores, then clear) to make
+            // those earlier deferred writes durable before dropping their
+            // manifests.
+            if !checkpoint.list()?.is_empty() {
+                flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
+            }
+        }
         Ok(record)
     }
+}
+
+/// Durability barrier for the deferred-fsync catch-up path: fsync every
+/// base store's WAL, THEN delete all retained cross-store manifests.
+///
+/// The ordering (fsync-all before delete-any) is the safety invariant: a
+/// crash after the fsyncs but before/within the deletes just leaves
+/// manifests to be replayed idempotently on restart; we never delete a
+/// manifest whose writes aren't yet durable.
+pub fn flush_state_wals_and_clear_checkpoints(
+    state: &StateBackends,
+    checkpoint: &tron_chainbase::CheckPointV2,
+) -> Result<(), tron_chainbase::CheckpointError> {
+    sync_all_state_wals(state).map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+    for id in checkpoint.list()? {
+        // A concurrent reader/pruner could have removed it already; treat
+        // NotFound as success.
+        match checkpoint.delete(id) {
+            Ok(()) | Err(tron_chainbase::CheckpointError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// fsync the WAL of every base backend referenced by `state`. No-op for
+/// in-memory backends. Covers every store `commit_with_checkpoint_and_undo`
+/// can write, so after this returns all deferred (non-sync) writes are
+/// durable.
+fn sync_all_state_wals(state: &StateBackends) -> Result<(), tron_chainbase::KvError> {
+    use tron_chainbase::KvBackend;
+    let sync = |b: &Arc<dyn KvBackend>| b.sync_wal();
+    sync(&state.accounts)?;
+    sync(&state.witnesses)?;
+    sync(&state.votes)?;
+    sync(&state.delegation)?;
+    sync(&state.delegated_resources)?;
+    sync(&state.dyn_props)?;
+    sync(&state.proposals)?;
+    sync(&state.name_index)?;
+    sync(&state.id_index)?;
+    sync(&state.asset_v1)?;
+    sync(&state.asset_v2)?;
+    sync(&state.contracts)?;
+    sync(&state.abi)?;
+    sync(&state.exchange_v1)?;
+    sync(&state.exchange_v2)?;
+    sync(&state.market_orders)?;
+    sync(&state.nullifiers)?;
+    if let Some(b) = &state.delegated_resource_account_index {
+        sync(b)?;
+    }
+    if let Some(b) = &state.merkle_trees {
+        sync(b)?;
+    }
+    if let Some(b) = &state.code {
+        sync(b)?;
+    }
+    if let Some(b) = &state.storage_row {
+        sync(b)?;
+    }
+    if let Some(b) = &state.contract_state {
+        sync(b)?;
+    }
+    if let Some(b) = &state.block_index {
+        sync(b)?;
+    }
+    if let Some(b) = &state.witness_schedule {
+        sync(b)?;
+    }
+    Ok(())
 }
 
 /// Replay every leftover cross-store checkpoint into `state`, then
@@ -1557,10 +1693,45 @@ fn execute_block_logic(
     let raw = header.raw_data.as_ref().ok_or(BlockExecError::NoHeader)?;
     let block_timestamp_ms = raw.timestamp;
 
-    // === 2. Per-tx atomic loop ===
+    // === 2. Parallel signer-recovery pre-pass ===
+    //
+    // ECDSA signer recovery is the dominant per-tx CPU cost on the
+    // non-VM path and is a *pure* function of `(raw_data, signature[])` —
+    // independent across transactions, reads no chain state, mutates
+    // nothing. Recover every tx's signers across cores here, then hand the
+    // positionally-indexed results into the strictly-serial per-tx loop
+    // below (which still applies state in order). This mirrors java-tron's
+    // CountDownLatch signature-verify pool.
+    //
+    // Correctness: `collect()` preserves order, so `precomputed[i]`
+    // corresponds to `block.transactions[i]`; errors are carried as
+    // `String` and surfaced by `check_transaction_permission_with_signers`
+    // at the exact same validation step (after the structural checks) they
+    // would have been raised inline — so the per-tx outcome is identical to
+    // the old serial recovery.
+    let precomputed_signers: Vec<Result<Vec<Address>, String>> = block
+        .transactions
+        .par_iter()
+        .map(|tx| recover_all_signers(tx).map_err(|e| e.to_string()))
+        .collect();
+
+    // === 2b. Per-tx atomic loop (serial — state application is ordered) ===
+    //
+    // `now_slot` (the bandwidth-recovery reference slot) depends only on
+    // the genesis timestamp and the parent block's header time — both
+    // fixed for this whole block — so compute it once here instead of
+    // per-tx inside the bandwidth charge.
+    let now_slot = head_slot(&DynamicPropertiesStore::new(state.dyn_props.clone()));
     let mut tx_results = Vec::with_capacity(block.transactions.len());
-    for tx in &block.transactions {
-        tx_results.push(execute_one_tx(state, tx, config, block_timestamp_ms));
+    for (i, tx) in block.transactions.iter().enumerate() {
+        tx_results.push(execute_one_tx(
+            state,
+            tx,
+            config,
+            block_timestamp_ms,
+            now_slot,
+            &precomputed_signers[i],
+        ));
     }
 
     // === 3. Head-pointer update (directly on base) ===
@@ -1716,13 +1887,10 @@ fn execute_block_logic(
         let standby_pay = dp.witness_127_pay_per_block();
         if standby_pay > 0 {
             let ws = WitnessStore::new(state.witnesses.clone());
-            if let Ok(mut by_vote) = ws.all() {
-                let mut ranked: Vec<(Address, i64)> =
-                    by_vote.drain(..).map(|(a, w)| (a, w.vote_count)).collect();
-                ranked.sort_by(|a, b| {
-                    b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
-                });
-                ranked.truncate(127);
+            if let Ok(by_vote) = ws.all() {
+                let ranked = top_standby_witnesses(
+                    by_vote.into_iter().map(|(a, w)| (a, w.vote_count)).collect(),
+                );
                 let _ =
                     tron_tvm::reward::pay_standby_witness(&accts, &dlg, &dp, &ranked);
             }
@@ -1943,6 +2111,8 @@ fn execute_one_tx(
     tx: &Transaction,
     config: &ExecConfig,
     block_timestamp_ms: i64,
+    now_slot: i64,
+    precomputed_signers: &Result<Vec<Address>, String>,
 ) -> TxResult {
     // Fork a fresh session for this tx — any writes here are confined
     // until we commit. Failed txs revert; the next tx starts fresh.
@@ -2060,9 +2230,14 @@ fn execute_one_tx(
     // (their owner is empty/transparent-only and the actuator has its
     // own verification path).
     if !matches!(ty, ContractType::ShieldedTransferContract) {
-        if let Err(e) =
-            check_transaction_permission(stores.accounts, stores.dyn_props, tx, contract, ty)
-        {
+        if let Err(e) = check_transaction_permission_with_signers(
+            stores.accounts,
+            stores.dyn_props,
+            tx,
+            contract,
+            ty,
+            precomputed_signers,
+        ) {
             session.revert();
             return TxResult {
                 tx_id,
@@ -2086,7 +2261,9 @@ fn execute_one_tx(
     // `execute_vm_tx` after the VM finishes.
     if !matches!(ty, ContractType::ShieldedTransferContract) {
         if let Ok(owner) = extract_owner_for_bandwidth(contract, ty) {
-            let now_slot = head_slot(stores.dyn_props);
+            // `now_slot` is hoisted to once-per-block by the caller — it
+            // derives only from the genesis timestamp and the parent
+            // block's header time, both fixed for the whole block.
             let bw_stores = bandwidth::BandwidthStores {
                 accounts: stores.accounts,
                 dyn_props: stores.dyn_props,
@@ -2781,4 +2958,68 @@ fn extract_owner_for_bandwidth(
 /// or it mixes unit systems and decays usage incorrectly.
 fn head_slot(dyn_props_be: &tron_chainbase::DynamicPropertiesStore) -> i64 {
     dyn_props_be.head_slot()
+}
+
+/// Number of top witnesses (by vote) that share the per-block standby
+/// reward pool — java-tron's standby-SR set size.
+const STANDBY_WITNESS_COUNT: usize = 127;
+
+/// Pick the top [`STANDBY_WITNESS_COUNT`] witnesses by `(vote_count desc,
+/// address asc)`, returned in that order.
+///
+/// The comparator is a strict total order (witness addresses are unique
+/// store keys → no ties), so this partial selection produces exactly the
+/// same set and order as a full sort + truncate would — but it avoids
+/// sorting the entire registered-witness candidate set (which can be
+/// thousands of entries) on every single block. Pinned equal to the naive
+/// sort in `standby_ranking_tests::top_standby_matches_full_sort`.
+fn top_standby_witnesses(mut ranked: Vec<(Address, i64)>) -> Vec<(Address, i64)> {
+    let cmp = |a: &(Address, i64), b: &(Address, i64)| {
+        b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+    };
+    if ranked.len() > STANDBY_WITNESS_COUNT {
+        // Partition so the top-127 occupy [0, 127) (in arbitrary order),
+        // drop the rest, then sort only those 127.
+        ranked.select_nth_unstable_by(STANDBY_WITNESS_COUNT - 1, cmp);
+        ranked.truncate(STANDBY_WITNESS_COUNT);
+    }
+    ranked.sort_by(cmp);
+    ranked
+}
+
+#[cfg(test)]
+mod standby_ranking_tests {
+    use super::{top_standby_witnesses, STANDBY_WITNESS_COUNT};
+    use tron_crypto::address::Address;
+
+    /// The pre-optimization ranking: full sort then truncate.
+    fn naive(mut v: Vec<(Address, i64)>) -> Vec<(Address, i64)> {
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
+        v.truncate(STANDBY_WITNESS_COUNT);
+        v
+    }
+
+    fn addr(i: u32) -> Address {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1..5].copy_from_slice(&i.to_be_bytes());
+        Address::from_raw(a)
+    }
+
+    #[test]
+    fn top_standby_matches_full_sort() {
+        // Cover counts below / at / above the 127 cutoff, with many ties on
+        // vote_count (broken by the address tiebreak) to exercise the
+        // boundary the partial selection has to reproduce exactly.
+        for n in [0u32, 1, 50, 126, 127, 128, 200, 500] {
+            let v: Vec<(Address, i64)> = (0..n)
+                .map(|i| (addr(i), (i.wrapping_mul(2_654_435_761) % 37) as i64))
+                .collect();
+            assert_eq!(
+                top_standby_witnesses(v.clone()),
+                naive(v),
+                "partial selection diverged from the full sort at n={n}"
+            );
+        }
+    }
 }

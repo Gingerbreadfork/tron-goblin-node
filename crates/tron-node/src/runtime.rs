@@ -426,6 +426,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // `txTrieRoot` check). Self-produced/canonical blocks on
                     // any other consumer keep the check.
                     verify_tx_trie: true,
+                    // Full per-block durability by default; `SyncDriver`
+                    // flips this on per-block while catching up.
+                    defer_store_fsync: false,
                 };
                 (
                     vm.support_constant,

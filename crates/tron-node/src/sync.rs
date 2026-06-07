@@ -2627,6 +2627,16 @@ impl SyncDriver {
             return self.execute_under_snapshot(block, id, prev_id);
         }
 
+        // Catch-up fast path: while the block we're applying is well
+        // behind wall-clock we're doing bulk sync, so defer the expensive
+        // per-store WAL fsync (batched into a barrier inside the commit —
+        // see `ExecConfig::defer_store_fsync`). At/near the tip every block
+        // fsyncs for full per-block durability. Either way no data is lost:
+        // a crash replays the retained cross-store manifests on restart.
+        // Only applies on this canonical-extension path; the rarer reorg /
+        // reapply paths keep full per-block fsync.
+        self.exec_config.defer_store_fsync = is_catching_up(block);
+
         // Execute. The executor commits dyn_props head + applies every
         // tx atomically inside a session. With an undo store, also
         // persist a per-block undo log for any future reorg. If a
@@ -4267,6 +4277,25 @@ pub fn backoff_for(initial: Duration, failures: u32) -> Duration {
 /// We seed from `(monotonic_now_ns ^ pid)` and hash through sha256
 /// twice to produce 64 bytes. Non-cryptographic but trivially unique
 /// across process restarts and reconnect attempts within a process.
+/// Whether the block we're about to apply is far enough behind wall-clock
+/// that we're in bulk catch-up rather than following the tip. Drives the
+/// deferred-fsync fast path in `accept_block`. Uses the same 90s threshold
+/// as the progress logger's tip detection.
+fn is_catching_up(block: &Block) -> bool {
+    const TIP_MS: i64 = 90_000;
+    let block_ts = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+        .map(|r| r.timestamp)
+        .unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    now_ms.saturating_sub(block_ts) > TIP_MS
+}
+
 fn random_node_id() -> Vec<u8> {
     use tron_crypto::hash::sha256;
     let now_ns = std::time::SystemTime::now()

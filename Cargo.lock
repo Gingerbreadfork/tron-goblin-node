@@ -5196,6 +5196,7 @@ dependencies = [
  "hex-literal",
  "prost",
  "prost-types",
+ "rayon",
  "thiserror 1.0.69",
  "tron-actuator",
  "tron-chainbase",

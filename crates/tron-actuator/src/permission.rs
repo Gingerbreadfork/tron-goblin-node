@@ -73,6 +73,47 @@ pub fn check_transaction_permission(
     contract: &Contract,
     contract_type: ContractType,
 ) -> Result<(), PermissionError> {
+    check_transaction_permission_inner(accounts, dyn_props, tx, contract, contract_type, None)
+}
+
+/// Like [`check_transaction_permission`] but consumes signer addresses
+/// recovered ahead of time instead of running ECDSA recovery inline.
+///
+/// The block executor recovers every transaction's signers in parallel
+/// (a pure, per-tx-independent operation) before the serial
+/// state-application loop, then feeds the result here. `precomputed` MUST
+/// equal what [`tron_types::recover_all_signers`] would return for `tx`
+/// (mapped to `String` on error) — the recovery step is the only thing it
+/// replaces; all structural checks still run first and in the same order,
+/// so a recovery error surfaces at exactly the same point (step 4) it
+/// would have inline. This keeps the validation outcome byte-identical to
+/// the serial path.
+pub fn check_transaction_permission_with_signers(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    tx: &Transaction,
+    contract: &Contract,
+    contract_type: ContractType,
+    precomputed: &Result<Vec<Address>, String>,
+) -> Result<(), PermissionError> {
+    check_transaction_permission_inner(
+        accounts,
+        dyn_props,
+        tx,
+        contract,
+        contract_type,
+        Some(precomputed),
+    )
+}
+
+fn check_transaction_permission_inner(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    tx: &Transaction,
+    contract: &Contract,
+    contract_type: ContractType,
+    precomputed: Option<&Result<Vec<Address>, String>>,
+) -> Result<(), PermissionError> {
     // === 0. Quick structural checks. ===
     let sigs = &tx.signature;
     if sigs.is_empty() {
@@ -112,10 +153,23 @@ pub fn check_transaction_permission(
     }
 
     // === 4. Recover signers + sum weights. ===
-    let signers = recover_all_signers(tx).map_err(|e| PermissionError::Recover(e.to_string()))?;
+    //
+    // Use the executor's parallel pre-pass result when supplied; otherwise
+    // recover inline. Either way the recovery error surfaces here (after
+    // steps 0-3), so the rejection outcome is identical to the serial path.
+    let signers_owned;
+    let signers: &[Address] = match precomputed {
+        Some(Ok(s)) => s.as_slice(),
+        Some(Err(e)) => return Err(PermissionError::Recover(e.clone())),
+        None => {
+            signers_owned =
+                recover_all_signers(tx).map_err(|e| PermissionError::Recover(e.to_string()))?;
+            signers_owned.as_slice()
+        }
+    };
     let mut seen: Vec<Address> = Vec::with_capacity(signers.len());
     let mut total_weight: i64 = 0;
-    for signer in &signers {
+    for signer in signers {
         let Some(key) = permission
             .keys
             .iter()

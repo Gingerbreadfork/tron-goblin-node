@@ -114,6 +114,23 @@ pub trait KvBackend: Send + Sync {
         self.write_batch(ops)
     }
 
+    /// Flush + fsync this backend's write-ahead log, making every prior
+    /// non-sync [`write_batch`] durable.
+    ///
+    /// This is the durability barrier for the catch-up fast path: blocks
+    /// are committed with non-sync `write_batch` (fast), then a single
+    /// `sync_wal` per store every N blocks makes the whole batch durable —
+    /// far cheaper than fsyncing on every block. After this returns, a
+    /// power loss won't lose any write that was issued before the call.
+    ///
+    /// Default impl is a no-op — in-memory backends have no WAL to fsync.
+    /// RocksDB overrides with `flush_wal(/* sync */ true)`.
+    ///
+    /// [`write_batch`]: KvBackend::write_batch
+    fn sync_wal(&self) -> Result<(), KvError> {
+        Ok(())
+    }
+
     /// Snapshot every `(key, value)` pair currently stored. Callers get
     /// owned bytes to avoid lifetime entanglement with internal locks.
     /// Iteration order is ascending byte-lexicographic (matches RocksDB

@@ -384,6 +384,141 @@ fn checkpoint_dir_has_no_leftover_tmp_after_apply() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// DEFERRED FSYNC (catch-up fast path): a block committed with
+/// `defer_store_fsync = true` produces the SAME state as the normal path,
+/// but RETAINS its cross-store manifest (the per-store fsync is batched
+/// into a later barrier). Crucially, that retained manifest replays into a
+/// fresh "post-crash" state to reconstruct the full block — so the fast
+/// path is zero-loss: even if every non-sync store write were lost on a
+/// crash, recovery is complete.
+#[test]
+fn deferred_fsync_retains_manifest_and_replays_to_reference_state() {
+    let block = empty_block(1, [0u8; 32]);
+
+    // Reference: normal (fsync-per-block) apply.
+    let state_ref = fresh_state();
+    let undo_ref = BlockUndoStore::new(mem());
+    seed_witness(&state_ref);
+    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned())
+        .unwrap();
+    let ref_snapshot = snapshot_state(&state_ref);
+
+    // Deferred-fsync apply.
+    let state = fresh_state();
+    let undo = BlockUndoStore::new(mem());
+    seed_witness(&state);
+    let root = tmp_checkpoint_root();
+    let cp = CheckPointV2::new(&root);
+    let cfg = ExecConfig {
+        defer_store_fsync: true,
+        ..ExecConfig::unsigned()
+    };
+    execute_block_with_undo_checkpoint_and_config(&state, &block, None, &undo, &cp, &cfg).unwrap();
+
+    // Same resulting state as the normal path...
+    assert_eq!(
+        ref_snapshot,
+        snapshot_state(&state),
+        "deferred-fsync apply must produce identical state to the normal path"
+    );
+    // ...but the manifest is RETAINED (not deleted), since the per-store
+    // writes weren't fsync'd yet.
+    assert_eq!(
+        cp.list().unwrap().len(),
+        1,
+        "deferred-fsync must retain the manifest until a barrier"
+    );
+
+    // Simulate a crash that lost every non-sync store write: replay the
+    // retained manifest into a fresh, pre-block state. It must reconstruct
+    // the reference state byte-for-byte (zero loss).
+    let state_recovered = fresh_state();
+    seed_witness(&state_recovered);
+    replay_pending_checkpoints(&state_recovered, &cp).unwrap();
+    assert_eq!(
+        ref_snapshot,
+        snapshot_state(&state_recovered),
+        "retained manifest must replay to the never-crashed reference state"
+    );
+    assert!(cp.list().unwrap().is_empty(), "replay deletes the manifest");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The deferred-fsync self-barrier: once `DEFER_FSYNC_BARRIER_BLOCKS`
+/// manifests accumulate, the next commit flushes all store WALs and clears
+/// every retained manifest. Verifies the manifest backlog stays bounded.
+#[test]
+fn deferred_fsync_self_barrier_clears_after_n_blocks() {
+    use tron_executor::DEFER_FSYNC_BARRIER_BLOCKS;
+
+    let state = fresh_state();
+    let undo = BlockUndoStore::new(mem());
+    seed_witness(&state);
+    let root = tmp_checkpoint_root();
+    let cp = CheckPointV2::new(&root);
+    let cfg = ExecConfig {
+        defer_store_fsync: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let mut parent = [0u8; 32];
+    for n in 1..=DEFER_FSYNC_BARRIER_BLOCKS as i64 {
+        let block = empty_block(n, parent);
+        execute_block_with_undo_checkpoint_and_config(&state, &block, None, &undo, &cp, &cfg)
+            .unwrap();
+        // Cheap stand-in for the next parent hash — the test applies with
+        // `None` expected_parent so the exact value doesn't gate execution.
+        parent = [n as u8; 32];
+        // The backlog never reaches the barrier count + 1; the barrier on
+        // the Nth block clears it back to zero.
+        assert!(
+            cp.list().unwrap().len() < DEFER_FSYNC_BARRIER_BLOCKS,
+            "manifest backlog must stay bounded by the barrier"
+        );
+    }
+    // After exactly N deferred commits, the Nth triggered the barrier.
+    assert!(
+        cp.list().unwrap().is_empty(),
+        "self-barrier must clear all retained manifests on the Nth block"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The explicit barrier helper fsyncs store WALs (no-op on MemBackend) and
+/// drops every retained manifest.
+#[test]
+fn flush_barrier_clears_retained_manifests() {
+    let state = fresh_state();
+    let undo = BlockUndoStore::new(mem());
+    seed_witness(&state);
+    let root = tmp_checkpoint_root();
+    let cp = CheckPointV2::new(&root);
+    let cfg = ExecConfig {
+        defer_store_fsync: true,
+        ..ExecConfig::unsigned()
+    };
+    execute_block_with_undo_checkpoint_and_config(
+        &state,
+        &empty_block(1, [0u8; 32]),
+        None,
+        &undo,
+        &cp,
+        &cfg,
+    )
+    .unwrap();
+    assert_eq!(cp.list().unwrap().len(), 1);
+
+    tron_executor::flush_state_wals_and_clear_checkpoints(&state, &cp).unwrap();
+    assert!(
+        cp.list().unwrap().is_empty(),
+        "barrier must clear all retained manifests"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Maps the helper's display name (used in snapshot_state) to the
 /// real on-disk db_name the manifest expects. The two diverged for
 /// historical reasons (the StateBackends fields are snake_cased

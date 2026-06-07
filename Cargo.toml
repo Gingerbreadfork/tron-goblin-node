@@ -60,6 +60,10 @@ sm2 = { version = "0.13", features = ["arithmetic", "dsa", "std"] }
 # Utilities
 hex = "0.4"
 thiserror = "1"
+# Data parallelism — used by the block executor to recover transaction
+# signers (pure, independent per tx) across cores before the serial
+# state-application loop.
+rayon = "1"
 # Testing
 hex-literal = "0.4"
 # Protobuf

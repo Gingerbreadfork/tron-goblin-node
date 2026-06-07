@@ -430,6 +430,16 @@ impl KvBackend for RocksDbBackend {
         wopts.set_sync(true);
         self.db.write_opt(batch, &wopts).map_err(Into::into)
     }
+
+    fn sync_wal(&self) -> Result<(), KvError> {
+        // Flush RocksDB's WAL writer to the OS and fsync it, making every
+        // prior non-sync `write_batch` durable. This is the per-store half
+        // of the catch-up durability barrier (the cross-store manifest is
+        // fsync'd separately by CheckPointV2). `flush_wal(true)` is a no-op
+        // when there's nothing buffered, so calling it on an idle store is
+        // cheap.
+        self.db.flush_wal(true).map_err(Into::into)
+    }
 }
 
 fn build_batch(ops: &[WriteOp]) -> WriteBatch {
