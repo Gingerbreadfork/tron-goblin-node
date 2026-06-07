@@ -207,8 +207,8 @@ fn commit_writes_code_and_code_hash_on_contract_deployment() {
     changes.insert(evm_addr, account);
     db.commit(changes);
 
-    // CodeStore got the bytecode keyed by hash.
-    assert_eq!(db.code.get(hash.as_slice()).unwrap().unwrap(), runtime_code);
+    // CodeStore got the bytecode keyed by ADDRESS (java-tron layout).
+    assert_eq!(db.code.get(tron_addr.as_bytes()).unwrap().unwrap(), runtime_code);
     // Account got both the inline code and the hash.
     let acct = db.accounts.get(&tron_addr).unwrap().unwrap();
     assert_eq!(acct.code, runtime_code);

@@ -517,8 +517,22 @@ fn flush_bottom_locked(
     Ok(id)
 }
 
+/// java-tron's RocksDB stores directory name (`storage.db.directory`, default
+/// `database`). We match it exactly, so a java-tron mainnet snapshot extracted
+/// straight into the node's data dir is used in place with no rename/import
+/// step, and fresh nodes lay out identically.
+pub(crate) const DB_DIR: &str = "database";
+
+/// The directory holding the RocksDB stores under `data_dir` — always
+/// `<data_dir>/database`, matching java-tron. (Kept as one named source of
+/// truth / future config hook rather than scattering the literal.)
+pub(crate) fn resolve_db_root(data_dir: &Path) -> PathBuf {
+    data_dir.join(DB_DIR)
+}
+
 impl OpenedStores {
-    /// Open every store under `data_dir/db/`. Creates the subtree if
+    /// Open every store under `data_dir/database/` (java-tron's layout).
+    /// Creates the subtree if
     /// missing. Each store is independent — they don't share a single
     /// RocksDB column family because java-tron uses separate
     /// directories and we mirror that layout 1:1.
@@ -543,7 +557,7 @@ impl OpenedStores {
         data_dir: &Path,
         tuning: Option<(usize, i32)>,
     ) -> Result<Self, StorageError> {
-        let db_root = data_dir.join("db");
+        let db_root = resolve_db_root(data_dir);
         std::fs::create_dir_all(&db_root).map_err(|e| StorageError::Io {
             path: db_root.clone(),
             source: e,
@@ -791,6 +805,17 @@ pub enum StorageError {
     Kv(#[from] tron_chainbase::KvError),
     #[error("incompatible chainbase schema version: on-disk {found}, this binary expects {expected}")]
     SchemaVersion { found: i64, expected: i64 },
+}
+
+#[cfg(test)]
+mod db_root_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_db_root_is_java_tron_database_dir() {
+        let base = Path::new("/some/data/dir");
+        assert_eq!(resolve_db_root(base), base.join("database"));
+    }
 }
 
 #[cfg(test)]

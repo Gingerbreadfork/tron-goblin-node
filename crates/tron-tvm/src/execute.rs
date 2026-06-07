@@ -788,10 +788,12 @@ pub fn execute_create_with_trace(
         tron_crypto::address::Address::from_raw(tron_addr);
     let evm_contract_addr = EvmAddress::from_slice(&tron_addr[1..]);
 
-    // Pre-install Account at the TRON address with init code.
+    // Pre-install Account at the TRON address with init code. Code is keyed by
+    // ADDRESS (java-tron's `saveCode(address, ...)`), so `basic_ref` resolves
+    // it during constructor execution.
     let init_code = &smart_contract.bytecode;
     let init_hash = tron_crypto::hash::keccak256(init_code);
-    if let Err(e) = stores.code.put(&init_hash, init_code) {
+    if let Err(e) = stores.code.put(tron_contract_addr.as_bytes(), init_code) {
         return (
             VmOutcome::PreflightError(format!("write init code: {e:?}")),
             Vec::new(),
@@ -935,9 +937,11 @@ pub fn execute_create_with_trace(
                     tron_crypto::hash::keccak256(&runtime_code).to_vec()
                 };
                 if !runtime_code.is_empty() {
+                    // Runtime code keyed by ADDRESS (overwrites the init code
+                    // pre-installed at the same key), matching java-tron.
                     stores
                         .code
-                        .put(&runtime_hash, &runtime_code)
+                        .put(tron_contract_addr.as_bytes(), &runtime_code)
                         .expect("db error in execute_create writing runtime code");
                 }
                 // Replace init code on the Account with the runtime code.

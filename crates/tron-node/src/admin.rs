@@ -76,7 +76,7 @@ pub fn prune_before(stores: &OpenedStores, before: i64) -> Result<usize, AdminEr
 /// running against the same data_dir will fail because RocksDB
 /// holds an exclusive lock. Call only when the daemon is stopped.
 pub fn compact_all(data_dir: &Path) -> Result<Vec<String>, AdminError> {
-    let db_root = data_dir.join("db");
+    let db_root = crate::storage::resolve_db_root(data_dir);
     if !db_root.exists() {
         return Err(AdminError::Io(format!(
             "no db/ subdirectory under {}; nothing to compact",
@@ -252,7 +252,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64, AdminError> {
 /// absent, every contract uses `KECCAK_EMPTY_STORAGE_ROOT` (the same
 /// placeholder `compute_account_state_root` plugs in by default).
 pub fn db_root(data_dir: &Path) -> Result<[u8; 32], AdminError> {
-    let db_root_path = data_dir.join("db");
+    let db_root_path = crate::storage::resolve_db_root(data_dir);
     let account_path = db_root_path.join(AccountStore::DB_NAME);
     if !account_path.is_dir() {
         return Err(AdminError::Invalid(format!(
@@ -355,10 +355,10 @@ pub fn db_lite(
             src.display()
         )));
     }
-    let src_db = src.join("db");
+    let src_db = crate::storage::resolve_db_root(src);
     if !src_db.is_dir() {
         return Err(AdminError::Invalid(format!(
-            "src has no db/ subdirectory: {}",
+            "src has no stores directory (database/ or db/): {}",
             src_db.display()
         )));
     }
@@ -369,8 +369,9 @@ pub fn db_lite(
         )));
     }
 
-    // Step 1: full recursive copy of src → dst.
-    let dst_db = dst.join("db");
+    // Step 1: full recursive copy of src → dst (normalized to the canonical
+    // `database/` layout regardless of which layout src used).
+    let dst_db = crate::storage::resolve_db_root(dst);
     let bytes_copied = copy_dir_recursive(&src_db, &dst_db)?;
 
     // Step 2: read the latest block num from the copy.

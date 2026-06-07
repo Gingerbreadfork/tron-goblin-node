@@ -116,7 +116,7 @@ async fn node_no_rpc_no_sync_still_opens_storage() {
         shutdown_handle.shutdown();
     });
     tron_node::run(config, shutdown).await.expect("run");
-    // Storage tree should exist on disk now.
-    assert!(data_dir.join("db").exists());
+    // Storage tree should exist on disk now (java-tron-style `database/`).
+    assert!(data_dir.join("database").exists());
     std::fs::remove_dir_all(&data_dir).ok();
 }

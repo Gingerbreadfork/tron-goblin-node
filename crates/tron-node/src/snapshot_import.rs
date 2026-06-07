@@ -373,7 +373,7 @@ pub fn import_from_directory(
     }
 
     // Compute destination root: data_dir/db. Wipe if force.
-    let db_root = data_dir.join("db");
+    let db_root = crate::storage::resolve_db_root(data_dir);
     if db_root.exists() {
         let mut populated = false;
         if let Ok(mut entries) = std::fs::read_dir(&db_root) {
@@ -514,7 +514,7 @@ pub fn import_live(
         return Err(ImportError::SourceEmpty);
     }
 
-    let db_root = data_dir.join("db");
+    let db_root = crate::storage::resolve_db_root(data_dir);
     if db_root.exists() {
         let mut populated = false;
         if let Ok(mut entries) = std::fs::read_dir(&db_root) {
@@ -630,7 +630,7 @@ pub fn import_live(
 pub fn verify_snapshot(data_dir: &Path) -> Result<ImportReport, ImportError> {
     let stores = OpenedStores::open(data_dir)?;
     // Enumerate what's actually on disk for the report.
-    let db_root = data_dir.join("db");
+    let db_root = crate::storage::resolve_db_root(data_dir);
     let mut names: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&db_root) {
         for entry in entries.flatten() {
@@ -884,7 +884,8 @@ mod tests {
         }
         // Drop the stores so RocksDB releases its locks before we copy.
         drop(stores);
-        data.join("db")
+        // Return the actual store root the node created (now `database/`).
+        crate::storage::resolve_db_root(&data)
     }
 
     #[serial_test::serial(snapshot)]

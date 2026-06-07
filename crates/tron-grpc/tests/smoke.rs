@@ -114,6 +114,7 @@ fn fixture() -> RpcState {
         mempool: None,
         filters: Arc::new(tron_rpc::FilterRegistry::default()),
         assets_v1: None,
+        account_assets: None,
         nullifiers: None,
         eth_call_gas_cap: 50_000_000,
         support_constant: false,
@@ -182,6 +183,14 @@ async fn grpc_server_serves_basic_read_methods() {
         .expect("get_account")
         .into_inner();
     assert_eq!(alice_resp.balance, 1_234_567);
+    // gRPC getAccount now applies java-tron's Wallet.getAccount read-time
+    // transforms — frozenV2 is padded to all three ResourceCodes
+    // (sortFrozenV2List), matching the HTTP surface.
+    assert_eq!(
+        alice_resp.frozen_v2.len(),
+        3,
+        "gRPC getAccount must pad frozenV2 to 3 entries like java/HTTP"
+    );
 
     // ---- list_witnesses ----
     let wits = client

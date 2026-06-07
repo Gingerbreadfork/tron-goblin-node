@@ -153,8 +153,9 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
     let expected_runtime_hash = tron_crypto::hash::keccak256(&runtime);
     assert_eq!(acct.code_hash, expected_runtime_hash.as_slice());
 
-    // CodeStore must contain the runtime code keyed by its hash.
-    let stored_code = stores.code.get(acct.code_hash.as_slice()).unwrap().unwrap();
+    // CodeStore must contain the runtime code keyed by ADDRESS (java-tron's
+    // `saveCode(address, ...)` layout), not by code_hash.
+    let stored_code = stores.code.get(contract_addr.as_bytes()).unwrap().unwrap();
     assert_eq!(stored_code, runtime);
 }
 

@@ -605,14 +605,23 @@ impl Wallet for WalletService {
         }
         let mut addr = [0u8; 21];
         addr.copy_from_slice(&probe.address);
-        let acct = self
-            .state
-            .accounts
-            .get(&Address::from_raw(addr))
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        Ok(Response::new(acct))
+        match self.state.accounts.get(&Address::from_raw(addr)).ok().flatten() {
+            Some(mut acct) => {
+                // Apply java-tron's Wallet.getAccount read-time transforms to the
+                // proto (asset merge, usage decay, slot→ms times, frozenV2 pad)
+                // so gRPC matches the HTTP surface (and java) for real clients.
+                let genesis_ms = self.state.dyn_props.genesis_block_timestamp().unwrap_or(0);
+                tron_rpc::methods::apply_get_account_transforms(
+                    &mut acct,
+                    &self.state.dyn_props,
+                    self.state.account_assets.as_deref(),
+                    genesis_ms,
+                );
+                Ok(Response::new(acct))
+            }
+            // java-tron returns the default (empty) Account for a missing one.
+            None => Ok(Response::new(Account::default())),
+        }
     }
 
     async fn list_witnesses(
@@ -807,9 +816,19 @@ impl Wallet for WalletService {
             Some(a) => a,
             None => return Ok(Response::new(Account::default())),
         };
-        Ok(Response::new(
-            self.state.accounts.get(&addr).ok().flatten().unwrap_or_default(),
-        ))
+        match self.state.accounts.get(&addr).ok().flatten() {
+            Some(mut acct) => {
+                let genesis_ms = self.state.dyn_props.genesis_block_timestamp().unwrap_or(0);
+                tron_rpc::methods::apply_get_account_transforms(
+                    &mut acct,
+                    &self.state.dyn_props,
+                    self.state.account_assets.as_deref(),
+                    genesis_ms,
+                );
+                Ok(Response::new(acct))
+            }
+            None => Ok(Response::new(Account::default())),
+        }
     }
 
     async fn get_account_balance(

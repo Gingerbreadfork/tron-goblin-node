@@ -1341,12 +1341,12 @@ fn freeze_v2_json(f: &tron_proto::account::FreezeV2) -> Value {
     Value::Object(m)
 }
 
-/// Build the getAccount `frozenV2` array exactly as java-tron's
-/// `Wallet.sortFrozenV2List` does: one entry per ResourceCode in canonical
-/// order (BANDWIDTH=0, ENERGY=1, TRON_POWER=2; UNRECOGNIZED skipped), carrying
-/// the stored amount for that resource or 0 if the account has no entry for
-/// it. Always three entries, regardless of what's actually frozen.
-fn normalized_frozen_v2_json(a: &tron_proto::Account) -> Vec<Value> {
+/// java-tron's `Wallet.sortFrozenV2List`: one `FreezeV2` per ResourceCode in
+/// canonical order (BANDWIDTH=0, ENERGY=1, TRON_POWER=2; UNRECOGNIZED skipped),
+/// carrying the stored amount for that resource or 0 if absent. Always three
+/// entries, regardless of what's actually frozen. (Proto form — the single
+/// source of truth; the JSON serializer maps it through `freeze_v2_json`.)
+fn padded_frozen_v2(a: &tron_proto::Account) -> Vec<tron_proto::account::FreezeV2> {
     [0_i32, 1, 2]
         .iter()
         .map(|&code| {
@@ -1356,9 +1356,42 @@ fn normalized_frozen_v2_json(a: &tron_proto::Account) -> Vec<Value> {
                 .find(|f| f.r#type == code)
                 .map(|f| f.amount)
                 .unwrap_or(0);
-            freeze_v2_json(&tron_proto::account::FreezeV2 { r#type: code, amount })
+            tron_proto::account::FreezeV2 { r#type: code, amount }
         })
         .collect()
+}
+
+fn normalized_frozen_v2_json(a: &tron_proto::Account) -> Vec<Value> {
+    padded_frozen_v2(a).iter().map(freeze_v2_json).collect()
+}
+
+/// Apply java-tron's `Wallet.getAccount` read-time transforms to `account`
+/// IN PLACE, on the proto: `importAllAsset` (merge optimized TRC10 balances),
+/// `updateUsage` (decay net/free/energy usage + materialize per-asset free-net
+/// usage), the slot→ms rewrite of the consume-time fields, and
+/// `sortFrozenV2List` (pad `frozenV2` to all three ResourceCodes).
+///
+/// Used by the **gRPC** getAccount path, which returns the proto directly. The
+/// HTTP serializer produces the identical values via its JSON encoder using the
+/// same shared helpers, so the two surfaces stay in lock-step.
+pub fn apply_get_account_transforms(
+    account: &mut tron_proto::Account,
+    dyn_props: &tron_chainbase::DynamicPropertiesStore,
+    account_assets: Option<&tron_chainbase::AccountAssetStore>,
+    genesis_ms: i64,
+) {
+    if let Some(store) = account_assets {
+        store.import_all_asset(account);
+    }
+    apply_read_usage_recovery(account, dyn_props);
+    account.latest_consume_time = consume_slot_to_ms(account.latest_consume_time, genesis_ms);
+    account.latest_consume_free_time =
+        consume_slot_to_ms(account.latest_consume_free_time, genesis_ms);
+    if let Some(r) = account.account_resource.as_mut() {
+        r.latest_consume_time_for_energy =
+            consume_slot_to_ms(r.latest_consume_time_for_energy, genesis_ms);
+    }
+    account.frozen_v2 = padded_frozen_v2(account);
 }
 
 fn vote_json(v: &tron_proto::Vote) -> Value {

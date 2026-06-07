@@ -197,19 +197,34 @@ impl DatabaseRef for TronDatabase {
         // is lossless because i64 is always non-negative for valid accounts.
         let balance = U256::from(account.balance.max(0) as u64);
 
-        // Account.code_hash may be empty for non-contracts; in that case
-        // we use revm's canonical KECCAK_EMPTY sentinel.
-        let code_hash = if account.code_hash.len() == 32 {
-            B256::from_slice(&account.code_hash)
+        // java-tron stores contract RUNTIME code in the `code` store keyed by
+        // the contract ADDRESS (`RepositoryImpl.getCode`/`saveCode`), NOT by
+        // code_hash. Load it by address and return it inline so revm uses it
+        // directly — this is what lets java snapshot contracts execute, since
+        // their `Account.code_hash` is frequently empty (the VM would otherwise
+        // resolve KECCAK_EMPTY → no code → empty execution).
+        let code_bytes = self.code.get(tron_addr.as_bytes())?.unwrap_or_default();
+        let (code, code_hash) = if code_bytes.is_empty() {
+            // No address-keyed code. Fall back to the account's code_hash so
+            // revm's `code_by_hash` can still resolve code this node wrote
+            // under the legacy hash key (pre-address-keying deploys); empty
+            // hash ⇒ a plain account.
+            let h = if account.code_hash.len() == 32 {
+                B256::from_slice(&account.code_hash)
+            } else {
+                revm::primitives::KECCAK_EMPTY
+            };
+            (None, h)
         } else {
-            revm::primitives::KECCAK_EMPTY
+            let h = code_hash(&code_bytes);
+            (Some(Bytecode::new_raw(code_bytes.into())), h)
         };
 
         Ok(Some(AccountInfo {
             balance,
             nonce: 0,
             code_hash,
-            code: None, // lazy-load via code_by_hash
+            code,
             account_id: None,
         }))
     }
@@ -335,12 +350,15 @@ impl DatabaseCommit for TronDatabase {
             if let Some(code) = &account.info.code {
                 let raw = code.original_byte_slice();
                 if !raw.is_empty() {
+                    // Key the runtime code by ADDRESS, matching java-tron's
+                    // `RepositoryImpl.saveCode(address, ...)` so a later
+                    // `getCode(address)` (and our address-keyed `basic_ref`)
+                    // resolves it. (Was keyed by code_hash, which diverged
+                    // from java and made snapshot contracts unreadable.)
                     self.code
-                        .put(account.info.code_hash.as_slice(), raw)
+                        .put(tron_addr.as_bytes(), raw)
                         .expect("db error in DatabaseCommit::commit writing code");
                     tron_account.code_hash = account.info.code_hash.to_vec();
-                    // `code` is stored both on the account and in CodeStore
-                    // in java-tron; we mirror that.
                     tron_account.code = raw.to_vec();
                 }
             }

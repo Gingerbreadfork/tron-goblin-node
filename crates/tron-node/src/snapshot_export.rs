@@ -62,7 +62,7 @@ pub struct ExportReport {
 pub enum ExportError {
     #[error("data dir does not exist: {0:?}")]
     DataDirMissing(PathBuf),
-    #[error("data_dir/db is missing or empty: {0:?}")]
+    #[error("data_dir stores directory (database/ or db/) is missing or empty: {0:?}")]
     DbDirEmpty(PathBuf),
     #[error("io error at {path:?}: {source}")]
     Io {
@@ -84,7 +84,7 @@ pub fn export_to_tarball(
     if !data_dir.exists() {
         return Err(ExportError::DataDirMissing(data_dir.to_path_buf()));
     }
-    let db_root = data_dir.join("db");
+    let db_root = crate::storage::resolve_db_root(data_dir);
     if !db_root.is_dir() {
         return Err(ExportError::DbDirEmpty(db_root));
     }
@@ -229,7 +229,7 @@ pub fn export_via_checkpoint(
     if !data_dir.exists() {
         return Err(ExportError::DataDirMissing(data_dir.to_path_buf()));
     }
-    let db_root = data_dir.join("db");
+    let db_root = crate::storage::resolve_db_root(data_dir);
     if !db_root.is_dir() {
         return Err(ExportError::DbDirEmpty(db_root));
     }
@@ -248,7 +248,8 @@ pub fn export_via_checkpoint(
     }
     subdirs.sort();
 
-    let dest_db_root = dest.join("db");
+    // Write the export in java-tron's canonical `database/` layout.
+    let dest_db_root = crate::storage::resolve_db_root(dest);
     std::fs::create_dir_all(&dest_db_root).map_err(|e| ExportError::Io {
         path: dest_db_root.clone(),
         source: e,
@@ -458,16 +459,17 @@ mod tests {
         let report = export_via_checkpoint(&data_dir, &dest).expect("checkpoint");
         // Same store count as the tar path.
         assert!(report.stores_exported >= 20);
-        // Checkpoint dir is `dest/db/*`.
-        assert!(dest.join("db").is_dir());
+        // Checkpoint stores land in the canonical `database/` layout.
+        let dest_db = crate::storage::resolve_db_root(&dest);
+        assert!(dest_db.is_dir());
 
         // Use the snapshot_import directory entrypoint to open the
         // checkpoint as the source. `import_from_directory` expects
         // the source to contain per-store dirs directly, so point at
-        // `dest/db` (not `dest`).
+        // the resolved store root (not `dest`).
         let restore_dir = temp_dir("restore-checkpoint");
         let restored = crate::snapshot_import::import_from_directory(
-            &dest.join("db"),
+            &dest_db,
             &restore_dir,
             crate::snapshot_import::ImportMode::Copy,
             false,

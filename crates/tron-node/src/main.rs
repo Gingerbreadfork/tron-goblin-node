@@ -56,7 +56,7 @@ dump-state:       open the storage tree read-only and emit a JSON snapshot of
                   head, chain-wide resource totals, fee accumulators, and witness
                   counters. Designed for divergence triage against java-tron.
 
-import-snapshot:  plant a java-tron snapshot into data_dir/db/. --from accepts
+import-snapshot:  plant a java-tron snapshot into data_dir/database/. --from accepts
                   either a directory of per-store subdirs (account/, witness/,
                   properties/, ...) or a tarball (.tar / .tar.gz / .tgz) —
                   tarballs are auto-extracted to a temp dir, layout-detected,
