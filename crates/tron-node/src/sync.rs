@@ -1297,6 +1297,24 @@ impl SyncDriver {
             .map(|c| c.outbound.subscribe());
 
         let mut prev_id = self.resume_head();
+        // Timestamp (ms) of our current head block. Used to distinguish two
+        // empty-inventory cases: "caught up to the real tip" (head is recent
+        // → keep this peer) vs "caught up to a laggard peer while still far
+        // behind the tip" (head is stale → this peer is a dead-end; release
+        // leadership and rotate to a peer that's actually at the tip). Seeded
+        // from the on-disk head so it's meaningful even before this pass
+        // applies its first block; refreshed on every apply below.
+        let mut last_block_ts: i64 = prev_id
+            .and_then(|id| BlockStore::new(self.blocks_backend.clone()).get(&id).ok())
+            .and_then(|b| b.block_header)
+            .and_then(|h| h.raw_data)
+            .map(|r| r.timestamp)
+            .unwrap_or(0);
+        // How far behind wall-clock our head may be before an empty
+        // inventory means "this peer is a dead-end", not "we're at the tip".
+        // Comfortably above a normal near-tip lag so caught-up peers aren't
+        // dropped, but well under any real backlog.
+        const DEAD_END_LAG_MS: i64 = 90_000;
         // Track how many `Block` frames we still expect for the current
         // FetchInvData batch. When this hits zero, drain the next chunk
         // from `pending_fetch_queue` (if any), or — if the queue is
@@ -1920,6 +1938,28 @@ impl SyncDriver {
                     // sync too — every caught-up peer and every dead-end
                     // peer we briefly lead from.)
                     if appended == 0 && chain_inv.remain_num == 0 {
+                        // Dead-end detection: an empty inventory means we've
+                        // caught up to THIS peer's head. If our head is still
+                        // far behind wall-clock, this peer is a laggard/lite
+                        // node that can't get us to the tip — don't sit on it
+                        // for a full LEADERSHIP_STALE window. Release the
+                        // leadership slot and rotate to another peer (which
+                        // may be at the tip), instead of spinning empty
+                        // round-trips against a dead-end. At/near the tip
+                        // (head recent) this never fires, so caught-up peers
+                        // are retained and feed us new blocks via adverts.
+                        let behind_ms =
+                            crate::node_statistics::unix_now_ms() as i64 - last_block_ts;
+                        if am_leader && last_block_ts > 0 && behind_ms > DEAD_END_LAG_MS {
+                            info!(
+                                peer,
+                                behind_s = behind_ms / 1000,
+                                "dead-end peer: caught up to it but still behind the tip; \
+                                 releasing leadership and rotating to find a peer at the tip"
+                            );
+                            self.release_leadership(peer);
+                            return PeerOutcome::CaughtUp;
+                        }
                         tokio::time::sleep(self.config.tail_interval).await;
                     }
                 }
@@ -2007,6 +2047,12 @@ impl SyncDriver {
                     match self.accept_block(&block, prev_id) {
                         AcceptOutcome::Accepted(id) => {
                             prev_id = Some(id);
+                            last_block_ts = block
+                                .block_header
+                                .as_ref()
+                                .and_then(|h| h.raw_data.as_ref())
+                                .map(|r| r.timestamp)
+                                .unwrap_or(last_block_ts);
                             // Reset the leadership staleness timer — we're
                             // making progress, so no standby should preempt.
                             self.note_sync_progress(peer);
