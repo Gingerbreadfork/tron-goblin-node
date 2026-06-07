@@ -967,7 +967,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         use rand::seq::SliceRandom;
         tail.shuffle(&mut rand::thread_rng());
         let mut shuffled: Vec<String> = head.iter().cloned().collect();
-        shuffled.extend(tail.iter().take(config.p2p.max_peers - seed_count).cloned());
+        // saturating_sub: when `max_peers` < seed count (a small-VM
+        // config), keep just the seeds rather than underflow-panicking.
+        shuffled.extend(
+            tail.iter()
+                .take(config.p2p.max_peers.saturating_sub(seed_count))
+                .cloned(),
+        );
         combined_peers = shuffled;
     }
     if !config.p2p.disabled && !combined_peers.is_empty() {

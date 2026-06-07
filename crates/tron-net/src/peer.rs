@@ -323,6 +323,10 @@ where
     /// on the wire. Snappy compression is not yet supported on the
     /// send side — every frame is sent with `type = uncompress`.
     pub async fn send_frame(&mut self, frame: Frame) -> Result<(), FrameError> {
+        // Outbound-frame trace (debug). Lets a diagnostic run see exactly
+        // which app message we sent last before a peer disconnects us (e.g.
+        // BAD_PROTOCOL on the sync exchange). Cheap; gated by log level.
+        tracing::debug!(ty = ?frame.ty, len = frame.payload.len(), "tx frame");
         if self.compress_wrap {
             let mut inner = Vec::with_capacity(1 + frame.payload.len());
             inner.push(frame.ty.as_byte());

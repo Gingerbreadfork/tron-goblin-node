@@ -75,11 +75,18 @@ fn seed_alice(state: &StateBackends) {
 }
 
 fn build_block(num: i64, parent_hash: [u8; 32]) -> Block {
+    build_block_salted(num, parent_hash, 0)
+}
+
+/// Like `build_block` but `salt` perturbs the timestamp so two blocks at
+/// the same height with the same parent get distinct ids — i.e. genuine
+/// sibling forks for reorg tests.
+fn build_block_salted(num: i64, parent_hash: [u8; 32], salt: i64) -> Block {
     let mut block = Block {
         transactions: Vec::new(),
         block_header: Some(BlockHeader {
             raw_data: Some(BlockHeaderRaw {
-                timestamp: 1_700_000_000_000 + num * 3000,
+                timestamp: 1_700_000_000_000 + num * 3000 + salt,
                 tx_trie_root: tron_types::calc_tx_trie_root(&[])
                     .map(|h| h.to_vec())
                     .unwrap_or_default(),
@@ -165,20 +172,87 @@ fn resume_head_returns_block_id_after_accept() {
 }
 
 #[test]
-fn accept_block_rejects_wrong_parent_link() {
+fn accept_block_rejects_unlinked_block() {
+    // Parent-link authority moved from the caller's `prev_id` hint to the
+    // fork tree: a block whose parent isn't in KhaosDb (a genuine orphan)
+    // is rejected as unlinked, regardless of what `prev_id` says. A stale
+    // `prev_id` alone must NOT cause a rejection — that was the bug that
+    // made public peers refuse to sync.
     let (state, blocks_be) = fresh_state();
     seed_alice(&state);
     let mut driver = make_driver(state, blocks_be);
-    let block = build_block(1, [0u8; 32]);
-    // Lie about prev_id — driver should reject.
-    let bogus = tron_types::BlockId::from_raw([0xffu8; 32]);
-    let outcome = driver.accept_block(&block, Some(bogus));
+
+    // Establish a head at block 1.
+    let b1 = build_block(1, [0u8; 32]);
+    let id1 = block_id_from_block(&b1).unwrap();
+    assert!(matches!(driver.accept_block(&b1, None), AcceptOutcome::Accepted(_)));
+
+    // A block whose parent_hash points at something not in the fork tree.
+    // Even though we hand it a *valid* prev_id (id1), KhaosDb can't link
+    // it → unlinked rejection.
+    let orphan = build_block(2, [0xffu8; 32]);
+    let outcome = driver.accept_block(&orphan, Some(id1));
     match outcome {
         AcceptOutcome::RejectedValidation(reason) => {
-            assert!(reason.contains("parent link"), "got: {reason}");
+            assert!(reason.contains("unlinked"), "got: {reason}");
         }
-        other => panic!("expected RejectedValidation, got {other:?}"),
+        other => panic!("expected RejectedValidation(unlinked), got {other:?}"),
     }
+}
+
+#[test]
+fn fork_block_with_stale_prev_id_reorgs_instead_of_rejecting() {
+    // The real-sync / leadership-handoff scenario the gate removal fixes:
+    // a sibling-fork block arrives while `prev_id` still points at the
+    // canonical head (the stream cursor lags the fork). Pre-fix, the early
+    // parent-link gate hard-rejected it, wedging the head. Now KhaosDb
+    // classifies it as a side fork, and a taller extension triggers a
+    // clean reorg — all with `prev_id` pinned at the (stale) canonical
+    // head throughout.
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let mut driver = make_driver(state.clone(), blocks_be)
+        .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()));
+
+    // Block 1 (head).
+    let b1 = build_block(1, [0u8; 32]);
+    let id1 = block_id_from_block(&b1).unwrap();
+    assert!(matches!(driver.accept_block(&b1, None), AcceptOutcome::Accepted(_)));
+
+    // Canonical block 2a.
+    let b2a = build_block_salted(2, *id1.as_bytes(), 0);
+    let id2a = block_id_from_block(&b2a).unwrap();
+    assert!(matches!(
+        driver.accept_block(&b2a, Some(id1)),
+        AcceptOutcome::Accepted(_)
+    ));
+    assert_eq!(driver.head_number(), 2);
+
+    // Sibling 2b — but prev_id is the canonical head (id2a), NOT 2b's
+    // real parent (id1). Pre-fix: hard parent-link reject. Now: side fork.
+    let b2b = build_block_salted(2, *id1.as_bytes(), 1);
+    let id2b = block_id_from_block(&b2b).unwrap();
+    let outcome = driver.accept_block(&b2b, Some(id2a));
+    assert!(
+        matches!(outcome, AcceptOutcome::SideFork(_)),
+        "sibling fork must be classified, not rejected on stale prev_id; got {outcome:?}"
+    );
+    assert_eq!(driver.head_number(), 2, "still on canonical 2a");
+
+    // 3b extends 2b → taller fork → reorg, again with the stale prev_id.
+    let b3b = build_block_salted(3, *id2b.as_bytes(), 1);
+    let id3b = block_id_from_block(&b3b).unwrap();
+    let outcome = driver.accept_block(&b3b, Some(id2a));
+    assert!(
+        matches!(outcome, AcceptOutcome::Accepted(_)),
+        "taller fork must reorg in, not reject on stale prev_id; got {outcome:?}"
+    );
+    assert_eq!(driver.head_number(), 3);
+    assert_eq!(
+        driver.resume_head(),
+        Some(id3b),
+        "head switched to the taller fork"
+    );
 }
 
 #[test]

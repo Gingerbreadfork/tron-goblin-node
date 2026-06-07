@@ -57,7 +57,7 @@ use tron_net::{
 };
 use tron_proto::{Block, Endpoint};
 use tron_types::{
-    block_id_from_block, genesis_block_id, mainnet_inputs, verify_parent_link, verify_tx_trie_root,
+    block_id_from_block, genesis_block_id, mainnet_inputs, verify_tx_trie_root,
     verify_tx_trie_root_raw, verify_witness_signature, BlockId,
 };
 
@@ -1391,6 +1391,17 @@ impl SyncDriver {
         // `sync_started` flips once we've sent it as leader; if we later
         // lose leadership we reset it (and drop queued work) and go quiet.
         let mut sync_started = false;
+        // A `SyncBlockChain` request is outstanding (we sent a locator and
+        // haven't yet received its `ChainInventory`). CRITICAL: never send
+        // a second `SyncBlockChain` while one is in flight. The peer
+        // (java-tron's `SyncBlockChainMsgHandler`) records the last block
+        // it served us and BAD_PROTOCOL-disconnects any subsequent locator
+        // whose head is *lower* than that — a regression. If we fire the
+        // queue-empty `AskInventory` before the first inventory lands, our
+        // second locator is still anchored at the un-advanced head, the
+        // peer has meanwhile served us up to ITS head, and we get dropped.
+        // This single-flight gate is what lets public peers sync with us.
+        let mut awaiting_inventory = false;
         // Pipelining threshold: when in-flight blocks drop below this,
         // try to queue the next FetchInvData chunk so the peer is
         // continuously processing while we're draining the current
@@ -1564,6 +1575,7 @@ impl SyncDriver {
                     return PeerOutcome::PeerFailure(format!("send_sync_request: {e}"));
                 }
                 sync_started = true;
+                awaiting_inventory = true;
             } else if !am_leader && sync_started {
                 // We led, then a peer took the slot (we stalled ≥
                 // LEADERSHIP_STALE). Stop driving sync and drop queued work
@@ -1571,6 +1583,7 @@ impl SyncDriver {
                 // advancing; we'll re-kick if we reclaim leadership.
                 debug!(peer, "yielded active-syncer role; going standby");
                 sync_started = false;
+                awaiting_inventory = false;
                 pending_fetch_queue.clear();
                 blocks_in_flight = 0;
             }
@@ -1590,6 +1603,7 @@ impl SyncDriver {
             } else if pending_fetch_queue.is_empty()
                 && blocks_in_flight == 0
                 && prev_id.is_some()
+                && !awaiting_inventory
             {
                 Some(PendingAction::AskInventory)
             } else {
@@ -1640,6 +1654,9 @@ impl SyncDriver {
                                     "send_sync_request (continue): {e}"
                                 ));
                             }
+                            // Single-flight: block further SyncBlockChain sends
+                            // until this request's ChainInventory comes back.
+                            awaiting_inventory = true;
                         }
                     }
                     // Loop around to re-evaluate `pending` (we may need
@@ -1672,6 +1689,11 @@ impl SyncDriver {
                 }
                 Err(_) => {
                     debug!("60s idle waiting for peer frame; loop continues");
+                    // If a SyncBlockChain went unanswered for a full idle
+                    // window, release the single-flight gate so we can retry
+                    // (the peer dropped or ignored it). Avoids wedging a
+                    // sole-peer leader that has no standby to preempt it.
+                    awaiting_inventory = false;
                     continue;
                 }
             };
@@ -1875,6 +1897,9 @@ impl SyncDriver {
                                 continue;
                             }
                         };
+                    // The outstanding SyncBlockChain has been answered — we
+                    // may issue the next one once this window drains.
+                    awaiting_inventory = false;
                     for b in chain_inv.ids.iter().skip(1) {
                         pending_fetch_queue.push_back(b.hash.clone());
                     }
@@ -1996,17 +2021,19 @@ impl SyncDriver {
                             }
                             // Tip-fork churn vs genuine validation failure.
                             // At the tip the network constantly produces
-                            // 1-block sibling forks; until the early
-                            // parent-link gate (sync.rs ~2538) is replaced by
-                            // khaos-driven reorg, a leader briefly on a
-                            // sibling rejects the canonical block ("parent
-                            // link") and the following blocks' refs then can't
-                            // resolve ("outside the 65,536-block window") —
-                            // a self-recovering cascade, not a fault. Log
-                            // those at debug so they don't flood the operator
-                            // log; keep real failures (bad signature, bad
-                            // tx_trie, bad number, ref_block hash mismatch) at
-                            // warn.
+                            // 1-block sibling forks. KhaosDb now drives the
+                            // reorg (the early parent-link gate is gone), so a
+                            // sibling block links as a side fork and a taller
+                            // extension reorgs us onto it — but in the brief
+                            // window before its parent has linked, a fork
+                            // block can still arrive "unlinked", and a block
+                            // built on a fork we haven't adopted yet can have
+                            // refs that don't resolve ("outside the
+                            // 65,536-block window"). Both self-recover once the
+                            // missing parents arrive. Log them at debug so they
+                            // don't flood the operator log; keep real failures
+                            // (bad signature, bad tx_trie, bad number,
+                            // ref_block hash mismatch) at warn.
                             let is_tip_fork_churn = reason.contains("parent link")
                                 || reason.contains("unlinked block")
                                 || reason.contains("outside the 65,536-block window");
@@ -2059,17 +2086,20 @@ impl SyncDriver {
                             }
                         }
                         AcceptOutcome::ReorgRequired(id, new_head_num) => {
-                            // Sibling fork overtook us — true reorg
-                            // needed but Phase B (state rollback) is
-                            // not yet wired. Warn loudly so the
-                            // operator knows the head is now divergent
-                            // from the canonical chain.
+                            // A taller sibling fork needs a reorg, but
+                            // neither an undo store nor a snapshot stack is
+                            // attached to actually roll state back (both are
+                            // wired in production — this only fires in a
+                            // degraded/misconfigured setup, or before any
+                            // head exists). Warn loudly: the head is now
+                            // divergent from the canonical chain and a
+                            // restart from a snapshot is the recovery path.
                             warn!(
                                 block = block_num,
                                 hash = %hex::encode(&id.as_bytes()[..8]),
                                 new_head_num,
-                                "REORG REQUIRED: sibling fork overtook canonical head; \
-                                 state rollback not yet implemented, head is stale"
+                                "REORG REQUIRED but no undo store / snapshot stack attached; \
+                                 cannot roll back state, head is stale"
                             );
                             if let Some(m) = &self.metrics {
                                 m.inc_reorgs_required();
@@ -2559,11 +2589,24 @@ impl SyncDriver {
             return AcceptOutcome::AlreadyKnown(id);
         }
 
-        if let Some(prev) = prev_id {
-            if let Err(e) = verify_parent_link(block, prev) {
-                return AcceptOutcome::RejectedValidation(format!("parent link: {e:?}"));
-            }
-        }
+        // NOTE: we deliberately do NOT hard-reject on a parent-link
+        // mismatch against the caller's `prev_id` here. `prev_id` is only
+        // a per-stream cursor hint, and it goes stale in two routine
+        // cases: (a) a leadership handoff, where the new leader's cursor
+        // lags the shared on-disk head, and (b) a sibling/fork block that
+        // arrives interleaved with the canonical chain. KhaosDb (below) is
+        // the authority on fork-tree linkage — it returns `Unlinked` for a
+        // genuine orphan — and the clean-extension path re-checks the
+        // parent link against the *executed head* from DPS, which is what
+        // we've actually applied. Gating on `prev_id` here is precisely
+        // what made public peers "refuse to sync": a valid sibling/fork,
+        // or a valid extension observed by a non-leader stream, was
+        // rejected before KhaosDb could classify it, wedging the head and
+        // — because our SyncBlockChain locator then regressed — earning a
+        // BAD_PROTOCOL from the serving peer (java-tron's
+        // SyncBlockChainMsgHandler rejects a regressing locator). java-tron
+        // drives sync entirely from the fork tree, not a stream cursor.
+        let _ = prev_id;
 
         // Push into KhaosDb to record the fork-tree position. Three
         // outcomes:
@@ -2643,14 +2686,14 @@ impl SyncDriver {
         }
 
         // Fork-switch detection. If the new head in KhaosDb has a
-        // *different* id than our just-pushed block, we landed on a
-        // non-canonical fork — the executor stays on the canonical
-        // chain. Phase B reorg-with-state-rollback would walk
-        // get_branch here; for now, log and skip execution.
+        // *different* id than our just-pushed block, this block did not
+        // win the longest-chain race — it sits on a sibling fork that's
+        // still shorter than or equal to the canonical head. It's
+        // correctly recorded in the fork tree but not executed against
+        // state. When a later block extends this fork past the canonical
+        // head, KhaosDb promotes it and the `needs_reorg` path below
+        // rolls state over to it.
         if khaos_head.id != id {
-            // This block is on a sibling fork that's still shorter
-            // than or equal to the canonical head. Recorded for fork
-            // analytics; not executed against state.
             return AcceptOutcome::SideFork(id);
         }
         let _ = prev_head_num;
@@ -2714,7 +2757,10 @@ impl SyncDriver {
         // it. Without the stack, fall through to the legacy
         // BlockUndoStore path.
         if self.snapshot_stack.is_some() {
-            return self.execute_under_snapshot(block, id, prev_id);
+            // Pass the authoritative executed head (not the stream-hint
+            // `prev_id`) as the expected parent — `needs_reorg == false`
+            // already established this block extends `executed_head`.
+            return self.execute_under_snapshot(block, id, executed_head);
         }
 
         // Catch-up fast path: while the block we're applying is well
@@ -2733,11 +2779,13 @@ impl SyncDriver {
         // cross-store checkpoint is attached, route through it so the
         // block's writes land behind one durable manifest (recovered
         // on next startup if we crash mid-flush).
+        // Expected parent is the authoritative executed head, not the
+        // stream-hint `prev_id` (see the clean-extension note above).
         let exec_result = match (&self.undo_store, &self.checkpoint) {
             (Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                 &self.state,
                 block,
-                prev_id,
+                executed_head,
                 undo,
                 cp,
                 &self.exec_config,
@@ -2745,14 +2793,14 @@ impl SyncDriver {
             (Some(undo), None) => tron_executor::execute_block_with_undo_and_config(
                 &self.state,
                 block,
-                prev_id,
+                executed_head,
                 undo,
                 &self.exec_config,
             ),
             (None, _) => tron_executor::execute_block_with_config(
                 &self.state,
                 block,
-                prev_id,
+                executed_head,
                 &self.exec_config,
             ),
         };
