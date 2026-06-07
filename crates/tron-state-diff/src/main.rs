@@ -59,7 +59,7 @@ OPTIONS:
                             both nodes need vm.supportConstant = true
   --call <addr:sig[:param]> diff one explicit constant call, e.g. T...:balanceOf(address):<64hex>
                             (repeatable; param is bare hex ABI args, optional)
-  --constant-owner <addr>   caller (msg.sender) for constant calls [default: the contract itself]
+  --constant-owner <addr>   caller (msg.sender) for constant calls [default: zero-address EOA]
   --settle-timeout-secs <n> max wait for both nodes to share a head [default 30]
   --max-rounds <n>          re-check rounds for head-unstable mismatches [default 3]
   --http-timeout-secs <n>   per-request timeout                 [default 10]
@@ -164,6 +164,12 @@ impl Job {
     }
 }
 
+/// Default `owner_address` (msg.sender) for constant calls: the all-zero TRON
+/// address — a guaranteed code-less EOA. Using the contract itself trips our
+/// node's `RejectCallerWithCode` check (a contract can't be a tx caller), so
+/// the caller must be an EOA. Override with `--constant-owner`.
+const DEFAULT_CONSTANT_OWNER: &str = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb";
+
 /// Standard zero-argument TRC20/ERC20 view functions. Calling these on every
 /// discovered contract exercises a uint8 (decimals), two strings (name,
 /// symbol), and a uint256 (totalSupply) return — a good spread for TVM
@@ -255,7 +261,10 @@ fn run(args: Args) -> i32 {
     }
     // Explicit --call jobs.
     for (contract, sig, param) in &args.calls {
-        let owner = args.constant_owner.clone().unwrap_or_else(|| contract.clone());
+        let owner = args
+            .constant_owner
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONSTANT_OWNER.to_string());
         jobs.push(Job::Constant {
             contract: contract.clone(),
             owner,
@@ -278,7 +287,10 @@ fn run(args: Args) -> i32 {
         for a in &candidates {
             if is_contract(&args.a, a, args.http_timeout) {
                 n_contracts += 1;
-                let owner = args.constant_owner.clone().unwrap_or_else(|| a.clone());
+                let owner = args
+                    .constant_owner
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_CONSTANT_OWNER.to_string());
                 for call in standard_view_calls() {
                     jobs.push(Job::Constant {
                         contract: a.clone(),
@@ -545,6 +557,14 @@ fn is_base58_address(s: &str) -> bool {
     s.len() == 34 && s.starts_with('T') && s.bytes().all(|c| B58.contains(&c))
 }
 
+/// A constant-call diff that is *only* on `energy_used` — return data, success
+/// flag, and contractRet all match. This is the known TRON-energy-vs-revm-gas
+/// model gap, not an execution-correctness divergence, so it's reported
+/// separately and doesn't fail the run.
+fn is_energy_only(ms: &[Mismatch]) -> bool {
+    !ms.is_empty() && ms.iter().all(|m| m.path == "energy_used")
+}
+
 fn report(
     args: &Args,
     head_num: i64,
@@ -554,16 +574,30 @@ fn report(
     pending: &[(Job, Vec<Mismatch>)],
     errors: &[(Job, String)],
 ) -> i32 {
+    // Split confirmed mismatches: real execution/state divergences vs
+    // constant calls that match on return data but differ only on energy.
+    let real: Vec<&(Job, Vec<Mismatch>)> =
+        confirmed.iter().filter(|(_, ms)| !is_energy_only(ms)).collect();
+    let energy_only: Vec<&(Job, Vec<Mismatch>)> =
+        confirmed.iter().filter(|(_, ms)| is_energy_only(ms)).collect();
+
     if args.json {
         let report = serde_json::json!({
             "head": { "number": head_num, "id": head_id },
             "summary": {
                 "matched": matched.len(),
-                "mismatched": confirmed.len(),
+                "mismatched": real.len(),
+                "energy_only": energy_only.len(),
                 "inconclusive": pending.len(),
                 "errors": errors.len(),
             },
-            "mismatches": confirmed.iter().map(|(j, ms)| serde_json::json!({
+            "mismatches": real.iter().map(|(j, ms)| serde_json::json!({
+                "address": j.address(), "probe": j.kind(),
+                "fields": ms.iter().map(|m| serde_json::json!({
+                    "path": m.path, "a": m.a, "b": m.b,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "energy_only": energy_only.iter().map(|(j, ms)| serde_json::json!({
                 "address": j.address(), "probe": j.kind(),
                 "fields": ms.iter().map(|m| serde_json::json!({
                     "path": m.path, "a": m.a, "b": m.b,
@@ -583,19 +617,36 @@ fn report(
     } else {
         println!("\n=== tron-state-diff @ head {head_num} ({}) ===", short(head_id));
         println!(
-            "matched: {}   mismatched: {}   inconclusive: {}   errors: {}",
+            "matched: {}   mismatched: {}   energy-only: {}   inconclusive: {}   errors: {}",
             matched.len(),
-            confirmed.len(),
+            real.len(),
+            energy_only.len(),
             pending.len(),
             errors.len()
         );
-        if !confirmed.is_empty() {
+        if !real.is_empty() {
             println!("\n-- MISMATCHES (real; observed under a stable head) --");
-            for (job, ms) in confirmed {
+            for (job, ms) in &real {
                 println!("  {} [{}]", job.address(), job.kind());
                 for m in ms {
                     println!("      {} :  A={}  B={}", m.path, m.a, m.b);
                 }
+            }
+        }
+        if !energy_only.is_empty() {
+            println!(
+                "\n-- ENERGY-ONLY ({}) (return data matches; energy_used differs — \
+                 known TRON-energy vs revm-gas model gap) --",
+                energy_only.len()
+            );
+            for (job, ms) in energy_only.iter().take(10) {
+                let e = ms.iter().find(|m| m.path == "energy_used");
+                if let Some(m) = e {
+                    println!("  {} [{}]  energy A={} B={}", job.address(), job.kind(), m.a, m.b);
+                }
+            }
+            if energy_only.len() > 10 {
+                println!("  … and {} more", energy_only.len() - 10);
             }
         }
         if !pending.is_empty() {
@@ -618,13 +669,22 @@ fn report(
                 println!("  {} [{}]: {}", job.address(), job.kind(), e);
             }
         }
-        if confirmed.is_empty() && errors.is_empty() {
-            println!("\nNo real divergences found across {} probe(s).", matched.len());
+        if real.is_empty() && errors.is_empty() {
+            println!(
+                "\nNo real divergences found across {} probe(s){}.",
+                matched.len() + energy_only.len(),
+                if energy_only.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} matched on return data, energy aside)", energy_only.len())
+                }
+            );
         }
     }
 
-    // Exit code: 1 if any confirmed mismatch, 2 if errors only, 0 if clean.
-    if !confirmed.is_empty() {
+    // Exit code: 1 if any REAL divergence (energy-only doesn't fail), 2 if
+    // errors only, 0 if clean.
+    if !real.is_empty() {
         1
     } else if !errors.is_empty() {
         2
@@ -855,6 +915,23 @@ mod tests {
         assert_eq!(p, "00aa"); // 0x stripped
 
         assert!(parse_call_spec("justone").is_err());
+    }
+
+    #[test]
+    fn energy_only_diff_is_classified_separately() {
+        let m = |p: &str| Mismatch { path: p.into(), a: "x".into(), b: "y".into() };
+        assert!(is_energy_only(&[m("energy_used")]));
+        assert!(!is_energy_only(&[m("constant_result[0].value")]));
+        // A real diff alongside energy is NOT energy-only (it's a real bug).
+        assert!(!is_energy_only(&[m("energy_used"), m("constant_result[0].value")]));
+        assert!(!is_energy_only(&[]));
+    }
+
+    #[test]
+    fn default_constant_owner_is_an_eoa_not_the_contract() {
+        // Must be a fixed code-less EOA (zero address), never the contract
+        // itself, or our node's RejectCallerWithCode trips.
+        assert_eq!(DEFAULT_CONSTANT_OWNER, "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb");
     }
 
     #[test]
