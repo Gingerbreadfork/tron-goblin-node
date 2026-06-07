@@ -970,6 +970,18 @@ pub struct P2pConfig {
     /// untouched. Skips KhaosDb seeding too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_test: Option<TipTestCheckpoint>,
+    /// Cooperative multi-peer block fetch: when on, every connected
+    /// ahead-of-us peer helps fetch the sync backlog (each on its own valid
+    /// sync context, only within its offered window) into a shared pool that
+    /// the single leader applies in chain order. Faster catch-up + resilience
+    /// (no dependence on one peer), network-polite (each block fetched once,
+    /// per-peer pacing unchanged). Off ⇒ the proven single-peer path.
+    #[serde(default = "default_multi_peer_fetch", alias = "multiPeerFetch")]
+    pub multi_peer_fetch: bool,
+}
+
+fn default_multi_peer_fetch() -> bool {
+    true
 }
 
 /// `(block_num, block_id_hex)` pair used by [`P2pConfig::tip_test`].
@@ -1046,6 +1058,7 @@ impl Default for P2pConfig {
             fetch_block_timeout_ms: default_fetch_block_timeout_ms(),
             fast_forward_nodes: Vec::new(),
             tip_test: None,
+            multi_peer_fetch: default_multi_peer_fetch(),
         }
     }
 }

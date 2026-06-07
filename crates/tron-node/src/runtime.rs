@@ -1055,6 +1055,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // stand by, so concurrent drivers don't race the shared head.
         let leadership = std::sync::Arc::new(crate::sync::SyncLeadership::new());
 
+        // Cooperative multi-peer fetch pool, shared by every driver: workers
+        // fetch the backlog in parallel (each within its peer's offered
+        // window) and the leader applies in order. `None` ⇒ single-peer path.
+        let fetch_pool = if config.p2p.multi_peer_fetch {
+            Some(std::sync::Arc::new(crate::sync::SyncFetchPool::new()))
+        } else {
+            None
+        };
+        info!(multi_peer_fetch = config.p2p.multi_peer_fetch, "cooperative fetch");
+
         // Active-peers gauge sampler. Reads `peer_registry.len()` every
         // 5 s and pushes it into the metrics handle so a Prometheus
         // scrape always reflects current connection count even between
@@ -1243,6 +1253,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             } else {
                 Some(dynamic_pool.clone())
             };
+            let fetch_pool_for_peer = fetch_pool.clone();
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
                     .with_metrics(metrics_for_peer)
@@ -1262,6 +1273,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     .with_strict_ref_block_check();
                 if let Some(dp) = dynamic_pool_for_peer {
                     driver = driver.with_dynamic_pool(dp);
+                }
+                if let Some(fp) = fetch_pool_for_peer {
+                    driver = driver.with_fetch_pool(fp);
                 }
                 if let Some(stack) = snapshot_stack_for_peer {
                     driver = driver.with_snapshot_stack(stack);

@@ -385,6 +385,15 @@ impl SyncFetchPool {
         let g = self.inner.lock().expect("SyncFetchPool poisoned");
         g.want.len() + g.inflight.len()
     }
+
+    /// Cheap pending-decision check: is there at least one want this peer can
+    /// serve (block num ≤ `max_num`) while the ready buffer is under
+    /// `ready_cap` (back-pressure)? Lets a worker choose fetch-vs-refresh
+    /// without claiming.
+    pub fn claimable_within(&self, max_num: i64, ready_cap: usize) -> bool {
+        let g = self.inner.lock().expect("SyncFetchPool poisoned");
+        g.ready.len() < ready_cap && g.want.range(..=max_num).next().is_some()
+    }
 }
 
 impl Default for SyncFetchPool {
@@ -677,6 +686,12 @@ pub struct SyncDriver {
     /// list is frozen at the startup snapshot. `None` for pinned drivers
     /// (configured `--peer`s), which keep their fixed `config.peers`.
     dynamic_pool: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// Optional shared multi-peer fetch pool. When attached, every eligible
+    /// driver fetches a slice of the backlog cooperatively (each on its own
+    /// valid sync context, only within its peer's offered window) and the
+    /// leader applies the bodies in chain order from the pool. `None` ⇒ the
+    /// proven single-peer fetch+apply path is used verbatim (safe fallback).
+    fetch_pool: Option<Arc<SyncFetchPool>>,
 }
 
 impl SyncDriver {
@@ -725,6 +740,7 @@ impl SyncDriver {
             strict_ref_block: false,
             recent_witnesses: VecDeque::new(),
             dynamic_pool: None,
+            fetch_pool: None,
             pending_raw_block: None,
             leadership: None,
         }
@@ -750,6 +766,14 @@ impl SyncDriver {
         self
     }
 
+    /// Attach the shared multi-peer [`SyncFetchPool`]. All drivers in a node
+    /// share one pool; together they fetch the backlog cooperatively while
+    /// the single leader applies in order.
+    pub fn with_fetch_pool(mut self, pool: Arc<SyncFetchPool>) -> Self {
+        self.fetch_pool = Some(pool);
+        self
+    }
+
     /// Whether this driver may act as the active syncer right now —
     /// claiming or retaining leadership if it can. With no coordinator
     /// attached, always `true` (original behavior).
@@ -766,6 +790,150 @@ impl SyncDriver {
         if let Some(l) = &self.leadership {
             l.note_progress(peer);
         }
+    }
+
+    /// Apply one already-decoded block on the leader's chain and handle every
+    /// `AcceptOutcome` exactly as the single-peer frame path does, updating
+    /// `prev_id` / `last_block_ts` in place. `raw` is the original wire bytes
+    /// (for txTrieRoot validation). Shared by the single-peer Block handler
+    /// and the multi-peer pool drain so both apply identically.
+    fn apply_block(
+        &mut self,
+        block: &Block,
+        raw: Bytes,
+        block_num: i64,
+        peer: &str,
+        prev_id: &mut Option<BlockId>,
+        last_block_ts: &mut i64,
+    ) {
+        self.pending_raw_block = Some(raw);
+        match self.accept_block(block, *prev_id) {
+            AcceptOutcome::Accepted(id) => {
+                *prev_id = Some(id);
+                *last_block_ts = block
+                    .block_header
+                    .as_ref()
+                    .and_then(|h| h.raw_data.as_ref())
+                    .map(|r| r.timestamp)
+                    .unwrap_or(*last_block_ts);
+                // Reset the leadership staleness timer — we're making
+                // progress, so no standby should preempt.
+                self.note_sync_progress(peer);
+                // Human-readable, time-throttled progress line.
+                self.log_sync_progress(block, block_num, peer);
+            }
+            AcceptOutcome::RejectedValidation(reason) => {
+                self.stats.blocks_rejected_validation += 1;
+                if let Some(m) = &self.metrics {
+                    m.inc_blocks_rejected_validation();
+                }
+                // Tip-fork churn (self-recovering) at debug; genuine failures
+                // (bad sig/tx_trie/number/ref_block) at warn.
+                let is_tip_fork_churn = reason.contains("parent link")
+                    || reason.contains("unlinked block")
+                    || reason.contains("outside the 65,536-block window");
+                if is_tip_fork_churn {
+                    debug!(
+                        block = block_num,
+                        reason = reason.as_str(),
+                        "block rejected: tip-fork churn (self-recovering)"
+                    );
+                } else {
+                    warn!(
+                        block = block_num,
+                        reason = reason.as_str(),
+                        "block rejected: validation"
+                    );
+                }
+            }
+            AcceptOutcome::RejectedExecution(reason) => {
+                self.stats.blocks_rejected_execution += 1;
+                if let Some(m) = &self.metrics {
+                    m.inc_blocks_rejected_execution();
+                }
+                warn!(
+                    block = block_num,
+                    reason = reason.as_str(),
+                    "block rejected: execution"
+                );
+            }
+            AcceptOutcome::AlreadyKnown(_id) => {
+                debug!(block = block_num, "block already in fork tree, skipped");
+                if let Some(m) = &self.metrics {
+                    m.inc_blocks_already_known();
+                }
+            }
+            AcceptOutcome::SideFork(id) => {
+                info!(
+                    block = block_num,
+                    hash = %hex::encode(&id.as_bytes()[..8]),
+                    "block on side fork; fork tree updated, state unchanged"
+                );
+                if let Some(m) = &self.metrics {
+                    m.inc_blocks_side_fork();
+                }
+            }
+            AcceptOutcome::ReorgRequired(id, new_head_num) => {
+                warn!(
+                    block = block_num,
+                    hash = %hex::encode(&id.as_bytes()[..8]),
+                    new_head_num,
+                    "REORG REQUIRED but no undo store / snapshot stack attached; \
+                     cannot roll back state, head is stale"
+                );
+                if let Some(m) = &self.metrics {
+                    m.inc_reorgs_required();
+                }
+            }
+            AcceptOutcome::RejectedSolidifiedDiverged(id) => {
+                warn!(
+                    block = block_num,
+                    hash = %hex::encode(&id.as_bytes()[..8]),
+                    "rejected head promotion: fork diverges from solidified"
+                );
+                if let Some(m) = &self.metrics {
+                    m.inc_blocks_rejected_solidified_diverged();
+                }
+            }
+        }
+    }
+
+    /// Drain the multi-peer fetch pool: while the next block the leader needs
+    /// (`expected` front) has been delivered by some worker, apply it in chain
+    /// order. Stops at the first gap (not yet fetched). Returns how many it
+    /// applied. Leader-only.
+    fn drain_pool(
+        &mut self,
+        pool: &SyncFetchPool,
+        expected: &mut std::collections::VecDeque<[u8; 32]>,
+        peer: &str,
+        prev_id: &mut Option<BlockId>,
+        last_block_ts: &mut i64,
+    ) -> usize {
+        let mut applied = 0usize;
+        while let Some(front) = expected.front().copied() {
+            let Some(raw) = pool.take_ready(&front) else {
+                break;
+            };
+            expected.pop_front();
+            let raw = Bytes::from(raw);
+            let block = match Block::decode(raw.clone()) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "decode pooled Block");
+                    continue;
+                }
+            };
+            let block_num = block
+                .block_header
+                .as_ref()
+                .and_then(|h| h.raw_data.as_ref())
+                .map(|r| r.number)
+                .unwrap_or(-1);
+            self.apply_block(&block, raw, block_num, peer, prev_id, last_block_ts);
+            applied += 1;
+        }
+        applied
     }
 
     /// Emit a human-readable sync-progress line for a freshly-applied block.
@@ -1680,6 +1848,12 @@ impl SyncDriver {
         // `sync_started` flips once we've sent it as leader; if we later
         // lose leadership we reset it (and drop queued work) and go quiet.
         let mut sync_started = false;
+        // The most recent sync request we sent THIS peer, for diagnostics: a
+        // P2pDisconnect only carries a numeric ReasonCode (the peer logs its
+        // real `check()` failure on its own side), so on a BAD_PROTOCOL we
+        // surface what we last sent — which is what actually triggered it
+        // (e.g. a regressing locator shows up as last=<lower-than-expected>).
+        let mut last_sync_request = String::from("(none)");
         // A `SyncBlockChain` request is outstanding (we sent a locator and
         // haven't yet received its `ChainInventory`). CRITICAL: never send
         // a second `SyncBlockChain` while one is in flight. The peer
@@ -1700,6 +1874,23 @@ impl SyncDriver {
         // current batch finishes.
         const PIPELINE_LOW_WATER: usize = 50;
         const FETCH_CHUNK_SIZE: usize = 100;
+
+        // === Multi-peer fetch pool state (only used when a pool is attached) ===
+        // `multi_peer`: this driver participates in cooperative fetch.
+        // `am_worker`: it actively fetches (leader OR an ahead-enough peer).
+        // `expected`: the leader's chain-ordered apply queue (block ids from
+        //   its own inventory); drained from the pool in order.
+        // `offered_max`: the highest block number THIS peer offered us in its
+        //   last ChainInventory — the ceiling of ids we may fetch from it, so
+        //   every FetchInvData stays inside the peer's serve window.
+        let multi_peer = self.fetch_pool.is_some();
+        let mut expected: std::collections::VecDeque<[u8; 32]> =
+            std::collections::VecDeque::new();
+        let mut offered_max: i64 = 0;
+        // Back-pressure ceiling on fetched-but-unapplied blocks, and how long
+        // before a stalled in-flight claim is re-offered to another peer.
+        const POOL_READY_CAP: usize = 400;
+        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(8);
 
         // KeepAlive heartbeat. Mirrors java-tron's
         // `KeepAliveService` — every `KEEPALIVE_INTERVAL` we send the
@@ -1841,9 +2032,19 @@ impl SyncDriver {
             // behind) peer may take it, so a fresh node can't win the slot
             // and stall us.
             let am_leader = self.is_active_syncer(peer, leader_eligible);
-            if am_leader && !sync_started {
-                // We're the active syncer and haven't kicked off yet —
-                // send the locator to start the block stream.
+            // With a fetch pool attached, every ahead-enough peer also FETCHES
+            // (each on its own valid sync context — its own SyncBlockChain →
+            // offered window → in-window FetchInvData), while only the leader
+            // APPLIES. Without a pool, `am_worker == am_leader` so behaviour is
+            // unchanged.
+            let am_worker = if multi_peer {
+                am_leader || leader_eligible
+            } else {
+                am_leader
+            };
+            if am_worker && !sync_started {
+                // Active fetcher and haven't kicked off yet — send the locator
+                // to establish our sync context and start the block stream.
                 let mut summary = self.build_chain_summary();
                 if summary.is_empty() {
                     // Fresh node / no index — genesis is in every peer's
@@ -1857,6 +2058,12 @@ impl SyncDriver {
                     last_num = summary.last().map(|id| id.num()).unwrap_or(0),
                     "sent SyncBlockChain locator (active syncer)"
                 );
+                last_sync_request = format!(
+                    "SyncBlockChain locator first={} last={} len={}",
+                    summary.first().map(|id| id.num()).unwrap_or(0),
+                    summary.last().map(|id| id.num()).unwrap_or(0),
+                    summary.len()
+                );
                 last_request_at = Some(Instant::now());
                 if let Err(e) =
                     tron_net::sync::send_sync_request(&mut conn, &summary).await
@@ -1865,12 +2072,12 @@ impl SyncDriver {
                 }
                 sync_started = true;
                 awaiting_inventory = true;
-            } else if !am_leader && sync_started {
-                // We led, then a peer took the slot (we stalled ≥
-                // LEADERSHIP_STALE). Stop driving sync and drop queued work
-                // so we don't apply against a head the new leader is now
-                // advancing; we'll re-kick if we reclaim leadership.
-                debug!(peer, "yielded active-syncer role; going standby");
+            } else if !am_worker && sync_started {
+                // We participated, then dropped out (lost leadership and not an
+                // eligible fetcher). Stop driving sync and drop queued work;
+                // we'll re-kick if we re-qualify. (Pool in-flight claims are
+                // reclaimed by other workers after the reclaim timeout.)
+                debug!(peer, "stepped down from fetching; going idle");
                 sync_started = false;
                 awaiting_inventory = false;
                 pending_fetch_queue.clear();
@@ -1883,8 +2090,41 @@ impl SyncDriver {
             // by the `select!` below to race the request timer against
             // the next inbound frame — this is what enables pipelining.
             // Standby drivers issue nothing.
-            let pending: Option<PendingAction> = if !am_leader {
+            let pending: Option<PendingAction> = if !am_worker {
                 None
+            } else if multi_peer {
+                // Pool path: claim+fetch ids inside our offered window; when
+                // there's nothing left to claim there, refresh the window
+                // (advance to the current shared head / re-establish context).
+                let can_fetch = blocks_in_flight < PIPELINE_LOW_WATER
+                    && offered_max > 0
+                    && self
+                        .fetch_pool
+                        .as_ref()
+                        .map(|p| p.claimable_within(offered_max, POOL_READY_CAP))
+                        .unwrap_or(false);
+                if can_fetch {
+                    Some(PendingAction::FetchChunk)
+                } else if blocks_in_flight == 0
+                    && prev_id.is_some()
+                    && !awaiting_inventory
+                    // Refresh our window only once (a) the leader's apply queue
+                    // is fully drained (so an overlapping re-offer can't push
+                    // duplicate ids into `expected` and stall the drain;
+                    // workers have no `expected` so this is always true), AND
+                    // (b) our applied head has reached the highest block this
+                    // peer already offered us (`offered_max`). Refreshing while
+                    // still below `offered_max` would send a locator lower than
+                    // the peer's recorded `lastSyncBlockId` — a regression it
+                    // rejects with BAD_PROTOCOL. Waiting until head ≥ offered_max
+                    // keeps every refresh monotonic.
+                    && expected.is_empty()
+                    && self.head_number() >= offered_max
+                {
+                    Some(PendingAction::AskInventory)
+                } else {
+                    None
+                }
             } else if !pending_fetch_queue.is_empty()
                 && blocks_in_flight < PIPELINE_LOW_WATER
             {
@@ -1918,10 +2158,36 @@ impl SyncDriver {
                     last_request_at = Some(Instant::now());
                     match pending.unwrap() {
                         PendingAction::FetchChunk => {
-                            let take = pending_fetch_queue.len().min(FETCH_CHUNK_SIZE);
-                            let to_fetch: Vec<Vec<u8>> =
-                                pending_fetch_queue.drain(..take).collect();
+                            let to_fetch: Vec<Vec<u8>> = if multi_peer {
+                                // Claim ids inside OUR peer's offered window
+                                // (num ≤ offered_max), deduped across the fleet
+                                // — so this FetchInvData is always in-context.
+                                self.fetch_pool
+                                    .as_ref()
+                                    .map(|p| {
+                                        p.claim(
+                                            offered_max,
+                                            FETCH_CHUNK_SIZE,
+                                            POOL_READY_CAP,
+                                            POOL_RECLAIM_AFTER,
+                                        )
+                                    })
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(|id| id.to_vec())
+                                    .collect()
+                            } else {
+                                let take = pending_fetch_queue.len().min(FETCH_CHUNK_SIZE);
+                                pending_fetch_queue.drain(..take).collect()
+                            };
+                            if to_fetch.is_empty() {
+                                // Nothing claimable right now (pool path); loop
+                                // re-evaluates (may switch to AskInventory).
+                                continue;
+                            }
                             blocks_in_flight += to_fetch.len();
+                            last_sync_request =
+                                format!("FetchInvData count={} window<={}", to_fetch.len(), offered_max);
                             if let Err(e) = tron_net::sync::send_fetch_inv_data(
                                 &mut conn,
                                 &to_fetch,
@@ -1934,14 +2200,39 @@ impl SyncDriver {
                             }
                         }
                         PendingAction::AskInventory => {
-                            // safe: pending is `AskInventory` only when prev_id is Some.
-                            let id = prev_id.expect("AskInventory requires prev_id");
-                            if let Err(e) =
-                                tron_net::sync::send_sync_request(&mut conn, &[id]).await
-                            {
-                                return PeerOutcome::PeerFailure(format!(
-                                    "send_sync_request (continue): {e}"
-                                ));
+                            if multi_peer {
+                                // Refresh our offered window from the current
+                                // shared head (also (re)establishes sync context
+                                // so in-window FetchInvData stays accepted).
+                                let mut summary = self.build_chain_summary();
+                                if summary.is_empty() {
+                                    summary.push(prev_id.unwrap_or(genesis));
+                                }
+                                last_sync_request = format!(
+                                    "SyncBlockChain refresh first={} last={} len={}",
+                                    summary.first().map(|id| id.num()).unwrap_or(0),
+                                    summary.last().map(|id| id.num()).unwrap_or(0),
+                                    summary.len()
+                                );
+                                if let Err(e) =
+                                    tron_net::sync::send_sync_request(&mut conn, &summary).await
+                                {
+                                    return PeerOutcome::PeerFailure(format!(
+                                        "send_sync_request (pool refresh): {e}"
+                                    ));
+                                }
+                            } else {
+                                // safe: pending is `AskInventory` only when prev_id is Some.
+                                let id = prev_id.expect("AskInventory requires prev_id");
+                                last_sync_request =
+                                    format!("SyncBlockChain continue last={}", id.num());
+                                if let Err(e) =
+                                    tron_net::sync::send_sync_request(&mut conn, &[id]).await
+                                {
+                                    return PeerOutcome::PeerFailure(format!(
+                                        "send_sync_request (continue): {e}"
+                                    ));
+                                }
                             }
                             // Single-flight: block further SyncBlockChain sends
                             // until this request's ChainInventory comes back.
@@ -1959,6 +2250,23 @@ impl SyncDriver {
                 // can take over promptly. Leaders skip this (their loop is
                 // already driven by the constant block stream).
                 _ = tokio::time::sleep(Duration::from_secs(5)), if !am_leader => {
+                    continue;
+                }
+                // Leader drain tick (pool path): apply blocks delivered by
+                // other workers even when this leader isn't itself receiving
+                // frames. Cheap no-op when nothing is ready.
+                _ = tokio::time::sleep(Duration::from_millis(150)),
+                    if multi_peer && am_leader && !expected.is_empty() =>
+                {
+                    if let Some(pool) = self.fetch_pool.clone() {
+                        self.drain_pool(
+                            &pool,
+                            &mut expected,
+                            peer,
+                            &mut prev_id,
+                            &mut last_block_ts,
+                        );
+                    }
                     continue;
                 }
                 // Read branch: wait up to 60s for the next frame. The
@@ -2189,10 +2497,43 @@ impl SyncDriver {
                     // The outstanding SyncBlockChain has been answered — we
                     // may issue the next one once this window drains.
                     awaiting_inventory = false;
-                    for b in chain_inv.ids.iter().skip(1) {
-                        pending_fetch_queue.push_back(b.hash.clone());
+                    let appended: usize;
+                    if multi_peer {
+                        // Our peer's offered window ceiling = highest block it
+                        // listed; we only ever fetch ids ≤ this from it.
+                        if let Some(last) = chain_inv.ids.last() {
+                            offered_max = offered_max.max(last.number);
+                        }
+                        if am_leader {
+                            // Leader defines the canonical fetch set (pool
+                            // `want`) and the apply order (`expected`). Workers
+                            // (incl. this leader) claim from `want` within their
+                            // own window. push_wants dedups, so overlapping
+                            // refreshes don't double-fetch; `expected` is only
+                            // extended when the prior window is fully drained
+                            // (see the AskInventory gate), so it can't dup.
+                            let mut wants = Vec::with_capacity(chain_inv.ids.len());
+                            for b in chain_inv.ids.iter().skip(1) {
+                                if b.hash.len() == 32 {
+                                    let mut id = [0u8; 32];
+                                    id.copy_from_slice(&b.hash);
+                                    wants.push((b.number, id));
+                                    expected.push_back(id);
+                                }
+                            }
+                            appended = wants.len();
+                            if let Some(pool) = &self.fetch_pool {
+                                pool.push_wants(wants);
+                            }
+                        } else {
+                            appended = chain_inv.ids.len().saturating_sub(1);
+                        }
+                    } else {
+                        for b in chain_inv.ids.iter().skip(1) {
+                            pending_fetch_queue.push_back(b.hash.clone());
+                        }
+                        appended = pending_fetch_queue.len();
                     }
-                    let appended = pending_fetch_queue.len();
                     debug!(
                         queued = appended,
                         remain = chain_inv.remain_num,
@@ -2299,12 +2640,36 @@ impl SyncDriver {
                         }
                         continue;
                     }
-                    // Standby drivers don't apply blocks — the active
-                    // syncer owns the head. We shouldn't receive any
+                    // Multi-peer pool path: every worker (leader or standby)
+                    // deposits the block it fetched into the shared pool; only
+                    // the leader applies, draining the pool in chain order. The
+                    // block we just got is one of OUR in-flight claims, so
+                    // decrement once per received frame.
+                    if multi_peer {
+                        blocks_in_flight = blocks_in_flight.saturating_sub(1);
+                        if let Ok(id) = block_id_from_block(&block) {
+                            if let Some(pool) = &self.fetch_pool {
+                                pool.deliver(*id.as_bytes(), raw_block_bytes.to_vec());
+                            }
+                        }
+                        if am_leader {
+                            if let Some(pool) = self.fetch_pool.clone() {
+                                self.drain_pool(
+                                    &pool,
+                                    &mut expected,
+                                    peer,
+                                    &mut prev_id,
+                                    &mut last_block_ts,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    // Single-peer path: standby drivers don't apply blocks —
+                    // the active syncer owns the head. We shouldn't receive any
                     // (we never requested), but drop defensively so a
-                    // late-arriving or broadcast block can't race the
-                    // shared head and spawn spurious unlinked/parent
-                    // rejections.
+                    // late-arriving or broadcast block can't race the shared
+                    // head and spawn spurious unlinked/parent rejections.
                     if !am_leader {
                         blocks_in_flight = blocks_in_flight.saturating_sub(1);
                         debug!(
@@ -2314,130 +2679,14 @@ impl SyncDriver {
                         );
                         continue;
                     }
-                    self.pending_raw_block = Some(raw_block_bytes);
-                    match self.accept_block(&block, prev_id) {
-                        AcceptOutcome::Accepted(id) => {
-                            prev_id = Some(id);
-                            last_block_ts = block
-                                .block_header
-                                .as_ref()
-                                .and_then(|h| h.raw_data.as_ref())
-                                .map(|r| r.timestamp)
-                                .unwrap_or(last_block_ts);
-                            // Reset the leadership staleness timer — we're
-                            // making progress, so no standby should preempt.
-                            self.note_sync_progress(peer);
-                            // Human-readable, time-throttled progress line
-                            // (height + block wall-clock + lag + rate + peer).
-                            self.log_sync_progress(&block, block_num, peer);
-                        }
-                        AcceptOutcome::RejectedValidation(reason) => {
-                            self.stats.blocks_rejected_validation += 1;
-                            if let Some(m) = &self.metrics {
-                                m.inc_blocks_rejected_validation();
-                            }
-                            // Tip-fork churn vs genuine validation failure.
-                            // At the tip the network constantly produces
-                            // 1-block sibling forks. KhaosDb now drives the
-                            // reorg (the early parent-link gate is gone), so a
-                            // sibling block links as a side fork and a taller
-                            // extension reorgs us onto it — but in the brief
-                            // window before its parent has linked, a fork
-                            // block can still arrive "unlinked", and a block
-                            // built on a fork we haven't adopted yet can have
-                            // refs that don't resolve ("outside the
-                            // 65,536-block window"). Both self-recover once the
-                            // missing parents arrive. Log them at debug so they
-                            // don't flood the operator log; keep real failures
-                            // (bad signature, bad tx_trie, bad number,
-                            // ref_block hash mismatch) at warn.
-                            let is_tip_fork_churn = reason.contains("parent link")
-                                || reason.contains("unlinked block")
-                                || reason.contains("outside the 65,536-block window");
-                            if is_tip_fork_churn {
-                                debug!(
-                                    block = block_num,
-                                    reason = reason.as_str(),
-                                    "block rejected: tip-fork churn (self-recovering)"
-                                );
-                            } else {
-                                warn!(
-                                    block = block_num,
-                                    reason = reason.as_str(),
-                                    "block rejected: validation"
-                                );
-                            }
-                        }
-                        AcceptOutcome::RejectedExecution(reason) => {
-                            self.stats.blocks_rejected_execution += 1;
-                            if let Some(m) = &self.metrics {
-                                m.inc_blocks_rejected_execution();
-                            }
-                            warn!(
-                                block = block_num,
-                                reason = reason.as_str(),
-                                "block rejected: execution"
-                            );
-                        }
-                        AcceptOutcome::AlreadyKnown(_id) => {
-                            // Peer re-sent inventory we already
-                            // applied. Common and not interesting —
-                            // log at debug.
-                            debug!(block = block_num, "block already in fork tree, skipped");
-                            if let Some(m) = &self.metrics {
-                                m.inc_blocks_already_known();
-                            }
-                        }
-                        AcceptOutcome::SideFork(id) => {
-                            // Recorded in the fork tree but not
-                            // applied — log at info so the operator
-                            // sees fork activity without it being a
-                            // warning.
-                            info!(
-                                block = block_num,
-                                hash = %hex::encode(&id.as_bytes()[..8]),
-                                "block on side fork; fork tree updated, state unchanged"
-                            );
-                            if let Some(m) = &self.metrics {
-                                m.inc_blocks_side_fork();
-                            }
-                        }
-                        AcceptOutcome::ReorgRequired(id, new_head_num) => {
-                            // A taller sibling fork needs a reorg, but
-                            // neither an undo store nor a snapshot stack is
-                            // attached to actually roll state back (both are
-                            // wired in production — this only fires in a
-                            // degraded/misconfigured setup, or before any
-                            // head exists). Warn loudly: the head is now
-                            // divergent from the canonical chain and a
-                            // restart from a snapshot is the recovery path.
-                            warn!(
-                                block = block_num,
-                                hash = %hex::encode(&id.as_bytes()[..8]),
-                                new_head_num,
-                                "REORG REQUIRED but no undo store / snapshot stack attached; \
-                                 cannot roll back state, head is stale"
-                            );
-                            if let Some(m) = &self.metrics {
-                                m.inc_reorgs_required();
-                            }
-                        }
-                        AcceptOutcome::RejectedSolidifiedDiverged(id) => {
-                            // KhaosDb wanted to promote this fork's
-                            // head but it doesn't contain the latest
-                            // solidified block — finality gate caught
-                            // it. Warn so the operator notices a peer
-                            // serving a divergent history.
-                            warn!(
-                                block = block_num,
-                                hash = %hex::encode(&id.as_bytes()[..8]),
-                                "rejected head promotion: fork diverges from solidified"
-                            );
-                            if let Some(m) = &self.metrics {
-                                m.inc_blocks_rejected_solidified_diverged();
-                            }
-                        }
-                    }
+                    self.apply_block(
+                        &block,
+                        raw_block_bytes,
+                        block_num,
+                        peer,
+                        &mut prev_id,
+                        &mut last_block_ts,
+                    );
                     // Count *every* Block frame received (including
                     // rejected ones), not just accepted ones — a peer
                     // that sent us a bad block still consumed one of
@@ -2500,7 +2749,8 @@ impl SyncDriver {
                         .map(|r| r.as_str_name())
                         .unwrap_or("UNKNOWN");
                     return PeerOutcome::PeerFailure(format!(
-                        "peer libp2p-disconnected with reason code {reason} ({name})"
+                        "peer libp2p-disconnected with reason code {reason} ({name}); \
+                         our last request to it: {last_sync_request}"
                     ));
                 }
                 MessageType::P2pDisconnect => {
@@ -2513,7 +2763,8 @@ impl SyncDriver {
                         .map(|r| r.as_str_name())
                         .unwrap_or("UNKNOWN");
                     return PeerOutcome::PeerFailure(format!(
-                        "peer app-disconnected with reason code {reason} ({name})"
+                        "peer app-disconnected with reason code {reason} ({name}); \
+                         our last request to it: {last_sync_request}"
                     ));
                 }
                 MessageType::Trx => {
