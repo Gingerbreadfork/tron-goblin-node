@@ -60,7 +60,24 @@ fn safety_baseline() -> Options {
 /// This is a *ceiling*, not a pre-allocation — the LRU fills lazily as
 /// blocks are read, so it costs nothing on small/idle processes (tests,
 /// tools).
-const DEFAULT_BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_BLOCK_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Runtime-overridable shared block-cache size. The node sets this from
+/// `storage.block_cache_mb` before opening any store; a larger cache keeps
+/// more of the multi-GB state hot, which is the dominant lever on
+/// catch-up apply throughput (sync is apply-bound, and per-tx state reads
+/// that miss the cache hit disk). Set once, before the lazy `OnceLock`
+/// init below — later changes are ignored.
+static CONFIGURED_BLOCK_CACHE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_BLOCK_CACHE_BYTES);
+
+/// Override the shared block-cache ceiling (bytes). No-op for 0 or if a
+/// store has already opened (the cache is built lazily, first-call-wins).
+pub fn set_block_cache_bytes(bytes: usize) {
+    if bytes > 0 {
+        CONFIGURED_BLOCK_CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Background-compaction / flush threads for the shared [`Env`]. Because
 /// each store is a *separate* RocksDB instance (one DB per directory, the
@@ -94,7 +111,11 @@ const WRITE_BUFFER_MANAGER_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 /// open path so memory is bounded process-wide.
 fn shared_block_cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    CACHE.get_or_init(|| Cache::new_lru_cache(DEFAULT_BLOCK_CACHE_BYTES))
+    CACHE.get_or_init(|| {
+        Cache::new_lru_cache(
+            CONFIGURED_BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
 }
 
 /// The shared write-buffer manager: caps total memtable memory across all

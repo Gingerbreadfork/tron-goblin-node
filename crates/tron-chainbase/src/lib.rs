@@ -22,7 +22,7 @@ pub use checkpoint_v2::{
     decode_manifest, encode_manifest, CheckPointV2, CheckpointEntry, CheckpointError,
     CheckpointId, CHECKPOINT_DIR_NAME,
 };
-pub use rocksdb_backend::{RocksDbBackend, RocksDbError};
+pub use rocksdb_backend::{set_block_cache_bytes, RocksDbBackend, RocksDbError};
 pub use session::SessionBackend;
 pub use snapshot::SnapshotKvBackend;
 pub use stores::{

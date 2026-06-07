@@ -142,7 +142,17 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // Give RocksDB (one instance per store) + peer sockets enough file
     // descriptors before anything opens one (M-21).
     raise_fd_limit();
-    info!(data_dir = ?config.data_dir, "opening stores");
+    // Size the shared RocksDB block cache before any store opens (it's
+    // built lazily, first-open-wins). Bigger cache → more state stays hot →
+    // faster apply-bound catch-up.
+    tron_chainbase::set_block_cache_bytes(
+        config.storage.block_cache_mb.saturating_mul(1024 * 1024),
+    );
+    info!(
+        data_dir = ?config.data_dir,
+        block_cache_mb = config.storage.block_cache_mb,
+        "opening stores"
+    );
     let mut stores = OpenedStores::open_tuned(
         &config.data_dir,
         config.storage.write_buffer_size_mb,

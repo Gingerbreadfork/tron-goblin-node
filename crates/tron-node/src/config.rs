@@ -157,10 +157,24 @@ pub struct StorageConfig {
     /// capping the per-layer HashMap footprint.
     #[serde(default = "default_snapshot_horizon", alias = "snapshotHorizon")]
     pub snapshot_horizon: usize,
+    /// Shared RocksDB block-cache ceiling, in MiB, across every store this
+    /// process opens (state is ~30 separate DBs sharing one cache). A
+    /// bigger cache keeps more of the multi-GB state hot, which is the
+    /// dominant lever on catch-up throughput — sync is apply-bound and
+    /// per-tx state reads that miss the cache hit disk. Default 1024 MiB;
+    /// operators doing a full re-sync on a roomy box can raise it (e.g.
+    /// 4096–8192) to cut read I/O. It's a ceiling that fills lazily, not a
+    /// pre-allocation.
+    #[serde(default = "default_block_cache_mb", alias = "blockCacheMb")]
+    pub block_cache_mb: usize,
 }
 
 fn default_snapshot_horizon() -> usize {
     64
+}
+
+fn default_block_cache_mb() -> usize {
+    1024
 }
 
 impl Default for StorageConfig {
@@ -173,6 +187,7 @@ impl Default for StorageConfig {
             tx_cache: TxCacheConfig::default(),
             snapshot_reorg: false,
             snapshot_horizon: default_snapshot_horizon(),
+            block_cache_mb: default_block_cache_mb(),
         }
     }
 }
