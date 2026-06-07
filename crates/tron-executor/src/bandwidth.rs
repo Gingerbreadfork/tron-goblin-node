@@ -494,9 +494,33 @@ fn try_use_free_net(
 /// java-tron's `tx.toBuilder().clearRet().build().getSerializedSize()`
 /// when the VM is supported. We pin that branch as the v1 behavior.
 fn serialized_bytes(tx: &Transaction) -> usize {
-    let mut cleared = tx.clone();
-    cleared.ret = Vec::new();
-    cleared.encoded_len()
+    // Equivalent to `tx.toBuilder().clearRet().build().getSerializedSize()`
+    // but without deep-cloning the whole transaction (the `raw_data`
+    // calldata can be large for contract calls) just to drop `ret`.
+    //
+    // protobuf encoded length is additive over fields and order-independent,
+    // so the ret-cleared length is exactly the full length minus the `ret`
+    // field's contribution. `ret` is repeated message field 5: each element
+    // encodes as a 1-byte key (tag 5, wire type 2) + a length varint + the
+    // element payload. Pinned byte-identical to the old clear-and-encode in
+    // `serialized_bytes_matches_clear_ret`.
+    fn varint_len(mut v: u64) -> usize {
+        let mut n = 1usize;
+        while v >= 0x80 {
+            v >>= 7;
+            n += 1;
+        }
+        n
+    }
+    let ret_contribution: usize = tx
+        .ret
+        .iter()
+        .map(|r| {
+            let len = r.encoded_len();
+            1 + varint_len(len as u64) + len
+        })
+        .sum();
+    tx.encoded_len() - ret_contribution
 }
 
 /// Effective net limit for `account`. Mirrors
@@ -590,4 +614,85 @@ fn address_from_proto(bytes: &[u8]) -> Option<Address> {
     let mut buf = [0u8; 21];
     buf.copy_from_slice(bytes);
     Some(Address::from_raw(buf))
+}
+
+#[cfg(test)]
+mod serialized_bytes_tests {
+    use super::*;
+    use tron_proto::transaction::{Raw, Result as TxResult};
+
+    /// The pre-optimization implementation: clone the whole tx, clear
+    /// `ret`, encode. `serialized_bytes` must match this byte-for-byte
+    /// because the value feeds consensus bandwidth charging.
+    fn clear_ret_len(tx: &Transaction) -> usize {
+        let mut cleared = tx.clone();
+        cleared.ret = Vec::new();
+        cleared.encoded_len()
+    }
+
+    fn tx_with(ret: Vec<TxResult>, raw_data_len: usize, sigs: usize) -> Transaction {
+        Transaction {
+            raw_data: Some(Raw {
+                ref_block_bytes: vec![0xab; 2],
+                ref_block_num: 123456,
+                ref_block_hash: vec![0xcd; 8],
+                expiration: 1_700_000_000_000,
+                data: vec![0x11; raw_data_len],
+                timestamp: 1_699_999_999_000,
+                ..Default::default()
+            }),
+            signature: (0..sigs).map(|i| vec![i as u8; 65]).collect(),
+            ret,
+        }
+    }
+
+    #[test]
+    fn serialized_bytes_matches_clear_ret() {
+        let cases = vec![
+            // No ret at all.
+            tx_with(vec![], 0, 1),
+            // One default (empty) ret entry — exercises the 1-byte key +
+            // zero-length payload path.
+            tx_with(vec![TxResult::default()], 0, 1),
+            // One populated ret entry.
+            tx_with(
+                vec![TxResult {
+                    fee: 1_000_000,
+                    contract_ret: 1,
+                    ..Default::default()
+                }],
+                32,
+                2,
+            ),
+            // Multiple ret entries (multi-result tx).
+            tx_with(
+                vec![
+                    TxResult { fee: 1, ..Default::default() },
+                    TxResult { fee: 2, contract_ret: 1, ..Default::default() },
+                    TxResult::default(),
+                ],
+                8,
+                1,
+            ),
+            // Large raw_data (the case the clone used to be expensive for)
+            // with a large ret payload that crosses the single-byte varint
+            // length boundary (>127 bytes).
+            tx_with(
+                vec![TxResult {
+                    fee: i64::MAX,
+                    asset_issue_id: "x".repeat(200),
+                    ..Default::default()
+                }],
+                4096,
+                3,
+            ),
+        ];
+        for (i, tx) in cases.iter().enumerate() {
+            assert_eq!(
+                serialized_bytes(tx),
+                clear_ret_len(tx),
+                "serialized_bytes diverged from clear-ret on case {i}"
+            );
+        }
+    }
 }

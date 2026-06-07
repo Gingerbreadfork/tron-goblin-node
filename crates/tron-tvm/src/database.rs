@@ -32,6 +32,8 @@
 //! we apply v2 unconditionally — v1 contract storage parity is a
 //! follow-up (java-tron reads `ContractCapsule.version` and switches).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use revm::primitives::{Address as EvmAddress, AddressMap, StorageKey, StorageValue, B256, U256};
@@ -81,6 +83,13 @@ pub struct TronDatabase {
     /// chainbase commit would clobber the staking-side fields with
     /// a stale account.
     pub last_balance_delta: Option<(EvmAddress, i64)>,
+    /// Per-`TronDatabase` (i.e. per-tx) memo of each contract's immutable
+    /// `version` field (`true` ⇒ v1 storage layout). Avoids re-reading and
+    /// decoding the same contract row on every storage slot a call touches.
+    /// `true`/`false` are cached only for contracts that exist; a missing
+    /// row is left uncached so a contract created earlier in the same tx is
+    /// still observed.
+    version_cache: RefCell<HashMap<TronAddress, bool>>,
 }
 
 impl TronDatabase {
@@ -100,6 +109,7 @@ impl TronDatabase {
             delegated_resources: None,
             delegation: None,
             last_balance_delta: None,
+            version_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -143,10 +153,26 @@ impl TronDatabase {
     /// everything else uses the slot raw.
     fn compose_storage_key(&self, addr: &TronAddress, slot: &[u8; 32]) -> [u8; 32] {
         if let Some(contracts) = &self.contracts {
-            if let Ok(Some(c)) = contracts.get(addr) {
-                if c.version == 1 {
-                    return StorageRowStore::compose_key_v1(addr, slot);
-                }
+            // `version` is immutable post-deploy, so memoize it per-tx —
+            // identical v1/v2 decision as a fresh read, but skips re-reading
+            // and re-decoding the contract row for every slot of a
+            // storage-heavy call.
+            let cached = self.version_cache.borrow().get(addr).copied();
+            let is_v1 = match cached {
+                Some(v) => v,
+                None => match contracts.get(addr) {
+                    Ok(Some(c)) => {
+                        let v = c.version == 1;
+                        self.version_cache.borrow_mut().insert(*addr, v);
+                        v
+                    }
+                    // Not found / read error → v2, and don't cache (a
+                    // contract created later in this tx must still be seen).
+                    _ => false,
+                },
+            };
+            if is_v1 {
+                return StorageRowStore::compose_key_v1(addr, slot);
             }
         }
         // v2 layout: matches every contract deployed after the

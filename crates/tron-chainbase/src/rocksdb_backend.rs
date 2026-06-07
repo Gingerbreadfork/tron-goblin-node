@@ -20,9 +20,9 @@
 
 use std::cmp::Ordering;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use rocksdb::{Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{BlockBasedOptions, Cache, Env, Options, WriteBatch, WriteOptions, DB};
 
 use crate::backend::{KvBackend, KvError, WriteOp};
 
@@ -47,6 +47,83 @@ fn safety_baseline() -> Options {
     opts.set_paranoid_checks(true);
     opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
     opts
+}
+
+/// Default capacity of the process-wide LRU block cache, shared by every
+/// store this node opens. RocksDB's per-DB default is a tiny 8 MiB, which
+/// thrashes badly during sync against multi-GB stores (the `account` store
+/// alone is tens of GB). One shared cache bounds total memory globally
+/// instead of letting it scale with the ~30 separate store DBs.
+///
+/// This is a *ceiling*, not a pre-allocation — the LRU fills lazily as
+/// blocks are read, so it costs nothing on small/idle processes (tests,
+/// tools).
+const DEFAULT_BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Background-compaction / flush threads for the shared [`Env`]. Because
+/// each store is a *separate* RocksDB instance (one DB per directory, the
+/// java-tron layout), per-DB `increase_parallelism` would spawn
+/// `cpus × ~30` threads. A single shared Env bounds the pool across all
+/// stores, matching java-tron's single-DB-with-column-families thread
+/// model.
+const DEFAULT_BACKGROUND_THREADS: i32 = 4;
+const DEFAULT_HIGH_PRI_FLUSH_THREADS: i32 = 2;
+
+/// With only the default single immutable memtable, a 64 MiB flush stalls
+/// incoming writes. Allowing a few in-flight write buffers lets the heavy
+/// write stores (`account`, `storage-row`) keep ingesting during a flush.
+const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
+
+/// The shared LRU block cache. Created once, referenced by every tuned
+/// open path so memory is bounded process-wide.
+fn shared_block_cache() -> &'static Cache {
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    CACHE.get_or_init(|| Cache::new_lru_cache(DEFAULT_BLOCK_CACHE_BYTES))
+}
+
+/// The shared background-thread [`Env`]. `None` if RocksDB couldn't build
+/// a custom Env (then each DB falls back to its own default Env — correct,
+/// just unshared).
+fn shared_env() -> Option<&'static Env> {
+    static ENV: OnceLock<Option<Env>> = OnceLock::new();
+    ENV.get_or_init(|| match Env::new() {
+        Ok(mut env) => {
+            env.set_background_threads(DEFAULT_BACKGROUND_THREADS);
+            env.set_high_priority_background_threads(DEFAULT_HIGH_PRI_FLUSH_THREADS);
+            Some(env)
+        }
+        Err(_) => None,
+    })
+    .as_ref()
+}
+
+/// Apply the runtime performance knobs the node's read-write open paths
+/// share: a shared LRU block cache + bloom filters (point-lookup stores
+/// like `account`/`code`/`storage-row` otherwise binary-search every
+/// miss), index/filter blocks held in the bounded cache, a shared
+/// background-compaction Env, and room for a few in-flight write buffers.
+///
+/// **All of these are runtime-only** — block cache, bloom filters, thread
+/// pools and memtable counts live in memory and in *newly written* SSTs;
+/// none change the on-disk key/value bytes or the SST format in a way that
+/// breaks reading a java-tron snapshot (RocksDB records the table format
+/// per-SST, so old filter-less SSTs still read fine). Byte-exact parity is
+/// unaffected.
+fn apply_runtime_tuning(opts: &mut Options) {
+    let mut bbt = BlockBasedOptions::default();
+    bbt.set_block_cache(shared_block_cache());
+    // 10 bits/key full-filter bloom — skips the index/data binary search
+    // on point-lookup misses, the dominant cost during sync.
+    bbt.set_bloom_filter(10.0, false);
+    bbt.set_cache_index_and_filter_blocks(true);
+    bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    opts.set_block_based_table_factory(&bbt);
+
+    opts.set_max_write_buffer_number(DEFAULT_MAX_WRITE_BUFFER_NUMBER);
+
+    if let Some(env) = shared_env() {
+        opts.set_env(env);
+    }
 }
 
 /// Wraps a single RocksDB instance (one store, one directory).
@@ -75,6 +152,7 @@ impl RocksDbBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RocksDbError> {
         let mut opts = safety_baseline();
         opts.create_if_missing(true);
+        apply_runtime_tuning(&mut opts);
         Self::open_with(path, opts)
     }
 
@@ -91,6 +169,7 @@ impl RocksDbBackend {
         opts.create_if_missing(true);
         opts.set_write_buffer_size(write_buffer_mb * 1024 * 1024);
         opts.set_max_open_files(max_open_files); // overrides safety_baseline default
+        apply_runtime_tuning(&mut opts);
         Self::open_with(path, opts)
     }
 
@@ -121,6 +200,7 @@ impl RocksDbBackend {
             opts.set_write_buffer_size(write_buffer_mb * 1024 * 1024);
             opts.set_max_open_files(max_open_files); // overrides safety_baseline default
         }
+        apply_runtime_tuning(&mut opts);
         opts.set_comparator(comparator_name, Box::new(compare_fn));
         Self::open_with(path, opts)
     }
