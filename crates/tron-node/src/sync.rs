@@ -1994,11 +1994,35 @@ impl SyncDriver {
                             if let Some(m) = &self.metrics {
                                 m.inc_blocks_rejected_validation();
                             }
-                            warn!(
-                                block = block_num,
-                                reason = reason.as_str(),
-                                "block rejected: validation"
-                            );
+                            // Tip-fork churn vs genuine validation failure.
+                            // At the tip the network constantly produces
+                            // 1-block sibling forks; until the early
+                            // parent-link gate (sync.rs ~2538) is replaced by
+                            // khaos-driven reorg, a leader briefly on a
+                            // sibling rejects the canonical block ("parent
+                            // link") and the following blocks' refs then can't
+                            // resolve ("outside the 65,536-block window") —
+                            // a self-recovering cascade, not a fault. Log
+                            // those at debug so they don't flood the operator
+                            // log; keep real failures (bad signature, bad
+                            // tx_trie, bad number, ref_block hash mismatch) at
+                            // warn.
+                            let is_tip_fork_churn = reason.contains("parent link")
+                                || reason.contains("unlinked block")
+                                || reason.contains("outside the 65,536-block window");
+                            if is_tip_fork_churn {
+                                debug!(
+                                    block = block_num,
+                                    reason = reason.as_str(),
+                                    "block rejected: tip-fork churn (self-recovering)"
+                                );
+                            } else {
+                                warn!(
+                                    block = block_num,
+                                    reason = reason.as_str(),
+                                    "block rejected: validation"
+                                );
+                            }
                         }
                         AcceptOutcome::RejectedExecution(reason) => {
                             self.stats.blocks_rejected_execution += 1;
