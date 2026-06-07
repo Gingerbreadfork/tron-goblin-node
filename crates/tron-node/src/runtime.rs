@@ -1011,6 +1011,26 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // broadcasts an eviction peer-key on `eviction_tx`, which the
         // matching SyncDriver observes inside its loop.
         let node_stats = crate::node_statistics::NodeStatisticsTable::new();
+        // Periodic prune of the per-peer statistics table — it's keyed by
+        // peer and entries were never removed in production, so over a
+        // long run with rotation touching thousands of distinct peers it
+        // grew without bound. Drop entries idle > 1h every 5 min.
+        {
+            let pruner = node_stats.clone();
+            let mut sd_prune = shutdown.subscribe();
+            handles.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(300));
+                tick.tick().await; // skip immediate tick
+                loop {
+                    tokio::select! {
+                        _ = sd_prune.recv() => return,
+                        _ = tick.tick() => {
+                            pruner.prune_older_than(Duration::from_secs(3600)).await;
+                        }
+                    }
+                }
+            }));
+        }
         let peer_registry = crate::PeerRegistry::new();
         let (eviction_tx, _eviction_rx_keep_alive) =
             tokio::sync::broadcast::channel::<String>(64);
@@ -1116,7 +1136,19 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .iter()
             .map(|p| (vec![p.clone()], true))
             .collect();
-        let n_rotation = config.p2p.max_peers.saturating_sub(driver_specs.len());
+        // Cap the rotation fleet. Each rotation driver is a full sync task
+        // (own fork tree, own mempool-broadcast subscription, a live
+        // connection) — 60 of them is wasteful (extra GBs of fork-tree RAM,
+        // 60 broadcast subscribers → "broadcast channel lagged" drops, and
+        // CPU forwarding every tx 60×). A couple dozen rotating connections
+        // give ample peer diversity + failover while staying light for
+        // months-long uptime. Each still hunts the FULL discovered pool.
+        const MAX_ROTATION_DRIVERS: usize = 24;
+        let n_rotation = config
+            .p2p
+            .max_peers
+            .saturating_sub(driver_specs.len())
+            .min(MAX_ROTATION_DRIVERS);
         if !rotation_pool.is_empty() {
             for _ in 0..n_rotation.max(1) {
                 driver_specs.push((rotation_pool.clone(), false));
@@ -1248,6 +1280,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                         return;
                     }
                     _ = tick.tick() => {
+                        // Prune dial-recency entries older than 24h before
+                        // flushing — otherwise the map (and its JSON file)
+                        // grows unbounded over a long run as rotation dials
+                        // thousands of distinct peers. (`prune` ran only at
+                        // startup before; now it runs every flush.)
+                        peer_state_flusher.prune(24 * 60 * 60 * 1000);
                         peer_state_flusher.flush();
                     }
                 }

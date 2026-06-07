@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use prost::Message as _;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::debug;
 use tron_chainbase::KvBackend;
 use tron_proto::Transaction;
 use tron_rpc::mempool::{Mempool, SubmitOutcome};
@@ -449,7 +449,9 @@ impl TxMempool {
             inner.pending.remove(id);
         }
         if !to_remove.is_empty() {
-            warn!(evicted = to_remove.len(), now_ms, "expired txs evicted");
+            // Routine housekeeping (txs age out of the pool constantly at the
+            // tip) — debug, not warn, so it doesn't spam the operator log.
+            debug!(evicted = to_remove.len(), now_ms, "expired txs evicted");
         }
         to_remove
     }

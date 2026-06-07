@@ -22,7 +22,9 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use rocksdb::{BlockBasedOptions, Cache, Env, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, Env, Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
+};
 
 use crate::backend::{KvBackend, KvError, WriteOp};
 
@@ -69,16 +71,42 @@ const DEFAULT_BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_BACKGROUND_THREADS: i32 = 4;
 const DEFAULT_HIGH_PRI_FLUSH_THREADS: i32 = 2;
 
-/// With only the default single immutable memtable, a 64 MiB flush stalls
-/// incoming writes. Allowing a few in-flight write buffers lets the heavy
-/// write stores (`account`, `storage-row`) keep ingesting during a flush.
-const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
+/// Allow one extra in-flight immutable memtable so a flush of the hot
+/// stores (`account`, `storage-row`) doesn't immediately stall writes.
+/// Kept at the RocksDB default (2) — the earlier bump to 4 multiplied
+/// per-store memtable RAM and, summed across ~42 separate store
+/// instances, was a major contributor to multi-GB memory growth. The
+/// shared [`WriteBufferManager`] below is what actually bounds aggregate
+/// memtable memory now, independent of this per-store count.
+const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 2;
+
+/// Aggregate memtable budget shared across EVERY store this process opens.
+/// Each store is a separate RocksDB instance, so without a shared manager
+/// total memtable RAM = `write_buffer_size × max_write_buffer_number ×
+/// store_count` (≈ 64 MiB × 2 × 42 ≈ 5 GiB, and far more at the old
+/// `×4`). A single `WriteBufferManager` caps the SUM regardless of store
+/// count — the fix for the unbounded memtable growth that drove the node
+/// to ~18 GiB. `allow_stall = true` applies write back-pressure when the
+/// budget is hit instead of letting memory balloon.
+const WRITE_BUFFER_MANAGER_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 
 /// The shared LRU block cache. Created once, referenced by every tuned
 /// open path so memory is bounded process-wide.
 fn shared_block_cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
     CACHE.get_or_init(|| Cache::new_lru_cache(DEFAULT_BLOCK_CACHE_BYTES))
+}
+
+/// The shared write-buffer manager: caps total memtable memory across all
+/// store instances in this process (see [`WRITE_BUFFER_MANAGER_BYTES`]).
+fn shared_write_buffer_manager() -> &'static WriteBufferManager {
+    static WBM: OnceLock<WriteBufferManager> = OnceLock::new();
+    WBM.get_or_init(|| {
+        WriteBufferManager::new_write_buffer_manager(
+            WRITE_BUFFER_MANAGER_BYTES,
+            /* allow_stall */ true,
+        )
+    })
 }
 
 /// The shared background-thread [`Env`]. `None` if RocksDB couldn't build
@@ -120,6 +148,10 @@ fn apply_runtime_tuning(opts: &mut Options) {
     opts.set_block_based_table_factory(&bbt);
 
     opts.set_max_write_buffer_number(DEFAULT_MAX_WRITE_BUFFER_NUMBER);
+    // Cap aggregate memtable memory across ALL store instances — without
+    // this each of the ~42 stores keeps its own independent budget and the
+    // total grows to many GiB.
+    opts.set_write_buffer_manager(shared_write_buffer_manager());
 
     if let Some(env) = shared_env() {
         opts.set_env(env);
