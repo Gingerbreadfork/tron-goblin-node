@@ -735,6 +735,20 @@ pub struct VmConfig {
     /// Default `0`.
     #[serde(default, alias = "constantCallTimeoutMs")]
     pub constant_call_timeout_ms: i64,
+    /// Master switch for Block-STM optimistic parallel block execution
+    /// during catch-up (byte-identical to serial; the `SyncDriver` only
+    /// turns it on per-block while bulk-syncing, never at the tip).
+    ///
+    /// **Default `false` (opt-in).** It passed byte-identical equivalence and
+    /// won ~1.4-3.2× on an in-memory benchmark, but on a real RocksDB-backed
+    /// mainnet catch-up it measured *slower* than the serial loop (~5 vs ~10
+    /// blk/s) — the per-read MVCC bookkeeping plus 32-thread allocator /
+    /// block-cache contention outweighs the parallelism on real per-tx work.
+    /// Left in, off by default, pending that overhead being addressed. Set
+    /// `true` to experiment / A/B compare (run with `BLOCKSTM_DEBUG=1` to log
+    /// per-block convergence: `rounds`/`reexecs`/`converged`).
+    #[serde(default, alias = "parallelExec")]
+    pub parallel_exec: bool,
 }
 
 impl Default for VmConfig {
@@ -753,6 +767,7 @@ impl Default for VmConfig {
             save_featured_internal_tx: false,
             save_cancel_all_unfreeze_v2_details: false,
             constant_call_timeout_ms: 0,
+            parallel_exec: false,
         }
     }
 }

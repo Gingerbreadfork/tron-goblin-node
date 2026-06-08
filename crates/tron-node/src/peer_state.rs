@@ -35,6 +35,16 @@ use tracing::{debug, warn};
 /// 90_000 ms = peer's 60s `bannedNodes` window + 30s margin.
 pub const SKIP_AFTER_DIAL_MS: u64 = 90_000;
 
+/// How long to avoid re-dialing a peer found to be far BEHIND our head (it has
+/// no blocks we need for catch-up, so dialing it just burns a rotation slot). It
+/// may catch up later, so this is a re-evaluation window, not a permanent ban.
+pub const AVOID_BEHIND_MS: u64 = 10 * 60_000;
+
+/// How long to avoid a peer that rejected us (BAD_PROTOCOL / version / refusal)
+/// before its sync request — a bad fetch source. Shorter than behind, since a
+/// rejection can be transient (the peer was busy / banned us briefly).
+pub const AVOID_REJECT_MS: u64 = 5 * 60_000;
+
 /// File name written under the data directory.
 pub const STATE_FILE: &str = "peer_state.json";
 
@@ -44,6 +54,13 @@ struct PeerStateFile {
     /// Peer dial-attempt timestamps, unix-ms.
     #[serde(default)]
     last_dial_ms: HashMap<String, u64>,
+    /// Peer → unix-ms timestamp until which the peer should be skipped in
+    /// rotation because it's a poor sync source (far behind us, or it rejected
+    /// us). Cleared the moment a peer actually serves us a block. Keeps the 24
+    /// rotation drivers from burning slots on dead-end peers while a handful of
+    /// ahead peers carry the fetch load.
+    #[serde(default)]
+    avoid_until_ms: HashMap<String, u64>,
 }
 
 /// Clone-friendly handle to the peer-state. Internally a single
@@ -107,6 +124,39 @@ impl PeerState {
         now.saturating_sub(ts) < SKIP_AFTER_DIAL_MS
     }
 
+    /// Mark `peer` as a poor sync source to skip for `cooldown_ms` (use
+    /// [`AVOID_BEHIND_MS`] for a far-behind peer, [`AVOID_REJECT_MS`] for a
+    /// rejection). Extends an existing cooldown rather than shortening it.
+    pub fn mark_avoid(&self, peer: &str, cooldown_ms: u64) {
+        let until = now_ms().saturating_add(cooldown_ms);
+        let mut g = self.inner.lock().expect("peer-state poisoned");
+        let e = g.file.avoid_until_ms.entry(peer.to_string()).or_insert(0);
+        if until > *e {
+            *e = until;
+            g.dirty = true;
+        }
+    }
+
+    /// Clear any avoid-cooldown on `peer` — it just served us a block, so it's
+    /// a useful peer; keep dialing it.
+    pub fn mark_useful(&self, peer: &str) {
+        let mut g = self.inner.lock().expect("peer-state poisoned");
+        if g.file.avoid_until_ms.remove(peer).is_some() {
+            g.dirty = true;
+        }
+    }
+
+    /// True if `peer` is currently within an avoid-cooldown (far behind /
+    /// rejected) and should be skipped in rotation while better peers exist.
+    pub fn should_avoid(&self, peer: &str) -> bool {
+        let g = self.inner.lock().expect("peer-state poisoned");
+        g.file
+            .avoid_until_ms
+            .get(peer)
+            .map(|&until| now_ms() < until)
+            .unwrap_or(false)
+    }
+
     /// Write the state to disk if it has been mutated since the last
     /// flush. Errors are logged but never returned — peer-state is
     /// purely advisory.
@@ -141,7 +191,11 @@ impl PeerState {
             .retain(|_, ts| now.saturating_sub(*ts) < max_age_ms);
         let after = g.file.last_dial_ms.len();
         let removed = before - after;
-        if removed > 0 {
+        // Drop expired avoid-cooldowns too (a long-past `avoid_until` is dead
+        // weight; `should_avoid` already treats it as not-avoided).
+        let avoid_before = g.file.avoid_until_ms.len();
+        g.file.avoid_until_ms.retain(|_, until| *until > now);
+        if removed > 0 || g.file.avoid_until_ms.len() != avoid_before {
             g.dirty = true;
         }
         removed
@@ -216,6 +270,37 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!s.was_dialed_recently("ancient:18888"));
         assert!(s.was_dialed_recently("recent:18888"));
+    }
+
+    #[test]
+    fn mark_avoid_then_should_avoid_true_until_cleared() {
+        let dir = tmpdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = PeerState::load(&dir);
+        assert!(!s.should_avoid("p:18888"));
+        s.mark_avoid("p:18888", 60_000);
+        assert!(s.should_avoid("p:18888"), "cooldown active");
+        // A short cooldown does not shorten a longer one.
+        s.mark_avoid("p:18888", 1);
+        assert!(s.should_avoid("p:18888"), "longer cooldown retained");
+        // Serving a block clears it.
+        s.mark_useful("p:18888");
+        assert!(!s.should_avoid("p:18888"), "useful clears cooldown");
+    }
+
+    #[test]
+    fn expired_avoid_is_not_avoided_and_pruned() {
+        let dir = tmpdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = PeerState::load(&dir);
+        {
+            let mut g = s.inner.lock().unwrap();
+            g.file.avoid_until_ms.insert("old:18888".into(), 1_000); // long past
+        }
+        assert!(!s.should_avoid("old:18888"), "past cooldown is not avoided");
+        s.prune(60_000);
+        let g = s.inner.lock().unwrap();
+        assert!(!g.file.avoid_until_ms.contains_key("old:18888"), "pruned");
     }
 
     #[test]

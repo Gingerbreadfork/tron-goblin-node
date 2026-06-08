@@ -439,6 +439,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // Full per-block durability by default; `SyncDriver`
                     // flips this on per-block while catching up.
                     defer_store_fsync: false,
+                    // Master switch carried into the SyncDriver, which only
+                    // turns parallel execution on per-block while catching up
+                    // (Block-STM; byte-identical to serial). `vm.parallel_exec`
+                    // defaults true.
+                    parallel_exec: vm.parallel_exec,
                 };
                 (
                     vm.support_constant,

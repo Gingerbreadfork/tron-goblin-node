@@ -107,14 +107,19 @@ const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 2;
 /// budget is hit instead of letting memory balloon.
 const WRITE_BUFFER_MANAGER_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 
-/// The shared LRU block cache. Created once, referenced by every tuned
-/// open path so memory is bounded process-wide.
+/// The shared block cache. Created once, referenced by every tuned open path so
+/// memory is bounded process-wide. Uses RocksDB's **HyperClockCache** rather than
+/// the sharded LRU: the LRU's per-shard mutex + LRU-list updates serialize
+/// concurrent lookups, which under Block-STM's 32 reader threads is real
+/// cache-line contention; HyperClockCache is a (near-)lock-free clock cache built
+/// for exactly this many-reader workload. `estimated_entry_charge = 0` selects
+/// the auto-tuning variant. Byte-neutral — cache choice never affects returned
+/// values or on-disk format.
 fn shared_block_cache() -> &'static Cache {
     static CACHE: OnceLock<Cache> = OnceLock::new();
     CACHE.get_or_init(|| {
-        Cache::new_lru_cache(
-            CONFIGURED_BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        let cap = CONFIGURED_BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        Cache::new_hyper_clock_cache(cap, 0)
     })
 }
 
@@ -166,6 +171,10 @@ fn apply_runtime_tuning(opts: &mut Options) {
     bbt.set_bloom_filter(10.0, false);
     bbt.set_cache_index_and_filter_blocks(true);
     bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    // Keep the top-level (partitioned) index/filter blocks pinned too, so
+    // point-lookup-heavy sync doesn't re-fetch them through the cache on every
+    // miss — fewer cache operations under the 32-thread read load.
+    bbt.set_pin_top_level_index_and_filter(true);
     opts.set_block_based_table_factory(&bbt);
 
     opts.set_max_write_buffer_number(DEFAULT_MAX_WRITE_BUFFER_NUMBER);

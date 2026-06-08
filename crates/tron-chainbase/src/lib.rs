@@ -18,7 +18,7 @@ pub mod snapshot;
 pub mod stores;
 pub use stores::incremental_merkle_tree_store;
 
-pub use backend::{KvBackend, KvError, MemBackend, WriteOp};
+pub use backend::{KvBackend, KvError, MemBackend, ShardedMemBackend, WriteOp};
 pub use checkpoint_v2::{
     decode_manifest, encode_manifest, CheckPointV2, CheckpointEntry, CheckpointError,
     CheckpointId, CHECKPOINT_DIR_NAME,

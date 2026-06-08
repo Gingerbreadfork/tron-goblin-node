@@ -4,12 +4,19 @@
 //! `TriggerSmartContract` transaction through `execute_block` and
 //! verifies the contract actually ran (storage row written).
 
+// Multi-threaded allocator for the throughput benchmark: the parallel block
+// executor allocates heavily per tx (session fork + VM store wrappers), and the
+// default glibc malloc serializes those across threads, capping scaling at ~4-8
+// cores. mimalloc's per-thread heaps remove that ceiling.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 
 use prost::Message;
 use prost_types::Any;
 use tron_chainbase::{
-    AccountStore, CodeStore, KvBackend, MemBackend, StorageRowStore,
+    AccountStore, CodeStore, KvBackend, ShardedMemBackend, StorageRowStore,
 };
 use tron_crypto::address::Address;
 use tron_actuator::ActuatorError;
@@ -35,7 +42,10 @@ fn apply_unsigned(
 }
 
 fn mem() -> Arc<dyn KvBackend> {
-    Arc::new(MemBackend::new())
+    // Sharded so concurrent base reads scale (like RocksDB) instead of all 32
+    // Block-STM threads serializing on one RwLock — otherwise the base lock, not
+    // the MVCC machinery, dominates the parallel throughput benchmark.
+    Arc::new(ShardedMemBackend::new())
 }
 
 fn addr_with_byte(byte: u8) -> [u8; 21] {
@@ -1014,6 +1024,437 @@ fn default_exec_config_drops_internal_tx_traces() {
         "default ExecConfig must drop internal_transactions; got {} entries",
         tx_result.internal_transactions.len()
     );
+}
+
+// =============================================================================
+// Block-STM: parallel VM execution must be byte-identical to serial.
+// =============================================================================
+
+/// Full dump of every store's key→value (sorted) for state comparison.
+fn dump_vm_state(
+    s: &StateBackends,
+) -> Vec<(&'static str, std::collections::BTreeMap<Vec<u8>, Vec<u8>>)> {
+    let one = |be: &Arc<dyn KvBackend>| -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        be.scan_all().unwrap().into_iter().collect()
+    };
+    let opt = |be: &Option<Arc<dyn KvBackend>>| -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        be.as_ref().map(|b| one(b)).unwrap_or_default()
+    };
+    vec![
+        ("accounts", one(&s.accounts)),
+        ("witnesses", one(&s.witnesses)),
+        ("votes", one(&s.votes)),
+        ("delegation", one(&s.delegation)),
+        ("delegated_resources", one(&s.delegated_resources)),
+        ("dyn_props", one(&s.dyn_props)),
+        ("proposals", one(&s.proposals)),
+        ("name_index", one(&s.name_index)),
+        ("id_index", one(&s.id_index)),
+        ("asset_v1", one(&s.asset_v1)),
+        ("asset_v2", one(&s.asset_v2)),
+        ("contracts", one(&s.contracts)),
+        ("abi", one(&s.abi)),
+        ("exchange_v1", one(&s.exchange_v1)),
+        ("exchange_v2", one(&s.exchange_v2)),
+        ("market_orders", one(&s.market_orders)),
+        ("nullifiers", one(&s.nullifiers)),
+        ("code", opt(&s.code)),
+        ("storage_row", opt(&s.storage_row)),
+        ("contract_state", opt(&s.contract_state)),
+        ("block_index", opt(&s.block_index)),
+    ]
+}
+
+/// Install a contract account + its code into the given state.
+fn install_contract(state: &StateBackends, contract: [u8; 21], bytecode: &[u8]) {
+    let accounts = AccountStore::new(state.accounts.clone());
+    let code = CodeStore::new(state.code.as_ref().unwrap().clone());
+    let hash = tron_crypto::hash::keccak256(bytecode);
+    code.put(&hash, bytecode).unwrap();
+    accounts
+        .put(
+            &Address::from_raw(contract),
+            &Account {
+                address: contract.to_vec(),
+                balance: 0,
+                code: bytecode.to_vec(),
+                code_hash: hash.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+
+/// Build a signed TriggerSmartContract tx for `caller` → `contract`.
+fn trigger_tx(caller_priv: &[u8; 32], caller: [u8; 21], contract: [u8; 21]) -> Transaction {
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let any = Any {
+        type_url: "type.googleapis.com/protocol.TriggerSmartContract".into(),
+        value: trigger.encode_to_vec(),
+    };
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TriggerSmartContract as i32,
+                parameter: Some(any),
+                ..Default::default()
+            }],
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        }),
+        signature: Vec::new(),
+        ret: Vec::new(),
+    };
+    tron_types::sign_transaction(&mut tx, caller_priv).expect("sign tx");
+    tx
+}
+
+/// The decisive Block-STM VM test: a block whose transactions form a
+/// genuine read-modify-write dependency CHAIN on a single storage slot
+/// (a counter incremented by N distinct callers) interleaved with an
+/// independent contract. Serial execution gives slot0 == N; parallel
+/// execution must converge to the identical full state, byte-for-byte —
+/// proving the MVCC read/validate/re-execute fixpoint reproduces
+/// serial semantics for VM (SLOAD/SSTORE) transactions, not just
+/// transfers.
+#[test]
+fn parallel_vm_execution_is_byte_identical_to_serial() {
+    use tron_executor::ExecConfig;
+
+    // INC contract: slot0 = SLOAD(slot0) + 1; STOP.
+    // PUSH1 0x00 SLOAD PUSH1 0x01 ADD PUSH1 0x00 SSTORE STOP
+    let inc_code: Vec<u8> = vec![
+        0x60, 0x00, // PUSH1 0   (slot)
+        0x54, // SLOAD
+        0x60, 0x01, // PUSH1 1
+        0x01, // ADD
+        0x60, 0x00, // PUSH1 0   (slot)
+        0x55, // SSTORE
+        0x00, // STOP
+    ];
+    // SET contract: slot0 = 0x42; STOP. Independent of INC's slot.
+    let set_code: Vec<u8> = vec![0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
+
+    let inc_addr = addr_with_byte(0xc1);
+    let set_addr = addr_with_byte(0xc2);
+
+    // Six distinct callers; their per-call order against INC defines the
+    // dependency chain. Interleave SET triggers so the scheduler sees a
+    // mix of conflicting and independent work.
+    let callers: Vec<([u8; 32], [u8; 21])> =
+        (0..6u8).map(|i| caller_keypair(0x30 + i)).collect();
+
+    // tx plan: a0→INC a1→INC a2→SET a3→INC a4→SET a5→INC
+    //          (INC hit 4× → slot0 must == 4; SET hit 2× → slot0 == 0x42)
+    let plan: [(usize, [u8; 21]); 6] = [
+        (0, inc_addr),
+        (1, inc_addr),
+        (2, set_addr),
+        (3, inc_addr),
+        (4, set_addr),
+        (5, inc_addr),
+    ];
+
+    let setup = |state: &StateBackends| {
+        install_contract(state, inc_addr, &inc_code);
+        install_contract(state, set_addr, &set_code);
+        let accounts = AccountStore::new(state.accounts.clone());
+        for (_, caller) in &callers {
+            accounts
+                .put(
+                    &Address::from_raw(*caller),
+                    &Account {
+                        address: caller.to_vec(),
+                        balance: 1_000_000_000,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    };
+    let txs = || -> Vec<Transaction> {
+        plan.iter()
+            .map(|(ci, contract)| {
+                let (priv_key, caller) = &callers[*ci];
+                trigger_tx(priv_key, *caller, *contract)
+            })
+            .collect()
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let s = build_state();
+    setup(&s);
+    let rs = execute_block_with_config(&s, &make_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+
+    let p = build_state();
+    setup(&p);
+    let rp = execute_block_with_config(&p, &make_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    // The counter must read exactly 4 (chain of 4 INC txs) in BOTH runs —
+    // proves the dependency chain serialised correctly, not just "matched
+    // each other while both being wrong".
+    let inc_slot = StorageRowStore::compose_key(&Address::from_raw(inc_addr), &[0u8; 32]);
+    let read_inc = |state: &StateBackends| -> Vec<u8> {
+        StorageRowStore::new(state.storage_row.as_ref().unwrap().clone())
+            .get(&inc_slot)
+            .unwrap()
+            .expect("INC slot written")
+    };
+    let mut want = [0u8; 32];
+    want[31] = 4;
+    assert_eq!(read_inc(&s), want.to_vec(), "serial counter != 4");
+    assert_eq!(read_inc(&p), want.to_vec(), "parallel counter != 4");
+
+    // Full state, byte-for-byte.
+    assert_eq!(
+        dump_vm_state(&s),
+        dump_vm_state(&p),
+        "parallel VM state diverged from serial"
+    );
+    // Per-tx outcomes identical and in order.
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, po, "tx outcomes diverged");
+    assert_eq!(rs.block_id, rp.block_id, "block id diverged");
+}
+
+/// Block-STM: the deferred per-contract dynamic-energy fold must be byte-identical
+/// to serial. Every call to a contract that's already caught-up this cycle RMWs
+/// its `ContractState.energy_usage` (a windowed `+=` whose factor is fixed for the
+/// cycle) — on mainnet that's USDT, written by ~every tx, the dominant remaining
+/// Block-STM chain. The parallel path excludes it from the MVCC chain and sums the
+/// per-tx deltas onto base at commit; this proves that sum equals serial's in-order
+/// chain AND that the (non-zero) energy_factor + update_cycle survive untouched.
+#[test]
+fn parallel_dynamic_energy_chain_is_byte_identical_to_serial() {
+    use tron_chainbase::{ContractStateStore, DynamicPropertiesStore};
+    use tron_executor::ExecConfig;
+    use tron_proto::ContractState;
+
+    // A tiny energy-using contract with NO storage write, so the ONLY state every
+    // call shares is its ContractState.energy_usage — isolating the deferral.
+    // PUSH1 1 PUSH1 2 ADD POP STOP.
+    let noop_code: Vec<u8> = vec![0x60, 0x01, 0x60, 0x02, 0x01, 0x50, 0x00];
+    let c_addr = addr_with_byte(0xe1);
+    const CYCLE: i64 = 100;
+
+    let callers: Vec<([u8; 32], [u8; 21])> = (0..8u8).map(|i| caller_keypair(0x40 + i)).collect();
+
+    let setup = |state: &StateBackends| {
+        install_contract(state, c_addr, &noop_code);
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        dp.put_long(b"ALLOW_DYNAMIC_ENERGY", 1);
+        dp.put_long(b"DYNAMIC_ENERGY_THRESHOLD", 1_000_000_000);
+        dp.put_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR", 1_000);
+        dp.put_long(b"DYNAMIC_ENERGY_MAX_FACTOR", 100_000);
+        dp.save_current_cycle_number(CYCLE);
+        // Already caught-up THIS cycle, with a NON-ZERO factor — so it takes the
+        // deferred path and we verify the factor is preserved (not zeroed/reset).
+        let cs = ContractStateStore::new(state.contract_state.as_ref().unwrap().clone());
+        cs.put(
+            &Address::from_raw(c_addr),
+            &ContractState {
+                update_cycle: CYCLE,
+                energy_factor: 3_000,
+                energy_usage: 0,
+            },
+        )
+        .unwrap();
+        let accounts = AccountStore::new(state.accounts.clone());
+        for (_, caller) in &callers {
+            accounts
+                .put(
+                    &Address::from_raw(*caller),
+                    &Account {
+                        address: caller.to_vec(),
+                        balance: 1_000_000_000,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    };
+    let txs = || {
+        callers
+            .iter()
+            .map(|(pk, c)| trigger_tx(pk, *c, c_addr))
+            .collect::<Vec<_>>()
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let s = build_state();
+    setup(&s);
+    let rs = execute_block_with_config(&s, &make_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+    let p = build_state();
+    setup(&p);
+    let rp = execute_block_with_config(&p, &make_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    let read_cs = |st: &StateBackends| {
+        ContractStateStore::new(st.contract_state.as_ref().unwrap().clone())
+            .get(&Address::from_raw(c_addr))
+            .unwrap()
+            .expect("contract state present")
+    };
+    let scs = read_cs(&s);
+    let pcs = read_cs(&p);
+    // Non-vacuous: the dynamic-energy accumulator actually moved, the fold matches
+    // serial, and the factor + cycle survived the deferral untouched.
+    assert!(scs.energy_usage > 0, "dynamic energy not exercised (usage stayed 0)");
+    assert_eq!(scs.energy_usage, pcs.energy_usage, "deferred energy fold != serial chain");
+    assert_eq!(scs.energy_factor, 3_000, "serial factor changed unexpectedly");
+    assert_eq!(pcs.energy_factor, 3_000, "factor not preserved through the deferral");
+    assert_eq!(scs.update_cycle, pcs.update_cycle, "update_cycle diverged");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert!(so.iter().all(|o| o == "Success"), "a call failed: {so:?}");
+    assert_eq!(so, po, "tx outcomes diverged");
+    assert_eq!(
+        dump_vm_state(&s),
+        dump_vm_state(&p),
+        "parallel diverged from serial on a dynamic-energy (ContractState) chain"
+    );
+    assert_eq!(rs.block_id, rp.block_id, "block id diverged");
+}
+
+/// Throughput benchmark (ignored — run with
+/// `cargo test -p tron-executor --test vm_integration --release -- --ignored --nocapture bench`).
+/// Builds a heavy block of N independent contract calls (each caller →
+/// its own contract instance running a multi-SSTORE workload) and times
+/// serial vs Block-STM parallel apply. Independent calls are the upper
+/// bound for parallel scaling — the "can we actually use the cores"
+/// answer the rig has 32 of.
+#[test]
+#[ignore]
+fn bench_parallel_vs_serial_throughput() {
+    use std::time::Instant;
+    use tron_executor::ExecConfig;
+
+    const N: usize = 512; // txs per block
+    const STORES_PER_TX: u8 = 24; // SSTOREs per call (≈ a busy contract tx)
+
+    // Bytecode: SSTORE value=i to slot=i for i in 0..STORES_PER_TX; STOP.
+    let mut bytecode: Vec<u8> = Vec::new();
+    if std::env::var("BENCH_COMPUTE").is_ok() {
+        // Compute-heavy variant: unrolled arithmetic, few state ops — measures
+        // the parallel ceiling when per-tx VM work dwarfs MVCC overhead.
+        for _ in 0..4000u16 {
+            bytecode.extend_from_slice(&[0x60, 0x01, 0x60, 0x01, 0x01, 0x50]); // PUSH1 1 PUSH1 1 ADD POP
+        }
+        bytecode.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]); // SSTORE 1->0 STOP
+    } else {
+        for i in 0..STORES_PER_TX {
+            bytecode.extend_from_slice(&[0x60, i, 0x60, i, 0x55]); // PUSH1 i PUSH1 i SSTORE
+        }
+        bytecode.push(0x00); // STOP
+    }
+
+    // Distinct caller + distinct contract instance per tx → fully independent.
+    let callers: Vec<([u8; 32], [u8; 21])> =
+        (0..N).map(|i| caller_keypair((i & 0xff) as u8 ^ 0x5a)).collect();
+    // Caller seeds can collide (only 256 distinct seed bytes); dedup by
+    // giving each its own contract address derived from the index.
+    let contract_addr = |i: usize| -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[19] = (i >> 8) as u8;
+        a[20] = (i & 0xff) as u8;
+        a
+    };
+
+    let setup = |state: &StateBackends| {
+        let accounts = AccountStore::new(state.accounts.clone());
+        for (i, (_, caller)) in callers.iter().enumerate() {
+            // Fund the caller (idempotent if seeds collide — same balance).
+            accounts
+                .put(
+                    &Address::from_raw(*caller),
+                    &Account {
+                        address: caller.to_vec(),
+                        balance: 100_000_000_000,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            install_contract(state, contract_addr(i), &bytecode);
+        }
+    };
+    let txs = || -> Vec<Transaction> {
+        callers
+            .iter()
+            .enumerate()
+            .map(|(i, (priv_key, caller))| trigger_tx(priv_key, *caller, contract_addr(i)))
+            .collect()
+    };
+
+    let run = |parallel: bool| -> (std::time::Duration, usize) {
+        let state = build_state();
+        setup(&state);
+        let cfg = ExecConfig {
+            parallel_exec: parallel,
+            ..ExecConfig::unsigned()
+        };
+        let block = make_block(1, [0u8; 32], txs());
+        let t = Instant::now();
+        let report = execute_block_with_config(&state, &block, None, &cfg).expect("exec");
+        let dt = t.elapsed();
+        (dt, report.successes())
+    };
+
+    // Warm up (build caches / page in), then take the best of 3.
+    let _ = run(false);
+    let _ = run(true);
+    let best = |parallel: bool| -> (std::time::Duration, usize) {
+        let mut best: Option<(std::time::Duration, usize)> = None;
+        for _ in 0..3 {
+            let r = run(parallel);
+            if best.map_or(true, |b| r.0 < b.0) {
+                best = Some(r);
+            }
+        }
+        best.unwrap()
+    };
+    let (serial_dt, serial_ok) = best(false);
+    let (par_dt, par_ok) = best(true);
+
+    assert_eq!(serial_ok, N, "all serial txs should succeed");
+    assert_eq!(par_ok, N, "all parallel txs should succeed");
+
+    let s_tps = N as f64 / serial_dt.as_secs_f64();
+    let p_tps = N as f64 / par_dt.as_secs_f64();
+    eprintln!("=== Block-STM throughput ({} cores) ===", num_cpus_hint());
+    eprintln!(
+        "  block = {N} independent contract calls × {STORES_PER_TX} SSTOREs each"
+    );
+    eprintln!("  serial:   {:>8.2?}  ({:>9.0} tx/s)", serial_dt, s_tps);
+    eprintln!("  parallel: {:>8.2?}  ({:>9.0} tx/s)", par_dt, p_tps);
+    eprintln!("  speedup:  {:.2}×", serial_dt.as_secs_f64() / par_dt.as_secs_f64());
+}
+
+/// Best-effort core count for the bench printout (avoids a num_cpus dep).
+fn num_cpus_hint() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
 }
 
 // =============================================================================

@@ -25,7 +25,10 @@ use tron_executor::{execute_block, StateBackends, TxOutcome};
 use tron_proto::block_header::Raw as BlockHeaderRaw;
 use tron_proto::transaction::contract::ContractType;
 use tron_proto::transaction::{Contract as TxContract, Raw as TxRaw};
-use tron_proto::{Account, AccountType, Block, BlockHeader, Transaction, TransferContract};
+use tron_proto::{
+    Account, AccountType, Block, BlockHeader, FreezeBalanceV2Contract, Transaction,
+    TransferContract,
+};
 use tron_types::{calc_tx_trie_root, sign_block};
 
 const ALICE: [u8; 21] = hex!("412e988a386a799f506693793c6a5af6b54dfaabfb");
@@ -685,4 +688,327 @@ fn unsigned_block_is_accepted_when_explicitly_opted_out() {
             .expect("opt-out config should accept unsigned block");
     assert_eq!(report.tx_results.len(), 0);
     assert_eq!(state.dyn_props.latest_block_header_number(), Some(1));
+}
+
+// =============================================================================
+// Block-STM: parallel execution must be byte-identical to serial.
+// =============================================================================
+
+/// Full dump of every store's key→value, sorted, for state comparison.
+fn dump_state(b: &StateBundle) -> Vec<(&'static str, std::collections::BTreeMap<Vec<u8>, Vec<u8>>)> {
+    let one = |be: &Arc<dyn KvBackend>| -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        be.scan_all().unwrap().into_iter().collect()
+    };
+    vec![
+        ("accounts", one(&b.accounts_be)),
+        ("witnesses", one(&b.witnesses_be)),
+        ("votes", one(&b.votes_be)),
+        ("delegation", one(&b.delegation_be)),
+        ("delegated_resources", one(&b.delegated_resources_be)),
+        ("dyn_props", one(&b.dyn_props_be)),
+        ("proposals", one(&b.proposals_be)),
+        ("name_index", one(&b.name_index_be)),
+        ("id_index", one(&b.id_index_be)),
+        ("asset_v1", one(&b.asset_v1_be)),
+        ("asset_v2", one(&b.asset_v2_be)),
+        ("contracts", one(&b.contracts_be)),
+        ("abi", one(&b.abi_be)),
+        ("exchange_v1", one(&b.exchange_v1_be)),
+        ("exchange_v2", one(&b.exchange_v2_be)),
+        ("market_orders", one(&b.market_orders_be)),
+        ("nullifiers", one(&b.nullifiers_be)),
+    ]
+}
+
+/// A FreezeBalanceV2(BANDWIDTH) tx — bumps the chain-wide `TOTAL_NET_WEIGHT`
+/// accumulator. Signed by ALICE when owned by ALICE (mirrors `transfer_tx`).
+fn freeze_v2_bw_tx(owner: [u8; 21], amount: i64) -> Transaction {
+    let c = FreezeBalanceV2Contract {
+        owner_address: owner.to_vec(),
+        frozen_balance: amount,
+        resource: 0, // BANDWIDTH
+    };
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            ref_block_bytes: vec![0, 1],
+            ref_block_num: 0,
+            ref_block_hash: vec![0u8; 8],
+            expiration: 1_700_000_000_000 + 86_400_000,
+            auths: Vec::new(),
+            data: Vec::new(),
+            contract: vec![TxContract {
+                r#type: ContractType::FreezeBalanceV2Contract as i32,
+                parameter: Some(Any {
+                    type_url: "type.googleapis.com/protocol.FreezeBalanceV2Contract".into(),
+                    value: c.encode_to_vec(),
+                }),
+                provider: Vec::new(),
+                contract_name: Vec::new(),
+                permission_id: 0,
+            }],
+            scripts: Vec::new(),
+            timestamp: 1_700_000_000_000,
+            fee_limit: 0,
+        }),
+        signature: Vec::new(),
+        ret: Vec::new(),
+    };
+    if owner == ALICE {
+        tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("sign");
+    }
+    tx
+}
+
+/// Derive a deterministic (private_key, 21-byte address) pair (mirrors the
+/// helper in `vm_integration.rs`) so the second sender can actually sign — the
+/// per-tx permission check is unconditional, unsigned txs are rejected.
+fn derive_keypair(seed: u8) -> ([u8; 32], [u8; 21]) {
+    use tron_crypto::signature::RecoverableSignature;
+    let mut priv_key = [0u8; 32];
+    priv_key[0] = 0x10;
+    priv_key[31] = seed;
+    let dummy = [0x42u8; 32];
+    let sig = RecoverableSignature::sign_prehash(&priv_key, &dummy).expect("sign");
+    let pubkey = sig.recover_uncompressed_pubkey(&dummy).expect("recover");
+    let h = tron_crypto::hash::keccak256(&pubkey[1..]);
+    let mut addr = [0u8; 21];
+    addr[0] = 0x41;
+    addr[1..].copy_from_slice(&h[12..]);
+    (priv_key, addr)
+}
+
+/// A TransferContract tx signed with an arbitrary key (for senders other than
+/// ALICE, whose key is the only one `transfer_tx` knows).
+fn signed_transfer_tx(priv_key: &[u8; 32], owner: [u8; 21], to: [u8; 21], amount: i64) -> Transaction {
+    let mut tx = transfer_tx(owner, to, amount); // unsigned for non-ALICE owners
+    tx.signature.clear();
+    tron_types::sign_transaction(&mut tx, priv_key).expect("sign");
+    tx
+}
+
+/// Regression for the commutative-accumulator audit (Finding 1): a dyn_props key
+/// that is BOTH written (`+=`) AND read-and-branched within tx execution must NOT
+/// be delta-ized — the delta scheme would feed a later tx `base + own_delta`
+/// instead of `base + Σ lower deltas`, diverging from serial with no read-set
+/// entry to catch it. `TOTAL_NET_WEIGHT` is exactly that: a FreezeBalanceV2 bumps
+/// it, and a same-block bandwidth-charged transfer reads it (as a `==0` gate +
+/// divisor in `calculate_global_net_limit`) to decide frozen-quota vs free/fee.
+///
+/// Block: [ FreezeBalanceV2(ALICE, BANDWIDTH), Transfer(BOB→d1) ] on a fresh
+/// chain (TOTAL_NET_WEIGHT base 0). With the weight wrongly treated as a delta,
+/// BOB's parallel transfer reads weight 0 → net_limit 0 → free/fee path, while
+/// serial reads ALICE's freeze (weight > 0) → frozen-quota path → different BOB
+/// account proto + different fee accumulators. Must be byte-identical.
+#[test]
+fn parallel_weight_dependent_block_is_byte_identical_to_serial() {
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    let (charlie_priv, charlie) = derive_keypair(0x77);
+    let d1 = {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[20] = 0xe1;
+        a
+    };
+    // CHARLIE holds frozen-V2 bandwidth so its transfer takes the account-net
+    // path (which reads TOTAL_NET_WEIGHT). Set directly so setup itself doesn't
+    // bump the weight — base stays 0 until ALICE's in-block freeze.
+    let setup = |b: &StateBundle| {
+        // Enable the V2-staking fork so FreezeBalanceV2 validates (else tx0
+        // fails, no weight is written, and there's nothing to diverge on).
+        b.dyn_props.save_unfreeze_delay_days(14);
+        put_account(&b.accounts, ALICE, 10_000_000_000_000);
+        put_account(&b.accounts, d1, 1); // pre-exists ⇒ plain transfer, not account-creation
+        b.accounts
+            .put(
+                &addr(charlie),
+                &Account {
+                    address: charlie.to_vec(),
+                    balance: 1_000_000_000,
+                    r#type: AccountType::Normal as i32,
+                    frozen_v2: vec![tron_proto::account::FreezeV2 {
+                        r#type: 0, // BANDWIDTH
+                        amount: 1_000_000_000,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    };
+    let txs = || {
+        vec![
+            freeze_v2_bw_tx(ALICE, 1_000_000_000_000), // writes TOTAL_NET_WEIGHT
+            signed_transfer_tx(&charlie_priv, charlie, d1, 1), // reads TOTAL_NET_WEIGHT
+        ]
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let s = StateBundle::fresh();
+    setup(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+
+    let p = StateBundle::fresh();
+    setup(&p);
+    let rp = execute_block_with_config(&p.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    // Both txs must succeed (a rejected freeze/transfer would make the divergence
+    // vacuous — see the keypair/fork-flag setup above).
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, vec!["Success", "Success"], "setup wrong: a tx was rejected");
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, po, "tx outcomes diverged");
+
+    // The decisive check: CHARLIE's transfer must take the SAME bandwidth path in
+    // both (account-net, having seen ALICE's in-block freeze raise the weight).
+    // The bug (weight delta-ized) makes parallel read weight 0 → free-net.
+    assert_eq!(
+        dump_state(&s),
+        dump_state(&p),
+        "parallel diverged from serial on a weight-dependent (freeze + bandwidth) block"
+    );
+}
+
+#[test]
+fn parallel_execution_is_byte_identical_to_serial() {
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    fn rcpt(n: u8) -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[20] = n;
+        a
+    }
+    let (d1, d2, d3, d4) = (rcpt(0xd1), rcpt(0xd2), rcpt(0xd3), rcpt(0xd4));
+
+    let fund = |b: &StateBundle| {
+        put_account(&b.accounts, ALICE, 1_000_000_000);
+        put_account(&b.accounts, BOB, 1_000_000_000);
+        put_account(&b.accounts, CARROL, 1_000_000_000);
+    };
+    // Independent (different senders) + conflicting (same sender) + shared
+    // recipient (d1 credited by two txs) — exercises the re-execution path.
+    let txs = || {
+        vec![
+            transfer_tx(ALICE, d1, 100),
+            transfer_tx(BOB, d2, 200),
+            transfer_tx(CARROL, d3, 300),
+            transfer_tx(ALICE, d4, 50),  // conflicts with ALICE's first tx
+            transfer_tx(BOB, d1, 20),    // conflicts with BOB's first tx + shares d1
+        ]
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let s = StateBundle::fresh();
+    fund(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+
+    let p = StateBundle::fresh();
+    fund(&p);
+    let rp = execute_block_with_config(&p.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    // Every store, byte-for-byte.
+    assert_eq!(dump_state(&s), dump_state(&p), "parallel state diverged from serial");
+    // Per-tx outcomes identical and in order.
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, po, "tx outcomes diverged");
+    // Block ids identical (tx_trie + header).
+    assert_eq!(rs.block_id, rp.block_id);
+}
+
+#[test]
+fn parallel_free_net_chain_is_byte_identical_to_serial() {
+    // Every funded account with no frozen bandwidth pays its transfer from the
+    // daily FREE quota, which read-modify-writes the chain-global
+    // `PUBLIC_NET_USAGE` via a windowed-average `increase()`. Serial threads that
+    // single counter through all N txs — an N-deep dependency chain that is the
+    // dominant Block-STM tax on real mainnet blocks. The parallel path excludes
+    // it from the MVCC chain (a deferred-sequential key) and replays the exact
+    // fold at commit. With N DISTINCT senders → distinct recipients, the only
+    // write all txs share is `PUBLIC_NET_USAGE`, so a byte-identical result
+    // proves the deferred fold reproduces the serial windowed-average chain
+    // exactly (ceil/floor rounding and all). A wrong fold (bad order / off-by-one
+    // / missed decay) diverges here.
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    fn rcpt(n: u8) -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1] = 0xb0;
+        a[20] = n;
+        a
+    }
+
+    const N: u8 = 16;
+    // Distinct, validly-signed senders (signatures are required even under
+    // `ExecConfig::unsigned()`, which only skips tx-trie verification).
+    let keypairs: Vec<([u8; 32], [u8; 21])> = (0..N).map(|i| derive_keypair(0x50 + i)).collect();
+    let fund = |b: &StateBundle| {
+        for (_, sender) in &keypairs {
+            put_account(&b.accounts, *sender, 1_000_000_000);
+        }
+        for i in 0..N {
+            put_account(&b.accounts, rcpt(i), 1); // pre-exists ⇒ plain transfer
+        }
+    };
+    let txs = || {
+        keypairs
+            .iter()
+            .enumerate()
+            .map(|(i, (priv_key, sender))| signed_transfer_tx(priv_key, *sender, rcpt(i as u8), 100))
+            .collect::<Vec<_>>()
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let s = StateBundle::fresh();
+    fund(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+
+    let p = StateBundle::fresh();
+    fund(&p);
+    let rp = execute_block_with_config(&p.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    // All txs must have actually spent free net (else the test is vacuous).
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert!(so.iter().all(|o| o == "Success"), "setup wrong, a tx was rejected: {so:?}");
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, po, "tx outcomes diverged");
+
+    // Non-vacuous: the free-net path was exercised and the counter moved.
+    let su = s.dyn_props.public_net_usage();
+    assert!(su > 0, "free-net path not exercised — PUBLIC_NET_USAGE stayed 0");
+    assert_eq!(
+        su,
+        p.dyn_props.public_net_usage(),
+        "deferred PUBLIC_NET fold != serial windowed-average chain"
+    );
+
+    // Every store, byte-for-byte (PUBLIC_NET_USAGE + PUBLIC_NET_TIME included).
+    assert_eq!(
+        dump_state(&s),
+        dump_state(&p),
+        "parallel diverged from serial on a free-net (PUBLIC_NET_USAGE chain) block"
+    );
+    assert_eq!(rs.block_id, rp.block_id);
 }

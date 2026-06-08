@@ -259,14 +259,35 @@ pub struct SyncFetchPool {
     inner: std::sync::Mutex<FetchPoolInner>,
 }
 
+/// RAII guard: returns a connection's in-flight fetch claims to the pool when
+/// the per-peer driver pass ends (disconnect, rotation, failure — any exit).
+/// Without it a dropped peer's claimed-but-undelivered blocks sit in `inflight`
+/// until the reclaim window elapses, stalling the leader if one of them is its
+/// next-to-apply block.
+struct FetchClaimGuard {
+    pool: Option<Arc<SyncFetchPool>>,
+    conn_token: u64,
+}
+
+impl Drop for FetchClaimGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.pool {
+            p.reclaim_conn(self.conn_token);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct FetchPoolInner {
     /// Wanted ids keyed by block number (chain order), not yet claimed.
     /// Numbers are unique on the canonical chain the leader is fetching.
     want: std::collections::BTreeMap<i64, [u8; 32]>,
-    /// Claimed ids being fetched: id → (num, when claimed) — num lets a
-    /// stalled claim be re-queued back into `want` in order.
-    inflight: std::collections::HashMap<[u8; 32], (i64, Instant)>,
+    /// Claimed ids being fetched: id → (num, when claimed, claiming conn) —
+    /// `num` lets a stalled claim be re-queued back into `want` in order; the
+    /// conn token lets a disconnecting driver reclaim exactly its own in-flight
+    /// ids immediately (so a dropped peer's head-of-line block doesn't wedge the
+    /// leader for a whole reclaim window).
+    inflight: std::collections::HashMap<[u8; 32], (i64, Instant, u64)>,
     /// Fetched bodies awaiting in-order apply: id → raw wire bytes.
     ready: std::collections::HashMap<[u8; 32], Vec<u8>>,
     /// Dedup set over want+inflight+ready so `push_wants` never enqueues an
@@ -335,16 +356,21 @@ impl SyncFetchPool {
         let stalled: Vec<([u8; 32], i64)> = g
             .inflight
             .iter()
-            .filter(|(_, (_, t))| t.elapsed() >= reclaim_after)
-            .map(|(id, (n, _))| (*id, *n))
+            .filter(|(_, (_, t, _))| t.elapsed() >= reclaim_after)
+            .map(|(id, (n, _, _))| (*id, *n))
             .collect();
         for (id, n) in stalled {
             g.inflight.remove(&id);
             g.want.insert(n, id);
         }
-        if g.ready.len() >= ready_cap {
-            return Vec::new();
-        }
+        // Back-pressure: above the ready cap, stop fetching ahead — EXCEPT
+        // always allow the single lowest wanted block. That block is what the
+        // leader is blocked on applying; refusing it while `ready` is full of
+        // higher blocks is a head-of-line deadlock (ready never drains because
+        // the leader can't get its next block, and the next block can't be
+        // fetched because ready is full). Letting the lowest through guarantees
+        // forward progress.
+        let cap_limit = if g.ready.len() >= ready_cap { 1 } else { max };
         // Lowest eligible numbers (≤ max_num) first, skipping any id this
         // connection has already been handed (re-requesting it would trip the
         // peer's served-hash cache → BAD_PROTOCOL).
@@ -357,18 +383,40 @@ impl SyncFetchPool {
                     .map(|c| !c.contains(&conn_token))
                     .unwrap_or(true)
             })
-            .take(max)
+            .take(cap_limit)
             .map(|(n, id)| (*n, *id))
             .collect();
         let now = Instant::now();
         let mut out = Vec::with_capacity(picked.len());
         for (n, id) in picked {
             g.want.remove(&n);
-            g.inflight.insert(id, (n, now));
+            g.inflight.insert(id, (n, now, conn_token));
             g.claimers.entry(id).or_default().push(conn_token);
             out.push(id);
         }
         out
+    }
+
+    /// Immediately return a disconnecting connection's in-flight claims to
+    /// `want` so another peer can fetch them at once — instead of the leader
+    /// idling until the per-id reclaim window elapses. The dead conn token is
+    /// also dropped from each id's `claimers` set: a fresh reconnect of the same
+    /// peer gets a clean served-hash cache, so re-offering it the id is safe.
+    pub fn reclaim_conn(&self, conn_token: u64) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        let mine: Vec<([u8; 32], i64)> = g
+            .inflight
+            .iter()
+            .filter(|(_, (_, _, c))| *c == conn_token)
+            .map(|(id, (n, _, _))| (*id, *n))
+            .collect();
+        for (id, n) in mine {
+            g.inflight.remove(&id);
+            g.want.insert(n, id);
+            if let Some(c) = g.claimers.get_mut(&id) {
+                c.retain(|t| *t != conn_token);
+            }
+        }
     }
 
     /// Worker: a claimed block arrived → move it to `ready`. Accepts a late
@@ -406,9 +454,7 @@ impl SyncFetchPool {
     /// isn't re-enqueued by a later `push_wants`.
     pub fn forget(&self, id: &[u8; 32]) {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
-        if let Some((n, _)) = g.inflight.remove(id) {
-            let _ = n;
-        }
+        g.inflight.remove(id);
         g.want.retain(|_, v| v != id);
         g.ready.remove(id);
         g.num_of.remove(id);
@@ -419,6 +465,22 @@ impl SyncFetchPool {
     pub fn outstanding(&self) -> usize {
         let g = self.inner.lock().expect("SyncFetchPool poisoned");
         g.want.len() + g.inflight.len()
+    }
+
+    /// Snapshot for the progress log: `(want, inflight, ready, fetchers)`.
+    /// `fetchers` = distinct connections with a claim in flight right now — the
+    /// fetch fan-out. `1` means the fleet has collapsed onto a single fetcher
+    /// (workers not contributing); `~N` means the worker pool is sharing the
+    /// load. Lets an operator tell apply-bound (high `ready`, many `fetchers`,
+    /// yet low blk/s) from fetch-bound (`ready` starved, `fetchers`≈1) at a
+    /// glance, without per-peer disconnect stats.
+    pub fn fanout_stats(&self) -> (usize, usize, usize, usize) {
+        let g = self.inner.lock().expect("SyncFetchPool poisoned");
+        let mut conns = std::collections::HashSet::new();
+        for (_, (_, _, c)) in g.inflight.iter() {
+            conns.insert(*c);
+        }
+        (g.want.len(), g.inflight.len(), g.ready.len(), conns.len())
     }
 
     /// Cheap pending-decision check: is there at least one want this peer can
@@ -507,15 +569,36 @@ mod fetch_pool_tests {
     }
 
     #[test]
-    fn back_pressure_stops_claims_when_applier_behind() {
+    fn back_pressure_caps_lookahead_but_never_blocks_head_of_line() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3)]);
         let c = p.claim(T1, HI, 1, 100, Duration::from_secs(5));
         p.deliver(c[0], vec![0]);
-        // ready holds 1; with ready_cap=1 no further claims are allowed.
-        assert!(p.claim(T1, HI, 10, 1, Duration::from_secs(5)).is_empty());
+        // ready holds 1; at ready_cap=1 the pool stops fetching AHEAD, but it
+        // must still hand out the single lowest wanted block — that's the
+        // head-of-line block the leader is blocked on. Refusing it deadlocks
+        // (ready never drains because the leader can't get its next block, and
+        // the next block can't be fetched because ready is full).
+        assert_eq!(
+            p.claim(T1, HI, 10, 1, Duration::from_secs(5)),
+            vec![id(2)],
+            "at cap, exactly the head-of-line is claimable — not bulk look-ahead"
+        );
+        // Applying block 1 drains ready below the cap → full look-ahead resumes.
         let _ = p.take_ready(&id(1));
-        assert_eq!(p.claim(T1, HI, 10, 1, Duration::from_secs(5)), vec![id(2), id(3)]);
+        assert_eq!(p.claim(T1, HI, 10, 1, Duration::from_secs(5)), vec![id(3)]);
+    }
+
+    #[test]
+    fn reclaim_conn_returns_a_dropped_peers_claims_immediately() {
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1), w(2)]);
+        // T1 claims both, then disconnects before delivering.
+        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(30)), vec![id(1), id(2)]);
+        p.reclaim_conn(T1);
+        // Both are immediately back in `want` (no 30s wait) AND re-offerable to
+        // T1 itself (a fresh reconnect has a clean served-hash cache).
+        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(30)), vec![id(1), id(2)]);
     }
 
     #[test]
@@ -677,6 +760,12 @@ pub struct SyncDriver {
     /// the block-apply path honors `vm.saveInternalTx` / `vm.vmTrace`.
     /// Default = java-tron parity (all off).
     exec_config: tron_executor::ExecConfig,
+    /// Master switch for Block-STM parallel execution (mirrors
+    /// `vm.parallel_exec`). The per-block catch-up gate ANDs with this, so
+    /// `false` forces the serial loop everywhere. Set via
+    /// [`SyncDriver::with_exec_config`]; `new` leaves it off so test /
+    /// read-only drivers never speculate.
+    parallel_exec_enabled: bool,
     /// Optional snapshot stack — when attached, every block-apply
     /// wraps its state mutations in a tentative-write layer that can
     /// be revoked on reorg. Replaces the `BlockUndoStore`-based reorg
@@ -805,6 +894,7 @@ impl SyncDriver {
                 verify_tx_trie: false,
                 ..tron_executor::ExecConfig::default()
             },
+            parallel_exec_enabled: false,
             snapshot_stack: None,
             pubsub: None,
             strict_ref_block: false,
@@ -877,7 +967,17 @@ impl SyncDriver {
         last_block_ts: &mut i64,
     ) {
         self.pending_raw_block = Some(raw);
-        match self.accept_block(block, *prev_id) {
+        // Full per-block apply time (accept_block = txTrieRoot validate + khaos
+        // fork-tree + execute + commit + events + mempool drop + solidified). The
+        // executor's [apply] line only covers exec+commit+undo INSIDE execute; the
+        // difference here is the per-block overhead. `accept_total × blk/s ≈ 1.0`
+        // ⇒ leader is ~always applying ⇒ apply-bound (not fetch-bound).
+        let accept_t0 = node_apply_timing::enabled().then(std::time::Instant::now);
+        let outcome = self.accept_block(block, *prev_id);
+        if let Some(t0) = accept_t0 {
+            node_apply_timing::record(t0.elapsed().as_micros() as u64);
+        }
+        match outcome {
             AcceptOutcome::Accepted(id) => {
                 *prev_id = Some(id);
                 *last_block_ts = block
@@ -972,6 +1072,16 @@ impl SyncDriver {
     /// (`expected` front) has been delivered by some worker, apply it in chain
     /// order. Stops at the first gap (not yet fetched). Returns how many it
     /// applied. Leader-only.
+    /// Max blocks applied per `drain_pool` call. Block apply is CPU-bound
+    /// (~tens of ms each), so an unbounded drain of a large ready backlog would
+    /// block the driver's event loop for tens of seconds — long enough to starve
+    /// the keepalive ping/pong (so the peer drops us) and the standby leadership
+    /// re-check (so failover stalls). Bounding the batch returns control to the
+    /// loop regularly; the remainder drains on the next 150ms tick / frame. At a
+    /// real ~10 blk/s this cap is far above one tick's worth, so it costs no
+    /// throughput.
+    const MAX_DRAIN_PER_CALL: usize = 64;
+
     fn drain_pool(
         &mut self,
         pool: &SyncFetchPool,
@@ -981,7 +1091,10 @@ impl SyncDriver {
         last_block_ts: &mut i64,
     ) -> usize {
         let mut applied = 0usize;
-        while let Some(front) = expected.front().copied() {
+        while applied < Self::MAX_DRAIN_PER_CALL {
+            let Some(front) = expected.front().copied() else {
+                break;
+            };
             let Some(raw) = pool.take_ready(&front) else {
                 break;
             };
@@ -1056,19 +1169,20 @@ impl SyncDriver {
             self.at_tip = false;
         }
 
-        // Recurring progress line: frequent while catching up, sparse once
-        // we're just following the tip.
-        let now = Instant::now();
-        let min_interval = if is_tip {
-            Duration::from_secs(30)
+        // Recurring progress line, COUNT-gated (deterministic, not wall-clock):
+        // during catch-up bulk sync flies by, so log every `progress_log_interval`
+        // blocks (100 by config); at the tip we apply ~one block per 3s, so log
+        // every 10 (a steady ~30s heartbeat) — but never sparser than the catch-up
+        // interval if that's set tighter.
+        let interval = if is_tip {
+            self.config.progress_log_interval.min(10).max(1)
         } else {
-            Duration::from_secs(5)
+            self.config.progress_log_interval.max(1)
         };
-        if let Some((last, _)) = self.last_progress_log {
-            if now.duration_since(last) < min_interval {
-                return;
-            }
+        if self.stats.blocks_applied % interval != 0 {
+            return;
         }
+        let now = Instant::now();
         let rate = match self.last_progress_log {
             Some((last, prev_blocks)) => {
                 let secs = now.duration_since(last).as_secs_f64();
@@ -1085,7 +1199,19 @@ impl SyncDriver {
         let when = logfmt::utc_millis(block_ts);
         let behind = logfmt::duration_ms(behind_ms);
         let mut line = if is_tip {
-            format!("at tip  #{height}  {when}  ({behind} behind)  ·  via {peer}")
+            // A fully caught-up node still trails the newest block's TIMESTAMP by
+            // up to ~one 3s production cadence plus propagation — block age
+            // oscillates ~1-6s even when we hold every block as it arrives. That
+            // isn't "behind" in any meaningful sense, and surfacing it reads as a
+            // problem when it's just normal cadence. So within ~2 block intervals
+            // we show a clean "at tip" with no age; only past that (a real,
+            // growing lag at the tip) do we surface "(N behind)".
+            const TIP_CURRENT_MS: i64 = 6_000;
+            if behind_ms <= TIP_CURRENT_MS {
+                format!("at tip  #{height}  {when}  ·  via {peer}")
+            } else {
+                format!("at tip  #{height}  {when}  ({behind} behind)  ·  via {peer}")
+            }
         } else {
             // Full-sync ETA. TRON produces a block every ~3s, so each block we
             // apply closes 3s of chain-time while real time advances 1s — the
@@ -1108,6 +1234,18 @@ impl SyncDriver {
         let er = self.stats.blocks_rejected_execution;
         if vr > 0 || er > 0 {
             line.push_str(&format!("  ·  {vr} val-rej  {er} exec-rej"));
+        }
+        // Multi-peer fetch fan-out. `fetchers` is the decisive number: if it
+        // stays at 1 while many peers are connected, the worker pool isn't
+        // claiming (fetch-bound on one peer); if it's high but blk/s is low,
+        // the pool is feeding the leader fine and we're apply-bound.
+        if !is_tip {
+            if let Some(pool) = &self.fetch_pool {
+                let (want, inflight, ready, fetchers) = pool.fanout_stats();
+                line.push_str(&format!(
+                    "  ·  pool w/i/r={want}/{inflight}/{ready} fetchers={fetchers}"
+                ));
+            }
         }
         info!("{line}");
         self.last_progress_log = Some((now, self.stats.blocks_applied));
@@ -1160,6 +1298,9 @@ impl SyncDriver {
     /// through here so peer-relayed blocks honor `vm.saveInternalTx`
     /// etc. Defaults to java-tron parity (all off).
     pub fn with_exec_config(mut self, config: tron_executor::ExecConfig) -> Self {
+        // Capture the master parallel-exec switch before the per-block gate
+        // starts overwriting `exec_config.parallel_exec` each block.
+        self.parallel_exec_enabled = config.parallel_exec;
         self.exec_config = config;
         // The sync driver always owns `txTrieRoot` validation (raw-bytes
         // check in `accept_block`), so keep the executor's decoded check off
@@ -1366,6 +1507,10 @@ impl SyncDriver {
         // it from rotation like an archive-incapable peer.
         let mut forked_strikes: Vec<u32> = vec![0; peers.len()];
         let mut cursor = 0usize; // index into `shuffled`
+        // Consecutive peers skipped this scan because they're in an
+        // avoid-cooldown. Reset whenever we actually dial; capped at the pool
+        // size so a fully-cooling-down pool still gets dialed (no idle deadlock).
+        let mut avoid_skips = 0usize;
 
         loop {
             // Check shutdown first so we exit promptly even mid-loop.
@@ -1407,6 +1552,22 @@ impl SyncDriver {
             }
             let peer_idx = shuffled[cursor];
             let peer = peers[peer_idx].clone();
+            // Skip peers in an avoid-cooldown (far behind us / recently rejected)
+            // so rotation slots go to viable fetch sources — UNLESS we've already
+            // skipped a full pass (every peer cooling down), in which case dial
+            // anyway rather than spin idle.
+            if avoid_skips < shuffled.len()
+                && self
+                    .peer_state
+                    .as_ref()
+                    .map(|ps| ps.should_avoid(&peer))
+                    .unwrap_or(false)
+            {
+                avoid_skips += 1;
+                cursor = (cursor + 1) % shuffled.len();
+                continue;
+            }
+            avoid_skips = 0;
             // Stamp the dial-recency tracker before we dial, so even
             // if we crash mid-attempt the next restart knows we tried
             // this peer recently.
@@ -1549,11 +1710,29 @@ impl SyncDriver {
                             fetch_fail_count[peer_idx].saturating_add(1);
                         if fetch_fail_count[peer_idx] >= 2 && !archive_incapable[peer_idx] {
                             archive_incapable[peer_idx] = true;
+                            // Persist it so we skip this archive-incapable peer
+                            // across restarts too, not just this process's pass.
+                            if let Some(ps) = &self.peer_state {
+                                ps.mark_avoid(&peer, crate::peer_state::AVOID_BEHIND_MS);
+                            }
                             info!(
                                 peer = peer.as_str(),
                                 fetch_fails = fetch_fail_count[peer_idx],
                                 "peer marked archive-incapable; excluding from rotation"
                             );
+                        }
+                    }
+                    // A peer that rejected us before serving anything (bad
+                    // protocol / version mismatch / "you're below me") is a poor
+                    // fetch source — give it a reject-cooldown so rotation skips
+                    // it while better peers exist, instead of re-dialing it into
+                    // the same rejection.
+                    let is_reject = reason.contains("(BAD_PROTOCOL)")
+                        || reason.contains("(DIFFERENT_VERSION)")
+                        || reason.contains("(BELOW_THAN_ME)");
+                    if is_reject {
+                        if let Some(ps) = &self.peer_state {
+                            ps.mark_avoid(&peer, crate::peer_state::AVOID_REJECT_MS);
                         }
                     }
                     // FORKED (app-disconnect reason 22): the peer is on a chain
@@ -1827,6 +2006,19 @@ impl SyncDriver {
         let leader_eligible =
             !(peer_head >= 0 && peer_head + LEAD_LAG_MARGIN < our_head_at_handshake);
 
+        // Peer-usefulness tracking for rotation (see `PeerState::should_avoid`):
+        // a peer far enough behind to be ineligible can't feed our catch-up, so
+        // give it an avoid-cooldown and stop burning rotation slots on it; an
+        // at/ahead peer that handshook clean is a viable fetch source, so clear
+        // any stale cooldown.
+        if let Some(ps) = &self.peer_state {
+            if leader_eligible {
+                ps.mark_useful(peer);
+            } else {
+                ps.mark_avoid(peer, crate::peer_state::AVOID_BEHIND_MS);
+            }
+        }
+
         // Register this peer with the live registry (if attached) so
         // the resilience scheduler can see it as a candidate. Fields
         // refreshed in-place as the loop runs.
@@ -1967,6 +2159,14 @@ impl SyncDriver {
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
+        // On ANY exit from this peer pass, return this connection's in-flight
+        // fetch claims to the pool immediately, so a dropped peer's blocks
+        // (especially the leader's next-to-apply one) don't wedge sync until the
+        // per-id reclaim window elapses.
+        let _fetch_claim_guard = FetchClaimGuard {
+            pool: self.fetch_pool.clone(),
+            conn_token,
+        };
         // Chain sync is kicked off from inside the loop, gated on
         // leadership: only the single active syncer sends the locator (a
         // java-tron-style geometric back-off of our recent block ids,
@@ -2028,7 +2228,13 @@ impl SyncDriver {
         // early just wastes a fetch. The per-connection claimer guard makes a
         // re-offer safe regardless, but a generous timeout avoids the churn.
         const POOL_READY_CAP: usize = 400;
-        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(30);
+        // Re-offer a still-in-flight id to a different peer after this long. A
+        // dead peer's claims are reclaimed immediately on disconnect (the
+        // `FetchClaimGuard`), so this only covers a *slow-but-alive* peer; with
+        // apply now running at ~20 blk/s the pipeline drains fast, so a long
+        // window would idle the leader. The per-connection claimer guard makes a
+        // re-offer harmless (the slow peer's late delivery is still accepted).
+        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(8);
 
         // KeepAlive heartbeat. Mirrors java-tron's
         // `KeepAliveService` — every `KEEPALIVE_INTERVAL` we send the
@@ -2039,7 +2245,20 @@ impl SyncDriver {
         // `last_inbound_at` is older than `KEEPALIVE_INBOUND_DEADLINE`
         // we drop the peer with PeerFailure — they're either stuck or
         // dead.
-        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+        //
+        // 10s (was 20s): java-tron's status check drops a silent peer
+        // with PING_TIMEOUT (reason 7) on the order of its own ~20s
+        // ping cadence. A fetch worker that fires a 100-block
+        // FetchInvData and then goes quiet awaiting the response sends
+        // the peer nothing in the meantime; at a 20s interval — plus
+        // the up-to-5s standby poll granularity — our ping landed at
+        // ~20-25s and tripped the peer's deadline. On the rig this
+        // churned every worker (per-peer applied=0, peer_failures
+        // 13-30) and collapsed the fleet onto a single leader. Ping at
+        // half the interval, and (below) wake the select! exactly on
+        // the ping deadline so it's never starved by a parked frame
+        // read.
+        const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
         const KEEPALIVE_INBOUND_DEADLINE: Duration = Duration::from_secs(120);
         let mut last_ping_sent_at: Instant = Instant::now();
         let mut last_inbound_at: Instant = Instant::now();
@@ -2398,14 +2617,43 @@ impl SyncDriver {
                     if multi_peer && am_leader && !expected.is_empty() =>
                 {
                     if let Some(pool) = self.fetch_pool.clone() {
-                        self.drain_pool(
+                        let applied = self.drain_pool(
                             &pool,
                             &mut expected,
                             peer,
                             &mut prev_id,
                             &mut last_block_ts,
                         );
+                        // Applying pooled blocks IS liveness: a leader can spend
+                        // long stretches applying blocks fetched by OTHER workers
+                        // while receiving no frames on its own connection.
+                        // Without this it would trip the keepalive inbound
+                        // deadline and drop itself mid-progress — which left the
+                        // fleet thrashing leadership and, observed on the rig,
+                        // stalling sync entirely. `drain_pool` is bounded per call
+                        // (see its cap) so the loop keeps servicing keepalive
+                        // pings + leadership re-checks between batches.
+                        if applied > 0 {
+                            last_inbound_at = Instant::now();
+                        }
                     }
+                    continue;
+                }
+                // Keepalive tick: wake on the ping deadline so the
+                // periodic Ping goes out on schedule even while parked
+                // on a slow frame read. A fetch worker that fires a
+                // 100-block FetchInvData and then blocks awaiting the
+                // response sends the peer nothing in the meantime;
+                // without this branch the ping only got serviced when
+                // some OTHER timer (5s standby / 150ms leader drain) or
+                // an inbound frame surfaced the loop top — landing the
+                // ping late enough to trip the peer's PING_TIMEOUT and
+                // churn the worker off. The loop-top check actually
+                // sends the ping (and resets `last_ping_sent_at`); here
+                // we just guarantee we get there in time.
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    last_ping_sent_at + KEEPALIVE_INTERVAL,
+                )) => {
                     continue;
                 }
                 // Read branch: wait up to 60s for the next frame. The
@@ -3458,6 +3706,20 @@ impl SyncDriver {
                 return AcceptOutcome::RejectedExecution(format!("block_index.put: {e}"));
             }
         }
+
+        // Catch-up fast path: while well behind wall-clock we're bulk-syncing,
+        // so execute the block's transactions optimistically in parallel
+        // (Block-STM — byte-identical to serial, see `ExecConfig::parallel_exec`
+        // and `working/BLOCKSTM-DESIGN.md`). Near the tip blocks are tiny and
+        // arrive every 3s, so the MVCC overhead isn't worth it — fall back to
+        // the serial loop. Set before the snapshot/legacy branch so it covers
+        // both. The serial path is always the source of truth (a non-converged
+        // round commits nothing and falls back to it). Gated by the
+        // `vm.parallel_exec` master switch (default on) AND a per-block work gate
+        // so light blocks (a few transfers) don't pay the parallel overhead.
+        self.exec_config.parallel_exec = self.parallel_exec_enabled
+            && is_catching_up(block)
+            && tron_executor::block_worth_parallel(&block.transactions);
 
         // When the snapshot stack is attached, every block runs under
         // its own tentative-write layer so a future reorg can revoke
@@ -5126,6 +5388,41 @@ pub fn backoff_for(initial: Duration, failures: u32) -> Duration {
 /// that we're in bulk catch-up rather than following the tip. Drives the
 /// deferred-fsync fast path in `accept_block`. Uses the same 90s threshold
 /// as the progress logger's tip detection.
+/// Node-side full-`accept_block` apply timer (env-gated `APPLY_TIMING`), the
+/// companion to the executor's `[apply]` line. Reports the TOTAL per-block apply
+/// time every 200 blocks so the overhead beyond tx-exec (txTrieRoot, fork-tree,
+/// block_index, events, mempool drop) is visible — and so apply-bound vs
+/// fetch-bound is decidable (`accept_avg × blk/s ≈ 1.0` ⇒ apply-bound).
+mod node_apply_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ACCEPT_US: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    const SAMPLE: u64 = 200;
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("APPLY_TIMING")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn record(accept_us: u64) {
+        ACCEPT_US.fetch_add(accept_us, Ordering::Relaxed);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % SAMPLE == 0 {
+            let a = ACCEPT_US.swap(0, Ordering::Relaxed) as f64 / n as f64 / 1000.0;
+            N.store(0, Ordering::Relaxed);
+            eprintln!(
+                "[accept] /{n} blk: accept_avg={a:.1}ms/blk (full apply incl. overhead) → {:.0} blk/s apply ceiling",
+                1000.0 / a.max(0.001),
+            );
+        }
+    }
+}
+
 fn is_catching_up(block: &Block) -> bool {
     const TIP_MS: i64 = 90_000;
     let block_ts = block

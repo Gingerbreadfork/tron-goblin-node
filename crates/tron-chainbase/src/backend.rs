@@ -310,3 +310,101 @@ impl KvBackend for MemBackend {
         Ok(())
     }
 }
+
+/// An in-memory [`KvBackend`] sharded across many independent `RwLock`s so
+/// concurrent reads to *different* keys don't serialize on one lock — the
+/// scalable analog of [`MemBackend`] for multi-threaded workloads (RocksDB reads
+/// concurrently; a single-`RwLock` `MemBackend` does not, which makes it a
+/// misleading base for Block-STM throughput benchmarks). Range scans merge +
+/// sort across shards, so point get/put (the hot path) stay lock-sharded while
+/// ordered iteration is still correct.
+pub struct ShardedMemBackend {
+    shards: Vec<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl ShardedMemBackend {
+    /// `shards` is rounded up to a power of two for cheap masking.
+    pub fn with_shards(shards: usize) -> Self {
+        let n = shards.next_power_of_two().max(1);
+        Self {
+            shards: (0..n).map(|_| RwLock::new(BTreeMap::new())).collect(),
+        }
+    }
+    pub fn new() -> Self {
+        Self::with_shards(256)
+    }
+    #[inline]
+    fn shard(&self, key: &[u8]) -> &RwLock<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in key {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        &self.shards[(h as usize) & (self.shards.len() - 1)]
+    }
+    fn merged(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut m = BTreeMap::new();
+        for s in &self.shards {
+            for (k, v) in s.read().expect("ShardedMemBackend poisoned").iter() {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        m
+    }
+}
+
+impl Default for ShardedMemBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KvBackend for ShardedMemBackend {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        Ok(self
+            .shard(key)
+            .read()
+            .expect("ShardedMemBackend poisoned")
+            .get(key)
+            .cloned())
+    }
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
+        self.shard(key)
+            .write()
+            .expect("ShardedMemBackend poisoned")
+            .insert(key.to_vec(), value.to_vec());
+        Ok(())
+    }
+    fn delete(&self, key: &[u8]) -> Result<(), KvError> {
+        self.shard(key)
+            .write()
+            .expect("ShardedMemBackend poisoned")
+            .remove(key);
+        Ok(())
+    }
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self.merged().into_iter().collect())
+    }
+    fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .merged()
+            .range(start.to_vec()..)
+            .take(limit)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        if prefix.is_empty() {
+            return self.scan_all();
+        }
+        Ok(self
+            .merged()
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+}

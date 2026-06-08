@@ -33,6 +33,7 @@
 pub mod adaptive;
 pub mod bandwidth;
 pub mod energy;
+pub mod parallel;
 pub mod resource;
 
 use std::sync::Arc;
@@ -130,6 +131,13 @@ pub struct ExecConfig {
     /// committed block. Only the WAL-fsync *frequency* changes, never
     /// durability or consistency. Reverts to per-block fsync at the tip.
     pub defer_store_fsync: bool,
+    /// Execute a block's transactions with the Block-STM optimistic parallel
+    /// scheduler instead of the serial loop. Produces byte-identical state (the
+    /// serial path stays the source of truth and the safe fallback). Defaults to
+    /// `false` until the parallel==serial equivalence is exhaustively validated;
+    /// the sync driver opts in for bulk catch-up where the multi-core speedup
+    /// matters most. See `crate::parallel`.
+    pub parallel_exec: bool,
 }
 
 impl Default for ExecConfig {
@@ -157,6 +165,9 @@ impl Default for ExecConfig {
             // Full per-block durability by default; the sync driver opts
             // into deferral only while catching up (see field docs).
             defer_store_fsync: false,
+            // Serial execution by default (the validated source of truth);
+            // opt into Block-STM parallel execution explicitly.
+            parallel_exec: false,
         }
     }
 }
@@ -550,6 +561,100 @@ impl TxSession {
             s.revert();
         }
     }
+
+    /// A [`StateBackends`] view over this session's per-store overlays (each
+    /// `Arc<SessionBackend>` upcast to `Arc<dyn KvBackend>`). Lets the shared
+    /// `execute_one_tx_isolated` core run over the session exactly as the
+    /// parallel path runs it over the versioned backend — writes flow into the
+    /// session's `pending`, `commit`/`revert` are driven by [`TxIsolation`].
+    /// `witness_schedule` is `None` (never mutated per-tx; the session doesn't
+    /// wrap it).
+    fn view(&self) -> StateBackends {
+        let up = |b: &Arc<SessionBackend>| -> Arc<dyn KvBackend> { b.clone() };
+        let upo = |b: &Option<Arc<SessionBackend>>| -> Option<Arc<dyn KvBackend>> {
+            b.as_ref().map(|x| x.clone() as Arc<dyn KvBackend>)
+        };
+        StateBackends {
+            accounts: up(&self.accounts),
+            witnesses: up(&self.witnesses),
+            votes: up(&self.votes),
+            delegation: up(&self.delegation),
+            delegated_resources: up(&self.delegated_resources),
+            delegated_resource_account_index: upo(&self.delegated_resource_account_index),
+            dyn_props: up(&self.dyn_props),
+            proposals: up(&self.proposals),
+            name_index: up(&self.name_index),
+            id_index: up(&self.id_index),
+            asset_v1: up(&self.asset_v1),
+            asset_v2: up(&self.asset_v2),
+            contracts: up(&self.contracts),
+            abi: up(&self.abi),
+            exchange_v1: up(&self.exchange_v1),
+            exchange_v2: up(&self.exchange_v2),
+            market_orders: up(&self.market_orders),
+            nullifiers: up(&self.nullifiers),
+            merkle_trees: upo(&self.merkle_trees),
+            code: upo(&self.code),
+            storage_row: upo(&self.storage_row),
+            contract_state: upo(&self.contract_state),
+            block_index: upo(&self.block_index),
+            witness_schedule: None,
+        }
+    }
+}
+
+/// Per-tx write isolation for the shared `execute_one_tx_isolated` core. The
+/// serial path commits/reverts a [`TxSession`] (a copy-on-write overlay over the
+/// block state); the Block-STM parallel path writes straight into the
+/// [`VersionedBackend`] capture, so "commit" is a no-op (the scheduler publishes
+/// the capture's write-set afterward) and "revert" discards this tx's buffered
+/// writes + accumulator deltas (keeping the read-set, which still drives
+/// validation/dependencies). Both produce byte-identical state.
+enum TxIsolation<'a> {
+    Session(&'a TxSession),
+    Capture(&'a tron_chainbase::blockstm::TxCaptureCell),
+}
+
+impl TxIsolation<'_> {
+    fn revert(&self) {
+        match self {
+            Self::Session(s) => s.revert(),
+            Self::Capture(c) => {
+                let mut g = c.borrow_mut();
+                g.writes.clear();
+                g.deltas.clear();
+                // The deferred free-net contribution dies with the write-set:
+                // a reverted tx drops its bandwidth charge (the serial session
+                // would discard the PUBLIC_NET write too), so it must contribute
+                // nothing to the commit-time fold. Mirrors the `writes.clear()`.
+                g.public_net_bytes = None;
+                // Same for the deferred per-contract energy deltas: a serial outer
+                // revert here would undo the ContractState writes too. (A VM-frame
+                // revert is already handled upstream — those writes never reach
+                // the versioned backend, so nothing was captured.)
+                g.contract_energy.clear();
+                g.contract_energy_boundary = false;
+            }
+        }
+    }
+    fn commit(&self) -> Result<(), tron_chainbase::KvError> {
+        match self {
+            Self::Session(s) => s.commit(),
+            // Writes are already in the capture; the scheduler publishes them.
+            Self::Capture(_) => Ok(()),
+        }
+    }
+
+    /// Record this tx's free-net `bytes` contribution to the chain-global
+    /// `PUBLIC_NET_USAGE` for the deferred-sequential fold (parallel/Capture
+    /// only). No-op in the serial path, where the bandwidth charge is applied to
+    /// the per-tx session normally. Called right after a `BandwidthCharge::Free`,
+    /// so it shares the bandwidth write's revert/commit lifecycle exactly.
+    fn record_public_net_bytes(&self, bytes: i64) {
+        if let Self::Capture(c) = self {
+            c.borrow_mut().public_net_bytes = Some(bytes);
+        }
+    }
 }
 
 /// Holder for the typed Store wrappers around a [`TxSession`]'s backends.
@@ -578,30 +683,33 @@ struct SessionStoreOwners {
 }
 
 impl SessionStoreOwners {
-    fn from_session(sess: &TxSession) -> Self {
+    /// Build typed actuator stores over a [`StateBackends`] view — either a
+    /// serial [`TxSession`]'s overlay (via [`TxSession::view`]) or the Block-STM
+    /// versioned backend. Writes land wherever the view's backends route them.
+    fn from_state(state: &StateBackends) -> Self {
         Self {
-            accounts: AccountStore::new(sess.accounts.clone()),
-            witnesses: WitnessStore::new(sess.witnesses.clone()),
-            votes: VotesStore::new(sess.votes.clone()),
-            delegation: DelegationStore::new(sess.delegation.clone()),
-            delegated_resources: DelegatedResourceStore::new(sess.delegated_resources.clone()),
-            delegated_resource_account_index: sess
+            accounts: AccountStore::new(state.accounts.clone()),
+            witnesses: WitnessStore::new(state.witnesses.clone()),
+            votes: VotesStore::new(state.votes.clone()),
+            delegation: DelegationStore::new(state.delegation.clone()),
+            delegated_resources: DelegatedResourceStore::new(state.delegated_resources.clone()),
+            delegated_resource_account_index: state
                 .delegated_resource_account_index
                 .as_ref()
                 .map(|b| tron_chainbase::DelegatedResourceAccountIndexStore::new(b.clone())),
-            dyn_props: DynamicPropertiesStore::new(sess.dyn_props.clone()),
-            proposals: ProposalStore::new(sess.proposals.clone()),
-            name_index: AccountIndexStore::new(sess.name_index.clone()),
-            id_index: AccountIdIndexStore::new(sess.id_index.clone()),
-            asset_v1: AssetIssueStore::new(sess.asset_v1.clone()),
-            asset_v2: AssetIssueV2Store::new(sess.asset_v2.clone()),
-            contracts: ContractStore::new(sess.contracts.clone()),
-            abi: AbiStore::new(sess.abi.clone()),
-            exchange_v1: ExchangeStore::new(sess.exchange_v1.clone()),
-            exchange_v2: ExchangeV2Store::new(sess.exchange_v2.clone()),
-            market_orders: MarketOrderStore::new(sess.market_orders.clone()),
-            nullifiers: NullifierStore::new(sess.nullifiers.clone()),
-            merkle_trees: sess
+            dyn_props: DynamicPropertiesStore::new(state.dyn_props.clone()),
+            proposals: ProposalStore::new(state.proposals.clone()),
+            name_index: AccountIndexStore::new(state.name_index.clone()),
+            id_index: AccountIdIndexStore::new(state.id_index.clone()),
+            asset_v1: AssetIssueStore::new(state.asset_v1.clone()),
+            asset_v2: AssetIssueV2Store::new(state.asset_v2.clone()),
+            contracts: ContractStore::new(state.contracts.clone()),
+            abi: AbiStore::new(state.abi.clone()),
+            exchange_v1: ExchangeStore::new(state.exchange_v1.clone()),
+            exchange_v2: ExchangeV2Store::new(state.exchange_v2.clone()),
+            market_orders: MarketOrderStore::new(state.market_orders.clone()),
+            nullifiers: NullifierStore::new(state.nullifiers.clone()),
+            merkle_trees: state
                 .merkle_trees
                 .as_ref()
                 .map(|b| IncrementalMerkleTreeStore::new(b.clone())),
@@ -674,24 +782,24 @@ impl VmSession {
     /// `execute_vm_tx` rejects with `NotImplemented` if any of them
     /// is missing on the per-tx session.
     fn wrap(
-        accounts: Arc<SessionBackend>,
-        code: Arc<SessionBackend>,
-        storage_row: Arc<SessionBackend>,
-        contract_state: Arc<SessionBackend>,
-        votes: Arc<SessionBackend>,
-        delegated_resources: Arc<SessionBackend>,
+        // Parents are `Arc<dyn KvBackend>` so the VM frame nests over EITHER a
+        // serial per-tx `SessionBackend` or a Block-STM `VersionedBackend` — the
+        // VM-frame revert semantics (commit on Success, discard on Revert/Halt)
+        // are identical either way.
+        accounts: Arc<dyn KvBackend>,
+        code: Arc<dyn KvBackend>,
+        storage_row: Arc<dyn KvBackend>,
+        contract_state: Arc<dyn KvBackend>,
+        votes: Arc<dyn KvBackend>,
+        delegated_resources: Arc<dyn KvBackend>,
     ) -> Self {
         Self {
-            accounts: Arc::new(SessionBackend::new(accounts as Arc<dyn KvBackend>)),
-            code: Arc::new(SessionBackend::new(code as Arc<dyn KvBackend>)),
-            storage_row: Arc::new(SessionBackend::new(storage_row as Arc<dyn KvBackend>)),
-            contract_state: Arc::new(SessionBackend::new(
-                contract_state as Arc<dyn KvBackend>,
-            )),
-            votes: Arc::new(SessionBackend::new(votes as Arc<dyn KvBackend>)),
-            delegated_resources: Arc::new(SessionBackend::new(
-                delegated_resources as Arc<dyn KvBackend>,
-            )),
+            accounts: Arc::new(SessionBackend::new(accounts)),
+            code: Arc::new(SessionBackend::new(code)),
+            storage_row: Arc::new(SessionBackend::new(storage_row)),
+            contract_state: Arc::new(SessionBackend::new(contract_state)),
+            votes: Arc::new(SessionBackend::new(votes)),
+            delegated_resources: Arc::new(SessionBackend::new(delegated_resources)),
         }
     }
 
@@ -946,6 +1054,57 @@ pub fn execute_block_with_undo_checkpoint_and_config(
     )
 }
 
+/// Decisive apply-phase profiler, env-gated by `APPLY_TIMING` (set to anything
+/// but `0`/empty). When catch-up sync is apply-bound, this answers the one
+/// question that picks the optimization: is the per-block cost *transaction
+/// execution* (the only thing Block-STM parallelism cuts) or *commit I/O* the
+/// block-session flush + per-block checkpoint-manifest fsync + undo-log write,
+/// none of which parallelism touches? Accumulates the three phases and prints
+/// one averaged line every `SAMPLE` blocks via `eprintln!` (matching
+/// `BLOCKSTM_DEBUG` — the executor has no `tracing` dep). The single active
+/// syncer drives this, so the relaxed atomics never really contend.
+mod apply_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static EXEC_US: AtomicU64 = AtomicU64::new(0);
+    static COMMIT_US: AtomicU64 = AtomicU64::new(0);
+    static UNDO_US: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+
+    const SAMPLE: u64 = 200;
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("APPLY_TIMING")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    /// `exec` = `execute_block_logic` (tx execution, parallel or serial).
+    /// `commit` = block-session flush + checkpoint manifest write/fsync.
+    /// `undo` = undo-log `put`.
+    pub fn record(exec_us: u64, commit_us: u64, undo_us: u64) {
+        EXEC_US.fetch_add(exec_us, Ordering::Relaxed);
+        COMMIT_US.fetch_add(commit_us, Ordering::Relaxed);
+        UNDO_US.fetch_add(undo_us, Ordering::Relaxed);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % SAMPLE == 0 {
+            let e = EXEC_US.swap(0, Ordering::Relaxed) as f64 / n as f64 / 1000.0;
+            let c = COMMIT_US.swap(0, Ordering::Relaxed) as f64 / n as f64 / 1000.0;
+            let u = UNDO_US.swap(0, Ordering::Relaxed) as f64 / n as f64 / 1000.0;
+            N.store(0, Ordering::Relaxed);
+            eprintln!(
+                "[apply] /{n} blk: exec_avg={e:.1}ms  commit_avg={c:.1}ms  \
+                 undo_avg={u:.2}ms  (exec+commit+undo={:.1}ms/blk → {:.0} blk/s)",
+                e + c + u,
+                1000.0 / (e + c + u).max(0.001),
+            );
+        }
+    }
+}
+
 fn execute_block_inner(
     state: &StateBackends,
     block: &Block,
@@ -968,9 +1127,13 @@ fn execute_block_inner(
     //     its own write_batch; per-store atomicity only (tests + the
     //     pre-checkpoint code path).
     if let Some(undo_store) = undo_store {
+        let timing = apply_timing::enabled();
         let block_session = BlockSession::wrap(state);
         let wrapped = block_session.as_state_backends();
+        let t_exec = timing.then(std::time::Instant::now);
         let report = execute_block_logic(&wrapped, block, expected_parent, config)?;
+        let exec_us = t_exec.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+        let t_commit = timing.then(std::time::Instant::now);
         let record = if let Some(checkpoint) = checkpoint {
             block_session
                 .commit_with_checkpoint_and_undo(checkpoint, state, config.defer_store_fsync)
@@ -978,13 +1141,19 @@ fn execute_block_inner(
         } else {
             block_session.commit_with_undo()?
         };
+        let commit_us = t_commit.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         let block_num = block
             .block_header
             .as_ref()
             .and_then(|h| h.raw_data.as_ref())
             .map(|r| r.number)
             .unwrap_or(0);
+        let t_undo = timing.then(std::time::Instant::now);
         undo_store.put(block_num, &record)?;
+        if timing {
+            let undo_us = t_undo.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+            apply_timing::record(exec_us, commit_us, undo_us);
+        }
         return Ok(report);
     }
     execute_block_logic(state, block, expected_parent, config)
@@ -1722,17 +1891,45 @@ fn execute_block_logic(
     // fixed for this whole block — so compute it once here instead of
     // per-tx inside the bandwidth charge.
     let now_slot = head_slot(&DynamicPropertiesStore::new(state.dyn_props.clone()));
-    let mut tx_results = Vec::with_capacity(block.transactions.len());
-    for (i, tx) in block.transactions.iter().enumerate() {
-        tx_results.push(execute_one_tx(
+    // Block-STM parallel execution when enabled, else the serial loop. The
+    // parallel path commits writes to `state` in tx order itself and returns the
+    // ordered results; it returns `None` only on the (should-never-happen)
+    // non-convergence safety hatch, in which case we fall through to serial. The
+    // serial path remains the byte-identical source of truth.
+    //
+    // The work gate (skip parallel for light blocks) lives in the sync driver
+    // via [`block_worth_parallel`], which sets `config.parallel_exec`. Here we
+    // simply honor it — so tests that force `parallel_exec = true` always
+    // exercise the parallel path regardless of block size.
+    let tx_results: Vec<TxResult> = if config.parallel_exec {
+        crate::parallel::execute_block_parallel(
             state,
-            tx,
+            &block.transactions,
             config,
             block_timestamp_ms,
             now_slot,
-            &precomputed_signers[i],
-        ));
+            &precomputed_signers,
+        )
+    } else {
+        None
     }
+    .unwrap_or_else(|| {
+        block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| {
+                execute_one_tx(
+                    state,
+                    tx,
+                    config,
+                    block_timestamp_ms,
+                    now_slot,
+                    &precomputed_signers[i],
+                )
+            })
+            .collect()
+    });
 
     // === 3. Head-pointer update (directly on base) ===
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
@@ -2106,7 +2303,36 @@ pub fn compute_state_root(state: &StateBackends) -> Result<[u8; 32], tron_chainb
     Ok(tron_types::compute_account_state_root_with_storage(&accounts, storage_lookup))
 }
 
-fn execute_one_tx(
+/// Work gate for Block-STM: is this block heavy enough to amortize the fixed
+/// parallel overhead (MvMemory init, per-tx versioned stores, rayon dispatch)?
+/// A block with any contract call (large per-tx VM work) always is; a handful of
+/// plain transfers is not. The sync driver AND-s this into `parallel_exec`, so it
+/// only ever picks the faster of two byte-equivalent paths — never affects state.
+pub fn block_worth_parallel(transactions: &[Transaction]) -> bool {
+    const MIN_PARALLEL_TXS: usize = 16;
+    transactions.len() >= MIN_PARALLEL_TXS || transactions.iter().any(tx_is_vm_bound)
+}
+
+/// True if a tx's first contract is VM-bound (TriggerSmartContract /
+/// CreateSmartContract) — its per-tx work is large enough to always be worth
+/// parallelizing. Cheap: reads the contract-type tag, decodes nothing.
+fn tx_is_vm_bound(tx: &Transaction) -> bool {
+    tx.raw_data
+        .as_ref()
+        .and_then(|r| r.contract.first())
+        .and_then(|c| ContractType::try_from(c.r#type).ok())
+        .is_some_and(|ty| {
+            matches!(
+                ty,
+                ContractType::TriggerSmartContract | ContractType::CreateSmartContract
+            )
+        })
+}
+
+/// Serial entry point: fork a per-tx [`TxSession`] (copy-on-write overlay) over
+/// `state`, then run the shared core. Failed txs revert the session; the next tx
+/// starts fresh.
+pub(crate) fn execute_one_tx(
     state: &StateBackends,
     tx: &Transaction,
     config: &ExecConfig,
@@ -2114,10 +2340,58 @@ fn execute_one_tx(
     now_slot: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
 ) -> TxResult {
-    // Fork a fresh session for this tx — any writes here are confined
-    // until we commit. Failed txs revert; the next tx starts fresh.
     let session = TxSession::fork(state);
-    let owners = SessionStoreOwners::from_session(&session);
+    let view = session.view();
+    execute_one_tx_isolated(
+        &view,
+        &TxIsolation::Session(&session),
+        tx,
+        config,
+        block_timestamp_ms,
+        now_slot,
+        precomputed_signers,
+    )
+}
+
+/// Block-STM entry point: run the shared core DIRECTLY over the versioned
+/// backend `view` — no per-tx `TxSession` overlay. Per-tx isolation, read-your-
+/// writes and revert are provided by the `VersionedBackend` capture itself
+/// (`iso = Capture`): a failed tx clears its buffered writes/deltas. Removes a
+/// whole copy-on-write overlay (and its ~24-backend fork) from every state op.
+pub(crate) fn execute_one_tx_versioned(
+    view: &StateBackends,
+    capture: &tron_chainbase::blockstm::TxCaptureCell,
+    tx: &Transaction,
+    config: &ExecConfig,
+    block_timestamp_ms: i64,
+    now_slot: i64,
+    precomputed_signers: &Result<Vec<Address>, String>,
+) -> TxResult {
+    execute_one_tx_isolated(
+        view,
+        &TxIsolation::Capture(capture),
+        tx,
+        config,
+        block_timestamp_ms,
+        now_slot,
+        precomputed_signers,
+    )
+}
+
+/// Shared per-tx execution core. Runs against an already-isolated `view`
+/// (a serial session overlay OR the Block-STM versioned backend) and
+/// commits/reverts via `iso`. Both callers go through this one body, so serial
+/// and parallel are byte-identical by construction.
+fn execute_one_tx_isolated(
+    view: &StateBackends,
+    iso: &TxIsolation,
+    tx: &Transaction,
+    config: &ExecConfig,
+    block_timestamp_ms: i64,
+    now_slot: i64,
+    precomputed_signers: &Result<Vec<Address>, String>,
+) -> TxResult {
+    let owners = SessionStoreOwners::from_state(view);
     let stores = owners.as_actuator_stores();
 
     let Some(raw) = &tx.raw_data else {
@@ -2205,7 +2479,7 @@ fn execute_one_tx(
     // java-tron, which only calls `getShieldTransactionHashIgnore...`
     // when dispatching ShieldedTransferContract.
     let tx_ctx = if matches!(ty, ContractType::ShieldedTransferContract) {
-        let dp = tron_chainbase::DynamicPropertiesStore::new(state.dyn_props.clone());
+        let dp = tron_chainbase::DynamicPropertiesStore::new(view.dyn_props.clone());
         let zen_token_id = dp
             .get_bytes(b"ZEN_TOKEN_ID")
             .and_then(|b| String::from_utf8(b).ok())
@@ -2238,7 +2512,7 @@ fn execute_one_tx(
             ty,
             precomputed_signers,
         ) {
-            session.revert();
+            iso.revert();
             return TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2270,19 +2544,27 @@ fn execute_one_tx(
                 asset_v1: stores.asset_v1,
                 asset_v2: stores.asset_v2,
             };
-            if let Err(e) =
-                bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot)
-            {
-                session.revert();
-                return TxResult {
-                    tx_id,
-                    contract_type: Some(ty),
-                    outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(format!(
-                        "bandwidth: {e}"
-                    ))),
-                                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
-                };
+            match bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot) {
+                Ok(bandwidth::BandwidthCharge::Free { bytes, .. }) => {
+                    // Free-net path: PUBLIC_NET_USAGE/TIME writes were dropped by
+                    // the versioned backend (parallel) to avoid serialising the
+                    // block; record this tx's `bytes` so the exact serial fold is
+                    // replayed at commit. No-op in the serial path.
+                    iso.record_public_net_bytes(bytes);
+                }
+                Ok(_) => { /* frozen / asset-issuer / fee — not deferred */ }
+                Err(e) => {
+                    iso.revert();
+                    return TxResult {
+                        tx_id,
+                        contract_type: Some(ty),
+                        outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(format!(
+                            "bandwidth: {e}"
+                        ))),
+                        internal_transactions: Vec::new(),
+                        vm_logs: Vec::new(),
+                    };
+                }
             }
         }
     }
@@ -2297,13 +2579,13 @@ fn execute_one_tx(
         ty,
         ContractType::TriggerSmartContract | ContractType::CreateSmartContract
     ) {
-        return execute_vm_tx(&session, tx_id, ty, parameter, config, raw.fee_limit);
+        return execute_vm_tx(view, iso, tx_id, ty, parameter, config, raw.fee_limit);
     }
 
     // Validate. On reject: revert (drops any pending writes — though
     // validate shouldn't write, this is defence in depth) and report.
     if let Err(e) = dispatch_validate(&stores, &tx_ctx, ty, parameter) {
-        session.revert();
+        iso.revert();
         return TxResult {
             tx_id,
             contract_type: Some(ty),
@@ -2328,9 +2610,8 @@ fn execute_one_tx(
             //   raw backend. A real IO error there is a tooling-level
             //   failure; panicking surfaces it to the operator rather
             //   than silently dropping the tx's writes.
-            session
-                .commit()
-                .expect("db error in execute_one_tx: TxSession::commit flush failed");
+            iso.commit()
+                .expect("db error in execute_one_tx: commit flush failed");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2340,7 +2621,7 @@ fn execute_one_tx(
             }
         }
         Err(e) => {
-            session.revert();
+            iso.revert();
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2413,7 +2694,8 @@ fn compute_vm_energy_limit(
 }
 
 fn execute_vm_tx(
-    session: &TxSession,
+    view: &StateBackends,
+    iso: &TxIsolation,
     tx_id: [u8; 32],
     ty: ContractType,
     parameter: &prost_types::Any,
@@ -2429,11 +2711,11 @@ fn execute_vm_tx(
     // Require all four EVM-side stores; if any is missing we can't
     // safely run the VM.
     let (Some(code), Some(storage), Some(contract_state)) = (
-        session.code.as_ref(),
-        session.storage_row.as_ref(),
-        session.contract_state.as_ref(),
+        view.code.as_ref(),
+        view.storage_row.as_ref(),
+        view.contract_state.as_ref(),
     ) else {
-        session.revert();
+        iso.revert();
         return TxResult {
             tx_id,
             contract_type: Some(ty),
@@ -2460,34 +2742,34 @@ fn execute_vm_tx(
     // matching java-tron's consensus rule that energy is paid even
     // on revert.
     let vm_session = VmSession::wrap(
-        session.accounts.clone(),
+        view.accounts.clone(),
         code.clone(),
         storage.clone(),
         contract_state.clone(),
-        session.votes.clone(),
-        session.delegated_resources.clone(),
+        view.votes.clone(),
+        view.delegated_resources.clone(),
     );
 
     let vm_stores = tron_tvm::execute::VmStores {
         accounts: Arc::new(AccountStore::new(vm_session.accounts.clone() as _)),
         code: Arc::new(CS::new(vm_session.code.clone() as _)),
         storage: Arc::new(SRS::new(vm_session.storage_row.clone() as _)),
-        witnesses: Arc::new(WS::new(session.witnesses.clone() as _)),
+        witnesses: Arc::new(WS::new(view.witnesses.clone() as _)),
         contract_state: Arc::new(CtS::new(vm_session.contract_state.clone() as _)),
-        dynamic_properties: Arc::new(DPS::new(session.dyn_props.clone() as _)),
+        dynamic_properties: Arc::new(DPS::new(view.dyn_props.clone() as _)),
         delegated_resources: Arc::new(DRS::new(vm_session.delegated_resources.clone() as _)),
-        delegation: Arc::new(DelS::new(session.delegation.clone() as _)),
+        delegation: Arc::new(DelS::new(view.delegation.clone() as _)),
         // Attach BlockIndexStore so BLOCKHASH(n) returns real hashes
         // for the last 256 blocks (when the backend is configured).
         // Read-only from the VM's perspective — no inner-session
         // wrapping needed.
-        block_index: session
+        block_index: view
             .block_index
             .as_ref()
             .map(|b| Arc::new(BIS::new(b.clone() as _))),
         // ContractStore lets the v1/v2 storage-key layout selector
         // read SmartContract.version. Read-only from the VM.
-        contracts: Some(Arc::new(ConS::new(session.contracts.clone() as _))),
+        contracts: Some(Arc::new(ConS::new(view.contracts.clone() as _))),
         // VotesStore feeds the VOTEWITNESS opcode bridge, which DOES
         // write (the corresponding `accounts` row plus the votes
         // row). Routed through the inner session so a reverted VM
@@ -2498,7 +2780,7 @@ fn execute_vm_tx(
     // Read current block number/time from the dyn-props session (so we
     // see this block's header if it's been written; otherwise the last
     // committed one).
-    let dp = DPS::new(session.dyn_props.clone() as _);
+    let dp = DPS::new(view.dyn_props.clone() as _);
     let block_number = dp.latest_block_header_number().unwrap_or(0);
     let block_timestamp_ms = dp.latest_block_header_timestamp().unwrap_or(0);
 
@@ -2509,7 +2791,7 @@ fn execute_vm_tx(
     ) {
         Ok(limit) => limit,
         Err(reason) => {
-            session.revert();
+            iso.revert();
             return TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2541,7 +2823,7 @@ fn execute_vm_tx(
                 match prost::Message::decode(parameter.value.as_slice()) {
                     Ok(t) => t,
                     Err(e) => {
-                        session.revert();
+                        iso.revert();
                         return TxResult {
                             tx_id,
                             contract_type: Some(ty),
@@ -2568,7 +2850,7 @@ fn execute_vm_tx(
                 match prost::Message::decode(parameter.value.as_slice()) {
                     Ok(c) => c,
                     Err(e) => {
-                        session.revert();
+                        iso.revert();
                         return TxResult {
                             tx_id,
                             contract_type: Some(ty),
@@ -2637,8 +2919,8 @@ fn execute_vm_tx(
     };
     if let Some(caller) = caller_addr {
         if energy_used > 0 {
-            let accounts = AccountStore::new(session.accounts.clone() as _);
-            let dp_store = DynamicPropertiesStore::new(session.dyn_props.clone() as _);
+            let accounts = AccountStore::new(view.accounts.clone() as _);
+            let dp_store = DynamicPropertiesStore::new(view.dyn_props.clone() as _);
             // For `TriggerSmartContract`, look up the contract row to
             // get the origin / `consume_user_resource_percent` /
             // `origin_energy_limit` triple that drives java-tron's
@@ -2649,7 +2931,7 @@ fn execute_vm_tx(
             // the whole bill.
             let (origin_opt, percent, origin_limit) = match trigger_contract_addr {
                 Some(contract_addr) => {
-                    let contracts = ConS::new(session.contracts.clone() as _);
+                    let contracts = ConS::new(view.contracts.clone() as _);
                     match contracts.get(&contract_addr) {
                         Ok(Some(sc)) => {
                             let origin = address_from_proto(&sc.origin_address);
@@ -2682,7 +2964,7 @@ fn execute_vm_tx(
                     // `pay_energy_bill` may have applied before
                     // hitting the caller-side shortfall); tx marked
                     // as failed.
-                    session.revert();
+                    iso.revert();
                     return TxResult {
                         tx_id,
                         contract_type: Some(ty),
@@ -2712,9 +2994,8 @@ fn execute_vm_tx(
     match outcome {
         tron_tvm::execute::VmOutcome::Success { logs, .. } => {
             let _ = vm_succeeded;
-            session
-                .commit()
-                .expect("db error in execute_vm_tx: TxSession::commit flush failed on VM Success");
+            iso.commit()
+                .expect("db error in execute_vm_tx: commit flush failed on VM Success");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2731,9 +3012,8 @@ fn execute_vm_tx(
             // afterwards — both of which java-tron's consensus rule
             // says must survive a revert. `session.commit()` flushes
             // exactly those into the per-tx parent.
-            session
-                .commit()
-                .expect("db error in execute_vm_tx: TxSession::commit flush failed on VM Revert");
+            iso.commit()
+                .expect("db error in execute_vm_tx: commit flush failed on VM Revert");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2745,9 +3025,8 @@ fn execute_vm_tx(
             }
         }
         tron_tvm::execute::VmOutcome::Halt { reason, .. } => {
-            session
-                .commit()
-                .expect("db error in execute_vm_tx: TxSession::commit flush failed on VM Halt");
+            iso.commit()
+                .expect("db error in execute_vm_tx: commit flush failed on VM Halt");
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2759,7 +3038,7 @@ fn execute_vm_tx(
             }
         }
         tron_tvm::execute::VmOutcome::CallTokenIgnored { .. } => {
-            session.revert();
+            iso.revert();
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2771,7 +3050,7 @@ fn execute_vm_tx(
             }
         }
         tron_tvm::execute::VmOutcome::PreflightError(msg) => {
-            session.revert();
+            iso.revert();
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -2786,7 +3065,7 @@ fn execute_vm_tx(
         // wiring mistake — treat it as an execution failure so the tx
         // is rejected rather than silently committed.
         tron_tvm::execute::VmOutcome::Timeout { deadline_ms, .. } => {
-            session.revert();
+            iso.revert();
             TxResult {
                 tx_id,
                 contract_type: Some(ty),

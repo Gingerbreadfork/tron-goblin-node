@@ -386,8 +386,15 @@ impl KadService {
             let _ = self.table.write().expect("kad table poisoned").add(placeholder);
             self.send_ping(*seed).await;
         }
-        info!(seeds = self.seeds.len(), bind = %self.socket.local_addr().unwrap_or(self.seeds[0]),
-              "kad: bootstrap pings sent");
+        // `unwrap_or` would EAGERLY evaluate `self.seeds[0]` even on the Ok path
+        // and panic when seeds is empty (DNS/disk-only discovery, no bootstrap
+        // seeds). Use a lazy, never-panicking sentinel — this is only the log's
+        // bind-address display.
+        let bind_disp = self
+            .socket
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        info!(seeds = self.seeds.len(), bind = %bind_disp, "kad: bootstrap pings sent");
 
         let me = Arc::new(self);
         let recv_task = {

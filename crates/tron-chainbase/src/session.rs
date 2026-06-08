@@ -29,6 +29,7 @@
 //! each other.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::backend::{KvBackend, KvError, WriteOp};
@@ -51,6 +52,19 @@ enum Op {
 pub struct SessionBackend {
     parent: Arc<dyn KvBackend>,
     pending: RwLock<HashMap<Vec<u8>, Op>>,
+    /// `false` while the overlay has never been written (set `true` by the
+    /// first `put`/`delete`, reset by `commit`/`revert`/`drain_*`). When clean,
+    /// `get` skips the `pending` `RwLock` entirely and reads the parent directly
+    /// — every read during the input-reading phase of a tx (before it writes),
+    /// and *every* read against a read-only base session (e.g. the block-level
+    /// overlay during Block-STM parallel speculation, which 32 threads hammer
+    /// concurrently), avoids an otherwise-pointless lock acquire. Writes/reads to
+    /// one session are single-threaded per tx; the shared base session is only
+    /// written between blocks (serially), never concurrently with the parallel
+    /// read phase — so the flag never transitions while readers race it, and a
+    /// `Relaxed` load is sufficient (the `RwLock` still guards real overlay
+    /// access once dirty).
+    dirty: AtomicBool,
 }
 
 impl SessionBackend {
@@ -59,6 +73,7 @@ impl SessionBackend {
         Self {
             parent,
             pending: RwLock::new(HashMap::new()),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -79,6 +94,7 @@ impl SessionBackend {
     pub fn commit(&self) -> Result<(), KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+            self.dirty.store(false, Ordering::Relaxed);
             std::mem::take(&mut *g)
         };
         if drained.is_empty() {
@@ -130,6 +146,7 @@ impl SessionBackend {
     pub fn commit_with_undo(&self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+            self.dirty.store(false, Ordering::Relaxed);
             std::mem::take(&mut *g)
         };
         if drained.is_empty() {
@@ -163,6 +180,7 @@ impl SessionBackend {
     pub fn drain_pending(&self) -> Vec<WriteOp> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+            self.dirty.store(false, Ordering::Relaxed);
             std::mem::take(&mut *g)
         };
         drained
@@ -190,6 +208,7 @@ impl SessionBackend {
     ) -> Result<(Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>), KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+            self.dirty.store(false, Ordering::Relaxed);
             std::mem::take(&mut *g)
         };
         let mut ops = Vec::with_capacity(drained.len());
@@ -207,10 +226,9 @@ impl SessionBackend {
 
     /// Discard all pending writes. The parent is unaffected.
     pub fn revert(&self) {
-        self.pending
-            .write()
-            .expect("SessionBackend lock poisoned")
-            .clear();
+        let mut g = self.pending.write().expect("SessionBackend lock poisoned");
+        self.dirty.store(false, Ordering::Relaxed);
+        g.clear();
     }
 
     /// Number of distinct keys currently in the overlay.
@@ -229,6 +247,11 @@ impl SessionBackend {
 
 impl KvBackend for SessionBackend {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        // Fast path: a never-written overlay has nothing to shadow the parent,
+        // so skip the `pending` lock entirely (see the `dirty` field doc).
+        if !self.dirty.load(Ordering::Relaxed) {
+            return self.parent.get(key);
+        }
         let g = self.pending.read().expect("SessionBackend lock poisoned");
         match g.get(key) {
             Some(Op::Put(v)) => Ok(Some(v.clone())),
@@ -244,6 +267,7 @@ impl KvBackend for SessionBackend {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
+        self.dirty.store(true, Ordering::Relaxed);
         self.pending
             .write()
             .expect("SessionBackend lock poisoned")
@@ -252,6 +276,7 @@ impl KvBackend for SessionBackend {
     }
 
     fn delete(&self, key: &[u8]) -> Result<(), KvError> {
+        self.dirty.store(true, Ordering::Relaxed);
         self.pending
             .write()
             .expect("SessionBackend lock poisoned")

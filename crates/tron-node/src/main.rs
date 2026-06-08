@@ -23,6 +23,15 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+// Multi-threaded allocator. The block-apply path (especially Block-STM parallel
+// execution, but also the serial loop's per-tx session fork) allocates heavily,
+// and glibc's malloc serializes concurrent allocations across cores — a hard
+// scaling ceiling at ~4-8 threads. mimalloc's per-thread heaps remove it, which
+// helps parallel catch-up the most but also speeds the serial path. Allocator
+// choice never affects committed bytes.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use tron_node::{
     export_to_tarball, import_live, import_snapshot, run, verify_snapshot, Compression,
     ImportMode, NodeConfig,
@@ -775,7 +784,36 @@ fn run_dump_state(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Launch banner. Bold TRON-red only on a real terminal (so piped logs /
+/// journald don't get ANSI escapes).
+fn print_banner() {
+    use std::io::IsTerminal;
+    let (c, r) = if std::io::stderr().is_terminal() {
+        ("\x1b[1;31m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    eprint!("{c}");
+    eprint!(
+        r#"
+▄▄▄█████▓ ██▀███   ▒█████   ███▄    █      ▄████  ▒█████   ▄▄▄▄    ██▓     ██▓ ███▄    █     ███▄    █  ▒█████  ▓█████▄ ▓█████
+▓  ██▒ ▓▒▓██ ▒ ██▒▒██▒  ██▒ ██ ▀█   █     ██▒ ▀█▒▒██▒  ██▒▓█████▄ ▓██▒    ▓██▒ ██ ▀█   █     ██ ▀█   █ ▒██▒  ██▒▒██▀ ██▌▓█   ▀
+▒ ▓██░ ▒░▓██ ░▄█ ▒▒██░  ██▒▓██  ▀█ ██▒   ▒██░▄▄▄░▒██░  ██▒▒██▒ ▄██▒██░    ▒██▒▓██  ▀█ ██▒   ▓██  ▀█ ██▒▒██░  ██▒░██   █▌▒███
+░ ▓██▓ ░ ▒██▀▀█▄  ▒██   ██░▓██▒  ▐▌██▒   ░▓█  ██▓▒██   ██░▒██░█▀  ▒██░    ░██░▓██▒  ▐▌██▒   ▓██▒  ▐▌██▒▒██   ██░░▓█▄   ▌▒▓█  ▄
+  ▒██▒ ░ ░██▓ ▒██▒░ ████▓▒░▒██░   ▓██░   ░▒▓███▀▒░ ████▓▒░░▓█  ▀█▓░██████▒░██░▒██░   ▓██░   ▒██░   ▓██░░ ████▓▒░░▒████▓ ░▒████▒
+  ▒ ░░   ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░   ▒ ▒     ░▒   ▒ ░ ▒░▒░▒░ ░▒▓███▀▒░ ▒░▓  ░░▓  ░ ▒░   ▒ ▒    ░ ▒░   ▒ ▒ ░ ▒░▒░▒░  ▒▒▓  ▒ ░░ ▒░ ░
+    ░      ░▒ ░ ▒░  ░ ▒ ▒░ ░ ░░   ░ ▒░     ░   ░   ░ ▒ ▒░ ▒░▒   ░ ░ ░ ▒  ░ ▒ ░░ ░░   ░ ▒░   ░ ░░   ░ ▒░  ░ ▒ ▒░  ░ ▒  ▒  ░ ░  ░
+  ░        ░░   ░ ░ ░ ░ ▒     ░   ░ ░    ░ ░   ░ ░ ░ ░ ▒   ░    ░   ░ ░    ▒ ░   ░   ░ ░       ░   ░ ░ ░ ░ ░ ▒   ░ ░  ░    ░
+            ░         ░ ░           ░          ░     ░ ░   ░          ░  ░ ░           ░             ░     ░ ░     ░       ░  ░
+                                                                ░                                                ░
+"#
+    );
+    eprintln!("{r}");
+    eprintln!("                                 https://github.com/gingerbreadfork/tron-goblin-node\n");
+}
+
 fn run_start(args: &[String]) -> ExitCode {
+    print_banner();
     let config = match parse_args(args) {
         Ok(c) => c,
         Err(e) => {

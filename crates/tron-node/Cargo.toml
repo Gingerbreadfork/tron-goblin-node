@@ -23,6 +23,7 @@ tron-tvm = { path = "../tron-tvm" }
 tron-replay = { path = "../tron-replay" }
 tron-wallet = { path = "../tron-wallet" }
 tokio = { workspace = true, features = ["signal"] }
+mimalloc = "0.1"
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
