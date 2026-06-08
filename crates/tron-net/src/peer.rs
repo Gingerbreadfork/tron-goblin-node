@@ -73,6 +73,14 @@ pub enum TronState {
 /// with [`PeerConnection::with_handshake_timeout`].
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Max time to establish the TCP connection in [`PeerConnection::dial`] before
+/// giving up. A bare `TcpStream::connect` to a dead/firewalled host blocks for
+/// the OS SYN-retry default (~20-75s on Linux), so without this a startup that
+/// dials many unreachable public peers stalls for minutes before finding a live
+/// one. A reachable peer completes the TCP handshake in well under a second
+/// (one RTT), so 5s is generous while still failing dead hosts fast.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A bidirectional framed connection to a single peer.
 pub struct PeerConnection<S> {
     framed: Framed<S, TronFrameCodec>,
@@ -461,7 +469,14 @@ fn snappy_decompress_checked(data: &[u8]) -> Result<Vec<u8>, FrameError> {
 /// The caller still drives the handshake afterwards.
 impl PeerConnection<TcpStream> {
     pub async fn dial(addr: impl tokio::net::ToSocketAddrs) -> Result<Self, std::io::Error> {
-        let stream = TcpStream::connect(addr).await?;
+        // Bound the TCP connect so a dead/firewalled host fails fast instead of
+        // blocking for the OS SYN-retry default — otherwise dialing through a
+        // pool of mostly-unreachable public peers stalls startup for minutes.
+        let stream = tokio::time::timeout(DEFAULT_CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "tcp connect timed out")
+            })??;
         Ok(Self::new(stream))
     }
 }
