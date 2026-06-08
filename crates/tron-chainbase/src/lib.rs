@@ -10,6 +10,7 @@
 //! data directory is available to validate byte-for-byte parity).
 
 pub mod backend;
+pub mod blockstm;
 pub mod checkpoint_v2;
 pub mod rocksdb_backend;
 pub mod session;
