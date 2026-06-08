@@ -1341,6 +1341,14 @@ impl SyncDriver {
         // shelf. Stop hammering: shelve for 30 min so the deeper ban
         // can decay.
         let mut time_banned_strikes: Vec<u32> = vec![0; peers.len()];
+        // Per-peer FORKED (reason 22) count. A peer that disconnects us with
+        // FORKED while OUR head is canonical is on a divergent chain (a stale
+        // tip or a genuinely bad fork) — it's the peer's problem, not a
+        // protocol error on our side, so we must NOT grow the exponential
+        // backoff for it (that wastes otherwise-fine peers). One-off → fixed
+        // short cooldown + retry; repeated → it's persistently forked, demote
+        // it from rotation like an archive-incapable peer.
+        let mut forked_strikes: Vec<u32> = vec![0; peers.len()];
         let mut cursor = 0usize; // index into `shuffled`
 
         loop {
@@ -1363,6 +1371,7 @@ impl SyncDriver {
                             fetch_fail_count.push(0);
                             archive_incapable.push(false);
                             time_banned_strikes.push(0);
+                            forked_strikes.push(0);
                             shuffled.push(peers.len() - 1);
                         }
                     }
@@ -1531,6 +1540,25 @@ impl SyncDriver {
                             );
                         }
                     }
+                    // FORKED (app-disconnect reason 22): the peer is on a chain
+                    // that diverges from ours. Since our head tracks canonical
+                    // (verified), this is the peer's stale/forked view, not our
+                    // error — don't let it grow our exponential backoff. A peer
+                    // that does it repeatedly is persistently forked; demote it
+                    // from rotation (reusing the archive-incapable exclusion) so
+                    // we stop dialing it.
+                    let is_forked = reason.contains("(FORKED)");
+                    if is_forked {
+                        forked_strikes[peer_idx] = forked_strikes[peer_idx].saturating_add(1);
+                        if forked_strikes[peer_idx] >= 2 && !archive_incapable[peer_idx] {
+                            archive_incapable[peer_idx] = true;
+                            info!(
+                                peer = peer.as_str(),
+                                forked = forked_strikes[peer_idx],
+                                "peer persistently forked; excluding from rotation"
+                            );
+                        }
+                    }
                     if is_time_banned {
                         time_banned_strikes[peer_idx] =
                             time_banned_strikes[peer_idx].saturating_add(1);
@@ -1558,6 +1586,12 @@ impl SyncDriver {
                         // margin) so re-dialing a full peer can't escalate
                         // into a TIME_BANNED. Matches the TIME_BANNED wait.
                         std::time::Duration::from_secs(90)
+                    } else if is_forked {
+                        // Peer's divergent view, not our fault — fixed cooldown,
+                        // no exponential escalation. A transient tip-fork peer
+                        // reconverges and is usable again; a persistently forked
+                        // one is demoted above after the 2nd strike.
+                        std::time::Duration::from_secs(60)
                     } else {
                         peer_failures[peer_idx] = peer_failures[peer_idx].saturating_add(1);
                         backoff_for(self.config.initial_backoff, peer_failures[peer_idx])
@@ -1569,6 +1603,10 @@ impl SyncDriver {
                     } else if is_other_rate_limit {
                         debug!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
                             "peer rate-limited; rotating");
+                    } else if is_forked {
+                        debug!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
+                            strikes = forked_strikes[peer_idx],
+                            "peer on a divergent fork; rotating (our head is canonical)");
                     } else if is_expected_peer_failure(&reason) {
                         // Unreachable / full / deduped peers from the
                         // discovery pool — normal churn, not a fault on our
@@ -6377,6 +6415,30 @@ mod peer_failure_log_tests {
                 .as_str_name(),
             "DIFFERENT_VERSION",
             "libp2p-layer code 4 = version mismatch (a DIFFERENT enum)"
+        );
+    }
+
+    #[test]
+    fn forked_disconnect_decodes_and_matches_the_handler() {
+        // Reason 22 (app-layer) must decode to "FORKED" so the disconnect
+        // string the run loop builds contains "(FORKED)" — which is exactly
+        // what the FORKED branch matches on (fixed cooldown + demote-on-repeat,
+        // NOT the escalating per-peer backoff). If the proto name or the format
+        // drifts, the gentle handling silently regresses to escalation.
+        assert_eq!(
+            tron_proto::ReasonCode::try_from(22).unwrap().as_str_name(),
+            "FORKED"
+        );
+        let formatted = format!(
+            "peer app-disconnected with reason code {} ({}); our last request to it: ...",
+            22,
+            tron_proto::ReasonCode::try_from(22).unwrap().as_str_name()
+        );
+        assert!(formatted.contains("(FORKED)"), "matcher would miss: {formatted}");
+        // We match "(FORKED)", not the substring "reason code 22", precisely so
+        // a 3-digit code (220..229) can't false-trip the FORKED handling.
+        assert!(
+            !"peer app-disconnected with reason code 220 (SOMETHING_ELSE)".contains("(FORKED)")
         );
     }
 
