@@ -5,15 +5,18 @@ protocol — the same role java-tron plays, written from scratch in
 Rust with byte-exact database and wire compatibility as a stated
 goal.
 
-> **Status: pre-release, experimental.** The protocol stack syncs
-> blocks from live mainnet peers and applies them into RocksDB
-> chainbase state, and rebuilds head state on a fork-switch
-> (reorg-driven rollback). Full state-exactness parity with java-tron,
-> long-running mainnet soak, and a few smaller polish items still need
-> work. See
-> [Status](#status) below for specifics. This is **not** a drop-in
-> production replacement for java-tron today — though that is the
-> goal.
+> **Status: pre-release, experimental.** Pointed at public mainnet from
+> a java-tron RocksDB snapshot, it catches up a multi-day backlog, holds
+> the live tip, and applies real blocks into RocksDB chainbase state —
+> and the block hashes it computes from its own executed state match the
+> canonical chain block-for-block. Transactions run through an optional
+> **Block-STM** parallel executor that stays byte-identical to the serial
+> path, and it rebuilds head state on a fork-switch (reorg-driven
+> rollback). Still open: full *state*-exactness across every edge case
+> (block headers carry no state root, so that's verified separately by
+> RPC reads — see below), long-running mainnet soak, and assorted polish.
+> See [Status](#status) for specifics. This is **not** a drop-in
+> production replacement for java-tron today — though that is the goal.
 
 
 ## What this is
@@ -39,6 +42,38 @@ Concretely, this means:
   both served. TronWeb, the Java SDK, and TronGrid clients can
   point at this node without modification.
 
+## See it for yourself
+
+A block hash commits to the full header **and** the transaction Merkle
+root — so if a node's block hash matches the network's, every transaction
+in that block executed to the same result. Sync this node against mainnet,
+then compare its own independently-computed block hashes against the
+official `trongrid.io` API for the most recent blocks:
+
+```sh
+CT='-H Content-Type:application/json'
+H=$(curl -s $CT -X POST http://127.0.0.1:8090/wallet/getnowblock -d '{}' | jq .block_header.raw_data.number)
+for N in $(seq $((H-6)) $((H-2))); do
+  O=$(curl -s $CT -X POST http://127.0.0.1:8090/wallet/getblockbynum -d "{\"num\":$N}" | jq -r .blockID)
+  T=$(curl -s $CT -X POST https://api.trongrid.io/wallet/getblockbynum  -d "{\"num\":$N}" | jq -r .blockID)
+  [ "$O" = "$T" ] && echo "✔ #$N  $O" || echo "✘ #$N  MISMATCH"
+done
+```
+
+```text
+✔ #83425584  0000000004f8f930899faeaa52baa520eded6c93d36fb9a384d77f978817664f
+✔ #83425585  0000000004f8f93133171bdd150fab96f1fffc78894c4c21d25b1d39d491e158
+✔ #83425586  0000000004f8f932d13f30de9fc5856ca13ca21d34ef7080ac5195fdce0c9c5d
+✔ #83425587  0000000004f8f9339d1953474fac8c5fb3ce6fd7c9d31dba40ce05eb7830792a
+✔ #83425588  0000000004f8f934a8d80f6d0164af2e9c2086e2af088e09a378a4cfa9238ebd
+```
+
+Matching the header and tx-merkle root is only half the story, though —
+TRON headers commit to no state root, so the resulting *state* is verified
+separately (see [Compatibility notes](#compatibility-notes)). That
+distinction is the whole reason this project is careful about the word
+"parity."
+
 ## Motivation
 
 This node exists because of [**trongoblin.com**](https://trongoblin.com).
@@ -61,12 +96,26 @@ What works today:
   java-tron for blocks and transactions across the live chain.
 - ✅ Block import: decode + validate + execute live mainnet blocks
   into per-store RocksDB state.
+- ✅ **Block-STM parallel execution** (optional, `vm.parallel_exec`).
+  Within a block, transactions execute optimistically across cores with
+  MVCC read/write-set tracking and re-execute only the ones that
+  conflict, producing a result **byte-identical to the serial loop** —
+  pinned by parallel-vs-serial equivalence tests, since TRON's absent
+  state root means a silent divergence would otherwise be invisible. On a
+  many-core machine, transaction-heavy mainnet blocks apply roughly 2×
+  faster (more on the densest, contract-heavy blocks); light blocks skip
+  the machinery and run serially.
 - ✅ Actuator dispatch: full coverage of java-tron's contract types
   (Transfer, AssetTransfer, Exchange*, FreezeBalance*, Witness*,
   Proposal*, TriggerSmartContract, CreateSmartContract, …).
-- ✅ TVM phase 1: precompile registry + energy model + Sapling
-  shielded-TRC-20 (Groth16 proving) wired into the prover service.
-  Phase 2 (full EVM-interpreter integration) tracks the revm fork.
+- ✅ TVM: smart-contract execution on a revm-based interpreter with
+  TRON's energy schedule, the TRC-10 transfer fields + TRON-extended
+  opcodes (`0xd0..0xd4`), the per-contract dynamic-energy model, and
+  Sapling shielded-TRC-20 (Groth16) proving. Real mainnet contracts
+  execute against snapshot state; read-only (`triggerconstantcontract`)
+  return data for tested TRC-20s (USDT and others) matches java-tron
+  byte-for-byte. Energy-accounting parity is close, with known residual
+  gaps still being chased.
 - ✅ JSON-RPC + REST: the `eth_*` surface that java-tron exposes
   plus the `/wallet/*` REST endpoints, backed by chainbase reads.
 - ✅ gRPC server on the Wallet / WalletSolidity / Database / Monitor
@@ -88,8 +137,11 @@ What works today:
   across the per-peer driver fleet (the rest stay connected as standby
   and fail over if it stalls), inbound `SyncBlockChain` is **served** so
   peers can sync *from* us, and the Hello advertises a truthful
-  solid/lowest block. Validated pulling real blocks from public mainnet
-  peers, not just a local reference node.
+  solid/lowest block. Fetch is **cooperative across the peer fleet** — many
+  peers download the backlog into a shared pool in parallel while one
+  driver applies in chain order. Live-validated catching up a multi-day
+  backlog off public mainnet and holding the tip, not just against a
+  local reference node.
 - ✅ SR block production: when `[witness]` is configured, the
   daemon runs java-tron's `DposTask` loop — slot ownership check,
   drain mempool, produce + sign + apply + broadcast.
@@ -209,9 +261,9 @@ crate is something you can hold in your head.
 | [`tron-net`](crates/tron-net) | Wire framing + message types for the TRON P2P protocol. |
 | [`tron-mempool`](crates/tron-mempool) | Validating mempool: decode + signer recovery + dedup + expiration. |
 | [`tron-actuator`](crates/tron-actuator) | Per-contract `(validate, execute)` pairs — reproduces java-tron actuator semantics. |
-| [`tron-executor`](crates/tron-executor) | Block-level orchestrator. Validates structure, applies txs via the actuator dispatch table. |
+| [`tron-executor`](crates/tron-executor) | Block-level orchestrator. Validates structure, applies txs via the actuator dispatch table — serial or Block-STM parallel. |
 | [`tron-consensus`](crates/tron-consensus) | DPoS slot scheduling, witness validation, maintenance period, fork choice. |
-| [`tron-tvm`](crates/tron-tvm) | TRON precompiles + energy model. Phase 1 of the TVM port. |
+| [`tron-tvm`](crates/tron-tvm) | TRON precompiles + energy model + revm-based contract execution. |
 | [`tron-rpc`](crates/tron-rpc) | Ethereum-compatible JSON-RPC server backed by chainbase. |
 | [`tron-grpc`](crates/tron-grpc) | gRPC (Wallet / WalletSolidity / Database / Monitor / Network). Wraps `tron-rpc`. |
 | [`tron-eventer`](crates/tron-eventer) | Event subscribe / logsfilter — per-block, per-tx, per-contract-event/log triggers. |
