@@ -1087,7 +1087,22 @@ impl SyncDriver {
         let mut line = if is_tip {
             format!("at tip  #{height}  {when}  ({behind} behind)  ·  via {peer}")
         } else {
-            format!("syncing #{height}  {when}  ({behind} behind)  ·  {rate:.0} blk/s  ·  via {peer}")
+            // Full-sync ETA. TRON produces a block every ~3s, so each block we
+            // apply closes 3s of chain-time while real time advances 1s — the
+            // gap shrinks at `rate*3 - 1` chain-seconds per wall-second. Only
+            // shown once we have a usable rate (>1 blk/s) and are actually
+            // gaining; it tracks the recent rate so it firms up as sync settles.
+            const TRON_BLOCK_SECS: f64 = 3.0;
+            let eta = if rate >= 1.0 {
+                let closing = rate * TRON_BLOCK_SECS - 1.0;
+                let eta_ms = (behind_ms as f64 / closing) as i64;
+                format!("  ·  ETA {}", logfmt::duration_ms(eta_ms))
+            } else {
+                String::new()
+            };
+            format!(
+                "syncing #{height}  {when}  ({behind} behind)  ·  {rate:.0} blk/s{eta}  ·  via {peer}"
+            )
         };
         let vr = self.stats.blocks_rejected_validation;
         let er = self.stats.blocks_rejected_execution;
