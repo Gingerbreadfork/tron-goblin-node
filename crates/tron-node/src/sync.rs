@@ -1041,7 +1041,8 @@ impl SyncDriver {
         // Transition lines fire once, regardless of the throttle.
         if is_tip && !self.at_tip {
             info!(
-                "caught up to chain tip at #{} ({}) — now following live blocks",
+                "🧌 tip reached at #{} ({}) — the goblin has done a little dance \
+                 and stopped screaming at peers for now 🎉",
                 logfmt::commas(block_num),
                 logfmt::utc_millis(block_ts),
             );
