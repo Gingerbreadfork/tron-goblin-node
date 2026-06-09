@@ -467,6 +467,28 @@ impl SyncFetchPool {
         g.want.len() + g.inflight.len()
     }
 
+    /// Every live id (want ∪ inflight ∪ ready) whose block number is `> above`,
+    /// in ascending chain order, returned as `(num, id)`.
+    ///
+    /// A freshly-promoted leader uses this to rebuild its apply queue
+    /// (`expected`) from work the *previous* leader had already scheduled into
+    /// the shared pool. This is the only safe way to re-engage when our applied
+    /// head sits below `offered_max`: re-issuing a `SyncBlockChain` locator
+    /// there would regress below the peer's recorded `lastSyncBlockId`, which
+    /// java-tron rejects (BAD_PROTOCOL). `num_of` tracks the number for every
+    /// live id, so one pass covers all three queues.
+    pub fn ordered_ids_above(&self, above: i64) -> Vec<(i64, [u8; 32])> {
+        let g = self.inner.lock().expect("SyncFetchPool poisoned");
+        let mut v: Vec<(i64, [u8; 32])> = g
+            .num_of
+            .iter()
+            .filter(|(_, n)| **n > above)
+            .map(|(id, n)| (*n, *id))
+            .collect();
+        v.sort_unstable_by_key(|(n, _)| *n);
+        v
+    }
+
     /// Snapshot for the progress log: `(want, inflight, ready, fetchers)`.
     /// `fetchers` = distinct connections with a claim in flight right now — the
     /// fetch fan-out. `1` means the fleet has collapsed onto a single fetcher
@@ -566,6 +588,30 @@ mod fetch_pool_tests {
         assert_eq!(p.take_ready(&id(1)), Some(vec![1]));
         assert_eq!(p.take_ready(&id(2)), Some(vec![2]));
         assert_eq!(p.outstanding(), 0);
+    }
+
+    #[test]
+    fn ordered_ids_above_rebuilds_an_apply_queue_across_all_three_queues() {
+        // A promoted leader rebuilds `expected` from the pool: it must see ids
+        // that are still wanted, in flight, AND already delivered — in chain
+        // order — and exclude anything at or below its applied head.
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1), w(2), w(3), w(4)]);
+        // id(1) in flight (claimed, not delivered); id(2) delivered (ready);
+        // id(3)/id(4) still wanted.
+        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(30)); // id(1)
+        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(30)); // id(2)
+        p.deliver(c[0], vec![2]);
+        // Above head 0: the whole contiguous window, ascending, regardless of
+        // which queue each id currently sits in.
+        assert_eq!(
+            p.ordered_ids_above(0),
+            vec![w(1), w(2), w(3), w(4)],
+        );
+        // Above head 2: only the un-applied tail.
+        assert_eq!(p.ordered_ids_above(2), vec![w(3), w(4)]);
+        // Caught up past the window → nothing to inherit.
+        assert!(p.ordered_ids_above(4).is_empty());
     }
 
     #[test]
@@ -2220,6 +2266,23 @@ impl SyncDriver {
         let mut expected: std::collections::VecDeque<[u8; 32]> =
             std::collections::VecDeque::new();
         let mut offered_max: i64 = 0;
+        // === Self-healing recovery state ===
+        // `was_leader`: previous iteration's leadership, so we can detect the
+        //   rising edge (a peer just promoted to leader) and rebuild its apply
+        //   queue from the shared pool.
+        // `last_head_num` / `last_head_advance`: when our applied head last moved.
+        //   A leader that's BEHIND the live tip yet hasn't advanced its head for
+        //   `STALL_RESET_AFTER` is wedged — recover instead of idling forever.
+        let mut was_leader = false;
+        let mut last_head_num: i64 = self.head_number();
+        let mut last_head_advance = Instant::now();
+        // How far behind wall-clock the head must be for a no-advance stall to
+        // count as a wedge (so a healthy node quietly waiting for the next tip
+        // block is never reset). Comfortably above normal near-tip lag.
+        const STALL_RESET_LAG_MS: i64 = 60_000;
+        // How long the head may sit still (while behind the tip) before the
+        // watchdog hard-resets the sync context and reconnects for a clean one.
+        const STALL_RESET_AFTER: Duration = Duration::from_secs(45);
         // Back-pressure ceiling on fetched-but-unapplied blocks, and how long
         // before a stalled in-flight claim is re-offered to (a DIFFERENT) peer.
         // This is a dead-peer backstop, not a normal-operation timer: during an
@@ -2439,6 +2502,93 @@ impl SyncDriver {
                 awaiting_inventory = false;
                 pending_fetch_queue.clear();
                 blocks_in_flight = 0;
+            }
+
+            // === Self-healing: leadership just transferred TO us ===
+            // The previous leader owned the apply order (`expected`); when it
+            // died mid-window we inherited an EMPTY queue, but the shared pool
+            // still holds the blocks it scheduled above our applied head. If we
+            // can't see those (empty `expected`) AND our head sits below
+            // `offered_max`, the AskInventory gate is wedged shut — re-issuing a
+            // locator there would regress below the peer's `lastSyncBlockId`
+            // (BAD_PROTOCOL). Rebuild `expected` straight from the pool instead:
+            // the only safe way to finish a window inherited mid-flight. Drain
+            // whatever's already delivered immediately. (No-op when the pool is
+            // empty / already caught up — the normal AskInventory path handles
+            // those.)
+            if multi_peer && am_leader && !was_leader && expected.is_empty() {
+                if let Some(pool) = self.fetch_pool.clone() {
+                    let pooled = pool.ordered_ids_above(self.head_number());
+                    if !pooled.is_empty() {
+                        if let Some((top, _)) = pooled.last() {
+                            offered_max = offered_max.max(*top);
+                        }
+                        expected = pooled.iter().map(|(_, id)| *id).collect();
+                        let took = expected.len();
+                        let applied = self.drain_pool(
+                            &pool,
+                            &mut expected,
+                            peer,
+                            &mut prev_id,
+                            &mut last_block_ts,
+                        );
+                        info!(
+                            peer,
+                            inherited = took,
+                            applied,
+                            "took over leadership mid-window; rebuilt apply queue from the pool"
+                        );
+                        if applied > 0 {
+                            last_inbound_at = Instant::now();
+                        }
+                    }
+                }
+            }
+            was_leader = am_leader;
+
+            // === Self-healing watchdog: a leader wedged behind the tip ===
+            // A leader that is behind the live tip but whose applied head hasn't
+            // advanced for `STALL_RESET_AFTER` keeps the node idle with peers
+            // attached — observed after a leadership transfer wedged the
+            // inherited sync context (head < offered_max blocks the refresh, and
+            // a gap / reset pool leaves nothing the rebuild above could adopt).
+            // This is the backstop for anything the graceful rebuild can't fix:
+            // hard-reset the shared pool, release leadership, and drop this
+            // connection so a fresh handshake re-establishes a clean context
+            // (clearing any poisoned `lastSyncBlockId`). The reconnected driver
+            // starts with `offered_max = 0` and sends a safe locator from head.
+            // Near the tip `behind_ms` stays small, so a healthy node quietly
+            // waiting for the next block is never reset.
+            {
+                let head_now = self.head_number();
+                if head_now > last_head_num {
+                    last_head_num = head_now;
+                    last_head_advance = Instant::now();
+                }
+                let behind_ms =
+                    crate::node_statistics::unix_now_ms() as i64 - last_block_ts;
+                if multi_peer
+                    && am_leader
+                    && last_block_ts > 0
+                    && behind_ms > STALL_RESET_LAG_MS
+                    && last_head_advance.elapsed() >= STALL_RESET_AFTER
+                {
+                    warn!(
+                        peer,
+                        head = head_now,
+                        behind_s = behind_ms / 1000,
+                        stalled_s = last_head_advance.elapsed().as_secs(),
+                        "sync wedged behind the tip; hard-resetting the fetch pool \
+                         and reconnecting for a clean sync context"
+                    );
+                    if let Some(pool) = &self.fetch_pool {
+                        pool.reset();
+                    }
+                    self.release_leadership(peer);
+                    return PeerOutcome::PeerFailure(
+                        "self-heal: sync wedged behind the tip; reconnecting".to_string(),
+                    );
+                }
             }
 
             // Determine if there's outbound work waiting (queued
