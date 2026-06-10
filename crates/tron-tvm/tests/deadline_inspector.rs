@@ -115,7 +115,7 @@ fn infinite_loop_without_deadline_halts_on_out_of_gas() {
         block_number: 1,
         block_timestamp_ms: 1_700_000_000_000,
     };
-    let (outcome, _) = execute_trigger_with_gas_cap(
+    let (outcome, _, _) = execute_trigger_with_gas_cap(
         &stores,
         block,
         &trigger(caller_addr, contract_addr),
@@ -157,7 +157,7 @@ fn infinite_loop_with_tight_deadline_returns_timeout() {
     // a 5× faster future CPU. Both args must be raised: `energy_limit`
     // is the sun-paid allowance, `gas_cap_override` is the per-tx VM
     // cap, and the effective limit is `min(energy_limit, cap)`.
-    let (outcome, _) = execute_trigger_with_deadline(
+    let (outcome, _, _) = execute_trigger_with_deadline(
         &stores,
         block,
         &trigger(caller_addr, contract_addr),
@@ -210,7 +210,7 @@ fn already_elapsed_deadline_halts_essentially_immediately() {
     };
     let deadline = Instant::now() - Duration::from_secs(1);
     let started = Instant::now();
-    let (outcome, _) = execute_trigger_with_deadline(
+    let (outcome, _, _) = execute_trigger_with_deadline(
         &stores,
         block,
         &trigger(caller_addr, contract_addr),
@@ -252,7 +252,7 @@ fn deadline_in_the_future_does_not_trip_for_short_call() {
         block_timestamp_ms: 1_700_000_000_000,
     };
     let deadline = Instant::now() + Duration::from_secs(60);
-    let (outcome, _) = execute_trigger_with_deadline(
+    let (outcome, _, _) = execute_trigger_with_deadline(
         &stores,
         block,
         &trigger(caller_addr, contract_addr),

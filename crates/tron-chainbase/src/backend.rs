@@ -192,6 +192,41 @@ pub trait KvBackend: Send + Sync {
             .filter(|(k, _)| k.starts_with(prefix))
             .collect())
     }
+
+    /// Read up to `limit` `(key, value)` pairs whose key is **strictly
+    /// less than** `before`, in **descending** byte-lexicographic
+    /// order. The mirror image of [`scan_from`]: where `scan_from`
+    /// walks forward from an inclusive lower bound, this walks
+    /// backward from an exclusive upper bound — which is what cursor-
+    /// resumable reverse pagination needs (pass the last key returned
+    /// and the next page continues just below it, no dup/skip).
+    ///
+    /// Used by the address-history index (`tron-index`) to serve
+    /// `order_by=...,asc` pages: index keys store the height
+    /// inverted (newest-first), so an oldest-first page is a reverse
+    /// walk of the same range.
+    ///
+    /// Default implementation builds on `scan_all` (O(N) but
+    /// correct). RocksDB-backed implementations override with a
+    /// native `seek_for_prev`; `MemBackend` with a reverse range.
+    ///
+    /// [`scan_from`]: KvBackend::scan_from
+    fn scan_back_from(
+        &self,
+        before: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let all = self.scan_all()?;
+        Ok(all
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() < before)
+            .rev()
+            .take(limit)
+            .collect())
+    }
 }
 
 /// In-memory `BTreeMap`-backed implementation. `BTreeMap` (not `HashMap`)
@@ -288,6 +323,27 @@ impl KvBackend for MemBackend {
             .expect("MemBackend lock poisoned")
             .range(prefix.to_vec()..)
             .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    fn scan_back_from(
+        &self,
+        before: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // BTreeMap::range(..before).rev() — the in-memory analog of
+        // RocksDB's seek_for_prev + prev walk. Exclusive upper bound.
+        Ok(self
+            .inner
+            .read()
+            .expect("MemBackend lock poisoned")
+            .range(..before.to_vec())
+            .rev()
+            .take(limit)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
     }
@@ -406,5 +462,44 @@ impl KvBackend for ShardedMemBackend {
             .take_while(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod scan_back_tests {
+    use super::*;
+
+    fn seeded() -> MemBackend {
+        let b = MemBackend::new();
+        for k in [&b"a"[..], b"b", b"c", b"d"] {
+            b.put(k, k).unwrap();
+        }
+        b
+    }
+
+    #[test]
+    fn mem_scan_back_is_exclusive_and_descending() {
+        let b = seeded();
+        let got = b.scan_back_from(b"c", 10).unwrap();
+        let keys: Vec<&[u8]> = got.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![&b"b"[..], b"a"], "strictly below 'c', newest-first");
+        assert_eq!(b.scan_back_from(b"a", 10).unwrap(), vec![]);
+        assert_eq!(b.scan_back_from(b"z", 1).unwrap().len(), 1);
+        assert_eq!(b.scan_back_from(b"z", 0).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn default_impl_matches_mem_override() {
+        // ShardedMemBackend uses the trait default (via scan_all);
+        // verify it agrees with MemBackend's native override.
+        let sharded = ShardedMemBackend::new();
+        let mem = seeded();
+        for k in [&b"a"[..], b"b", b"c", b"d"] {
+            sharded.put(k, k).unwrap();
+        }
+        assert_eq!(
+            sharded.scan_back_from(b"c", 10).unwrap(),
+            mem.scan_back_from(b"c", 10).unwrap()
+        );
     }
 }

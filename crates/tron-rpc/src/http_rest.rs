@@ -219,6 +219,11 @@ pub fn router_with_rate_limits(state: RpcState, limits: crate::RateLimitRegistry
             "/walletsolidity/getrcm",
             get(http_get_rcm).post(http_get_rcm),
         )
+        // TronGrid-style /v1 address-history surface (served from the
+        // embedded index when [index] is enabled; a clear error
+        // otherwise).
+        .merge(crate::index_api::router())
+        .merge(crate::index_api::archive_router())
         .with_state(state);
     // Rate-limit middleware: when the registry is empty the closure
     // returns immediately. Otherwise it parses the path tail and
@@ -555,7 +560,7 @@ static ADDR_FIELDS: &[&str] = &[
 /// * already-`0x`-prefixed → leave alone
 /// * non-string or unknown shape → leave alone (downstream parser
 ///   will reject with a clear error)
-fn translate_addresses_to_hex(value: &mut Value) {
+pub(crate) fn translate_addresses_to_hex(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
@@ -601,7 +606,7 @@ fn normalize_address_string(s: &str) -> Option<String> {
 /// `address_fields` set: strip leading `0x`, and (if `visible`)
 /// convert to base58. This is the post-processing step matching
 /// java-tron's `Util.formatAddress`/`setVisible`.
-fn rewrite_addresses(value: &mut Value, visible: bool) {
+pub(crate) fn rewrite_addresses(value: &mut Value, visible: bool) {
     match value {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
@@ -612,6 +617,17 @@ fn rewrite_addresses(value: &mut Value, visible: bool) {
                         let stripped = s.strip_prefix("0x").unwrap_or(s);
                         if let Ok(raw) = hex::decode(stripped) {
                             *v = Value::String(format_address(&raw, visible));
+                            continue;
+                        }
+                    }
+                }
+                // java's `visible=true` also renders `account_name` as
+                // readable text (the serializer emits hex bytes under the
+                // default visible=false, matching proto3 JsonFormat).
+                if visible && k == "account_name" {
+                    if let Some(s) = v.as_str() {
+                        if let Ok(raw) = hex::decode(s) {
+                            *v = Value::String(String::from_utf8_lossy(&raw).into_owned());
                             continue;
                         }
                     }
@@ -914,14 +930,18 @@ fn format_block_for_http(id: &tron_types::BlockId, block: &tron_proto::Block) ->
         .iter()
         .map(|tx| {
             use prost::Message as _;
-            let tx_id = tx
+            let raw_data_hex = tx
                 .raw_data
                 .as_ref()
-                .map(|r| tron_crypto::hash::sha256(&r.encode_to_vec()))
-                .unwrap_or([0u8; 32]);
+                .map(|r| r.encode_to_vec())
+                .unwrap_or_default();
+            let tx_id = tron_crypto::hash::sha256(&raw_data_hex);
             json!({
                 "txID": hex::encode(tx_id),
                 "raw_data": tx.raw_data.as_ref().map(format_raw_data_for_http).unwrap_or(json!({})),
+                // java includes the canonical wire bytes alongside the
+                // decoded form.
+                "raw_data_hex": hex::encode(&raw_data_hex),
                 "signature": tx.signature.iter().map(hex::encode).collect::<Vec<_>>(),
             })
         })
@@ -937,28 +957,314 @@ fn format_block_for_http(id: &tron_types::BlockId, block: &tron_proto::Block) ->
 }
 
 fn format_raw_data_for_http(raw: &tron_proto::transaction::Raw) -> Value {
+    use serde_json::Map;
     let contracts: Vec<Value> = raw
         .contract
         .iter()
         .map(|c| {
-            json!({
-                "type": c.r#type,
-                "parameter": c.parameter.as_ref().map(|any| json!({
-                    "type_url": any.type_url,
-                    "value": hex::encode(&any.value),
-                })),
-                "Permission_id": c.permission_id,
-            })
+            // java renders `type` as the enum NAME and `parameter.value`
+            // as the DECODED contract message (proto3 JsonFormat with a
+            // type registry) — not raw hex.
+            let type_name = tron_proto::transaction::contract::ContractType::try_from(c.r#type)
+                .map(|t| t.as_str_name().to_string())
+                .unwrap_or_else(|_| c.r#type.to_string());
+            let mut m = Map::new();
+            if let Some(any) = c.parameter.as_ref() {
+                let value = decode_contract_parameter(c.r#type, &any.value)
+                    // Unknown / not-yet-modeled types keep the raw hex so
+                    // no information is lost.
+                    .unwrap_or_else(|| json!(hex::encode(&any.value)));
+                m.insert(
+                    "parameter".into(),
+                    json!({ "value": value, "type_url": any.type_url }),
+                );
+            }
+            m.insert("type".into(), json!(type_name));
+            if c.permission_id != 0 {
+                m.insert("Permission_id".into(), json!(c.permission_id));
+            }
+            Value::Object(m)
         })
         .collect();
-    json!({
-        "contract": contracts,
-        "ref_block_bytes": hex::encode(&raw.ref_block_bytes),
-        "ref_block_hash": hex::encode(&raw.ref_block_hash),
-        "expiration": raw.expiration,
-        "timestamp": raw.timestamp,
-        "fee_limit": raw.fee_limit,
-    })
+    let mut m = Map::new();
+    m.insert("contract".into(), json!(contracts));
+    m.insert("ref_block_bytes".into(), json!(hex::encode(&raw.ref_block_bytes)));
+    m.insert("ref_block_hash".into(), json!(hex::encode(&raw.ref_block_hash)));
+    m.insert("expiration".into(), json!(raw.expiration));
+    if raw.fee_limit != 0 {
+        m.insert("fee_limit".into(), json!(raw.fee_limit));
+    }
+    if !raw.data.is_empty() {
+        m.insert("data".into(), json!(hex::encode(&raw.data)));
+    }
+    m.insert("timestamp".into(), json!(raw.timestamp));
+    Value::Object(m)
+}
+
+/// Insert `v` unless it is a proto3 default (0 / empty / false) — java's
+/// JsonFormat omits default-valued fields.
+fn jput(m: &mut serde_json::Map<String, Value>, k: &str, v: Value) {
+    let omit = match &v {
+        Value::Number(n) => n.as_i64() == Some(0) || n.as_u64() == Some(0),
+        Value::String(s) => s.is_empty(),
+        Value::Bool(b) => !*b,
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        Value::Null => true,
+    };
+    if !omit {
+        m.insert(k.to_string(), v);
+    }
+}
+
+/// `Common.ResourceCode` as proto3 JSON renders it: the enum NAME, with
+/// the zero value (`BANDWIDTH`) omitted entirely.
+fn jput_resource(m: &mut serde_json::Map<String, Value>, code: i32) {
+    match code {
+        1 => jput(m, "resource", json!("ENERGY")),
+        2 => jput(m, "resource", json!("TRON_POWER")),
+        _ => {}
+    }
+}
+
+/// Decode a contract `Any` payload into java-tron's typed JSON form.
+/// Covers every contract type that appears in normal mainnet traffic;
+/// returns `None` for the rest (caller falls back to raw hex).
+fn decode_contract_parameter(contract_type: i32, value: &[u8]) -> Option<Value> {
+    use prost::Message as _;
+    use serde_json::Map;
+    use tron_proto::transaction::contract::ContractType as CT;
+
+    let hexb = |b: &[u8]| json!(hex::encode(b));
+    let ty = CT::try_from(contract_type).ok()?;
+    let mut m = Map::new();
+    match ty {
+        CT::TransferContract => {
+            let c = tron_proto::TransferContract::decode(value).ok()?;
+            jput(&mut m, "amount", json!(c.amount));
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "to_address", hexb(&c.to_address));
+        }
+        CT::TransferAssetContract => {
+            let c = tron_proto::TransferAssetContract::decode(value).ok()?;
+            jput(&mut m, "amount", json!(c.amount));
+            jput(&mut m, "asset_name", hexb(&c.asset_name));
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "to_address", hexb(&c.to_address));
+        }
+        CT::TriggerSmartContract => {
+            let c = tron_proto::TriggerSmartContract::decode(value).ok()?;
+            jput(&mut m, "data", hexb(&c.data));
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "contract_address", hexb(&c.contract_address));
+            jput(&mut m, "call_value", json!(c.call_value));
+            jput(&mut m, "call_token_value", json!(c.call_token_value));
+            jput(&mut m, "token_id", json!(c.token_id));
+        }
+        CT::DelegateResourceContract => {
+            let c = tron_proto::DelegateResourceContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput_resource(&mut m, c.resource);
+            jput(&mut m, "balance", json!(c.balance));
+            jput(&mut m, "receiver_address", hexb(&c.receiver_address));
+            jput(&mut m, "lock", json!(c.lock));
+            jput(&mut m, "lock_period", json!(c.lock_period));
+        }
+        CT::UnDelegateResourceContract => {
+            let c = tron_proto::UnDelegateResourceContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput_resource(&mut m, c.resource);
+            jput(&mut m, "balance", json!(c.balance));
+            jput(&mut m, "receiver_address", hexb(&c.receiver_address));
+        }
+        CT::FreezeBalanceV2Contract => {
+            let c = tron_proto::FreezeBalanceV2Contract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "frozen_balance", json!(c.frozen_balance));
+            jput_resource(&mut m, c.resource);
+        }
+        CT::UnfreezeBalanceV2Contract => {
+            let c = tron_proto::UnfreezeBalanceV2Contract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "unfreeze_balance", json!(c.unfreeze_balance));
+            jput_resource(&mut m, c.resource);
+        }
+        CT::WithdrawExpireUnfreezeContract => {
+            let c = tron_proto::WithdrawExpireUnfreezeContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+        }
+        CT::CancelAllUnfreezeV2Contract => {
+            let c = tron_proto::CancelAllUnfreezeV2Contract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+        }
+        CT::WithdrawBalanceContract => {
+            let c = tron_proto::WithdrawBalanceContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+        }
+        CT::FreezeBalanceContract => {
+            let c = tron_proto::FreezeBalanceContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "frozen_balance", json!(c.frozen_balance));
+            jput(&mut m, "frozen_duration", json!(c.frozen_duration));
+            jput_resource(&mut m, c.resource);
+            jput(&mut m, "receiver_address", hexb(&c.receiver_address));
+        }
+        CT::UnfreezeBalanceContract => {
+            let c = tron_proto::UnfreezeBalanceContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput_resource(&mut m, c.resource);
+            jput(&mut m, "receiver_address", hexb(&c.receiver_address));
+        }
+        CT::VoteWitnessContract => {
+            let c = tron_proto::VoteWitnessContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            let votes: Vec<Value> = c
+                .votes
+                .iter()
+                .map(|v| {
+                    let mut vm = Map::new();
+                    jput(&mut vm, "vote_address", hexb(&v.vote_address));
+                    jput(&mut vm, "vote_count", json!(v.vote_count));
+                    Value::Object(vm)
+                })
+                .collect();
+            jput(&mut m, "votes", json!(votes));
+            jput(&mut m, "support", json!(c.support));
+        }
+        CT::AccountCreateContract => {
+            let c = tron_proto::AccountCreateContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "account_address", hexb(&c.account_address));
+            jput(&mut m, "type", json!(c.r#type));
+        }
+        CT::AccountUpdateContract => {
+            let c = tron_proto::AccountUpdateContract::decode(value).ok()?;
+            jput(&mut m, "account_name", hexb(&c.account_name));
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+        }
+        CT::SetAccountIdContract => {
+            let c = tron_proto::SetAccountIdContract::decode(value).ok()?;
+            jput(&mut m, "account_id", hexb(&c.account_id));
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+        }
+        CT::ParticipateAssetIssueContract => {
+            let c = tron_proto::ParticipateAssetIssueContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "to_address", hexb(&c.to_address));
+            jput(&mut m, "asset_name", hexb(&c.asset_name));
+            jput(&mut m, "amount", json!(c.amount));
+        }
+        CT::UnfreezeAssetContract => {
+            let c = tron_proto::UnfreezeAssetContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+        }
+        CT::UpdateBrokerageContract => {
+            let c = tron_proto::UpdateBrokerageContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "brokerage", json!(c.brokerage));
+        }
+        CT::WitnessCreateContract => {
+            let c = tron_proto::WitnessCreateContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "url", hexb(&c.url));
+        }
+        CT::WitnessUpdateContract => {
+            let c = tron_proto::WitnessUpdateContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "update_url", hexb(&c.update_url));
+        }
+        CT::ProposalCreateContract => {
+            let c = tron_proto::ProposalCreateContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            let params: Vec<Value> = c
+                .parameters
+                .iter()
+                .map(|(k, v)| json!({ "key": k, "value": v }))
+                .collect();
+            jput(&mut m, "parameters", json!(params));
+        }
+        CT::ProposalApproveContract => {
+            let c = tron_proto::ProposalApproveContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "proposal_id", json!(c.proposal_id));
+            jput(&mut m, "is_add_approval", json!(c.is_add_approval));
+        }
+        CT::ProposalDeleteContract => {
+            let c = tron_proto::ProposalDeleteContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "proposal_id", json!(c.proposal_id));
+        }
+        CT::UpdateSettingContract => {
+            let c = tron_proto::UpdateSettingContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "contract_address", hexb(&c.contract_address));
+            jput(
+                &mut m,
+                "consume_user_resource_percent",
+                json!(c.consume_user_resource_percent),
+            );
+        }
+        CT::UpdateEnergyLimitContract => {
+            let c = tron_proto::UpdateEnergyLimitContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "contract_address", hexb(&c.contract_address));
+            jput(&mut m, "origin_energy_limit", json!(c.origin_energy_limit));
+        }
+        CT::ClearAbiContract => {
+            let c = tron_proto::ClearAbiContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "contract_address", hexb(&c.contract_address));
+        }
+        CT::MarketSellAssetContract => {
+            let c = tron_proto::MarketSellAssetContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "sell_token_id", hexb(&c.sell_token_id));
+            jput(&mut m, "sell_token_quantity", json!(c.sell_token_quantity));
+            jput(&mut m, "buy_token_id", hexb(&c.buy_token_id));
+            jput(&mut m, "buy_token_quantity", json!(c.buy_token_quantity));
+        }
+        CT::MarketCancelOrderContract => {
+            let c = tron_proto::MarketCancelOrderContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "order_id", hexb(&c.order_id));
+        }
+        CT::ExchangeCreateContract => {
+            let c = tron_proto::ExchangeCreateContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "first_token_id", hexb(&c.first_token_id));
+            jput(&mut m, "first_token_balance", json!(c.first_token_balance));
+            jput(&mut m, "second_token_id", hexb(&c.second_token_id));
+            jput(&mut m, "second_token_balance", json!(c.second_token_balance));
+        }
+        CT::ExchangeInjectContract => {
+            let c = tron_proto::ExchangeInjectContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "exchange_id", json!(c.exchange_id));
+            jput(&mut m, "token_id", hexb(&c.token_id));
+            jput(&mut m, "quant", json!(c.quant));
+        }
+        CT::ExchangeWithdrawContract => {
+            let c = tron_proto::ExchangeWithdrawContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "exchange_id", json!(c.exchange_id));
+            jput(&mut m, "token_id", hexb(&c.token_id));
+            jput(&mut m, "quant", json!(c.quant));
+        }
+        CT::ExchangeTransactionContract => {
+            let c = tron_proto::ExchangeTransactionContract::decode(value).ok()?;
+            jput(&mut m, "owner_address", hexb(&c.owner_address));
+            jput(&mut m, "exchange_id", json!(c.exchange_id));
+            jput(&mut m, "token_id", hexb(&c.token_id));
+            jput(&mut m, "quant", json!(c.quant));
+            jput(&mut m, "expected", json!(c.expected));
+        }
+        // CreateSmartContract / AccountPermissionUpdate / AssetIssue /
+        // ShieldedTransfer carry deeply-nested messages (ABI, permission
+        // trees, zk proofs); they keep the hex fallback until a full
+        // nested renderer lands.
+        _ => return None,
+    }
+    Some(Value::Object(m))
 }
 
 async fn get_account(
@@ -1162,6 +1468,50 @@ enum ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_parameter_decodes_to_typed_json_like_java() {
+        use prost::Message as _;
+        use tron_proto::transaction::contract::ContractType as CT;
+        // Wire bytes captured from a live mainnet UnDelegateResourceContract
+        // (java decodes these to {owner_address, balance, receiver_address};
+        // resource=BANDWIDTH is the proto3 default and must be omitted).
+        let value = hex::decode(
+            "0a1541df4c13530f20bd279f60257ee7db35563155f50c18e3c8bd9603\
+             221541c1ad43b988ed5f2799b715953820e283372ff62b",
+        )
+        .unwrap();
+        let v = decode_contract_parameter(CT::UnDelegateResourceContract as i32, &value)
+            .expect("decodes");
+        assert_eq!(
+            v["owner_address"],
+            json!("41df4c13530f20bd279f60257ee7db35563155f50c")
+        );
+        assert_eq!(
+            v["receiver_address"],
+            json!("41c1ad43b988ed5f2799b715953820e283372ff62b")
+        );
+        let expected = tron_proto::UnDelegateResourceContract::decode(value.as_slice())
+            .unwrap()
+            .balance;
+        assert!(expected > 0);
+        assert_eq!(v["balance"], json!(expected));
+        assert!(v.get("resource").is_none(), "default BANDWIDTH omitted");
+
+        // Unknown / unmodeled types fall back to None (caller keeps hex).
+        assert!(decode_contract_parameter(CT::CreateSmartContract as i32, &value).is_none());
+    }
+
+    #[test]
+    fn visible_true_renders_account_name_as_text() {
+        let mut v = json!({ "account_name": hex::encode("Blackhole") });
+        rewrite_addresses(&mut v, true);
+        assert_eq!(v["account_name"], json!("Blackhole"));
+        // visible=false leaves the hex untouched (java parity).
+        let mut v = json!({ "account_name": hex::encode("Blackhole") });
+        rewrite_addresses(&mut v, false);
+        assert_eq!(v["account_name"], json!(hex::encode("Blackhole")));
+    }
 
     #[test]
     fn rewrite_addresses_handles_hex_to_base58() {

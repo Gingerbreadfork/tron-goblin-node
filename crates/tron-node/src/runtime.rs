@@ -444,6 +444,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // (Block-STM; byte-identical to serial). `vm.parallel_exec`
                     // defaults true.
                     parallel_exec: vm.parallel_exec,
+                    // Flipped on below when the historical-state archive
+                    // ([index] capture_state_deltas) is enabled.
+                    capture_state_deltas: false,
                 };
                 (
                     vm.support_constant,
@@ -462,6 +465,118 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 )
             }
         };
+    let mut exec_config = exec_config;
+
+    // === Address-history index (the `[index]` subsystem) ===
+    //
+    // Self-orchestrating: opens (or rebuilds) the dedicated index DB
+    // under <data_dir>/index/db, arms the apply-path hook (persist
+    // per-block transaction-info + wake the follower), and yields the
+    // engine/reader pair that the follower task and the HTTP /v1
+    // surface use below. A failure here logs and disables the index —
+    // it never blocks consensus.
+    let index_parts = if config.index.enable {
+        match open_index_subsystem(&config, &stores) {
+            Ok(parts) => {
+                // Internal-tx capture requires the executor to record
+                // per-frame traces (observational only — no state or
+                // consensus impact). Force it on so `idx_internal`
+                // actually sees data; java-tron operators do the same
+                // via vm.saveInternalTx for their event plugins.
+                if parts.engine.capture_set().internal && !exec_config.save_internal_tx {
+                    info!("index: capture_internal is on — enabling vm.save_internal_tx for trace capture");
+                    exec_config.save_internal_tx = true;
+                }
+                if parts.archive.is_some() {
+                    // The archive consumes the per-block write-set; tell
+                    // the executor to capture it (pure observation — no
+                    // consensus-path behavior change).
+                    exec_config.capture_state_deltas = true;
+                }
+                Some(parts)
+            }
+            Err(e) => {
+                error!(error = %e, "index: subsystem failed to start; continuing WITHOUT the index");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let index_hook = index_parts.as_ref().map(|p| p.hook.clone());
+
+    // Index follower + metrics sampler tasks. The follower is the
+    // unified gap-closing loop: backfill from the local stores while
+    // behind, park on the apply hook's wake-up at the tip, reconcile
+    // reorgs by hash. The sampler mirrors the engine's counters into
+    // the Prometheus surface every 5s.
+    if let Some(parts) = &index_parts {
+        spawn_index_follower(
+            &mut handles,
+            parts.engine.clone(),
+            parts.hook.notify_handle(),
+            shutdown.clone(),
+        );
+        let engine = parts.engine.clone();
+        let archive_sampler = parts
+            .archive
+            .as_ref()
+            .map(|a| (a.reader.clone(), a.counters.clone()));
+        let firehose_sampler = parts
+            .firehose_tail
+            .as_ref()
+            .zip(parts.firehose_counters.as_ref())
+            .map(|(t, c)| (t.clone(), c.clone()));
+        let m = metrics.clone();
+        let mut sd = shutdown.subscribe();
+        handles.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sd.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                let st = engine.status();
+                let c = engine.counters();
+                use std::sync::atomic::Ordering::Relaxed;
+                if let Some((tail, counters)) = &firehose_sampler {
+                    m.set_firehose_stats(
+                        tail.durable_seq(),
+                        counters.entries.load(Relaxed),
+                        counters.unwinds.load(Relaxed),
+                        counters.gap_repaired_blocks.load(Relaxed),
+                    );
+                }
+                if let Some((reader, counters)) = &archive_sampler {
+                    let (base, head) = reader.coverage().ok().flatten().unwrap_or((0, 0));
+                    m.set_archive_stats(
+                        base,
+                        head,
+                        counters.blocks_archived.load(Relaxed),
+                        counters.entries_written.load(Relaxed),
+                        counters.reorg_unwinds.load(Relaxed),
+                        counters.gap_repaired_blocks.load(Relaxed),
+                        counters.coverage_resets.load(Relaxed),
+                    );
+                }
+                m.set_index_stats(
+                    st.cursor.unwrap_or(0),
+                    st.back_edge.unwrap_or(0),
+                    st.floor.unwrap_or(0),
+                    (st.target_head - st.cursor.unwrap_or(0)).max(0),
+                    st.backfill_complete && st.at_tip,
+                    c.blocks_indexed.load(Relaxed),
+                    c.rows_native.load(Relaxed),
+                    c.rows_trc20.load(Relaxed),
+                    c.rows_trc721.load(Relaxed),
+                    c.rows_internal.load(Relaxed),
+                    c.rows_logs.load(Relaxed),
+                    c.reorg_unwinds.load(Relaxed),
+                    c.reorg_rows_deleted.load(Relaxed),
+                    c.missing_txinfo_blocks.load(Relaxed),
+                );
+            }
+        }));
+    }
 
     // === RPC server ===
     if !config.rpc.disabled {
@@ -506,7 +621,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // the JSON-RPC server, so the two surfaces always see identical
     // data — clients can mix and match.
     if !config.grpc.disabled {
-        let grpc_state = stores
+        let mut grpc_state = stores
             .to_rpc_state(config.rpc.chain_id)
             .with_metrics(metrics.clone())
             .with_mempool(mempool.clone())
@@ -514,6 +629,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .with_support_constant(support_constant)
             .with_constant_call_timeout_ms(constant_call_timeout_ms)
             .with_pubsub(pubsub.clone());
+        // The firehose tail service mounts on this same port when the
+        // durable log is enabled.
+        if let Some(handle) = index_parts.as_ref().and_then(|p| p.firehose_tail.clone()) {
+            grpc_state = grpc_state.with_firehose(handle);
+        }
         let addr: std::net::SocketAddr = format!("{}:{}", config.grpc.host, config.grpc.port)
             .parse()
             .map_err(|e: std::net::AddrParseError| RunError::Rpc(e.to_string()))?;
@@ -534,12 +654,30 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // `RpcState` as JSON-RPC / gRPC — all three surfaces are live
     // views over the same underlying chainbase.
     if !config.http.disabled {
-        let http_state = stores
+        let mut http_state = stores
             .to_rpc_state(config.rpc.chain_id)
             .with_metrics(metrics.clone())
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
-            .with_support_constant(support_constant);
+            .with_support_constant(support_constant)
+            // The /v1 surfaces run constant calls too (token metadata,
+            // archive trigger-at-height — the latter over at-height
+            // store views, the slowest read path in the node), so the
+            // wall-clock budget must apply here exactly as it does on
+            // the JSON-RPC and gRPC servers.
+            .with_constant_call_timeout_ms(constant_call_timeout_ms);
+        // The /v1 address-history surface reads the embedded index;
+        // token-metadata resolution additionally needs the constant-
+        // call machinery, which `to_rpc_state` already attached.
+        if let Some(parts) = &index_parts {
+            http_state = http_state.with_index(parts.reader.clone());
+            if let Some(arch) = &parts.archive {
+                http_state = http_state.with_archive(tron_rpc::ArchiveApiState::new(
+                    arch.reader.clone(),
+                    arch.backends.clone(),
+                ));
+            }
+        }
         let addr: std::net::SocketAddr = format!("{}:{}", config.http.host, config.http.port)
             .parse()
             .map_err(|e: std::net::AddrParseError| RunError::Rpc(e.to_string()))?;
@@ -616,6 +754,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         .with_metrics(metrics.clone())
         .with_exec_config(exec_config)
         .with_pubsub(pubsub.clone());
+        let runtime = match &index_hook {
+            Some(hook) => runtime.with_index_hook(hook.clone()),
+            None => runtime,
+        };
         let runtime = if config.storage.snapshot_reorg {
             runtime.with_snapshot_stack(stores.snapshots.clone())
         } else {
@@ -1093,6 +1235,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // scheduler that's mostly a safety net). The decision channel
         // is `eviction_tx`; SyncDrivers `subscribe()` to receive
         // peer-keys to drop.
+        //
+        // The policy's per-peer inputs are live: the sync driver updates
+        // `need_sync_from_peer` on every ChainInventory, `need_sync_from_us`
+        // on every SyncBlockChain it serves, and `block_recv_ms` on every
+        // Block frame — so the isolation-breakout rule (no block from ANY
+        // peer for 60s while we hold adv-eligible peers) can actually fire.
+        // `open_full_tcp_disconnect` stays false deliberately: the random-
+        // elimination rule exists for nodes accepting inbound connections at
+        // their cap, which we don't yet do; with all-outbound dialers it
+        // would only churn useful peers.
         {
             let resilience = crate::resilience::ResilienceService {
                 config: crate::resilience::ResilienceConfig {
@@ -1259,6 +1411,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 Some(dynamic_pool.clone())
             };
             let fetch_pool_for_peer = fetch_pool.clone();
+            let index_hook_for_peer = index_hook.clone();
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
                     .with_metrics(metrics_for_peer)
@@ -1281,6 +1434,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 }
                 if let Some(fp) = fetch_pool_for_peer {
                     driver = driver.with_fetch_pool(fp);
+                }
+                if let Some(hook) = index_hook_for_peer {
+                    driver = driver.with_index_hook(hook);
                 }
                 if let Some(stack) = snapshot_stack_for_peer {
                     driver = driver.with_snapshot_stack(stack);
@@ -1476,6 +1632,378 @@ fn random_node_id_64() -> Vec<u8> {
         id[i] = bytes[i % bytes.len()] ^ (i as u8).wrapping_mul(0x9E);
     }
     id.to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// Address-history index wiring
+// ---------------------------------------------------------------------------
+
+/// Live handles for the `[index]` subsystem.
+struct IndexParts {
+    hook: Arc<crate::index_hook::IndexHook>,
+    engine: Arc<tron_index::IndexEngine>,
+    reader: tron_index::IndexReader,
+    /// Historical-state archive (P2, `capture_state_deltas`) — reader
+    /// + per-store live backends for at-height views, plus the
+    /// writer's counters for the metrics sampler.
+    archive: Option<ArchiveParts>,
+    /// Firehose tail handle (P3, `[index.firehose]`) — handed to the
+    /// gRPC server so external consumers can tail the durable log.
+    firehose_tail: Option<tron_index::FirehoseTailHandle>,
+    firehose_counters: Option<Arc<crate::firehose::FirehoseCounters>>,
+}
+
+struct ArchiveParts {
+    reader: tron_index::ArchiveReader,
+    counters: Arc<tron_index::ArchiveCounters>,
+    backends: Vec<(tron_chainbase::UndoStoreId, Arc<dyn tron_chainbase::KvBackend>)>,
+}
+
+/// Every state store the executor's write-set can touch, paired with
+/// its `StoreId` — the archive's gap-repair source and the raw
+/// backends behind the `/v1/archive` at-height views.
+fn store_id_backends(
+    stores: &OpenedStores,
+) -> Vec<(tron_chainbase::UndoStoreId, Arc<dyn tron_chainbase::KvBackend>)> {
+    use tron_chainbase::UndoStoreId as Id;
+    vec![
+        (Id::Accounts, stores.accounts.clone()),
+        (Id::Witnesses, stores.witnesses.clone()),
+        (Id::Votes, stores.votes.clone()),
+        (Id::Delegation, stores.delegation.clone()),
+        (Id::DelegatedResources, stores.delegated_resources.clone()),
+        (Id::DynProps, stores.dyn_props.clone()),
+        (Id::Proposals, stores.proposals.clone()),
+        (Id::NameIndex, stores.name_index.clone()),
+        (Id::IdIndex, stores.id_index.clone()),
+        (Id::AssetV1, stores.asset_v1.clone()),
+        (Id::AssetV2, stores.asset_v2.clone()),
+        (Id::Contracts, stores.contracts.clone()),
+        (Id::Abi, stores.abi.clone()),
+        (Id::ExchangeV1, stores.exchange_v1.clone()),
+        (Id::ExchangeV2, stores.exchange_v2.clone()),
+        (Id::MarketOrders, stores.market_orders.clone()),
+        (Id::Nullifiers, stores.nullifiers.clone()),
+        (Id::MerkleTrees, stores.merkle_trees.clone()),
+        (Id::Code, stores.code.clone()),
+        (Id::StorageRow, stores.storage_row.clone()),
+        (Id::ContractState, stores.contract_state.clone()),
+        (Id::BlockIndex, stores.block_index.clone()),
+        (Id::WitnessSchedule, stores.witness_schedule.clone()),
+        (
+            Id::DelegatedResourceAccountIndex,
+            stores.delegated_resource_account_index.clone(),
+        ),
+    ]
+}
+
+/// Open (or rebuild) the dedicated index DB and assemble the
+/// hook/engine/reader trio. The DB lives at `<data_dir>/index/db`,
+/// is a separate RocksDB instance (its compactions never touch the
+/// consensus stores; memory is bounded by the process-wide shared
+/// cache + write-buffer manager), and is **disposable by contract**:
+/// a format-version bump or scope change deletes and re-derives it
+/// from the node's own committed stores — the rebuild path IS the
+/// follower's ordinary cold start.
+fn open_index_subsystem(
+    config: &NodeConfig,
+    stores: &OpenedStores,
+) -> Result<IndexParts, String> {
+    use tron_chainbase::RocksDbBackend;
+    use tron_index::{IndexDb, IndexEngine, IndexReader, InitOutcome};
+
+    let caps = config.index.capture_set();
+    let opts = config.index.engine_options();
+    let fingerprint = caps.fingerprint(opts.start_height);
+    let dir = config.data_dir.join("index").join("db");
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+    }
+    let open = || -> Result<Arc<dyn tron_chainbase::KvBackend>, String> {
+        RocksDbBackend::open_tuned(
+            &dir,
+            config.storage.write_buffer_size_mb,
+            config.storage.max_open_files,
+        )
+        .map(|b| Arc::new(b) as Arc<dyn tron_chainbase::KvBackend>)
+        .map_err(|e| format!("open index db {dir:?}: {e:?}"))
+    };
+
+    let mut backend = open()?;
+    match IndexDb::new(backend.clone())
+        .check_or_init(fingerprint)
+        .map_err(|e| e.to_string())?
+    {
+        InitOutcome::Fresh => {
+            info!(scope = ?config.index.scope, "index: fresh database stamped");
+        }
+        InitOutcome::Compatible => {}
+        InitOutcome::NeedsRebuild { reason } => {
+            // Loud by design: a multi-TB index rebuild is hours of
+            // work and the operator should know why it happened.
+            warn!(
+                reason,
+                "index: REBUILDING from scratch — dropping {dir:?} and re-deriving from local stores"
+            );
+            drop(backend);
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {dir:?}: {e}"))?;
+            backend = open()?;
+            IndexDb::new(backend.clone())
+                .stamp(fingerprint)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let db = IndexDb::new(backend);
+
+    // Historical-state archive (P2) — its own DB instance: unlike the
+    // tx-history index it is NOT a disposable projection (deltas are
+    // not re-derivable), so it must never share the index DB's
+    // wipe-and-rebuild lifecycle.
+    let mut archive_parts: Option<ArchiveParts> = None;
+    let mut hook = crate::index_hook::IndexHook::new(stores.transaction_ret.clone())
+        .with_tx_refs(stores.transactions.clone());
+    if config.index.capture_state_deltas {
+        if config.storage.snapshot_reorg {
+            error!(
+                "index: capture_state_deltas requires the BlockSession commit path \
+                 (storage.snapshot_reorg = false) — the snapshot-stack path does not \
+                 materialize per-block write-sets. Archive DISABLED."
+            );
+        } else {
+            let arch_dir = config.data_dir.join("archive").join("db");
+            if let Some(parent) = arch_dir.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {parent:?}: {e}"))?;
+            }
+            let arch_backend: Arc<dyn tron_chainbase::KvBackend> = Arc::new(
+                RocksDbBackend::open_tuned(
+                    &arch_dir,
+                    config.storage.write_buffer_size_mb,
+                    config.storage.max_open_files,
+                )
+                .map_err(|e| format!("open archive db {arch_dir:?}: {e:?}"))?,
+            );
+            let backends = store_id_backends(stores);
+            let writer = Arc::new(tron_index::ArchiveWriter::new(
+                arch_backend,
+                Some(tron_chainbase::BlockUndoStore::new(stores.block_undo.clone())),
+                backends.clone(),
+            ));
+            let fresh = writer.check_or_init().map_err(|e| e.to_string())?;
+            let coverage = writer.reader().coverage().map_err(|e| e.to_string())?;
+            info!(fresh, ?coverage, dir = ?arch_dir, "index: historical-state archive enabled");
+            archive_parts = Some(ArchiveParts {
+                reader: writer.reader(),
+                counters: writer.counters(),
+                backends,
+            });
+            hook = hook.with_archive(writer);
+        }
+    }
+    // Firehose external-sink log (P3) — its own durable artifact under
+    // <data_dir>/firehose/, reconciled against consensus at open (a
+    // log ahead of the recovered chain emits an UNWIND; a log behind
+    // repairs from the stores on the next apply).
+    let mut firehose_tail: Option<tron_index::FirehoseTailHandle> = None;
+    let mut firehose_counters: Option<Arc<crate::firehose::FirehoseCounters>> = None;
+    if config.index.firehose.enable {
+        let fh_dir = config.data_dir.join("firehose");
+        let writer = Arc::new(
+            crate::firehose::FirehoseWriter::open(
+                &fh_dir,
+                config.index.firehose.retain_mb.saturating_mul(1024 * 1024),
+                stores.blocks.clone(),
+                stores.block_index.clone(),
+                stores.transaction_ret.clone(),
+                stores.dyn_props.clone(),
+            )
+            .map_err(|e| format!("firehose open {fh_dir:?}: {e}"))?,
+        );
+        firehose_tail = Some(writer.tail_handle());
+        firehose_counters = Some(writer.counters());
+        info!(dir = ?fh_dir, retain_mb = config.index.firehose.retain_mb, "index: firehose log enabled");
+        hook = hook.with_firehose(writer);
+    }
+    let hook = Arc::new(hook);
+    let engine = Arc::new(IndexEngine::new(
+        db.clone(),
+        stores.blocks.clone(),
+        stores.block_index.clone(),
+        stores.transaction_ret.clone(),
+        stores.dyn_props.clone(),
+        caps,
+        opts,
+    ));
+    let reader = IndexReader::new(
+        db,
+        stores.blocks.clone(),
+        stores.block_index.clone(),
+        stores.dyn_props.clone(),
+    )
+    .with_solidified_stream(config.index.engine_options().follow_solidified);
+    info!(
+        ?caps,
+        head_first = config.index.engine_options().head_first,
+        dir = ?dir,
+        "index: subsystem ready"
+    );
+    Ok(IndexParts { hook, engine, reader, archive: archive_parts, firehose_tail, firehose_counters })
+}
+
+/// Spawn the follower loop: tick the engine on a blocking thread,
+/// park on the apply hook's wake-up (with a 3s poll fallback — a
+/// missed signal costs nothing, the stores are the queue), and emit
+/// the count-gated progress line while a gap is being closed.
+fn spawn_index_follower(
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    engine: Arc<tron_index::IndexEngine>,
+    notify: Arc<tokio::sync::Notify>,
+    shutdown: ShutdownSignal,
+) {
+    let mut sd = shutdown.subscribe();
+    handles.push(tokio::spawn(async move {
+        // Startup decision line — the (cursor, head, floor) triple
+        // makes the chosen behavior legible at a glance.
+        {
+            let st = engine.status();
+            info!(
+                cursor = st.cursor,
+                indexed_from = st.back_edge,
+                floor = st.floor,
+                head = st.target_head,
+                "🧌 index follower starting"
+            );
+        }
+        let mut progress = IndexProgress::new(&engine);
+        loop {
+            if shutdown.is_shutdown() {
+                break;
+            }
+            let eng = engine.clone();
+            let tick = match tokio::task::spawn_blocking(move || eng.tick()).await {
+                Ok(t) => t,
+                Err(join_err) => {
+                    error!(error = %join_err, "index: follower tick panicked; stopping");
+                    break;
+                }
+            };
+            match tick {
+                Ok(tron_index::Tick::Parked) | Ok(tron_index::Tick::NotReady) => {
+                    progress.log_caught_up(&engine);
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                        _ = sd.recv() => break,
+                    }
+                }
+                Ok(_) => progress.maybe_log(&engine),
+                Err(
+                    e @ (tron_index::IndexError::Corrupt(_)
+                    | tron_index::IndexError::NewerFormat { .. }),
+                ) => {
+                    // The tx-history index is a disposable projection —
+                    // unlike the archive/firehose, delete-and-rebuild is
+                    // always the correct remedy here.
+                    error!(
+                        error = %e,
+                        "index: follower stopped — delete <data_dir>/index and restart to rebuild"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "index: tick failed; retrying in 5s");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                        _ = sd.recv() => break,
+                    }
+                }
+            }
+        }
+        debug!("index follower exiting");
+    }));
+}
+
+/// Count-gated progress reporting for the index follower, in the same
+/// voice as the sync driver's catch-up line.
+struct IndexProgress {
+    last_log: std::time::Instant,
+    last_blocks: u64,
+    caught_up_logged: bool,
+    counters: Arc<tron_index::IndexCounters>,
+}
+
+impl IndexProgress {
+    fn new(engine: &tron_index::IndexEngine) -> Self {
+        Self {
+            last_log: std::time::Instant::now(),
+            last_blocks: 0,
+            caught_up_logged: false,
+            counters: engine.counters(),
+        }
+    }
+
+    fn remaining(st: &tron_index::IndexStatus) -> i64 {
+        let forward = (st.target_head - st.cursor.unwrap_or(st.target_head)).max(0);
+        let backward = match (st.back_edge, st.floor) {
+            (Some(b), Some(f)) => (b - f).max(0),
+            _ => 0,
+        };
+        forward + backward
+    }
+
+    fn maybe_log(&mut self, engine: &tron_index::IndexEngine) {
+        let elapsed = self.last_log.elapsed();
+        if elapsed < Duration::from_secs(5) {
+            return;
+        }
+        let st = engine.status();
+        let blocks = self
+            .counters
+            .blocks_indexed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let rate = (blocks.saturating_sub(self.last_blocks)) as f64 / elapsed.as_secs_f64();
+        let remaining = Self::remaining(&st);
+        let eta_ms = if rate > 0.0 {
+            ((remaining as f64 / rate) * 1000.0) as i64
+        } else {
+            0
+        };
+        info!(
+            "🧌 index backfill cursor #{} head #{} backfill-edge #{} floor #{}  ({} to go)  {:.0} blk/s{}",
+            crate::logfmt::commas(st.cursor.unwrap_or(0)),
+            crate::logfmt::commas(st.target_head),
+            crate::logfmt::commas(st.back_edge.unwrap_or(0)),
+            crate::logfmt::commas(st.floor.unwrap_or(0)),
+            crate::logfmt::commas(remaining),
+            rate,
+            if eta_ms > 0 {
+                format!("  eta {}", crate::logfmt::duration_ms(eta_ms))
+            } else {
+                String::new()
+            },
+        );
+        self.last_log = std::time::Instant::now();
+        self.last_blocks = blocks;
+        // Re-arm the caught-up transition if we fell well behind.
+        if remaining > 1_000 {
+            self.caught_up_logged = false;
+        }
+    }
+
+    fn log_caught_up(&mut self, engine: &tron_index::IndexEngine) {
+        if self.caught_up_logged {
+            return;
+        }
+        let st = engine.status();
+        if st.at_tip && st.backfill_complete {
+            info!(
+                "🧌 index caught up to head at #{} — now following live",
+                crate::logfmt::commas(st.cursor.unwrap_or(0)),
+            );
+            self.caught_up_logged = true;
+        }
+    }
 }
 
 /// True if `dyn_props` already has a head-pointer entry. Used to

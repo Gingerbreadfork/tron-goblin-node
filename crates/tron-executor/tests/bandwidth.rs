@@ -50,6 +50,17 @@ struct Env {
     asset_v2: AssetIssueV2Store,
 }
 
+/// Seed the destination account: a transfer to a MISSING account takes
+/// java's `contractCreateNewAccount` branch (tested separately below),
+/// so every test of the ordinary cascade needs the recipient to exist.
+fn seed_recipient(env: &Env) {
+    put(
+        &env.accounts,
+        BOB,
+        Account { address: BOB.to_vec(), balance: 1, ..Default::default() },
+    );
+}
+
 impl Env {
     fn new() -> Self {
         Self {
@@ -147,6 +158,7 @@ fn make_transfer_asset_tx(asset_name: &[u8]) -> (Transaction, TxContract) {
 #[test]
 fn small_tx_charges_against_free_quota() {
     let env = Env::new();
+    seed_recipient(&env);
     put(
         &env.accounts,
         ALICE,
@@ -171,6 +183,7 @@ fn small_tx_charges_against_free_quota() {
 #[test]
 fn account_with_frozen_bandwidth_consumes_frozen_first() {
     let env = Env::new();
+    seed_recipient(&env);
     // Frozen bandwidth: 1000 TRX (1_000_000_000 sun) — enough that the
     // global-ratio scaling will produce a non-zero net_limit.
     // We also seed TOTAL_NET_WEIGHT so the V2 formula produces a real cap.
@@ -200,6 +213,7 @@ fn account_with_frozen_bandwidth_consumes_frozen_first() {
 #[test]
 fn free_quota_exhaustion_falls_back_to_trx_fee() {
     let env = Env::new();
+    seed_recipient(&env);
     env.dyn_props.put_long(b"FREE_NET_LIMIT", 1);
     put(
         &env.accounts,
@@ -224,6 +238,7 @@ fn free_quota_exhaustion_falls_back_to_trx_fee() {
 #[test]
 fn insufficient_balance_for_fee_returns_error() {
     let env = Env::new();
+    seed_recipient(&env);
     env.dyn_props.put_long(b"FREE_NET_LIMIT", 1);
     put(
         &env.accounts,
@@ -286,6 +301,7 @@ fn seed_asset(env: &Env, public_limit: i64, free_limit: i64) {
 #[test]
 fn transfer_asset_uses_issuer_quota_when_funded() {
     let env = Env::new();
+    seed_recipient(&env);
     // V1 mode (allow_same_token_name == 0): asset_name is the token name bytes.
     seed_asset(&env, /*public_limit=*/ 1_000_000, /*free_limit=*/ 1_000_000);
     put(
@@ -327,6 +343,7 @@ fn transfer_asset_uses_issuer_quota_when_funded() {
 #[test]
 fn transfer_asset_falls_through_when_public_quota_exhausted() {
     let env = Env::new();
+    seed_recipient(&env);
     // public_free_asset_net_limit=1 ⇒ even a tiny tx busts it.
     seed_asset(&env, /*public_limit=*/ 1, /*free_limit=*/ 1_000_000);
     put(
@@ -348,6 +365,7 @@ fn transfer_asset_falls_through_when_public_quota_exhausted() {
 #[test]
 fn transfer_asset_falls_through_when_issuer_net_insufficient() {
     let env = Env::new();
+    seed_recipient(&env);
     seed_asset(&env, /*public_limit=*/ 1_000_000, /*free_limit=*/ 1_000_000);
     // Zero out the issuer's frozen bandwidth.
     let mut issuer_acct = env.accounts.get(&Address::from_raw(ISSUER)).unwrap().unwrap();
@@ -374,6 +392,7 @@ fn transfer_asset_falls_through_when_issuer_net_insufficient() {
 #[test]
 fn public_net_accumulator_blocks_free_quota_when_exhausted() {
     let env = Env::new();
+    seed_recipient(&env);
     // Pre-set PUBLIC_NET_USAGE near the limit so the next tx is rejected
     // from the free path → falls to TRX fee.
     env.dyn_props.save_public_net_limit(100);
@@ -420,4 +439,105 @@ fn increase_adds_new_usage_immediately() {
     // collapses to roughly 499.
     let v = increase(0, 500, 0, 0);
     assert!((499..=500).contains(&v), "got {v}");
+}
+
+// ---------------------------------------------------------------------
+// 5. contractCreateNewAccount — the special new-account charge
+// ---------------------------------------------------------------------
+
+#[test]
+fn transfer_to_missing_account_burns_the_flat_create_fee() {
+    let env = Env::new();
+    // BOB deliberately absent; ALICE has balance but no frozen net.
+    put(
+        &env.accounts,
+        ALICE,
+        Account { address: ALICE.to_vec(), balance: 10_000_000, ..Default::default() },
+    );
+    let (tx, contract) = make_transfer_tx();
+    let outcome =
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+    let fee = match outcome {
+        BandwidthCharge::CreateNewAccountFee { fee_sun } => fee_sun,
+        other => panic!("expected CreateNewAccountFee, got {other:?}"),
+    };
+    assert_eq!(fee, 100_000, "DEFAULT_CREATE_ACCOUNT_FEE = 0.1 TRX");
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    assert_eq!(after.balance, 10_000_000 - fee);
+    // Free quota untouched — the create branch never falls through to it.
+    assert_eq!(after.free_net_usage, 0);
+    assert_eq!(env.dyn_props.get_long(b"BURN_TRX_AMOUNT").unwrap(), fee);
+    assert_eq!(env.dyn_props.get_long(b"TOTAL_CREATE_ACCOUNT_COST").unwrap(), fee);
+}
+
+#[test]
+fn transfer_to_missing_account_uses_frozen_net_at_the_new_account_rate() {
+    let env = Env::new();
+    env.dyn_props.save_total_net_weight(1_000);
+    env.dyn_props.save_unfreeze_delay_days(1);
+    let mut acct = Account { address: ALICE.to_vec(), balance: 1_000, ..Default::default() };
+    acct.frozen_v2.push(FreezeV2 { r#type: 0, amount: 1_000_000_000 });
+    put(&env.accounts, ALICE, acct);
+    let (tx, contract) = make_transfer_tx();
+    let outcome =
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+    match outcome {
+        BandwidthCharge::CreateNewAccountFrozen { net_cost, new_net_usage } => {
+            // Default createNewAccountBandwidthRate = 1 → cost == bytes.
+            assert!(net_cost > 0);
+            assert!(new_net_usage > 0);
+        }
+        other => panic!("expected CreateNewAccountFrozen, got {other:?}"),
+    }
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    assert!(after.net_usage > 0);
+    assert_eq!(after.balance, 1_000, "no TRX debit when frozen covers it");
+}
+
+#[test]
+fn create_branch_with_nothing_to_pay_is_a_hard_error() {
+    let env = Env::new();
+    put(
+        &env.accounts,
+        ALICE,
+        Account { address: ALICE.to_vec(), balance: 5, ..Default::default() },
+    );
+    let (tx, contract) = make_transfer_tx();
+    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+        .unwrap_err();
+    assert!(matches!(err, BandwidthError::InsufficientForNewAccount { .. }), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------
+// 6. supportVM byte accounting — the MAX_RESULT_SIZE_IN_TX padding
+// ---------------------------------------------------------------------
+
+#[test]
+fn support_vm_pads_the_charged_bytes_by_max_result_size() {
+    let bytes_with_flag = |vm: bool| -> i64 {
+        let env = Env::new();
+        seed_recipient(&env);
+        if vm {
+            env.dyn_props.put_long(b"ALLOW_CREATION_OF_CONTRACTS", 1);
+        }
+        put(
+            &env.accounts,
+            ALICE,
+            Account { address: ALICE.to_vec(), balance: 10_000_000, ..Default::default() },
+        );
+        let (tx, contract) = make_transfer_tx();
+        match consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+            .expect("ok")
+        {
+            BandwidthCharge::Free { bytes, .. } => bytes,
+            other => panic!("expected Free, got {other:?}"),
+        }
+    };
+    let plain = bytes_with_flag(false);
+    let padded = bytes_with_flag(true);
+    assert_eq!(
+        padded,
+        plain + tron_executor::bandwidth::MAX_RESULT_SIZE_IN_TX,
+        "supportVM adds the 64-byte per-contract result padding"
+    );
 }

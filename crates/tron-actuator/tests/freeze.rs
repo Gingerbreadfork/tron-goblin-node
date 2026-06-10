@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use hex_literal::hex;
 use tron_actuator::{freeze, freeze_v2, ActuatorError};
-use tron_chainbase::{AccountStore, DynamicPropertiesStore, KvBackend, MemBackend};
+use tron_chainbase::{
+    AccountStore, DelegatedResourceStore, DelegationStore, DynamicPropertiesStore, KvBackend,
+    MemBackend, VotesStore,
+};
 use tron_crypto::address::Address;
 use tron_proto::account::{Frozen, FreezeV2 as FreezeV2Entry};
 use tron_proto::{
@@ -215,7 +218,7 @@ fn unfreeze_v1_rejects_missing_owner() {
         resource: 0,
         receiver_address: Vec::new(),
     };
-    let err = freeze::validate_unfreeze_balance(&accounts, &dp, &c).unwrap_err();
+    let err = freeze::validate_unfreeze_balance(&accounts, &dp, &DelegatedResourceStore::new(mem()), &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing), "got: {err:?}");
 }
 
@@ -229,7 +232,7 @@ fn unfreeze_v1_rejects_when_no_frozen_entries() {
         resource: 0,
         receiver_address: Vec::new(),
     };
-    let err = freeze::validate_unfreeze_balance(&accounts, &dp, &c).unwrap_err();
+    let err = freeze::validate_unfreeze_balance(&accounts, &dp, &DelegatedResourceStore::new(mem()), &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NothingToUnfreeze), "got: {err:?}");
 }
 
@@ -253,7 +256,7 @@ fn unfreeze_v1_rejects_when_all_entries_still_locked() {
         resource: 0,
         receiver_address: Vec::new(),
     };
-    let err = freeze::validate_unfreeze_balance(&accounts, &dp, &c).unwrap_err();
+    let err = freeze::validate_unfreeze_balance(&accounts, &dp, &DelegatedResourceStore::new(mem()), &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NothingToUnfreeze), "got: {err:?}");
 }
 
@@ -283,8 +286,19 @@ fn unfreeze_v1_returns_only_expired_entries() {
         resource: 0,
         receiver_address: Vec::new(),
     };
-    freeze::validate_unfreeze_balance(&accounts, &dp, &c).unwrap();
-    freeze::execute_unfreeze_balance(&accounts, &dp, &c).unwrap();
+    freeze::validate_unfreeze_balance(&accounts, &dp, &DelegatedResourceStore::new(mem()), &c).unwrap();
+    let votes = VotesStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    freeze::execute_unfreeze_balance(
+        &accounts,
+        &dp,
+        &votes,
+        &delegation,
+        &DelegatedResourceStore::new(mem()),
+        None,
+        &c,
+    )
+    .unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     // Only the expired 10 TRX returned to balance.
     assert_eq!(alice.balance, 10 * PRECISION);
@@ -662,7 +676,10 @@ fn unfreeze_v2_partial_unfreeze_only_subtracts_delta_from_global_weight() {
         unfreeze_balance: 30 * PRECISION,
         resource: 0,
     };
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &c_unfreeze).unwrap();
+    let votes = VotesStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &c_unfreeze)
+        .unwrap();
     assert_eq!(dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0), 70);
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bw_slot = alice.frozen_v2.iter().find(|f| f.r#type == 0).unwrap();
@@ -692,7 +709,10 @@ fn unfreeze_v2_full_unfreeze_zeroes_resource_bucket_and_global_weight() {
         unfreeze_balance: 100 * PRECISION,
         resource: 1,
     };
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &c_unfreeze).unwrap();
+    let votes = VotesStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &c_unfreeze)
+        .unwrap();
     assert_eq!(dp.get_long(b"TOTAL_ENERGY_WEIGHT").unwrap_or(0), 0);
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let energy_slot = alice.frozen_v2.iter().find(|f| f.r#type == 1).unwrap();

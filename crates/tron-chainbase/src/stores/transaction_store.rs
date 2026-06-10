@@ -52,6 +52,25 @@ impl TransactionStore {
         Ok(())
     }
 
+    /// Put a whole block's worth of block-references in one atomic
+    /// batch. Used by the apply hook (one batch per block beats
+    /// hundreds of individual puts on the apply path).
+    pub fn put_block_refs(
+        &self,
+        refs: impl IntoIterator<Item = ([u8; 32], i64)>,
+    ) -> Result<(), StoreError> {
+        let ops: Vec<crate::backend::WriteOp> = refs
+            .into_iter()
+            .map(|(tx_id, num)| {
+                crate::backend::WriteOp::Put(tx_id.to_vec(), num.to_be_bytes().to_vec())
+            })
+            .collect();
+        if !ops.is_empty() {
+            self.backend.write_batch(&ops)?;
+        }
+        Ok(())
+    }
+
     /// Put a full transaction (pre-inclusion).
     pub fn put_full(&self, tx_id: &[u8; 32], tx: &Transaction) -> Result<(), StoreError> {
         self.backend.put(tx_id, &tx.encode_to_vec())?;

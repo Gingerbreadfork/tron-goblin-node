@@ -166,6 +166,10 @@ pub enum ActuatorError {
     NoExpiredUnfreeze,
     #[error("delegation not enabled")]
     DelegationDisabled,
+    #[error("receiverAddress must not be the same as ownerAddress")]
+    ReceiverSameAsOwner,
+    #[error("delegated resource does not exist")]
+    DelegatedResourceMissing,
     #[error("delegation receiver invalid or same as owner")]
     InvalidDelegationReceiver,
     #[error("delegation receiver is a contract")]

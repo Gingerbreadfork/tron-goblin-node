@@ -375,6 +375,33 @@ impl RocksDbBackend {
         out
     }
 
+    /// Walk backward from (exclusive) `before`, returning up to
+    /// `limit` pairs in descending key order. Native RocksDB
+    /// `seek_for_prev` + `prev` — no full-table scan. The reverse
+    /// mirror of [`rocks_scan_from`](Self::rocks_scan_from); used by
+    /// the trait's `scan_back_from` for cursor-resumable reverse
+    /// pagination (the `tron-index` ascending-order pages).
+    fn rocks_scan_back_from(&self, before: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut iter = self.db.raw_iterator();
+        // `seek_for_prev` lands on the last key <= `before`; the bound
+        // is exclusive, so step off an exact match before collecting.
+        iter.seek_for_prev(before);
+        if iter.valid() && iter.key() == Some(before) {
+            iter.prev();
+        }
+        while iter.valid() && out.len() < limit {
+            if let (Some(k), Some(v)) = (iter.key(), iter.value()) {
+                out.push((k.to_vec(), v.to_vec()));
+            }
+            iter.prev();
+        }
+        out
+    }
+
     /// Prefix-iterate via RocksDB's native iterator. Stops at the
     /// first key that doesn't start with `prefix`.
     fn rocks_scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -458,6 +485,14 @@ impl KvBackend for RocksDbBackend {
 
     fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
         Ok(self.rocks_scan_prefix(prefix))
+    }
+
+    fn scan_back_from(
+        &self,
+        before: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        Ok(self.rocks_scan_back_from(before, limit))
     }
 
     fn write_batch(&self, ops: &[WriteOp]) -> Result<(), KvError> {

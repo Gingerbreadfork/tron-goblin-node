@@ -1,6 +1,7 @@
 //! CodeStore — directory name `code`.
 //!
-//! Key:   contract code hash (typically 32-byte Keccak-256 of the bytecode).
+//! Key:   21-byte contract address (java-tron CodeStore keying — the
+//!        TVM writes runtime code at `stores.code.put(address, ...)`).
 //! Value: raw bytecode bytes (NOT protobuf-wrapped).
 //!
 //! Source: `CodeStore` — `CodeCapsule.getData()` returns the bytecode

@@ -81,6 +81,17 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (one RTT), so 5s is generous while still failing dead hosts fast.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on a single outbound frame write. A peer that stops READING
+/// (zero TCP window, socket left open) otherwise parks the writer task inside
+/// `send_frame` forever: reads have their own timeout, but every liveness
+/// check (keepalive deadline, eviction, watchdogs) lives at the caller's loop
+/// top, which a parked send never returns to. The cheapest trigger is serving
+/// a 100-block `FetchInvData` (10-20 MB) to a peer that never drains it — a
+/// few such sockets would pin that many driver slots until process restart.
+/// 30s passes any genuine congestion a healthy peer recovers from; a peer
+/// that can't drain a frame in 30s is effectively dead to us anyway.
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A bidirectional framed connection to a single peer.
 pub struct PeerConnection<S> {
     framed: Framed<S, TronFrameCodec>,
@@ -108,6 +119,9 @@ pub struct PeerConnection<S> {
     /// [`DEFAULT_HANDSHAKE_TIMEOUT`]; see
     /// [`PeerConnection::with_handshake_timeout`].
     handshake_timeout: Duration,
+    /// Per-frame upper bound on outbound writes. Defaults to
+    /// [`DEFAULT_SEND_TIMEOUT`]; see [`PeerConnection::with_send_timeout`].
+    send_timeout: Duration,
 }
 
 impl<S> PeerConnection<S>
@@ -124,6 +138,7 @@ where
             early_frame: None,
             compress_wrap: false,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            send_timeout: DEFAULT_SEND_TIMEOUT,
         }
     }
 
@@ -141,6 +156,27 @@ where
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
+    }
+
+    /// Override the per-frame send timeout (default
+    /// [`DEFAULT_SEND_TIMEOUT`]). Builder-style.
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// Write one codec frame with the send timeout applied. EVERY outbound
+    /// write must funnel through here — an un-bounded `framed.send` against
+    /// a peer that stopped reading parks the task forever (see
+    /// [`DEFAULT_SEND_TIMEOUT`]).
+    async fn send_bounded(&mut self, frame: Frame) -> Result<(), FrameError> {
+        match tokio::time::timeout(self.send_timeout, self.framed.send(frame)).await {
+            Ok(r) => r,
+            Err(_elapsed) => Err(FrameError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "frame send timed out (peer not reading)",
+            ))),
+        }
     }
 
     /// Run the libp2p connection-layer handshake. **Must be called
@@ -173,12 +209,11 @@ where
             timestamp: local.timestamp_ms,
             version: local.version,
         };
-        self.framed
-            .send(Frame {
-                ty: MessageType::Libp2pHandshakeHello,
-                payload: Bytes::from(outbound.encode_to_vec()),
-            })
-            .await?;
+        self.send_bounded(Frame {
+            ty: MessageType::Libp2pHandshakeHello,
+            payload: Bytes::from(outbound.encode_to_vec()),
+        })
+        .await?;
 
         let frame = self.next_frame_required().await?;
 
@@ -361,14 +396,13 @@ where
             let ty_byte = proto_bytes[0];
             let ty = MessageType::from_byte(ty_byte).map_err(FrameError::BadType)?;
             return self
-                .framed
-                .send(Frame {
+                .send_bounded(Frame {
                     ty,
                     payload: Bytes::from(proto_bytes[1..].to_vec()),
                 })
                 .await;
         }
-        self.framed.send(frame).await
+        self.send_bounded(frame).await
     }
 
     /// Read the next frame off the wire. `None` on clean EOF.

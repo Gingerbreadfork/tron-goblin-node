@@ -1,0 +1,23 @@
+[package]
+name = "tron-firehose-postgres"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reference firehose consumer: tails a tron-goblin-node's tronfirehose.Firehose gRPC stream into a Postgres explorer schema. Out-of-process by design — never linked into the node."
+
+# Deliberately NOT a dependency of tron-node / tron-grpc: the node's
+# default build carries no sink-side deps. This binary runs its own
+# tonic codegen over the same proto/firehose.proto the node serves.
+
+[dependencies]
+tonic = { workspace = true }
+prost.workspace = true
+tokio = { workspace = true }
+tokio-postgres = "0.7"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true
+
+[build-dependencies]
+tonic-build = { workspace = true }

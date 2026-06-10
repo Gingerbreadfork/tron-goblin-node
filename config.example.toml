@@ -231,6 +231,120 @@ lru_cache_size = 500
 
 
 # -----------------------------------------------------------------------------
+# [index] — built-in address-history indexer + TronGrid-style /v1 API
+# -----------------------------------------------------------------------------
+# Turns the node into its own TronGrid-compatible history indexer. With
+# `enable = true` and an extracted archive snapshot in the data dir, the node
+# detects an empty index over the populated block store and BACKFILLS
+# AUTOMATICALLY (no command), prints a progress line with rate, catches up to
+# the live head, and follows forever (reorg-reconciling by hash,
+# restart-resuming). It then serves address history over the HTTP surface:
+#   GET /v1/accounts/{address}/transactions
+#   GET /v1/accounts/{address}/transactions/trc20
+#   GET /v1/accounts/{address}/transactions/trc721     (tron-goblin extension)
+#   GET /v1/accounts/{address}/transactions/internal   (tron-goblin extension)
+#   GET /v1/contracts/{address}/events                 (needs scope = "all")
+# Same params as TronGrid (limit, fingerprint, only_from/only_to,
+# only_confirmed/only_unconfirmed, contract_address, min/max_timestamp,
+# order_by) — drop-in for existing TronWeb code, self-hosted, no keys.
+#
+# Zero external infrastructure: everything lives under <data_dir>/index/,
+# which is DISPOSABLE — delete it any time; the node rebuilds it
+# automatically (a format-version bump or scope change also rebuilds, with a
+# loud log line).
+#
+# Fast TRC20/internal-tx backfill REQUIRES the snapshot to include a
+# transaction-info store (transactionRetStore). Ranges without it index
+# native kinds only (counted in tron_node_index_missing_txinfo_blocks_total)
+# — historical receipts cannot be regenerated without the historical state
+# they executed against. Once the index is enabled, the node persists
+# transaction-info for every newly-applied block, so live history is always
+# complete.
+#
+# Disk: a full-history mainnet index at the default scope is terabyte-scale
+# — the same order as the archive snapshot itself. Bound it with `scope`,
+# `capture_*`, or `backfill.start_height`.
+[index]
+# Master switch. false (default) = subsystem never starts; no files, no
+# threads, one no-op branch per applied block.
+enable = false
+
+# Index size/coverage preset. Sets the capture_* flags below; an explicit
+# capture_* key overrides the preset.
+#   "native"  — TRX/TRC10/account-level only (smallest)
+#   "trc20"   — + TRC20/TRC721 transfers + internal txs (default;
+#               wallets/explorers)
+#   "all"     — + all VM log rows (largest; serves the
+#               /v1/contracts/{address}/events search)
+scope = "trc20"
+
+# Per-dimension overrides (uncomment to override the scope preset).
+# capture_native   = true
+# capture_trc20    = true
+# capture_trc721   = true   # defaults to the trc20 preset value
+# capture_internal = true   # forces vm.save_internal_tx on while indexing
+# capture_logs     = false
+
+# Index the CALLED contract of every TriggerSmartContract (not just the
+# caller), powering /v1/accounts/{contract}/transactions. Default-off: it is
+# the single largest row source (hot contracts accrue billions of rows).
+# Changing it later triggers an automatic full index rebuild.
+# capture_callee_contract = false
+
+# Opt-in HISTORICAL-STATE ARCHIVE (P2): record every block's committed
+# write-set as per-key versions under <data_dir>/archive/db, enabling
+# at-height reads via:
+#   GET  /v1/archive/account?address=...&block=H
+#   GET  /v1/archive/accountresource?address=...&block=H
+#   POST /v1/archive/triggerconstantcontract   (standard body + "block": H)
+# Each historical point read is ONE seek — no replay, no reconstruction.
+# NEVER set by a scope preset: it has its own cost profile (terabyte-scale
+# on mainnet; write volume comparable to chain state). Coverage starts when
+# first enabled and the archive is NOT rebuildable — deleting it (or
+# toggling this off and on) restarts coverage at the then-current head.
+# Small crash gaps self-repair exactly from the block-undo log. Requires
+# storage.snapshot_reorg = false (the default).
+# capture_state_deltas = false
+
+# Which stream the index follows.
+#   "head"       — canonical head; reorg-reconciled; `only_confirmed` is a
+#                  read-time filter (freshest; the default).
+#   "solidified" — trail the PBFT-solidified mark; never unwinds; lags ~19
+#                  blocks (~1 min).
+stream = "head"
+
+[index.backfill]
+# "head_first" = newest history queryable within seconds, the long tail
+# fills in behind it (default). "floor_first" = one monotonic edge from the
+# snapshot base upward.
+order = "head_first"
+# Blocks per gap-closing window (one atomic write-batch each).
+window_blocks = 1024
+# Soft cap on transactions per window — bounds batch RAM on heavy ranges.
+window_tx_budget = 20000
+# Deferred-fsync barrier: WAL-sync once every N windows; crash recovery
+# re-derives at most N windows.
+fsync_barrier_windows = 16
+# Optional capacity clamp: index only from this height up (0 = the snapshot
+# base). Changing it later triggers an automatic full index rebuild.
+start_height = 0
+
+# The FIREHOSE external-sink log (P3): a durable, append-only log of applied
+# blocks — decoded transfer facts, TRC20/VM logs, internal txs — with
+# explicit UNWIND entries for reorgs and crash recoveries. External
+# consumers tail it over gRPC (service tronfirehose.Firehose on the regular
+# gRPC port), resuming by sequence number; exactly-once is achieved by
+# committing the cursor transactionally with the consumer's own writes.
+# Format + cursor protocol + reference consumers (Postgres / NATS
+# JetStream / ClickHouse): working/FIREHOSE.md and the
+# crates/tron-firehose-* binaries.
+[index.firehose]
+enable = false
+# Retention budget in MiB; oldest segments are pruned past it. Consumers
+# further behind than retention resume at the oldest retained entry.
+retain_mb = 32768
+
+# -----------------------------------------------------------------------------
 # Schema-only sections (parsed for java-tron config.conf compatibility, but
 # their runtimes are not yet wired — setting them is currently a no-op):
 #   [event]        — event.subscribe.* plugin loader

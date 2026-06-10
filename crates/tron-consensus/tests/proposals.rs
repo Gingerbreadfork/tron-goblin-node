@@ -165,10 +165,24 @@ fn unknown_parameter_id_is_silently_dropped() {
 
 #[test]
 fn parameter_id_to_key_pinned_values() {
-    // Spot-check a few critical ids.
+    // Spot-check critical ids against java's `ProposalUtil.ProposalType`
+    // enum — including its gaps and naming quirks.
     assert_eq!(parameter_id_to_key(0), Some(&b"MAINTENANCE_TIME_INTERVAL"[..]));
     assert_eq!(parameter_id_to_key(11), Some(&b"ENERGY_FEE"[..]));
-    assert_eq!(parameter_id_to_key(43), Some(&b"ALLOW_TVM_VOTE"[..]));
-    assert_eq!(parameter_id_to_key(54), Some(&b"ALLOW_DYNAMIC_ENERGY"[..]));
+    // Leading-space java key typo, canonical forever.
+    assert_eq!(parameter_id_to_key(15), Some(&b" ALLOW_SAME_TOKEN_NAME"[..]));
+    // No ALLOW_ prefix on java's disk key.
+    assert_eq!(parameter_id_to_key(30), Some(&b"CHANGE_DELEGATION"[..]));
+    assert_eq!(parameter_id_to_key(59), Some(&b"ALLOW_TVM_VOTE"[..]));
+    assert_eq!(parameter_id_to_key(72), Some(&b"ALLOW_DYNAMIC_ENERGY"[..]));
+    assert_eq!(
+        parameter_id_to_key(94),
+        Some(&b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION"[..])
+    );
+    // Java enum gaps must NOT map to anything.
+    assert_eq!(parameter_id_to_key(27), None);
+    assert_eq!(parameter_id_to_key(28), None);
+    assert_eq!(parameter_id_to_key(34), None);
+    assert_eq!(parameter_id_to_key(50), None);
     assert_eq!(parameter_id_to_key(9999), None);
 }

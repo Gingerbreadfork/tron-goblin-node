@@ -38,7 +38,7 @@ use tron_proto::Account;
 
 use crate::resource::{
     calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
-    recovery, ResourceGates, ResourceKind, TRX_PRECISION,
+    recovery_account, ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
 /// What happened during a `consume_energy` call.
@@ -113,7 +113,17 @@ pub fn consume_energy(
     let current_usage = res.energy_usage;
     let latest_consume = res.latest_consume_time_for_energy;
     let decayed_usage = if support_unfreeze_delay {
-        recovery(current_usage, latest_consume, now_slot, res.energy_window_size)
+        // Window-interpreted decay (java `recovery(accountCapsule, …)` →
+        // `getWindowSize`); the raw `energy_window_size` field is
+        // precision-scaled ×1000 on optimized accounts — see the
+        // matching fix in `bandwidth::try_use_account_net`.
+        recovery_account(
+            &account,
+            ResourceKind::Energy,
+            current_usage,
+            latest_consume,
+            now_slot,
+        )
     } else {
         increase_default(current_usage, 0, latest_consume, now_slot)
     };
@@ -315,22 +325,23 @@ fn origin_quota_left(
     let Some(account) = accounts.get(origin)? else {
         return Ok(0);
     };
-    let res = account.account_resource.unwrap_or_default();
+    let (energy_usage, latest_consume) = account
+        .account_resource
+        .as_ref()
+        .map(|r| (r.energy_usage, r.latest_consume_time_for_energy))
+        .unwrap_or((0, 0));
     let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
     let decayed_usage = if support_unfreeze_delay {
-        recovery(
-            res.energy_usage,
-            res.latest_consume_time_for_energy,
+        // Window-interpreted decay — see `consume_energy`.
+        recovery_account(
+            &account,
+            ResourceKind::Energy,
+            energy_usage,
+            latest_consume,
             now_slot,
-            res.energy_window_size,
         )
     } else {
-        increase_default(
-            res.energy_usage,
-            0,
-            res.latest_consume_time_for_energy,
-            now_slot,
-        )
+        increase_default(energy_usage, 0, latest_consume, now_slot)
     };
     let energy_limit = calculate_global_energy_limit(&account, dyn_props);
     Ok(energy_limit.saturating_sub(decayed_usage).max(0))

@@ -542,6 +542,7 @@ mod tests {
             blocks: mem(),
             transactions: mem(),
             tx_history: mem(),
+            transaction_ret: mem(),
             delegated_resource_account_index: mem(),
             market_account: mem(),
             market_pair_to_price: mem(),

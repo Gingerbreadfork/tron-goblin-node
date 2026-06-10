@@ -249,6 +249,10 @@ pub struct SrRuntime {
     /// Optional WebSocket pubsub broker. When set, every produced
     /// block fires a `newHeads` notification to subscribers.
     pubsub: Option<Arc<tron_rpc::PubSubBroker>>,
+    /// Optional address-history index hook — SR-produced blocks
+    /// persist their transaction-info + wake the follower, same as
+    /// sync-applied blocks (see `crate::index_hook`).
+    index_hook: Option<Arc<crate::index_hook::IndexHook>>,
 }
 
 impl SrRuntime {
@@ -281,6 +285,7 @@ impl SrRuntime {
             snapshot_stack: None,
             checkpoint: None,
             pubsub: None,
+            index_hook: None,
         }
     }
 
@@ -295,6 +300,12 @@ impl SrRuntime {
     /// `newHeads` notifications.
     pub fn with_pubsub(mut self, broker: Arc<tron_rpc::PubSubBroker>) -> Self {
         self.pubsub = Some(broker);
+        self
+    }
+
+    /// Attach the address-history index hook (see `crate::index_hook`).
+    pub fn with_index_hook(mut self, hook: Arc<crate::index_hook::IndexHook>) -> Self {
+        self.index_hook = Some(hook);
         self
     }
 
@@ -636,6 +647,12 @@ impl SrRuntime {
                     ));
                 }
             }
+        }
+
+        // Persist the produced block's transaction-info + wake the
+        // index follower (no-op when the index is disabled).
+        if let Some(hook) = &self.index_hook {
+            hook.on_block_applied(&block, &block_id, &exec_report);
         }
 
         // Encode for broadcast.

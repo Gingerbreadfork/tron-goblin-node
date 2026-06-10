@@ -148,8 +148,9 @@ fn withdraw_balance_round_trip() {
     let c = tron_proto::WithdrawBalanceContract {
         owner_address: ALICE.to_vec(),
     };
-    witness::validate_withdraw_balance(&accounts, &dp, &c).unwrap();
-    witness::execute_withdraw_balance(&accounts, &dp, &c).unwrap();
+    let delegation = DelegationStore::new(mem());
+    witness::validate_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap();
+    witness::execute_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap();
     alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 1050);
     assert_eq!(alice.allowance, 0);
@@ -380,7 +381,10 @@ fn freeze_v2_updates_total_net_weight_and_unfreeze_reverses_it() {
         unfreeze_balance: 20_000_000,
         resource: 0,
     };
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &unfreeze).unwrap();
+    let votes = VotesStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &unfreeze)
+        .unwrap();
     assert_eq!(dp.total_net_weight(), 60);
 }
 
@@ -461,7 +465,10 @@ fn unfreeze_balance_v2_then_withdraw_after_expiry() {
         resource: 0,
     };
     freeze_v2::validate_unfreeze_balance_v2(&accounts, &dp, &unfreeze).unwrap();
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &unfreeze).unwrap();
+    let votes = VotesStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &unfreeze)
+        .unwrap();
 
     // Fast-forward; the unfreeze entry's expiry is at now + 1 day.
     dp.save_latest_block_header_timestamp(1_700_000_000_000 + 2 * 24 * 60 * 60 * 1000);

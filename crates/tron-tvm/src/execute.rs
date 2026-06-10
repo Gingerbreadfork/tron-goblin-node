@@ -167,6 +167,11 @@ pub fn execute_trigger(
     execute_trigger_with_trace(stores, block, contract, energy_limit).0
 }
 
+/// Third tuple element on the `*_with_trace` / `*_with_gas_cap` /
+/// `*_with_deadline` variants: the run's dynamic-energy penalty total
+/// (java-tron `ProgramResult.energyPenaltyTotal`), for
+/// `receipt.energy_penalty_total` / constant-call `energy_penalty`.
+
 /// Execute a `TriggerSmartContract` and return both the outcome and the
 /// list of internal-transaction traces captured by the inspector.
 pub fn execute_trigger_with_trace(
@@ -174,7 +179,7 @@ pub fn execute_trigger_with_trace(
     block: VmBlockEnv,
     contract: &TriggerSmartContract,
     energy_limit: u64,
-) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>) {
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     execute_trigger_inner(stores, block, contract, energy_limit, None, None)
 }
 
@@ -190,7 +195,7 @@ pub fn execute_trigger_with_gas_cap(
     contract: &TriggerSmartContract,
     energy_limit: u64,
     gas_cap_override: u64,
-) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>) {
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     execute_trigger_inner(stores, block, contract, energy_limit, Some(gas_cap_override), None)
 }
 
@@ -239,7 +244,7 @@ pub fn execute_trigger_with_deadline(
     gas_cap_override: u64,
     deadline: std::time::Instant,
     timeout_ms: u64,
-) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>) {
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     execute_trigger_inner(
         stores,
         block,
@@ -257,14 +262,14 @@ fn execute_trigger_inner(
     energy_limit: u64,
     gas_cap_override: Option<u64>,
     deadline: Option<(std::time::Instant, u64)>,
-) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>) {
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     let owner_bytes = match parse_tron_address_to_evm(&contract.owner_address) {
         Ok(a) => a,
-        Err(e) => return (VmOutcome::PreflightError(e), Vec::new()),
+        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0),
     };
     let target_bytes = match parse_tron_address_to_evm(&contract.contract_address) {
         Ok(a) => a,
-        Err(e) => return (VmOutcome::PreflightError(e), Vec::new()),
+        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0),
     };
 
     // Top-level CALLTOKEN: perform the TRC-10 transfer (debit owner,
@@ -279,6 +284,7 @@ fn execute_trigger_inner(
                         contract.token_id, contract.call_token_value
                     )),
                     Vec::new(),
+                    0,
                 );
             }
             match apply_top_level_trc10(
@@ -289,7 +295,7 @@ fn execute_trigger_inner(
                 contract.call_token_value,
             ) {
                 Ok(_) => Some((contract.token_id, contract.call_token_value)),
-                Err(e) => return (VmOutcome::PreflightError(e), Vec::new()),
+                Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0),
             }
         } else {
             None
@@ -384,7 +390,7 @@ fn execute_trigger_inner(
         .build()
     {
         Ok(tx) => tx,
-        Err(e) => return (VmOutcome::PreflightError(format!("TxEnv build: {e:?}")), Vec::new()),
+        Err(e) => return (VmOutcome::PreflightError(format!("TxEnv build: {e:?}")), Vec::new(), 0),
     };
 
     let outcome = evm.inspect_tx_commit(tx);
@@ -404,6 +410,7 @@ fn execute_trigger_inner(
     // Deadline check has to happen before we move-out internal_txs from
     // the inspector, since `into_internal_txs` consumes it.
     let deadline_tripped = evm.inspector.deadline_exceeded();
+    let energy_penalty = evm.inspector.energy_penalty_total();
     let timeout_budget_ms = deadline.map(|(_, ms)| ms).unwrap_or(0);
     let vm_outcome = match outcome {
         Ok(ExecutionResult::Success { output, gas, logs, .. }) => VmOutcome::Success {
@@ -442,7 +449,7 @@ fn execute_trigger_inner(
         }
     };
     let traces = evm.inspector.into_internal_txs();
-    (vm_outcome, traces)
+    (vm_outcome, traces, energy_penalty)
 }
 
 /// Tracer-attached variant of [`execute_trigger_inner`]. Mirrors the
@@ -770,7 +777,7 @@ pub fn execute_create_with_trace(
     contract: &CreateSmartContract,
     tx_id: &[u8; 32],
     energy_limit: u64,
-) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>) {
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     // Reject CALLTOKEN-on-CREATE for symmetry with execute_trigger.
     if contract.call_token_value != 0 || contract.token_id != 0 {
         return (
@@ -779,6 +786,7 @@ pub fn execute_create_with_trace(
                 call_token_value: contract.call_token_value,
             },
             Vec::new(),
+            0,
         );
     }
 
@@ -786,11 +794,12 @@ pub fn execute_create_with_trace(
         return (
             VmOutcome::PreflightError("CreateSmartContract.new_contract missing".to_string()),
             Vec::new(),
+            0,
         );
     };
     let owner_bytes = match parse_tron_address_to_evm(&contract.owner_address) {
         Ok(a) => a,
-        Err(e) => return (VmOutcome::PreflightError(e), Vec::new()),
+        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0),
     };
 
     // Derive the TRON contract address from `owner_address || tx_id`.
@@ -815,6 +824,7 @@ pub fn execute_create_with_trace(
         return (
             VmOutcome::PreflightError(format!("write init code: {e:?}")),
             Vec::new(),
+            0,
         );
     }
     if let Err(e) = stores.accounts.put(
@@ -830,6 +840,7 @@ pub fn execute_create_with_trace(
         return (
             VmOutcome::PreflightError(format!("install contract account: {e:?}")),
             Vec::new(),
+            0,
         );
     }
 
@@ -915,6 +926,7 @@ pub fn execute_create_with_trace(
             return (
                 VmOutcome::PreflightError(format!("TxEnv build: {e:?}")),
                 Vec::new(),
+                0,
             )
         }
     };
@@ -922,8 +934,9 @@ pub fn execute_create_with_trace(
     let exec = match evm.inspect_tx_commit(tx) {
         Ok(r) => r,
         Err(e) => {
+            let energy_penalty = evm.inspector.energy_penalty_total();
             let traces = evm.inspector.into_internal_txs();
-            return (VmOutcome::PreflightError(format!("{e:?}")), traces);
+            return (VmOutcome::PreflightError(format!("{e:?}")), traces, energy_penalty);
         }
     };
 
@@ -1010,8 +1023,9 @@ pub fn execute_create_with_trace(
             }
         }
     };
+    let energy_penalty = evm.inspector.energy_penalty_total();
     let traces = evm.inspector.into_internal_txs();
-    (vm_outcome, traces)
+    (vm_outcome, traces, energy_penalty)
 }
 
 /// Convert a raw TRON address (21 bytes with `0x41` prefix) into a

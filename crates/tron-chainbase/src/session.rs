@@ -144,13 +144,32 @@ impl SessionBackend {
     ///
     /// [`commit`]: SessionBackend::commit
     pub fn commit_with_undo(&self) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, KvError> {
+        // One implementation: this is `commit_with_undo_and_ops` with
+        // the (internally-built-anyway) ops vec dropped. Keeping a
+        // verbatim second copy of the drain/before-image/write-batch
+        // sequence would let a future correctness change (locking,
+        // error path) land on only one of the two commit flavors —
+        // and these produce the undo logs rollback depends on.
+        Ok(self.commit_with_undo_and_ops()?.1)
+    }
+
+    /// [`commit_with_undo`](Self::commit_with_undo) that also returns
+    /// the applied write ops (post-images), parallel to the undo
+    /// pairs (same key order). The ops vec is built internally either
+    /// way; returning it costs nothing. Used by the executor's
+    /// state-delta capture (`ExecConfig::capture_state_deltas`), which
+    /// needs both the pre- and post-image of every key a block
+    /// committed.
+    pub fn commit_with_undo_and_ops(
+        &self,
+    ) -> Result<(Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>), KvError> {
         let drained = {
             let mut g = self.pending.write().expect("SessionBackend lock poisoned");
             self.dirty.store(false, Ordering::Relaxed);
             std::mem::take(&mut *g)
         };
         if drained.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut undo = Vec::with_capacity(drained.len());
         let mut ops = Vec::with_capacity(drained.len());
@@ -163,7 +182,7 @@ impl SessionBackend {
             });
         }
         self.parent.write_batch(&ops)?;
-        Ok(undo)
+        Ok((ops, undo))
     }
 
     /// Drain pending writes WITHOUT applying them to the parent.

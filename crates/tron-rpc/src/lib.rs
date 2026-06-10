@@ -14,6 +14,8 @@ pub mod abi;
 pub mod builder;
 pub mod filters;
 pub mod http_rest;
+pub mod index_api;
+pub use index_api::ArchiveApiState;
 pub mod mempool;
 pub mod metrics;
 pub mod pubsub;

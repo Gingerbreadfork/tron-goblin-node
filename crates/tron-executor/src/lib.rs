@@ -138,6 +138,15 @@ pub struct ExecConfig {
     /// the sync driver opts in for bulk catch-up where the multi-core speedup
     /// matters most. See `crate::parallel`.
     pub parallel_exec: bool,
+    /// Capture the block's committed write-set (per-store post-images +
+    /// pre-images) onto [`BlockExecutionReport::state_deltas`]. Pure
+    /// observation of the block-session drain — zero effect on what is
+    /// written or how. Powers the opt-in historical-state archive
+    /// (`[index] capture_state_deltas`); requires the undo (BlockSession)
+    /// commit path, since that is where the write-set is materialized —
+    /// on the snapshot-stack path the report's `state_deltas` stays
+    /// `None`. Defaults to `false` (no allocation, no clone).
+    pub capture_state_deltas: bool,
 }
 
 impl Default for ExecConfig {
@@ -168,6 +177,8 @@ impl Default for ExecConfig {
             // Serial execution by default (the validated source of truth);
             // opt into Block-STM parallel execution explicitly.
             parallel_exec: false,
+            // Archive capture is an explicit archive-node opt-in.
+            capture_state_deltas: false,
         }
     }
 }
@@ -866,6 +877,52 @@ impl TxOutcome {
     }
 }
 
+/// Per-transaction resource receipt, mirroring java-tron's
+/// `protocol.ResourceReceipt` semantics. Captured at execution time —
+/// the bandwidth charge fills the net side, `pay_energy_bill`'s
+/// returned split fills the energy side — identically on the serial
+/// and Block-STM paths (both run `execute_one_tx_isolated`).
+///
+/// The flat multi-sign / memo fees ride here as well — java-tron keeps
+/// them as transient `ReceiptCapsule` members that never enter the
+/// proto `ResourceReceipt`, and the stored `TransactionInfo.fee` sums
+/// them in (`TransactionUtil.buildTransactionInfoInstance`):
+/// `fee = ret.fee + energy_fee + net_fee + multi_sign_fee + memo_fee`.
+/// The actuator side (`ret.fee`) lives on [`TxResult::actuator_fee`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TxReceipt {
+    /// Energy covered by the caller's frozen quota.
+    pub energy_usage: i64,
+    /// Energy paid in TRX (sun).
+    pub energy_fee: i64,
+    /// Energy covered by the contract origin's quota (the
+    /// `consume_user_resource_percent` split).
+    pub origin_energy_usage: i64,
+    /// Total energy the VM consumed.
+    pub energy_usage_total: i64,
+    /// Bandwidth bytes covered by quotas (frozen / free / asset-issuer).
+    pub net_usage: i64,
+    /// Bandwidth paid in TRX (sun).
+    pub net_fee: i64,
+    /// `protocol.Transaction.Result.contractResult` value: DEFAULT(0)
+    /// for non-VM contracts (java-tron leaves it unset there),
+    /// SUCCESS/REVERT/OUT_OF_ENERGY/OUT_OF_TIME/UNKNOWN for VM txs.
+    pub result: i32,
+    /// Dynamic-energy penalty included in `energy_usage_total`
+    /// (java-tron `ProgramResult.energyPenaltyTotal` →
+    /// `ResourceReceipt.energy_penalty_total`). `0` when the tx touched
+    /// no penalized contract.
+    pub energy_penalty_total: i64,
+    /// Flat fee for a transaction carrying more than one signature
+    /// (java-tron `Manager.consumeMultiSignFee` →
+    /// `ReceiptCapsule.multiSignFee`, transient — never in the proto
+    /// `ResourceReceipt`, but summed into `TransactionInfo.fee`).
+    pub multi_sign_fee: i64,
+    /// Flat fee for a non-empty memo (`raw_data.data`) — java-tron
+    /// `Manager.consumeMemoFee` → `ReceiptCapsule.memoFee`, transient.
+    pub memo_fee: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TxResult {
     pub tx_id: [u8; 32],
@@ -882,6 +939,36 @@ pub struct TxResult {
     /// halted txs surface no logs (java-tron behavior — logsfilter
     /// only fires for committed contract executions).
     pub vm_logs: Vec<tron_tvm::execute::VmLog>,
+    /// Resource receipt — see [`TxReceipt`].
+    pub receipt: TxReceipt,
+    /// The VM's return data (SUCCESS return value or REVERT payload).
+    /// Empty for non-VM contracts and halts.
+    pub vm_return_data: Vec<u8>,
+    /// TRX burned by the actuator itself (java-tron's
+    /// `ProgramResult.ret.fee`): account-creation fee in system
+    /// contracts, asset-issue fee, witness-create fee, exchange-create
+    /// fee, permission-update fee, … Summed into the stored
+    /// `TransactionInfo.fee` alongside the receipt fees.
+    pub actuator_fee: i64,
+}
+
+impl TxResult {
+    /// All-empty scaffold for struct-update syntax at the many
+    /// early-reject construction sites (`TxResult { tx_id, outcome,
+    /// ..TxResult::empty() }`) — rejected txs charge nothing, so every
+    /// auxiliary field is its default.
+    fn empty() -> Self {
+        Self {
+            tx_id: [0u8; 32],
+            contract_type: None,
+            outcome: TxOutcome::MissingRawData,
+            internal_transactions: Vec::new(),
+            vm_logs: Vec::new(),
+            receipt: TxReceipt::default(),
+            vm_return_data: Vec::new(),
+            actuator_fee: 0,
+        }
+    }
 }
 
 /// SR-list rotation observed during block apply. Populated only when
@@ -906,6 +993,23 @@ pub struct MaintenanceRotation {
     pub before_maintenance_time_ms: i64,
 }
 
+/// One committed key mutation from a block's write-set, captured at
+/// the block-session drain when [`ExecConfig::capture_state_deltas`]
+/// is on. `before` is the value prior to the block (the undo
+/// pre-image), `after` the committed post-image (`None` = deleted).
+/// Exactly one entry per `(store, key)` — the session overlay
+/// collapses intra-block rewrites to the final value, which is
+/// precisely the per-height version the historical-state archive
+/// stores. Byte-identical on the serial and parallel execution paths
+/// (the deferred-fold keys land in the drain as ordinary puts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedDelta {
+    pub store: tron_chainbase::UndoStoreId,
+    pub key: Vec<u8>,
+    pub before: Option<Vec<u8>>,
+    pub after: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockExecutionReport {
     pub block_id: BlockId,
@@ -916,6 +1020,11 @@ pub struct BlockExecutionReport {
     /// validates cross-rotation votes the way java-tron does. `None`
     /// for ordinary blocks.
     pub maintenance: Option<MaintenanceRotation>,
+    /// The block's committed write-set, present iff
+    /// [`ExecConfig::capture_state_deltas`] was on AND the block ran
+    /// the undo (BlockSession) commit path. Sorted by `(store, key)`
+    /// for deterministic consumption.
+    pub state_deltas: Option<Vec<CapturedDelta>>,
 }
 
 impl BlockExecutionReport {
@@ -1131,16 +1240,22 @@ fn execute_block_inner(
         let block_session = BlockSession::wrap(state);
         let wrapped = block_session.as_state_backends();
         let t_exec = timing.then(std::time::Instant::now);
-        let report = execute_block_logic(&wrapped, block, expected_parent, config)?;
+        let mut report = execute_block_logic(&wrapped, block, expected_parent, config)?;
         let exec_us = t_exec.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         let t_commit = timing.then(std::time::Instant::now);
-        let record = if let Some(checkpoint) = checkpoint {
+        let (record, deltas) = if let Some(checkpoint) = checkpoint {
             block_session
-                .commit_with_checkpoint_and_undo(checkpoint, state, config.defer_store_fsync)
+                .commit_with_checkpoint_and_undo(
+                    checkpoint,
+                    state,
+                    config.defer_store_fsync,
+                    config.capture_state_deltas,
+                )
                 .map_err(BlockExecError::Checkpoint)?
         } else {
-            block_session.commit_with_undo()?
+            block_session.commit_with_undo(config.capture_state_deltas)?
         };
+        report.state_deltas = deltas;
         let commit_us = t_commit.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         let block_num = block
             .block_header
@@ -1284,53 +1399,77 @@ impl BlockSession {
     /// Commit every store's overlay to its base backend, capturing
     /// `(store_id, key, before_image)` triples for each write. The
     /// result is one [`BlockUndoRecord`] suitable for persistence.
-    fn commit_with_undo(self) -> Result<tron_chainbase::BlockUndoRecord, tron_chainbase::KvError> {
-        use tron_chainbase::UndoStoreId as Id;
+    fn commit_with_undo(
+        self,
+        capture_deltas: bool,
+    ) -> Result<
+        (tron_chainbase::BlockUndoRecord, Option<Vec<CapturedDelta>>),
+        tron_chainbase::KvError,
+    > {
+        use tron_chainbase::{UndoStoreId as Id, WriteOp};
         let mut record = tron_chainbase::BlockUndoRecord::new();
-        let mut push = |id: Id, undo: Vec<(Vec<u8>, Option<Vec<u8>>)>| {
+        let mut deltas: Option<Vec<CapturedDelta>> = capture_deltas.then(Vec::new);
+        // `commit_with_undo_and_ops` builds the ops vec internally
+        // either way; the only capture-mode cost is moving entries
+        // into `CapturedDelta` (ops and undo are parallel, same key
+        // order — see `SessionBackend::drain_pending_with_undo`).
+        let mut push = |id: Id,
+                        (ops, undo): (Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>)| {
+            if let Some(deltas) = deltas.as_mut() {
+                for (op, (_, before)) in ops.into_iter().zip(undo.iter()) {
+                    let (key, after) = match op {
+                        WriteOp::Put(k, v) => (k, Some(v)),
+                        WriteOp::Delete(k) => (k, None),
+                    };
+                    deltas.push(CapturedDelta { store: id, key, before: before.clone(), after });
+                }
+            }
             for (key, before) in undo {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
             }
         };
-        push(Id::Accounts, self.accounts.commit_with_undo()?);
-        push(Id::Witnesses, self.witnesses.commit_with_undo()?);
-        push(Id::Votes, self.votes.commit_with_undo()?);
-        push(Id::Delegation, self.delegation.commit_with_undo()?);
-        push(Id::DelegatedResources, self.delegated_resources.commit_with_undo()?);
-        push(Id::DynProps, self.dyn_props.commit_with_undo()?);
-        push(Id::Proposals, self.proposals.commit_with_undo()?);
-        push(Id::NameIndex, self.name_index.commit_with_undo()?);
-        push(Id::IdIndex, self.id_index.commit_with_undo()?);
-        push(Id::AssetV1, self.asset_v1.commit_with_undo()?);
-        push(Id::AssetV2, self.asset_v2.commit_with_undo()?);
-        push(Id::Contracts, self.contracts.commit_with_undo()?);
-        push(Id::Abi, self.abi.commit_with_undo()?);
-        push(Id::ExchangeV1, self.exchange_v1.commit_with_undo()?);
-        push(Id::ExchangeV2, self.exchange_v2.commit_with_undo()?);
-        push(Id::MarketOrders, self.market_orders.commit_with_undo()?);
-        push(Id::Nullifiers, self.nullifiers.commit_with_undo()?);
+        push(Id::Accounts, self.accounts.commit_with_undo_and_ops()?);
+        push(Id::Witnesses, self.witnesses.commit_with_undo_and_ops()?);
+        push(Id::Votes, self.votes.commit_with_undo_and_ops()?);
+        push(Id::Delegation, self.delegation.commit_with_undo_and_ops()?);
+        push(Id::DelegatedResources, self.delegated_resources.commit_with_undo_and_ops()?);
+        push(Id::DynProps, self.dyn_props.commit_with_undo_and_ops()?);
+        push(Id::Proposals, self.proposals.commit_with_undo_and_ops()?);
+        push(Id::NameIndex, self.name_index.commit_with_undo_and_ops()?);
+        push(Id::IdIndex, self.id_index.commit_with_undo_and_ops()?);
+        push(Id::AssetV1, self.asset_v1.commit_with_undo_and_ops()?);
+        push(Id::AssetV2, self.asset_v2.commit_with_undo_and_ops()?);
+        push(Id::Contracts, self.contracts.commit_with_undo_and_ops()?);
+        push(Id::Abi, self.abi.commit_with_undo_and_ops()?);
+        push(Id::ExchangeV1, self.exchange_v1.commit_with_undo_and_ops()?);
+        push(Id::ExchangeV2, self.exchange_v2.commit_with_undo_and_ops()?);
+        push(Id::MarketOrders, self.market_orders.commit_with_undo_and_ops()?);
+        push(Id::Nullifiers, self.nullifiers.commit_with_undo_and_ops()?);
         if let Some(s) = self.delegated_resource_account_index {
-            push(Id::DelegatedResourceAccountIndex, s.commit_with_undo()?);
+            push(Id::DelegatedResourceAccountIndex, s.commit_with_undo_and_ops()?);
         }
         if let Some(s) = self.merkle_trees {
-            push(Id::MerkleTrees, s.commit_with_undo()?);
+            push(Id::MerkleTrees, s.commit_with_undo_and_ops()?);
         }
         if let Some(s) = self.code {
-            push(Id::Code, s.commit_with_undo()?);
+            push(Id::Code, s.commit_with_undo_and_ops()?);
         }
         if let Some(s) = self.storage_row {
-            push(Id::StorageRow, s.commit_with_undo()?);
+            push(Id::StorageRow, s.commit_with_undo_and_ops()?);
         }
         if let Some(s) = self.contract_state {
-            push(Id::ContractState, s.commit_with_undo()?);
+            push(Id::ContractState, s.commit_with_undo_and_ops()?);
         }
         if let Some(s) = self.block_index {
-            push(Id::BlockIndex, s.commit_with_undo()?);
+            push(Id::BlockIndex, s.commit_with_undo_and_ops()?);
         }
         if let Some(s) = self.witness_schedule {
-            push(Id::WitnessSchedule, s.commit_with_undo()?);
+            push(Id::WitnessSchedule, s.commit_with_undo_and_ops()?);
         }
-        Ok(record)
+        if let Some(d) = deltas.as_mut() {
+            d.sort_by(|a, b| (a.store as u8, &a.key).cmp(&(b.store as u8, &b.key)));
+        }
+        Ok((record, deltas))
     }
 
     /// Commit every store's overlay to its base backend under one
@@ -1358,7 +1497,11 @@ impl BlockSession {
         checkpoint: &tron_chainbase::CheckPointV2,
         state: &StateBackends,
         defer_store_fsync: bool,
-    ) -> Result<tron_chainbase::BlockUndoRecord, tron_chainbase::CheckpointError> {
+        capture_deltas: bool,
+    ) -> Result<
+        (tron_chainbase::BlockUndoRecord, Option<Vec<CapturedDelta>>),
+        tron_chainbase::CheckpointError,
+    > {
         use tron_chainbase::{CheckpointEntry, KvBackend, UndoStoreId as Id, WriteOp};
 
         // (1) Drain every per-store session, capturing pre-images for
@@ -1425,7 +1568,7 @@ impl BlockSession {
         //     point creating a checkpoint dir we'll immediately delete.
         let mut record = tron_chainbase::BlockUndoRecord::new();
         if drained.is_empty() {
-            return Ok(record);
+            return Ok((record, capture_deltas.then(Vec::new)));
         }
         let mut entries: Vec<CheckpointEntry> = Vec::new();
         for (id, _, ops, _) in &drained {
@@ -1465,6 +1608,7 @@ impl BlockSession {
         //     manifest (skip step 5) — on a crash the startup replay
         //     re-applies it idempotently, so nothing is lost. The
         //     expensive per-store fsync is amortized by the barrier below.
+        let mut deltas: Option<Vec<CapturedDelta>> = capture_deltas.then(Vec::new);
         for (id, base, ops, undo) in drained {
             if defer_store_fsync {
                 base.write_batch(&ops)
@@ -1472,6 +1616,17 @@ impl BlockSession {
             } else {
                 base.write_batch_sync(&ops)
                     .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+            }
+            // Capture before `undo` is consumed for the record — ops
+            // and undo are parallel (same drain loop, same key order).
+            if let Some(deltas) = deltas.as_mut() {
+                for (op, (_, before)) in ops.into_iter().zip(undo.iter()) {
+                    let (key, after) = match op {
+                        WriteOp::Put(k, v) => (k, Some(v)),
+                        WriteOp::Delete(k) => (k, None),
+                    };
+                    deltas.push(CapturedDelta { store: id, key, before: before.clone(), after });
+                }
             }
             for (key, before) in undo {
                 record.push(tron_chainbase::UndoEntry { store: id, key, before });
@@ -1502,7 +1657,10 @@ impl BlockSession {
                 flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
             }
         }
-        Ok(record)
+        if let Some(d) = deltas.as_mut() {
+            d.sort_by(|a, b| (a.store as u8, &a.key).cmp(&(b.store as u8, &b.key)));
+        }
+        Ok((record, deltas))
     }
 }
 
@@ -2016,21 +2174,43 @@ fn execute_block_logic(
             && prev_block_ts.is_some()
         {
             const BLOCK_INTERVAL_MS: i64 = 3_000;
+            // java `ChainConstant.MAINTENANCE_SKIP_SLOTS`.
+            const MAINTENANCE_SKIP_SLOTS: i64 = 2;
             let prev_ts = prev_block_ts.unwrap();
-            // Absolute-slot calculation mirrors `DposSlot.getAbSlot`.
+            // java `DposSlot.getTime(1)`: the first expected production
+            // slot after the head block — head timestamp aligned DOWN to
+            // a slot boundary, plus one interval, plus
+            // MAINTENANCE_SKIP_SLOTS intervals when the head block was a
+            // maintenance block (`state_flag == 1`; production pauses
+            // around maintenance and those slots must NOT count as
+            // misses — skipping this skip over-counted every SR
+            // scheduled right after a maintenance boundary). The flag
+            // still holds the PREVIOUS block's value here: this step
+            // runs before the maintenance pass below updates it.
+            let skip = if dp.state_flag() == 1 {
+                MAINTENANCE_SKIP_SLOTS
+            } else {
+                0
+            };
+            let head_aligned =
+                prev_ts - (prev_ts - genesis_ts).rem_euclid(BLOCK_INTERVAL_MS);
+            let first_slot_time = head_aligned + (1 + skip) * BLOCK_INTERVAL_MS;
+            // java `DposSlot.getSlot(blockTime)`.
+            let slot = if raw.timestamp < first_slot_time {
+                0
+            } else {
+                (raw.timestamp - first_slot_time) / BLOCK_INTERVAL_MS + 1
+            };
+            // java `StatisticManager.applyBlock`: for i in 1..slot the
+            // missed SR is `DposSlot.getScheduledWitness(i)` =
+            // `active[(abSlot(head_ts) + i) % N]` (SINGLE_REPEAT == 1).
+            // The index is relative to the HEAD block's absolute slot —
+            // `(slot − 1) % N` (the previous formula here) attributed
+            // every miss to the witness one schedule position early.
             let prev_abs = (prev_ts - genesis_ts) / BLOCK_INTERVAL_MS;
-            let this_abs = (raw.timestamp - genesis_ts) / BLOCK_INTERVAL_MS;
-            // For every slot strictly between the prev producer's
-            // slot and this block's slot, look up the scheduled SR.
-            // The scheduled-index formula mirrors `DposSlot
-            // .getScheduledWitness` — `((slot - 1) % N)` where N is
-            // the active witness count (SINGLE_REPEAT == 1 today).
-            for missed_slot in (prev_abs + 1)..this_abs {
-                if missed_slot < 1 {
-                    continue;
-                }
-                let idx = ((missed_slot - 1).rem_euclid(active_witnesses.len() as i64))
-                    as usize;
+            for i in 1..slot {
+                let idx =
+                    (prev_abs + i).rem_euclid(active_witnesses.len() as i64) as usize;
                 let missed_addr = active_witnesses[idx];
                 if let Ok(Some(mut w)) = ws.get(&missed_addr) {
                     w.total_missed = w.total_missed.saturating_add(1);
@@ -2165,6 +2345,13 @@ fn execute_block_logic(
             maintenance_interval,
         );
         dp.save_next_maintenance_time(new_next);
+        // java's `MaintenanceManager.applyBlock` records on EVERY block
+        // whether it crossed the boundary (`saveStateFlag(flag ? 1 : 0)`).
+        // The NEXT block's slot math reads this to skip
+        // MAINTENANCE_SKIP_SLOTS when counting missed slots (step 5b).
+        dp.save_state_flag(1);
+    } else {
+        dp.save_state_flag(0);
     }
 
     // === 6. AccountStateRoot verification (consensus-critical when
@@ -2203,6 +2390,7 @@ fn execute_block_logic(
         block_id,
         tx_results,
         maintenance: maintenance_rotation,
+        state_deltas: None,
     })
 }
 
@@ -2400,11 +2588,15 @@ fn execute_one_tx_isolated(
             tx_id: [0u8; 32],
             contract_type: None,
             outcome: TxOutcome::MissingRawData,
-                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                    ..TxResult::empty()
         };
     };
     let tx_id = sha256(&raw.encode_to_vec());
+
+    // Resource receipt, filled as charges land (net side here, energy
+    // side inside `execute_vm_tx`). Reject/revert paths return zeros —
+    // a tx whose charges were rolled back consumed nothing.
+    let mut receipt = TxReceipt::default();
 
     // === Expiration check. ===
     //
@@ -2428,8 +2620,7 @@ fn execute_one_tx_isolated(
                 expiration_ms: raw.expiration,
                 block_timestamp_ms,
             },
-            internal_transactions: Vec::new(),
-            vm_logs: Vec::new(),
+            ..TxResult::empty()
         };
     }
 
@@ -2446,8 +2637,7 @@ fn execute_one_tx_isolated(
             tx_id,
             contract_type: None,
             outcome: TxOutcome::NoContract,
-                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                    ..TxResult::empty()
         };
     };
 
@@ -2458,8 +2648,7 @@ fn execute_one_tx_isolated(
                 tx_id,
                 contract_type: None,
                 outcome: TxOutcome::UnknownContractType(contract.r#type),
-                            internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                            ..TxResult::empty()
             }
         }
     };
@@ -2469,8 +2658,7 @@ fn execute_one_tx_isolated(
             tx_id,
             contract_type: Some(ty),
             outcome: TxOutcome::MissingParameter,
-                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                    ..TxResult::empty()
         };
     };
 
@@ -2517,8 +2705,7 @@ fn execute_one_tx_isolated(
                 tx_id,
                 contract_type: Some(ty),
                 outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(e.to_string())),
-                            internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                            ..TxResult::empty()
             };
         }
     }
@@ -2551,8 +2738,25 @@ fn execute_one_tx_isolated(
                     // block; record this tx's `bytes` so the exact serial fold is
                     // replayed at commit. No-op in the serial path.
                     iso.record_public_net_bytes(bytes);
+                    receipt.net_usage = bytes;
                 }
-                Ok(_) => { /* frozen / asset-issuer / fee — not deferred */ }
+                Ok(bandwidth::BandwidthCharge::Frozen { bytes, .. })
+                | Ok(bandwidth::BandwidthCharge::AssetIssuer { bytes, .. }) => {
+                    // Quota-covered bytes land in netUsage, mirroring
+                    // java-tron's BandwidthProcessor receipt writes.
+                    receipt.net_usage = bytes;
+                }
+                Ok(bandwidth::BandwidthCharge::Fee { fee_sun, .. }) => {
+                    receipt.net_fee = fee_sun;
+                }
+                Ok(bandwidth::BandwidthCharge::CreateNewAccountFrozen { net_cost, .. }) => {
+                    // setNetBillForCreateNewAccount(netCost, 0): the
+                    // special new-account cost IS the net bill.
+                    receipt.net_usage = net_cost;
+                }
+                Ok(bandwidth::BandwidthCharge::CreateNewAccountFee { fee_sun }) => {
+                    receipt.net_fee = fee_sun;
+                }
                 Err(e) => {
                     iso.revert();
                     return TxResult {
@@ -2561,8 +2765,52 @@ fn execute_one_tx_isolated(
                         outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(format!(
                             "bandwidth: {e}"
                         ))),
-                        internal_transactions: Vec::new(),
-                        vm_logs: Vec::new(),
+                        ..TxResult::empty()
+                    };
+                }
+            }
+        }
+    }
+
+    // === Multi-sign + memo flat fees. ===
+    // java-tron `Manager.processTransaction` charges these right after
+    // bandwidth (`consumeMultiSignFee` / `consumeMemoFee`): a tx
+    // carrying more than one signature pays MULTI_SIGN_FEE, and a tx
+    // with a non-empty memo (`raw_data.data`) pays MEMO_FEE (0 until
+    // the SR proposal sets it). Both debit the contract owner's
+    // balance (skipping silently when the owner account doesn't exist
+    // — the shielded case) and burn; an uncoverable fee rejects the tx.
+    if tx.signature.len() > 1 {
+        let fee = stores.dyn_props.multi_sign_fee();
+        match charge_flat_fee(stores.accounts, stores.dyn_props, contract, ty, fee) {
+            Ok(charged) => receipt.multi_sign_fee = charged,
+            Err(msg) => {
+                iso.revert();
+                return TxResult {
+                    tx_id,
+                    contract_type: Some(ty),
+                    outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(format!(
+                        "multi-sign fee: {msg}"
+                    ))),
+                    ..TxResult::empty()
+                };
+            }
+        }
+    }
+    if !raw.data.is_empty() {
+        let fee = stores.dyn_props.memo_fee();
+        if fee != 0 {
+            match charge_flat_fee(stores.accounts, stores.dyn_props, contract, ty, fee) {
+                Ok(charged) => receipt.memo_fee = charged,
+                Err(msg) => {
+                    iso.revert();
+                    return TxResult {
+                        tx_id,
+                        contract_type: Some(ty),
+                        outcome: TxOutcome::Invalid(ActuatorError::PermissionDenied(format!(
+                            "memo fee: {msg}"
+                        ))),
+                        ..TxResult::empty()
                     };
                 }
             }
@@ -2579,7 +2827,7 @@ fn execute_one_tx_isolated(
         ty,
         ContractType::TriggerSmartContract | ContractType::CreateSmartContract
     ) {
-        return execute_vm_tx(view, iso, tx_id, ty, parameter, config, raw.fee_limit);
+        return execute_vm_tx(view, iso, tx_id, ty, parameter, config, raw.fee_limit, receipt);
     }
 
     // Validate. On reject: revert (drops any pending writes — though
@@ -2590,8 +2838,7 @@ fn execute_one_tx_isolated(
             tx_id,
             contract_type: Some(ty),
             outcome: TxOutcome::Invalid(e),
-                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                    ..TxResult::empty()
         };
     }
 
@@ -2599,7 +2846,7 @@ fn execute_one_tx_isolated(
     // (this is the bit that fixes the old v1 limitation — partial
     // state mutations from a failed execute are NOT applied).
     match dispatch_execute(&stores, &tx_ctx, ty, parameter) {
-        Ok(_result) => {
+        Ok(result) => {
             // Containment for the .expect():
             // * Production (`execute_block_with_undo_*`) path: TxSession's
             //   parent is a BlockSession-wrapped SessionBackend whose
@@ -2616,8 +2863,9 @@ fn execute_one_tx_isolated(
                 tx_id,
                 contract_type: Some(ty),
                 outcome: TxOutcome::Success,
-                            internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                receipt,
+                actuator_fee: result.fee,
+                ..TxResult::empty()
             }
         }
         Err(e) => {
@@ -2626,8 +2874,7 @@ fn execute_one_tx_isolated(
                 tx_id,
                 contract_type: Some(ty),
                 outcome: TxOutcome::ExecutionFailed(e),
-                            internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                            ..TxResult::empty()
             }
         }
     }
@@ -2693,6 +2940,7 @@ fn compute_vm_energy_limit(
     Ok(derived.min(MAX_VM_ENERGY_LIMIT))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_vm_tx(
     view: &StateBackends,
     iso: &TxIsolation,
@@ -2701,6 +2949,7 @@ fn execute_vm_tx(
     parameter: &prost_types::Any,
     config: &ExecConfig,
     fee_limit: i64,
+    mut receipt: TxReceipt,
 ) -> TxResult {
     use tron_chainbase::{
         BlockIndexStore as BIS, CodeStore as CS, ContractStateStore as CtS,
@@ -2722,8 +2971,7 @@ fn execute_vm_tx(
             outcome: TxOutcome::Invalid(ActuatorError::NotImplemented(
                 "VM-bound contract but executor was built without EVM stores attached",
             )),
-                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                    ..TxResult::empty()
         };
     };
 
@@ -2796,8 +3044,7 @@ fn execute_vm_tx(
                 tx_id,
                 contract_type: Some(ty),
                 outcome: reason,
-                internal_transactions: Vec::new(),
-                vm_logs: Vec::new(),
+                ..TxResult::empty()
             };
         }
     };
@@ -2817,7 +3064,7 @@ fn execute_vm_tx(
     // energy_fee`. Until that flow lands we keep the 10M cap.
     let now_slot = head_slot(&dp);
 
-    let (caller_addr, trigger_contract_addr, outcome, vm_traces) = match ty {
+    let (caller_addr, trigger_contract_addr, outcome, vm_traces, energy_penalty) = match ty {
         ContractType::TriggerSmartContract => {
             let trigger: tron_proto::TriggerSmartContract =
                 match prost::Message::decode(parameter.value.as_slice()) {
@@ -2830,20 +3077,19 @@ fn execute_vm_tx(
                             outcome: TxOutcome::Invalid(ActuatorError::Store(format!(
                                 "decode TriggerSmartContract: {e}"
                             ))),
-                                                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                                                    ..TxResult::empty()
                         };
                     }
                 };
             let caller = address_from_proto(&trigger.owner_address);
             let contract_addr = address_from_proto(&trigger.contract_address);
-            let (outcome, traces) = tron_tvm::execute::execute_trigger_with_trace(
+            let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_trigger_with_trace(
                 &vm_stores,
                 block_env,
                 &trigger,
                 energy_limit,
             );
-            (caller, contract_addr, outcome, traces)
+            (caller, contract_addr, outcome, traces, energy_penalty)
         }
         ContractType::CreateSmartContract => {
             let create: tron_proto::CreateSmartContract =
@@ -2857,8 +3103,7 @@ fn execute_vm_tx(
                             outcome: TxOutcome::Invalid(ActuatorError::Store(format!(
                                 "decode CreateSmartContract: {e}"
                             ))),
-                                                    internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                                                    ..TxResult::empty()
                         };
                     }
                 };
@@ -2868,7 +3113,7 @@ fn execute_vm_tx(
                 .new_contract
                 .as_ref()
                 .and_then(|c| address_from_proto(&c.origin_address));
-            let (outcome, traces) = tron_tvm::execute::execute_create_with_trace(
+            let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_create_with_trace(
                 &vm_stores,
                 block_env,
                 &create,
@@ -2878,7 +3123,7 @@ fn execute_vm_tx(
             // CreateSmartContract: caller IS the origin, so no origin
             // split applies. Pass `None` for the contract address so
             // the energy-charge path takes the caller-pays-all branch.
-            (caller, None, outcome, traces)
+            (caller, None, outcome, traces, energy_penalty)
         }
         _ => unreachable!("execute_vm_tx invoked for non-VM contract type"),
     };
@@ -2917,6 +3162,11 @@ fn execute_vm_tx(
         tron_tvm::execute::VmOutcome::Halt { energy_used, .. } => (*energy_used, false),
         _ => (0, false),
     };
+    receipt.energy_usage_total = energy_used as i64;
+    // java-tron: `TransactionTrace.setPenalty(programResult
+    // .getEnergyPenaltyTotal())` → `receipt.energy_penalty_total`,
+    // recorded for every executed VM tx (success, revert, and halt).
+    receipt.energy_penalty_total = energy_penalty as i64;
     if let Some(caller) = caller_addr {
         if energy_used > 0 {
             let accounts = AccountStore::new(view.accounts.clone() as _);
@@ -2956,7 +3206,31 @@ fn execute_vm_tx(
                 energy_used,
                 now_slot,
             ) {
-                Ok(_bill) => { /* state updated in-place */ }
+                Ok(bill) => {
+                    // State updated in-place; mirror the split into the
+                    // receipt (java-tron's ReceiptCapsule fields).
+                    if let Some(o) = &bill.origin_charge {
+                        receipt.origin_energy_usage = match o {
+                            energy::EnergyCharge::Frozen { energy_used, .. }
+                            | energy::EnergyCharge::Fee { energy_used, .. }
+                            | energy::EnergyCharge::Mixed { energy_used, .. } => *energy_used,
+                        };
+                    }
+                    match &bill.caller_charge {
+                        energy::EnergyCharge::Frozen { energy_used, .. } => {
+                            receipt.energy_usage = *energy_used;
+                        }
+                        energy::EnergyCharge::Fee { fee_sun, .. } => {
+                            receipt.energy_fee = *fee_sun;
+                        }
+                        energy::EnergyCharge::Mixed {
+                            energy_from_frozen, fee_sun, ..
+                        } => {
+                            receipt.energy_usage = *energy_from_frozen;
+                            receipt.energy_fee = *fee_sun;
+                        }
+                    }
+                }
                 Err(e) => {
                     // Insufficient balance for fee, or account missing.
                     // Whole session reverts (which also undoes any VM
@@ -2971,8 +3245,7 @@ fn execute_vm_tx(
                         outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(format!(
                             "energy: {e}"
                         ))),
-                                            internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                                            ..TxResult::empty()
                     };
                 }
             }
@@ -2992,19 +3265,24 @@ fn execute_vm_tx(
     };
 
     match outcome {
-        tron_tvm::execute::VmOutcome::Success { logs, .. } => {
+        tron_tvm::execute::VmOutcome::Success { logs, return_data, .. } => {
             let _ = vm_succeeded;
             iso.commit()
                 .expect("db error in execute_vm_tx: commit flush failed on VM Success");
+            receipt.result =
+                tron_proto::transaction::result::ContractResult::Success as i32;
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
                 outcome: TxOutcome::Success,
                 internal_transactions: proto_internal_txs,
                 vm_logs: logs,
+                receipt,
+                vm_return_data: return_data,
+                actuator_fee: 0,
             }
         }
-        tron_tvm::execute::VmOutcome::Revert { .. } => {
+        tron_tvm::execute::VmOutcome::Revert { return_data, .. } => {
             // VM-side writes were already discarded by `vm_session.revert()`
             // above (the inner nested-session layer). All that remains
             // in the per-tx session is bandwidth (charged before the
@@ -3014,6 +3292,8 @@ fn execute_vm_tx(
             // exactly those into the per-tx parent.
             iso.commit()
                 .expect("db error in execute_vm_tx: commit flush failed on VM Revert");
+            receipt.result =
+                tron_proto::transaction::result::ContractResult::Revert as i32;
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -3022,11 +3302,21 @@ fn execute_vm_tx(
                 )),
                 internal_transactions: proto_internal_txs,
                 vm_logs: Vec::new(),
+                receipt,
+                vm_return_data: return_data,
+                actuator_fee: 0,
             }
         }
         tron_tvm::execute::VmOutcome::Halt { reason, .. } => {
             iso.commit()
                 .expect("db error in execute_vm_tx: commit flush failed on VM Halt");
+            // The reason is revm's `HaltReason` Debug form; OutOfGas
+            // maps onto TRON's OUT_OF_ENERGY, the rest are UNKNOWN.
+            receipt.result = if reason.contains("OutOfGas") {
+                tron_proto::transaction::result::ContractResult::OutOfEnergy as i32
+            } else {
+                tron_proto::transaction::result::ContractResult::Unknown as i32
+            };
             TxResult {
                 tx_id,
                 contract_type: Some(ty),
@@ -3035,6 +3325,9 @@ fn execute_vm_tx(
                 ))),
                 internal_transactions: proto_internal_txs,
                 vm_logs: Vec::new(),
+                receipt,
+                vm_return_data: Vec::new(),
+                actuator_fee: 0,
             }
         }
         tron_tvm::execute::VmOutcome::CallTokenIgnored { .. } => {
@@ -3045,8 +3338,7 @@ fn execute_vm_tx(
                 outcome: TxOutcome::Invalid(ActuatorError::NotImplemented(
                     "CALLTOKEN opcode (TRC-10 transfer) — requires revm fork",
                 )),
-                internal_transactions: Vec::new(),
-                    vm_logs: Vec::new(),
+                ..TxResult::empty()
             }
         }
         tron_tvm::execute::VmOutcome::PreflightError(msg) => {
@@ -3056,7 +3348,7 @@ fn execute_vm_tx(
                 contract_type: Some(ty),
                 outcome: TxOutcome::Invalid(ActuatorError::Store(msg)),
                 internal_transactions: proto_internal_txs,
-                vm_logs: Vec::new(),
+                ..TxResult::empty()
             }
         }
         // Timeout is only produced by read-only RPC paths
@@ -3073,7 +3365,7 @@ fn execute_vm_tx(
                     "VM timeout ({deadline_ms}ms) — not expected on block-apply path"
                 ))),
                 internal_transactions: proto_internal_txs,
-                vm_logs: Vec::new(),
+                ..TxResult::empty()
             }
         }
     }
@@ -3183,6 +3475,39 @@ pub fn apply_genesis_allocations(
 /// Pull the owner address from a contract for bandwidth charging.
 /// Returns `Err(())` for contract types that have no obvious owner
 /// (in which case the caller skips the charge).
+/// Debit a flat fee (multi-sign / memo) from the contract owner's
+/// balance, mirroring the body of java-tron's
+/// `Manager.consumeMultiSignFee`: a missing owner account skips the
+/// charge (`if (accountCapsule != null)` — the shielded case), an
+/// insufficient balance is an error, and the fee burns via the
+/// blackhole-optimization path. Notably java does NOT touch
+/// `latest_operation_time` here, unlike its other fee debits. Returns
+/// the amount actually charged.
+fn charge_flat_fee(
+    accounts: &AccountStore,
+    dyn_props: &tron_chainbase::DynamicPropertiesStore,
+    contract: &tron_proto::transaction::Contract,
+    ty: ContractType,
+    fee: i64,
+) -> Result<i64, String> {
+    let Ok(owner) = extract_owner_for_bandwidth(contract, ty) else {
+        return Ok(0);
+    };
+    let Some(mut account) = accounts.get(&owner).map_err(|e| e.to_string())? else {
+        return Ok(0);
+    };
+    if account.balance < fee {
+        return Err(format!(
+            "account balance {} cannot cover the {} sun fee",
+            account.balance, fee
+        ));
+    }
+    account.balance -= fee;
+    accounts.put(&owner, &account).map_err(|e| e.to_string())?;
+    bandwidth::dispose_fee(dyn_props, fee);
+    Ok(fee)
+}
+
 fn extract_owner_for_bandwidth(
     contract: &tron_proto::transaction::Contract,
     ty: ContractType,
@@ -3215,6 +3540,52 @@ fn extract_owner_for_bandwidth(
         ContractType::ProposalCreateContract => unpack!(tron_proto::ProposalCreateContract),
         ContractType::ProposalApproveContract => unpack!(tron_proto::ProposalApproveContract),
         ContractType::ProposalDeleteContract => unpack!(tron_proto::ProposalDeleteContract),
+        // VM-bound contracts pay for their wire bytes like everything
+        // else (java's TransactionCapsule.getOwner covers every type;
+        // this match previously bailed for them, silently skipping the
+        // bandwidth charge for ALL smart-contract transactions).
+        ContractType::TriggerSmartContract => unpack!(tron_proto::TriggerSmartContract),
+        ContractType::CreateSmartContract => {
+            let c = <tron_proto::CreateSmartContract as prost::Message>::decode(
+                parameter.value.as_slice(),
+            )
+            .map_err(|_| ())?;
+            c.owner_address
+        }
+        ContractType::ParticipateAssetIssueContract => {
+            unpack!(tron_proto::ParticipateAssetIssueContract)
+        }
+        ContractType::AssetIssueContract => unpack!(tron_proto::AssetIssueContract),
+        ContractType::UpdateAssetContract => unpack!(tron_proto::UpdateAssetContract),
+        ContractType::UnfreezeAssetContract => unpack!(tron_proto::UnfreezeAssetContract),
+        ContractType::SetAccountIdContract => unpack!(tron_proto::SetAccountIdContract),
+        ContractType::UpdateSettingContract => unpack!(tron_proto::UpdateSettingContract),
+        ContractType::UpdateEnergyLimitContract => {
+            unpack!(tron_proto::UpdateEnergyLimitContract)
+        }
+        ContractType::ClearAbiContract => unpack!(tron_proto::ClearAbiContract),
+        ContractType::UpdateBrokerageContract => unpack!(tron_proto::UpdateBrokerageContract),
+        ContractType::ExchangeCreateContract => unpack!(tron_proto::ExchangeCreateContract),
+        ContractType::ExchangeInjectContract => unpack!(tron_proto::ExchangeInjectContract),
+        ContractType::ExchangeWithdrawContract => {
+            unpack!(tron_proto::ExchangeWithdrawContract)
+        }
+        ContractType::ExchangeTransactionContract => {
+            unpack!(tron_proto::ExchangeTransactionContract)
+        }
+        ContractType::MarketSellAssetContract => unpack!(tron_proto::MarketSellAssetContract),
+        ContractType::MarketCancelOrderContract => {
+            unpack!(tron_proto::MarketCancelOrderContract)
+        }
+        ContractType::WithdrawExpireUnfreezeContract => {
+            unpack!(tron_proto::WithdrawExpireUnfreezeContract)
+        }
+        ContractType::CancelAllUnfreezeV2Contract => {
+            unpack!(tron_proto::CancelAllUnfreezeV2Contract)
+        }
+        ContractType::VoteAssetContract => unpack!(tron_proto::VoteAssetContract),
+        // ShieldedTransfer is skipped by the caller; Custom/Get have no
+        // owner shape.
         _ => return Err(()),
     };
     if bytes.len() != 21 {

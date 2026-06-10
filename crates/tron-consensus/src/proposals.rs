@@ -76,6 +76,73 @@ pub fn activate_expired_proposals(
             for (param_id, value) in &proposal.parameters {
                 if let Some(key) = parameter_id_to_key(*param_id) {
                     dyn_props.put_long(key, *value);
+                    // Price changes also append to the historic schedule
+                    // (java's `ProposalService.process`, TRANSACTION_FEE /
+                    // ENERGY_FEE cases): `old + "," + expiration:value` —
+                    // the proposal's expiration is the instant the new
+                    // price takes effect. `getBandwidthPrices` /
+                    // `getEnergyPrices` serve this string verbatim, and
+                    // at-timestamp fee lookups walk it.
+                    match *param_id {
+                        3 => {
+                            let appended = format!(
+                                "{},{}:{}",
+                                dyn_props.bandwidth_price_history(),
+                                proposal.expiration_time,
+                                value
+                            );
+                            dyn_props.save_bandwidth_price_history(&appended);
+                        }
+                        11 => {
+                            let appended = format!(
+                                "{},{}:{}",
+                                dyn_props.energy_price_history(),
+                                proposal.expiration_time,
+                                value
+                            );
+                            dyn_props.save_energy_price_history(&appended);
+                        }
+                        // ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO(33) is
+                        // stored SCALED — java's ProposalService writes
+                        // `24 * 60 * value` (periods per day × ratio) and
+                        // re-derives the energy target limit from it.
+                        33 => {
+                            let ratio = 24 * 60 * *value;
+                            dyn_props.put_long(
+                                b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO",
+                                ratio,
+                            );
+                            let total = dyn_props
+                                .get_long(b"TOTAL_ENERGY_LIMIT")
+                                .unwrap_or(0);
+                            if ratio > 0 {
+                                dyn_props.put_long(
+                                    b"TOTAL_ENERGY_TARGET_LIMIT",
+                                    total / ratio,
+                                );
+                            }
+                        }
+                        // Energy-limit proposals write derived keys too:
+                        //   17 — `saveTotalEnergyLimit`: target = v/14400.
+                        //   19 — `saveTotalEnergyLimit2`: target = v/14400,
+                        //        plus current = v when adaptive energy is
+                        //        off (it is on mainnet:
+                        //        ALLOW_ADAPTIVE_ENERGY = 0).
+                        17 | 19 => {
+                            dyn_props
+                                .put_long(b"TOTAL_ENERGY_TARGET_LIMIT", value / 14_400);
+                            if *param_id == 19
+                                && dyn_props
+                                    .get_long(b"ALLOW_ADAPTIVE_ENERGY")
+                                    .unwrap_or(0)
+                                    == 0
+                            {
+                                dyn_props
+                                    .put_long(b"TOTAL_ENERGY_CURRENT_LIMIT", *value);
+                            }
+                        }
+                        _ => {}
+                    }
                     report
                         .parameter_updates
                         .push((id, *param_id, *value));
@@ -119,11 +186,16 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         12 => b"EXCHANGE_CREATE_FEE",
         13 => b"MAX_CPU_TIME_OF_ONE_TX",
         14 => b"ALLOW_UPDATE_ACCOUNT_NAME",
-        15 => b"ALLOW_SAME_TOKEN_NAME",
+        // java quirk: stored with a leading space (the canonical typo —
+        // see the chainbase keys doc).
+        15 => b" ALLOW_SAME_TOKEN_NAME",
         16 => b"ALLOW_DELEGATE_RESOURCE",
         17 => b"TOTAL_ENERGY_LIMIT",
         18 => b"ALLOW_TVM_TRANSFER_TRC10",
-        19 => b"TOTAL_CURRENT_ENERGY_LIMIT",
+        // java's TOTAL_CURRENT_ENERGY_LIMIT(19) routes through
+        // `saveTotalEnergyLimit2`, whose primary write is the same
+        // TOTAL_ENERGY_LIMIT key (derived keys handled at activation).
+        19 => b"TOTAL_ENERGY_LIMIT",
         20 => b"ALLOW_MULTI_SIGN",
         21 => b"ALLOW_ADAPTIVE_ENERGY",
         22 => b"UPDATE_ACCOUNT_PERMISSION_FEE",
@@ -131,43 +203,61 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         24 => b"ALLOW_PROTO_FILTER_NUM",
         25 => b"ALLOW_ACCOUNT_STATE_ROOT",
         26 => b"ALLOW_TVM_CONSTANTINOPLE",
-        27 => b"ALLOW_TVM_SOLIDITY_059",
-        28 => b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO",
+        // Ids below follow java's `ProposalUtil.ProposalType` enum
+        // EXACTLY, including its gaps (27/28, 34, 36-38, 42/43, 50,
+        // 54-58, 64, 80, 84-86, 90/91, 93 are unassigned or were
+        // removed before activation). The previous table numbered these
+        // sequentially, so every id ≥ 27 mapped to the WRONG chain
+        // parameter — historic proposals were applied by java before
+        // our snapshot, but any FUTURE proposal would have activated
+        // against the wrong key.
         29 => b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER",
-        30 => b"ALLOW_CHANGE_DELEGATION",
+        // java quirk: the on-disk key has no ALLOW_ prefix.
+        30 => b"CHANGE_DELEGATION",
         31 => b"WITNESS_127_PAY_PER_BLOCK",
-        32 => b"ALLOW_TVM_SHIELDED_TRC20",
-        33 => b"ALLOW_TVM_ISTANBUL",
-        34 => b"ALLOW_MARKET_TRANSACTION",
-        35 => b"MARKET_SELL_FEE",
-        36 => b"MARKET_CANCEL_FEE",
-        37 => b"ALLOW_PBFT",
-        38 => b"ALLOW_TRANSACTION_FEE_POOL",
-        39 => b"MAX_FEE_LIMIT",
-        40 => b"ALLOW_OPTIMIZE_BLACK_HOLE",
-        41 => b"ALLOW_NEW_RESOURCE_MODEL",
-        42 => b"ALLOW_TVM_FREEZE",
-        43 => b"ALLOW_TVM_VOTE",
-        44 => b"ALLOW_TVM_LONDON",
-        45 => b"ALLOW_TVM_COMPATIBLE_EVM",
-        46 => b"FREE_NET_LIMIT",
-        47 => b"TOTAL_NET_LIMIT",
-        48 => b"ALLOW_ACCOUNT_ASSET_OPTIMIZATION",
-        49 => b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX",
-        50 => b"ALLOW_ASSET_OPTIMIZATION",
-        51 => b"ALLOW_NEW_REWARD",
-        52 => b"MEMO_FEE",
-        53 => b"ALLOW_DELEGATE_OPTIMIZATION",
-        54 => b"ALLOW_DYNAMIC_ENERGY",
-        55 => b"DYNAMIC_ENERGY_THRESHOLD",
-        56 => b"DYNAMIC_ENERGY_INCREASE_FACTOR",
-        57 => b"DYNAMIC_ENERGY_MAX_FACTOR",
-        58 => b"ALLOW_TVM_SHANGHAI",
-        59 => b"ALLOW_CANCEL_ALL_UNFREEZE_V2",
-        60 => b"ALLOW_OLD_REWARD_OPT",
-        61 => b"ALLOW_TVM_CANCUN",
-        62 => b"ALLOW_ENERGY_ADJUSTMENT",
-        63 => b"MAX_CREATE_ACCOUNT_TX_SIZE",
+        32 => b"ALLOW_TVM_SOLIDITY_059",
+        33 => b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO",
+        35 => b"FORBID_TRANSFER_TO_CONTRACT",
+        39 => b"ALLOW_SHIELDED_TRC20_TRANSACTION",
+        40 => b"ALLOW_PBFT",
+        41 => b"ALLOW_TVM_ISTANBUL",
+        44 => b"ALLOW_MARKET_TRANSACTION",
+        45 => b"MARKET_SELL_FEE",
+        46 => b"MARKET_CANCEL_FEE",
+        47 => b"MAX_FEE_LIMIT",
+        48 => b"ALLOW_TRANSACTION_FEE_POOL",
+        49 => b"ALLOW_BLACKHOLE_OPTIMIZATION",
+        51 => b"ALLOW_NEW_RESOURCE_MODEL",
+        52 => b"ALLOW_TVM_FREEZE",
+        53 => b"ALLOW_ACCOUNT_ASSET_OPTIMIZATION",
+        59 => b"ALLOW_TVM_VOTE",
+        60 => b"ALLOW_TVM_COMPATIBLE_EVM",
+        61 => b"FREE_NET_LIMIT",
+        62 => b"TOTAL_NET_LIMIT",
+        63 => b"ALLOW_TVM_LONDON",
+        65 => b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX",
+        66 => b"ALLOW_ASSET_OPTIMIZATION",
+        67 => b"ALLOW_NEW_REWARD",
+        68 => b"MEMO_FEE",
+        69 => b"ALLOW_DELEGATE_OPTIMIZATION",
+        70 => b"UNFREEZE_DELAY_DAYS",
+        71 => b"ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID",
+        72 => b"ALLOW_DYNAMIC_ENERGY",
+        73 => b"DYNAMIC_ENERGY_THRESHOLD",
+        74 => b"DYNAMIC_ENERGY_INCREASE_FACTOR",
+        75 => b"DYNAMIC_ENERGY_MAX_FACTOR",
+        76 => b"ALLOW_TVM_SHANGHAI",
+        77 => b"ALLOW_CANCEL_ALL_UNFREEZE_V2",
+        78 => b"MAX_DELEGATE_LOCK_PERIOD",
+        79 => b"ALLOW_OLD_REWARD_OPT",
+        81 => b"ALLOW_ENERGY_ADJUSTMENT",
+        82 => b"MAX_CREATE_ACCOUNT_TX_SIZE",
+        83 => b"ALLOW_TVM_CANCUN",
+        87 => b"ALLOW_STRICT_MATH",
+        88 => b"CONSENSUS_LOGIC_OPTIMIZATION",
+        89 => b"ALLOW_TVM_BLOB",
+        92 => b"PROPOSAL_EXPIRE_TIME",
+        94 => b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION",
         _ => return None,
     })
 }

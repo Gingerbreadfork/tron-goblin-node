@@ -30,6 +30,14 @@ pub mod proto {
     tonic::include_proto!("protocol");
 }
 
+/// Generated tonic stubs for the firehose external-sink stream
+/// (`proto/firehose.proto`, self-contained package).
+pub mod firehose_proto {
+    tonic::include_proto!("tronfirehose");
+}
+
+pub mod firehose;
+
 mod database;
 mod monitor;
 mod prover;

@@ -464,15 +464,20 @@ async fn get_chain_parameters_returns_seeded_entries() {
     )
     .await;
     let params = resp["result"]["chainParameter"].as_array().unwrap();
+    // java-parity: keys use java's `get…` names; zero values omit the
+    // `value` field (proto3 JSON), so map through Option.
     let by_key: std::collections::HashMap<_, _> = params
         .iter()
         .map(|p| (
             p["key"].as_str().unwrap().to_string(),
-            p["value"].as_i64().unwrap(),
+            p["value"].as_i64().unwrap_or(0),
         ))
         .collect();
-    assert_eq!(by_key.get("TRANSACTION_FEE"), Some(&1234));
-    assert_eq!(by_key.get("ENERGY_FEE"), Some(&5678));
+    assert_eq!(by_key.get("getTransactionFee"), Some(&1234));
+    assert_eq!(by_key.get("getEnergyFee"), Some(&5678));
+    // Every java entry is present even when unset (value omitted → 0).
+    assert_eq!(params.len(), 75);
+    assert_eq!(by_key.get("getAllowNewResourceModel"), Some(&0));
 }
 
 #[tokio::test]
@@ -492,7 +497,8 @@ async fn get_burn_trx_reads_from_dyn_props() {
     let (addr, _accts, _blocks, _idx, _txs, dp) = spawn_server().await;
     dp.put_long(b"BURN_TRX_AMOUNT", 42);
     let resp = call(addr, json!({"jsonrpc":"2.0","method":"getBurnTrx","id":1})).await;
-    assert_eq!(resp["result"], 42_i64);
+    // java wraps the value in NumberMessage JSON.
+    assert_eq!(resp["result"]["burnTrxAmount"], 42_i64);
 }
 
 #[tokio::test]
@@ -518,9 +524,11 @@ async fn get_node_info_returns_block_header_and_version() {
 #[tokio::test]
 async fn get_energy_prices_reads_dyn_props() {
     let (addr, _accts, _blocks, _idx, _txs, dp) = spawn_server().await;
-    dp.put_long(b"ENERGY_FEE", 420);
+    // Served verbatim from the persisted history string (java parity) —
+    // NOT fabricated from the current ENERGY_FEE.
+    dp.save_energy_price_history("0:100,1542607200000:20");
     let resp = call(addr, json!({"jsonrpc":"2.0","method":"getEnergyPrices","id":1})).await;
-    assert_eq!(resp["result"]["prices"], "0:420");
+    assert_eq!(resp["result"]["prices"], "0:100,1542607200000:20");
 }
 
 #[tokio::test]
@@ -668,7 +676,8 @@ async fn get_next_maintenance_time_reads_dyn_props() {
         json!({"jsonrpc":"2.0","method":"getNextMaintenanceTime","id":1}),
     )
     .await;
-    assert_eq!(resp["result"], 1_700_000_000_000_i64);
+    // java wraps the value in NumberMessage JSON ({"num": t}).
+    assert_eq!(resp["result"]["num"], 1_700_000_000_000_i64);
 }
 
 #[tokio::test]
@@ -2988,4 +2997,234 @@ async fn build_transaction_dispatches_to_handler_not_method_not_found() {
         Some(-32601),
         "buildTransaction must dispatch, not method_not_found; got: {resp}"
     );
+}
+
+// =============================================================================
+// getContract / getContractInfo — java-tron JsonFormat parity
+// (STATE-3, 2026-06-10): ABI stitched from the split `abi` column
+// family, runtimecode looked up by ADDRESS, top-level
+// {smart_contract, runtimecode, contract_state} wrapper, bare hex,
+// defaults omitted, ABI enums as value names.
+// =============================================================================
+
+#[tokio::test]
+async fn get_contract_info_matches_java_wrapper_shape() {
+    use tron_chainbase::{AbiStore, AccountStore, CodeStore, ContractStateStore, ContractStore};
+    use tron_proto::smart_contract::abi::entry::{EntryType, Param, StateMutabilityType};
+    use tron_proto::smart_contract::abi::Entry;
+    use tron_proto::smart_contract::Abi;
+
+    let accounts_be = mem();
+    let blocks_be = mem();
+    let block_index_be = mem();
+    let trans_be = mem();
+    let dp_be = mem();
+    let contracts_be = mem();
+    let abis_be = mem();
+    let code_be = mem();
+    let storage_be = mem();
+    let contract_state_be = mem();
+
+    let mut contract_tron = [0u8; 21];
+    contract_tron[0] = 0x41;
+    contract_tron[1..].fill(0xc2);
+    let contract_addr = Address::from_raw(contract_tron);
+
+    // Account row must exist (java returns null otherwise).
+    AccountStore::new(accounts_be.clone())
+        .put(
+            &contract_addr,
+            &Account {
+                address: contract_tron.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Contract row: post-ABI-split (abi cleared on the row itself).
+    ContractStore::new(contracts_be.clone())
+        .put(
+            &contract_addr,
+            &tron_proto::SmartContract {
+                origin_address: vec![0x41; 21],
+                contract_address: contract_tron.to_vec(),
+                abi: None,
+                bytecode: vec![0x60, 0x80],
+                call_value: 0,
+                consume_user_resource_percent: 30,
+                name: "TetherToken".into(),
+                origin_energy_limit: 10_000_000,
+                code_hash: vec![0xaa; 32],
+                trx_hash: Vec::new(),
+                version: 0,
+            },
+        )
+        .unwrap();
+
+    // ABI lives in the split `abi` store and must be stitched back.
+    AbiStore::new(abis_be.clone())
+        .put(
+            &contract_addr,
+            &Abi {
+                entrys: vec![Entry {
+                    constant: true,
+                    name: "balanceOf".into(),
+                    inputs: vec![Param {
+                        indexed: false,
+                        name: "who".into(),
+                        r#type: "address".into(),
+                    }],
+                    outputs: vec![Param {
+                        indexed: false,
+                        name: String::new(),
+                        r#type: "uint256".into(),
+                    }],
+                    r#type: EntryType::Function as i32,
+                    payable: false,
+                    anonymous: false,
+                    state_mutability: StateMutabilityType::View as i32,
+                }],
+            },
+        )
+        .unwrap();
+
+    // Runtime code keyed by ADDRESS (java CodeStore keying).
+    CodeStore::new(code_be.clone())
+        .put(contract_addr.as_bytes(), &[0xde, 0xad, 0xbe, 0xef])
+        .unwrap();
+
+    // Dynamic-energy state served caught-up-for-display.
+    ContractStateStore::new(contract_state_be.clone())
+        .put(
+            &contract_addr,
+            &tron_proto::ContractState {
+                energy_usage: 12_345,
+                energy_factor: 34_000,
+                update_cycle: 9_656,
+            },
+        )
+        .unwrap();
+    DynamicPropertiesStore::new(dp_be.clone()).save_current_cycle_number(9_656);
+
+    let eth_backends = tron_rpc::state::EthCallBackends {
+        accounts: accounts_be.clone(),
+        code: code_be.clone(),
+        storage: storage_be.clone(),
+        witnesses: mem(),
+        contract_state: contract_state_be.clone(),
+        dyn_props: dp_be.clone(),
+        delegated_resources: mem(),
+        delegation: mem(),
+        contracts: contracts_be.clone(),
+        block_index: None,
+    };
+
+    let state = RpcState::new(
+        accounts_be,
+        blocks_be,
+        block_index_be,
+        trans_be,
+        dp_be,
+        MAINNET_CHAIN_ID,
+    )
+    .with_contract_stores(contracts_be, abis_be)
+    .with_evm_stores(code_be, storage_be)
+    .with_eth_call_backends(eth_backends);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let app = tron_rpc::server::router(state);
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+
+    let hex_addr = format!("0x{}", hex::encode(&contract_tron[1..]));
+
+    // --- getContract: bare hex, omit defaults, stitched ABI ---
+    let resp = call(
+        addr,
+        json!({"jsonrpc":"2.0","method":"getContract","params":[hex_addr],"id":1}),
+    )
+    .await;
+    let c = &resp["result"];
+    assert_eq!(c["name"], "TetherToken");
+    assert_eq!(c["consume_user_resource_percent"], 30);
+    assert_eq!(c["bytecode"], "6080", "bare hex, no 0x prefix");
+    assert_eq!(c["code_hash"], hex::encode([0xaa; 32]));
+    // java JsonFormat omits zero/empty fields entirely.
+    assert!(c.get("call_value").is_none(), "call_value=0 must be omitted: {c}");
+    assert!(c.get("trx_hash").is_none(), "empty trx_hash must be omitted: {c}");
+    assert!(c.get("version").is_none(), "version=0 must be omitted: {c}");
+    // Stitched ABI with java enum names and per-entry omit-defaults.
+    let entry = &c["abi"]["entrys"][0];
+    assert_eq!(entry["name"], "balanceOf");
+    assert_eq!(entry["type"], "Function");
+    assert_eq!(entry["stateMutability"], "View");
+    assert_eq!(entry["constant"], true);
+    assert!(entry.get("anonymous").is_none(), "false bools omitted: {entry}");
+    assert!(entry.get("payable").is_none(), "false bools omitted: {entry}");
+    assert_eq!(entry["inputs"][0]["type"], "address");
+    assert!(
+        entry["outputs"][0].get("name").is_none(),
+        "empty param name omitted: {entry}"
+    );
+
+    // --- getContractInfo: {smart_contract, runtimecode, contract_state} ---
+    let resp = call(
+        addr,
+        json!({"jsonrpc":"2.0","method":"getContractInfo","params":[hex_addr],"id":1}),
+    )
+    .await;
+    let r = &resp["result"];
+    assert_eq!(r["smart_contract"]["name"], "TetherToken");
+    assert_eq!(
+        r["smart_contract"]["abi"]["entrys"][0]["name"], "balanceOf",
+        "getContractInfo stitches the ABI too: {r}"
+    );
+    assert_eq!(r["runtimecode"], "deadbeef", "address-keyed code lookup: {r}");
+    assert_eq!(r["contract_state"]["energy_factor"], 34_000);
+    assert_eq!(r["contract_state"]["energy_usage"], 12_345);
+    assert_eq!(r["contract_state"]["update_cycle"], 9_656);
+}
+
+#[tokio::test]
+async fn get_contract_returns_null_when_account_missing() {
+    use tron_chainbase::ContractStore;
+
+    let accounts_be = mem();
+    let contracts_be = mem();
+    let abis_be = mem();
+
+    let mut contract_tron = [0u8; 21];
+    contract_tron[0] = 0x41;
+    contract_tron[1..].fill(0xc3);
+    // Contract row exists but the ACCOUNT row doesn't — java returns null.
+    ContractStore::new(contracts_be.clone())
+        .put(
+            &Address::from_raw(contract_tron),
+            &tron_proto::SmartContract {
+                contract_address: contract_tron.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let state = RpcState::new(accounts_be, mem(), mem(), mem(), mem(), MAINNET_CHAIN_ID)
+        .with_contract_stores(contracts_be, abis_be);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let app = tron_rpc::server::router(state);
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+
+    let resp = call(
+        addr,
+        json!({"jsonrpc":"2.0","method":"getContract",
+               "params":[format!("0x{}", hex::encode(&contract_tron[1..]))],"id":1}),
+    )
+    .await;
+    assert_eq!(resp["result"], Value::Null);
 }

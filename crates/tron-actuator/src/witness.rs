@@ -166,16 +166,11 @@ pub fn execute_update_brokerage(
 // =============================================================================
 // WithdrawBalanceActuator
 // =============================================================================
-//
-// **Deferred**: `MortgageService.withdrawReward` (computes accumulated
-// voter rewards and adds them to `allowance`) is not yet ported. This
-// implementation only drains an existing `allowance` field — sufficient
-// for SRs claiming block production rewards but missing the voter-side
-// reward computation.
 
 pub fn validate_withdraw_balance(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    delegation: &DelegationStore,
     contract: &WithdrawBalanceContract,
 ) -> Result<(), ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -188,7 +183,15 @@ pub fn validate_withdraw_balance(
     if account.latest_withdraw_time > 0 && now < ready_at {
         return Err(ActuatorError::WithdrawTooSoon { ready_at, now });
     }
-    if account.allowance == 0 {
+    // java rejects only when BOTH the settled allowance AND the not-yet-
+    // settled voter reward are empty (`getAllowance() <= 0 &&
+    // mortgageService.queryReward(owner) <= 0`). A voter whose rewards
+    // haven't been folded into `allowance` yet must still be able to
+    // withdraw — execute settles them first. Gating on allowance alone
+    // failed txs that mainnet accepts.
+    if account.allowance <= 0
+        && tron_tvm::reward::query_reward(&owner, accounts, delegation, dyn_props)? <= 0
+    {
         return Err(ActuatorError::NoAllowance);
     }
     Ok(())
@@ -197,9 +200,19 @@ pub fn validate_withdraw_balance(
 pub fn execute_withdraw_balance(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    delegation: &DelegationStore,
     contract: &WithdrawBalanceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
+
+    // Settle pending voter rewards into `allowance` first — java-tron's
+    // `mortgageService.withdrawReward(ownerAddress)` at the top of
+    // `WithdrawBalanceActuator.execute`. Besides the allowance credit,
+    // this advances the voter's begin/end-cycle markers and writes the
+    // `account_vote` snapshot in DelegationStore — state java mutates on
+    // every withdrawal.
+    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props)?;
+
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;

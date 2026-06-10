@@ -78,31 +78,65 @@ impl ContractStateStore {
         increase_factor: i64,
         max_factor: i64,
     ) -> Result<i64, StoreError> {
+        let (state, changed) =
+            Self::caught_up(self.get(address)?, new_cycle, threshold, increase_factor, max_factor);
+        if changed {
+            self.put(address, &state)?;
+        }
+        Ok(state.energy_factor)
+    }
+
+    /// Read-only caught-up view of a contract's state — what java-tron's
+    /// `getContractInfo` serves: `catchUpToCycle` is run on the capsule
+    /// for display but never written back. A missing record yields a
+    /// fresh `{update_cycle: new_cycle}` (java builds
+    /// `new ContractStateCapsule(currentCycleNumber)`).
+    pub fn caught_up_view(
+        &self,
+        address: &Address,
+        new_cycle: i64,
+        threshold: i64,
+        increase_factor: i64,
+        max_factor: i64,
+    ) -> Result<ContractState, StoreError> {
+        Ok(Self::caught_up(self.get(address)?, new_cycle, threshold, increase_factor, max_factor).0)
+    }
+
+    /// Pure catch-up transform shared by the consensus write path
+    /// ([`Self::catch_up_to_cycle`]) and the RPC view
+    /// ([`Self::caught_up_view`]). Returns the post-catch-up state and
+    /// whether it differs from what's stored (i.e. needs a write).
+    fn caught_up(
+        stored: Option<ContractState>,
+        new_cycle: i64,
+        threshold: i64,
+        increase_factor: i64,
+        max_factor: i64,
+    ) -> (ContractState, bool) {
         const DECIMAL: i64 = 10_000;
         const DECREASE_DIVISION: i64 = 4;
 
-        let mut state = match self.get(address)? {
-            Some(s) => s,
-            None => {
-                let fresh = ContractState {
+        let Some(state) = stored else {
+            return (
+                ContractState {
                     update_cycle: new_cycle,
                     ..Default::default()
-                };
-                self.put(address, &fresh)?;
-                return Ok(0);
-            }
+                },
+                true,
+            );
         };
 
         if state.update_cycle == new_cycle {
-            return Ok(state.energy_factor);
+            return (state, false);
         }
         if state.update_cycle > new_cycle || state.update_cycle == 0 {
-            state = ContractState {
-                update_cycle: new_cycle,
-                ..Default::default()
-            };
-            self.put(address, &state)?;
-            return Ok(0);
+            return (
+                ContractState {
+                    update_cycle: new_cycle,
+                    ..Default::default()
+                },
+                true,
+            );
         }
 
         let mut current_factor = state.energy_factor;
@@ -128,13 +162,14 @@ impl ContractStateStore {
             }
         }
 
-        state = ContractState {
-            update_cycle: new_cycle,
-            energy_factor: current_factor,
-            energy_usage: 0,
-        };
-        self.put(address, &state)?;
-        Ok(current_factor)
+        (
+            ContractState {
+                update_cycle: new_cycle,
+                energy_factor: current_factor,
+                energy_usage: 0,
+            },
+            true,
+        )
     }
 
     /// Record additional energy consumption against the contract's

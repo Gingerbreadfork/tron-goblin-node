@@ -296,15 +296,20 @@ struct FetchPoolInner {
     /// Block number for every live id (want/inflight/ready), so a late
     /// delivery of a reclaimed id can be located back in `want`.
     num_of: std::collections::HashMap<[u8; 32], i64>,
-    /// Per-id set of connection tokens that have already been handed this id
-    /// to fetch. java-tron's `FetchInvDataMsgHandler` caches every block hash
-    /// it serves a connection and disconnects (BAD_PROTOCOL) on a re-request,
-    /// so we must NEVER ask the same connection for the same id twice — even
-    /// after a stall-reclaim. A reclaimed id is therefore re-offered only to a
-    /// *different* connection; its original (slow-but-alive) peer's late
-    /// delivery is still accepted by `deliver`.
-    claimers: std::collections::HashMap<[u8; 32], Vec<u64>>,
 }
+
+// NOTE on the never-re-request guard: java-tron's `FetchInvDataMsgHandler`
+// caches every block hash a connection requests and disconnects
+// (BAD_PROTOCOL) on a re-request, so we must NEVER ask the same connection
+// for the same id twice — even after a stall-reclaim or a pool `reset()`.
+// That history is deliberately NOT kept in the pool: the pool's lifecycle
+// (`take_ready` consumes an id, `reset()` wipes everything) is shorter than
+// a connection's, and an early version that tracked it here forgot the
+// history on reset and re-offered already-fetched hashes to live
+// connections. Each peer pass keeps its own fetched-id map (which dies with
+// the connection — a reconnect legitimately gets a clean remote cache) and
+// passes it to [`SyncFetchPool::claim`] / [`SyncFetchPool::claimable_within`]
+// as the `already_fetched` predicate.
 
 impl SyncFetchPool {
     pub fn new() -> Self {
@@ -314,7 +319,9 @@ impl SyncFetchPool {
     }
 
     /// Clear everything — leader call on a new sync session / reorg /
-    /// leadership change. Anything dropped is simply re-requested.
+    /// leadership change. Anything dropped is simply re-requested (by a
+    /// connection that hasn't fetched it before — see the never-re-request
+    /// note above; per-conn fetched history survives a reset by design).
     pub fn reset(&self) {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
         g.want.clear();
@@ -322,20 +329,29 @@ impl SyncFetchPool {
         g.ready.clear();
         g.seen.clear();
         g.num_of.clear();
-        g.claimers.clear();
     }
 
     /// Leader: enqueue `(num, id)` wants in chain order. Ids already being
     /// handled (want/inflight/ready) are skipped, so no block is fetched
-    /// twice.
-    pub fn push_wants(&self, items: impl IntoIterator<Item = (i64, [u8; 32])>) {
+    /// twice. Returns the ids that were NEWLY inserted, in input order —
+    /// the leader extends its `expected` apply queue with exactly these, so
+    /// an overlapping window (a takeover-inherited pool + the new leader's
+    /// own inventory covering the same range) can never put a duplicate id
+    /// into the apply order.
+    pub fn push_wants(
+        &self,
+        items: impl IntoIterator<Item = (i64, [u8; 32])>,
+    ) -> Vec<[u8; 32]> {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        let mut inserted = Vec::new();
         for (num, id) in items {
             if g.seen.insert(id) {
                 g.want.insert(num, id);
                 g.num_of.insert(id, num);
+                inserted.push(id);
             }
         }
+        inserted
     }
 
     /// Worker: claim up to `max` ids whose block number is ≤ `max_num` — the
@@ -343,6 +359,12 @@ impl SyncFetchPool {
     /// is inside that peer's serve window. Lowest numbers first (so the
     /// leader's next-to-apply blocks get fetched soonest). First reclaims
     /// stalled in-flight ids. Returns empty under `ready_cap` back-pressure.
+    ///
+    /// `already_fetched` is the caller's per-CONNECTION fetched-id history:
+    /// ids it returns `true` for are never handed out (re-requesting a hash
+    /// on the same connection trips java-tron's served-hash cache →
+    /// BAD_PROTOCOL). The caller owns that history so it survives pool
+    /// resets and `take_ready` (see the module note above).
     pub fn claim(
         &self,
         conn_token: u64,
@@ -350,6 +372,7 @@ impl SyncFetchPool {
         max: usize,
         ready_cap: usize,
         reclaim_after: Duration,
+        already_fetched: impl Fn(&[u8; 32]) -> bool,
     ) -> Vec<[u8; 32]> {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
         // Reclaim stalled in-flight ids back into `want` (by number).
@@ -372,17 +395,11 @@ impl SyncFetchPool {
         // forward progress.
         let cap_limit = if g.ready.len() >= ready_cap { 1 } else { max };
         // Lowest eligible numbers (≤ max_num) first, skipping any id this
-        // connection has already been handed (re-requesting it would trip the
-        // peer's served-hash cache → BAD_PROTOCOL).
+        // connection has already fetched (per the caller's history).
         let picked: Vec<(i64, [u8; 32])> = g
             .want
             .range(..=max_num)
-            .filter(|(_, id)| {
-                g.claimers
-                    .get(*id)
-                    .map(|c| !c.contains(&conn_token))
-                    .unwrap_or(true)
-            })
+            .filter(|(_, id)| !already_fetched(id))
             .take(cap_limit)
             .map(|(n, id)| (*n, *id))
             .collect();
@@ -391,7 +408,6 @@ impl SyncFetchPool {
         for (n, id) in picked {
             g.want.remove(&n);
             g.inflight.insert(id, (n, now, conn_token));
-            g.claimers.entry(id).or_default().push(conn_token);
             out.push(id);
         }
         out
@@ -399,9 +415,10 @@ impl SyncFetchPool {
 
     /// Immediately return a disconnecting connection's in-flight claims to
     /// `want` so another peer can fetch them at once — instead of the leader
-    /// idling until the per-id reclaim window elapses. The dead conn token is
-    /// also dropped from each id's `claimers` set: a fresh reconnect of the same
-    /// peer gets a clean served-hash cache, so re-offering it the id is safe.
+    /// idling until the per-id reclaim window elapses. (A fresh reconnect of
+    /// the same peer starts a new per-connection fetched-id history, so
+    /// re-offering it these ids is safe — the remote served-hash cache is
+    /// per-connection too.)
     pub fn reclaim_conn(&self, conn_token: u64) {
         let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
         let mine: Vec<([u8; 32], i64)> = g
@@ -413,8 +430,20 @@ impl SyncFetchPool {
         for (id, n) in mine {
             g.inflight.remove(&id);
             g.want.insert(n, id);
-            if let Some(c) = g.claimers.get_mut(&id) {
-                c.retain(|t| *t != conn_token);
+        }
+    }
+
+    /// Return specific in-flight ids to `want` so a DIFFERENT connection can
+    /// fetch them. Used when a peer answers a `FetchInvData` with
+    /// `ItemNotFound`: those ids will never arrive on the requesting
+    /// connection, and waiting out the stall-reclaim window just idles the
+    /// leader. The requester keeps them in its own fetched-id history, so it
+    /// won't re-claim them itself. Ids not currently in flight are ignored.
+    pub fn reclaim_ids<'a>(&self, ids: impl IntoIterator<Item = &'a [u8; 32]>) {
+        let mut g = self.inner.lock().expect("SyncFetchPool poisoned");
+        for id in ids {
+            if let Some((n, _, _)) = g.inflight.remove(id) {
+                g.want.insert(n, *id);
             }
         }
     }
@@ -442,7 +471,6 @@ impl SyncFetchPool {
         if let Some(bytes) = g.ready.remove(id) {
             g.seen.remove(id);
             g.num_of.remove(id);
-            g.claimers.remove(id);
             Some(bytes)
         } else {
             None
@@ -458,7 +486,6 @@ impl SyncFetchPool {
         g.want.retain(|_, v| v != id);
         g.ready.remove(id);
         g.num_of.remove(id);
-        g.claimers.remove(id);
     }
 
     /// Count of ids still to fetch or in flight (not yet ready).
@@ -508,16 +535,19 @@ impl SyncFetchPool {
     /// Cheap pending-decision check: is there at least one want this peer can
     /// serve (block num ≤ `max_num`) while the ready buffer is under
     /// `ready_cap` (back-pressure)? Lets a worker choose fetch-vs-refresh
-    /// without claiming.
-    pub fn claimable_within(&self, conn_token: u64, max_num: i64, ready_cap: usize) -> bool {
+    /// without claiming. `already_fetched` is the same per-connection
+    /// history predicate passed to [`Self::claim`].
+    pub fn claimable_within(
+        &self,
+        max_num: i64,
+        ready_cap: usize,
+        already_fetched: impl Fn(&[u8; 32]) -> bool,
+    ) -> bool {
         let g = self.inner.lock().expect("SyncFetchPool poisoned");
         g.ready.len() < ready_cap
-            && g.want.range(..=max_num).any(|(_, id)| {
-                g.claimers
-                    .get(id)
-                    .map(|c| !c.contains(&conn_token))
-                    .unwrap_or(true)
-            })
+            && g.want
+                .range(..=max_num)
+                .any(|(_, id)| !already_fetched(id))
     }
 }
 
@@ -544,23 +574,50 @@ mod fetch_pool_tests {
     const T1: u64 = 1; // connection token A
     const T2: u64 = 2; // connection token B (a different peer)
 
+    /// "This connection has fetched nothing yet" history predicate.
+    fn fresh(_: &[u8; 32]) -> bool {
+        false
+    }
+
     #[test]
     fn claims_lowest_first_and_dedups() {
         let p = SyncFetchPool::new();
         p.push_wants([w(3), w(1), w(2)]); // out of order in → claimed low-first
         p.push_wants([w(2), w(3)]); // dups ignored
-        let c = p.claim(T1, HI, 10, 100, Duration::from_secs(5));
+        let c = p.claim(T1, HI, 10, 100, Duration::from_secs(5), fresh);
         assert_eq!(c, vec![id(1), id(2), id(3)]);
         assert_eq!(p.outstanding(), 3); // all in-flight now
-        assert!(p.claim(T1, HI, 10, 100, Duration::from_secs(5)).is_empty());
+        assert!(p.claim(T1, HI, 10, 100, Duration::from_secs(5), fresh).is_empty());
+    }
+
+    #[test]
+    fn push_wants_returns_only_newly_inserted_ids() {
+        // The leader extends its `expected` apply queue with exactly the
+        // RETURN of push_wants — overlapping windows (takeover-inherited pool
+        // + the new leader's own inventory) must not produce duplicates.
+        let p = SyncFetchPool::new();
+        assert_eq!(p.push_wants([w(1), w(2)]), vec![id(1), id(2)]);
+        // Full overlap → nothing new.
+        assert!(p.push_wants([w(1), w(2)]).is_empty());
+        // Partial overlap → only the genuinely new tail comes back.
+        assert_eq!(p.push_wants([w(2), w(3), w(4)]), vec![id(3), id(4)]);
+        // An id that's in flight (claimed) is still tracked → not "new".
+        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(5), fresh);
+        assert!(p.push_wants([w(1)]).is_empty());
     }
 
     #[test]
     fn claim_respects_max() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3), w(4)]);
-        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
-        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(5)), vec![id(3), id(4)]);
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_secs(5), fresh),
+            vec![id(1), id(2)]
+        );
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_secs(5), fresh),
+            vec![id(3), id(4)]
+        );
     }
 
     #[test]
@@ -571,16 +628,22 @@ mod fetch_pool_tests {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3)]);
         // Worker whose peer only reaches block 2.
-        assert_eq!(p.claim(T1, 2, 10, 100, Duration::from_secs(5)), vec![id(1), id(2)]);
+        assert_eq!(
+            p.claim(T1, 2, 10, 100, Duration::from_secs(5), fresh),
+            vec![id(1), id(2)]
+        );
         // Block 3 still unclaimed — a higher-window peer takes it.
-        assert_eq!(p.claim(T2, HI, 10, 100, Duration::from_secs(5)), vec![id(3)]);
+        assert_eq!(
+            p.claim(T2, HI, 10, 100, Duration::from_secs(5), fresh),
+            vec![id(3)]
+        );
     }
 
     #[test]
     fn deliver_and_take_in_order() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
-        let _ = p.claim(T1, HI, 2, 100, Duration::from_secs(5));
+        let _ = p.claim(T1, HI, 2, 100, Duration::from_secs(5), fresh);
         // Deliver out of order; leader still takes in its own order.
         p.deliver(id(2), vec![2]);
         assert!(p.take_ready(&id(1)).is_none(), "gap blocks until id(1) lands");
@@ -599,8 +662,8 @@ mod fetch_pool_tests {
         p.push_wants([w(1), w(2), w(3), w(4)]);
         // id(1) in flight (claimed, not delivered); id(2) delivered (ready);
         // id(3)/id(4) still wanted.
-        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(30)); // id(1)
-        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(30)); // id(2)
+        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(30), fresh); // id(1)
+        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(30), fresh); // id(2)
         p.deliver(c[0], vec![2]);
         // Above head 0: the whole contiguous window, ascending, regardless of
         // which queue each id currently sits in.
@@ -618,7 +681,7 @@ mod fetch_pool_tests {
     fn back_pressure_caps_lookahead_but_never_blocks_head_of_line() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2), w(3)]);
-        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(5));
+        let c = p.claim(T1, HI, 1, 100, Duration::from_secs(5), fresh);
         p.deliver(c[0], vec![0]);
         // ready holds 1; at ready_cap=1 the pool stops fetching AHEAD, but it
         // must still hand out the single lowest wanted block — that's the
@@ -626,13 +689,13 @@ mod fetch_pool_tests {
         // (ready never drains because the leader can't get its next block, and
         // the next block can't be fetched because ready is full).
         assert_eq!(
-            p.claim(T1, HI, 10, 1, Duration::from_secs(5)),
+            p.claim(T1, HI, 10, 1, Duration::from_secs(5), fresh),
             vec![id(2)],
             "at cap, exactly the head-of-line is claimable — not bulk look-ahead"
         );
         // Applying block 1 drains ready below the cap → full look-ahead resumes.
         let _ = p.take_ready(&id(1));
-        assert_eq!(p.claim(T1, HI, 10, 1, Duration::from_secs(5)), vec![id(3)]);
+        assert_eq!(p.claim(T1, HI, 10, 1, Duration::from_secs(5), fresh), vec![id(3)]);
     }
 
     #[test]
@@ -640,11 +703,45 @@ mod fetch_pool_tests {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
         // T1 claims both, then disconnects before delivering.
-        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(30)), vec![id(1), id(2)]);
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_secs(30), fresh),
+            vec![id(1), id(2)]
+        );
         p.reclaim_conn(T1);
-        // Both are immediately back in `want` (no 30s wait) AND re-offerable to
-        // T1 itself (a fresh reconnect has a clean served-hash cache).
-        assert_eq!(p.claim(T1, HI, 2, 100, Duration::from_secs(30)), vec![id(1), id(2)]);
+        // Both are immediately back in `want` (no 30s wait) AND offerable to a
+        // fresh reconnect of the same peer — the reconnect starts a new
+        // fetched-id history, so its `fresh` predicate admits them again.
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_secs(30), fresh),
+            vec![id(1), id(2)]
+        );
+    }
+
+    #[test]
+    fn reclaim_ids_returns_not_found_ids_to_want_for_other_conns() {
+        // ItemNotFound handling: the requesting conn keeps the ids in its own
+        // fetched history (it may never re-request them), but the pool must
+        // hand them to a DIFFERENT connection immediately.
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1), w(2), w(3)]);
+        let claimed = p.claim(T1, HI, 2, 100, Duration::from_secs(30), fresh);
+        assert_eq!(claimed, vec![id(1), id(2)]);
+        // Peer answered ItemNotFound for both.
+        p.reclaim_ids(claimed.iter());
+        // T1's history now contains them → its next claim skips to id(3).
+        let t1_fetched = claimed.clone();
+        assert_eq!(
+            p.claim(T1, HI, 10, 100, Duration::from_secs(30), |i| t1_fetched.contains(i)),
+            vec![id(3)]
+        );
+        // A different conn picks the returned ids up at once.
+        assert_eq!(
+            p.claim(T2, HI, 10, 100, Duration::from_secs(30), fresh),
+            vec![id(1), id(2)]
+        );
+        // Unknown / not-in-flight ids are ignored quietly.
+        p.reclaim_ids([id(9)].iter());
+        assert_eq!(p.outstanding(), 3);
     }
 
     #[test]
@@ -652,19 +749,27 @@ mod fetch_pool_tests {
         // The java-tron `syncBlockIdCache` guard: a stall-reclaimed id must
         // NEVER be re-handed to the connection that already requested it
         // (re-requesting trips the peer's served-hash cache → BAD_PROTOCOL).
+        // The history lives with the caller; the pool honors its predicate.
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
-        assert_eq!(p.claim(T1, HI, 1, 100, Duration::from_secs(5)), vec![id(1)]);
+        assert_eq!(
+            p.claim(T1, HI, 1, 100, Duration::from_secs(5), fresh),
+            vec![id(1)]
+        );
+        let t1_fetched = vec![id(1)];
         // 0 reclaim window → id(1) is reclaimed back into `want`.
         // Same connection re-claims: it gets id(2), NOT the reclaimed id(1).
         assert_eq!(
-            p.claim(T1, HI, 2, 100, Duration::from_millis(0)),
+            p.claim(T1, HI, 2, 100, Duration::from_millis(0), |i| t1_fetched.contains(i)),
             vec![id(2)],
             "reclaimed id(1) must not be re-offered to the conn that has it"
         );
         // A DIFFERENT connection may take the reclaimed id(1). (Use a normal
         // reclaim window so id(2), just claimed by T1, isn't pulled back.)
-        assert_eq!(p.claim(T2, HI, 2, 100, Duration::from_secs(5)), vec![id(1)]);
+        assert_eq!(
+            p.claim(T2, HI, 2, 100, Duration::from_secs(5), fresh),
+            vec![id(1)]
+        );
     }
 
     #[test]
@@ -674,10 +779,13 @@ mod fetch_pool_tests {
         // the id would need a re-fetch (BAD_PROTOCOL) or stall forever.
         let p = SyncFetchPool::new();
         p.push_wants([w(1)]);
-        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(5)); // id(1) in flight
+        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(5), fresh); // id(1) in flight
+        let t1_fetched = vec![id(1)];
         // Reclaim it (a later claim with a 0 window pulls it back to `want`),
-        // but T1 won't re-take it (previous test); it sits in `want`.
-        assert!(p.claim(T1, HI, 1, 100, Duration::from_millis(0)).is_empty());
+        // but T1 won't re-take it (history predicate); it sits in `want`.
+        assert!(p
+            .claim(T1, HI, 1, 100, Duration::from_millis(0), |i| t1_fetched.contains(i))
+            .is_empty());
         // The original (slow) fetch lands late — accepted into `ready`.
         p.deliver(id(1), vec![9]);
         assert_eq!(p.take_ready(&id(1)), Some(vec![9]));
@@ -690,18 +798,35 @@ mod fetch_pool_tests {
         p.push_wants([w(1), w(2)]);
         // Leader fetched id(1) itself → forget it so no worker re-fetches.
         p.forget(&id(1));
-        assert_eq!(p.claim(T1, HI, 10, 100, Duration::from_secs(5)), vec![id(2)]);
+        assert_eq!(
+            p.claim(T1, HI, 10, 100, Duration::from_secs(5), fresh),
+            vec![id(2)]
+        );
     }
 
     #[test]
-    fn reset_clears_everything() {
+    fn reset_clears_pool_but_caller_history_still_guards_refetch() {
         let p = SyncFetchPool::new();
         p.push_wants([w(1), w(2)]);
-        let _ = p.claim(T1, HI, 1, 100, Duration::from_secs(5));
+        let claimed = p.claim(T1, HI, 1, 100, Duration::from_secs(5), fresh);
+        assert_eq!(claimed, vec![id(1)]);
         p.reset();
         assert_eq!(p.outstanding(), 0);
-        p.push_wants([w(1)]);
-        assert_eq!(p.claim(T1, HI, 10, 100, Duration::from_secs(5)), vec![id(1)]);
+        // After a reset the same ids may be re-pushed (the backlog didn't
+        // change). The conn that already fetched id(1) must STILL never be
+        // offered it — its live remote served-hash cache survives our reset.
+        p.push_wants([w(1), w(2)]);
+        let t1_fetched = claimed;
+        assert_eq!(
+            p.claim(T1, HI, 10, 100, Duration::from_secs(5), |i| t1_fetched.contains(i)),
+            vec![id(2)],
+            "reset must not forget what a live connection already fetched"
+        );
+        // A different conn is free to take it.
+        assert_eq!(
+            p.claim(T2, HI, 10, 100, Duration::from_secs(5), fresh),
+            vec![id(1)]
+        );
     }
 }
 
@@ -835,6 +960,12 @@ pub struct SyncDriver {
     /// runtime's local apply still publishes if it has its own
     /// broker handle.
     pubsub: Option<Arc<tron_rpc::PubSubBroker>>,
+    /// Optional address-history index hook. When attached, every
+    /// successfully-applied block (clean extension AND both
+    /// reorg-reapply paths) persists its `TransactionRet` into
+    /// `transactionRetStore` and wakes the index follower. `None`
+    /// (index disabled) costs one branch per applied block.
+    index_hook: Option<Arc<crate::index_hook::IndexHook>>,
     /// When `true`, every tx inside an incoming block has its
     /// `ref_block_bytes` / `ref_block_hash` validated against the
     /// chain's `BlockIndexStore` before the block is accepted. A bad
@@ -943,6 +1074,7 @@ impl SyncDriver {
             parallel_exec_enabled: false,
             snapshot_stack: None,
             pubsub: None,
+            index_hook: None,
             strict_ref_block: false,
             recent_witnesses: VecDeque::new(),
             dynamic_pool: None,
@@ -1313,6 +1445,14 @@ impl SyncDriver {
         self
     }
 
+    /// Attach the address-history index hook. With this set, every
+    /// successful block-apply persists the block's transaction-info
+    /// and wakes the index follower (see `crate::index_hook`).
+    pub fn with_index_hook(mut self, hook: Arc<crate::index_hook::IndexHook>) -> Self {
+        self.index_hook = Some(hook);
+        self
+    }
+
     /// Enable per-tx `ref_block_bytes` / `ref_block_hash` validation
     /// during `accept_block`. Production callers should always set
     /// this; the daemon's runtime wires it in. The opt-in is
@@ -1552,6 +1692,12 @@ impl SyncDriver {
         // short cooldown + retry; repeated → it's persistently forked, demote
         // it from rotation like an archive-incapable peer.
         let mut forked_strikes: Vec<u32> = vec![0; peers.len()];
+        // Per-peer local cooldown (this driver's view; `peer_state` shares the
+        // same signal fleet-wide when attached). A failed/banned/dead-end peer
+        // is marked avoided for its backoff window and rotation HOPS instead
+        // of the driver sleeping the window out — one bad peer must never
+        // idle a whole rotation slot (90s per rate-limit, 30min per deep-ban).
+        let mut avoid_until: Vec<Option<Instant>> = vec![None; peers.len()];
         let mut cursor = 0usize; // index into `shuffled`
         // Consecutive peers skipped this scan because they're in an
         // avoid-cooldown. Reset whenever we actually dial; capped at the pool
@@ -1579,6 +1725,7 @@ impl SyncDriver {
                             archive_incapable.push(false);
                             time_banned_strikes.push(0);
                             forked_strikes.push(0);
+                            avoid_until.push(None);
                             shuffled.push(peers.len() - 1);
                         }
                     }
@@ -1598,17 +1745,20 @@ impl SyncDriver {
             }
             let peer_idx = shuffled[cursor];
             let peer = peers[peer_idx].clone();
-            // Skip peers in an avoid-cooldown (far behind us / recently rejected)
-            // so rotation slots go to viable fetch sources — UNLESS we've already
-            // skipped a full pass (every peer cooling down), in which case dial
-            // anyway rather than spin idle.
-            if avoid_skips < shuffled.len()
-                && self
+            // Skip peers in an avoid-cooldown (far behind us / recently
+            // rejected / serving out a failure backoff) so rotation slots go
+            // to viable fetch sources — UNLESS we've already skipped a full
+            // pass (every peer cooling down), in which case dial anyway
+            // rather than spin idle.
+            let cooling = avoid_until[peer_idx]
+                .map(|until| Instant::now() < until)
+                .unwrap_or(false)
+                || self
                     .peer_state
                     .as_ref()
                     .map(|ps| ps.should_avoid(&peer))
-                    .unwrap_or(false)
-            {
+                    .unwrap_or(false);
+            if avoid_skips < shuffled.len() && cooling {
                 avoid_skips += 1;
                 cursor = (cursor + 1) % shuffled.len();
                 continue;
@@ -1646,6 +1796,20 @@ impl SyncDriver {
                     tokio::select! {
                         _ = shutdown.recv() => return self.stats.clone(),
                         _ = tokio::time::sleep(self.config.tail_interval) => {}
+                    }
+                    // CaughtUp is the DEAD-END exit (we exhausted this peer
+                    // while still behind the tip — the pass marked it
+                    // avoided). With a pool to rotate over, hop instead of
+                    // re-dialing the same laggard straight into the ~60s ban
+                    // window its side starts on every disconnect. A sole-peer
+                    // driver keeps re-dialing — that's the tail-follow.
+                    if shuffled.len() > 1 {
+                        avoid_until[peer_idx] = Some(
+                            Instant::now()
+                                + Duration::from_millis(crate::peer_state::AVOID_BEHIND_MS),
+                        );
+                        cursor =
+                            pick_next_cursor(&mut rng, cursor, &shuffled, &archive_incapable);
                     }
                 }
                 PeerOutcome::CapReached => {
@@ -1860,17 +2024,37 @@ impl SyncDriver {
                         warn!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
                             "peer rejected us; backing off");
                     }
-                    tokio::select! {
-                        _ = shutdown.recv() => return self.stats.clone(),
-                        _ = tokio::time::sleep(backoff) => {}
-                    }
-                    // Hop to a random different peer that hasn't been
-                    // archive-demoted. If every peer is demoted (the
-                    // whole pool can't serve archive sync) reset the
-                    // demotion list so we don't starve out — better to
-                    // re-try a known-broken peer than spin forever.
+                    // Serve the backoff as PER-PEER cooldown state, not a
+                    // driver-wide sleep. The protection every wait above buys
+                    // (don't re-dial THIS peer inside its ban/reconnect
+                    // window) is per-peer; sleeping the whole driver for it
+                    // (90s per rate-limit, 30 min per deep-ban) idles a
+                    // rotation slot that could be hunting the rest of the
+                    // pool for a serving peer. So: mark the peer avoided for
+                    // the backoff window — locally (drives this driver's
+                    // rotation skip) and via `peer_state` (shares it with the
+                    // fleet + across restarts) — then hop to a different
+                    // candidate after a short pacing delay. A pinned /
+                    // sole-peer driver has nowhere to hop; it waits out the
+                    // full backoff exactly as before.
                     let pool_len = shuffled.len();
                     if pool_len > 1 {
+                        avoid_until[peer_idx] = Some(Instant::now() + backoff);
+                        if let Some(ps) = &self.peer_state {
+                            ps.mark_avoid(&peer, backoff.as_millis() as u64);
+                        }
+                        // Pacing only: keeps the fleet's dial rate sane even
+                        // when failures come back instantly (a dead LAN, a
+                        // pool where every dial is refused).
+                        const HOP_PACING: Duration = Duration::from_secs(2);
+                        tokio::select! {
+                            _ = shutdown.recv() => return self.stats.clone(),
+                            _ = tokio::time::sleep(backoff.min(HOP_PACING)) => {}
+                        }
+                        // If every peer is archive-demoted (the whole pool
+                        // can't serve archive sync) reset the demotion list
+                        // so we don't starve out — better to re-try a
+                        // known-broken peer than spin forever.
                         let all_demoted =
                             shuffled.iter().all(|&i| archive_incapable[i]);
                         if all_demoted {
@@ -1884,31 +2068,13 @@ impl SyncDriver {
                                 *slot = 0;
                             }
                         }
-                        // Try up to `pool_len` candidates to find an
-                        // undemoted one different from the current cursor.
-                        let mut next = cursor;
-                        for _ in 0..pool_len {
-                            let candidate = rng.next_usize_below(pool_len);
-                            if candidate != cursor
-                                && !archive_incapable[shuffled[candidate]]
-                            {
-                                next = candidate;
-                                break;
-                            }
-                        }
-                        // Fallback: linear scan if random sampling
-                        // didn't find an undemoted slot.
-                        if next == cursor || archive_incapable[shuffled[next]] {
-                            for offset in 1..pool_len {
-                                let candidate = (cursor + offset) % pool_len;
-                                if !archive_incapable[shuffled[candidate]] {
-                                    next = candidate;
-                                    break;
-                                }
-                            }
-                        }
-                        cursor = next;
+                        cursor =
+                            pick_next_cursor(&mut rng, cursor, &shuffled, &archive_incapable);
                     } else {
+                        tokio::select! {
+                            _ = shutdown.recv() => return self.stats.clone(),
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
                         cursor = 0;
                     }
                 }
@@ -2197,14 +2363,30 @@ impl SyncDriver {
         const REQ_MIN_INTERVAL: Duration = Duration::from_millis(400);
         let mut last_request_at: Option<Instant> = None;
         // Unique token for THIS connection, used by the shared `SyncFetchPool`
-        // so a stall-reclaimed block id is never re-requested from the same
-        // connection (java-tron caches served hashes per connection and
-        // disconnects on a re-request). A fresh token per connection is correct:
-        // a reconnect resets the peer's cache, so re-requesting is fine again.
+        // to track which connection holds each in-flight claim (so a
+        // disconnect can reclaim exactly its own ids).
         let conn_token: u64 = {
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
+        // Every block id THIS connection has ever requested (id → block num).
+        // java-tron caches requested hashes per connection and BAD_PROTOCOL-
+        // disconnects on a re-request, so this history must outlive every pool
+        // lifecycle event (stall-reclaim, `take_ready`, `reset()`) — which is
+        // why it lives here, with the connection, and not in the pool. A
+        // reconnect gets a fresh map, matching the peer's fresh per-connection
+        // cache. Pruned to ids above the applied head on each ChainInventory
+        // (sub-head ids can never be re-offered, so their entries are dead
+        // weight on a long-lived connection).
+        let mut fetched_ids: std::collections::HashMap<[u8; 32], i64> =
+            std::collections::HashMap::new();
+        // Last moment the block-fetch pipeline showed life on this connection
+        // (a FetchInvData went out or a Block frame came in). Backs the
+        // `blocks_in_flight` stall reset below: a peer that silently drops
+        // part of a batch (or answers ItemNotFound we failed to account)
+        // would otherwise leak the counter up to PIPELINE_LOW_WATER and
+        // permanently mute this connection's fetching — a zombie worker.
+        let mut last_block_pipeline_at: Instant = Instant::now();
         // On ANY exit from this peer pass, return this connection's in-flight
         // fetch claims to the pool immediately, so a dropped peer's blocks
         // (especially the leader's next-to-apply one) don't wedge sync until the
@@ -2233,17 +2415,25 @@ impl SyncDriver {
         // surface what we last sent — which is what actually triggered it
         // (e.g. a regressing locator shows up as last=<lower-than-expected>).
         let mut last_sync_request = String::from("(none)");
-        // A `SyncBlockChain` request is outstanding (we sent a locator and
-        // haven't yet received its `ChainInventory`). CRITICAL: never send
-        // a second `SyncBlockChain` while one is in flight. The peer
-        // (java-tron's `SyncBlockChainMsgHandler`) records the last block
-        // it served us and BAD_PROTOCOL-disconnects any subsequent locator
-        // whose head is *lower* than that — a regression. If we fire the
-        // queue-empty `AskInventory` before the first inventory lands, our
-        // second locator is still anchored at the un-advanced head, the
-        // peer has meanwhile served us up to ITS head, and we get dropped.
-        // This single-flight gate is what lets public peers sync with us.
-        let mut awaiting_inventory = false;
+        // When `Some`, a `SyncBlockChain` request is outstanding (we sent a
+        // locator at that instant and haven't yet received its
+        // `ChainInventory`). CRITICAL: never send a second `SyncBlockChain`
+        // while one is in flight. The peer (java-tron's
+        // `SyncBlockChainMsgHandler`) records the last block it served us and
+        // BAD_PROTOCOL-disconnects any subsequent locator whose head is
+        // *lower* than that — a regression. If we fire the queue-empty
+        // `AskInventory` before the first inventory lands, our second locator
+        // is still anchored at the un-advanced head, the peer has meanwhile
+        // served us up to ITS head, and we get dropped. This single-flight
+        // gate is what lets public peers sync with us.
+        //
+        // The instant gives the gate a DEADLINE (`INVENTORY_REPLY_TIMEOUT`
+        // below). Without one, a reply that never comes — the peer's
+        // SYNC_BLOCK_CHAIN token bucket silently dropped our locator, or its
+        // reply failed to decode — wedges the gate forever: keepalive pongs
+        // keep the connection "alive" every ~10s, so the 60s read-idle valve
+        // never fires on a healthy-looking socket.
+        let mut awaiting_inventory: Option<Instant> = None;
         // Pipelining threshold: when in-flight blocks drop below this,
         // try to queue the next FetchInvData chunk so the peer is
         // continuously processing while we're draining the current
@@ -2266,6 +2456,15 @@ impl SyncDriver {
         let mut expected: std::collections::VecDeque<[u8; 32]> =
             std::collections::VecDeque::new();
         let mut offered_max: i64 = 0;
+        // The `(num, id)` list from this peer's most recent ChainInventory to
+        // US — our own offered window, kept whether we're leader or worker.
+        // A freshly-promoted leader merges this into the apply queue it
+        // rebuilds from the pool: the dead leader may have scheduled wants
+        // only up to ITS window top, and ids above that were offered to us
+        // but never pooled — the monotonic-locator rule forbids re-asking for
+        // them while head < offered_max, so without this tail the fleet would
+        // idle on them until the stall watchdog hard-resets the session.
+        let mut my_window: Vec<(i64, [u8; 32])> = Vec::new();
         // === Self-healing recovery state ===
         // `was_leader`: previous iteration's leadership, so we can detect the
         //   rising edge (a peer just promoted to leader) and rebuild its apply
@@ -2295,9 +2494,22 @@ impl SyncDriver {
         // dead peer's claims are reclaimed immediately on disconnect (the
         // `FetchClaimGuard`), so this only covers a *slow-but-alive* peer; with
         // apply now running at ~20 blk/s the pipeline drains fast, so a long
-        // window would idle the leader. The per-connection claimer guard makes a
-        // re-offer harmless (the slow peer's late delivery is still accepted).
+        // window would idle the leader. The per-connection fetched-history
+        // guard makes a re-offer harmless (the slow peer's late delivery is
+        // still accepted).
         const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(8);
+        // How long an outstanding `SyncBlockChain` may go unanswered before
+        // the single-flight gate re-opens. The peer either answers within an
+        // RTT or never will (rate-limiter drop / undecodable reply); a leader
+        // wedged on this gate stops refreshing its window entirely.
+        const INVENTORY_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+        // How long `blocks_in_flight > 0` may persist with NO pipeline
+        // activity (no fetch sent, no Block received) before the counter is
+        // declared leaked and reset. Generous: even an apply-bound backlog
+        // keeps frames trickling well inside this. The pool's own reclaim
+        // timer re-offers the actual ids elsewhere; this only repairs OUR
+        // bookkeeping so the connection doesn't go permanently mute.
+        const BLOCK_PIPELINE_STALL: Duration = Duration::from_secs(30);
 
         // KeepAlive heartbeat. Mirrors java-tron's
         // `KeepAliveService` — every `KEEPALIVE_INTERVAL` we send the
@@ -2330,6 +2542,11 @@ impl SyncDriver {
         enum PendingAction {
             FetchChunk,
             AskInventory,
+            /// Drain queued tx-body fetches (`FetchInvData{type=TRX}`).
+            /// Lowest priority: it shares the peer's FETCH_INV_DATA token
+            /// bucket with block fetches, so it only runs when no block
+            /// work is ready to send.
+            FetchTx,
         }
 
         loop {
@@ -2385,6 +2602,43 @@ impl SyncDriver {
                 last_ping_sent_at = Instant::now();
             }
 
+            // Self-repair: a leaked in-flight counter (peer silently dropped
+            // part of a batch). The ids themselves are re-offered by the
+            // pool's reclaim timer; without this reset the COUNTER alone
+            // would mute this connection's fetching (and, for a leader, its
+            // window refresh) for the rest of the connection's life.
+            if blocks_in_flight > 0
+                && last_block_pipeline_at.elapsed() >= BLOCK_PIPELINE_STALL
+            {
+                debug!(
+                    peer,
+                    stuck = blocks_in_flight,
+                    "block pipeline silent with requests outstanding; resetting in-flight counter"
+                );
+                blocks_in_flight = 0;
+                last_block_pipeline_at = Instant::now();
+            }
+            // Self-repair: an unanswered SyncBlockChain. Re-open the
+            // single-flight gate so the next AskInventory can retry. In the
+            // common cause (the peer's rate limiter silently dropped our
+            // locator) the peer's recorded lastSyncBlockId is unchanged, so
+            // the retry — anchored at our monotonic head — can't regress it.
+            // If the peer in fact SERVED a reply we never decoded (or one
+            // slower than this deadline), its lastSyncBlockId is already
+            // above our head and a strict peer will BAD_PROTOCOL the retry —
+            // which drops the connection and reconnects with a clean
+            // context: the right outcome for a peer that unhealthy.
+            if let Some(since) = awaiting_inventory {
+                if since.elapsed() >= INVENTORY_REPLY_TIMEOUT {
+                    debug!(
+                        peer,
+                        waited_s = since.elapsed().as_secs(),
+                        "SyncBlockChain unanswered; releasing the single-flight gate"
+                    );
+                    awaiting_inventory = None;
+                }
+            }
+
             // Best-effort broadcast: drain mempool before reading the
             // next frame so newly-submitted txs leave the local node
             // promptly. Now uses java-tron's pull-based advertise path:
@@ -2405,21 +2659,14 @@ impl SyncDriver {
                 }
             }
 
-            // Drain queued tx hashes the peer told us about into one
-            // `FetchInvData{type=TRX}` frame. Bounded per drain by
-            // `MAX_TX_FETCH_PER_BATCH` so a chatty peer can't pin a
-            // huge single frame; remainder stays in the queue for the
-            // next pass. Matches java-tron's
-            // `MAX_TRX_FETCH_PER_PEER` cap (1000).
-            if !pending_tx_fetch_queue.is_empty() {
-                if let Err(reason) =
-                    drain_tx_fetch_requests(&mut conn, &mut pending_tx_fetch_queue).await
-                {
-                    return PeerOutcome::PeerFailure(format!(
-                        "send FetchInvData(TRX): {reason}"
-                    ));
-                }
-            }
+            // NOTE: queued tx-body fetches (`pending_tx_fetch_queue`) are NOT
+            // drained here. Tx and block requests ride the same FETCH_INV_DATA
+            // wire type, so they share the peer's ~3/s token bucket — an
+            // ungated loop-top drain could starve our next BLOCK fetch out of
+            // that bucket (a silently-dropped block is a stall repaired only
+            // by timers). They're sent through the rate-gated `PendingAction`
+            // machinery below instead, as the LOWEST-priority action, so
+            // block fetches and window refreshes always outrank them.
 
             // Same pattern for produced blocks from the local SR
             // runtime. Each notice carries pre-encoded bytes ready to
@@ -2491,7 +2738,7 @@ impl SyncDriver {
                     return PeerOutcome::PeerFailure(format!("send_sync_request: {e}"));
                 }
                 sync_started = true;
-                awaiting_inventory = true;
+                awaiting_inventory = Some(Instant::now());
             } else if !am_worker && sync_started {
                 // We participated, then dropped out (lost leadership and not an
                 // eligible fetcher). Stop driving sync and drop queued work;
@@ -2499,31 +2746,68 @@ impl SyncDriver {
                 // reclaimed by other workers after the reclaim timeout.)
                 debug!(peer, "stepped down from fetching; going idle");
                 sync_started = false;
-                awaiting_inventory = false;
+                awaiting_inventory = None;
                 pending_fetch_queue.clear();
                 blocks_in_flight = 0;
             }
 
-            // === Self-healing: leadership just transferred TO us ===
-            // The previous leader owned the apply order (`expected`); when it
-            // died mid-window we inherited an EMPTY queue, but the shared pool
-            // still holds the blocks it scheduled above our applied head. If we
-            // can't see those (empty `expected`) AND our head sits below
-            // `offered_max`, the AskInventory gate is wedged shut — re-issuing a
-            // locator there would regress below the peer's `lastSyncBlockId`
-            // (BAD_PROTOCOL). Rebuild `expected` straight from the pool instead:
-            // the only safe way to finish a window inherited mid-flight. Drain
-            // whatever's already delivered immediately. (No-op when the pool is
-            // empty / already caught up — the normal AskInventory path handles
-            // those.)
-            if multi_peer && am_leader && !was_leader && expected.is_empty() {
+            // === Self-healing: leadership edges ===
+            //
+            // Falling edge (leader → eligible worker): drop the apply queue.
+            // A worker never drains `expected`, so entries left behind go
+            // stale — and a later re-promotion would inherit a queue whose
+            // front references long-applied blocks that `take_ready` can
+            // never produce again: a leader that holds the slot while
+            // applying nothing until preempted. The pool still tracks every
+            // outstanding id, so nothing is lost — the rising edge below
+            // rebuilds the queue from it.
+            if multi_peer && was_leader && !am_leader {
+                expected.clear();
+            }
+            // Rising edge (just promoted): REBUILD `expected` from the shared
+            // pool. The previous leader owned the apply order; when it died
+            // mid-window the pool still holds the blocks it scheduled above
+            // our applied head, and re-issuing a locator below `offered_max`
+            // would regress below the peer's `lastSyncBlockId`
+            // (BAD_PROTOCOL). The pool's live set (want ∪ inflight ∪ ready,
+            // above head) IS the authoritative outstanding window, so we
+            // REPLACE the queue — never append — and the inventory handler
+            // below only ever extends `expected` with ids `push_wants`
+            // actually inserted, so the locator we just sent (kick-off above)
+            // can't append an overlapping window on top of this rebuild.
+            //
+            // We also adopt the un-pooled tail of OUR OWN offered window
+            // (`my_window`): the dead leader scheduled wants only up to ITS
+            // window top, and ids above that — offered to us as a worker but
+            // never pooled — would otherwise be unreachable until the stall
+            // watchdog hard-resets (no one may send a locator for them while
+            // head < offered_max). They're within this connection's serve
+            // window by construction, and `push_wants` dedups them against
+            // the pool. The merge is re-sorted by block number so `expected`
+            // stays in strict chain order.
+            //
+            // Deliberately NOT raising `offered_max` to the pool's top: this
+            // peer only ever offered us blocks up to its own ChainInventory
+            // ceiling, and fetching past that is outside our serve window —
+            // inherited ids above it are fetched by workers whose windows
+            // cover them (the watchdog backstops the rare case where no live
+            // window does). Drain whatever's already delivered immediately.
+            if multi_peer && am_leader && !was_leader {
                 if let Some(pool) = self.fetch_pool.clone() {
-                    let pooled = pool.ordered_ids_above(self.head_number());
-                    if !pooled.is_empty() {
-                        if let Some((top, _)) = pooled.last() {
-                            offered_max = offered_max.max(*top);
-                        }
-                        expected = pooled.iter().map(|(_, id)| *id).collect();
+                    let head_now = self.head_number();
+                    let mut merged = pool.ordered_ids_above(head_now);
+                    let inherited = merged.len();
+                    let mine: Vec<(i64, [u8; 32])> = my_window
+                        .iter()
+                        .filter(|(n, _)| *n > head_now)
+                        .copied()
+                        .collect();
+                    for id in pool.push_wants(mine) {
+                        merged.push((BlockId::from_raw(id).num() as i64, id));
+                    }
+                    merged.sort_unstable_by_key(|(n, _)| *n);
+                    expected = merged.iter().map(|(_, id)| *id).collect();
+                    if !expected.is_empty() {
                         let took = expected.len();
                         let applied = self.drain_pool(
                             &pool,
@@ -2534,7 +2818,8 @@ impl SyncDriver {
                         );
                         info!(
                             peer,
-                            inherited = took,
+                            inherited,
+                            adopted = took - inherited,
                             applied,
                             "took over leadership mid-window; rebuilt apply queue from the pool"
                         );
@@ -2596,8 +2881,8 @@ impl SyncDriver {
             // the earliest time we're rate-allowed to issue it. Used
             // by the `select!` below to race the request timer against
             // the next inbound frame — this is what enables pipelining.
-            // Standby drivers issue nothing.
-            let pending: Option<PendingAction> = if !am_worker {
+            // Standby drivers issue no block work.
+            let block_action: Option<PendingAction> = if !am_worker {
                 None
             } else if multi_peer {
                 // Pool path: claim+fetch ids inside our offered window; when
@@ -2608,13 +2893,17 @@ impl SyncDriver {
                     && self
                         .fetch_pool
                         .as_ref()
-                        .map(|p| p.claimable_within(conn_token, offered_max, POOL_READY_CAP))
+                        .map(|p| {
+                            p.claimable_within(offered_max, POOL_READY_CAP, |id| {
+                                fetched_ids.contains_key(id)
+                            })
+                        })
                         .unwrap_or(false);
                 if can_fetch {
                     Some(PendingAction::FetchChunk)
                 } else if blocks_in_flight == 0
                     && prev_id.is_some()
-                    && !awaiting_inventory
+                    && awaiting_inventory.is_none()
                     // Refresh our window only once (a) the leader's apply queue
                     // is fully drained (so an overlapping re-offer can't push
                     // duplicate ids into `expected` and stall the drain;
@@ -2639,12 +2928,21 @@ impl SyncDriver {
             } else if pending_fetch_queue.is_empty()
                 && blocks_in_flight == 0
                 && prev_id.is_some()
-                && !awaiting_inventory
+                && awaiting_inventory.is_none()
             {
                 Some(PendingAction::AskInventory)
             } else {
                 None
             };
+            // Tx-body fetches take the send slot only when no block work is
+            // ready — both ride the same FETCH_INV_DATA bucket on the peer,
+            // and a tx drain that outranked block fetches at a busy tip
+            // would starve the head+1 fetch out of that bucket. Allowed for
+            // every driver (standbys included): tx propagation doesn't need
+            // sync eligibility.
+            let pending: Option<PendingAction> = block_action.or_else(|| {
+                (!pending_tx_fetch_queue.is_empty()).then_some(PendingAction::FetchTx)
+            });
             let action_deadline: Option<tokio::time::Instant> = pending.map(|_| {
                 match last_request_at {
                     Some(t) => tokio::time::Instant::from_std(t + REQ_MIN_INTERVAL),
@@ -2669,7 +2967,8 @@ impl SyncDriver {
                                 // Claim ids inside OUR peer's offered window
                                 // (num ≤ offered_max), deduped across the fleet
                                 // — so this FetchInvData is always in-context.
-                                self.fetch_pool
+                                let claimed = self
+                                    .fetch_pool
                                     .as_ref()
                                     .map(|p| {
                                         p.claim(
@@ -2678,12 +2977,19 @@ impl SyncDriver {
                                             FETCH_CHUNK_SIZE,
                                             POOL_READY_CAP,
                                             POOL_RECLAIM_AFTER,
+                                            |id| fetched_ids.contains_key(id),
                                         )
                                     })
-                                    .unwrap_or_default()
-                                    .iter()
-                                    .map(|id| id.to_vec())
-                                    .collect()
+                                    .unwrap_or_default();
+                                // Record every claimed id in this connection's
+                                // permanent fetched history BEFORE the request
+                                // goes out — re-requesting any of them on this
+                                // connection is a BAD_PROTOCOL offense.
+                                for id in &claimed {
+                                    fetched_ids
+                                        .insert(*id, BlockId::from_raw(*id).num() as i64);
+                                }
+                                claimed.iter().map(|id| id.to_vec()).collect()
                             } else {
                                 let take = pending_fetch_queue.len().min(FETCH_CHUNK_SIZE);
                                 pending_fetch_queue.drain(..take).collect()
@@ -2694,6 +3000,7 @@ impl SyncDriver {
                                 continue;
                             }
                             blocks_in_flight += to_fetch.len();
+                            last_block_pipeline_at = Instant::now();
                             last_sync_request =
                                 format!("FetchInvData count={} window<={}", to_fetch.len(), offered_max);
                             if let Err(e) = tron_net::sync::send_fetch_inv_data(
@@ -2743,8 +3050,24 @@ impl SyncDriver {
                                 }
                             }
                             // Single-flight: block further SyncBlockChain sends
-                            // until this request's ChainInventory comes back.
-                            awaiting_inventory = true;
+                            // until this request's ChainInventory comes back
+                            // (or the reply deadline above expires).
+                            awaiting_inventory = Some(Instant::now());
+                        }
+                        PendingAction::FetchTx => {
+                            // One bounded `FetchInvData{type=TRX}` frame
+                            // (≤1000 hashes per drain; remainder waits for
+                            // the next free slot).
+                            if let Err(reason) = drain_tx_fetch_requests(
+                                &mut conn,
+                                &mut pending_tx_fetch_queue,
+                            )
+                            .await
+                            {
+                                return PeerOutcome::PeerFailure(format!(
+                                    "send FetchInvData(TRX): {reason}"
+                                ));
+                            }
                         }
                     }
                     // Loop around to re-evaluate `pending` (we may need
@@ -2825,9 +3148,9 @@ impl SyncDriver {
                     debug!("60s idle waiting for peer frame; loop continues");
                     // If a SyncBlockChain went unanswered for a full idle
                     // window, release the single-flight gate so we can retry
-                    // (the peer dropped or ignored it). Avoids wedging a
-                    // sole-peer leader that has no standby to preempt it.
-                    awaiting_inventory = false;
+                    // (the peer dropped or ignored it). Largely subsumed by
+                    // INVENTORY_REPLY_TIMEOUT at the loop top, but harmless.
+                    awaiting_inventory = None;
                     continue;
                 }
             };
@@ -2926,7 +3249,45 @@ impl SyncDriver {
                                 now_ms,
                             ) {
                                 crate::fetch_block::FetchDecision::Dispatch => {
-                                    pending_fetch_queue.push_back(hash);
+                                    if multi_peer {
+                                        // Pool path: `pending_fetch_queue` is
+                                        // never drained here, so queueing the
+                                        // hash would leak it forever AND leave
+                                        // tip-following purely poll-based
+                                        // (SyncBlockChain refresh every ~3s).
+                                        // Instead the LEADER routes the adv'd
+                                        // head+1 straight into the pool +
+                                        // apply queue, cutting tip latency to
+                                        // one fetch round-trip. Only when
+                                        // `expected` is empty (the normal
+                                        // at-tip state) so the apply queue
+                                        // stays chain-ordered; `push_wants`
+                                        // dedups against the pool. Fetching an
+                                        // advertised hash is in-context for
+                                        // this peer even past its sync window
+                                        // (java-tron allows adv fetches), so
+                                        // raising `offered_max` to a block the
+                                        // peer itself advertised is safe.
+                                        // Workers drop the adv: only the
+                                        // leader defines the apply order, and
+                                        // a want no leader expects would just
+                                        // rot in `ready`.
+                                        if am_leader && expected.is_empty() {
+                                            if let Some(pool) = &self.fetch_pool {
+                                                let new =
+                                                    pool.push_wants([(block_num, raw)]);
+                                                if !new.is_empty() {
+                                                    offered_max =
+                                                        offered_max.max(block_num);
+                                                }
+                                                for nid in new {
+                                                    expected.push_back(nid);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        pending_fetch_queue.push_back(hash);
+                                    }
                                 }
                                 crate::fetch_block::FetchDecision::Defer
                                 | crate::fetch_block::FetchDecision::NotNextBlock => {
@@ -3003,7 +3364,24 @@ impl SyncDriver {
                             now_ms,
                         ) {
                             crate::fetch_block::FetchDecision::Dispatch => {
-                                pending_fetch_queue.push_back(b.hash.clone());
+                                // Same routing as the Inventory(BLOCK) arm
+                                // above — see the rationale there.
+                                if multi_peer {
+                                    if am_leader && expected.is_empty() {
+                                        if let Some(pool) = &self.fetch_pool {
+                                            let new =
+                                                pool.push_wants([(b.number, raw)]);
+                                            if !new.is_empty() {
+                                                offered_max = offered_max.max(b.number);
+                                            }
+                                            for nid in new {
+                                                expected.push_back(nid);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    pending_fetch_queue.push_back(b.hash.clone());
+                                }
                             }
                             crate::fetch_block::FetchDecision::Defer
                             | crate::fetch_block::FetchDecision::NotNextBlock => {
@@ -3028,12 +3406,16 @@ impl SyncDriver {
                             Ok(c) => c,
                             Err(e) => {
                                 warn!(error = %e, "decode ChainInventory");
+                                // The reply DID arrive (just undecodable) —
+                                // re-open the single-flight gate now rather
+                                // than wedging until its deadline.
+                                awaiting_inventory = None;
                                 continue;
                             }
                         };
                     // The outstanding SyncBlockChain has been answered — we
                     // may issue the next one once this window drains.
-                    awaiting_inventory = false;
+                    awaiting_inventory = None;
                     let appended: usize;
                     if multi_peer {
                         // Our peer's offered window ceiling = highest block it
@@ -3041,26 +3423,53 @@ impl SyncDriver {
                         if let Some(last) = chain_inv.ids.last() {
                             offered_max = offered_max.max(last.number);
                         }
+                        // Housekeeping: ids at/below the applied head can never
+                        // be re-offered (wants are filtered to `> head` below),
+                        // so their fetched-history entries are dead weight on a
+                        // long-lived connection. Prune here — once per window,
+                        // off the per-frame hot path.
+                        let head_now = self.head_number();
+                        fetched_ids.retain(|_, n| *n > head_now);
+                        // Remember OUR offered window (leader and worker
+                        // alike) for a potential leadership takeover — see
+                        // `my_window` at its declaration. Replaced wholesale
+                        // each window.
+                        my_window.clear();
+                        for b in chain_inv.ids.iter().skip(1) {
+                            if b.hash.len() == 32 {
+                                let mut id = [0u8; 32];
+                                id.copy_from_slice(&b.hash);
+                                my_window.push((b.number, id));
+                            }
+                        }
                         if am_leader {
                             // Leader defines the canonical fetch set (pool
                             // `want`) and the apply order (`expected`). Workers
                             // (incl. this leader) claim from `want` within their
-                            // own window. push_wants dedups, so overlapping
-                            // refreshes don't double-fetch; `expected` is only
-                            // extended when the prior window is fully drained
-                            // (see the AskInventory gate), so it can't dup.
-                            let mut wants = Vec::with_capacity(chain_inv.ids.len());
-                            for b in chain_inv.ids.iter().skip(1) {
-                                if b.hash.len() == 32 {
-                                    let mut id = [0u8; 32];
-                                    id.copy_from_slice(&b.hash);
-                                    wants.push((b.number, id));
-                                    expected.push_back(id);
-                                }
-                            }
+                            // own window.
+                            //
+                            // Two filters keep the apply queue sound:
+                            //   * num > head — a window anchored at a stale
+                            //     head (a takeover: the locator went out before
+                            //     the inherited pool drained) must not
+                            //     re-enqueue blocks we already applied; those
+                            //     would be re-fetched only to rot in `ready`.
+                            //   * extend `expected` ONLY with ids `push_wants`
+                            //     newly inserted — ids the pool already tracks
+                            //     are already in `expected` (the takeover
+                            //     rebuild put them there), and a duplicate
+                            //     `expected` entry wedges the drain forever
+                            //     (its body can only be taken once).
+                            let wants: Vec<(i64, [u8; 32])> = my_window
+                                .iter()
+                                .filter(|(n, _)| *n > head_now)
+                                .copied()
+                                .collect();
                             appended = wants.len();
                             if let Some(pool) = &self.fetch_pool {
-                                pool.push_wants(wants);
+                                for nid in pool.push_wants(wants) {
+                                    expected.push_back(nid);
+                                }
                             }
                         } else {
                             appended = chain_inv.ids.len().saturating_sub(1);
@@ -3070,6 +3479,13 @@ impl SyncDriver {
                             pending_fetch_queue.push_back(b.hash.clone());
                         }
                         appended = pending_fetch_queue.len();
+                    }
+                    // Resilience-policy input: an empty window with nothing
+                    // remaining means we're caught up to this peer — we no
+                    // longer need sync FROM it (java-tron's needSyncFromPeer).
+                    if let Some(reg) = &self.peer_registry {
+                        let caught_up = appended == 0 && chain_inv.remain_num == 0;
+                        reg.touch(peer, |s| s.need_sync_from_peer = !caught_up);
                     }
                     debug!(
                         queued = appended,
@@ -3106,6 +3522,14 @@ impl SyncDriver {
                                 "dead-end peer: caught up to it but still behind the tip; \
                                  releasing leadership and rotating to find a peer at the tip"
                             );
+                            // It handshook eligible but can't feed our
+                            // catch-up — same avoid-cooldown as a behind-at-
+                            // handshake peer, so rotation (this driver AND the
+                            // rest of the fleet) skips it instead of re-dialing
+                            // it straight into its post-disconnect ban window.
+                            if let Some(ps) = &self.peer_state {
+                                ps.mark_avoid(peer, crate::peer_state::AVOID_BEHIND_MS);
+                            }
                             self.release_leadership(peer);
                             return PeerOutcome::CaughtUp;
                         }
@@ -3132,6 +3556,14 @@ impl SyncDriver {
                         .map(|r| r.number)
                         .unwrap_or(-1);
                     let tx_count = block.transactions.len();
+                    // The block pipeline is alive on this connection.
+                    last_block_pipeline_at = Instant::now();
+                    // Resilience-policy input: when our latest block arrived
+                    // (java-tron's `block_recv_ms`) — the isolation-breakout
+                    // rule fires only when NO peer has delivered one recently.
+                    if let Some(reg) = &self.peer_registry {
+                        reg.touch(peer, |s| s.block_recv_ms = now_ms);
+                    }
                     // Release the live-tip single-slot scheduler if the
                     // arriving block matches the in-flight adv fetch.
                     // Bulk-sync arrivals (which don't go through the
@@ -3179,12 +3611,17 @@ impl SyncDriver {
                     }
                     // Multi-peer pool path: every worker (leader or standby)
                     // deposits the block it fetched into the shared pool; only
-                    // the leader applies, draining the pool in chain order. The
-                    // block we just got is one of OUR in-flight claims, so
-                    // decrement once per received frame.
+                    // the leader applies, draining the pool in chain order.
+                    // Decrement the in-flight counter only for blocks WE
+                    // requested on this connection — an unsolicited push (a
+                    // fast-forward relay, a broadcast) must not drift the
+                    // counter below the true outstanding count, or the
+                    // pipeline gate over-fetches past its depth.
                     if multi_peer {
-                        blocks_in_flight = blocks_in_flight.saturating_sub(1);
                         if let Ok(id) = block_id_from_block(&block) {
+                            if fetched_ids.contains_key(id.as_bytes()) {
+                                blocks_in_flight = blocks_in_flight.saturating_sub(1);
+                            }
                             if let Some(pool) = &self.fetch_pool {
                                 pool.deliver(*id.as_bytes(), raw_block_bytes.to_vec());
                             }
@@ -3240,12 +3677,20 @@ impl SyncDriver {
                     // java-tron's app-level Ping/Pong payload is the
                     // single byte 0xC0 (RLP empty list). An empty
                     // payload triggers BAD_MESSAGE from the parser.
-                    let _ = conn
+                    //
+                    // A send failure is fatal for the whole pass: with the
+                    // bounded send, an error can mean a PARTIAL frame went
+                    // out, and any further write on this connection would
+                    // feed the peer garbage mid-stream.
+                    if let Err(e) = conn
                         .send_frame(Frame {
                             ty: MessageType::P2pPong,
                             payload: Bytes::from_static(&[0xC0]),
                         })
-                        .await;
+                        .await
+                    {
+                        return PeerOutcome::PeerFailure(format!("send P2pPong: {e}"));
+                    }
                 }
                 MessageType::Libp2pKeepAlivePing => {
                     // libp2p KeepAlivePong carries a `KeepAliveMessage`
@@ -3259,12 +3704,19 @@ impl SyncDriver {
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
                     let pong = tron_proto::libp2p::KeepAliveMessage { timestamp: now_ms };
-                    let _ = conn
+                    // Fatal on failure — same partial-frame rationale as the
+                    // P2pPong reply above.
+                    if let Err(e) = conn
                         .send_frame(Frame {
                             ty: MessageType::Libp2pKeepAlivePong,
                             payload: Bytes::from(pong.encode_to_vec()),
                         })
-                        .await;
+                        .await
+                    {
+                        return PeerOutcome::PeerFailure(format!(
+                            "send keepalive pong: {e}"
+                        ));
+                    }
                 }
                 MessageType::Libp2pKeepAlivePong => {
                     // Reply to our outbound Ping. The deadline refresh
@@ -3363,9 +3815,61 @@ impl SyncDriver {
                     }
                 }
                 MessageType::ItemNotFound => {
-                    warn!(
-                        "peer reported ItemNotFound for our FetchInvData request"
-                    );
+                    // The peer is telling us some of our FetchInvData ids will
+                    // never arrive. Two things MUST happen for blocks, or the
+                    // miss quietly degrades this connection:
+                    //   * decrement `blocks_in_flight` by the missing count —
+                    //     it only counts down on received Block frames, so an
+                    //     unaccounted miss leaks it toward PIPELINE_LOW_WATER,
+                    //     where this connection stops fetching (and a leader
+                    //     stops refreshing) for good;
+                    //   * hand the ids straight back to the pool so a
+                    //     DIFFERENT connection fetches them now, instead of
+                    //     the leader idling out the stall-reclaim window. They
+                    //     stay in OUR fetched history — java-tron caches even
+                    //     not-found hashes, so re-requesting here would be a
+                    //     BAD_PROTOCOL disconnect.
+                    match tron_proto::Inventory::decode(frame.payload) {
+                        Ok(inv) => {
+                            let is_block = inv.r#type
+                                == tron_proto::inventory::InventoryType::Block as i32;
+                            if is_block {
+                                let ids: Vec<[u8; 32]> = inv
+                                    .ids
+                                    .iter()
+                                    .filter(|raw| raw.len() == 32)
+                                    .map(|raw| {
+                                        let mut id = [0u8; 32];
+                                        id.copy_from_slice(raw);
+                                        id
+                                    })
+                                    .collect();
+                                blocks_in_flight =
+                                    blocks_in_flight.saturating_sub(ids.len());
+                                if let Some(pool) = &self.fetch_pool {
+                                    pool.reclaim_ids(ids.iter());
+                                }
+                                warn!(
+                                    peer,
+                                    missing = ids.len(),
+                                    "peer reported ItemNotFound for requested blocks; \
+                                     returned them to the fetch pool for other peers"
+                                );
+                            } else {
+                                // Tx misses are routine (evicted/expired on
+                                // the peer between adv and pull) — not worth
+                                // a warn.
+                                debug!(
+                                    peer,
+                                    missing = inv.ids.len(),
+                                    "peer reported ItemNotFound for requested txs"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "decode ItemNotFound");
+                        }
+                    }
                 }
                 MessageType::PbftMsg => {
                     // Decode + forward into the PbftRuntime if we
@@ -3411,6 +3915,12 @@ impl SyncDriver {
                         return PeerOutcome::PeerFailure(format!(
                             "send_chain_inventory: {e}"
                         ));
+                    }
+                    // Resilience-policy input: java-tron's needSyncFromUs —
+                    // the peer still needs blocks from us while we hold more
+                    // than this batch covered.
+                    if let Some(reg) = &self.peer_registry {
+                        reg.touch(peer, |s| s.need_sync_from_us = remain > 0);
                     }
                     debug!(
                         peer,
@@ -3782,11 +4292,9 @@ impl SyncDriver {
         // the latest solidified block. If it doesn't, revert the
         // head pointer and treat the block as a rejected fork.
         // (No-ops pre-PBFT when no solidified block is set yet.)
-        if let Some(rejected) = self.gate_new_head_against_solidified(
-            khaos_head.id,
-            khaos_head.num,
-            &prev_head_arc,
-        ) {
+        if let Some(rejected) =
+            self.gate_new_head_against_solidified(&khaos_head, &prev_head_arc)
+        {
             return AcceptOutcome::RejectedSolidifiedDiverged(rejected);
         }
 
@@ -3936,6 +4444,7 @@ impl SyncDriver {
                 self.update_solidified(block, id.num() as i64);
                 self.emit_block_events(block, &id, &report);
                 self.publish_block_to_pubsub(block, &id, &report);
+                self.notify_index(block, &id, &report);
                 self.drop_included_txs_from_mempool(block);
                 AcceptOutcome::Accepted(id)
             }
@@ -3985,6 +4494,7 @@ impl SyncDriver {
                 self.update_solidified(block, id.num() as i64);
                 self.emit_block_events(block, &id, &report);
                 self.publish_block_to_pubsub(block, &id, &report);
+                self.notify_index(block, &id, &report);
                 self.drop_included_txs_from_mempool(block);
                 AcceptOutcome::Accepted(id)
             }
@@ -4094,6 +4604,7 @@ impl SyncDriver {
                         tron_types::block_id_from_block(block_to_apply).unwrap_or(kb.id);
                     self.emit_block_events(block_to_apply, &block_id, report);
                     self.publish_block_to_pubsub(block_to_apply, &block_id, report);
+                    self.notify_index(block_to_apply, &block_id, report);
                     self.drop_included_txs_from_mempool(block_to_apply);
                 }
                 // Repoint num → id at the new canonical branch (side-fork
@@ -4123,9 +4634,23 @@ impl SyncDriver {
             }
             Err(crate::storage::ReorgFailure::ApplyFailed {
                 failed_block,
-                applied_before,
+                applied,
                 source,
             }) => {
+                let applied_before = applied.len();
+                // The blocks that DID apply remain committed (the
+                // coordinator keeps their layers) — they are state, so
+                // the index hook must fire for them exactly like any
+                // other applied block: otherwise transactionRetStore,
+                // the archive, and the firehose would all be missing
+                // blocks the chain is now standing on.
+                for (idx, report) in applied.iter().enumerate() {
+                    let kb = new_oldest_first[idx];
+                    let block_to_apply = new_blocks[idx];
+                    let block_id =
+                        tron_types::block_id_from_block(block_to_apply).unwrap_or(kb.id);
+                    self.notify_index(block_to_apply, &block_id, report);
+                }
                 error!(
                     ?source,
                     failed_block,
@@ -4171,6 +4696,26 @@ impl SyncDriver {
                 ));
             }
         }
+    }
+
+    /// Persist the block's transaction-info + wake the index follower.
+    /// No-op when no hook is attached; never fails the apply (the hook
+    /// logs and swallows store errors). Rides the same
+    /// once-per-applied-block sites as `publish_block_to_pubsub`, so
+    /// it inherits single-fire semantics across the clean-extension
+    /// and both reorg-reapply paths — a reorg overwrites the
+    /// block-num-keyed transaction-info with the new canonical
+    /// chain's receipts.
+    fn notify_index(
+        &self,
+        block: &Block,
+        block_id: &BlockId,
+        report: &tron_executor::BlockExecutionReport,
+    ) {
+        let Some(hook) = self.index_hook.as_ref() else {
+            return;
+        };
+        hook.on_block_applied(block, block_id, report);
     }
 
     /// Drop every transaction in `block` from the mempool's pending
@@ -4483,10 +5028,11 @@ impl SyncDriver {
     /// — is the canonical source of truth.
     fn gate_new_head_against_solidified(
         &mut self,
-        new_head_id: BlockId,
-        new_head_num: i64,
+        new_head: &Arc<tron_consensus::KhaosBlock>,
         prev_head_arc: &Option<Arc<tron_consensus::KhaosBlock>>,
     ) -> Option<BlockId> {
+        let new_head_id = new_head.id;
+        let new_head_num = new_head.num;
         // No-op when the head didn't actually change.
         let prev_id = prev_head_arc.as_ref().map(|h| h.id);
         if prev_id == Some(new_head_id) {
@@ -4508,6 +5054,19 @@ impl SyncDriver {
             }
         };
         let executed_head_id = BlockId::from_raw(executed_head_bytes);
+
+        // Clean-extension fast path: a candidate whose parent IS the executed
+        // head contains the solidified block by construction — `solid_id` is
+        // derived below by walking back from that very executed head, so the
+        // candidate's chain (executed chain + itself) trivially contains it.
+        // This is ~every block during sync; skipping the two ancestor walks
+        // here saves ~2× (head − solid) full block reads + decodes per
+        // applied block. Fork promotions (parent ≠ executed head) — the case
+        // the gate exists for — still take the full walk. (`parent_id` reads
+        // the header directly, so fork-tree pruning can't blind this check.)
+        if new_head.parent_id() == Some(executed_head_id) {
+            return None;
+        }
 
         let block_store = BlockStore::new(self.blocks_backend.clone());
         let parent_of = |id: &BlockId| -> Option<BlockId> {
@@ -4871,6 +5430,7 @@ impl SyncDriver {
                     let block_id =
                         tron_types::block_id_from_block(block_to_apply).unwrap_or(kb.id);
                     self.publish_block_to_pubsub(block_to_apply, &block_id, &report);
+                    self.notify_index(block_to_apply, &block_id, &report);
                     self.drop_included_txs_from_mempool(block_to_apply);
                 }
                 Err(e) => {
@@ -4928,7 +5488,25 @@ impl SyncDriver {
                             ),
                         };
                         match reapply_res {
-                            Ok(_) => reapplied += 1,
+                            Ok(report) => {
+                                reapplied += 1;
+                                // The index hook MUST also fire on
+                                // recovery re-applies: the rolled-back
+                                // new-fork blocks fired it (overwriting
+                                // block-num-keyed transaction-info,
+                                // feeding the archive, and emitting
+                                // firehose APPLY entries), so restoring
+                                // the old chain without it would leave
+                                // all three durable artifacts holding
+                                // fork data the chain abandoned — with
+                                // no unwind ever issued. Re-firing here
+                                // rewrites the txinfo, unwinds the
+                                // archive ring, and makes the firehose
+                                // emit the corrective UNWIND + APPLYs.
+                                let old_id = tron_types::block_id_from_block(&old_kb.block)
+                                    .unwrap_or(old_kb.id);
+                                self.notify_index(&old_kb.block, &old_id, &report);
+                            }
                             Err(re) => {
                                 reapply_failed =
                                     Some(format!("block {}: {re:?}", old_kb.num));
@@ -5626,6 +6204,41 @@ mod node_id_tests {
     }
 }
 
+/// Pick the next rotation cursor after leaving a peer: a random candidate
+/// different from `cursor` whose peer isn't archive-demoted, falling back to
+/// a linear scan. Returns `cursor` unchanged only when no other eligible
+/// slot exists. Shared by the failure-hop and dead-end-hop paths.
+fn pick_next_cursor(
+    rng: &mut XorShift64,
+    cursor: usize,
+    shuffled: &[usize],
+    archive_incapable: &[bool],
+) -> usize {
+    let pool_len = shuffled.len();
+    if pool_len <= 1 {
+        return 0;
+    }
+    let mut next = cursor;
+    for _ in 0..pool_len {
+        let candidate = rng.next_usize_below(pool_len);
+        if candidate != cursor && !archive_incapable[shuffled[candidate]] {
+            next = candidate;
+            break;
+        }
+    }
+    // Fallback: linear scan if random sampling didn't find an undemoted slot.
+    if next == cursor || archive_incapable[shuffled[next]] {
+        for offset in 1..pool_len {
+            let candidate = (cursor + offset) % pool_len;
+            if !archive_incapable[shuffled[candidate]] {
+                next = candidate;
+                break;
+            }
+        }
+    }
+    next
+}
+
 /// Tiny xorshift64 PRNG — used to randomize peer dial order per
 /// session. Non-cryptographic; just needs to be deterministic-given-seed
 /// and produce a usable spread for shuffle + bounded `next_usize_below`.
@@ -5677,6 +6290,42 @@ impl XorShift64 {
             let j = self.next_usize_below(i + 1);
             slice.swap(i, j);
         }
+    }
+}
+
+#[cfg(test)]
+mod pick_next_cursor_tests {
+    use super::{pick_next_cursor, XorShift64};
+
+    #[test]
+    fn hops_away_from_the_current_cursor() {
+        let mut rng = XorShift64 { state: 0xDEAD_BEEF };
+        let shuffled: Vec<usize> = (0..8).collect();
+        let demoted = vec![false; 8];
+        for cursor in 0..8 {
+            let next = pick_next_cursor(&mut rng, cursor, &shuffled, &demoted);
+            assert_ne!(next, cursor, "must leave the failing peer's slot");
+            assert!(next < 8);
+        }
+    }
+
+    #[test]
+    fn skips_archive_demoted_slots() {
+        let mut rng = XorShift64 { state: 7 };
+        let shuffled: Vec<usize> = (0..4).collect();
+        // Only slot 2 is eligible besides the cursor's own.
+        let mut demoted = vec![true; 4];
+        demoted[2] = false;
+        for _ in 0..32 {
+            assert_eq!(pick_next_cursor(&mut rng, 0, &shuffled, &demoted), 2);
+        }
+    }
+
+    #[test]
+    fn single_slot_pool_returns_zero() {
+        let mut rng = XorShift64 { state: 1 };
+        assert_eq!(pick_next_cursor(&mut rng, 0, &[0], &[false]), 0);
+        assert_eq!(pick_next_cursor(&mut rng, 0, &[], &[]), 0);
     }
 }
 

@@ -81,6 +81,7 @@ pub mod shielded;
 pub mod tracer;
 pub mod trc10;
 pub mod tron_host;
+pub mod votes;
 
 pub use address::PrecompileAddress;
 pub use context::{EvmContext, EvmContextError};

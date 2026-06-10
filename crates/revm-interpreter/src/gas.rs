@@ -30,30 +30,32 @@ pub struct Gas {
     /// Effective gas cost = `base × (TRON_DYNAMIC_DECIMAL + factor) /
     /// TRON_DYNAMIC_DECIMAL`. See [`TRON_DYNAMIC_DECIMAL`].
     tron_dynamic_factor: i64,
+    /// **TRON fork** — raw (unscaled) cost accumulated within the
+    /// *current opcode*. java-tron computes one combined `energyCost`
+    /// per opcode and applies the dynamic-energy floor ONCE on that
+    /// total (`VM.play()`); revm splits an opcode's cost across several
+    /// `record_*` calls (static gas, memory expansion, dynamic gas).
+    /// Flooring each piece independently loses up to 1 unit per split
+    /// vs java. This accumulator lets each charge pay the *incremental*
+    /// scaled delta so the opcode's total is byte-identical to java's
+    /// single floor. Reset by [`Gas::tron_op_boundary`] at each
+    /// instruction dispatch.
+    tron_op_raw: u64,
+    /// **TRON fork** — frame-lifetime sum of raw (unscaled) costs.
+    /// Mirrors java-tron's `energyUsage` local in `VM.play()` (the
+    /// Σ`actualEnergy` fed to `addContextContractUsage`): forwarded
+    /// child-call gas and CREATE code-deposit do NOT count (they go
+    /// through [`Gas::record_unscaled_cost`]).
+    tron_base_spent: u64,
+    /// **TRON fork** — frame-lifetime sum of dynamic-energy penalties
+    /// (scaled − raw). Mirrors java-tron's
+    /// `ProgramResult.energyPenaltyTotal` contribution of this frame.
+    tron_penalty_spent: u64,
 }
 
 /// Divisor used by TRON's dynamic-energy formula (`10_000`). Pinned in
 /// `actuator/src/main/java/org/tron/core/vm/config/VMConfig.java`.
 pub const TRON_DYNAMIC_DECIMAL: i64 = 10_000;
-
-/// Apply the dynamic-energy multiplier:
-/// `effective = base × (DECIMAL + factor) / DECIMAL`. Returns `base`
-/// when factor is zero (zero-overhead common case). Saturates on
-/// overflow rather than reporting failure — the gas-tracker bounds
-/// check downstream catches OOG.
-#[inline]
-const fn apply_tron_factor(base: u64, factor: i64) -> u64 {
-    if factor == 0 || base == 0 {
-        return base;
-    }
-    let mul = base as u128 * (TRON_DYNAMIC_DECIMAL as u128 + factor as u128);
-    let scaled = mul / (TRON_DYNAMIC_DECIMAL as u128);
-    if scaled > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        scaled as u64
-    }
-}
 
 impl Gas {
     /// Creates a new `Gas` struct with the given gas limit.
@@ -65,6 +67,9 @@ impl Gas {
             tracker: GasTracker::new(limit, limit, 0),
             memory: MemoryGas::new(),
             tron_dynamic_factor: 0,
+            tron_op_raw: 0,
+            tron_base_spent: 0,
+            tron_penalty_spent: 0,
         }
     }
 
@@ -96,6 +101,9 @@ impl Gas {
             tracker: GasTracker::new(limit, limit, reservoir),
             memory: MemoryGas::new(),
             tron_dynamic_factor: 0,
+            tron_op_raw: 0,
+            tron_base_spent: 0,
+            tron_penalty_spent: 0,
         }
     }
 
@@ -106,6 +114,9 @@ impl Gas {
             tracker: GasTracker::new(limit, 0, reservoir),
             memory: MemoryGas::new(),
             tron_dynamic_factor: 0,
+            tron_op_raw: 0,
+            tron_base_spent: 0,
+            tron_penalty_spent: 0,
         }
     }
 
@@ -123,6 +134,80 @@ impl Gas {
     #[inline]
     pub const fn tron_dynamic_factor(&self) -> i64 {
         self.tron_dynamic_factor
+    }
+
+    /// **TRON fork** — mark an opcode boundary: the next `record_*`
+    /// charge starts a fresh per-op charge group for the dynamic-energy
+    /// floor. Called by `Interpreter::step` before dispatching each
+    /// instruction so a whole opcode's charges (static gas + memory
+    /// expansion + dynamic gas) scale as ONE unit, matching java-tron's
+    /// single `energy * factor / DECIMAL` floor per op in `VM.play()`.
+    #[inline]
+    pub const fn tron_op_boundary(&mut self) {
+        self.tron_op_raw = 0;
+    }
+
+    /// **TRON fork** — frame-lifetime sum of raw (unscaled) charges,
+    /// excluding forwarded child gas / code deposit. This is java-tron's
+    /// `energyUsage` (Σ`actualEnergy`) for `addContextContractUsage`.
+    #[inline]
+    pub const fn tron_base_spent(&self) -> u64 {
+        self.tron_base_spent
+    }
+
+    /// **TRON fork** — frame-lifetime sum of dynamic-energy penalties
+    /// (java-tron's per-frame `energyPenaltyTotal` contribution).
+    #[inline]
+    pub const fn tron_penalty_spent(&self) -> u64 {
+        self.tron_penalty_spent
+    }
+
+    /// **TRON fork** — convert a raw charge into the effective amount to
+    /// deduct, maintaining the per-op group invariant: after each call,
+    /// the group's total deducted equals `floor(raw_total × (DECIMAL +
+    /// factor) / DECIMAL)` — exactly java-tron's one-floor-per-op
+    /// result no matter how the op's cost is split across charges.
+    /// Also maintains the frame's base/penalty accounting.
+    #[inline]
+    const fn tron_charge(&mut self, cost: u64) -> u64 {
+        self.tron_base_spent = self.tron_base_spent.saturating_add(cost);
+        if self.tron_dynamic_factor == 0 || cost == 0 {
+            return cost;
+        }
+        let num = TRON_DYNAMIC_DECIMAL as u128 + self.tron_dynamic_factor as u128;
+        let den = TRON_DYNAMIC_DECIMAL as u128;
+        let prev_scaled = self.tron_op_raw as u128 * num / den;
+        let new_raw = self.tron_op_raw as u128 + cost as u128;
+        let new_scaled = new_raw * num / den;
+        self.tron_op_raw = if new_raw > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            new_raw as u64
+        };
+        let delta = new_scaled - prev_scaled;
+        let effective = if delta > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            delta as u64
+        };
+        self.tron_penalty_spent = self
+            .tron_penalty_spent
+            .saturating_add(effective.saturating_sub(cost));
+        effective
+    }
+
+    /// **TRON fork** — record a cost that java-tron does NOT scale by
+    /// the dynamic-energy factor and does NOT count toward the frame's
+    /// contract usage: gas forwarded to a child call/create frame
+    /// (`adjustedCallEnergy` is excluded from both in `VM.play()`), and
+    /// the CREATE code-deposit charge (spent directly on the result in
+    /// `createContractImpl`, outside the op loop).
+    ///
+    /// Returns `false` if the regular gas limit is exceeded.
+    #[inline]
+    #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
+    pub const fn record_unscaled_cost(&mut self, cost: u64) -> bool {
+        self.tracker.record_regular_cost(cost)
     }
 
     /// Returns the gas limit.
@@ -308,7 +393,7 @@ impl Gas {
     #[inline(always)]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
     pub const fn record_cost_unsafe(&mut self, cost: u64) -> bool {
-        let effective = apply_tron_factor(cost, self.tron_dynamic_factor);
+        let effective = self.tron_charge(cost);
         let remaining = self.tracker.remaining();
         let oog = remaining < effective;
         self.tracker.set_remaining(remaining.wrapping_sub(effective));
@@ -325,7 +410,7 @@ impl Gas {
     #[inline]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
     pub const fn record_state_cost(&mut self, cost: u64) -> bool {
-        let effective = apply_tron_factor(cost, self.tron_dynamic_factor);
+        let effective = self.tron_charge(cost);
         self.tracker.record_state_cost(effective)
     }
 
@@ -335,7 +420,7 @@ impl Gas {
     #[inline]
     #[must_use = "In case of not enough gas, the interpreter should halt with an out-of-gas error"]
     pub const fn record_regular_cost(&mut self, cost: u64) -> bool {
-        let effective = apply_tron_factor(cost, self.tron_dynamic_factor);
+        let effective = self.tron_charge(cost);
         self.tracker.record_regular_cost(effective)
     }
 }
@@ -516,5 +601,81 @@ mod tests {
 
         // Now any cost → OOG (both remaining and reservoir are 0)
         assert!(!gas.record_state_cost(1));
+    }
+
+    /// java-tron applies the dynamic-energy floor ONCE per opcode on
+    /// the op's combined cost. Splitting a charge across several
+    /// `record_*` calls within the same op group must total exactly
+    /// `floor(total × (DECIMAL + factor) / DECIMAL)` — never the sum of
+    /// per-piece floors (which can lose up to 1 unit per split).
+    #[test]
+    fn tron_per_op_floor_matches_single_floor() {
+        const F: i64 = 34_000; // mainnet USDT factor (max)
+        let java = |raw: u64| raw as u128 * (10_000 + F as u128) / 10_000;
+
+        // 935 split as 3 + 900 + 32: per-piece floors lose vs combined.
+        let pieces = [3u64, 900, 32];
+        let total: u64 = pieces.iter().sum();
+
+        let mut gas = Gas::new(1_000_000);
+        gas.set_tron_dynamic_factor(F);
+        gas.tron_op_boundary();
+        for p in pieces {
+            assert!(!gas.record_cost_unsafe(p));
+        }
+        let charged = 1_000_000 - gas.remaining();
+        assert_eq!(charged as u128, java(total));
+        // and per-piece flooring would have differed (sanity of the test)
+        let split_sum: u128 = pieces.iter().map(|&p| java(p)).sum();
+        assert!(split_sum < java(total));
+
+        // Frame accounting: base = raw sum, penalty = scaled − raw.
+        assert_eq!(gas.tron_base_spent(), total);
+        assert_eq!(gas.tron_penalty_spent() as u128, java(total) - total as u128);
+    }
+
+    /// A new op boundary starts a fresh floor group: two ops of 935
+    /// each charge `2 × floor(935 × 4.4)`, not `floor(1870 × 4.4)`.
+    #[test]
+    fn tron_op_boundary_resets_group() {
+        const F: i64 = 34_000;
+        let java = |raw: u64| (raw as u128 * (10_000 + F as u128) / 10_000) as u64;
+        let mut gas = Gas::new(1_000_000);
+        gas.set_tron_dynamic_factor(F);
+        gas.tron_op_boundary();
+        assert!(!gas.record_cost_unsafe(935));
+        gas.tron_op_boundary();
+        assert!(!gas.record_cost_unsafe(935));
+        assert_eq!(1_000_000 - gas.remaining(), 2 * java(935));
+    }
+
+    /// Forwarded child gas (java's `adjustedCallEnergy`) is never
+    /// scaled by the parent's factor and never counts toward the
+    /// parent's contract-usage base.
+    #[test]
+    fn tron_forwarded_gas_is_unscaled_and_excluded_from_base() {
+        const F: i64 = 34_000;
+        let mut gas = Gas::new(1_000_000);
+        gas.set_tron_dynamic_factor(F);
+        gas.tron_op_boundary();
+        assert!(!gas.record_cost_unsafe(100)); // scaled call base: floor(100×4.4)=440
+        assert!(gas.record_unscaled_cost(50_000)); // forwarded — raw
+        assert_eq!(1_000_000 - gas.remaining(), 440 + 50_000);
+        assert_eq!(gas.tron_base_spent(), 100);
+        assert_eq!(gas.tron_penalty_spent(), 340);
+    }
+
+    /// factor == 0 keeps the zero-overhead path but still maintains the
+    /// base accumulator (java records contract usage for un-penalised
+    /// frames too).
+    #[test]
+    fn tron_factor_zero_tracks_base_only() {
+        let mut gas = Gas::new(10_000);
+        gas.tron_op_boundary();
+        assert!(!gas.record_cost_unsafe(123));
+        assert!(gas.record_unscaled_cost(1_000));
+        assert_eq!(gas.tron_base_spent(), 123);
+        assert_eq!(gas.tron_penalty_spent(), 0);
+        assert_eq!(10_000 - gas.remaining(), 1_123);
     }
 }

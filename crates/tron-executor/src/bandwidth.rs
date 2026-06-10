@@ -7,7 +7,6 @@
 //! 1. **`contractCreateNewAccount`** — if the contract creates a fresh
 //!    account, pay the new-account net cost (`createNewAccountBandwidthRate
 //!    * bytes`) from frozen net, falling back to `createAccountFee` in TRX.
-//!    *(Not yet modeled — pinned as a remaining gap; see below.)*
 //! 2. **`useAssetAccountNet`** — for `TransferAssetContract` only: try
 //!    the asset-issuer-funded public/free quota first. If the issuer hasn't
 //!    funded enough, fall through to (3).
@@ -26,11 +25,15 @@
 //! with a 28_800-block (24h / 3s) window and `PRECISION = 1_000_000`.
 //! Times are slot units (`latest_block_header_number`), not wall-clock.
 //!
-//! **What's still not modeled** (deferred): `contractCreateNewAccount`,
-//! the `TransactionFeePool` path (only the legacy burn path is supported),
-//! and the `useTransactionFee` `MAX_RESULT_SIZE_IN_TX` per-contract padding.
-//! See `crates/tron-executor/src/lib.rs::execute_one_tx` for where these
-//! plug in.
+//! Byte accounting mirrors java-tron's `supportVM()` branch: the
+//! clear-ret serialized size plus `MAX_RESULT_SIZE_IN_TX` (64) padding
+//! per contract when the VM fork is active, the full serialized size
+//! otherwise.
+//!
+//! **What's still not modeled** (deferred): the pre-blackhole-
+//! optimization fee disposal credits the burn counter instead of the
+//! blackhole *account* (identical supply tracking; see
+//! [`pay_bandwidth_fee`] / [`dispose_fee`]).
 
 use prost::Message;
 use tron_chainbase::{
@@ -43,7 +46,7 @@ use tron_proto::{Account, Transaction, TransferAssetContract};
 
 use crate::resource::{
     calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
-    recovery, ResourceGates, ResourceKind, TRX_PRECISION,
+    recovery_account, ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
 // Re-export the shared constants here so existing callers (and tests
@@ -78,6 +81,16 @@ pub enum BandwidthCharge {
     },
     /// Paid in TRX (deducted from balance).
     Fee { bytes: i64, fee_sun: i64 },
+    /// The contract creates a fresh account and the owner's frozen
+    /// bandwidth covered the special new-account net cost
+    /// (`bytes × createNewAccountBandwidthRate`). Maps to
+    /// `receipt.net_usage = net_cost` (java-tron
+    /// `setNetBillForCreateNewAccount(netCost, 0)`).
+    CreateNewAccountFrozen { net_cost: i64, new_net_usage: i64 },
+    /// The contract creates a fresh account and frozen bandwidth could
+    /// not cover it: the flat `CREATE_ACCOUNT_FEE` (0.1 TRX default)
+    /// was debited and burned. Maps to `receipt.net_fee = fee_sun`.
+    CreateNewAccountFee { fee_sun: i64 },
 }
 
 /// Hard errors — caller should reject the transaction.
@@ -91,6 +104,14 @@ pub enum BandwidthError {
     AssetIssuerMissing(i64),
     #[error("transfer asset contract references unknown asset {0:?}")]
     UnknownAsset(Vec<u8>),
+    #[error(
+        "account has insufficient bandwidth[{bytes}] and balance[{fee_sun}] to create new account"
+    )]
+    InsufficientForNewAccount { bytes: i64, fee_sun: i64 },
+    #[error("too big new account transaction, the size is {size} bytes, maxTxSize {max}")]
+    TooBigCreateAccountTx { size: i64, max: i64 },
+    #[error("too big transaction result, the result size is {size} bytes, maxResultSize {max}")]
+    TooBigTransactionResult { size: i64, max: i64 },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -123,13 +144,55 @@ pub fn consume_bandwidth(
     owner: &Address,
     now_slot: i64,
 ) -> Result<BandwidthCharge, BandwidthError> {
-    let bytes = serialized_bytes(tx) as i64;
+    // java unconditionally rejects an oversized stored result before
+    // any charging (`getResultSerializedSize() > MAX_RESULT_SIZE_IN_TX
+    // * contracts.size()`); honest blocks never trip it (`ret` is just
+    // the contractRet verdict).
+    let result_size: i64 = tx.ret.iter().map(|r| r.encoded_len() as i64).sum();
+    if result_size > MAX_RESULT_SIZE_IN_TX {
+        return Err(BandwidthError::TooBigTransactionResult {
+            size: result_size,
+            max: MAX_RESULT_SIZE_IN_TX,
+        });
+    }
+
+    // Byte accounting, both supportVM branches: clear-ret size plus
+    // the per-contract MAX_RESULT_SIZE_IN_TX padding when the VM fork
+    // is active (mainnet), the full serialized size otherwise.
+    let support_vm = stores.dyn_props.support_vm();
+    let bytes = if support_vm {
+        serialized_bytes(tx) as i64 + MAX_RESULT_SIZE_IN_TX
+    } else {
+        tx.encoded_len() as i64
+    };
     let mut account = stores
         .accounts
         .get(owner)?
         .ok_or(BandwidthError::AccountMissing)?;
 
     let ty = ContractType::try_from(contract.r#type).unwrap_or(ContractType::AccountCreateContract);
+
+    // === contractCreateNewAccount — the special new-account charge ===
+    //
+    // A contract that creates a fresh account (AccountCreateContract,
+    // or a Transfer/TransferAsset to a non-existent address) pays
+    // `bytes × createNewAccountBandwidthRate` from frozen bandwidth,
+    // falling back to the flat CREATE_ACCOUNT_FEE in TRX — it never
+    // touches the free quota or the per-byte fee path.
+    if contract_creates_new_account(stores.accounts, contract)? {
+        // The in-block size gate rides the consensus-logic-optimization
+        // fork (java's `optimizeTxs` is true for in-block txs only when
+        // that flag is active).
+        if stores.dyn_props.allow_consensus_logic_optimization() {
+            let max = stores.dyn_props.max_create_account_tx_size();
+            let create_size =
+                serialized_bytes(tx) as i64 - tx.signature.len() as i64 * PER_SIGN_LENGTH;
+            if create_size > max {
+                return Err(BandwidthError::TooBigCreateAccountTx { size: create_size, max });
+            }
+        }
+        return consume_for_create_new_account(&stores, &mut account, owner, bytes, now_slot);
+    }
 
     // === useAssetAccountNet (TransferAssetContract only) ===
     //
@@ -320,11 +383,13 @@ fn try_use_asset_account_net(
     let issuer_net_limit = calculate_global_net_limit(&issuer, stores.dyn_props);
     let support_unfreeze_delay = stores.dyn_props.support_unfreeze_delay();
     let new_issuer_net_usage = if support_unfreeze_delay {
-        recovery(
+        // Window-interpreted decay — see `try_use_account_net`.
+        recovery_account(
+            &issuer,
+            ResourceKind::Bandwidth,
             issuer_net_usage,
             issuer_last_consume,
             now_slot,
-            issuer.net_window_size,
         )
     } else {
         increase_default(issuer_net_usage, 0, issuer_last_consume, now_slot)
@@ -338,12 +403,27 @@ fn try_use_asset_account_net(
     let final_free_asset_usage =
         increase_default(new_free_asset_usage, bytes, now_slot, now_slot);
     let final_issuer_net_usage = if support_unfreeze_delay {
-        // V2 path: the increase() call also recomputes net_window_size,
-        // which our simplified model skips (we keep a fixed
-        // 24h window). Use the same increase_default for now — divergence
-        // here only matters for accounts that have called
-        // FreezeBalanceV2 with non-default windows, which is rare.
-        increase_default(issuer_net_usage, bytes, issuer_last_consume, now_slot)
+        // Account-aware growth (java `increase(issuerAccountCapsule,
+        // BANDWIDTH, …)`): decays with the issuer's interpreted window
+        // and recomputes + writes the window fields back, exactly like
+        // the `useAccountNet` path. The previous default-window
+        // shortcut both ignored non-default issuer windows and never
+        // maintained them.
+        let gates = ResourceGates {
+            support_unfreeze_delay: true,
+            support_allow_cancel_all_unfreeze_v2: stores
+                .dyn_props
+                .support_allow_cancel_all_unfreeze_v2(),
+        };
+        increase_account(
+            &mut issuer,
+            ResourceKind::Bandwidth,
+            issuer_net_usage,
+            bytes,
+            issuer_last_consume,
+            now_slot,
+            gates,
+        )
     } else {
         increase_default(new_issuer_net_usage, bytes, now_slot, now_slot)
     };
@@ -418,7 +498,19 @@ fn try_use_account_net(
     let last_consume = account.latest_consume_time;
     let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
     let decayed = if support_unfreeze_delay {
-        recovery(account.net_usage, last_consume, now_slot, account.net_window_size)
+        // Window-INTERPRETED decay (java `recovery(accountCapsule, …)` →
+        // `getWindowSize`): an optimized window stores its value
+        // precision-scaled ×1000, so passing the raw field here (the
+        // previous code) read a 28800000-valued window as 28.8M slots —
+        // usage then barely decayed and txs spilled to the free/fee paths
+        // java serves from the staked quota.
+        recovery_account(
+            account,
+            ResourceKind::Bandwidth,
+            account.net_usage,
+            last_consume,
+            now_slot,
+        )
     } else {
         increase_default(account.net_usage, 0, last_consume, now_slot)
     };
@@ -448,6 +540,145 @@ fn try_use_account_net(
         bytes,
         new_net_usage: new_usage,
     }))
+}
+
+/// `Constant.MAX_RESULT_SIZE_IN_TX` — the per-contract byte padding
+/// java adds under `supportVM()`, and the stored-result size cap.
+pub const MAX_RESULT_SIZE_IN_TX: i64 = 64;
+/// `Constant.PER_SIGN_LENGTH` — bytes attributed to one signature in
+/// the max-create-account-tx-size check.
+const PER_SIGN_LENGTH: i64 = 65;
+
+/// `BandwidthProcessor.contractCreateNewAccount`: does this contract
+/// create a fresh account? `AccountCreateContract` always; a Transfer /
+/// TransferAsset when the destination account doesn't exist. Malformed
+/// parameters resolve as "creates" (java NPEs into rejection either
+/// way — the actuator validate rejects the tx and the charge reverts
+/// with it).
+fn contract_creates_new_account(
+    accounts: &AccountStore,
+    contract: &Contract,
+) -> Result<bool, BandwidthError> {
+    let param = contract.parameter.as_ref().map(|p| p.value.as_slice()).unwrap_or(&[]);
+    let to_missing = |to_bytes: &[u8], accounts: &AccountStore| -> Result<bool, BandwidthError> {
+        match address_from_proto(to_bytes) {
+            Some(to) => Ok(accounts.get(&to)?.is_none()),
+            None => Ok(true),
+        }
+    };
+    match ContractType::try_from(contract.r#type).ok() {
+        Some(ContractType::AccountCreateContract) => Ok(true),
+        Some(ContractType::TransferContract) => match tron_proto::TransferContract::decode(param)
+        {
+            Ok(c) => to_missing(&c.to_address, accounts),
+            Err(_) => Ok(true),
+        },
+        Some(ContractType::TransferAssetContract) => {
+            match TransferAssetContract::decode(param) {
+                Ok(c) => to_missing(&c.to_address, accounts),
+                Err(_) => Ok(true),
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `BandwidthProcessor.consumeForCreateNewAccount`: frozen bandwidth at
+/// the new-account rate, falling back to the flat create-account fee.
+fn consume_for_create_new_account(
+    stores: &BandwidthStores<'_>,
+    account: &mut Account,
+    owner: &Address,
+    bytes: i64,
+    now_slot: i64,
+) -> Result<BandwidthCharge, BandwidthError> {
+    if let Some(charge) = try_use_net_for_create_new_account(
+        stores.accounts,
+        stores.dyn_props,
+        account,
+        owner,
+        bytes,
+        now_slot,
+    )? {
+        return Ok(charge);
+    }
+    // `consumeFeeForCreateNewAccount` → `consumeFeeForNewAccount`: the
+    // flat fee burns (no fee-pool branch, unlike the per-byte
+    // bandwidth fee) and bumps TOTAL_CREATE_ACCOUNT_COST.
+    let fee = stores.dyn_props.create_account_fee();
+    if account.balance < fee {
+        return Err(BandwidthError::InsufficientForNewAccount { bytes, fee_sun: fee });
+    }
+    account.latest_opration_time = head_block_timestamp(stores.dyn_props);
+    account.balance -= fee;
+    stores.accounts.put(owner, account)?;
+    dispose_fee(stores.dyn_props, fee);
+    stores.dyn_props.add_total_create_account_cost(fee);
+    Ok(BandwidthCharge::CreateNewAccountFee { fee_sun: fee })
+}
+
+/// `BandwidthProcessor.consumeBandwidthForCreateNewAccount`: identical
+/// quota math to [`try_use_account_net`], but the cost is
+/// `bytes × createNewAccountBandwidthRate` and there is no
+/// `net_limit <= 0` early-out (java charges a zero cost successfully —
+/// only reachable with a zero rate, never on mainnet).
+fn try_use_net_for_create_new_account(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    account: &mut Account,
+    owner: &Address,
+    bytes: i64,
+    now_slot: i64,
+) -> Result<Option<BandwidthCharge>, StoreError> {
+    let rate = dyn_props.create_new_account_bandwidth_rate();
+    let net_limit = calculate_global_net_limit(account, dyn_props);
+    let net_usage = account.net_usage;
+    let last_consume = account.latest_consume_time;
+    let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
+    let decayed = if support_unfreeze_delay {
+        recovery_account(account, ResourceKind::Bandwidth, net_usage, last_consume, now_slot)
+    } else {
+        increase_default(net_usage, 0, last_consume, now_slot)
+    };
+    let net_cost = bytes.saturating_mul(rate);
+    if net_cost > net_limit.saturating_sub(decayed) {
+        return Ok(None);
+    }
+    let new_usage = if support_unfreeze_delay {
+        let gates = ResourceGates {
+            support_unfreeze_delay: true,
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+        increase_account(
+            account,
+            ResourceKind::Bandwidth,
+            net_usage,
+            net_cost,
+            last_consume,
+            now_slot,
+            gates,
+        )
+    } else {
+        increase_default(decayed, net_cost, now_slot, now_slot)
+    };
+    account.net_usage = new_usage;
+    account.latest_consume_time = now_slot;
+    account.latest_opration_time = head_block_timestamp(dyn_props);
+    accounts.put(owner, account)?;
+    Ok(Some(BandwidthCharge::CreateNewAccountFrozen { net_cost, new_net_usage: new_usage }))
+}
+
+/// Flat-fee disposal shared by the create-account fee here and the
+/// executor's multi-sign / memo fees (java-tron
+/// `ResourceProcessor.consumeFeeForNewAccount` /
+/// `Manager.consumeMultiSignFee` / `consumeMemoFee`): burn under the
+/// blackhole optimization. The fee pool is deliberately NOT consulted —
+/// java only routes `useTransactionFee` bandwidth fees through it.
+/// Pre-optimization the credit goes to the blackhole *account*; we burn
+/// instead (same compromise as [`pay_bandwidth_fee`], identical supply
+/// tracking).
+pub fn dispose_fee(dyn_props: &DynamicPropertiesStore, fee: i64) {
+    dyn_props.burn_trx(fee);
 }
 
 /// Try the `useFreeNet` path. Mirrors `BandwidthProcessor.useFreeNet`,

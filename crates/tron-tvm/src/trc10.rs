@@ -30,19 +30,15 @@ use tron_chainbase::{AccountStore, ContractStateStore, DynamicPropertiesStore};
 use crate::database::evm_to_tron_address;
 use crate::internal_tx::InternalTxTrace;
 
-/// One per active VM frame, pushed at `initialize_interp` and popped at
-/// `call_end` / `create_end`. Captures the factor that was installed on
-/// this frame's Gas tracker so we can back out the un-penalised base
-/// energy at frame end (= the number java-tron records into
-/// `ContractState.energy_usage`).
+/// One per active *interpreter* VM frame, pushed at `initialize_interp`
+/// and popped at `call_end` / `create_end` (guarded by `interp_markers`
+/// so precompile/no-code frames — which never run `initialize_interp` —
+/// don't pop a parent's entry). Records which contract the frame's
+/// exact base energy (`Gas::tron_base_spent`) belongs to: java-tron's
+/// `addContextContractUsage(energyUsage)` target.
 #[derive(Debug, Clone, Copy)]
 struct DynEnergyFrame {
     target: tron_crypto::address::Address,
-    /// Installed factor in units of `DYNAMIC_ENERGY_FACTOR_DECIMAL`.
-    /// `0` = no penalty (and no need to record usage).
-    factor: i64,
-    /// Gas limit at frame start. `gas.spent() = limit - remaining`.
-    gas_limit: u64,
 }
 
 /// One pending transfer's pre-state. Pushed in `call`, popped in
@@ -83,10 +79,23 @@ pub struct Trc10Inspector {
     /// reading the stored value, and `*_end` calls `add_energy_usage`
     /// with the un-penalised base energy consumed in the frame.
     dyn_props: Option<Arc<DynamicPropertiesStore>>,
-    /// Per-frame (factor, gas_limit) so `*_end` can back out the base
-    /// energy used. One entry per active frame; pushed at
-    /// `initialize_interp`, popped at `call_end` / `create_end`.
+    /// Per-interpreter-frame usage-attribution records. Pushed at
+    /// `initialize_interp`, popped at `call_end` / `create_end` when the
+    /// matching `interp_markers` entry says an interpreter actually ran.
     dyn_energy_frames: Vec<DynEnergyFrame>,
+    /// One entry per `call`/`create` (i.e. per frame revm *attempted*).
+    /// Flipped to `true` by `initialize_interp` when a real interpreter
+    /// frame was created. Precompile and no-code calls produce a
+    /// `call_end` without `initialize_interp` — without this guard they
+    /// would pop the PARENT's `dyn_energy_frames` entry and misattribute
+    /// `ContractState.energy_usage`.
+    interp_markers: Vec<bool>,
+    /// Σ dynamic-energy penalties across every finished frame — java's
+    /// `ProgramResult.energyPenaltyTotal` (merged unconditionally into
+    /// the parent, even when the child reverted or halted). Lands on
+    /// `receipt.energy_penalty_total` / `TransactionExtention
+    /// .energy_penalty`.
+    energy_penalty_total: u64,
     /// Top-level CALLTOKEN: token_id/value supplied by the
     /// transaction itself (not from a nested CALLTOKEN opcode). The
     /// inspector installs these onto the first frame's `InterpreterInput`
@@ -148,6 +157,8 @@ impl Trc10Inspector {
             contract_state: None,
             dyn_props: None,
             dyn_energy_frames: Vec::new(),
+            interp_markers: Vec::new(),
+            energy_penalty_total: 0,
             pending_top_level: None,
             internal_txs: Vec::new(),
             frame_starts: Vec::new(),
@@ -225,45 +236,48 @@ impl Trc10Inspector {
         self
     }
 
-    /// Pop this frame's `(target, factor, gas_limit)` and (if the full
-    /// lifecycle is enabled and the factor was non-zero) add the
-    /// un-penalised base energy used to `ContractState.energy_usage`.
+    /// Pop this interpreter frame's attribution record, merge its
+    /// penalty total, and (if the full lifecycle is enabled) add the
+    /// exact un-penalised base energy to `ContractState.energy_usage`.
     ///
-    /// `base = spent × DECIMAL / (DECIMAL + factor)` reverses the
-    /// multiplier `record_*_cost` applied. Mirrors java-tron's
-    /// `addContextContractUsage(actualEnergy)` where `actualEnergy` is
-    /// the pre-penalty cost summed inside `VM.play()`.
-    fn record_frame_energy(&mut self, gas_limit: u64, gas_remaining: u64) {
+    /// `Gas::tron_base_spent` is the frame's Σ raw charges with
+    /// forwarded child gas and code-deposit excluded — exactly
+    /// java-tron's `energyUsage` (Σ `actualEnergy`) in `VM.play()`. No
+    /// lossy back-out from the scaled total is needed.
+    ///
+    /// java-tron parity notes:
+    /// - penalties merge into the tx total unconditionally
+    ///   (`ProgramResult.merge` runs `addTotalPenalty` even for
+    ///   reverted/halted children);
+    /// - an exceptionally-halted frame throws PAST
+    ///   `addContextContractUsage`, so its usage is never recorded
+    ///   (REVERT exits the loop normally and IS recorded).
+    fn record_frame_energy(&mut self, gas: &revm::interpreter::Gas, exceptional_halt: bool) {
         let Some(frame) = self.dyn_energy_frames.pop() else {
             return;
         };
+        self.energy_penalty_total = self
+            .energy_penalty_total
+            .saturating_add(gas.tron_penalty_spent());
         let (Some(cs), true) = (&self.contract_state, self.dyn_props.is_some()) else {
             return;
         };
-        if frame.factor == 0 {
-            // No penalty was applied → spent == base; java-tron still
-            // calls addContextContractUsage in this case so the next
-            // cycle's threshold check sees the activity.
-            let spent = gas_limit.saturating_sub(gas_remaining);
-            if spent > 0 {
-                cs.add_energy_usage(&frame.target, spent as i64).expect(
-                    "db error in Trc10Inspector::record_frame_energy writing energy usage (factor=0)",
-                );
-            }
+        if exceptional_halt {
             return;
         }
-        // Sanity: `gas.limit()` on the outcome may have been reset by
-        // revm in some halts. Prefer the captured limit when smaller —
-        // the spent should never exceed the original limit.
-        let limit = gas_limit.min(frame.gas_limit);
-        let spent = limit.saturating_sub(gas_remaining) as i128;
-        let decimal: i128 = 10_000;
-        let base = spent * decimal / (decimal + frame.factor as i128);
+        let base = gas.tron_base_spent();
         if base > 0 {
             cs.add_energy_usage(&frame.target, base as i64).expect(
                 "db error in Trc10Inspector::record_frame_energy writing energy usage",
             );
         }
+    }
+
+    /// Σ dynamic-energy penalties across all finished frames — java's
+    /// `ProgramResult.getEnergyPenaltyTotal()`. Read after the run for
+    /// `receipt.energy_penalty_total` / constant-call `energy_penalty`.
+    pub fn energy_penalty_total(&self) -> u64 {
+        self.energy_penalty_total
     }
 }
 
@@ -308,13 +322,17 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         if factor != 0 {
             interp.gas.set_tron_dynamic_factor(factor);
         }
+        // A real interpreter frame exists for the innermost attempted
+        // call/create — flip its marker so `*_end` knows to pop the
+        // record below. (Precompile/no-code frames never get here.)
+        match self.interp_markers.last_mut() {
+            Some(m) => *m = true,
+            None => self.interp_markers.push(true),
+        }
         // Record the frame even when factor == 0 so the pop in
-        // call_end / create_end stays balanced.
-        self.dyn_energy_frames.push(DynEnergyFrame {
-            target: tron_addr,
-            factor,
-            gas_limit: interp.gas.limit(),
-        });
+        // call_end / create_end stays balanced — java-tron records
+        // contract usage for un-penalised frames too.
+        self.dyn_energy_frames.push(DynEnergyFrame { target: tron_addr });
     }
 
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {
@@ -367,6 +385,10 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 tracer, _context, inputs,
             );
         }
+        // Frame attempted — assume no interpreter until
+        // `initialize_interp` proves otherwise (precompiles/no-code
+        // targets produce a `call_end` without one).
+        self.interp_markers.push(false);
         // Internal-tx trace — record one entry per nested CALL frame.
         // The top-level frame (depth == 0, the user-facing transaction
         // itself) is NOT an internal tx, so skip it.
@@ -498,7 +520,11 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 }
             }
         }
-        self.record_frame_energy(outcome.result.gas.limit(), outcome.result.gas.remaining());
+        // Only interpreter frames pushed a dyn-energy record; precompile
+        // and no-code call_ends must not pop the parent's.
+        if self.interp_markers.pop().unwrap_or(false) {
+            self.record_frame_energy(&outcome.result.gas, outcome.result.result.is_halt());
+        }
 
         let Some(pending) = self.pending.pop() else {
             return;
@@ -588,6 +614,9 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         let created = inputs.created_address(0);
         let target = evm_to_tron_address(&created);
 
+        // Same marker protocol as `call` — a CREATE that fails before
+        // frame creation (e.g. depth limit) ends without an interpreter.
+        self.interp_markers.push(false);
         self.frame_starts.push(self.internal_txs.len());
         self.internal_txs.push(InternalTxTrace {
             caller_address: *caller.as_bytes(),
@@ -629,7 +658,9 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 }
             }
         }
-        self.record_frame_energy(outcome.result.gas.limit(), outcome.result.gas.remaining());
+        if self.interp_markers.pop().unwrap_or(false) {
+            self.record_frame_energy(&outcome.result.gas, outcome.result.result.is_halt());
+        }
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {

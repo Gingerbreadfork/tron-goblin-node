@@ -42,4 +42,16 @@ fn main() {
         .extern_path(".protocol", "::tron_proto::protocol")
         .compile_protos(&[api_proto], &[proto_root, vendored])
         .expect("tonic codegen failed");
+
+    // Second pass: the firehose external-sink stream. Self-contained
+    // package (no java-tron imports) — messages AND service generate
+    // here; the out-of-process Postgres reference consumer runs its
+    // own codegen over the same file.
+    let firehose_proto = PathBuf::from("proto/firehose.proto");
+    println!("cargo:rerun-if-changed={}", firehose_proto.display());
+    tonic_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_protos(&[firehose_proto], &[PathBuf::from("proto")])
+        .expect("firehose tonic codegen failed");
 }

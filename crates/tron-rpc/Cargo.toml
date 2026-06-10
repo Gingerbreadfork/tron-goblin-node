@@ -11,6 +11,7 @@ tron-crypto = { path = "../tron-crypto" }
 tron-proto = { path = "../tron-proto" }
 tron-types = { path = "../tron-types" }
 tron-chainbase = { path = "../tron-chainbase" }
+tron-index = { path = "../tron-index" }
 tron-tvm = { path = "../tron-tvm" }
 tron-executor = { path = "../tron-executor" }
 tron-actuator = { path = "../tron-actuator" }

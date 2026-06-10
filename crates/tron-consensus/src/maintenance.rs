@@ -86,8 +86,14 @@ pub struct MaintenanceReport {
 /// * `candidate_witnesses` — every address registered in [`WitnessStore`].
 ///
 /// **Effects:**
-/// * For each candidate, sum the `new_votes` votes pointing at them
-///   across every voter's [`tron_proto::Votes`] record.
+/// * For each candidate, tally the NET vote delta across every voter's
+///   [`tron_proto::Votes`] record: `Σ new_votes − Σ old_votes`
+///   (java-tron's `MaintenanceManager.countVote`). `old_votes` is the
+///   voter's vote list as it stood at its first vote-mutation of the
+///   cycle, so subtracting it is what makes a re-vote net out to zero
+///   and a vote-move debit the abandoned witness. Summing only
+///   `new_votes` double-counts every re-vote and never reduces a
+///   witness when votes move away or are cut by an unstake.
 /// * Add those deltas to each `WitnessCapsule.vote_count` (accumulate;
 ///   do not replace).
 /// * Sort by `vote_count desc`, take the top 27.
@@ -112,24 +118,33 @@ pub fn update_active_witnesses(
     voters: &[Address],
     candidate_witnesses: &[Address],
 ) -> Result<MaintenanceReport, tron_chainbase::StoreError> {
-    // 1. Tally vote deltas from each voter's `new_votes` list.
+    // 1. Tally NET vote deltas: `new_votes − old_votes` per voter record
+    //    (java-tron's `countVote`). The old list is the voter's votes at
+    //    its first mutation this cycle — already reflected in each
+    //    witness's accumulated `vote_count` — so it must be debited or
+    //    re-votes double-count and moved/reduced votes never come off.
+    fn vote_addr(raw: &[u8]) -> Option<Address> {
+        if raw.len() != tron_crypto::address::ADDRESS_LENGTH {
+            return None;
+        }
+        let mut buf = [0u8; tron_crypto::address::ADDRESS_LENGTH];
+        buf.copy_from_slice(raw);
+        Some(Address::from_raw(buf))
+    }
     let mut deltas: HashMap<Address, i64> = HashMap::new();
     for voter in voters {
         let Some(record) = votes.get(voter)? else {
             continue;
         };
+        for v in &record.old_votes {
+            if let Some(witness_addr) = vote_addr(&v.vote_address) {
+                *deltas.entry(witness_addr).or_insert(0) -= v.vote_count;
+            }
+        }
         for v in &record.new_votes {
-            let Some(witness_addr) = (|| -> Option<Address> {
-                if v.vote_address.len() != tron_crypto::address::ADDRESS_LENGTH {
-                    return None;
-                }
-                let mut buf = [0u8; tron_crypto::address::ADDRESS_LENGTH];
-                buf.copy_from_slice(&v.vote_address);
-                Some(Address::from_raw(buf))
-            })() else {
-                continue;
-            };
-            *deltas.entry(witness_addr).or_insert(0) += v.vote_count;
+            if let Some(witness_addr) = vote_addr(&v.vote_address) {
+                *deltas.entry(witness_addr).or_insert(0) += v.vote_count;
+            }
         }
     }
 
@@ -200,10 +215,11 @@ pub struct MaintenanceOutcome {
 ///      `delegation.witness_vi(current_cycle, witness)`. This is the
 ///      "freeze the per-vote share" step — voters' future
 ///      `withdraw_reward` calls walk these Vi deltas.
-///   2. **Vote tally + SR re-rank**: scan every voter's `new_votes`,
-///      add deltas to per-witness vote counts, re-rank, save top 27 as
-///      the new active list, **clear the votes store** (java-tron does
-///      this so the next cycle starts fresh).
+///   2. **Vote tally + SR re-rank**: scan every voter's record, apply
+///      the net `new_votes − old_votes` delta to per-witness vote
+///      counts, re-rank, save top 27 as the new active list, **clear
+///      the votes store** (java-tron does this so the next cycle
+///      starts fresh).
 ///   3. **Legacy `IncentiveManager.reward`** (only when
 ///      `ALLOW_CHANGE_DELEGATION == 0`): distribute
 ///      `WITNESS_STANDBY_ALLOWANCE` proportionally across the new

@@ -142,6 +142,69 @@ impl DelegatedResourceAccountIndexStore {
         self.delete_raw(&Self::v2_to_key(from, to))?;
         Ok(())
     }
+
+    // -------------------- V1 delegate/undelegate ----------------------
+
+    /// java-tron `delegateV1` — write the bidirectional V1 index rows for
+    /// a legacy `from → to` delegation.
+    pub fn delegate_v1(&self, from: &Address, to: &Address, time: i64) -> Result<(), StoreError> {
+        self.put_raw(
+            &Self::v1_from_key(from, to),
+            &DelegatedResourceAccountIndex {
+                account: to.as_bytes().to_vec(),
+                timestamp: time,
+                ..Default::default()
+            },
+        )?;
+        self.put_raw(
+            &Self::v1_to_key(from, to),
+            &DelegatedResourceAccountIndex {
+                account: from.as_bytes().to_vec(),
+                timestamp: time,
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    /// java-tron `unDelegateV1` — drop both V1 index rows.
+    pub fn undelegate_v1(&self, from: &Address, to: &Address) -> Result<(), StoreError> {
+        self.delete_raw(&Self::v1_from_key(from, to))?;
+        self.delete_raw(&Self::v1_to_key(from, to))?;
+        Ok(())
+    }
+
+    /// java-tron `convert(address)` — migrate the LEGACY aggregated index
+    /// row (bare 21-byte key holding `from_accounts` / `to_accounts`
+    /// lists) into the per-pair prefixed form, then delete the legacy
+    /// row. A missing legacy row means "already converted or never
+    /// delegated" — no-op. Pair timestamps use the list position (i + 1),
+    /// exactly as java does, "just to keep index in order".
+    pub fn convert(&self, address: &Address) -> Result<(), StoreError> {
+        let Some(legacy) = self.get_raw(&Self::legacy_key(address))? else {
+            return Ok(());
+        };
+        let addr_of = |raw: &[u8]| -> Option<Address> {
+            if raw.len() != ADDRESS_LENGTH {
+                return None;
+            }
+            let mut buf = [0u8; ADDRESS_LENGTH];
+            buf.copy_from_slice(raw);
+            Some(Address::from_raw(buf))
+        };
+        for (i, to) in legacy.to_accounts.iter().enumerate() {
+            if let Some(to) = addr_of(to) {
+                self.delegate_v1(address, &to, (i + 1) as i64)?;
+            }
+        }
+        for (i, from) in legacy.from_accounts.iter().enumerate() {
+            if let Some(from) = addr_of(from) {
+                self.delegate_v1(&from, address, (i + 1) as i64)?;
+            }
+        }
+        self.delete_raw(&Self::legacy_key(address))?;
+        Ok(())
+    }
 }
 
 fn prefixed_pair(prefix: u8, a: &Address, b: &Address) -> [u8; 1 + ADDRESS_LENGTH * 2] {

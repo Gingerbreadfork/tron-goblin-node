@@ -65,6 +65,34 @@ pub struct Metrics {
     rpc_requests_by_method: Mutex<HashMap<String, u64>>,
     /// Per-method error counter — `{method_name: count}`.
     rpc_errors_by_method: Mutex<HashMap<String, u64>>,
+    // --- Address-history index (gauges + counters) --------------------------
+    index_cursor_block_number: AtomicI64,
+    index_indexed_from_block_number: AtomicI64,
+    index_floor_block_number: AtomicI64,
+    index_lag_blocks: AtomicI64,
+    index_backfill_complete: AtomicI64,
+    index_blocks_indexed: AtomicU64,
+    index_rows_native: AtomicU64,
+    index_rows_trc20: AtomicU64,
+    index_rows_trc721: AtomicU64,
+    index_rows_internal: AtomicU64,
+    index_rows_logs: AtomicU64,
+    index_reorg_unwinds: AtomicU64,
+    index_reorg_rows_deleted: AtomicU64,
+    index_missing_txinfo_blocks: AtomicU64,
+    // --- Historical-state archive (gauges + counters) -----------------------
+    archive_base_height: AtomicI64,
+    archive_head: AtomicI64,
+    archive_blocks_total: AtomicU64,
+    archive_entries_total: AtomicU64,
+    archive_reorg_unwinds: AtomicU64,
+    archive_gap_repaired_blocks: AtomicU64,
+    archive_coverage_resets: AtomicU64,
+    // --- Firehose external-sink log ------------------------------------------
+    firehose_head_seq: AtomicU64,
+    firehose_entries_total: AtomicU64,
+    firehose_unwinds_total: AtomicU64,
+    firehose_gap_repaired_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -105,6 +133,31 @@ impl Metrics {
             rpc_requests_total: AtomicU64::new(0),
             rpc_requests_by_method: Mutex::new(HashMap::new()),
             rpc_errors_by_method: Mutex::new(HashMap::new()),
+            index_cursor_block_number: AtomicI64::new(0),
+            index_indexed_from_block_number: AtomicI64::new(0),
+            index_floor_block_number: AtomicI64::new(0),
+            index_lag_blocks: AtomicI64::new(0),
+            index_backfill_complete: AtomicI64::new(0),
+            index_blocks_indexed: AtomicU64::new(0),
+            index_rows_native: AtomicU64::new(0),
+            index_rows_trc20: AtomicU64::new(0),
+            index_rows_trc721: AtomicU64::new(0),
+            index_rows_internal: AtomicU64::new(0),
+            index_rows_logs: AtomicU64::new(0),
+            index_reorg_unwinds: AtomicU64::new(0),
+            index_reorg_rows_deleted: AtomicU64::new(0),
+            index_missing_txinfo_blocks: AtomicU64::new(0),
+            archive_base_height: AtomicI64::new(0),
+            archive_head: AtomicI64::new(0),
+            archive_blocks_total: AtomicU64::new(0),
+            archive_entries_total: AtomicU64::new(0),
+            archive_reorg_unwinds: AtomicU64::new(0),
+            archive_gap_repaired_blocks: AtomicU64::new(0),
+            archive_coverage_resets: AtomicU64::new(0),
+            firehose_head_seq: AtomicU64::new(0),
+            firehose_entries_total: AtomicU64::new(0),
+            firehose_unwinds_total: AtomicU64::new(0),
+            firehose_gap_repaired_total: AtomicU64::new(0),
         }
     }
 
@@ -240,6 +293,88 @@ impl Metrics {
             let mut err = self.rpc_errors_by_method.lock().unwrap();
             *err.entry(method.to_string()).or_insert(0) += 1;
         }
+    }
+
+    /// Bulk update of the address-history-index gauges + counters.
+    /// Called by the node's index sampler (the index engine keeps its
+    /// own atomic counters; this mirrors a snapshot of them into the
+    /// Prometheus surface). Counters are *stored*, not added — the
+    /// source values are already monotonic totals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_index_stats(
+        &self,
+        cursor: i64,
+        indexed_from: i64,
+        floor: i64,
+        lag: i64,
+        backfill_complete: bool,
+        blocks_indexed: u64,
+        rows_native: u64,
+        rows_trc20: u64,
+        rows_trc721: u64,
+        rows_internal: u64,
+        rows_logs: u64,
+        reorg_unwinds: u64,
+        reorg_rows_deleted: u64,
+        missing_txinfo_blocks: u64,
+    ) {
+        self.index_cursor_block_number.store(cursor, Ordering::Relaxed);
+        self.index_indexed_from_block_number.store(indexed_from, Ordering::Relaxed);
+        self.index_floor_block_number.store(floor, Ordering::Relaxed);
+        self.index_lag_blocks.store(lag, Ordering::Relaxed);
+        self.index_backfill_complete
+            .store(backfill_complete as i64, Ordering::Relaxed);
+        self.index_blocks_indexed.store(blocks_indexed, Ordering::Relaxed);
+        self.index_rows_native.store(rows_native, Ordering::Relaxed);
+        self.index_rows_trc20.store(rows_trc20, Ordering::Relaxed);
+        self.index_rows_trc721.store(rows_trc721, Ordering::Relaxed);
+        self.index_rows_internal.store(rows_internal, Ordering::Relaxed);
+        self.index_rows_logs.store(rows_logs, Ordering::Relaxed);
+        self.index_reorg_unwinds.store(reorg_unwinds, Ordering::Relaxed);
+        self.index_reorg_rows_deleted
+            .store(reorg_rows_deleted, Ordering::Relaxed);
+        self.index_missing_txinfo_blocks
+            .store(missing_txinfo_blocks, Ordering::Relaxed);
+    }
+
+    /// Bulk update of the historical-state-archive gauges/counters
+    /// (mirrored from the archive writer's atomics by the node's
+    /// sampler — stored, not added).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_archive_stats(
+        &self,
+        base: i64,
+        head: i64,
+        blocks: u64,
+        entries: u64,
+        reorg_unwinds: u64,
+        gap_repaired_blocks: u64,
+        coverage_resets: u64,
+    ) {
+        self.archive_base_height.store(base, Ordering::Relaxed);
+        self.archive_head.store(head, Ordering::Relaxed);
+        self.archive_blocks_total.store(blocks, Ordering::Relaxed);
+        self.archive_entries_total.store(entries, Ordering::Relaxed);
+        self.archive_reorg_unwinds.store(reorg_unwinds, Ordering::Relaxed);
+        self.archive_gap_repaired_blocks
+            .store(gap_repaired_blocks, Ordering::Relaxed);
+        self.archive_coverage_resets
+            .store(coverage_resets, Ordering::Relaxed);
+    }
+
+    /// Mirror of the firehose writer's counters (stored, not added).
+    pub fn set_firehose_stats(
+        &self,
+        head_seq: u64,
+        entries: u64,
+        unwinds: u64,
+        gap_repaired: u64,
+    ) {
+        self.firehose_head_seq.store(head_seq, Ordering::Relaxed);
+        self.firehose_entries_total.store(entries, Ordering::Relaxed);
+        self.firehose_unwinds_total.store(unwinds, Ordering::Relaxed);
+        self.firehose_gap_repaired_total
+            .store(gap_repaired, Ordering::Relaxed);
     }
 
     // -------------------- Exposition (Prometheus text format) ----------
@@ -475,6 +610,163 @@ impl Metrics {
                 ),
             );
         }
+        drop(err);
+
+        // --- Address-history index ---
+        emit_gauge(
+            &mut out,
+            "tron_node_index_cursor_block_number",
+            "Address-history index live-edge cursor (highest contiguously-indexed block).",
+            self.index_cursor_block_number.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_index_indexed_from_block_number",
+            "Address-history index lowest indexed block (the backward backfill edge).",
+            self.index_indexed_from_block_number.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_index_floor_block_number",
+            "Address-history index effective floor (snapshot base / start_height clamp).",
+            self.index_floor_block_number.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_index_lag_blocks",
+            "Blocks between the committed head and the index cursor (0 = parked at tip).",
+            self.index_lag_blocks.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_index_backfill_complete",
+            "1 once the index back edge reached the floor (full history present).",
+            self.index_backfill_complete.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_blocks_indexed_total",
+            "Blocks the address-history index has processed.",
+            self.index_blocks_indexed.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_rows_written_total_native",
+            "idx_native rows written.",
+            self.index_rows_native.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_rows_written_total_trc20",
+            "idx_trc20 rows written.",
+            self.index_rows_trc20.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_rows_written_total_trc721",
+            "idx_trc721 rows written.",
+            self.index_rows_trc721.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_rows_written_total_internal",
+            "idx_internal rows written.",
+            self.index_rows_internal.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_rows_written_total_logs",
+            "idx_logs rows written (scope = all only).",
+            self.index_rows_logs.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_reorg_unwinds_total",
+            "Reorgs the index reconciled by unwinding to the common ancestor.",
+            self.index_reorg_unwinds.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_reorg_rows_deleted_total",
+            "Rows deleted by reorg unwinds.",
+            self.index_reorg_rows_deleted.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_index_missing_txinfo_blocks_total",
+            "Blocks indexed without transaction-info while VM-derived kinds were enabled (those ranges lack TRC20/internal rows).",
+            self.index_missing_txinfo_blocks.load(Ordering::Relaxed),
+        );
+
+        // --- Historical-state archive ---
+        emit_gauge(
+            &mut out,
+            "tron_node_archive_base_height",
+            "Historical-state archive coverage base (reads valid from here up).",
+            self.archive_base_height.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_archive_head",
+            "Historical-state archive coverage head (last archived block).",
+            self.archive_head.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_archive_blocks_total",
+            "Blocks whose write-sets were archived.",
+            self.archive_blocks_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_archive_entries_total",
+            "Versioned key entries written to the archive.",
+            self.archive_entries_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_archive_reorg_unwinds_total",
+            "Reorgs the archive reconciled by unwinding orphaned heights.",
+            self.archive_reorg_unwinds.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_archive_gap_repaired_blocks_total",
+            "Capture-gap blocks repaired exactly from the undo log.",
+            self.archive_gap_repaired_blocks.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_archive_coverage_resets_total",
+            "Archive coverage resets (history lost, capture restarted) — should stay 0.",
+            self.archive_coverage_resets.load(Ordering::Relaxed),
+        );
+
+        // --- Firehose ---
+        emit_gauge(
+            &mut out,
+            "tron_node_firehose_head_seq",
+            "Newest durable firehose log sequence number (the consumers' cursor space).",
+            self.firehose_head_seq.load(Ordering::Relaxed) as i64,
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_firehose_entries_total",
+            "Firehose APPLY entries appended this run.",
+            self.firehose_entries_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_firehose_unwinds_total",
+            "Firehose UNWIND entries appended (reorgs + crash recoveries).",
+            self.firehose_unwinds_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_firehose_gap_repaired_total",
+            "Firehose entries re-derived from the stores to close log gaps.",
+            self.firehose_gap_repaired_total.load(Ordering::Relaxed),
+        );
 
         out
     }

@@ -745,57 +745,132 @@ pub fn get_block_by_num(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// has a long value, returned as a `{key, value}` pair list. Mirrors
 /// java-tron's `wallet.getChainParameters`.
 pub fn get_chain_parameters(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    // We don't have a `scan_all` on DynamicPropertiesStore. Return the
-    // commonly-queried subset that governs chain behaviour.
-    let keys: &[&[u8]] = &[
-        b"MAINTENANCE_TIME_INTERVAL",
-        b"ACCOUNT_UPGRADE_COST",
-        b"CREATE_ACCOUNT_FEE",
-        b"TRANSACTION_FEE",
-        b"ASSET_ISSUE_FEE",
-        b"WITNESS_PAY_PER_BLOCK",
-        b"WITNESS_STANDBY_ALLOWANCE",
-        b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT",
-        b"CREATE_NEW_ACCOUNT_BANDWIDTH_RATE",
-        b"ALLOW_CREATION_OF_CONTRACTS",
-        b"REMOVE_THE_POWER_OF_THE_GR",
-        b"ENERGY_FEE",
-        b"EXCHANGE_CREATE_FEE",
-        b"MAX_CPU_TIME_OF_ONE_TX",
-        b"ALLOW_MULTI_SIGN",
-        b"ALLOW_ADAPTIVE_ENERGY",
-        b"TOTAL_ENERGY_LIMIT",
-        b"ALLOW_TVM_TRANSFER_TRC10",
-        b"ALLOW_TVM_CONSTANTINOPLE",
-        b"ALLOW_TVM_SOLIDITY_059",
-        b"ALLOW_TVM_ISTANBUL",
-        b"ALLOW_TVM_LONDON",
-        b"ALLOW_TVM_SHANGHAI",
-        b"ALLOW_TVM_CANCUN",
-        b"ALLOW_TVM_VOTE",
-        b"ALLOW_TVM_FREEZE",
-        b"ALLOW_TVM_COMPATIBLE_EVM",
-        b"ALLOW_SHIELDED_TRC20_TRANSACTION",
-        b"ALLOW_PBFT",
-        b"ALLOW_CHANGE_DELEGATION",
-        b"ALLOW_DYNAMIC_ENERGY",
-        b"DYNAMIC_ENERGY_THRESHOLD",
-        b"DYNAMIC_ENERGY_INCREASE_FACTOR",
-        b"DYNAMIC_ENERGY_MAX_FACTOR",
-        b"MAX_FEE_LIMIT",
-        b"TOTAL_NET_LIMIT",
-        b"FREE_NET_LIMIT",
-        b"TOTAL_SHIELDED_POOL_VALUE",
+    // Mirrors java-tron's `Wallet.getChainParameters` EXACTLY: the same
+    // 75 entries, in the same order, under java's `get…` camelCase names
+    // (what TronWeb/TronGrid clients key on). Every entry is emitted even
+    // when its value is 0 — but, matching java's proto3 JSON, a zero
+    // value omits the `value` field. The third tuple element is java's
+    // getter default, used when the key is absent from the DB (a
+    // java-imported mainnet DB has virtually all of them).
+    const PARAMS: &[(&str, &[u8], i64)] = &[
+        ("getMaintenanceTimeInterval", b"MAINTENANCE_TIME_INTERVAL", 0),
+        ("getAccountUpgradeCost", b"ACCOUNT_UPGRADE_COST", 0),
+        ("getCreateAccountFee", b"CREATE_ACCOUNT_FEE", 0),
+        ("getTransactionFee", b"TRANSACTION_FEE", 0),
+        ("getAssetIssueFee", b"ASSET_ISSUE_FEE", 0),
+        ("getWitnessPayPerBlock", b"WITNESS_PAY_PER_BLOCK", 0),
+        ("getWitnessStandbyAllowance", b"WITNESS_STANDBY_ALLOWANCE", 0),
+        (
+            "getCreateNewAccountFeeInSystemContract",
+            b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT",
+            0,
+        ),
+        ("getCreateNewAccountBandwidthRate", b"CREATE_NEW_ACCOUNT_BANDWIDTH_RATE", 0),
+        ("getAllowCreationOfContracts", b"ALLOW_CREATION_OF_CONTRACTS", 0),
+        ("getRemoveThePowerOfTheGr", b"REMOVE_THE_POWER_OF_THE_GR", 0),
+        ("getEnergyFee", b"ENERGY_FEE", 0),
+        ("getExchangeCreateFee", b"EXCHANGE_CREATE_FEE", 0),
+        ("getMaxCpuTimeOfOneTx", b"MAX_CPU_TIME_OF_ONE_TX", 0),
+        ("getAllowUpdateAccountName", b"ALLOW_UPDATE_ACCOUNT_NAME", 0),
+        // Leading space: java's canonical key typo.
+        ("getAllowSameTokenName", b" ALLOW_SAME_TOKEN_NAME", 0),
+        ("getAllowDelegateResource", b"ALLOW_DELEGATE_RESOURCE", 0),
+        ("getTotalEnergyLimit", b"TOTAL_ENERGY_LIMIT", 0),
+        ("getAllowTvmTransferTrc10", b"ALLOW_TVM_TRANSFER_TRC10", 0),
+        ("getTotalEnergyCurrentLimit", b"TOTAL_ENERGY_CURRENT_LIMIT", 0),
+        ("getAllowMultiSign", b"ALLOW_MULTI_SIGN", 0),
+        ("getAllowAdaptiveEnergy", b"ALLOW_ADAPTIVE_ENERGY", 0),
+        ("getTotalEnergyTargetLimit", b"TOTAL_ENERGY_TARGET_LIMIT", 0),
+        ("getTotalEnergyAverageUsage", b"TOTAL_ENERGY_AVERAGE_USAGE", 0),
+        ("getUpdateAccountPermissionFee", b"UPDATE_ACCOUNT_PERMISSION_FEE", 0),
+        ("getMultiSignFee", b"MULTI_SIGN_FEE", 0),
+        ("getAllowAccountStateRoot", b"ALLOW_ACCOUNT_STATE_ROOT", 0),
+        ("getAllowProtoFilterNum", b"ALLOW_PROTO_FILTER_NUM", 0),
+        ("getAllowTvmConstantinople", b"ALLOW_TVM_CONSTANTINOPLE", 0),
+        ("getAllowTvmSolidity059", b"ALLOW_TVM_SOLIDITY_059", 0),
+        ("getAllowTvmIstanbul", b"ALLOW_TVM_ISTANBUL", 0),
+        ("getAllowShieldedTRC20Transaction", b"ALLOW_SHIELDED_TRC20_TRANSACTION", 0),
+        ("getForbidTransferToContract", b"FORBID_TRANSFER_TO_CONTRACT", 0),
+        // Stored SCALED (`24 * 60 * ratio`, java ProposalService); the
+        // getter-facing value divides back out — handled below.
+        (
+            "getAdaptiveResourceLimitTargetRatio",
+            b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO",
+            14_400,
+        ),
+        (
+            "getAdaptiveResourceLimitMultiplier",
+            b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER",
+            1000,
+        ),
+        ("getChangeDelegation", b"CHANGE_DELEGATION", 0),
+        ("getWitness127PayPerBlock", b"WITNESS_127_PAY_PER_BLOCK", 0),
+        ("getAllowMarketTransaction", b"ALLOW_MARKET_TRANSACTION", 0),
+        ("getMarketSellFee", b"MARKET_SELL_FEE", 0),
+        ("getMarketCancelFee", b"MARKET_CANCEL_FEE", 0),
+        ("getAllowPBFT", b"ALLOW_PBFT", 0),
+        ("getAllowTransactionFeePool", b"ALLOW_TRANSACTION_FEE_POOL", 0),
+        ("getMaxFeeLimit", b"MAX_FEE_LIMIT", 0),
+        ("getAllowOptimizeBlackHole", b"ALLOW_BLACKHOLE_OPTIMIZATION", 0),
+        ("getAllowNewResourceModel", b"ALLOW_NEW_RESOURCE_MODEL", 0),
+        ("getAllowTvmFreeze", b"ALLOW_TVM_FREEZE", 0),
+        ("getAllowTvmVote", b"ALLOW_TVM_VOTE", 0),
+        ("getAllowTvmLondon", b"ALLOW_TVM_LONDON", 0),
+        ("getAllowTvmCompatibleEvm", b"ALLOW_TVM_COMPATIBLE_EVM", 0),
+        ("getAllowAccountAssetOptimization", b"ALLOW_ACCOUNT_ASSET_OPTIMIZATION", 0),
+        ("getFreeNetLimit", b"FREE_NET_LIMIT", 0),
+        ("getTotalNetLimit", b"TOTAL_NET_LIMIT", 0),
+        (
+            "getAllowHigherLimitForMaxCpuTimeOfOneTx",
+            b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX",
+            0,
+        ),
+        ("getAllowAssetOptimization", b"ALLOW_ASSET_OPTIMIZATION", 0),
+        ("getAllowNewReward", b"ALLOW_NEW_REWARD", 0),
+        ("getMemoFee", b"MEMO_FEE", 0),
+        ("getAllowDelegateOptimization", b"ALLOW_DELEGATE_OPTIMIZATION", 0),
+        ("getUnfreezeDelayDays", b"UNFREEZE_DELAY_DAYS", 0),
+        (
+            "getAllowOptimizedReturnValueOfChainId",
+            b"ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID",
+            0,
+        ),
+        ("getAllowDynamicEnergy", b"ALLOW_DYNAMIC_ENERGY", 0),
+        ("getDynamicEnergyThreshold", b"DYNAMIC_ENERGY_THRESHOLD", 0),
+        ("getDynamicEnergyIncreaseFactor", b"DYNAMIC_ENERGY_INCREASE_FACTOR", 0),
+        ("getDynamicEnergyMaxFactor", b"DYNAMIC_ENERGY_MAX_FACTOR", 0),
+        ("getAllowTvmShangHai", b"ALLOW_TVM_SHANGHAI", 0),
+        ("getAllowCancelAllUnfreezeV2", b"ALLOW_CANCEL_ALL_UNFREEZE_V2", 0),
+        ("getMaxDelegateLockPeriod", b"MAX_DELEGATE_LOCK_PERIOD", 0),
+        ("getAllowOldRewardOpt", b"ALLOW_OLD_REWARD_OPT", 0),
+        ("getAllowEnergyAdjustment", b"ALLOW_ENERGY_ADJUSTMENT", 0),
+        // java getter default (`CommonParameter.maxCreateAccountTxSize`).
+        ("getMaxCreateAccountTxSize", b"MAX_CREATE_ACCOUNT_TX_SIZE", 1000),
+        ("getAllowStrictMath", b"ALLOW_STRICT_MATH", 0),
+        ("getConsensusLogicOptimization", b"CONSENSUS_LOGIC_OPTIMIZATION", 0),
+        ("getAllowTvmCancun", b"ALLOW_TVM_CANCUN", 0),
+        ("getAllowTvmBlob", b"ALLOW_TVM_BLOB", 0),
+        (
+            "getAllowTvmSelfdestructRestriction",
+            b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION",
+            0,
+        ),
+        ("getProposalExpireTime", b"PROPOSAL_EXPIRE_TIME", 259_200_000),
     ];
-    let entries: Vec<Value> = keys
+    let entries: Vec<Value> = PARAMS
         .iter()
-        .filter_map(|k| {
-            s.dyn_props.get_long(k).map(|v| {
-                json!({
-                    "key": std::str::from_utf8(k).unwrap_or(""),
-                    "value": v,
-                })
-            })
+        .map(|(name, key, default)| {
+            let mut v = s.dyn_props.get_long(key).unwrap_or(*default);
+            // java's Wallet divides the stored scaled ratio back to the
+            // proposal-facing value (10), `24 * 60` periods per day.
+            if *name == "getAdaptiveResourceLimitTargetRatio" {
+                v /= 24 * 60;
+            }
+            if v == 0 {
+                json!({ "key": name })
+            } else {
+                json!({ "key": name, "value": v })
+            }
         })
         .collect();
     Ok(json!({ "chainParameter": entries }))
@@ -889,9 +964,13 @@ pub fn get_reward(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 }
 
 /// `getBurnTrx` — total amount of TRX burned by the chain, as tracked
-/// in `DynamicPropertiesStore` under `BURN_TRX_AMOUNT`.
+/// in `DynamicPropertiesStore` under `BURN_TRX_AMOUNT`. java wraps the
+/// value in `{"burnTrxAmount": n}` (`NumberMessage` JSON), not a bare
+/// number.
 pub fn get_burn_trx(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    Ok(json!(s.dyn_props.get_long(b"BURN_TRX_AMOUNT").unwrap_or(0)))
+    Ok(json!({
+        "burnTrxAmount": s.dyn_props.get_long(b"BURN_TRX_AMOUNT").unwrap_or(0)
+    }))
 }
 
 /// `listProposals` — every entry in `ProposalStore`, sorted by id.
@@ -1054,17 +1133,17 @@ pub fn get_stats_info(_p: &Value, s: &RpcState) -> Value {
 }
 
 /// `getBandwidthPrices` / `getEnergyPrices` — TRON's historic price
-/// schedule. We return the current static values from DynamicProperties
-/// (a single-entry "history" matches what java-tron emits before any
-/// proposal updates the table).
+/// schedule, served verbatim from the persisted `*_PRICE_HISTORY`
+/// strings (`unix_ms:price` pairs, comma-joined; appended by every
+/// price-change proposal since genesis). Fabricating `0:current`
+/// (the previous behaviour) hid the whole schedule from clients that
+/// compute historic fees from it.
 pub fn get_bandwidth_prices(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let price = s.dyn_props.get_long(b"TRANSACTION_FEE").unwrap_or(0);
-    Ok(json!({ "prices": format!("0:{}", price) }))
+    Ok(json!({ "prices": s.dyn_props.bandwidth_price_history() }))
 }
 
 pub fn get_energy_prices(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let price = s.dyn_props.get_long(b"ENERGY_FEE").unwrap_or(0);
-    Ok(json!({ "prices": format!("0:{}", price) }))
+    Ok(json!({ "prices": s.dyn_props.energy_price_history() }))
 }
 
 // =============================================================================
@@ -1195,7 +1274,12 @@ fn encode_account_for_rpc(a: &tron_proto::Account, genesis_ms: i64) -> Value {
     let consume_free_ms = consume_slot_to_ms(a.latest_consume_free_time, genesis_ms);
 
     if !a.account_name.is_empty() {
-        m.insert("account_name".into(), json!(String::from_utf8_lossy(&a.account_name)));
+        // java's proto3 JsonFormat renders bytes as bare hex (no 0x) with
+        // the default `visible=false` (e.g. the Blackhole account's name
+        // reads `426c61636b686f6c65`); the readable-text form only appears
+        // under `visible=true`, which the HTTP layer's rewrite pass
+        // produces.
+        m.insert("account_name".into(), json!(hex::encode(&a.account_name)));
     }
     put(&mut m, "type", a.r#type != 0, json!(account_type_name(a.r#type)));
     put(&mut m, "balance", a.balance != 0, json!(a.balance));
@@ -1513,18 +1597,18 @@ pub fn build_call_vm_stores(b: &crate::state::EthCallBackends) -> tron_tvm::exec
 /// mid-execution if the wall-clock budget elapses. Otherwise routes
 /// through `execute_trigger_with_gas_cap` (no deadline overhead).
 /// java-tron's `vm.constantCallTimeoutMs` plumbing terminates here.
-fn dispatch_constant_trigger(
+pub(crate) fn dispatch_constant_trigger(
     s: &RpcState,
     vm_stores: &tron_tvm::execute::VmStores,
     block_env: tron_tvm::execute::VmBlockEnv,
     trigger: &tron_proto::TriggerSmartContract,
     energy_limit: u64,
-) -> tron_tvm::execute::VmOutcome {
+) -> (tron_tvm::execute::VmOutcome, u64) {
     if s.constant_call_timeout_ms > 0 {
         let timeout_ms = s.constant_call_timeout_ms as u64;
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(timeout_ms);
-        let (outcome, _traces) = tron_tvm::execute::execute_trigger_with_deadline(
+        let (outcome, _traces, energy_penalty) = tron_tvm::execute::execute_trigger_with_deadline(
             vm_stores,
             block_env,
             trigger,
@@ -1533,16 +1617,16 @@ fn dispatch_constant_trigger(
             deadline,
             timeout_ms,
         );
-        return outcome;
+        return (outcome, energy_penalty);
     }
-    let (outcome, _traces) = tron_tvm::execute::execute_trigger_with_gas_cap(
+    let (outcome, _traces, energy_penalty) = tron_tvm::execute::execute_trigger_with_gas_cap(
         vm_stores,
         block_env,
         trigger,
         energy_limit,
         s.eth_call_gas_cap,
     );
-    outcome
+    (outcome, energy_penalty)
 }
 
 /// Decode an `eth_call` "TransactionRequest" JSON-RPC object.
@@ -1639,7 +1723,7 @@ pub fn eth_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         call_token_value: 0,
         token_id: 0,
     };
-    let outcome = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
+    let (outcome, _energy_penalty) = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
     match outcome {
         tron_tvm::execute::VmOutcome::Success { return_data, .. } => {
             Ok(Value::String(hex_bytes(&return_data)))
@@ -1693,7 +1777,7 @@ pub fn eth_estimate_gas(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         call_token_value: 0,
         token_id: 0,
     };
-    let outcome = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
+    let (outcome, _energy_penalty) = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
     let used = match outcome {
         tron_tvm::execute::VmOutcome::Success { energy_used, .. } => energy_used,
         tron_tvm::execute::VmOutcome::Revert { energy_used, .. }
@@ -2375,9 +2459,6 @@ pub fn eth_get_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 
 /// `getTransactionInfoById(hash)` — TRON-style receipt fetch.
 pub fn get_transaction_info_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let Some(history) = &s.tx_history else {
-        return Ok(Value::Null);
-    };
     let hash_str = p
         .get(0)
         .and_then(|v| v.as_str())
@@ -2388,17 +2469,30 @@ pub fn get_transaction_info_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcE
     }
     let mut tx_id = [0u8; 32];
     tx_id.copy_from_slice(&bytes);
-    match history.get(&tx_id) {
-        Ok(Some(info)) => Ok(encode_transaction_info(&info)),
-        _ => Ok(Value::Null),
+    // Primary: the tx-id-keyed history store (java-tron's
+    // transactionHistoryStore, populated by snapshots).
+    if let Some(history) = &s.tx_history {
+        if let Ok(Some(info)) = history.get(&tx_id) {
+            return Ok(encode_transaction_info(&info));
+        }
     }
+    // Fallback: the block-keyed transactionRetStore, written at every
+    // apply when [index] is enabled. The tx's stored block-ref tells
+    // us which block's receipt list to search.
+    if let (Some(ret_store), Ok(Some(tron_chainbase::StoredTransaction::BlockRef(num)))) =
+        (&s.transaction_ret, s.transactions.get(&tx_id))
+    {
+        if let Ok(Some(ret)) = ret_store.get(num) {
+            if let Some(info) = ret.transactioninfo.iter().find(|i| i.id == tx_id) {
+                return Ok(encode_transaction_info(info));
+            }
+        }
+    }
+    Ok(Value::Null)
 }
 
 /// `getTransactionInfoByBlockNum(num)` — all receipts in the block.
 pub fn get_transaction_info_by_block_num(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let Some(history) = &s.tx_history else {
-        return Ok(Value::Array(vec![]));
-    };
     let num = p
         .get(0)
         .and_then(|v| v.as_i64())
@@ -2408,6 +2502,22 @@ pub fn get_transaction_info_by_block_num(p: &Value, s: &RpcState) -> Result<Valu
                 .and_then(|s| s.parse::<i64>().ok())
         })
         .ok_or_else(|| RpcError::invalid_params("missing block number"))?;
+    // The block-keyed transactionRetStore IS this query's shape — one
+    // get serves the whole block when present (written at apply with
+    // [index] enabled, or imported with an archive snapshot).
+    if let Some(ret_store) = &s.transaction_ret {
+        if let Ok(Some(ret)) = ret_store.get(num) {
+            if !ret.transactioninfo.is_empty() {
+                return Ok(Value::Array(
+                    ret.transactioninfo.iter().map(encode_transaction_info).collect(),
+                ));
+            }
+        }
+    }
+    // Fallback: per-tx lookups through the tx-id-keyed history store.
+    let Some(history) = &s.tx_history else {
+        return Ok(Value::Array(vec![]));
+    };
     let Ok(id) = s.block_index.get(num) else {
         return Ok(Value::Array(vec![]));
     };
@@ -2426,30 +2536,189 @@ pub fn get_transaction_info_by_block_num(p: &Value, s: &RpcState) -> Result<Valu
 }
 
 fn encode_transaction_info(info: &tron_proto::TransactionInfo) -> Value {
-    json!({
-        "id": hex_bytes(&info.id),
-        "fee": info.fee,
-        "blockNumber": info.block_number,
-        "blockTimeStamp": info.block_time_stamp,
-        "contractAddress": hex_bytes(&info.contract_address),
-        "receipt": info.receipt.as_ref().map(|r| json!({
-            "energyUsageTotal": r.energy_usage_total,
-            "netUsage": r.net_usage,
-            "netFee": r.net_fee,
-            "result": r.result,
-        })).unwrap_or(Value::Null),
-        "log": info.log.iter().map(|l| json!({
-            "address": hex_bytes(&l.address),
-            "topics": l.topics.iter().map(|t| hex_bytes(t)).collect::<Vec<_>>(),
-            "data": hex_bytes(&l.data),
-        })).collect::<Vec<_>>(),
-        "result": info.result,
-        "resMessage": String::from_utf8_lossy(&info.res_message).to_string(),
-        "withdrawAmount": info.withdraw_amount,
-        "unfreezeAmount": info.unfreeze_amount,
-        "shieldedTransactionFee": info.shielded_transaction_fee,
-        "packingFee": info.packing_fee,
-    })
+    // java-tron JsonFormat semantics: proto field names verbatim
+    // (`blockNumber` but `contract_address` — the .proto mixes styles),
+    // default-valued fields omitted, bytes as bare hex, enums as value
+    // names (including the `SUCESS` typo java pins forever).
+    let mut m = serde_json::Map::new();
+    m.insert("id".into(), json!(hex::encode(&info.id)));
+    if info.fee != 0 {
+        m.insert("fee".into(), json!(info.fee));
+    }
+    if info.block_number != 0 {
+        m.insert("blockNumber".into(), json!(info.block_number));
+    }
+    if info.block_time_stamp != 0 {
+        m.insert("blockTimeStamp".into(), json!(info.block_time_stamp));
+    }
+    if !info.contract_result.is_empty() {
+        m.insert(
+            "contractResult".into(),
+            json!(info.contract_result.iter().map(hex::encode).collect::<Vec<_>>()),
+        );
+    }
+    if !info.contract_address.is_empty() {
+        m.insert("contract_address".into(), json!(hex::encode(&info.contract_address)));
+    }
+    if let Some(r) = &info.receipt {
+        let mut rm = serde_json::Map::new();
+        if r.energy_usage != 0 {
+            rm.insert("energy_usage".into(), json!(r.energy_usage));
+        }
+        if r.energy_fee != 0 {
+            rm.insert("energy_fee".into(), json!(r.energy_fee));
+        }
+        if r.origin_energy_usage != 0 {
+            rm.insert("origin_energy_usage".into(), json!(r.origin_energy_usage));
+        }
+        if r.energy_usage_total != 0 {
+            rm.insert("energy_usage_total".into(), json!(r.energy_usage_total));
+        }
+        if r.net_usage != 0 {
+            rm.insert("net_usage".into(), json!(r.net_usage));
+        }
+        if r.net_fee != 0 {
+            rm.insert("net_fee".into(), json!(r.net_fee));
+        }
+        if r.result != 0 {
+            let name = tron_proto::transaction::result::ContractResult::try_from(r.result)
+                .map(|c| c.as_str_name().to_string())
+                .unwrap_or_else(|_| r.result.to_string());
+            rm.insert("result".into(), json!(name));
+        }
+        if r.energy_penalty_total != 0 {
+            rm.insert("energy_penalty_total".into(), json!(r.energy_penalty_total));
+        }
+        m.insert("receipt".into(), Value::Object(rm));
+    }
+    if !info.log.is_empty() {
+        let logs: Vec<Value> = info
+            .log
+            .iter()
+            .map(|l| {
+                let mut lm = serde_json::Map::new();
+                if !l.address.is_empty() {
+                    lm.insert("address".into(), json!(hex::encode(&l.address)));
+                }
+                if !l.topics.is_empty() {
+                    lm.insert(
+                        "topics".into(),
+                        json!(l.topics.iter().map(hex::encode).collect::<Vec<_>>()),
+                    );
+                }
+                if !l.data.is_empty() {
+                    lm.insert("data".into(), json!(hex::encode(&l.data)));
+                }
+                Value::Object(lm)
+            })
+            .collect();
+        m.insert("log".into(), json!(logs));
+    }
+    if info.result != 0 {
+        let name = tron_proto::transaction_info::Code::try_from(info.result)
+            .map(|c| c.as_str_name().to_string())
+            .unwrap_or_else(|_| info.result.to_string());
+        m.insert("result".into(), json!(name));
+    }
+    if !info.res_message.is_empty() {
+        m.insert("resMessage".into(), json!(hex::encode(&info.res_message)));
+    }
+    if !info.asset_issue_id.is_empty() {
+        m.insert("assetIssueID".into(), json!(info.asset_issue_id));
+    }
+    if info.withdraw_amount != 0 {
+        m.insert("withdraw_amount".into(), json!(info.withdraw_amount));
+    }
+    if info.unfreeze_amount != 0 {
+        m.insert("unfreeze_amount".into(), json!(info.unfreeze_amount));
+    }
+    if !info.internal_transactions.is_empty() {
+        let itxs: Vec<Value> = info
+            .internal_transactions
+            .iter()
+            .map(|t| {
+                let mut tm = serde_json::Map::new();
+                if !t.hash.is_empty() {
+                    tm.insert("hash".into(), json!(hex::encode(&t.hash)));
+                }
+                if !t.caller_address.is_empty() {
+                    tm.insert("caller_address".into(), json!(hex::encode(&t.caller_address)));
+                }
+                if !t.transfer_to_address.is_empty() {
+                    tm.insert(
+                        "transferTo_address".into(),
+                        json!(hex::encode(&t.transfer_to_address)),
+                    );
+                }
+                if !t.call_value_info.is_empty() {
+                    let cvs: Vec<Value> = t
+                        .call_value_info
+                        .iter()
+                        .map(|cv| {
+                            let mut cm = serde_json::Map::new();
+                            if cv.call_value != 0 {
+                                cm.insert("callValue".into(), json!(cv.call_value));
+                            }
+                            if !cv.token_id.is_empty() {
+                                cm.insert("tokenId".into(), json!(cv.token_id));
+                            }
+                            Value::Object(cm)
+                        })
+                        .collect();
+                    tm.insert("callValueInfo".into(), json!(cvs));
+                }
+                if !t.note.is_empty() {
+                    tm.insert("note".into(), json!(hex::encode(&t.note)));
+                }
+                if t.rejected {
+                    tm.insert("rejected".into(), json!(true));
+                }
+                if !t.extra.is_empty() {
+                    tm.insert("extra".into(), json!(t.extra));
+                }
+                Value::Object(tm)
+            })
+            .collect();
+        m.insert("internal_transactions".into(), json!(itxs));
+    }
+    if info.exchange_received_amount != 0 {
+        m.insert("exchange_received_amount".into(), json!(info.exchange_received_amount));
+    }
+    if info.exchange_inject_another_amount != 0 {
+        m.insert(
+            "exchange_inject_another_amount".into(),
+            json!(info.exchange_inject_another_amount),
+        );
+    }
+    if info.exchange_withdraw_another_amount != 0 {
+        m.insert(
+            "exchange_withdraw_another_amount".into(),
+            json!(info.exchange_withdraw_another_amount),
+        );
+    }
+    if info.exchange_id != 0 {
+        m.insert("exchange_id".into(), json!(info.exchange_id));
+    }
+    if info.shielded_transaction_fee != 0 {
+        m.insert("shielded_transaction_fee".into(), json!(info.shielded_transaction_fee));
+    }
+    if !info.order_id.is_empty() {
+        m.insert("orderId".into(), json!(hex::encode(&info.order_id)));
+    }
+    if info.packing_fee != 0 {
+        m.insert("packingFee".into(), json!(info.packing_fee));
+    }
+    if info.withdraw_expire_amount != 0 {
+        m.insert("withdraw_expire_amount".into(), json!(info.withdraw_expire_amount));
+    }
+    if !info.cancel_unfreeze_v2_amount.is_empty() {
+        let mut cm = serde_json::Map::new();
+        for (k, v) in &info.cancel_unfreeze_v2_amount {
+            cm.insert(k.clone(), json!(v));
+        }
+        m.insert("cancel_unfreezeV2_amount".into(), Value::Object(cm));
+    }
+    Value::Object(m)
 }
 
 /// `listAssets` / `getAssetIssueList` — every TRC-10 asset.
@@ -2500,12 +2769,12 @@ pub fn list_exchanges(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     Ok(json!({ "exchanges": out }))
 }
 
-/// `getNextMaintenanceTime` — next epoch boundary timestamp.
+/// `getNextMaintenanceTime` — next epoch boundary timestamp. java wraps
+/// it in `{"num": t}` (`NumberMessage` JSON), not a bare number.
 pub fn get_next_maintenance_time(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    Ok(json!(s
-        .dyn_props
-        .get_long(b"NEXT_MAINTENANCE_TIME")
-        .unwrap_or(0)))
+    Ok(json!({
+        "num": s.dyn_props.get_long(b"NEXT_MAINTENANCE_TIME").unwrap_or(0)
+    }))
 }
 
 /// `getNodes` / `listNodes` — peer list. We don't track peers at this
@@ -2648,9 +2917,12 @@ fn parse_constant_call_request(p: &Value, gas_cap: u64) -> Result<EthCallRequest
 /// return data), `energy_used`, `result.{result,code,message}`, and a
 /// minimal `transaction.ret[].contractRet`. The energy + return-data are
 /// what a state-diff harness compares to validate TVM execution exactness.
-fn constant_outcome_to_json(outcome: tron_tvm::execute::VmOutcome) -> Value {
+fn constant_outcome_to_json(outcome: tron_tvm::execute::VmOutcome, energy_penalty: u64) -> Value {
     use tron_tvm::execute::VmOutcome;
-    match outcome {
+    // java-tron: `TransactionExtention.energy_penalty` =
+    // `ProgramResult.energyPenaltyTotal` (Wallet.triggerConstantContract).
+    // proto3 JsonFormat omits the field when 0.
+    let mut v = match outcome {
         VmOutcome::Success {
             return_data,
             energy_used,
@@ -2692,7 +2964,13 @@ fn constant_outcome_to_json(outcome: tron_tvm::execute::VmOutcome) -> Value {
             "result": { "result": false, "code": "CONTRACT_VALIDATE_ERROR",
                         "message": "CALLTOKEN at top level is not supported in a constant call" },
         }),
+    };
+    if energy_penalty > 0 {
+        if let Value::Object(map) = &mut v {
+            map.insert("energy_penalty".to_string(), json!(energy_penalty));
+        }
     }
+    v
 }
 
 pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
@@ -2742,8 +3020,9 @@ pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcEr
         call_token_value: 0,
         token_id: 0,
     };
-    let outcome = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
-    Ok(constant_outcome_to_json(outcome))
+    let (outcome, energy_penalty) =
+        dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
+    Ok(constant_outcome_to_json(outcome, energy_penalty))
 }
 
 /// `broadcastTransaction(tx)` — accepts a transaction but doesn't
@@ -3646,103 +3925,227 @@ pub fn get_block_by_latest_num(p: &Value, s: &RpcState) -> Result<Value, RpcErro
 // Contract / asset / proposal lookups
 // =============================================================================
 
+/// Resolve a contract row the way java-tron's `Wallet.getContract` /
+/// `getContractInfo` do: the account must exist, the `contract` store
+/// must have a row, and the ABI (split into the `abi` column family on
+/// post-split chains) is stitched back onto the proto when present.
+fn load_contract_with_abi(
+    s: &RpcState,
+    addr: &tron_crypto::address::Address,
+) -> Result<Option<tron_proto::SmartContract>, RpcError> {
+    let Some(contracts) = &s.contracts else {
+        return Ok(None);
+    };
+    // java: `accountStore.get(address) == null` → null response.
+    let account_exists = s
+        .accounts
+        .get(addr)
+        .map_err(|e| RpcError::internal(format!("account read: {e}")))?
+        .is_some();
+    if !account_exists {
+        return Ok(None);
+    }
+    let Some(mut contract) = contracts
+        .get(addr)
+        .map_err(|e| RpcError::internal(format!("contract read: {e}")))?
+    else {
+        return Ok(None);
+    };
+    if let Some(abis) = &s.abis {
+        if let Ok(Some(abi)) = abis.get(addr) {
+            contract.abi = Some(abi);
+        }
+    }
+    Ok(Some(contract))
+}
+
 /// `getContract(address)` — the static `SmartContract` metadata
 /// (origin, ABI, contract_address, name, settings). Does NOT include
 /// runtime code; use `getContractInfo` or `eth_getCode` for that.
 pub fn get_contract(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let Some(contracts) = &s.contracts else {
-        return Ok(Value::Null);
-    };
     let addr_str = p
         .get(0)
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("missing contract address"))?;
     let addr = parse_eth_address(addr_str)?;
-    let contract = match contracts
-        .get(&addr)
-        .map_err(|e| RpcError::internal(format!("contract read: {e}")))?
-    {
-        Some(c) => c,
-        None => return Ok(Value::Null),
-    };
-    Ok(encode_smart_contract(&contract))
-}
-
-/// `getContractInfo(address)` — `getContract` + runtime bytecode +
-/// code hash. Returned shape mirrors java-tron's
-/// `wallet.getContractInfo`, which adds `runtimecode` to the
-/// `getContract` body.
-pub fn get_contract_info(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let Some(contracts) = &s.contracts else {
-        return Ok(Value::Null);
-    };
-    let addr_str = p
-        .get(0)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcError::invalid_params("missing contract address"))?;
-    let addr = parse_eth_address(addr_str)?;
-    let contract = match contracts
-        .get(&addr)
-        .map_err(|e| RpcError::internal(format!("contract read: {e}")))?
-    {
-        Some(c) => c,
-        None => return Ok(Value::Null),
-    };
-    // Runtime code: look up by the SmartContract.code_hash. The Code
-    // store is keyed by 32-byte code_hash (keccak256 of bytecode).
-    let runtime_code = match &s.code {
-        Some(code) if contract.code_hash.len() == 32 => {
-            code.get(&contract.code_hash).ok().flatten().unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
-    let mut body = encode_smart_contract(&contract);
-    if let Value::Object(map) = &mut body {
-        map.insert(
-            "runtimecode".to_string(),
-            json!(hex_bytes(&runtime_code)),
-        );
-        map.insert("code_hash".to_string(), json!(hex_bytes(&contract.code_hash)));
+    match load_contract_with_abi(s, &addr)? {
+        Some(contract) => Ok(encode_smart_contract(&contract)),
+        None => Ok(Value::Null),
     }
-    Ok(json!({ "smart_contract": body }))
 }
 
+/// `getContractInfo(address)` — java-tron's `SmartContractDataWrapper`:
+/// `{smart_contract, runtimecode, contract_state}`. The runtime code is
+/// looked up by ADDRESS (java-tron `CodeStore` keying), and
+/// `contract_state` is the caught-up-for-display view of the dynamic-
+/// energy record (java runs `catchUpToCycle` on the served capsule
+/// without writing it back; a missing record serves
+/// `{update_cycle: currentCycleNumber}`).
+pub fn get_contract_info(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let addr_str = p
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("missing contract address"))?;
+    let addr = parse_eth_address(addr_str)?;
+    let Some(contract) = load_contract_with_abi(s, &addr)? else {
+        return Ok(Value::Null);
+    };
+    // java: a contract row without code yields runtimecode = "".
+    let runtime_code = match &s.code {
+        Some(code) => code.get(addr.as_bytes()).ok().flatten().unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let current_cycle = s.dyn_props.current_cycle_number();
+    let contract_state = match &s.eth_call_backends {
+        Some(b) => {
+            let cs = tron_chainbase::ContractStateStore::new(b.contract_state.clone());
+            let threshold = s.dyn_props.get_long(b"DYNAMIC_ENERGY_THRESHOLD").unwrap_or(0);
+            let increase = s
+                .dyn_props
+                .get_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR")
+                .unwrap_or(0);
+            let max_factor = s.dyn_props.get_long(b"DYNAMIC_ENERGY_MAX_FACTOR").unwrap_or(0);
+            cs.caught_up_view(&addr, current_cycle, threshold, increase, max_factor)
+                .map_err(|e| RpcError::internal(format!("contract state read: {e}")))?
+        }
+        None => tron_proto::ContractState {
+            update_cycle: current_cycle,
+            ..Default::default()
+        },
+    };
+    let mut csm = serde_json::Map::new();
+    if contract_state.energy_usage != 0 {
+        csm.insert("energy_usage".into(), json!(contract_state.energy_usage));
+    }
+    if contract_state.energy_factor != 0 {
+        csm.insert("energy_factor".into(), json!(contract_state.energy_factor));
+    }
+    if contract_state.update_cycle != 0 {
+        csm.insert("update_cycle".into(), json!(contract_state.update_cycle));
+    }
+
+    let mut m = serde_json::Map::new();
+    m.insert("smart_contract".into(), encode_smart_contract(&contract));
+    if !runtime_code.is_empty() {
+        m.insert("runtimecode".into(), json!(hex::encode(&runtime_code)));
+    }
+    m.insert("contract_state".into(), Value::Object(csm));
+    Ok(Value::Object(m))
+}
+
+/// java-tron JsonFormat rendering of a `SmartContract`: proto field
+/// names, bare hex for bytes, defaults omitted, ABI enums as value
+/// names ("Function", "View", …).
 fn encode_smart_contract(c: &tron_proto::SmartContract) -> Value {
-    json!({
-        "origin_address": hex_bytes(&c.origin_address),
-        "contract_address": hex_bytes(&c.contract_address),
-        "name": c.name,
-        "bytecode": hex_bytes(&c.bytecode),
-        "call_value": c.call_value,
-        "consume_user_resource_percent": c.consume_user_resource_percent,
-        "origin_energy_limit": c.origin_energy_limit,
-        "code_hash": hex_bytes(&c.code_hash),
-        "trx_hash": hex_bytes(&c.trx_hash),
-        "version": c.version,
-        // ABI: full entry list with inputs/outputs as proper objects
-        // (name + Solidity type string + indexed flag for events).
-        // Matches the shape returned by `wallet/getcontract` in
-        // java-tron's HTTP API.
-        "abi": c.abi.as_ref().map(|a| json!({
-            "entrys": a.entrys.iter().map(|e| json!({
-                "name": e.name,
-                "type": e.r#type,
-                "anonymous": e.anonymous,
-                "constant": e.constant,
-                "payable": e.payable,
-                "stateMutability": e.state_mutability,
-                "inputs": e.inputs.iter().map(|p| json!({
-                    "name": p.name,
-                    "type": p.r#type,
-                    "indexed": p.indexed,
-                })).collect::<Vec<_>>(),
-                "outputs": e.outputs.iter().map(|p| json!({
-                    "name": p.name,
-                    "type": p.r#type,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        })).unwrap_or(json!({"entrys": Vec::<Value>::new()})),
-    })
+    let mut m = serde_json::Map::new();
+    if !c.origin_address.is_empty() {
+        m.insert("origin_address".into(), json!(hex::encode(&c.origin_address)));
+    }
+    if !c.contract_address.is_empty() {
+        m.insert("contract_address".into(), json!(hex::encode(&c.contract_address)));
+    }
+    if let Some(a) = &c.abi {
+        m.insert("abi".into(), encode_abi(a));
+    }
+    if !c.bytecode.is_empty() {
+        m.insert("bytecode".into(), json!(hex::encode(&c.bytecode)));
+    }
+    if c.call_value != 0 {
+        m.insert("call_value".into(), json!(c.call_value));
+    }
+    if c.consume_user_resource_percent != 0 {
+        m.insert(
+            "consume_user_resource_percent".into(),
+            json!(c.consume_user_resource_percent),
+        );
+    }
+    if !c.name.is_empty() {
+        m.insert("name".into(), json!(c.name));
+    }
+    if c.origin_energy_limit != 0 {
+        m.insert("origin_energy_limit".into(), json!(c.origin_energy_limit));
+    }
+    if !c.code_hash.is_empty() {
+        m.insert("code_hash".into(), json!(hex::encode(&c.code_hash)));
+    }
+    if !c.trx_hash.is_empty() {
+        m.insert("trx_hash".into(), json!(hex::encode(&c.trx_hash)));
+    }
+    if c.version != 0 {
+        m.insert("version".into(), json!(c.version));
+    }
+    Value::Object(m)
+}
+
+/// ABI rendering — java JsonFormat omits unset/default fields per
+/// entry, so e.g. `balanceOf` renders as `{"outputs": [...], "constant":
+/// true, "name": "balanceOf", "inputs": [...], "type": "Function",
+/// "stateMutability": "View"}` with no `anonymous`/`payable` keys.
+fn encode_abi(abi: &tron_proto::smart_contract::Abi) -> Value {
+    if abi.entrys.is_empty() {
+        return json!({});
+    }
+    let entrys: Vec<Value> = abi
+        .entrys
+        .iter()
+        .map(|e| {
+            let mut em = serde_json::Map::new();
+            if e.anonymous {
+                em.insert("anonymous".into(), json!(true));
+            }
+            if e.constant {
+                em.insert("constant".into(), json!(true));
+            }
+            if !e.name.is_empty() {
+                em.insert("name".into(), json!(e.name));
+            }
+            if !e.inputs.is_empty() {
+                em.insert("inputs".into(), json!(encode_abi_params(&e.inputs)));
+            }
+            if !e.outputs.is_empty() {
+                em.insert("outputs".into(), json!(encode_abi_params(&e.outputs)));
+            }
+            if e.r#type != 0 {
+                let name = tron_proto::smart_contract::abi::entry::EntryType::try_from(e.r#type)
+                    .map(|t| t.as_str_name().to_string())
+                    .unwrap_or_else(|_| e.r#type.to_string());
+                em.insert("type".into(), json!(name));
+            }
+            if e.payable {
+                em.insert("payable".into(), json!(true));
+            }
+            if e.state_mutability != 0 {
+                let name = tron_proto::smart_contract::abi::entry::StateMutabilityType::try_from(
+                    e.state_mutability,
+                )
+                .map(|t| t.as_str_name().to_string())
+                .unwrap_or_else(|_| e.state_mutability.to_string());
+                em.insert("stateMutability".into(), json!(name));
+            }
+            Value::Object(em)
+        })
+        .collect();
+    json!({ "entrys": entrys })
+}
+
+fn encode_abi_params(params: &[tron_proto::smart_contract::abi::entry::Param]) -> Vec<Value> {
+    params
+        .iter()
+        .map(|p| {
+            let mut pm = serde_json::Map::new();
+            if p.indexed {
+                pm.insert("indexed".into(), json!(true));
+            }
+            if !p.name.is_empty() {
+                pm.insert("name".into(), json!(p.name));
+            }
+            if !p.r#type.is_empty() {
+                pm.insert("type".into(), json!(p.r#type));
+            }
+            Value::Object(pm)
+        })
+        .collect()
 }
 
 /// `getProposalById(id)` — single proposal lookup. java-tron returns
@@ -4443,14 +4846,36 @@ pub fn get_transaction_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError>
     let tx = match stored {
         tron_chainbase::StoredTransaction::Full(tx) => tx,
         tron_chainbase::StoredTransaction::BlockRef(num) => {
-            // Block-ref form only — clients usually want full bodies; surface
-            // a minimal `{txID, status, block_num}` so they know the tx
-            // exists but the body wasn't indexed.
-            return Ok(json!({
-                "txID": hex_bytes(&id),
-                "status": "block_ref_only",
-                "block_num": num,
-            }));
+            // Resolve the full body through the canonical block — one
+            // block read, exactly java-tron's lite-node lookup path.
+            let hydrated = s
+                .block_index
+                .get(num)
+                .ok()
+                .and_then(|block_id| s.blocks.get(&block_id).ok())
+                .and_then(|block| {
+                    block.transactions.into_iter().find(|tx| {
+                        tx.raw_data
+                            .as_ref()
+                            .map(|raw| {
+                                tron_crypto::hash::sha256(&raw.encode_to_vec()) == id
+                            })
+                            .unwrap_or(false)
+                    })
+                });
+            match hydrated {
+                Some(tx) => tx,
+                None => {
+                    // Ref exists but the body is gone (pruned block) —
+                    // surface the minimal shape so clients know the tx
+                    // exists.
+                    return Ok(json!({
+                        "txID": hex_bytes(&id),
+                        "status": "block_ref_only",
+                        "block_num": num,
+                    }));
+                }
+            }
         }
     };
 
@@ -6341,8 +6766,13 @@ mod account_encoding_tests {
         assert!(o.get("createTime").is_none(), "no eth-style camelCase keys");
         assert!(o.get("netUsage").is_none());
         assert!(o.get("votesCount").is_none());
-        // account_name rendered as text, like java-tron.
-        assert_eq!(o.get("account_name"), Some(&json!("Ant Investment Group")));
+        // account_name rendered as HEX bytes (java's proto3 JsonFormat with
+        // the default visible=false; the readable-text form is produced by
+        // the HTTP layer's visible=true rewrite).
+        assert_eq!(
+            o.get("account_name"),
+            Some(&json!(hex::encode("Ant Investment Group")))
+        );
         // frozenV2 is normalized to all 3 ResourceCodes in canonical order
         // (java-tron's Wallet.sortFrozenV2List), padding absent ones with 0:
         // BANDWIDTH:0 → {}, ENERGY:5000, TRON_POWER:0 → {"type":"TRON_POWER"}.

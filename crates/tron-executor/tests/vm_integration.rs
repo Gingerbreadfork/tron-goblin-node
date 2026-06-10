@@ -430,7 +430,9 @@ fn executing_block_bumps_total_missed_for_skipped_slots() {
     let producer = Address::from_raw(producer_bytes);
 
     // Build five distinct fake addresses for the active witness schedule.
-    // Indices 1 and 2 are what we expect to be debited.
+    // Indices 2 and 3 are what we expect to be debited (java's
+    // `DposSlot.getScheduledWitness(i)` = `active[(abSlot(head) + i) % N]`,
+    // so missed abs slots 2 and 3 map to indices 2 and 3).
     let mut active: Vec<Address> = (0..5_u8)
         .map(|i| {
             let mut a = [0u8; 21];
@@ -460,9 +462,11 @@ fn executing_block_bumps_total_missed_for_skipped_slots() {
         ).unwrap();
     }
 
-    // Genesis at t=0, prev block at t=3000ms (slot 1). This block lands
-    // at t=12000ms (slot 4). Slots 2 and 3 were missed → witnesses[1]
-    // and witnesses[2] should each gain a miss.
+    // Genesis at t=0, prev block at t=3000ms (abs slot 1). This block
+    // lands at t=12000ms (abs slot 4). Abs slots 2 and 3 were missed →
+    // the SRs scheduled at those slots, `active[2]` and `active[3]`
+    // (which is the producer — java DOES debit a producer that skipped
+    // its earlier slot), each gain a miss.
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     dp.save_genesis_block_timestamp(0);
     dp.save_latest_block_header_timestamp(3_000);
@@ -483,21 +487,22 @@ fn executing_block_bumps_total_missed_for_skipped_slots() {
 
     apply_unsigned(&state, &block, None).expect("execute");
 
-    // The producer (active[3]) should have total_produced = 1.
+    // The producer (active[3]) should have total_produced = 1 — and one
+    // miss: it was also the SR scheduled for skipped abs slot 3.
     let prod_row = ws.get(&producer).unwrap().unwrap();
     assert_eq!(prod_row.total_produced, 1);
-    assert_eq!(prod_row.total_missed, 0);
+    assert_eq!(prod_row.total_missed, 1, "abs slot 3 scheduled SR (index 3)");
 
-    // Witnesses at indices 1 and 2 should each have total_missed = 1.
-    let m1 = ws.get(&active[1]).unwrap().unwrap();
+    // The witness at index 2 takes the abs-slot-2 miss.
     let m2 = ws.get(&active[2]).unwrap().unwrap();
-    assert_eq!(m1.total_missed, 1, "slot 2 scheduled SR (index 1)");
-    assert_eq!(m2.total_missed, 1, "slot 3 scheduled SR (index 2)");
+    assert_eq!(m2.total_missed, 1, "abs slot 2 scheduled SR (index 2)");
 
     // No collateral damage on the others.
     let m0 = ws.get(&active[0]).unwrap().unwrap();
+    let m1 = ws.get(&active[1]).unwrap().unwrap();
     let m4 = ws.get(&active[4]).unwrap().unwrap();
     assert_eq!(m0.total_missed, 0);
+    assert_eq!(m1.total_missed, 0);
     assert_eq!(m4.total_missed, 0);
 }
 

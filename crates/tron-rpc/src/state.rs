@@ -58,6 +58,13 @@ pub struct RpcState {
     pub eth_call_backends: Option<EthCallBackends>,
     /// Per-tx receipts / logs index.
     pub tx_history: Option<Arc<TransactionHistoryStore>>,
+    /// Block-keyed receipts (`transactionRetStore`) — written at every
+    /// apply when `[index]` is enabled, and present in archive
+    /// snapshots. `gettransactioninfobyid` falls back to it (via the
+    /// tx's stored block ref) when the tx-id-keyed history store has
+    /// no entry, and `gettransactioninfobyblocknum` serves whole
+    /// blocks from it directly.
+    pub transaction_ret: Option<Arc<tron_chainbase::TransactionRetStore>>,
     /// Per-account id index — needed for `getAccountById`.
     pub account_id_index: Option<Arc<AccountIdIndexStore>>,
     /// Smart contract metadata store — needed for `getContract` /
@@ -90,6 +97,17 @@ pub struct RpcState {
     /// incoming transactions; otherwise both endpoints return an
     /// "unsupported" error.
     pub mempool: Option<Arc<dyn crate::mempool::Mempool>>,
+    /// Optional address-history index reader (the `/v1/accounts/...`
+    /// surface). Attached by the node runtime when `[index]` is
+    /// enabled; absent ⇒ the `/v1` endpoints answer with a clear
+    /// "index not enabled" error.
+    pub index: Option<tron_index::IndexReader>,
+    /// Optional historical-state archive (the `/v1/archive/...`
+    /// surface). Attached when `[index] capture_state_deltas` is on.
+    pub archive: Option<crate::index_api::ArchiveApiState>,
+    /// Optional firehose tail handle (the gRPC `tronfirehose.Firehose`
+    /// service). Attached when `[index.firehose]` is enabled.
+    pub firehose: Option<tron_index::FirehoseTailHandle>,
     pub chain_id: u64,
     /// `eth_call` / `eth_estimateGas` per-call gas cap. Defaults to
     /// 50M — the soft ceiling for heavy read-only calls (DEX
@@ -167,7 +185,11 @@ impl RpcState {
             nullifiers: None,
             exchanges_v2: None,
             eth_call_backends: None,
+            index: None,
+            archive: None,
+            firehose: None,
             tx_history: None,
+            transaction_ret: None,
             account_id_index: None,
             filters: crate::filters::FilterRegistry::new(),
             mempool: None,
@@ -202,6 +224,34 @@ impl RpcState {
 
     pub fn with_tx_history(mut self, tx_history: Arc<dyn KvBackend>) -> Self {
         self.tx_history = Some(Arc::new(TransactionHistoryStore::new(tx_history)));
+        self
+    }
+
+    /// Attach the block-keyed `transactionRetStore` (receipt fallback
+    /// for the txinfo RPCs).
+    pub fn with_transaction_ret(mut self, backend: Arc<dyn KvBackend>) -> Self {
+        self.transaction_ret = Some(Arc::new(tron_chainbase::TransactionRetStore::new(backend)));
+        self
+    }
+
+    /// Attach the address-history index reader, enabling the
+    /// TronGrid-style `/v1/accounts/{address}/transactions` surface.
+    pub fn with_index(mut self, reader: tron_index::IndexReader) -> Self {
+        self.index = Some(reader);
+        self
+    }
+
+    /// Attach the historical-state archive, enabling the
+    /// `/v1/archive/...` at-height read surface.
+    pub fn with_archive(mut self, archive: crate::index_api::ArchiveApiState) -> Self {
+        self.archive = Some(archive);
+        self
+    }
+
+    /// Attach the firehose tail handle, enabling the gRPC
+    /// server-stream sink surface.
+    pub fn with_firehose(mut self, handle: tron_index::FirehoseTailHandle) -> Self {
+        self.firehose = Some(handle);
         self
     }
 

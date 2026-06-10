@@ -27,8 +27,9 @@ pub const REWARD_VI_DECIMAL: i128 = 1_000_000_000_000_000_000;
 /// `CURRENT_CYCLE_NUMBER` key in DynamicPropertiesStore.
 pub const CURRENT_CYCLE_NUMBER_KEY: &[u8] = b"CURRENT_CYCLE_NUMBER";
 
-/// `ALLOW_CHANGE_DELEGATION` key in DynamicPropertiesStore.
-pub const ALLOW_CHANGE_DELEGATION_KEY: &[u8] = b"ALLOW_CHANGE_DELEGATION";
+/// Change-delegation flag key. java's on-disk key is `CHANGE_DELEGATION`
+/// (no `ALLOW_` prefix — a java naming quirk; see the chainbase keys doc).
+pub const ALLOW_CHANGE_DELEGATION_KEY: &[u8] = b"CHANGE_DELEGATION";
 
 // =============================================================================
 // Per-block + per-maintenance reward distribution
@@ -391,7 +392,7 @@ pub fn withdraw_reward(
 ) -> Result<i64, StoreError> {
     use tron_proto::Account;
 
-    if dyn_props.get_long(b"ALLOW_CHANGE_DELEGATION").unwrap_or(0) == 0 {
+    if dyn_props.get_long(ALLOW_CHANGE_DELEGATION_KEY).unwrap_or(0) == 0 {
         return Ok(0);
     }
     let Some(mut account) = accounts.get(address)? else {

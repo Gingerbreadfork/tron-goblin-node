@@ -4,7 +4,7 @@
 //! Source: `FreezeBalanceV2Actuator`, `UnfreezeBalanceV2Actuator`,
 //! `WithdrawExpireUnfreezeActuator`, `CancelAllUnfreezeV2Actuator`.
 
-use tron_chainbase::{AccountStore, DynamicPropertiesStore};
+use tron_chainbase::{AccountStore, DelegationStore, DynamicPropertiesStore, VotesStore};
 use tron_proto::account::{FreezeV2, UnFreezeV2};
 use tron_proto::{
     Account, CancelAllUnfreezeV2Contract, FreezeBalanceV2Contract, UnfreezeBalanceV2Contract,
@@ -185,7 +185,18 @@ pub fn validate_unfreeze_balance_v2(
     if contract.unfreeze_balance <= 0 || contract.unfreeze_balance > frozen {
         return Err(ActuatorError::UnfreezeExceedsFrozen);
     }
-    if account.unfrozen_v2.len() >= UNFREEZE_MAX_TIMES {
+    // java counts only UNEXPIRED entries against the cap
+    // (`AccountCapsule.getUnfreezingV2Count(now)`): expired ones are
+    // swept into balance by the execute below, so they don't occupy a
+    // slot. Counting the raw list length rejected unstakes java accepts
+    // whenever expired entries were still awaiting their sweep.
+    let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+    let unfreezing = account
+        .unfrozen_v2
+        .iter()
+        .filter(|u| u.unfreeze_expire_time > now)
+        .count();
+    if unfreezing >= UNFREEZE_MAX_TIMES {
         return Err(ActuatorError::TooManyUnfreezes {
             max: UNFREEZE_MAX_TIMES,
         });
@@ -196,12 +207,41 @@ pub fn validate_unfreeze_balance_v2(
 pub fn execute_unfreeze_balance_v2(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    votes_store: &VotesStore,
+    delegation: &DelegationStore,
     contract: &UnfreezeBalanceV2Contract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
+
+    // java-tron settles pending voter rewards FIRST
+    // (`mortgageService.withdrawReward` at the top of
+    // `UnfreezeBalanceV2Actuator.execute`) — before the stake, and
+    // therefore the vote list below, changes.
+    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props)?;
+
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
+    let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+
+    // Sweep EXPIRED unfreeze entries into balance (java's
+    // `unfreezeExpire`, run on every v2 unstake before the new entry is
+    // added). Skipping this left expired entries parked in `unfrozen_v2`
+    // until an explicit WithdrawExpireUnfreeze — diverging both the
+    // balance and the unfrozen list from java for accounts that unstake
+    // repeatedly. (java records the swept amount in the tx receipt's
+    // `withdraw_expire_amount`; `ExecutionResult` doesn't carry receipt
+    // fields yet — state effects are identical.)
+    let mut swept = 0i64;
+    account.unfrozen_v2.retain(|u| {
+        if u.unfreeze_expire_time <= now {
+            swept = swept.saturating_add(u.unfreeze_amount);
+            false
+        } else {
+            true
+        }
+    });
+    account.balance = check_add(account.balance, swept)?;
 
     // Capture the old weight basis BEFORE deducting — java-tron's
     // `getFrozenV2BalanceWithDelegated(resource)` (held + delegated-out).
@@ -215,14 +255,12 @@ pub fn execute_unfreeze_balance_v2(
     {
         slot.amount = check_sub(slot.amount, contract.unfreeze_balance)?;
     }
-    let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let withdraw_expire = now + unfreeze_delay_ms(dyn_props);
     account.unfrozen_v2.push(UnFreezeV2 {
         r#type: contract.resource,
         unfreeze_amount: contract.unfreeze_balance,
         unfreeze_expire_time: withdraw_expire,
     });
-    accounts.put(&owner, &account)?;
 
     // Shrink chain-wide weight by the freed amount. Java-tron:
     //   oldWeight = getFrozenV2BalanceWithDelegated(res) / TRX_PRECISION
@@ -231,6 +269,16 @@ pub fn execute_unfreeze_balance_v2(
     let new_basis = old_basis.saturating_sub(contract.unfreeze_balance);
     let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
     apply_weight_delta(dyn_props, contract.resource, weight_delta);
+
+    // Trim votes the unstake no longer backs — java's `updateVote`
+    // (proportional reduction when remaining TRON Power < voted total;
+    // shared with the TVM unstake opcode, see `tron_tvm::votes`).
+    // Without this, witness `vote_count`s stayed inflated after every
+    // unstake-below-votes — java's count dropped at the next
+    // maintenance, ours didn't.
+    tron_tvm::votes::update_vote_after_unstake(votes_store, &owner, &mut account)?;
+
+    accounts.put(&owner, &account)?;
     Ok(ExecutionResult::default())
 }
 

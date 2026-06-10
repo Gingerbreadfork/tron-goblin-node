@@ -64,7 +64,17 @@ pub mod keys {
     pub const WITNESS_127_PAY_PER_BLOCK: &[u8] = b"WITNESS_127_PAY_PER_BLOCK";
     pub const WITNESS_STANDBY_ALLOWANCE: &[u8] = b"WITNESS_STANDBY_ALLOWANCE";
     pub const CURRENT_CYCLE_NUMBER: &[u8] = b"CURRENT_CYCLE_NUMBER";
-    pub const ALLOW_CHANGE_DELEGATION: &[u8] = b"ALLOW_CHANGE_DELEGATION";
+    /// **Quirk**: java-tron's on-disk key for the change-delegation flag
+    /// is `CHANGE_DELEGATION` — no `ALLOW_` prefix, unlike every sibling
+    /// flag (`DynamicPropertiesStore.CHANGE_DELEGATION`). Reading
+    /// `ALLOW_CHANGE_DELEGATION` (the previous value here) found NOTHING
+    /// in a java-imported DB, so `allow_change_delegation()` was false on
+    /// live mainnet state — silently routing maintenance into the legacy
+    /// pre-Vi reward path: no Vi accumulation, no cycle advance, no
+    /// brokerage/vote snapshots, and `withdraw_reward`/`query_reward`
+    /// no-oping. The Rust-side name keeps the `ALLOW_` prefix for
+    /// consistency with the accessor; only the BYTES follow java.
+    pub const ALLOW_CHANGE_DELEGATION: &[u8] = b"CHANGE_DELEGATION";
     pub const TOTAL_SHIELDED_POOL_VALUE: &[u8] = b"TOTAL_SHIELDED_POOL_VALUE";
     /// Genesis block timestamp (millis). Saved once at genesis init so
     /// runtime slot-attribution (`total_missed`) can compute absolute
@@ -116,11 +126,28 @@ pub mod keys {
     pub const ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER: &[u8] = b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER";
     pub const ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO: &[u8] = b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO";
 
+    /// Flat fee charged when a transaction carries more than one
+    /// signature (java-tron `Manager.consumeMultiSignFee`).
+    pub const MULTI_SIGN_FEE: &[u8] = b"MULTI_SIGN_FEE";
+    /// Flat fee charged when `raw_data.data` (the memo) is non-empty
+    /// (java-tron `Manager.consumeMemoFee`; 0 until the SR proposal
+    /// sets it).
+    pub const MEMO_FEE: &[u8] = b"MEMO_FEE";
+    /// java-tron `CONSENSUS_LOGIC_OPTIMIZATION` — gates several "v2"
+    /// consensus behaviors (strict-math, witness sort, the in-block
+    /// max-create-account-tx-size check).
+    pub const CONSENSUS_LOGIC_OPTIMIZATION: &[u8] = b"CONSENSUS_LOGIC_OPTIMIZATION";
+
     // --- Fee accounting -----------------------------------------------
     pub const TOTAL_TRANSACTION_COST: &[u8] = b"TOTAL_TRANSACTION_COST";
     pub const TOTAL_CREATE_ACCOUNT_COST: &[u8] = b"TOTAL_CREATE_ACCOUNT_COST";
     pub const BURN_TRX_AMOUNT: &[u8] = b"BURN_TRX_AMOUNT";
     pub const TRANSACTION_FEE_POOL: &[u8] = b"TRANSACTION_FEE_POOL";
+    pub const ALLOW_TRANSACTION_FEE_POOL: &[u8] = b"ALLOW_TRANSACTION_FEE_POOL";
+    /// Comma-joined `unix_ms:price` schedule of every historic price, e.g.
+    /// `0:100,1542607200000:20,…`. Appended by price-change proposals.
+    pub const ENERGY_PRICE_HISTORY: &[u8] = b"ENERGY_PRICE_HISTORY";
+    pub const BANDWIDTH_PRICE_HISTORY: &[u8] = b"BANDWIDTH_PRICE_HISTORY";
     pub const MAX_CREATE_ACCOUNT_TX_SIZE: &[u8] = b"MAX_CREATE_ACCOUNT_TX_SIZE";
 
     /// **Quirk**: java-tron stores this key with a single leading space —
@@ -295,6 +322,24 @@ impl DynamicPropertiesStore {
     }
     pub fn save_genesis_block_timestamp(&self, t: i64) {
         self.put_long(keys::GENESIS_BLOCK_TIMESTAMP, t);
+    }
+
+    /// `state_flag`: `1` iff the LATEST applied block crossed a
+    /// maintenance boundary (java's `saveStateFlag`, written by
+    /// `MaintenanceManager.applyBlock` on every block). Read by the
+    /// next block's slot math — `DposSlot.getTime` adds
+    /// `MAINTENANCE_SKIP_SLOTS` (2) to the expected slot when the head
+    /// block was a maintenance block, so the production pause around
+    /// maintenance is not attributed to SRs as missed slots.
+    pub fn state_flag(&self) -> i64 {
+        self.get_long(keys::STATE_FLAG).unwrap_or(0)
+    }
+    pub fn save_state_flag(&self, flag: i64) {
+        // java writes this key as a 4-byte big-endian int
+        // (`ByteArray.fromInt`); match the on-disk byte format so
+        // state-diff tooling sees identical bytes. Our permissive
+        // reader handles either width.
+        self.write_or_panic(keys::STATE_FLAG, &(flag as i32).to_be_bytes());
     }
 
     pub fn latest_block_header_hash(&self) -> Result<Option<[u8; 32]>, StoreError> {
@@ -616,6 +661,29 @@ impl DynamicPropertiesStore {
         self.allow_blackhole_optimization() == 1
     }
 
+    /// java-tron `supportVM()` = `getAllowCreationOfContracts() == 1`.
+    /// Gates the VM byte-accounting branch in the bandwidth processor
+    /// (clear-ret size + `MAX_RESULT_SIZE_IN_TX` padding).
+    pub fn support_vm(&self) -> bool {
+        self.get_long(keys::ALLOW_CREATION_OF_CONTRACTS) == Some(1)
+    }
+
+    /// java-tron `getMultiSignFee()` — initialized to 1 TRX at genesis.
+    pub fn multi_sign_fee(&self) -> i64 {
+        self.get_long(keys::MULTI_SIGN_FEE).unwrap_or(1_000_000)
+    }
+
+    /// java-tron `getMemoFee()` — initialized from node config (0 by
+    /// default); set on mainnet by SR proposal #68.
+    pub fn memo_fee(&self) -> i64 {
+        self.get_long(keys::MEMO_FEE).unwrap_or(0)
+    }
+
+    /// java-tron `allowConsensusLogicOptimization()`.
+    pub fn allow_consensus_logic_optimization(&self) -> bool {
+        self.get_long(keys::CONSENSUS_LOGIC_OPTIMIZATION) == Some(1)
+    }
+
     /// `getUnfreezeDelayDays()` — java-tron returns 0 when unset; the
     /// fork-gate is `> 0`.
     pub fn unfreeze_delay_days(&self) -> i64 {
@@ -654,15 +722,49 @@ impl DynamicPropertiesStore {
         (ts - genesis) / BLOCK_PRODUCED_INTERVAL_MS
     }
 
-    /// `TRANSACTION_FEE_POOL` accumulator: when on, bandwidth fees flow
-    /// here instead of being burned.
+    /// java's `supportTransactionFeePool()`: the `ALLOW_TRANSACTION_FEE_POOL`
+    /// proposal flag is `1`. When on, tx fees flow into the
+    /// `TRANSACTION_FEE_POOL` accumulator instead of being burned.
+    ///
+    /// Mainnet has NEVER activated this flag (it is 0), but every mainnet
+    /// database contains the `TRANSACTION_FEE_POOL` balance key — so the
+    /// previous check (`key exists`) was always-true on imported state and
+    /// silently routed EVERY bandwidth/energy fee into the pool key while
+    /// java burned them: `BURN_TRX_AMOUNT` froze at its snapshot value
+    /// (~4.6M TRX/day of missed burn accounting) and the pool key grew a
+    /// value java doesn't have. Balances were unaffected (the fee left the
+    /// payer either way).
     pub fn support_transaction_fee_pool(&self) -> bool {
-        self.get_long(keys::TRANSACTION_FEE_POOL).is_some()
+        self.get_long(keys::ALLOW_TRANSACTION_FEE_POOL).unwrap_or(0) == 1
     }
 
     pub fn add_transaction_fee_pool(&self, amount: i64) {
         let cur = self.get_long(keys::TRANSACTION_FEE_POOL).unwrap_or(0);
         self.put_long(keys::TRANSACTION_FEE_POOL, cur.wrapping_add(amount));
+    }
+
+    /// Historic energy-price schedule (`unix_ms:price` pairs, comma-joined).
+    /// java's `getEnergyPriceHistory` — falls back to the
+    /// `DEFAULT_ENERGY_PRICE_HISTORY` ("0:100") when the key is absent.
+    pub fn energy_price_history(&self) -> String {
+        self.get_bytes(keys::ENERGY_PRICE_HISTORY)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| "0:100".to_string())
+    }
+    pub fn save_energy_price_history(&self, history: &str) {
+        self.write_or_panic(keys::ENERGY_PRICE_HISTORY, history.as_bytes());
+    }
+
+    /// Historic bandwidth-price schedule. java's
+    /// `getBandwidthPriceHistory` — default "0:10"
+    /// (`DEFAULT_TRANSACTION_FEE`).
+    pub fn bandwidth_price_history(&self) -> String {
+        self.get_bytes(keys::BANDWIDTH_PRICE_HISTORY)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| "0:10".to_string())
+    }
+    pub fn save_bandwidth_price_history(&self, history: &str) {
+        self.write_or_panic(keys::BANDWIDTH_PRICE_HISTORY, history.as_bytes());
     }
 
     /// Current `TRANSACTION_FEE_POOL` balance (0 when the key is absent).

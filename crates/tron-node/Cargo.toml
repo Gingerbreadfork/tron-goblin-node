@@ -18,6 +18,7 @@ tron-rpc = { path = "../tron-rpc" }
 tron-grpc = { path = "../tron-grpc" }
 tron-mempool = { path = "../tron-mempool" }
 tron-eventer = { path = "../tron-eventer" }
+tron-index = { path = "../tron-index" }
 tron-net = { path = "../tron-net" }
 tron-tvm = { path = "../tron-tvm" }
 tron-replay = { path = "../tron-replay" }

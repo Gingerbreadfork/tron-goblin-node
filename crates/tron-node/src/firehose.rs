@@ -1,0 +1,578 @@
+//! The firehose writer — appends one durable log entry per applied
+//! block for external sinks (P3).
+//!
+//! Entries are **store-derivable by construction**: an `APPLY` entry
+//! is a pure function of `(block, TransactionRet)`, both of which the
+//! node persists — so any gap between the log and the chain (crash
+//! tail, node ran with the firehose off) is repaired by re-deriving
+//! the missing entries from `BlockStore` + `TransactionRetStore`.
+//! Chain unwinds (reorgs, or the log being *ahead* of consensus after
+//! a power loss) become explicit `UNWIND` entries; consumers must
+//! handle them anyway, so crash recovery and reorgs share one
+//! protocol. This is why the log needs **no** CheckPointV2 cursor
+//! binding: it can neither lose blocks (store repair) nor claim a
+//! block that didn't commit (startup unwind), and external consumers
+//! get exactly-once semantics by persisting their cursor
+//! transactionally with their own writes (see `working/FIREHOSE.md`).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use prost::Message as _;
+use tron_chainbase::{
+    BlockIndexStore, BlockStore, DynamicPropertiesStore, KvBackend, StoreError,
+    TransactionRetStore,
+};
+use tron_grpc::firehose_proto as fh;
+use tron_index::{FirehoseLogWriter, FirehoseTailHandle, IndexError};
+use tron_proto::{Block, TransactionRet};
+use tron_types::BlockId;
+
+/// Blocks between WAL fsyncs while catching up; recent (near-tip)
+/// blocks fsync every entry — at one block per ~3s that is cheap, and
+/// it minimizes the repair window for live consumers.
+const SYNC_EVERY: u32 = 16;
+const RECENT_MS: i64 = 5 * 60 * 1000;
+
+#[derive(Debug, Default)]
+pub struct FirehoseCounters {
+    pub entries: AtomicU64,
+    pub unwinds: AtomicU64,
+    pub gap_repaired_blocks: AtomicU64,
+}
+
+pub struct FirehoseWriter {
+    inner: Mutex<Inner>,
+    blocks: Arc<dyn KvBackend>,
+    block_index: Arc<dyn KvBackend>,
+    txret: Arc<dyn KvBackend>,
+    dyn_props: Arc<dyn KvBackend>,
+    counters: Arc<FirehoseCounters>,
+}
+
+struct Inner {
+    log: FirehoseLogWriter,
+    /// Height of the newest entry (`-1` = empty log).
+    head_height: i64,
+    blocks_since_sync: u32,
+}
+
+impl FirehoseWriter {
+    /// Open the log under `dir` and reconcile it against consensus:
+    /// a log *ahead* of the recovered chain head gets an immediate
+    /// `UNWIND` so consumers can never hold blocks the chain lost.
+    pub fn open(
+        dir: impl Into<std::path::PathBuf>,
+        retain_bytes: u64,
+        blocks: Arc<dyn KvBackend>,
+        block_index: Arc<dyn KvBackend>,
+        txret: Arc<dyn KvBackend>,
+        dyn_props: Arc<dyn KvBackend>,
+    ) -> Result<Self, IndexError> {
+        let mut log = FirehoseLogWriter::open(dir, retain_bytes)?;
+        let mut head_height = match log.reader().head()? {
+            Some((_, payload)) => match fh::Entry::decode(payload.as_slice()) {
+                Ok(e) => match e.event {
+                    Some(fh::entry::Event::Apply(a)) => a.height,
+                    Some(fh::entry::Event::Unwind(u)) => u.to_height,
+                    None => -1,
+                },
+                Err(e) => {
+                    return Err(IndexError::Corrupt(format!(
+                        "firehose head entry undecodable: {e}"
+                    )))
+                }
+            },
+            None => -1,
+        };
+        let consensus_head = DynamicPropertiesStore::new(dyn_props.clone())
+            .latest_block_header_number()
+            .unwrap_or(0);
+        let counters = Arc::new(FirehoseCounters::default());
+        if head_height > consensus_head {
+            tracing::warn!(
+                log_head = head_height,
+                consensus_head,
+                "firehose: log is ahead of recovered consensus state — emitting UNWIND \
+                 (power loss rolled the chain back; re-applied blocks will follow)"
+            );
+            let seq = log.next_seq();
+            let entry = fh::Entry {
+                seq,
+                event: Some(fh::entry::Event::Unwind(fh::Unwind { to_height: consensus_head })),
+            };
+            log.append(&entry.encode_to_vec())?;
+            log.sync()?;
+            counters.unwinds.fetch_add(1, Ordering::Relaxed);
+            head_height = consensus_head;
+        }
+        tracing::info!(head_height, consensus_head, "firehose: log open");
+        Ok(Self {
+            inner: Mutex::new(Inner { log, head_height, blocks_since_sync: 0 }),
+            blocks,
+            block_index,
+            txret,
+            dyn_props,
+            counters,
+        })
+    }
+
+    pub fn counters(&self) -> Arc<FirehoseCounters> {
+        self.counters.clone()
+    }
+
+    pub fn tail_handle(&self) -> FirehoseTailHandle {
+        self.inner.lock().expect("firehose poisoned").log.tail_handle()
+    }
+
+    /// Append entries for one applied block: an `UNWIND` first when
+    /// this is a reorg re-apply, store-derived repair entries first
+    /// when the log missed blocks. Never fails the apply (caller logs
+    /// errors).
+    pub fn on_block_applied(
+        &self,
+        block: &Block,
+        block_id: &BlockId,
+        ret: &TransactionRet,
+    ) -> Result<(), IndexError> {
+        let mut inner = self.inner.lock().expect("firehose poisoned");
+        let h = block_id.num() as i64;
+        let solidified = DynamicPropertiesStore::new(self.dyn_props.clone())
+            .latest_solidified_block_num()
+            .unwrap_or(0);
+
+        if inner.head_height >= 0 {
+            if h <= inner.head_height {
+                // Reorg re-apply: consumers drop everything above the
+                // common ancestor, then re-consume.
+                self.append(
+                    &mut inner,
+                    fh::entry::Event::Unwind(fh::Unwind { to_height: h - 1 }),
+                )?;
+                self.counters.unwinds.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(to_height = h - 1, "firehose: reorg unwind appended");
+            } else if h > inner.head_height + 1 {
+                // The log missed blocks (firehose was off / crash tail
+                // truncated): re-derive them from the stores.
+                let from = inner.head_height + 1;
+                for g in from..h {
+                    match self.derive_from_stores(g, solidified)? {
+                        Some(event) => {
+                            self.append(&mut inner, event)?;
+                            self.counters.gap_repaired_blocks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => {
+                            // Canonical block below head missing from the
+                            // stores — store-level inconsistency. Surface
+                            // loudly; the height jump is the consumer's
+                            // fault signal.
+                            tracing::error!(
+                                height = g,
+                                "firehose: cannot repair gap (canonical block missing); \
+                                 consumers will observe a height jump"
+                            );
+                        }
+                    }
+                }
+                if h > from {
+                    tracing::warn!(from, to = h - 1, "firehose: repaired log gap from stores");
+                }
+            }
+        }
+
+        let event = fh::entry::Event::Apply(build_apply(h, block, Some(ret), solidified));
+        self.append(&mut inner, event)?;
+        self.counters.entries.fetch_add(1, Ordering::Relaxed);
+        inner.head_height = h;
+
+        // Durability: every entry near the tip, batched during
+        // catch-up. Lost (un-fsynced) tails self-repair from the
+        // stores on the next append.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let block_ts = block
+            .block_header
+            .as_ref()
+            .and_then(|hd| hd.raw_data.as_ref())
+            .map(|r| r.timestamp)
+            .unwrap_or(0);
+        inner.blocks_since_sync += 1;
+        if now_ms.saturating_sub(block_ts) < RECENT_MS || inner.blocks_since_sync >= SYNC_EVERY {
+            inner.log.sync()?;
+            inner.blocks_since_sync = 0;
+        }
+        Ok(())
+    }
+
+    fn append(&self, inner: &mut Inner, event: fh::entry::Event) -> Result<u64, IndexError> {
+        let seq = inner.log.next_seq();
+        let entry = fh::Entry { seq, event: Some(event) };
+        inner.log.append(&entry.encode_to_vec())
+    }
+
+    /// Re-derive one canonical block's APPLY event from the stores —
+    /// the same `(block, txinfo)` inputs the live path uses, so
+    /// repaired entries are byte-equivalent to what would have been
+    /// written live (modulo the solidified watermark, which is "as of
+    /// now").
+    fn derive_from_stores(
+        &self,
+        height: i64,
+        solidified: i64,
+    ) -> Result<Option<fh::entry::Event>, IndexError> {
+        let id = match BlockIndexStore::new(self.block_index.clone()).get(height) {
+            Ok(id) => id,
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let block = match BlockStore::new(self.blocks.clone()).get(&id) {
+            Ok(b) => b,
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let ret = TransactionRetStore::new(self.txret.clone()).get(height)?;
+        Ok(Some(fh::entry::Event::Apply(build_apply(
+            height,
+            &block,
+            ret.as_ref(),
+            solidified,
+        ))))
+    }
+}
+
+/// Build a `BlockApplied` event from committed inputs. Pure —
+/// unit-tested directly; identical for the live and repair paths.
+pub fn build_apply(
+    height: i64,
+    block: &Block,
+    ret: Option<&TransactionRet>,
+    solidified: i64,
+) -> fh::BlockApplied {
+    let raw = block.block_header.as_ref().and_then(|h| h.raw_data.as_ref());
+    let block_id = tron_types::block_id_from_block(block)
+        .map(|id| id.as_bytes().to_vec())
+        .unwrap_or_default();
+
+    // transaction-info matched through the SAME rulebook the index
+    // extractor uses (32-byte id match, positional fallback only for
+    // id-less infos) — a private fork here had already drifted and
+    // would have made firehose entries disagree with index rows over
+    // identical blocks.
+    let matcher = tron_index::TxInfoMatcher::new(ret);
+
+    let txs = block
+        .transactions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, tx)| {
+            let raw_tx = tx.raw_data.as_ref()?;
+            let tx_id = tron_crypto::hash::sha256(&raw_tx.encode_to_vec());
+            let facts = tron_index::tx_facts(tx, &tx_id);
+            let info = matcher.for_tx(&tx_id, i);
+            let success = tx
+                .ret
+                .first()
+                .map(|r| {
+                    r.contract_ret
+                        == tron_proto::transaction::result::ContractResult::Success as i32
+                })
+                .unwrap_or(false);
+            Some(fh::Tx {
+                txid: tx_id.to_vec(),
+                contract_type: facts.as_ref().map(|f| f.contract_type).unwrap_or(0),
+                success,
+                from: facts.as_ref().map(|f| f.from.clone()).unwrap_or_default(),
+                to: facts.as_ref().and_then(|f| f.to.clone()).unwrap_or_default(),
+                amount: facts.as_ref().map(|f| f.amount).unwrap_or(0),
+                asset: facts.as_ref().and_then(|f| f.asset.clone()).unwrap_or_default(),
+                vm_contract: info.map(|i| i.contract_address.clone()).unwrap_or_default(),
+                logs: info
+                    .map(|i| {
+                        i.log
+                            .iter()
+                            .map(|l| fh::Log {
+                                address: l.address.clone(),
+                                topics: l.topics.clone(),
+                                data: l.data.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                internal_txs: info
+                    .map(|i| {
+                        i.internal_transactions
+                            .iter()
+                            .map(|itx| fh::InternalTx {
+                                caller: itx.caller_address.clone(),
+                                transfer_to: itx.transfer_to_address.clone(),
+                                call_value: itx
+                                    .call_value_info
+                                    .iter()
+                                    .find(|cv| cv.token_id.is_empty())
+                                    .map(|cv| cv.call_value)
+                                    .unwrap_or(0),
+                                token_id: itx
+                                    .call_value_info
+                                    .iter()
+                                    .find(|cv| !cv.token_id.is_empty())
+                                    .map(|cv| cv.token_id.clone())
+                                    .unwrap_or_default(),
+                                rejected: itx.rejected,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    fh::BlockApplied {
+        height,
+        block_id,
+        parent_id: raw.map(|r| r.parent_hash.clone()).unwrap_or_default(),
+        timestamp_ms: raw.map(|r| r.timestamp).unwrap_or(0),
+        witness: raw.map(|r| r.witness_address.clone()).unwrap_or_default(),
+        solidified_height: solidified,
+        txinfo_missing: ret.is_none() && !block.transactions.is_empty(),
+        txs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tron_chainbase::MemBackend;
+
+    fn mem() -> Arc<dyn KvBackend> {
+        Arc::new(MemBackend::new())
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "tron-fh-writer-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Test rig mirroring what the hook + stores provide: applying a
+    /// block writes it to the consensus stores (canonical) and bumps
+    /// the head, exactly what `accept_block` guarantees before the
+    /// hook fires.
+    struct Rig {
+        blocks: Arc<dyn KvBackend>,
+        block_index: Arc<dyn KvBackend>,
+        txret: Arc<dyn KvBackend>,
+        dyn_props: Arc<dyn KvBackend>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            Self {
+                blocks: mem(),
+                block_index: mem(),
+                txret: mem(),
+                dyn_props: mem(),
+                dir: tmp_dir(tag),
+            }
+        }
+
+        fn open(&self) -> FirehoseWriter {
+            FirehoseWriter::open(
+                &self.dir,
+                u64::MAX,
+                self.blocks.clone(),
+                self.block_index.clone(),
+                self.txret.clone(),
+                self.dyn_props.clone(),
+            )
+            .unwrap()
+        }
+
+        fn make_block(&self, height: i64, fork: u8) -> (Block, BlockId, TransactionRet) {
+            let c = tron_proto::TransferContract {
+                owner_address: vec![0x41; 21],
+                to_address: vec![0x42; 21],
+                amount: height * 10,
+            };
+            let tx = tron_proto::Transaction {
+                raw_data: Some(tron_proto::transaction::Raw {
+                    contract: vec![tron_proto::transaction::Contract {
+                        r#type:
+                            tron_proto::transaction::contract::ContractType::TransferContract
+                                as i32,
+                        parameter: Some(prost_types::Any {
+                            type_url: String::new(),
+                            value: c.encode_to_vec(),
+                        }),
+                        ..Default::default()
+                    }],
+                    data: vec![height as u8, fork],
+                    ..Default::default()
+                }),
+                ret: vec![tron_proto::transaction::Result {
+                    contract_ret:
+                        tron_proto::transaction::result::ContractResult::Success as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let tx_id =
+                tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
+            let block = Block {
+                transactions: vec![tx],
+                block_header: Some(tron_proto::BlockHeader {
+                    raw_data: Some(tron_proto::block_header::Raw {
+                        number: height,
+                        timestamp: 1_700_000_000_000 + height * 3000,
+                        witness_address: vec![fork; 21],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            };
+            let id = tron_types::block_id_from_block(&block).unwrap();
+            let ret = TransactionRet {
+                block_number: height,
+                block_time_stamp: 1_700_000_000_000 + height * 3000,
+                transactioninfo: vec![tron_proto::TransactionInfo {
+                    id: tx_id.to_vec(),
+                    block_number: height,
+                    ..Default::default()
+                }],
+            };
+            (block, id, ret)
+        }
+
+        /// Persist a block to the stores + advance the head — what the
+        /// node has already done by the time the hook fires.
+        fn persist(&self, block: &Block, id: &BlockId, ret: &TransactionRet) {
+            BlockStore::new(self.blocks.clone()).put(id, block).unwrap();
+            BlockIndexStore::new(self.block_index.clone()).put(id).unwrap();
+            TransactionRetStore::new(self.txret.clone())
+                .put(id.num() as i64, ret)
+                .unwrap();
+            let dp = DynamicPropertiesStore::new(self.dyn_props.clone());
+            if dp.latest_block_header_number().unwrap_or(0) < id.num() as i64 {
+                dp.save_latest_block_header_number(id.num() as i64);
+            }
+        }
+
+        fn apply(&self, w: &FirehoseWriter, height: i64) {
+            let (block, id, ret) = self.make_block(height, 0);
+            self.persist(&block, &id, &ret);
+            w.on_block_applied(&block, &id, &ret).unwrap();
+        }
+
+        fn entries(&self) -> Vec<fh::Entry> {
+            tron_index::FirehoseLogReader::new(self.dir.clone())
+                .read_from(1, 1000)
+                .unwrap()
+                .into_iter()
+                .map(|(_, p)| fh::Entry::decode(p.as_slice()).unwrap())
+                .collect()
+        }
+    }
+
+    fn heights(entries: &[fh::Entry]) -> Vec<(char, i64)> {
+        entries
+            .iter()
+            .map(|e| match &e.event {
+                Some(fh::entry::Event::Apply(a)) => ('A', a.height),
+                Some(fh::entry::Event::Unwind(u)) => ('U', u.to_height),
+                None => ('?', 0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn applies_carry_decoded_tx_facts() {
+        let rig = Rig::new("facts");
+        let w = rig.open();
+        rig.apply(&w, 1);
+        rig.apply(&w, 2);
+        let entries = rig.entries();
+        assert_eq!(heights(&entries), vec![('A', 1), ('A', 2)]);
+        let Some(fh::entry::Event::Apply(a)) = &entries[1].event else { panic!() };
+        assert_eq!(a.txs.len(), 1);
+        let tx = &a.txs[0];
+        assert!(tx.success);
+        assert_eq!(tx.from, vec![0x41; 21]);
+        assert_eq!(tx.to, vec![0x42; 21]);
+        assert_eq!(tx.amount, 20);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[1].seq, 2);
+    }
+
+    #[test]
+    fn reorg_reapply_emits_unwind_then_apply() {
+        let rig = Rig::new("reorg");
+        let w = rig.open();
+        for h in 1..=3 {
+            rig.apply(&w, h);
+        }
+        // Reorg: height 2 re-applies on a new branch.
+        let (block, id, ret) = rig.make_block(2, 1);
+        rig.persist(&block, &id, &ret);
+        w.on_block_applied(&block, &id, &ret).unwrap();
+        rig.apply(&w, 3);
+        assert_eq!(
+            heights(&rig.entries()),
+            vec![('A', 1), ('A', 2), ('A', 3), ('U', 1), ('A', 2), ('A', 3)]
+        );
+        assert_eq!(w.counters().unwinds.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn missed_blocks_are_repaired_from_the_stores() {
+        let rig = Rig::new("gap");
+        {
+            let w = rig.open();
+            rig.apply(&w, 1);
+        } // firehose "off"
+
+        // Blocks 2-3 happen without the writer (persisted to stores only).
+        for h in 2..=3 {
+            let (block, id, ret) = rig.make_block(h, 0);
+            rig.persist(&block, &id, &ret);
+        }
+
+        // Reopen; block 4 applies → 2..3 derive from the stores first.
+        let w = rig.open();
+        rig.apply(&w, 4);
+        let entries = rig.entries();
+        assert_eq!(heights(&entries), vec![('A', 1), ('A', 2), ('A', 3), ('A', 4)]);
+        // Repaired entries carry the same decoded facts as live ones.
+        let Some(fh::entry::Event::Apply(a)) = &entries[1].event else { panic!() };
+        assert_eq!(a.txs[0].amount, 20);
+        assert!(!a.txinfo_missing);
+        assert_eq!(w.counters().gap_repaired_blocks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn log_ahead_of_consensus_unwinds_at_open() {
+        let rig = Rig::new("ahead");
+        {
+            let w = rig.open();
+            for h in 1..=5 {
+                rig.apply(&w, h);
+            }
+        }
+        // Power loss: consensus recovered to height 3.
+        DynamicPropertiesStore::new(rig.dyn_props.clone()).save_latest_block_header_number(3);
+        let w = rig.open();
+        let entries = rig.entries();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(heights(&entries)[5], ('U', 3), "startup unwind to the recovered head");
+        // Re-applying 4 continues normally (no extra unwind).
+        rig.apply(&w, 4);
+        assert_eq!(heights(&rig.entries())[6], ('A', 4));
+    }
+}

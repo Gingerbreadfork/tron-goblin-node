@@ -156,11 +156,38 @@ What works today:
   `BlockUndoStore` (default) and a `SnapshotManager`-style overlay
   stack (`--snapshot-reorg`). The solidified/irreversible block is
   never crossed (forks diverging below it are rejected).
+- ✅ **Built-in address-history indexer** (`[index] enable = true`):
+  TronGrid-compatible
+  `/v1/accounts/{address}/transactions[/trc20|/trc721|/internal]` plus an
+  event-search endpoint `/v1/contracts/{address}/events`, served from the
+  node's own stores — no external indexer, no API keys. Backfill from a
+  snapshot is automatic (head-first by default: recent history is
+  queryable within seconds while the long tail fills in behind it),
+  reorg-reconciled, restart-resuming, and the on-disk index is
+  disposable — delete `data_dir/index/` and the node rebuilds it. Same
+  query params as TronGrid (`limit`, `fingerprint`, `only_from`/`only_to`,
+  `only_confirmed`, timestamps, `order_by`), so existing TronWeb history
+  code is a drop-in.
+- ✅ **Historical-state archive** (`[index] capture_state_deltas = true`):
+  every block's committed write-set recorded as per-key versions, enabling
+  `getaccount` / `getaccountresource` / `triggerconstantcontract` **at any
+  covered height** via `/v1/archive/...` — each historical read is one
+  seek, not a replay, and constant calls run against the full archived VM
+  state of that height (block number/timestamp included).
+- ✅ **Firehose** (`[index.firehose] enable = true`): a durable,
+  append-only log of applied blocks — decoded transfer facts, TRC20 logs,
+  internal txs — with explicit `UNWIND` entries covering both reorgs and
+  crash recovery, tailed by external consumers over gRPC
+  (`tronfirehose.Firehose/Tail`, resume by sequence number).
+  Reference consumers for **Postgres**, **NATS JetStream**, and
+  **ClickHouse** ship as standalone workspace binaries.
 - ✅ Prometheus `/metrics` endpoint (`--metrics-port`, default 9090)
-  exposes ~29 metrics across chain head, sync flow, reorg / fork-tree
+  exposes metrics across chain head, sync flow, reorg / fork-tree
   outcomes, SR block production, PBFT message traffic, mempool
   (size + accepted + evicted + rejected-by-reason labels), active
-  peers, and per-method RPC counters.
+  peers, per-method RPC counters, and the indexer (cursor / lag /
+  backfill edges, per-namespace row counters, archive coverage,
+  firehose head-seq and unwind counters).
 
 What doesn't work yet (real, currently-open gaps):
 
@@ -191,24 +218,25 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **1883** |
+| Workspace tests passing | **2202** |
 | Ignored (gated on Sapling proving, ~50 MB params + 1–2 s each) | 9 |
-| Integration test files (`crates/*/tests/`) | 109 |
-| Source modules with `#[cfg(test)]` blocks | 94 |
+| Integration test files (`crates/*/tests/`) | 119 |
+| Source modules with `#[cfg(test)]` blocks | 112 |
 
 Per-crate breakdown of the test surface (where coverage lives is
 where parity risk lives):
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `tron-actuator`  | 317 | `tron-net`      |  56 |
-| `tron-rpc`       | 289 | `tron-types`    |  46 |
-| `tron-tvm`       | 280 | `tron-crypto`   |  34 |
-| `tron-node`      | 308 | `tron-mempool`  |  25 |
-| `tron-chainbase` | 207 | `tron-wallet`   |  22 |
-| `tron-executor`  | 121 | `tron-eventer`  |  14 |
-| `tron-consensus` |  87 | `tron-replay`   |   6 |
-| `tron-grpc`      |  63 | `tron-proto`    |   8 |
+| `tron-node`      | 356 | `tron-types`     |  58 |
+| `tron-actuator`  | 321 | `tron-net`       |  57 |
+| `tron-rpc`       | 309 | `tron-index`     |  55 |
+| `tron-tvm`       | 285 | `tron-crypto`    |  34 |
+| `tron-chainbase` | 220 | `tron-mempool`   |  25 |
+| `tron-executor`  | 135 | `tron-wallet`    |  22 |
+| `tron-consensus` |  88 | `tron-eventer`   |  14 |
+| `tron-grpc`      |  66 | `tron-firehose-*`|   8 |
+| `tron-proto`     |   8 | `tron-replay`    |   6 |
 
 Notable test categories:
 
@@ -267,9 +295,16 @@ crate is something you can hold in your head.
 | [`tron-rpc`](crates/tron-rpc) | Ethereum-compatible JSON-RPC server backed by chainbase. |
 | [`tron-grpc`](crates/tron-grpc) | gRPC (Wallet / WalletSolidity / Database / Monitor / Network). Wraps `tron-rpc`. |
 | [`tron-eventer`](crates/tron-eventer) | Event subscribe / logsfilter — per-block, per-tx, per-contract-event/log triggers. |
+| [`tron-index`](crates/tron-index) | Built-in address-history indexer: extraction rules, backfill/follow engine, query layer for the `/v1` history + event-search API, the versioned-KV historical-state archive, and the firehose segment log. |
 | [`tron-wallet`](crates/tron-wallet) | Key management + transaction signing CLI. Reads java-tron-compatible v3 keystores. |
 | [`tron-replay`](crates/tron-replay) | CLI for generating + validating length-delimited TRON block streams. |
 | [`tron-node`](crates/tron-node) | Full-node daemon binary — opens stores, runs RPC, syncs blocks. |
+
+Three `tron-firehose-*` crates (`-postgres`, `-nats`, `-clickhouse`)
+are standalone reference consumers for the firehose stream — never
+linked into the node; each runs its own codegen over the same
+`firehose.proto` the node serves, so they build (and can be vendored)
+independently.
 
 Four `revm-*` crates are vendored forks needed to plug TRON's
 TRC-10 transfer fields and the five TRON-extended opcodes
@@ -308,7 +343,7 @@ The full workspace compiles in ~3–5 minutes on a modern machine.
 Tests:
 
 ```sh
-cargo test --workspace            # 1800+ tests, all defaults
+cargo test --workspace            # 2200+ tests, all defaults
 cargo test --workspace --release -- --ignored
                                   # adds 9 Sapling-proving tests
                                   # (~50 MB Groth16 params + 1-2s each)
@@ -374,6 +409,74 @@ compatible; runtime config is its own surface. A fully-annotated
 starting point ships at [`config.example.toml`](config.example.toml)
 (every key set to its built-in default); copy it and pass it with
 `--config`.
+
+## Indexer, historical state & firehose
+
+The node can be its own TronGrid: a built-in indexer serves address
+history, NFT transfers, internal transactions, and contract events from
+the node's own stores — self-hosted, no API keys, no external indexing
+stack. Enable it in the config:
+
+```toml
+[index]
+enable = true            # address-history index + /v1 API
+scope  = "trc20"         # native | trc20 (default) | all (adds event search)
+# capture_state_deltas = true     # + historical-state archive (/v1/archive)
+
+[index.firehose]
+enable = true            # + the external-sink stream (gRPC Tail)
+```
+
+With a populated block store (e.g. right after `import-snapshot`) the
+index **backfills automatically** — no command, head-first by default so
+the most recent history is queryable within seconds — then follows the
+live head, reconciling reorgs by hash and resuming across restarts. The
+HTTP surface (same port as the REST API):
+
+```text
+GET /v1/accounts/{address}/transactions             — native + contract calls
+GET /v1/accounts/{address}/transactions/trc20       — TRC20 transfers
+GET /v1/accounts/{address}/transactions/trc721      — NFT transfers (extension)
+GET /v1/accounts/{address}/transactions/internal    — internal txs (extension)
+GET /v1/contracts/{address}/events                  — event search (scope = "all")
+GET /v1/archive/account?address=…&block=H           — state at height H
+GET /v1/archive/accountresource?address=…&block=H
+POST /v1/archive/triggerconstantcontract            — constant call at height H
+```
+
+Query params mirror TronGrid (`limit`, `fingerprint` pagination,
+`only_from`/`only_to`, `only_confirmed`/`only_unconfirmed`,
+`min_timestamp`/`max_timestamp`, `order_by`, `contract_address`), so
+existing TronWeb / TronGrid client code points here unmodified. Event
+search resolves `event_name` through the contract's on-chain ABI and
+returns ABI-decoded results when the ABI is stored.
+
+Three properties worth knowing:
+
+- **The index is disposable.** `data_dir/index/` can be deleted at any
+  time; the node re-derives it from its own stores. Scope changes and
+  format-version bumps rebuild automatically (and loudly).
+- **The archive is not.** `capture_state_deltas` records each block's
+  committed write-set as per-key versions (one seek per historical
+  read, no replay) — coverage starts when first enabled and cannot be
+  back-filled, since deleted history isn't re-derivable.
+- **TRC20/internal backfill needs transaction-info.** Snapshots without
+  `transactionRetStore` index native kinds only for pre-enable history
+  (the gap is counted in metrics); once enabled, the node persists
+  transaction-info for every newly-applied block.
+
+The **firehose** is the push-side complement: a durable append-only log
+of applied blocks (decoded transfer facts, TRC20 logs, internal txs)
+with explicit `UNWIND` entries, so reorgs and crash recovery reach
+consumers through one protocol. External processes tail it over gRPC
+(`tronfirehose.Firehose/Tail`) resuming by sequence number; three
+reference consumers ship in-workspace — `tron-firehose-postgres`
+(exactly-once into an explorer schema), `tron-firehose-nats`
+(JetStream bridge), and `tron-firehose-clickhouse` (analytics schema).
+Format and cursor protocol: [`working/FIREHOSE.md`](working/FIREHOSE.md).
+
+Every `[index]` knob is annotated in
+[`config.example.toml`](config.example.toml).
 
 ## Compatibility notes
 

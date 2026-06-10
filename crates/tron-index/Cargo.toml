@@ -1,0 +1,24 @@
+[package]
+name = "tron-index"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Built-in address-history indexer: a secondary index over committed blocks + transaction-info, serving TronGrid-style account history from the node's own stores."
+
+[dependencies]
+tron-crypto = { path = "../tron-crypto" }
+tron-proto = { path = "../tron-proto" }
+tron-types = { path = "../tron-types" }
+tron-chainbase = { path = "../tron-chainbase" }
+prost.workspace = true
+flate2.workspace = true
+tokio = { workspace = true }
+rayon.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+prost-types.workspace = true
+hex-literal.workspace = true

@@ -100,6 +100,7 @@ fn fixture() -> RpcState {
         exchanges_v2: None,
         eth_call_backends: None,
         tx_history: None,
+        transaction_ret: None,
         account_id_index: None,
         contracts: None,
         abis: None,
@@ -120,6 +121,9 @@ fn fixture() -> RpcState {
         support_constant: false,
         constant_call_timeout_ms: 0,
         pubsub: None,
+        index: None,
+        archive: None,
+        firehose: None,
     }
 }
 

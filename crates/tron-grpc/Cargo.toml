@@ -45,6 +45,8 @@ group = "0.13"
 tron-crypto = { path = "../tron-crypto" }
 tron-types = { path = "../tron-types" }
 tonic = { workspace = true }
+tokio-stream = "0.1"
+tron-index = { path = "../tron-index" }
 prost.workspace = true
 prost-types.workspace = true
 tokio.workspace = true

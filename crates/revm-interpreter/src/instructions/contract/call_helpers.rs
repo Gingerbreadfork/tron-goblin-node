@@ -98,7 +98,13 @@ pub fn load_acc_and_calc_gas<H: Host + ?Sized>(
     } else {
         stack_gas_limit
     };
-    gas!(interpreter, gas_limit);
+    // TRON fork: gas forwarded to the child frame is java-tron's
+    // `adjustedCallEnergy` — never scaled by the parent's dynamic-energy
+    // factor and excluded from the parent's contract-usage accounting
+    // (`VM.play()` subtracts it from `actualEnergy`).
+    if !interpreter.gas.record_unscaled_cost(gas_limit) {
+        return Err(InstructionResult::OutOfGas);
+    }
 
     // Add call stipend if there is value to be transferred.
     if transfers_value {

@@ -288,6 +288,90 @@ fn update_active_witnesses_promotes_top_by_vote_count() {
 }
 
 #[test]
+fn update_active_witnesses_nets_old_votes_against_new() {
+    // java-tron's countVote: delta = Σ new_votes − Σ old_votes. The old
+    // list (the voter's votes at its first mutation this cycle) is already
+    // baked into each witness's accumulated vote_count, so it must come
+    // OFF — a re-vote nets to zero, a moved vote debits the abandoned
+    // witness, an unstake-trimmed vote shrinks it.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+
+    let candidates: Vec<Address> = (1u8..=3).map(addr).collect();
+    for (w, base) in candidates.iter().zip([1000i64, 500, 0]) {
+        witnesses
+            .put(
+                w,
+                &Witness {
+                    address: w.as_bytes().to_vec(),
+                    vote_count: base,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let av = |w: &Address, n: i64| AccountVote {
+        vote_address: w.as_bytes().to_vec(),
+        vote_count: n,
+    };
+
+    // voter1 re-votes the exact same 300 on w0 → net 0 (the old code
+    // double-counted this as +300).
+    let voter1 = addr(100);
+    votes
+        .put(
+            &voter1,
+            &Votes {
+                address: voter1.as_bytes().to_vec(),
+                old_votes: vec![av(&candidates[0], 300)],
+                new_votes: vec![av(&candidates[0], 300)],
+            },
+        )
+        .unwrap();
+    // voter2 moves 200 votes from w1 to w2 → w1 −200, w2 +200.
+    let voter2 = addr(101);
+    votes
+        .put(
+            &voter2,
+            &Votes {
+                address: voter2.as_bytes().to_vec(),
+                old_votes: vec![av(&candidates[1], 200)],
+                new_votes: vec![av(&candidates[2], 200)],
+            },
+        )
+        .unwrap();
+    // voter3's votes were trimmed by an unstake: 100 → 40 on w1.
+    let voter3 = addr(102);
+    votes
+        .put(
+            &voter3,
+            &Votes {
+                address: voter3.as_bytes().to_vec(),
+                old_votes: vec![av(&candidates[1], 100)],
+                new_votes: vec![av(&candidates[1], 40)],
+            },
+        )
+        .unwrap();
+
+    update_active_witnesses(
+        &witnesses,
+        &votes,
+        &schedule,
+        &[voter1, voter2, voter3],
+        &candidates,
+    )
+    .unwrap();
+
+    // w0: 1000 + (300 − 300) = 1000
+    // w1: 500 − 200 + (40 − 100) = 240
+    // w2: 0 + 200 = 200
+    assert_eq!(witnesses.get(&candidates[0]).unwrap().unwrap().vote_count, 1000);
+    assert_eq!(witnesses.get(&candidates[1]).unwrap().unwrap().vote_count, 240);
+    assert_eq!(witnesses.get(&candidates[2]).unwrap().unwrap().vote_count, 200);
+}
+
+#[test]
 fn update_active_witnesses_caps_at_27() {
     let witnesses_be = mem();
     let votes_be = mem();

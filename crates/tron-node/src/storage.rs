@@ -41,6 +41,15 @@ pub struct OpenedStores {
     pub blocks: Arc<dyn KvBackend>,
     pub transactions: Arc<dyn KvBackend>,
     pub tx_history: Arc<dyn KvBackend>,
+    /// `transactionRetStore` — per-block `TransactionRet` (the list of
+    /// `TransactionInfo` receipts, block-num keyed, java-tron layout).
+    /// Read by the address-history indexer's backfill (a snapshot that
+    /// includes it makes TRC20/internal history derivable without
+    /// re-execution); written at block commit when `[index]` is
+    /// enabled. Append-only, KhaosDb owns reorg semantics (the reorg
+    /// reapply path overwrites the block-num key with the new chain's
+    /// receipts).
+    pub transaction_ret: Arc<dyn KvBackend>,
     pub delegated_resource_account_index: Arc<dyn KvBackend>,
     pub market_account: Arc<dyn KvBackend>,
     pub market_pair_to_price: Arc<dyn KvBackend>,
@@ -300,7 +309,7 @@ impl SnapshotStack {
         new_block_nums: &[i64],
         between_revoke_and_apply: FB,
         mut apply_one: F,
-    ) -> Result<Vec<R>, ReorgFailure<E>>
+    ) -> Result<Vec<R>, ReorgFailure<E, R>>
     where
         FB: FnOnce(),
         F: FnMut(i64, usize) -> Result<R, E>,
@@ -355,7 +364,7 @@ impl SnapshotStack {
                     // partial-apply state.
                     return Err(ReorgFailure::ApplyFailed {
                         failed_block: block_num,
-                        applied_before: results.into_iter().count(),
+                        applied: results,
                         source: e,
                     });
                 }
@@ -459,7 +468,7 @@ impl SnapshotStack {
 /// downstream `apply_one` callback failures so callers can pick the
 /// right recovery path.
 #[derive(Debug, thiserror::Error)]
-pub enum ReorgFailure<E> {
+pub enum ReorgFailure<E, R = ()> {
     #[error(
         "snapshot drift: reorg expected to revoke block {expected} but top layer is for block {actual}"
     )]
@@ -471,7 +480,13 @@ pub enum ReorgFailure<E> {
     #[error("new-fork apply failed at block {failed_block}: {source}")]
     ApplyFailed {
         failed_block: i64,
-        applied_before: usize,
+        /// Results of the new-fork blocks that DID apply (and remain
+        /// committed — the coordinator does not roll them back).
+        /// Carried so the caller can run its per-block side effects
+        /// for them: the index/firehose/archive hook must fire for
+        /// every block that lands in state, or external sinks hold
+        /// blocks with no transaction-info and no unwind.
+        applied: Vec<R>,
         #[source]
         source: E,
     },
@@ -652,6 +667,9 @@ impl OpenedStores {
             blocks: open("block")?,
             transactions: open("trans")?,
             tx_history: open("transactionHistoryStore")?,
+            // camelCase trap: java-tron names this one (and the history
+            // store above) in camelCase, unlike every kebab-case store.
+            transaction_ret: open(tron_chainbase::TransactionRetStore::DB_NAME)?,
             delegated_resource_account_index,
             market_account,
             market_pair_to_price,
@@ -725,6 +743,7 @@ impl OpenedStores {
             self.exchange_v2.clone(),
         )
         .with_tx_history(self.tx_history.clone())
+        .with_transaction_ret(self.transaction_ret.clone())
         .with_account_id_index(self.id_index.clone())
         .with_contract_stores(self.contracts.clone(), self.abi.clone())
         .with_delegated_resource_account_index(self.delegated_resource_account_index.clone())

@@ -4,19 +4,18 @@
 //!
 //! Deferred behaviors (documented inline; tracked for follow-up):
 //!
-//! 1. **MortgageService.withdrawReward(owner)** — java-tron settles any
-//!    accumulated voter rewards before re-voting. Requires reward
-//!    accounting infra (RewardViStore, DelegationStore math) that has
-//!    not yet been ported. v1 skips this; voter rewards will be
-//!    overcounted in the cycle of a re-vote until that lands.
-//! 2. **New resource model (`supportAllowNewResourceModel`)** — uses
-//!    `getAllTronPower` which sums frozen + delegated balances. v1 uses
-//!    the old model only: `tron_power = sum(account.frozen[i].balance)`.
-//! 3. **`oldTronPowerIsNotInitialized` / `initializeOldTronPower`** —
-//!    one-shot migration step in java-tron. Trivial to add once the
-//!    new-resource-model path is in.
+//! 1. **New resource model (`supportAllowNewResourceModel`)** — uses
+//!    `getAllTronPower` (adds `oldTronPower` + TRON_POWER-typed v2
+//!    stakes). Mainnet runs with `ALLOW_NEW_RESOURCE_MODEL = 0`, so the
+//!    live path is `getTronPower()` — fully ported in
+//!    [`tron_power_old_model`].
+//! 2. **`oldTronPowerIsNotInitialized` / `initializeOldTronPower`** —
+//!    one-shot migration step in java-tron, only reachable under the
+//!    new resource model. Trivial to add once that path is in.
 
-use tron_chainbase::{AccountStore, VotesStore, WitnessStore};
+use tron_chainbase::{
+    AccountStore, DelegationStore, DynamicPropertiesStore, VotesStore, WitnessStore,
+};
 use tron_crypto::address::{Address, ADDRESS_LENGTH, ADDRESS_PREFIX_MAINNET};
 use tron_proto::{Vote as AccountVote, Votes, VoteWitnessContract};
 
@@ -105,6 +104,13 @@ pub fn validate_vote_witness(
 /// Apply the vote. Caller must have passed [`validate_vote_witness`] first.
 ///
 /// Effects:
+/// * Pending voter rewards are settled FIRST (java-tron's
+///   `mortgageService.withdrawReward(ownerAddress)` at the top of
+///   `VoteWitnessActuator.execute`). Reward windows are computed against
+///   the votes that were live while the cycles ran, so the settle must
+///   happen before the vote list changes — and it also advances the
+///   voter's `begin/end_cycle` markers + `account_vote` snapshot in
+///   `DelegationStore`, state java mutates on every re-vote.
 /// * `owner_account.votes` is replaced with the new vote list.
 /// * `VotesStore[owner]` records both the previous (`old_votes`) and new
 ///   (`new_votes`) vote lists. If the owner had no previous entry, the
@@ -113,10 +119,14 @@ pub fn validate_vote_witness(
 pub fn execute_vote_witness(
     accounts: &AccountStore,
     votes_store: &VotesStore,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &VoteWitnessContract,
 ) -> Result<(), ActuatorError> {
     let owner =
         decode_address(&contract.owner_address).ok_or(ActuatorError::InvalidOwnerAddress)?;
+
+    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props)?;
 
     let mut owner_account = accounts
         .get(&owner)?
@@ -151,17 +161,18 @@ pub fn execute_vote_witness(
     Ok(())
 }
 
-/// Compute "old-model" tron power: sum of frozen balances for the
-/// bandwidth pool. Matches `AccountCapsule.getTronPower` in java-tron.
+/// The account's TRON Power — java-tron's `AccountCapsule.getTronPower()`
+/// (the live path on mainnet, where `ALLOW_NEW_RESOURCE_MODEL = 0`).
+/// Implemented in [`tron_tvm::votes::tron_power`], shared with the TVM
+/// stake opcodes.
 ///
-/// New-resource-model (`getAllTronPower`) adds delegated/v2 balances; not
-/// yet implemented — see crate docs.
+/// Summing only the legacy `frozen` list (the previous implementation)
+/// under-counted every Stake-2.0 staker to ~zero, which made our
+/// validation REJECT virtually every modern `VoteWitnessContract` that
+/// mainnet accepted — votes silently never landed, and witness
+/// `vote_count`s drifted below java-tron's at every maintenance.
 fn old_tron_power(account: &tron_proto::Account) -> i64 {
-    account
-        .frozen
-        .iter()
-        .map(|f| f.frozen_balance)
-        .sum::<i64>()
+    tron_tvm::votes::tron_power(account)
 }
 
 fn decode_address(bytes: &[u8]) -> Option<Address> {

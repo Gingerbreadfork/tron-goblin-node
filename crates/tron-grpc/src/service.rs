@@ -322,7 +322,7 @@ fn run_constant_call(
         let timeout_ms = state.constant_call_timeout_ms as u64;
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(timeout_ms);
-        let (outcome, _traces) = tron_tvm::execute::execute_trigger_with_deadline(
+        let (outcome, _traces, _energy_penalty) = tron_tvm::execute::execute_trigger_with_deadline(
             &vm_stores,
             block_env,
             trigger,
@@ -3041,6 +3041,7 @@ pub async fn start_server(
     addr: SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
+    let firehose = state.firehose.clone();
     let wallet = WalletService::new(state);
     let wallet_solidity = wallet.clone();
     let monitor = wallet.clone();
@@ -3067,6 +3068,13 @@ pub async fn start_server(
             WalletExtensionServer::new(wallet_extension)
                 .max_decoding_message_size(GRPC_MAX_DECODING_BYTES),
         )
+        // The firehose tail — mounted only when the node runs the
+        // durable log ([index.firehose] enable = true).
+        .add_optional_service(firehose.map(|handle| {
+            crate::firehose_proto::firehose_server::FirehoseServer::new(
+                crate::firehose::FirehoseService::new(handle),
+            )
+        }))
         .serve_with_shutdown(addr, shutdown)
         .await?;
     Ok(())

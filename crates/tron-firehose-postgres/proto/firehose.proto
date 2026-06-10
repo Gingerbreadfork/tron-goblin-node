@@ -1,0 +1,84 @@
+// The tron-goblin-node firehose — the durable external-sink stream.
+//
+// Entries are appended to a local durable log (own fsync, crash-safe
+// framing) once per applied block, and external consumers tail them
+// over this gRPC stream, resuming by `seq`. The full format + cursor
+// protocol contract is documented in working/FIREHOSE.md. Wire
+// stability: additive fields only; any breaking change bumps the
+// on-disk segment magic AND this package name.
+
+syntax = "proto3";
+
+package tronfirehose;
+
+service Firehose {
+  // Tail the log from a cursor: replays history from `from_seq`
+  // (or the oldest retained entry when `from_seq` is older than
+  // retention — detect via the first entry's seq), then follows
+  // live. Resume by passing 1 + the last seq you durably applied.
+  rpc Tail(TailRequest) returns (stream Entry);
+}
+
+message TailRequest {
+  uint64 from_seq = 1;
+}
+
+message Entry {
+  // Monotonic, contiguous log sequence — the cursor.
+  uint64 seq = 1;
+  oneof event {
+    BlockApplied apply = 2;
+    // The chain unwound (reorg, or node crash-recovery): drop
+    // everything you derived from blocks with height > to_height,
+    // then keep consuming — re-applied blocks follow as ordinary
+    // BlockApplied entries.
+    Unwind unwind = 3;
+  }
+}
+
+message BlockApplied {
+  int64 height = 1;
+  bytes block_id = 2;   // 32 bytes
+  bytes parent_id = 3;  // 32 bytes
+  int64 timestamp_ms = 4;
+  bytes witness = 5;    // 21-byte producer address
+  // The PBFT/DPoS-solidified height as of this entry — consumers that
+  // cannot tolerate unwinds should only act on heights <= this.
+  int64 solidified_height = 6;
+  // True when the node had no transaction-info for this block (a
+  // backfill gap): `logs` and `internal_txs` below are absent even
+  // though the block may have had VM activity.
+  bool txinfo_missing = 7;
+  repeated Tx txs = 8;
+}
+
+message Unwind {
+  int64 to_height = 1;
+}
+
+message Tx {
+  bytes txid = 1;            // 32 bytes
+  int32 contract_type = 2;   // protocol.Transaction.Contract.ContractType
+  bool success = 3;          // contractRet == SUCCESS
+  bytes from = 4;            // 21-byte owner (empty for fully-shielded)
+  bytes to = 5;              // 21-byte counterparty, when the type has one
+  int64 amount = 6;          // sun / TRC10 units, per contract type
+  string asset = 7;          // TRC10 asset id; empty for TRX / non-asset
+  bytes vm_contract = 8;     // called/created contract for VM txs
+  repeated Log logs = 9;             // committed VM logs (empty if reverted)
+  repeated InternalTx internal_txs = 10;
+}
+
+message Log {
+  bytes address = 1;          // 20-byte VM-form contract address
+  repeated bytes topics = 2;  // 32 bytes each
+  bytes data = 3;
+}
+
+message InternalTx {
+  bytes caller = 1;       // 21 bytes
+  bytes transfer_to = 2;  // 21 bytes
+  int64 call_value = 3;   // sun
+  string token_id = 4;    // TRC10 id for in-VM token moves
+  bool rejected = 5;      // frame (or ancestor) reverted
+}

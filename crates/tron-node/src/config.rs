@@ -99,6 +99,16 @@ pub struct NodeConfig {
     /// folding them into the genesis path is a separate follow-up.
     #[serde(default)]
     pub committee: CommitteeConfig,
+
+    /// Built-in address-history indexer (`[index]`). Off by default;
+    /// `enable = true` turns the node into its own TronGrid-compatible
+    /// history API: a follower task backfills automatically from the
+    /// local block store (no command), follows the live head, and the
+    /// HTTP surface serves `/v1/accounts/{address}/transactions[/...]`.
+    /// Everything lives under `<data_dir>/index/` and is disposable —
+    /// delete it any time, the node rebuilds it.
+    #[serde(default)]
+    pub index: IndexConfig,
 }
 
 /// Per-store RocksDB tuning. The defaults mirror java-tron's
@@ -1038,6 +1048,7 @@ impl Default for NodeConfig {
             rate_limiter: RateLimiterConfig::default(),
             local_witness: LocalWitnessConfig::default(),
             committee: CommitteeConfig::default(),
+            index: IndexConfig::default(),
         }
     }
 }
@@ -1577,6 +1588,241 @@ pub enum ConfigError {
     Committee(String),
 }
 
+// -- [index] — built-in address-history indexer --
+
+/// `[index]` — the built-in address-history indexer + TronGrid-style
+/// `/v1` history API. See `working/INDEXER_PLAN.md` for the design and
+/// `working/INDEXER_IMPL_NOTES.md` for implementation notes.
+///
+/// Cost when disabled: zero — the subsystem never starts, no files,
+/// no threads, and the apply path carries one `Option::is_none()`
+/// branch per committed block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexConfig {
+    /// Master switch. `true` additionally persists per-block
+    /// transaction-info (`transactionRetStore`) at commit so every
+    /// kind of history stays re-derivable from local stores.
+    #[serde(default)]
+    pub enable: bool,
+
+    /// Index size/coverage preset; sets the `capture_*` flags below.
+    /// An explicit `capture_*` key overrides the preset.
+    #[serde(default)]
+    pub scope: IndexScope,
+
+    /// Per-dimension overrides (`capture_* > scope` precedence).
+    #[serde(default, alias = "captureNative")]
+    pub capture_native: Option<bool>,
+    #[serde(default, alias = "captureTrc20")]
+    pub capture_trc20: Option<bool>,
+    #[serde(default, alias = "captureTrc721")]
+    pub capture_trc721: Option<bool>,
+    #[serde(default, alias = "captureInternal")]
+    pub capture_internal: Option<bool>,
+    #[serde(default, alias = "captureLogs")]
+    pub capture_logs: Option<bool>,
+
+    /// Index the CALLED contract of every `TriggerSmartContract` (not
+    /// just the caller), powering `/v1/accounts/{contract}/transactions`.
+    /// Outside the scope preset and default-off: it is the single
+    /// largest row source (hot contracts accrue billions of rows).
+    /// Changing it later triggers an automatic full index rebuild.
+    #[serde(default, alias = "captureCalleeContract")]
+    pub capture_callee_contract: bool,
+
+    /// Opt-in historical-state archive (P2): record every block's
+    /// committed write-set as per-key versions under
+    /// `<data_dir>/archive/db`, enabling `getaccount` /
+    /// `getaccountresource` / `triggerconstantcontract` **at any
+    /// covered height** via `/v1/archive/...`. NEVER set by a scope
+    /// preset — it has its own cost profile (terabyte-scale on
+    /// mainnet, write amplification comparable to chain state).
+    /// Unlike the tx-history index, the archive is NOT re-derivable:
+    /// deleting it (or toggling this off and back on) restarts
+    /// coverage at the then-current head. Requires the BlockSession
+    /// commit path (`storage.snapshot_reorg = false`). Excluded from
+    /// the index scope fingerprint — toggling it never rebuilds the
+    /// tx-history index.
+    #[serde(default, alias = "captureStateDeltas")]
+    pub capture_state_deltas: bool,
+
+    /// Which stream the index follows: the canonical head
+    /// (reorg-reconciled, freshest) or the PBFT-solidified mark
+    /// (never unwinds, lags ~19 blocks).
+    #[serde(default)]
+    pub stream: IndexStream,
+
+    /// Backfill tuning (automatic either way; these only tune it).
+    #[serde(default)]
+    pub backfill: IndexBackfillConfig,
+
+    /// The firehose external-sink log (`[index.firehose]`, P3): a
+    /// durable append-only log of applied blocks (decoded tx facts +
+    /// logs + internal txs) with explicit unwind entries, tailed by
+    /// external consumers over the gRPC `tronfirehose.Firehose`
+    /// service on the existing gRPC port. Format + cursor protocol:
+    /// `working/FIREHOSE.md`.
+    #[serde(default)]
+    pub firehose: IndexFirehoseConfig,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            scope: IndexScope::default(),
+            capture_native: None,
+            capture_trc20: None,
+            capture_trc721: None,
+            capture_internal: None,
+            capture_logs: None,
+            capture_callee_contract: false,
+            capture_state_deltas: false,
+            stream: IndexStream::default(),
+            backfill: IndexBackfillConfig::default(),
+            firehose: IndexFirehoseConfig::default(),
+        }
+    }
+}
+
+impl IndexConfig {
+    /// Resolve the preset + overrides into the effective capture set
+    /// (`capture_* > scope` precedence — the §6.5 rule).
+    pub fn capture_set(&self) -> tron_index::CaptureSet {
+        // TRC721 rides with TRC20 in the presets (NFT transfers are a
+        // tiny row source next to fungible transfers).
+        let (native, trc20, internal, logs) = match self.scope {
+            IndexScope::Native => (true, false, false, false),
+            IndexScope::Trc20 => (true, true, true, false),
+            IndexScope::All => (true, true, true, true),
+        };
+        tron_index::CaptureSet {
+            native: self.capture_native.unwrap_or(native),
+            trc20: self.capture_trc20.unwrap_or(trc20),
+            trc721: self.capture_trc721.unwrap_or(trc20),
+            internal: self.capture_internal.unwrap_or(internal),
+            logs: self.capture_logs.unwrap_or(logs),
+            callee_contract: self.capture_callee_contract,
+        }
+    }
+
+    /// Map the backfill knobs onto the engine options.
+    pub fn engine_options(&self) -> tron_index::EngineOptions {
+        tron_index::EngineOptions {
+            window_blocks: self.backfill.window_blocks.clamp(1, 65_536),
+            window_tx_budget: self.backfill.window_tx_budget.clamp(64, 2_000_000),
+            head_first: matches!(self.backfill.order, IndexBackfillOrder::HeadFirst),
+            start_height: self.backfill.start_height.max(0),
+            follow_solidified: matches!(self.stream, IndexStream::Solidified),
+            sync_every_windows: self.backfill.fsync_barrier_windows.clamp(1, 4096),
+            ..tron_index::EngineOptions::default()
+        }
+    }
+}
+
+/// `index.scope` preset values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexScope {
+    /// TRX / TRC10 / account-level only (smallest).
+    Native,
+    /// + TRC20 transfers + internal txs (default; wallets/explorers).
+    #[default]
+    Trc20,
+    /// + all VM logs/events (largest; event-search rows).
+    All,
+}
+
+/// `index.stream` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexStream {
+    #[default]
+    Head,
+    Solidified,
+}
+
+/// `index.backfill.order` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexBackfillOrder {
+    /// Newest history queryable within seconds; the long tail fills in
+    /// behind it (the default).
+    #[default]
+    HeadFirst,
+    /// Monotonic single edge from the snapshot base upward.
+    FloorFirst,
+}
+
+/// `[index.backfill]` — tuning only; backfill itself is automatic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexBackfillConfig {
+    #[serde(default)]
+    pub order: IndexBackfillOrder,
+    /// Blocks per gap-closing window (one atomic write-batch each).
+    #[serde(default = "default_index_window_blocks", alias = "windowBlocks")]
+    pub window_blocks: usize,
+    /// Soft cap on transactions per window — bounds batch RAM on
+    /// tx-heavy ranges regardless of `window_blocks`.
+    #[serde(default = "default_index_window_tx_budget", alias = "windowTxBudget")]
+    pub window_tx_budget: usize,
+    /// Deferred-fsync barrier: WAL-sync once every N windows. Crash
+    /// recovery re-derives at most N windows.
+    #[serde(default = "default_index_fsync_barrier", alias = "fsyncBarrierWindows")]
+    pub fsync_barrier_windows: u32,
+    /// Optional capacity clamp: index only from this height up (the
+    /// snapshot base still floors it). Changing it later triggers an
+    /// automatic full index rebuild.
+    #[serde(default, alias = "startHeight")]
+    pub start_height: i64,
+}
+
+impl Default for IndexBackfillConfig {
+    fn default() -> Self {
+        Self {
+            order: IndexBackfillOrder::default(),
+            window_blocks: default_index_window_blocks(),
+            window_tx_budget: default_index_window_tx_budget(),
+            fsync_barrier_windows: default_index_fsync_barrier(),
+            start_height: 0,
+        }
+    }
+}
+
+/// `[index.firehose]` — the durable external-sink log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexFirehoseConfig {
+    /// Master switch. The log lives under `<data_dir>/firehose/`;
+    /// enabling also mounts the gRPC tail service.
+    #[serde(default)]
+    pub enable: bool,
+    /// Retention budget in MiB — oldest segments are pruned past it.
+    /// Consumers further behind than retention resume at the oldest
+    /// retained entry (visible as a seq jump). Default 32 GiB.
+    #[serde(default = "default_firehose_retain_mb", alias = "retainMb")]
+    pub retain_mb: u64,
+}
+
+impl Default for IndexFirehoseConfig {
+    fn default() -> Self {
+        Self { enable: false, retain_mb: default_firehose_retain_mb() }
+    }
+}
+
+fn default_firehose_retain_mb() -> u64 {
+    32 * 1024
+}
+
+fn default_index_window_blocks() -> usize {
+    1024
+}
+fn default_index_window_tx_budget() -> usize {
+    20_000
+}
+fn default_index_fsync_barrier() -> u32 {
+    16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1605,6 +1851,104 @@ mod tests {
         assert!(cfg.p2p.discover_enable);
         // No [witness] table → sync-only.
         assert!(cfg.witness.is_none());
+    }
+
+    // ---- [index] schema ----
+
+    #[test]
+    fn index_defaults_are_off_and_trc20_scope() {
+        let cfg: NodeConfig = toml::from_str("").expect("empty TOML");
+        assert!(!cfg.index.enable);
+        let caps = cfg.index.capture_set();
+        assert!(caps.native && caps.trc20 && caps.internal);
+        assert!(!caps.logs && !caps.callee_contract);
+        let opts = cfg.index.engine_options();
+        assert!(opts.head_first);
+        assert!(!opts.follow_solidified);
+        assert_eq!(opts.window_blocks, 1024);
+        assert_eq!(opts.start_height, 0);
+    }
+
+    #[test]
+    fn index_bare_enable_is_fully_valid() {
+        // The blessed operator flow: a bare `[index]\nenable = true`.
+        let cfg: NodeConfig =
+            toml::from_str("[index]\nenable = true").expect("bare enable parses");
+        assert!(cfg.index.enable);
+    }
+
+    #[test]
+    fn index_capture_overrides_beat_the_scope_preset() {
+        let cfg: NodeConfig = toml::from_str(
+            r#"
+                [index]
+                enable = true
+                scope = "native"
+                capture_trc20 = true
+
+                [index.backfill]
+                order = "floor_first"
+                start_height = 50000000
+            "#,
+        )
+        .expect("parse");
+        let caps = cfg.index.capture_set();
+        assert!(caps.native, "preset");
+        assert!(caps.trc20, "override beats preset");
+        assert!(!caps.internal, "preset (native) leaves internal off");
+        let opts = cfg.index.engine_options();
+        assert!(!opts.head_first);
+        assert_eq!(opts.start_height, 50_000_000);
+    }
+
+    #[test]
+    fn index_scope_typo_is_a_hard_parse_error() {
+        // A typo'd scope silently defaulting could mean terabytes of
+        // unexpected disk use — fail loudly instead.
+        assert!(toml::from_str::<NodeConfig>("[index]\nscope = \"trc-20\"").is_err());
+        assert!(toml::from_str::<NodeConfig>("[index]\nstream = \"both\"").is_err());
+    }
+
+    #[test]
+    fn index_capture_state_deltas_is_off_by_default_and_outside_the_fingerprint() {
+        let cfg: NodeConfig = toml::from_str("").unwrap();
+        assert!(!cfg.index.capture_state_deltas);
+        let on: NodeConfig =
+            toml::from_str("[index]\ncapture_state_deltas = true").unwrap();
+        assert!(on.index.capture_state_deltas);
+        // Toggling the archive must NOT change the tx-history index's
+        // scope fingerprint (it would force a pointless index rebuild).
+        assert_eq!(
+            cfg.index.capture_set().fingerprint(0),
+            on.index.capture_set().fingerprint(0)
+        );
+    }
+
+    #[test]
+    fn index_firehose_defaults_off_with_32g_retention() {
+        let cfg: NodeConfig = toml::from_str("").unwrap();
+        assert!(!cfg.index.firehose.enable);
+        assert_eq!(cfg.index.firehose.retain_mb, 32 * 1024);
+        let on: NodeConfig = toml::from_str(
+            "[index]\nenable = true\n[index.firehose]\nenable = true\nretain_mb = 1024",
+        )
+        .unwrap();
+        assert!(on.index.firehose.enable);
+        assert_eq!(on.index.firehose.retain_mb, 1024);
+    }
+
+    #[test]
+    fn index_solidified_stream_and_fingerprint_stability() {
+        let cfg: NodeConfig = toml::from_str("[index]\nstream = \"solidified\"").unwrap();
+        assert!(cfg.index.engine_options().follow_solidified);
+        // The scope fingerprint must be stable for identical configs
+        // and differ when the effective capture set changes.
+        let a = cfg.index.capture_set().fingerprint(0);
+        let b = cfg.index.capture_set().fingerprint(0);
+        assert_eq!(a, b);
+        let cfg2: NodeConfig =
+            toml::from_str("[index]\ncapture_callee_contract = true").unwrap();
+        assert_ne!(a, cfg2.index.capture_set().fingerprint(0));
     }
 
     // ---- event.subscribe.* schema ----

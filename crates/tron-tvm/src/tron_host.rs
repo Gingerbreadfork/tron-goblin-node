@@ -198,6 +198,15 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
+        // java's `VoteWitnessProcessor.execute` settles pending voter
+        // rewards FIRST (`VoteRewardUtil.withdrawReward`) — the reward
+        // window must close against the votes as they stood.
+        if let (Some(delegation), Some(dyn_props)) =
+            (self.delegation.as_ref(), self.dyn_props.as_ref())
+        {
+            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props)
+                .expect("db error in TronDatabaseExt::tron_vote_witness settling rewards");
+        }
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
             return 0;
         };
@@ -237,18 +246,27 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
+        // java's TVM `WithdrawRewardProcessor.execute` settles pending
+        // voter rewards into `allowance` first (`VoteRewardUtil
+        // .withdrawReward`), then drains the allowance. NOTE: unlike the
+        // `WithdrawBalanceContract` actuator, the TVM opcode has NO 24h
+        // cooldown — its validate only blocks genesis GRs. Our previous
+        // guard (`latest_withdraw_time + 24h`) failed withdrawals java
+        // accepts.
+        if let Some(delegation) = self.delegation.as_ref() {
+            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props)
+                .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
+        }
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
             return 0;
         };
         let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-        let ready_at = account.latest_withdraw_time + WITNESS_ALLOWANCE_FROZEN_TIME_MS;
-        if account.latest_withdraw_time > 0 && now < ready_at {
-            return 0;
-        }
-        if account.allowance == 0 {
-            return 0;
-        }
+        // java: `if (allowance <= 0) return 0;` AFTER the settle, leaving
+        // the account untouched.
         let allowance = account.allowance;
+        if allowance <= 0 {
+            return 0;
+        }
         account.balance = match account.balance.checked_add(allowance) {
             Some(v) => v,
             None => return 0,
@@ -260,9 +278,7 @@ impl TronDatabaseExt for TronDatabase {
             .expect("db error in TronDatabaseExt::tron_withdraw_reward writing owner account");
         // Credit the withdrawn allowance to the caller's journaled
         // balance.
-        if allowance > 0 {
-            self.last_balance_delta = Some((caller, allowance));
-        }
+        self.last_balance_delta = Some((caller, allowance));
         allowance
     }
 
@@ -340,8 +356,34 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         }
         let owner = evm_to_tron_address(&caller);
+        // java's TVM `UnfreezeBalanceV2Processor.execute` settles pending
+        // voter rewards first, mirroring the actuator.
+        if let Some(delegation) = self.delegation.as_ref() {
+            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props)
+                .expect(
+                    "db error in TronDatabaseExt::tron_unfreeze_balance_v2 settling rewards",
+                );
+        }
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
             return 0;
+        };
+        let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+        // Sweep EXPIRED unfreeze entries into balance (java's
+        // `unfreezeExpire`, run on every v2 unstake before the new entry
+        // is added). The swept amount is journaled below so the EVM-side
+        // balance view matches.
+        let mut swept = 0i64;
+        account.unfrozen_v2.retain(|u| {
+            if u.unfreeze_expire_time <= now {
+                swept = swept.saturating_add(u.unfreeze_amount);
+                false
+            } else {
+                true
+            }
+        });
+        account.balance = match account.balance.checked_add(swept) {
+            Some(v) => v,
+            None => return 0,
         };
         let resource = resource_type as i32;
         // Find the matching FreezeV2 slot and subtract.
@@ -355,7 +397,6 @@ impl TronDatabaseExt for TronDatabase {
         }
         // Append an unfreezing entry — matures after the chain's
         // unfreeze delay.
-        let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
         let delay_ms = dyn_props
             .get_long(b"UNFREEZE_DELAY_DAYS")
             .map(|d| d.max(0) * 24 * 60 * 60 * 1000)
@@ -365,6 +406,13 @@ impl TronDatabaseExt for TronDatabase {
             unfreeze_amount: unfreeze_balance,
             unfreeze_expire_time: now + delay_ms,
         });
+        // Trim votes the unstake no longer backs (java's `updateVote`,
+        // shared with the actuator — see `crate::votes`).
+        if let Some(votes_store) = self.votes.as_ref() {
+            crate::votes::update_vote_after_unstake(votes_store, &owner, &mut account).expect(
+                "db error in TronDatabaseExt::tron_unfreeze_balance_v2 trimming votes",
+            );
+        }
         self.accounts
             .put(&owner, &account)
             .expect("db error in TronDatabaseExt::tron_unfreeze_balance_v2 writing owner account");
@@ -377,6 +425,10 @@ impl TronDatabaseExt for TronDatabase {
                 1 => dyn_props.add_total_energy_weight(weight_delta),
                 _ => {}
             }
+        }
+        // Credit the expired-sweep to the caller's journaled balance.
+        if swept > 0 {
+            self.last_balance_delta = Some((caller, swept));
         }
         1
     }
@@ -653,8 +705,6 @@ impl TronDatabaseExt for TronDatabase {
 /// dep we can't cycle back through).
 const TRX_PRECISION: i64 = 1_000_000;
 const FROZEN_PERIOD_MS: i64 = 3 * 24 * 60 * 60 * 1000;
-/// 24 hours — gap between consecutive `withdrawBalance` calls.
-const WITNESS_ALLOWANCE_FROZEN_TIME_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn self_freeze_expire(
     db: &TronDatabase,

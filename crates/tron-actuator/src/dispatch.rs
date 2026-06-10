@@ -116,7 +116,12 @@ pub fn dispatch_validate(
         }
         ContractType::WithdrawBalanceContract => {
             let c = unpack::<tron_proto::WithdrawBalanceContract>(parameter)?;
-            crate::witness::validate_withdraw_balance(stores.accounts, stores.dyn_props, &c)
+            crate::witness::validate_withdraw_balance(
+                stores.accounts,
+                stores.dyn_props,
+                stores.delegation,
+                &c,
+            )
         }
         ContractType::AccountCreateContract => {
             let c = unpack::<tron_proto::AccountCreateContract>(parameter)?;
@@ -198,7 +203,12 @@ pub fn dispatch_validate(
         }
         ContractType::UnfreezeBalanceContract => {
             let c = unpack::<tron_proto::UnfreezeBalanceContract>(parameter)?;
-            crate::freeze::validate_unfreeze_balance(stores.accounts, stores.dyn_props, &c)
+            crate::freeze::validate_unfreeze_balance(
+                stores.accounts,
+                stores.dyn_props,
+                stores.delegated_resources,
+                &c,
+            )
         }
         ContractType::FreezeBalanceV2Contract => {
             let c = unpack::<tron_proto::FreezeBalanceV2Contract>(parameter)?;
@@ -344,7 +354,13 @@ pub fn dispatch_execute(
         }
         ContractType::VoteWitnessContract => {
             let c = unpack::<tron_proto::VoteWitnessContract>(parameter)?;
-            crate::vote_witness::execute_vote_witness(stores.accounts, stores.votes, &c)?;
+            crate::vote_witness::execute_vote_witness(
+                stores.accounts,
+                stores.votes,
+                stores.delegation,
+                stores.dyn_props,
+                &c,
+            )?;
             Ok(ExecutionResult::default())
         }
         ContractType::WitnessCreateContract => {
@@ -366,7 +382,12 @@ pub fn dispatch_execute(
         }
         ContractType::WithdrawBalanceContract => {
             let c = unpack::<tron_proto::WithdrawBalanceContract>(parameter)?;
-            crate::witness::execute_withdraw_balance(stores.accounts, stores.dyn_props, &c)
+            crate::witness::execute_withdraw_balance(
+                stores.accounts,
+                stores.dyn_props,
+                stores.delegation,
+                &c,
+            )
         }
         ContractType::AccountCreateContract => {
             let c = unpack::<tron_proto::AccountCreateContract>(parameter)?;
@@ -428,7 +449,15 @@ pub fn dispatch_execute(
         }
         ContractType::UnfreezeBalanceContract => {
             let c = unpack::<tron_proto::UnfreezeBalanceContract>(parameter)?;
-            crate::freeze::execute_unfreeze_balance(stores.accounts, stores.dyn_props, &c)
+            crate::freeze::execute_unfreeze_balance(
+                stores.accounts,
+                stores.dyn_props,
+                stores.votes,
+                stores.delegation,
+                stores.delegated_resources,
+                stores.delegated_resource_account_index,
+                &c,
+            )
         }
         ContractType::FreezeBalanceV2Contract => {
             let c = unpack::<tron_proto::FreezeBalanceV2Contract>(parameter)?;
@@ -436,7 +465,13 @@ pub fn dispatch_execute(
         }
         ContractType::UnfreezeBalanceV2Contract => {
             let c = unpack::<tron_proto::UnfreezeBalanceV2Contract>(parameter)?;
-            crate::freeze_v2::execute_unfreeze_balance_v2(stores.accounts, stores.dyn_props, &c)
+            crate::freeze_v2::execute_unfreeze_balance_v2(
+                stores.accounts,
+                stores.dyn_props,
+                stores.votes,
+                stores.delegation,
+                &c,
+            )
         }
         ContractType::WithdrawExpireUnfreezeContract => {
             let c = unpack::<tron_proto::WithdrawExpireUnfreezeContract>(parameter)?;

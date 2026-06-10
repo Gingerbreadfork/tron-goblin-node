@@ -7,7 +7,10 @@ use hex_literal::hex;
 use tron_actuator::{
     execute_vote_witness, validate_vote_witness, ActuatorError, MAX_VOTE_NUMBER, TRX_PRECISION,
 };
-use tron_chainbase::{AccountStore, KvBackend, MemBackend, VotesStore, WitnessStore};
+use tron_chainbase::{
+    AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend, VotesStore,
+    WitnessStore,
+};
 use tron_crypto::address::Address;
 use tron_proto::account::Frozen;
 use tron_proto::vote_witness_contract::Vote as ContractVote;
@@ -257,7 +260,9 @@ fn execute_records_votes_on_account_and_in_votes_store() {
     put_account(&accounts, ALICE, 10 * TRX_PRECISION);
 
     let contract = vote_contract(ALICE, vec![vote(SR1, 4), vote(SR2, 3)]);
-    execute_vote_witness(&accounts, &votes_store, &contract).unwrap();
+    let delegation = DelegationStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &contract).unwrap();
 
     // Account got the new votes.
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -303,7 +308,9 @@ fn execute_preserves_old_votes_when_revoting() {
 
     // First call to execute: creates VotesCapsule with old_votes = account.votes (SR1=2).
     let c1 = vote_contract(ALICE, vec![vote(SR2, 5)]);
-    execute_vote_witness(&accounts, &votes_store, &c1).unwrap();
+    let delegation = DelegationStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &c1).unwrap();
 
     let v = votes_store.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(v.old_votes.len(), 1);
@@ -316,7 +323,7 @@ fn execute_preserves_old_votes_when_revoting() {
     // entries. Java-tron does NOT advance old_votes on re-vote; that
     // happens at maintenance.
     let c2 = vote_contract(ALICE, vec![vote(SR1, 3)]);
-    execute_vote_witness(&accounts, &votes_store, &c2).unwrap();
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &c2).unwrap();
 
     let v = votes_store.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(v.old_votes.len(), 1, "old_votes preserved across re-vote");
@@ -361,7 +368,9 @@ fn execute_clears_old_votes_on_account_before_adding_new_ones() {
     accounts.put(&addr(ALICE), &alice).unwrap();
 
     let c = vote_contract(ALICE, vec![vote(SR1, 5)]);
-    execute_vote_witness(&accounts, &votes_store, &c).unwrap();
+    let delegation = DelegationStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &c).unwrap();
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.votes.len(), 1);

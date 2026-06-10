@@ -228,11 +228,11 @@ fn reorg_apply_failure_partial_state_visible_to_caller() {
     match result {
         Err(tron_node::storage::ReorgFailure::ApplyFailed {
             failed_block,
-            applied_before,
+            applied,
             source,
         }) => {
             assert_eq!(failed_block, 30);
-            assert_eq!(applied_before, 1);
+            assert_eq!(applied.len(), 1, "the committed partial results ride the error");
             assert_eq!(source, "boom");
         }
         other => panic!("expected ApplyFailed, got: {other:?}"),

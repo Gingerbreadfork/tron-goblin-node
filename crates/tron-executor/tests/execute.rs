@@ -491,9 +491,16 @@ fn failed_txs_leave_no_trace_in_parent_state() {
     assert!(report.tx_results[1].outcome.is_success(), "good transfer ok");
     assert!(!report.tx_results[2].outcome.is_success(), "self transfer: invalid");
 
-    // Only tx1's effects landed.
-    assert_eq!(state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance, 999_900);
+    // Only tx1's effects landed. CARROL didn't exist, so the transfer
+    // took the contractCreateNewAccount bandwidth branch: with no
+    // frozen net, ALICE burned the flat 0.1 TRX create-account fee on
+    // top of the amount (java-tron `consumeFeeForCreateNewAccount`).
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        1_000_000 - 100 - 100_000
+    );
     assert_eq!(state.accounts.get(&addr(CARROL)).unwrap().unwrap().balance, 100);
+    assert_eq!(state.dyn_props.get_long(b"TOTAL_CREATE_ACCOUNT_COST"), Some(100_000));
     // BOB never created — bad owner tx didn't run.
     assert!(state.accounts.get(&addr(BOB)).unwrap().is_none());
 }
@@ -1011,4 +1018,248 @@ fn parallel_free_net_chain_is_byte_identical_to_serial() {
         "parallel diverged from serial on a free-net (PUBLIC_NET_USAGE chain) block"
     );
     assert_eq!(rs.block_id, rp.block_id);
+}
+
+// ---------------------------------------------------------------------------
+// State-delta capture (ExecConfig::capture_state_deltas)
+// ---------------------------------------------------------------------------
+
+/// Capture is OFF by default — no allocation, report carries None.
+#[test]
+fn state_deltas_absent_by_default() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000);
+    let block = build_block(1, [0u8; 32], vec![transfer_tx(ALICE, BOB, 100)]);
+    let undo = tron_chainbase::BlockUndoStore::new(mem());
+    let report = tron_executor::execute_block_with_undo_and_config(
+        &state.backends(),
+        &block,
+        None,
+        &undo,
+        &tron_executor::ExecConfig::unsigned(),
+    )
+    .unwrap();
+    assert!(report.state_deltas.is_none());
+}
+
+/// With capture on, the report carries one (store, key) entry per
+/// committed write with exact pre/post images, sorted by (store, key),
+/// and the SAME set on the plain-undo and checkpoint commit paths.
+#[test]
+fn state_deltas_capture_pre_and_post_images_on_both_commit_paths() {
+    let cfg = tron_executor::ExecConfig {
+        capture_state_deltas: true,
+        ..tron_executor::ExecConfig::unsigned()
+    };
+    let run_plain = || {
+        let state = StateBundle::fresh();
+        put_account(&state.accounts, ALICE, 1_000_000);
+        put_account(&state.accounts, BOB, 0);
+        let block = build_block(1, [0u8; 32], vec![transfer_tx(ALICE, BOB, 250_000)]);
+        let undo = tron_chainbase::BlockUndoStore::new(mem());
+        tron_executor::execute_block_with_undo_and_config(
+            &state.backends(),
+            &block,
+            None,
+            &undo,
+            &cfg,
+        )
+        .unwrap()
+    };
+    let run_checkpoint = || {
+        let state = StateBundle::fresh();
+        put_account(&state.accounts, ALICE, 1_000_000);
+        put_account(&state.accounts, BOB, 0);
+        let block = build_block(1, [0u8; 32], vec![transfer_tx(ALICE, BOB, 250_000)]);
+        let undo = tron_chainbase::BlockUndoStore::new(mem());
+        let cp_root = std::env::temp_dir().join(format!(
+            "tron-delta-capture-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cp = tron_chainbase::CheckPointV2::new(&cp_root);
+        tron_executor::execute_block_with_undo_checkpoint_and_config(
+            &state.backends(),
+            &block,
+            None,
+            &undo,
+            &cp,
+            &cfg,
+        )
+        .unwrap()
+    };
+
+    let plain = run_plain().state_deltas.expect("captured on plain path");
+    let checkpointed = run_checkpoint()
+        .state_deltas
+        .expect("captured on checkpoint path");
+    assert!(!plain.is_empty());
+    assert_eq!(plain, checkpointed, "both commit paths capture the identical write-set");
+
+    // Sorted by (store, key) — the deterministic-consumption contract.
+    let keys: Vec<(u8, Vec<u8>)> =
+        plain.iter().map(|d| (d.store as u8, d.key.clone())).collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
+
+    // The account mutations carry exact pre/post images.
+    use prost::Message as _;
+    let balance_of = |bytes: &Option<Vec<u8>>| -> Option<i64> {
+        bytes
+            .as_ref()
+            .and_then(|b| tron_proto::Account::decode(b.as_slice()).ok())
+            .map(|a| a.balance)
+    };
+    let alice_delta = plain
+        .iter()
+        .find(|d| d.store == tron_chainbase::UndoStoreId::Accounts && d.key == ALICE.to_vec())
+        .expect("alice account delta present");
+    assert_eq!(balance_of(&alice_delta.before), Some(1_000_000));
+    assert_eq!(balance_of(&alice_delta.after), Some(750_000));
+    let bob_delta = plain
+        .iter()
+        .find(|d| d.store == tron_chainbase::UndoStoreId::Accounts && d.key == BOB.to_vec())
+        .expect("bob account delta present");
+    assert_eq!(balance_of(&bob_delta.after), Some(250_000));
+
+    // Head-pointer writes are part of the write-set too (dyn props).
+    assert!(plain.iter().any(|d| d.store == tron_chainbase::UndoStoreId::DynProps));
+}
+
+// =============================================================================
+// Flat fees: multi-sign + memo (java-tron Manager.consumeMultiSignFee /
+// consumeMemoFee) and the actuator fee in the result.
+// =============================================================================
+
+/// A tx with more than one signature pays MULTI_SIGN_FEE (1 TRX
+/// default) from the owner's balance, burned — and the receipt carries
+/// it for the stored TransactionInfo.fee aggregation.
+#[test]
+fn second_signature_charges_the_multi_sign_fee() {
+    // A second keypair for the 2-of-2 owner permission.
+    let dave_priv: [u8; 32] =
+        hex!("9876543210987654321098765432109876543210987654321098765432109876");
+    let dave: [u8; 21] = {
+        use tron_crypto::signature::RecoverableSignature;
+        let dummy = [0x42u8; 32];
+        let sig = RecoverableSignature::sign_prehash(&dave_priv, &dummy).expect("sign");
+        let pubkey = sig.recover_uncompressed_pubkey(&dummy).expect("recover");
+        let h = tron_crypto::hash::keccak256(&pubkey[1..]);
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1..].copy_from_slice(&h[12..]);
+        a
+    };
+
+    let state = StateBundle::fresh();
+    // ALICE with a 2-of-2 owner permission (ALICE + DAVE) — the real
+    // multi-sign shape; both signatures are required and the tx pays
+    // the multi-sign fee for carrying more than one.
+    state
+        .accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 10_000_000,
+                r#type: AccountType::Normal as i32,
+                owner_permission: Some(tron_proto::Permission {
+                    r#type: 0,
+                    id: 0,
+                    permission_name: "owner".into(),
+                    threshold: 2,
+                    keys: vec![
+                        tron_proto::Key { address: ALICE.to_vec(), weight: 1 },
+                        tron_proto::Key { address: dave.to_vec(), weight: 1 },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    put_account(&state.accounts, BOB, 0);
+
+    let mut tx = transfer_tx(ALICE, BOB, 100); // transfer_tx signs with ALICE_PRIV
+    tron_types::sign_transaction(&mut tx, &dave_priv).expect("dave co-signs");
+    let block = build_block(1, [0u8; 32], vec![tx]);
+
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+    let res = &report.tx_results[0];
+    assert!(res.outcome.is_success(), "got {:?}", res.outcome);
+    assert_eq!(res.receipt.multi_sign_fee, 1_000_000);
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        10_000_000 - 100 - 1_000_000
+    );
+    assert_eq!(state.dyn_props.get_long(b"BURN_TRX_AMOUNT"), Some(1_000_000));
+    // (Single-signature txs paying no multi-sign fee is implicit in
+    // every other test here: their receipt.multi_sign_fee is 0.)
+}
+
+/// A non-empty memo (`raw_data.data`) pays MEMO_FEE once the SR
+/// proposal sets it; with the property unset (0) the memo is free.
+#[test]
+fn memo_fee_charges_only_when_the_property_is_set() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 10_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    // MEMO_FEE unset → free.
+    let mut tx = transfer_tx(ALICE, BOB, 100);
+    tx.raw_data.as_mut().unwrap().data = b"hello".to_vec();
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("re-sign");
+    tx.signature.drain(..tx.signature.len() - 1); // keep only the fresh signature
+    let block = build_block(1, [0u8; 32], vec![tx.clone()]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+    assert!(report.tx_results[0].outcome.is_success(), "got {:?}", report.tx_results[0].outcome);
+    assert_eq!(report.tx_results[0].receipt.memo_fee, 0);
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        10_000_000 - 100
+    );
+
+    // Proposal sets MEMO_FEE = 1 TRX → the next memo tx pays it.
+    state.dyn_props.put_long(b"MEMO_FEE", 1_000_000);
+    let mut tx2 = transfer_tx(ALICE, BOB, 100);
+    tx2.raw_data.as_mut().unwrap().data = b"world".to_vec();
+    tron_types::sign_transaction(&mut tx2, &ALICE_PRIV).expect("re-sign");
+    tx2.signature.drain(..tx2.signature.len() - 1);
+    let block2 = build_block(2, *report.block_id.as_bytes(), vec![tx2]);
+    let report2 = execute_block(&state.backends(), &block2, Some(report.block_id)).unwrap();
+    let res = &report2.tx_results[0];
+    assert!(res.outcome.is_success(), "got {:?}", res.outcome);
+    assert_eq!(res.receipt.memo_fee, 1_000_000);
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        10_000_000 - 200 - 1_000_000
+    );
+}
+
+/// The actuator-charged fee (here: createNewAccountFeeInSystemContract,
+/// set by proposal) surfaces on `TxResult::actuator_fee` — java's
+/// `ProgramResult.ret.fee` half of the TransactionInfo.fee sum.
+#[test]
+fn actuator_fee_is_reported_on_the_result() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 10_000_000);
+    // The in-system-contract creation fee (distinct from the bandwidth
+    // processor's CREATE_ACCOUNT_FEE) — mainnet sets it to 1 TRX.
+    state.dyn_props.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", 1_000_000);
+
+    // CARROL doesn't exist → transfer pays the actuator-side creation
+    // fee AND the bandwidth-side flat create fee.
+    let block = build_block(1, [0u8; 32], vec![transfer_tx(ALICE, CARROL, 500)]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+    let res = &report.tx_results[0];
+    assert!(res.outcome.is_success(), "got {:?}", res.outcome);
+    assert_eq!(res.actuator_fee, 1_000_000, "in-system-contract creation fee");
+    assert_eq!(res.receipt.net_fee, 100_000, "bandwidth-side flat create-account fee");
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        10_000_000 - 500 - 1_000_000 - 100_000
+    );
 }

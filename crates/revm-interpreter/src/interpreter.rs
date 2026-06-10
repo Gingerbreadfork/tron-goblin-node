@@ -312,6 +312,12 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         let instruction = instruction_table[opcode as usize];
         let static_gas = unsafe { *gas_table.get_unchecked(opcode as usize) };
 
+        // TRON fork: each opcode is one dynamic-energy charge group —
+        // the static gas below plus any charges made inside the
+        // instruction floor-scale as a single unit (java-tron applies
+        // its factor once per op in `VM.play()`).
+        self.gas.tron_op_boundary();
+
         if self.gas.record_cost_unsafe(static_gas as u64) {
             cold_path();
             return Err(InstructionResult::OutOfGas);

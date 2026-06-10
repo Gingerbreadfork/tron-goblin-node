@@ -115,7 +115,12 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
         // Take remaining gas and deduce l64 part of it.
         gas_limit = context.host.gas_params().call_stipend_reduction(gas_limit);
     }
-    gas!(context.interpreter, gas_limit);
+    // TRON fork: forwarded child gas is never scaled by the parent's
+    // dynamic-energy factor nor counted toward its contract usage (see
+    // `load_acc_and_calc_gas` for the CALL-side rationale).
+    if !context.interpreter.gas.record_unscaled_cost(gas_limit) {
+        return Err(InstructionResult::OutOfGas);
+    }
 
     // Call host to interact with target contract
     let create_inputs = CreateInputs::new(

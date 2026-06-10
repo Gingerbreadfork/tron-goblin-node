@@ -671,8 +671,13 @@ pub fn return_create<CTX: ContextTr>(
     }
 
     // regular gas for code deposit. It is zero in EIP-8037.
+    //
+    // TRON fork: java-tron spends `saveCodeEnergy` directly on the
+    // result in `createContractImpl` — outside `VM.play()`'s op loop —
+    // so it is never scaled by the dynamic-energy factor and never
+    // counted toward the created contract's usage.
     let gas_for_code = gas_params.code_deposit_cost(interpreter_result.output.len());
-    if !interpreter_result.gas.record_regular_cost(gas_for_code) {
+    if !interpreter_result.gas.record_unscaled_cost(gas_for_code) {
         // Record code deposit gas cost and check if we are out of gas.
         // EIP-2 point 3: If contract creation does not have enough gas to pay for the
         // final gas fee for adding the contract code to the state, the contract
