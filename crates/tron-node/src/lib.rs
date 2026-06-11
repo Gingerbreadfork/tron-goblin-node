@@ -12,6 +12,7 @@ pub mod backup;
 pub mod event_loader;
 pub mod fetch_block;
 pub mod firehose;
+pub mod inbound;
 pub mod index_hook;
 pub mod logfmt;
 pub mod mempool_validator;

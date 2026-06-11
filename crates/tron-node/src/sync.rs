@@ -4149,44 +4149,14 @@ impl SyncDriver {
         &self,
         locator: &[tron_proto::block_inventory::BlockId],
     ) -> (Vec<BlockId>, i64) {
-        let our_head = self.head_number();
         let Some(bi) = &self.state.block_index else {
             return (Vec::new(), 0);
         };
-        let block_index = BlockIndexStore::new(bi.clone());
-
-        // The locator is dense near the peer's head and sparse below; keep the
-        // highest entry whose id matches our main-chain block at that number.
-        let mut common: Option<i64> = None;
-        for entry in locator {
-            if entry.hash.len() != 32 {
-                continue;
-            }
-            let mut raw = [0u8; 32];
-            raw.copy_from_slice(&entry.hash);
-            let their_id = BlockId::from_raw(raw);
-            if block_index
-                .get(entry.number)
-                .map(|ours| ours == their_id)
-                .unwrap_or(false)
-            {
-                common = Some(common.map_or(entry.number, |c| c.max(entry.number)));
-            }
-        }
-        let Some(start) = common else {
-            return (Vec::new(), 0);
-        };
-
-        const SYNC_FETCH_BATCH_NUM: i64 = 2000;
-        let end = (start + SYNC_FETCH_BATCH_NUM).min(our_head);
-        let mut ids = Vec::new();
-        for num in start..=end {
-            match block_index.get(num) {
-                Ok(id) => ids.push(id),
-                Err(_) => break,
-            }
-        }
-        (ids, (our_head - end).max(0))
+        serve_sync_block_chain_ids(
+            &BlockIndexStore::new(bi.clone()),
+            self.head_number(),
+            locator,
+        )
     }
 
     /// Validate + persist + execute a single block. Returns the
@@ -5893,6 +5863,52 @@ fn process_tx_inventory_advertise(
     }
 }
 
+/// Core of [`SyncDriver::serve_sync_block_chain`], factored out so the inbound
+/// peer server ([`crate::inbound`]) shares one source of truth. Given a peer's
+/// `SyncBlockChain` locator, our head, and our block index, find the highest
+/// locator entry that sits on our main chain (the common ancestor) and return
+/// our block ids from there to head — the shared block first so the peer can
+/// verify the link — capped at `SYNC_FETCH_BATCH_NUM`, plus how many more blocks
+/// we hold beyond the batch (`remain_num`). `(empty, 0)` when we share no block.
+pub(crate) fn serve_sync_block_chain_ids(
+    block_index: &BlockIndexStore,
+    our_head: i64,
+    locator: &[tron_proto::block_inventory::BlockId],
+) -> (Vec<BlockId>, i64) {
+    // The locator is dense near the peer's head and sparse below; keep the
+    // highest entry whose id matches our main-chain block at that number.
+    let mut common: Option<i64> = None;
+    for entry in locator {
+        if entry.hash.len() != 32 {
+            continue;
+        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&entry.hash);
+        let their_id = BlockId::from_raw(raw);
+        if block_index
+            .get(entry.number)
+            .map(|ours| ours == their_id)
+            .unwrap_or(false)
+        {
+            common = Some(common.map_or(entry.number, |c| c.max(entry.number)));
+        }
+    }
+    let Some(start) = common else {
+        return (Vec::new(), 0);
+    };
+
+    const SYNC_FETCH_BATCH_NUM: i64 = 2000;
+    let end = (start + SYNC_FETCH_BATCH_NUM).min(our_head);
+    let mut ids = Vec::new();
+    for num in start..=end {
+        match block_index.get(num) {
+            Ok(id) => ids.push(id),
+            Err(_) => break,
+        }
+    }
+    (ids, (our_head - end).max(0))
+}
+
 /// Serve an inbound `FetchInvData` request by looking up each
 /// requested id and sending the corresponding body frame.
 ///   * `type=TRX` → look up in `mempool`; reply with one `Trx` frame
@@ -5905,7 +5921,7 @@ fn process_tx_inventory_advertise(
 ///
 /// Returns the wire-error string on send failure so the caller can
 /// drop the peer.
-async fn serve_tx_fetch_inv_data<S>(
+pub(crate) async fn serve_tx_fetch_inv_data<S>(
     conn: &mut PeerConnection<S>,
     payload: Bytes,
     mempool: Option<&TxMempool>,
@@ -6326,7 +6342,7 @@ fn is_catching_up(block: &Block) -> bool {
     now_ms.saturating_sub(block_ts) > TIP_MS
 }
 
-fn random_node_id() -> Vec<u8> {
+pub(crate) fn random_node_id() -> Vec<u8> {
     use tron_crypto::hash::sha256;
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -58,6 +58,12 @@ pub struct Metrics {
     mempool_rejected_by_reason: Mutex<HashMap<String, u64>>,
     // --- Peers (gauge) ----------------------------------------------------
     active_peers: AtomicI64,
+    /// Inbound P2P connections we are currently serving (peers that dialed
+    /// US and are syncing FROM us). Zero on a sync-only node.
+    p2p_inbound_peers: AtomicI64,
+    /// Total inbound sync requests served (`SyncBlockChain` inventories +
+    /// `FetchInvData` block/tx batches answered for inbound peers).
+    p2p_inbound_served: AtomicU64,
     // --- RPC (counters) ---------------------------------------------------
     rpc_requests_total: AtomicU64,
     /// Per-method counter — `{method_name: count}`. Mutex-protected
@@ -130,6 +136,8 @@ impl Metrics {
             mempool_evicted_expired: AtomicU64::new(0),
             mempool_rejected_by_reason: Mutex::new(HashMap::new()),
             active_peers: AtomicI64::new(0),
+            p2p_inbound_peers: AtomicI64::new(0),
+            p2p_inbound_served: AtomicU64::new(0),
             rpc_requests_total: AtomicU64::new(0),
             rpc_requests_by_method: Mutex::new(HashMap::new()),
             rpc_errors_by_method: Mutex::new(HashMap::new()),
@@ -252,6 +260,16 @@ impl Metrics {
     }
     pub fn set_active_peers(&self, n: i64) {
         self.active_peers.store(n, Ordering::Relaxed);
+    }
+
+    /// Set the current count of inbound peers syncing FROM us.
+    pub fn set_p2p_inbound_peers(&self, n: i64) {
+        self.p2p_inbound_peers.store(n, Ordering::Relaxed);
+    }
+
+    /// Bump the inbound-served counter (one per sync request answered).
+    pub fn inc_p2p_inbound_served(&self) {
+        self.p2p_inbound_served.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Uptime in seconds. Used by `/monitor/getstatsinfo`.
@@ -567,6 +585,18 @@ impl Metrics {
             "tron_node_active_peers",
             "Peers currently registered with the live peer registry (handshake completed).",
             self.active_peers.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_p2p_inbound_peers",
+            "Inbound P2P peers currently syncing FROM us (peers that dialed us).",
+            self.p2p_inbound_peers.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_p2p_inbound_served_total",
+            "Inbound sync requests served (SyncBlockChain + FetchInvData answered for inbound peers).",
+            self.p2p_inbound_served.load(Ordering::Relaxed),
         );
 
         // --- RPC counters ---

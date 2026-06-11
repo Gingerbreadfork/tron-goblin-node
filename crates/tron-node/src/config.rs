@@ -961,6 +961,18 @@ pub struct P2pConfig {
     /// runaway resource use on long peer-list misconfigurations.
     #[serde(default = "default_max_peers")]
     pub max_peers: usize,
+    /// Accept INBOUND P2P connections so other peers (java-tron deployments and
+    /// our own kind) can sync FROM us. When on, we bind `listen_host:advertise_port`
+    /// and serve the sync protocol (SyncBlockChain → inventory, FetchInvData →
+    /// blocks) over accepted connections. Default `true` — a full node should be
+    /// reachable; set `false` for a pure outbound-only / firewalled sync client.
+    #[serde(default = "default_listen")]
+    pub listen: bool,
+    /// Interface to bind the inbound P2P listener on. Default `0.0.0.0` (all
+    /// interfaces). The port is `advertise_port` (the same one we tell peers to
+    /// dial). Only consulted when `listen = true`.
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
     /// Enable Kademlia DHT peer discovery. When on, bootstraps from
     /// `peers` + `MAINNET_SEEDS` over UDP, then augments the TCP dial
     /// list with the discovered peers. Off keeps the legacy
@@ -1101,6 +1113,8 @@ impl Default for P2pConfig {
             use_mainnet_seeds: false,
             advertise_port: default_advertise_port(),
             max_peers: default_max_peers(),
+            listen: default_listen(),
+            listen_host: default_listen_host(),
             discover_enable: default_discover_enable(),
             discover_bootstrap_ms: default_discover_bootstrap_ms(),
             discover_tree_urls: default_discover_tree_urls(),
@@ -1117,6 +1131,14 @@ impl Default for P2pConfig {
 
 fn default_advertise_port() -> i32 {
     18_888
+}
+
+fn default_listen() -> bool {
+    true
+}
+
+fn default_listen_host() -> String {
+    "0.0.0.0".to_string()
 }
 
 fn default_discover_enable() -> bool {

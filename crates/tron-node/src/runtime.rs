@@ -1223,6 +1223,38 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         );
         combined_peers = shuffled;
     }
+    // Inbound P2P listener — lets other peers (java-tron deployments and our
+    // own kind) sync FROM us. Independent of the outbound dialers below: we
+    // serve even with zero configured outbound peers. Bind failures are
+    // non-fatal (the node keeps running as an outbound-only client).
+    if config.p2p.listen && !config.p2p.disabled {
+        let listen_host = config.p2p.listen_host.clone();
+        let listen_port = config.p2p.advertise_port;
+        match format!("{listen_host}:{listen_port}").parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let inbound_state = stores.to_state_backends();
+                let server = std::sync::Arc::new(crate::inbound::InboundServer::new(
+                    inbound_state.block_index.clone(),
+                    stores.blocks.clone(),
+                    inbound_state.dyn_props.clone(),
+                    Some(mempool.clone()),
+                    tron_types::genesis_block_id(&tron_types::mainnet_inputs()),
+                    config.p2p.advertise_port,
+                    Some(metrics.clone()),
+                    config.p2p.max_peers,
+                ));
+                let sd = shutdown.subscribe();
+                handles.push(tokio::spawn(crate::inbound::run_inbound_listener(
+                    server, addr, sd,
+                )));
+            }
+            Err(e) => {
+                warn!(listen_host, listen_port, error = %e,
+                    "invalid p2p listen address — inbound listener disabled");
+            }
+        }
+    }
+
     if !config.p2p.disabled && !combined_peers.is_empty() {
         // Multi-peer sync: one independent `SyncDriver` per configured
         // peer, each running in its own tokio task. They share the
