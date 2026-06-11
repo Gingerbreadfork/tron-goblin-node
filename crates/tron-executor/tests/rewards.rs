@@ -72,6 +72,7 @@ fn fresh_state() -> StateBackends {
         contract_state: Some(mem()),
         block_index: Some(mem()),
         witness_schedule: Some(mem()),
+        reward_vi: None,
     }
 }
 
@@ -352,6 +353,10 @@ fn voter_withdraws_reward_after_full_cycle() {
     let state = fresh_state();
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     dp.save_allow_change_delegation(1);
+    // The Vi (new) reward algorithm has been effective since cycle 0 —
+    // without this the withdraw routes through the legacy per-cycle
+    // path (java's pre-ALLOW_NEW_REWARD behavior).
+    dp.put_long(b"NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE", 0);
     dp.save_maintenance_time_interval(6 * 3600 * 1000);
     dp.save_next_maintenance_time(1_700_000_000_000);
 
@@ -390,9 +395,25 @@ fn voter_withdraws_reward_after_full_cycle() {
     dlg.add_reward(0, &Address::from_raw(w), 1_000_000_000);
 
     // Voter's begin/end cycles default to 0 with REMARK semantics;
-    // explicitly initialize so withdraw walks the right window.
+    // explicitly initialize so withdraw walks the right window. The
+    // chain ALWAYS writes the account_vote snapshot alongside these
+    // markers (java's withdrawReward tail / vote settlement), and the
+    // single-cycle catch-up pays from that snapshot — so seed it too.
     dlg.set_begin_cycle(&Address::from_raw(voter), 0);
     dlg.set_end_cycle(&Address::from_raw(voter), 1);
+    dlg.set_account_vote(
+        0,
+        &Address::from_raw(voter),
+        &Account {
+            address: voter.to_vec(),
+            votes: vec![Vote {
+                vote_address: w.to_vec(),
+                vote_count: 100,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Apply genesis (num=1) then a boundary block (num=2).
     apply_unsigned(
@@ -423,6 +444,7 @@ fn voter_withdraws_reward_after_full_cycle() {
         &accts,
         &dlg,
         &dp,
+        None,
     )
     .expect("withdraw");
     assert_eq!(

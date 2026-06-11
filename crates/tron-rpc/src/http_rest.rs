@@ -39,17 +39,44 @@ pub fn router(state: RpcState) -> Router {
     router_with_rate_limits(state, crate::RateLimitRegistry::empty())
 }
 
-/// Mount the endpoints with optional rate-limit gating. When the
-/// registry is non-empty, each request's path-tail is looked up
-/// (lowercased) and `try_acquire` runs before the handler. Failures
-/// return HTTP 429.
+/// [`router_with_limits`] with the global limiter disabled — kept as a
+/// stable entry point for existing callers.
 pub fn router_with_rate_limits(state: RpcState, limits: crate::RateLimitRegistry) -> Router {
+    router_with_limits(state, limits, crate::GlobalRateLimiter::disabled())
+}
+
+/// Mount the endpoints with rate-limit gating. When the registry is
+/// non-empty, each request's path-tail is looked up (lowercased) and
+/// `try_acquire` runs before the handler; the node-wide
+/// [`GlobalRateLimiter`](crate::GlobalRateLimiter) is consulted after
+/// the per-component check (java-tron's ordering). Failures return
+/// HTTP 429. Per-IP buckets use the socket peer address when the
+/// server is built with `into_make_service_with_connect_info`.
+pub fn router_with_limits(
+    state: RpcState,
+    limits: crate::RateLimitRegistry,
+    global: crate::GlobalRateLimiter,
+) -> Router {
     // Helper: bind a route whose handler delegates to a JSON-RPC
     // builder method. The HTTP body is wrapped in `[body]` to match the
     // `params[0]` shape that `methods::*` expects.
     macro_rules! builder {
         ($name:literal, $method:path) => {
             post(|state, query, body| forward_builder($method, state, query, body))
+        };
+    }
+    // Forward a java-shaped POST body to a positional-params method:
+    // each listed field is plucked from the body (Null when absent)
+    // and passed in order. `[]` with "@body" passes the WHOLE body as
+    // params[0] (tx-shaped endpoints).
+    macro_rules! mapped {
+        ($method:path, @body) => {
+            post(|state, query, body| forward_mapped($method, &["@body"], state, query, body))
+        };
+        ($method:path, [$($field:literal),*]) => {
+            post(|state, query, body| {
+                forward_mapped($method, &[$($field),*], state, query, body)
+            })
         };
     }
     macro_rules! getter_no_arg {
@@ -139,6 +166,140 @@ pub fn router_with_rate_limits(state: RpcState, limits: crate::RateLimitRegistry
         .route("/walletsolidity/getaccount", post(get_account))
         .route("/walletsolidity/gettransactionbyid", post(get_transaction_by_id))
         .route("/walletsolidity/gettransactioninfobyid", post(get_transaction_info_by_id))
+        // ---- java parity sweep (4.8.x servlet list) ----
+        // Reads forwarded onto the same positional-params methods the
+        // JSON-RPC surface dispatches to; bodies use java's field names.
+        .route("/wallet/getreward", mapped!(methods::get_reward, ["address"]))
+        .route("/wallet/getbrokerage", mapped!(methods::get_brokerage, ["address"]))
+        .route(
+            "/wallet/getdelegatedresource",
+            mapped!(methods::get_delegated_resource, ["fromAddress", "toAddress"]),
+        )
+        .route(
+            "/wallet/getdelegatedresourcev2",
+            mapped!(methods::get_delegated_resource_v2, ["fromAddress", "toAddress"]),
+        )
+        .route(
+            "/wallet/getdelegatedresourceaccountindex",
+            mapped!(methods::get_delegated_resource_account_index, ["value"]),
+        )
+        .route(
+            "/wallet/getdelegatedresourceaccountindexv2",
+            mapped!(methods::get_delegated_resource_account_index_v2, ["value"]),
+        )
+        .route(
+            "/wallet/getcandelegatedmaxsize",
+            mapped!(methods::get_can_delegated_max_size, ["owner_address", "type"]),
+        )
+        .route(
+            "/wallet/getavailableunfreezecount",
+            mapped!(methods::get_available_unfreeze_count, ["owner_address"]),
+        )
+        .route(
+            "/wallet/getcanwithdrawunfreezeamount",
+            mapped!(
+                methods::get_can_withdraw_unfreeze_amount,
+                ["owner_address", "timestamp"]
+            ),
+        )
+        .route("/wallet/getaccountbyid", mapped!(methods::get_account_by_id, ["account_id"]))
+        .route("/wallet/getaccountnet", mapped!(methods::get_account_net, ["address"]))
+        .route(
+            "/wallet/getassetissuebyaccount",
+            mapped!(methods::get_asset_issue_by_account, ["address"]),
+        )
+        .route(
+            "/wallet/getassetissuebyid",
+            mapped!(methods::get_asset_issue_by_id, ["value"]),
+        )
+        .route(
+            "/wallet/getassetissuebyname",
+            mapped!(methods::get_asset_issue_by_name, ["value"]),
+        )
+        .route(
+            "/wallet/getassetissuelistbyname",
+            mapped!(methods::get_asset_issue_list_by_name, ["value"]),
+        )
+        .route("/wallet/getassetissuelist", getter_no_arg!(methods::list_assets))
+        .route(
+            "/wallet/getpaginatedassetissuelist",
+            mapped!(methods::get_paginated_asset_issue_list, ["offset", "limit"]),
+        )
+        .route(
+            "/wallet/getpaginatedproposallist",
+            mapped!(methods::get_paginated_proposal_list, ["offset", "limit"]),
+        )
+        .route(
+            "/wallet/getpaginatedexchangelist",
+            mapped!(methods::get_paginated_exchange_list, ["offset", "limit"]),
+        )
+        .route("/wallet/listproposals", getter_no_arg!(methods::list_proposals))
+        .route("/wallet/listexchanges", getter_no_arg!(methods::list_exchanges))
+        .route("/wallet/getproposalbyid", mapped!(methods::get_proposal_by_id, ["id"]))
+        .route("/wallet/getexchangebyid", mapped!(methods::get_exchange_by_id, ["id"]))
+        .route(
+            "/wallet/getmarketorderbyaccount",
+            mapped!(methods::get_market_order_by_account, ["value"]),
+        )
+        .route(
+            "/wallet/getmarketorderbyid",
+            mapped!(methods::get_market_order_by_id, ["value"]),
+        )
+        .route(
+            "/wallet/getmarketorderlistbypair",
+            mapped!(
+                methods::get_market_order_list_by_pair,
+                ["sell_token_id", "buy_token_id"]
+            ),
+        )
+        .route(
+            "/wallet/getmarketpricebypair",
+            mapped!(
+                methods::get_market_price_by_pair,
+                ["sell_token_id", "buy_token_id"]
+            ),
+        )
+        .route("/wallet/getmarketpairlist", getter_no_arg!(methods::get_market_pair_list))
+        .route("/wallet/getblock", mapped!(methods::get_block, ["id_or_num", "detail"]))
+        .route(
+            "/wallet/getblockbalance",
+            mapped!(methods::get_block_balance_trace, ["number"]),
+        )
+        .route(
+            "/wallet/gettransactioninfobyblocknum",
+            mapped!(methods::get_transaction_info_by_block_num, ["num"]),
+        )
+        .route(
+            "/wallet/gettransactioncountbyblocknum",
+            mapped!(methods::get_transaction_count_by_block_num, ["num"]),
+        )
+        .route("/wallet/totaltransaction", getter_no_arg!(methods::get_total_transaction))
+        .route("/wallet/getsignweight", mapped!(methods::get_sign_weight, @body))
+        .route("/wallet/getapprovedlist", mapped!(methods::get_approved_list, @body))
+        .route(
+            "/wallet/broadcasthex",
+            mapped!(methods::broadcast_transaction_v2, ["transaction"]),
+        )
+        // java's name for what we already serve at clearcontractabi.
+        .route("/wallet/clearabi", builder!("clearabi", methods::clear_abi))
+        // Solidity mirrors for the read set java exposes there.
+        .route(
+            "/walletsolidity/getdelegatedresource",
+            mapped!(methods::get_delegated_resource, ["fromAddress", "toAddress"]),
+        )
+        .route(
+            "/walletsolidity/getdelegatedresourcev2",
+            mapped!(methods::get_delegated_resource_v2, ["fromAddress", "toAddress"]),
+        )
+        .route(
+            "/walletsolidity/getassetissuelist",
+            getter_no_arg!(methods::list_assets),
+        )
+        .route("/walletsolidity/getreward", mapped!(methods::get_reward, ["address"]))
+        .route(
+            "/walletsolidity/getbrokerage",
+            mapped!(methods::get_brokerage, ["address"]),
+        )
         // ---- /monitor (java-tron operational endpoints) ----
         // `/monitor/getnodeinfo` is the standard `MetricsInfoServlet`
         // shape — same payload as `/wallet/getnodeinfo`, just a
@@ -229,10 +390,10 @@ pub fn router_with_rate_limits(state: RpcState, limits: crate::RateLimitRegistry
     // returns immediately. Otherwise it parses the path tail and
     // consults the registry, rejecting with HTTP 429 on overrun.
     use axum::middleware::from_fn_with_state;
-    let router = if limits.is_empty() {
+    let router = if limits.is_empty() && global.is_disabled() {
         router
     } else {
-        router.layer(from_fn_with_state(limits, rate_limit_middleware))
+        router.layer(from_fn_with_state((limits, global), rate_limit_middleware))
     };
     router
 }
@@ -242,20 +403,35 @@ pub fn router_with_rate_limits(state: RpcState, limits: crate::RateLimitRegistry
 /// `PreemptibleCounter` guards are dropped after the inner handler
 /// returns so the slot is freed when the response is sent.
 async fn rate_limit_middleware(
-    axum::extract::State(reg): axum::extract::State<crate::RateLimitRegistry>,
+    axum::extract::State((reg, global)): axum::extract::State<(
+        crate::RateLimitRegistry,
+        crate::GlobalRateLimiter,
+    )>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_string();
     let component = crate::rate_limit::component_for_http_path(&path);
-    let Some(limit) = reg.get(&component) else {
-        return next.run(req).await;
+    // Source IP for per-IP buckets — present when the server was built
+    // with `into_make_service_with_connect_info::<SocketAddr>()`;
+    // absent (anonymous shared bucket) otherwise.
+    let ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let mut _guard = None;
+    // Per-component first, then the node-wide limiter — java-tron's
+    // RateLimiterServlet ordering (an exhausted global still consumes
+    // the per-component token).
+    let component_ok = match reg.get(&component) {
+        Some(limit) => {
+            let (ok, guard) = limit.try_acquire(ip);
+            _guard = guard;
+            ok
+        }
+        None => true,
     };
-    // IP-based limits would need ConnectInfo here — we don't currently
-    // plumb it through axum. Pass `None` so the IpQps strategy falls
-    // back to a fixed "anonymous" bucket.
-    let (ok, _guard) = limit.try_acquire(None);
-    if !ok {
+    if !component_ok || !global.try_acquire(ip) {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded",
@@ -296,6 +472,31 @@ async fn forward_builder(
 
 /// Like [`forward_builder`] but for read endpoints that take no params.
 /// Honours `?visible=true` for response rewriting.
+/// Pluck java's named body fields into a positional params array and
+/// call the method. `"@body"` passes the whole body as params[0].
+async fn forward_mapped(
+    method: fn(&Value, &RpcState) -> Result<Value, methods::RpcError>,
+    fields: &'static [&'static str],
+    State(state): State<RpcState>,
+    Query(_query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let params = if fields == ["@body"] {
+        Value::Array(vec![body])
+    } else {
+        Value::Array(
+            fields
+                .iter()
+                .map(|f| body.get(*f).cloned().unwrap_or(Value::Null))
+                .collect(),
+        )
+    };
+    match method(&params, &state) {
+        Ok(v) => api_ok(v),
+        Err(e) => api_err(e),
+    }
+}
+
 async fn forward_no_arg(
     method: fn(&Value, &RpcState) -> Result<Value, methods::RpcError>,
     State(state): State<RpcState>,

@@ -219,6 +219,9 @@ impl ApplyPipeline {
             contract_state: opt(&mut overlays, Id::ContractState, &base.contract_state),
             block_index: opt(&mut overlays, Id::BlockIndex, &base.block_index),
             witness_schedule: opt(&mut overlays, Id::WitnessSchedule, &base.witness_schedule),
+            // Read-only pass-through — never in a block's write-set, so it
+            // needs no pending overlay.
+            reward_vi: base.reward_vi.clone(),
         };
         Self {
             base: base.clone(),

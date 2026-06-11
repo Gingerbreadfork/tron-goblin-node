@@ -198,6 +198,9 @@ fn versioned_state(
         contract_state: wo(SID_CONTRACT_STATE, &base.contract_state),
         block_index: wo(SID_BLOCK_INDEX, &base.block_index),
         witness_schedule: wo(SID_WITNESS_SCHEDULE, &base.witness_schedule),
+        // Read-only pass-through: never written by any tx, so it needs no
+        // MVCC versioning (reads go straight to base).
+        reward_vi: base.reward_vi.clone(),
     }
 }
 

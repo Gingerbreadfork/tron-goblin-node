@@ -121,12 +121,13 @@ pub fn execute_vote_witness(
     votes_store: &VotesStore,
     delegation: &DelegationStore,
     dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&tron_chainbase::RewardViStore>,
     contract: &VoteWitnessContract,
 ) -> Result<(), ActuatorError> {
     let owner =
         decode_address(&contract.owner_address).ok_or(ActuatorError::InvalidOwnerAddress)?;
 
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props)?;
+    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut owner_account = accounts
         .get(&owner)?

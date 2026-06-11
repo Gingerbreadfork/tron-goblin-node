@@ -416,6 +416,13 @@ pub struct StateBackends {
     /// because unit tests of single-contract paths don't need it; in
     /// production it's always attached.
     pub witness_schedule: Option<Arc<dyn KvBackend>>,
+    /// `reward-vi` store — READ-ONLY pass-through (block execution never
+    /// writes it; java-tron's `RewardViCalService` computes it once,
+    /// merkle-pinned). Consulted by reward settlement / queries for
+    /// voters whose reward window predates the new reward algorithm
+    /// (`ALLOW_OLD_REWARD_OPT`). Not session-wrapped, not undo-logged,
+    /// not checkpointed — there is nothing to roll back.
+    pub reward_vi: Option<Arc<dyn KvBackend>>,
 }
 
 // =============================================================================
@@ -450,6 +457,9 @@ struct TxSession {
     storage_row: Option<Arc<SessionBackend>>,
     contract_state: Option<Arc<SessionBackend>>,
     block_index: Option<Arc<SessionBackend>>,
+    /// READ-ONLY pass-through (never session-wrapped — block execution
+    /// never writes the reward-vi store).
+    reward_vi: Option<Arc<dyn KvBackend>>,
 }
 
 impl TxSession {
@@ -496,6 +506,7 @@ impl TxSession {
                 .block_index
                 .as_ref()
                 .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            reward_vi: base.reward_vi.clone(),
         }
     }
 
@@ -613,6 +624,7 @@ impl TxSession {
             contract_state: upo(&self.contract_state),
             block_index: upo(&self.block_index),
             witness_schedule: None,
+            reward_vi: self.reward_vi.clone(),
         }
     }
 }
@@ -694,6 +706,7 @@ struct SessionStoreOwners {
     market_orders: MarketOrderStore,
     nullifiers: NullifierStore,
     merkle_trees: Option<IncrementalMerkleTreeStore>,
+    reward_vi: Option<tron_chainbase::RewardViStore>,
 }
 
 impl SessionStoreOwners {
@@ -727,6 +740,10 @@ impl SessionStoreOwners {
                 .merkle_trees
                 .as_ref()
                 .map(|b| IncrementalMerkleTreeStore::new(b.clone())),
+            reward_vi: state
+                .reward_vi
+                .as_ref()
+                .map(|b| tron_chainbase::RewardViStore::new(b.clone())),
         }
     }
 
@@ -751,6 +768,7 @@ impl SessionStoreOwners {
             market_orders: &self.market_orders,
             nullifiers: &self.nullifiers,
             merkle_trees: self.merkle_trees.as_ref(),
+            reward_vi: self.reward_vi.as_ref(),
         }
     }
 }
@@ -1308,6 +1326,8 @@ struct BlockSession {
     contract_state: Option<Arc<SessionBackend>>,
     block_index: Option<Arc<SessionBackend>>,
     witness_schedule: Option<Arc<SessionBackend>>,
+    /// READ-ONLY pass-through — see `StateBackends::reward_vi`.
+    reward_vi: Option<Arc<dyn tron_chainbase::KvBackend>>,
 }
 
 impl BlockSession {
@@ -1355,6 +1375,7 @@ impl BlockSession {
                 .witness_schedule
                 .as_ref()
                 .map(|b| Arc::new(SessionBackend::new(b.clone()))),
+            reward_vi: state.reward_vi.clone(),
         }
     }
 
@@ -1396,6 +1417,7 @@ impl BlockSession {
                 .witness_schedule
                 .clone()
                 .map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
+            reward_vi: self.reward_vi.clone(),
         }
     }
 
@@ -3076,6 +3098,15 @@ fn execute_vm_tx(
         // row). Routed through the inner session so a reverted VM
         // frame doesn't leave votes persisted.
         votes: Some(Arc::new(VotesStore::new(vm_session.votes.clone() as _))),
+        // reward-vi: read-only legacy-reward accumulator (no session
+        // wrapping — never written by execution).
+        reward_vi: view
+            .reward_vi
+            .as_ref()
+            .map(|b| Arc::new(tron_chainbase::RewardViStore::new(b.clone()))),
+        // abi: only deleted (SELFDESTRUCT cleanup) — routed through the
+        // per-tx session like `contracts`, so a failed tx reverts it.
+        abi: Some(Arc::new(tron_chainbase::AbiStore::new(view.abi.clone()))),
     };
 
     // Read current block number/time from the dyn-props session (so we

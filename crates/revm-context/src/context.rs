@@ -676,6 +676,23 @@ impl<
     // stores receive the actuator-driven writes. Defaults on
     // TronDatabaseExt keep stock DBs (`EmptyDB` etc.) returning 0.
 
+    fn tron_selfdestruct_restriction(&self) -> bool {
+        self.journaled_state.tron_selfdestruct_restriction_effective()
+    }
+
+    fn tron_account_created_locally(&self, address: Address) -> bool {
+        self.journaled_state.tron_account_created_locally(address)
+    }
+
+    fn tron_suicide(&mut self, owner: Address, obtainer: Address, will_destroy: bool) -> i64 {
+        let result = self
+            .journaled_state
+            .db_mut()
+            .tron_suicide(owner, obtainer, will_destroy);
+        self.apply_tron_balance_deltas();
+        result
+    }
+
     fn tron_freeze(
         &mut self,
         caller: Address,
@@ -819,6 +836,22 @@ impl<
     /// load, the delta is dropped — the bridge's chainbase write
     /// already happened, so we'd rather keep going than fail the call.
     #[inline]
+    /// Multi-delta sibling of [`apply_tron_balance_delta`](Self::apply_tron_balance_delta)
+    /// -- drains every pending delta (suicide moves several balances).
+    fn apply_tron_balance_deltas(&mut self) {
+        for (address, delta) in self.journaled_state.db_mut().tron_take_balance_deltas() {
+            if delta == 0 || address == Address::ZERO {
+                continue;
+            }
+            if delta > 0 {
+                let _ = self.journaled_state.balance_incr(address, U256::from(delta as u64));
+            } else {
+                let abs = (-delta) as u64;
+                let _ = self.journaled_state.balance_decr(address, U256::from(abs));
+            }
+        }
+    }
+
     fn apply_tron_balance_delta(&mut self) {
         let (address, delta) = self.journaled_state.db_mut().tron_take_last_balance_delta();
         if delta == 0 || address == Address::ZERO {

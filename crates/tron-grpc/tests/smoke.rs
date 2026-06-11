@@ -85,6 +85,7 @@ fn fixture() -> RpcState {
     ).unwrap();
 
     RpcState {
+        reward_vi: None,
         accounts: Arc::new(AccountStore::new(accounts_be)),
         blocks: Arc::new(BlockStore::new(blocks_be)),
         block_index: Arc::new(BlockIndexStore::new(block_index_be)),

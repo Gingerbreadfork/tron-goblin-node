@@ -139,6 +139,27 @@ pub trait JournalTr {
     /// Sets the spec id.
     fn set_spec_id(&mut self, spec_id: SpecId);
 
+    /// TRON fork: effective SELFDESTRUCT-restriction gate (proposal #94
+    /// override when set, else the spec-derived EIP-6780 rule).
+    fn tron_selfdestruct_restriction_effective(&self) -> bool {
+        false
+    }
+
+    /// TRON fork: was `address` created in the current transaction?
+    fn tron_account_created_locally(&self, _address: Address) -> bool {
+        false
+    }
+
+    /// TRON fork: set the journal's SELFDESTRUCT overrides (restriction
+    /// gate + burn-account redirect). Default no-op for journals that
+    /// don't carry the TRON cfg.
+    fn set_tron_selfdestruct_overrides(
+        &mut self,
+        _restriction: Option<bool>,
+        _blackhole: Option<Address>,
+    ) {
+    }
+
     /// Sets EIP-7708 configuration flags.
     ///
     /// - `disabled`: Whether EIP-7708 (ETH transfers emit logs) is completely disabled.

@@ -22,6 +22,7 @@ members = [
     "crates/tron-state-diff",
     "crates/tron-wallet",
     "crates/tron-eventer",
+    "crates/tron-eventer-kafka",
     # Vendored forks of two revm component crates — needed so we can:
     #  * extend `CallInputs` with the TRC-10 transfer fields
     #    (`tron_token_id`, `tron_token_value`)

@@ -31,6 +31,10 @@ pub struct RpcState {
     /// etc.). Absent in minimal Ethereum-compat configurations.
     pub witnesses: Option<Arc<WitnessStore>>,
     pub delegation: Option<Arc<DelegationStore>>,
+    /// `reward-vi` store — legacy-reward (`ALLOW_OLD_REWARD_OPT`) fast
+    /// path for `getReward` on voters whose window predates the new
+    /// reward algorithm. Optional like the other governance stores.
+    pub reward_vi: Option<Arc<tron_chainbase::RewardViStore>>,
     pub delegated_resources: Option<Arc<DelegatedResourceStore>>,
     pub proposals: Option<Arc<ProposalStore>>,
     pub assets_v2: Option<Arc<AssetIssueV2Store>>,
@@ -177,6 +181,7 @@ impl RpcState {
             storage: None,
             witnesses: None,
             delegation: None,
+            reward_vi: None,
             delegated_resources: None,
             proposals: None,
             assets_v2: None,
@@ -296,6 +301,13 @@ impl RpcState {
         self.proposals = Some(Arc::new(ProposalStore::new(proposals)));
         self.assets_v2 = Some(Arc::new(AssetIssueV2Store::new(assets_v2)));
         self.exchanges_v2 = Some(Arc::new(ExchangeV2Store::new(exchanges_v2)));
+        self
+    }
+
+    /// Attach the `reward-vi` store (legacy-reward fast path for
+    /// `getReward` — see the field docs).
+    pub fn with_reward_vi(mut self, reward_vi: Arc<dyn KvBackend>) -> Self {
+        self.reward_vi = Some(Arc::new(tron_chainbase::RewardViStore::new(reward_vi)));
         self
     }
 

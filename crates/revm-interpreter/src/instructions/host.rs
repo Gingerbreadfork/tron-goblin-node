@@ -387,3 +387,73 @@ pub fn selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resu
 
     Err(InstructionResult::SelfDestruct)
 }
+
+/// TRON SELFDESTRUCT (0xff) -- java-tron `suicideAction` / `suicideAction2`.
+///
+/// On top of the standard journal selfdestruct (which already follows the
+/// proposal-#94 destroy rule and the burn-account redirect via the TRON
+/// journal cfg), this:
+///
+/// 1. Validates `canSuicide` / `canSuicide2` via `Host::tron_suicide`
+///    -- outstanding delegations REVERT the frame (java sets revert and
+///    stops; gas charged so far is kept, the rest refunded).
+/// 2. Applies the TRON chainbase side-effects (reward settlement + vote
+///    cancellation, TRC-10 sweep, frozen v1/v2 transfer, expired-unfreeze
+///    credit) BEFORE the journal moves the TRX balance, mirroring
+///    java-tron's ordering inside `Program.suicide` (the allowance fold
+///    must land before the balance is read).
+/// 3. Charges `SUICIDE_V2` (5000) base energy when the restriction
+///    proposal is active (java `EnergyCost.getSuicideCost3`); the
+///    pre-#94 base stays 0 via the Frontier-pinned table.
+pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    require_non_staticcall!(context.interpreter);
+    popn!([target], context.interpreter);
+    let target = target.into_address();
+    let owner = context.interpreter.input.target_address();
+
+    // java `EnergyCost.getSuicideCost3`: SUICIDE_V2 = 5000 base under
+    // the restriction proposal (pre-#94 SUICIDE = 0).
+    let restriction = context.host.tron_selfdestruct_restriction();
+    if restriction {
+        gas!(context.interpreter, 5000);
+    }
+
+    let created_locally = context.host.tron_account_created_locally(owner);
+    let will_destroy = created_locally || !restriction;
+
+    // Chainbase side-effects + canSuicide validation. -1 => revert the
+    // frame (java: `program.getResult().setRevert(); program.stop()`).
+    if context.host.tron_suicide(owner, target, will_destroy) < 0 {
+        return Err(InstructionResult::Revert);
+    }
+
+    // Standard journal selfdestruct -- destroy/no-op/transfer per the
+    // (overridden) 6780 rule, burn-account redirect for self-target.
+    let spec = context.host.gas_params().spec();
+    let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
+    let skip_cold_load = context.interpreter.gas.remaining() < cold_load_gas;
+    let res = context.host.selfdestruct(owner, target, skip_cold_load)?;
+
+    let should_charge_topup = if spec.is_enabled_in(SpecId::SPURIOUS_DRAGON) {
+        res.had_value && !res.target_exists
+    } else {
+        !res.target_exists
+    };
+
+    gas!(
+        context.interpreter,
+        context
+            .host
+            .gas_params()
+            .selfdestruct_cost(should_charge_topup, res.is_cold)
+    );
+
+    if !res.previously_destroyed {
+        context
+            .interpreter
+            .gas
+            .record_refund(context.host.gas_params().selfdestruct_refund());
+    }
+
+    Err(InstructionResult::SelfDestruct)
+}

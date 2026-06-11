@@ -5022,6 +5022,19 @@ impl SyncDriver {
             if let Some(m) = &self.metrics {
                 m.set_solidified_block_number(solid);
             }
+            // solidityTrigger — java posts one whenever the solidified
+            // pointer advances (EventPluginLoader SOLIDITY topic).
+            if let Some(bus) = &self.event_bus {
+                if !bus.is_empty() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    bus.emit_solidified_block(&tron_eventer::trigger::SolidifiedBlockEvent::new(
+                        solid, now_ms,
+                    ));
+                }
+            }
         }
     }
 
@@ -5298,6 +5311,10 @@ impl SyncDriver {
             .map(|r| tron_eventer::TxOutcomeSlice {
                 tx_id: r.tx_id,
                 contract_result: format!("{:?}", r.outcome),
+                energy_usage_total: r.receipt.energy_usage_total,
+                energy_fee: r.receipt.energy_fee,
+                net_usage: r.receipt.net_usage,
+                net_fee: r.receipt.net_fee,
             })
             .collect();
         tron_eventer::emit_block_and_transactions(
@@ -5357,12 +5374,13 @@ impl SyncDriver {
             // list (revm collapses logs across frames). java-tron's
             // logsfilter accepts this approximation — consumers that
             // want per-frame caller info read the trace anyway.
-            let origin_hex = tx
+            // java posts base58check addresses on contract triggers.
+            let origin_b58 = tx
                 .raw_data
                 .as_ref()
                 .and_then(|r| r.contract.first())
                 .and_then(|c| c.parameter.as_ref())
-                .map(|any| extract_owner_address_hex(&any.value))
+                .map(|any| extract_owner_address_b58(&any.value))
                 .unwrap_or_default();
             let tx_id_hex = hex::encode(result.tx_id);
 
@@ -5371,12 +5389,18 @@ impl SyncDriver {
                 let mut tron_addr = [0u8; 21];
                 tron_addr[0] = 0x41;
                 tron_addr[1..].copy_from_slice(&vm_log.address);
-                let contract_addr_hex = hex::encode(tron_addr);
-                let creator_hex = contract_store
+                let contract_addr_b58 = tron_crypto::base58check::encode_check(&tron_addr);
+                let creator_b58 = contract_store
                     .get(&tron_crypto::address::Address::from_raw(tron_addr))
                     .ok()
                     .flatten()
-                    .map(|c| hex::encode(&c.origin_address))
+                    .map(|c| {
+                        if c.origin_address.len() == 21 {
+                            tron_crypto::base58check::encode_check(&c.origin_address)
+                        } else {
+                            String::new()
+                        }
+                    })
                     .unwrap_or_default();
 
                 let ctx = crate::abi_event_decoder::EventLogContext {
@@ -5384,10 +5408,10 @@ impl SyncDriver {
                     block_number,
                     block_hash_hex: block_hash_hex.clone(),
                     transaction_id_hex: tx_id_hex.clone(),
-                    contract_address_hex: contract_addr_hex,
-                    origin_address_hex: origin_hex.clone(),
-                    caller_address_hex: origin_hex.clone(),
-                    creator_address_hex: creator_hex,
+                    contract_address_hex: contract_addr_b58,
+                    origin_address_hex: origin_b58.clone(),
+                    caller_address_hex: origin_b58.clone(),
+                    creator_address_hex: creator_b58,
                     unique_id: format!("{}_{}", tx_id_hex, log_index),
                     removed: false,
                     latest_solidified_block_number: latest_solid,
@@ -6192,7 +6216,7 @@ fn fifo_set_insert(
 /// contract type starts with this field, so a single protobuf-prefix
 /// peek covers all of them — cheaper than full-decode dispatch on
 /// `ContractType`. Returns the empty string on malformed input.
-fn extract_owner_address_hex(any_value: &[u8]) -> String {
+fn extract_owner_address_b58(any_value: &[u8]) -> String {
     // Tag byte for field=1 wire-type=2 is `(1 << 3) | 2 = 0x0a`.
     if any_value.len() < 2 || any_value[0] != 0x0a {
         return String::new();
@@ -6202,7 +6226,7 @@ fn extract_owner_address_hex(any_value: &[u8]) -> String {
     if len != 21 || any_value.len() < 2 + 21 {
         return String::new();
     }
-    hex::encode(&any_value[2..2 + 21])
+    tron_crypto::base58check::encode_check(&any_value[2..2 + 21])
 }
 
 /// Classify a `PeerFailure` reason as *expected* discovery-pool churn —
@@ -7260,6 +7284,7 @@ mod solidify_tests {
             contract_state: Some(mem()),
             block_index: Some(mem()),
             witness_schedule: Some(mem()),
+            reward_vi: None,
         }
     }
 
@@ -7847,6 +7872,7 @@ mod pipelined_apply_tests {
             contract_state: Some(mem()),
             block_index: Some(mem()),
             witness_schedule: Some(mem()),
+            reward_vi: None,
         }
     }
 

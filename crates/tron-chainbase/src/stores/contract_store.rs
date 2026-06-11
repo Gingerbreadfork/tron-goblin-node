@@ -51,6 +51,13 @@ impl ContractStore {
         Ok(Some(SmartContract::decode(bytes.as_slice())?))
     }
 
+    /// Remove a contract row -- SELFDESTRUCT cleanup (java-tron
+    /// `TransactionTrace.deleteContract`). Idempotent.
+    pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
+        self.backend.delete(address.as_bytes())?;
+        Ok(())
+    }
+
     pub fn contains(&self, address: &Address) -> Result<bool, StoreError> {
         Ok(self.backend.contains(address.as_bytes())?)
     }

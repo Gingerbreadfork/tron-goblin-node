@@ -273,6 +273,70 @@ pub fn component_for_http_path(path: &str) -> String {
         .to_lowercase()
 }
 
+/// Normalize a configured component name to registry-key form:
+/// lowercased, with java-tron's `Servlet` class-name suffix stripped —
+/// so a config.conf copied from java-tron (`component =
+/// "GetAccountServlet"`) matches our path-derived key (`getaccount`).
+/// gRPC method components (`protocol.Wallet/GetAccount`) only get the
+/// lowercasing.
+pub fn normalize_component(component: &str) -> String {
+    let lower = component.to_lowercase();
+    match lower.strip_suffix("servlet") {
+        Some(stripped) if !stripped.is_empty() && !lower.contains('/') => stripped.to_string(),
+        _ => lower,
+    }
+}
+
+/// Node-wide request limits applied AFTER any per-component limit —
+/// java-tron's `GlobalRateLimiter`: one global QPS bucket plus a
+/// per-source-IP QPS bucket, both consulted on every HTTP servlet and
+/// gRPC call. Defaults (50 000 qps global / 10 000 qps per IP) are
+/// far above organic traffic; they exist to blunt floods.
+///
+/// Cheap to clone — both buckets are shared via `Arc`. A non-positive
+/// qps disables the corresponding check.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalRateLimiter {
+    qps: Option<Arc<QpsBucket>>,
+    ip_qps: Option<Arc<IpQpsBuckets>>,
+}
+
+impl GlobalRateLimiter {
+    pub fn new(qps: f64, ip_qps: f64) -> Self {
+        Self {
+            qps: (qps > 0.0).then(|| Arc::new(QpsBucket::new(qps))),
+            ip_qps: (ip_qps > 0.0).then(|| Arc::new(IpQpsBuckets::new(ip_qps))),
+        }
+    }
+
+    /// A limiter that admits everything (both checks disabled).
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// `true` iff the request is admitted by BOTH the global and the
+    /// per-IP bucket (java rejects when either is exhausted). An
+    /// unknown source IP shares one anonymous bucket.
+    pub fn try_acquire(&self, ip: Option<IpAddr>) -> bool {
+        if let Some(qps) = &self.qps {
+            if !qps.try_acquire() {
+                return false;
+            }
+        }
+        if let Some(ip_qps) = &self.ip_qps {
+            let ip = ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+            if !ip_qps.try_acquire(ip) {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.qps.is_none() && self.ip_qps.is_none()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +438,45 @@ mod tests {
         assert_eq!(component_for_http_path("/wallet/getaccount/"), "getaccount");
         assert_eq!(component_for_http_path("/"), "");
         assert_eq!(component_for_http_path(""), "");
+    }
+
+    #[test]
+    fn normalize_component_strips_servlet_suffix() {
+        assert_eq!(normalize_component("GetAccountServlet"), "getaccount");
+        assert_eq!(normalize_component("getaccount"), "getaccount");
+        // gRPC components keep the full method path (lowercased).
+        assert_eq!(
+            normalize_component("protocol.Wallet/GetAccount"),
+            "protocol.wallet/getaccount"
+        );
+        // Degenerate name that IS just "servlet" stays as-is.
+        assert_eq!(normalize_component("Servlet"), "servlet");
+    }
+
+    #[test]
+    fn global_rate_limiter_disabled_admits_everything() {
+        let g = GlobalRateLimiter::disabled();
+        assert!(g.is_disabled());
+        for _ in 0..1000 {
+            assert!(g.try_acquire(None));
+        }
+    }
+
+    #[test]
+    fn global_rate_limiter_rejects_when_global_bucket_drains() {
+        let g = GlobalRateLimiter::new(1.0, 0.0); // 1 qps global, ip check off
+        assert!(g.try_acquire(None));
+        assert!(!g.try_acquire(None));
+    }
+
+    #[test]
+    fn global_rate_limiter_per_ip_buckets_are_independent() {
+        let g = GlobalRateLimiter::new(0.0, 1.0); // global off, 1 qps per ip
+        let a = Some(IpAddr::V4("1.1.1.1".parse().unwrap()));
+        let b = Some(IpAddr::V4("2.2.2.2".parse().unwrap()));
+        assert!(g.try_acquire(a));
+        assert!(g.try_acquire(b));
+        assert!(!g.try_acquire(a));
     }
 
     #[test]

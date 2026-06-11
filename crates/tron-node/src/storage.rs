@@ -56,6 +56,11 @@ pub struct OpenedStores {
     pub market_pair_price_to_order: Arc<dyn KvBackend>,
     pub balance_trace: Arc<dyn KvBackend>,
     pub witness_schedule: Arc<dyn KvBackend>,
+    /// `reward-vi` — java-tron's background-computed legacy-reward
+    /// accumulator (`RewardViCalService`, merkle-pinned). READ-ONLY for
+    /// us: consulted by reward settlement/queries for voters whose
+    /// window predates the new reward algorithm (`ALLOW_OLD_REWARD_OPT`).
+    pub reward_vi: Arc<dyn KvBackend>,
     /// Per-block undo log powering KhaosDb Phase B reorg-with-rollback.
     /// On a fresh node this starts empty; every block applied via the
     /// SyncDriver writes a record here. Pruned beyond the reorg horizon.
@@ -634,6 +639,7 @@ impl OpenedStores {
         let market_pair_price_to_order = wrap("market_pair_price_to_order")?;
         let balance_trace = wrap("balance-trace")?;
         let witness_schedule = wrap("witness_schedule")?;
+        let reward_vi = open("reward-vi")?;
 
         Ok(Self {
             accounts,
@@ -676,6 +682,7 @@ impl OpenedStores {
             market_pair_price_to_order,
             balance_trace,
             witness_schedule,
+            reward_vi,
             block_undo: open("block-undo")?,
             pbft_sign_data: open("pbft-sign-data")?,
             common_database: open("common-database")?,
@@ -683,6 +690,21 @@ impl OpenedStores {
             mempool: open("mempool")?,
             snapshots: SnapshotStack::from_named(snapshots),
         })
+    }
+
+    /// java `ChainBaseManager`: the node runs a LITE dataset when the
+    /// lowest block in `block-index` is above 1 — the history below it
+    /// was pruned (`admin db lite` / java's LiteFullNodeTool split).
+    pub fn is_lite_node(&self) -> bool {
+        match self.block_index.scan_from(&[], 1) {
+            Ok(rows) => match rows.first() {
+                Some((key, _)) if key.len() == 8 => {
+                    i64::from_be_bytes(key.as_slice().try_into().unwrap_or([0; 8])) > 1
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
     }
 
     /// Build the `StateBackends` handle for the executor.
@@ -718,6 +740,7 @@ impl OpenedStores {
             contract_state: Some(self.contract_state.clone()),
             block_index: Some(self.block_index.clone()),
             witness_schedule: Some(self.witness_schedule.clone()),
+            reward_vi: Some(self.reward_vi.clone()),
         }
     }
 
@@ -742,6 +765,7 @@ impl OpenedStores {
             self.asset_v2.clone(),
             self.exchange_v2.clone(),
         )
+        .with_reward_vi(self.reward_vi.clone())
         .with_tx_history(self.tx_history.clone())
         .with_transaction_ret(self.transaction_ret.clone())
         .with_account_id_index(self.id_index.clone())

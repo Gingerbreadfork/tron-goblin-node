@@ -203,6 +203,33 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn tron_selfdestruct_restriction_effective(&self) -> bool {
+        self.inner
+            .cfg
+            .tron_selfdestruct_restriction
+            .unwrap_or_else(|| self.inner.cfg.spec.is_enabled_in(SpecId::CANCUN))
+    }
+
+    #[inline]
+    fn tron_account_created_locally(&self, address: Address) -> bool {
+        self.inner
+            .state
+            .get(&address)
+            .map(|a| a.is_created_locally())
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn set_tron_selfdestruct_overrides(
+        &mut self,
+        restriction: Option<bool>,
+        blackhole: Option<Address>,
+    ) {
+        self.inner.cfg.tron_selfdestruct_restriction = restriction;
+        self.inner.cfg.tron_blackhole = blackhole;
+    }
+
+    #[inline]
     fn set_eip7708_config(&mut self, disabled: bool, delayed_burn_disabled: bool) {
         self.inner
             .set_eip7708_config(disabled, delayed_burn_disabled);

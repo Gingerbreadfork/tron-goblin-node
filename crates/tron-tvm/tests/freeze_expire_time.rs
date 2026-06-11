@@ -47,6 +47,8 @@ fn fresh_stores() -> VmStores {
         block_index: None,
         contracts: None,
         votes: None,
+        reward_vi: None,
+    abi: None,
     }
 }
 

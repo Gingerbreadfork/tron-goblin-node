@@ -44,6 +44,12 @@ impl AbiStore {
         Ok(())
     }
 
+    /// Remove an ABI row -- SELFDESTRUCT cleanup. Idempotent.
+    pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
+        self.backend.delete(address.as_bytes())?;
+        Ok(())
+    }
+
     pub fn get(&self, address: &Address) -> Result<Option<Abi>, StoreError> {
         let Some(bytes) = self.backend.get(address.as_bytes())? else {
             return Ok(None);

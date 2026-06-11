@@ -262,7 +262,7 @@ fn execute_records_votes_on_account_and_in_votes_store() {
     let contract = vote_contract(ALICE, vec![vote(SR1, 4), vote(SR2, 3)]);
     let delegation = DelegationStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
     let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
-    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &contract).unwrap();
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, None, &contract).unwrap();
 
     // Account got the new votes.
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -310,7 +310,7 @@ fn execute_preserves_old_votes_when_revoting() {
     let c1 = vote_contract(ALICE, vec![vote(SR2, 5)]);
     let delegation = DelegationStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
     let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
-    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &c1).unwrap();
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, None, &c1).unwrap();
 
     let v = votes_store.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(v.old_votes.len(), 1);
@@ -323,7 +323,7 @@ fn execute_preserves_old_votes_when_revoting() {
     // entries. Java-tron does NOT advance old_votes on re-vote; that
     // happens at maintenance.
     let c2 = vote_contract(ALICE, vec![vote(SR1, 3)]);
-    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &c2).unwrap();
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, None, &c2).unwrap();
 
     let v = votes_store.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(v.old_votes.len(), 1, "old_votes preserved across re-vote");
@@ -370,7 +370,7 @@ fn execute_clears_old_votes_on_account_before_adding_new_ones() {
     let c = vote_contract(ALICE, vec![vote(SR1, 5)]);
     let delegation = DelegationStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
     let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
-    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, &c).unwrap();
+    execute_vote_witness(&accounts, &votes_store, &delegation, &dp, None, &c).unwrap();
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.votes.len(), 1);

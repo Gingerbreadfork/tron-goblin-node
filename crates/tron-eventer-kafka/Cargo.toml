@@ -1,0 +1,15 @@
+[package]
+name = "tron-eventer-kafka"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Kafka sink for tron-eventer — java-tron eventplugin-kafka parity (topics + JSON trigger shapes)"
+
+[dependencies]
+tron-eventer = { path = "../tron-eventer" }
+serde = "1"
+serde_json = "1"
+tracing = "0.1"
+# Pure-Rust Kafka client — no cmake / system libs, builds everywhere.
+# Fire-and-forget JSON publishing only needs the >=0.8 wire protocol.
+kafka = { version = "0.10", default-features = false, features = ["snappy", "gzip"] }

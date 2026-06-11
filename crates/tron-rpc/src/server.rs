@@ -37,11 +37,72 @@ struct JsonRpcRequest {
 /// `RpcState` carries a pubsub broker, the router also mounts the
 /// `/ws` WebSocket endpoint for `eth_subscribe`.
 pub fn router(state: RpcState) -> Router {
+    router_with_limits(
+        state,
+        crate::RateLimitRegistry::empty(),
+        crate::GlobalRateLimiter::disabled(),
+    )
+}
+
+/// [`router`] with rate-limit gating. java-tron's JSON-RPC endpoint is
+/// an HTTP servlet behind the same `rate.limiter.http` filter chain
+/// (component `JsonRpcServlet`) plus the node-wide GlobalRateLimiter —
+/// we mirror that: a configured `jsonrpc` component limits every
+/// JSON-RPC POST, and the global limiter applies regardless.
+pub fn router_with_limits(
+    state: RpcState,
+    limits: crate::RateLimitRegistry,
+    global: crate::GlobalRateLimiter,
+) -> Router {
     let mut r = Router::new().route("/", post(handle));
     if state.pubsub.is_some() {
         r = r.route("/ws", axum::routing::get(crate::pubsub::ws_upgrade_handler));
     }
-    r.with_state(state)
+    let r = r.with_state(state);
+    if limits.get("jsonrpc").is_none() && global.is_disabled() {
+        return r;
+    }
+    r.layer(axum::middleware::from_fn_with_state(
+        (limits, global),
+        jsonrpc_rate_limit_middleware,
+    ))
+}
+
+/// Whole-endpoint rate limit for JSON-RPC: one `jsonrpc` component
+/// (matches java's `JsonRpcServlet` after servlet-suffix
+/// normalization) + the global limiter. 429 on overrun.
+async fn jsonrpc_rate_limit_middleware(
+    axum::extract::State((reg, global)): axum::extract::State<(
+        crate::RateLimitRegistry,
+        crate::GlobalRateLimiter,
+    )>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let mut _guard = None;
+    let component_ok = match reg.get("jsonrpc") {
+        Some(limit) => {
+            let (ok, guard) = limit.try_acquire(ip);
+            _guard = guard;
+            ok
+        }
+        None => true,
+    };
+    if !component_ok || !global.try_acquire(ip) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        )
+            .into_response();
+    }
+    let response = next.run(req).await;
+    drop(_guard);
+    response
 }
 
 /// Convenience: bind a TCP listener and serve the JSON-RPC API on
@@ -278,6 +339,8 @@ fn dispatch(method: &str, params: &Value, state: &RpcState) -> Result<Value, Rpc
         // ============================
         "getTransactionById" => get_transaction_by_id(params, state),
         "getTotalTransaction" | "totalTransaction" => get_total_transaction(params, state),
+        "getTransactionCountByBlockNum" => get_transaction_count_by_block_num(params, state),
+        "getCanDelegatedMaxSize" => get_can_delegated_max_size(params, state),
         "getMemoFee" => get_memo_fee(params, state),
         "estimateEnergy" => estimate_energy(params, state),
 

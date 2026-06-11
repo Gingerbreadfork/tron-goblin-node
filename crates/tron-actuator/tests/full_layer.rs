@@ -149,8 +149,8 @@ fn withdraw_balance_round_trip() {
         owner_address: ALICE.to_vec(),
     };
     let delegation = DelegationStore::new(mem());
-    witness::validate_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap();
-    witness::execute_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap();
+    witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap();
+    witness::execute_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap();
     alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 1050);
     assert_eq!(alice.allowance, 0);
@@ -383,7 +383,7 @@ fn freeze_v2_updates_total_net_weight_and_unfreeze_reverses_it() {
     };
     let votes = VotesStore::new(mem());
     let delegation = DelegationStore::new(mem());
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &unfreeze)
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, None, &unfreeze)
         .unwrap();
     assert_eq!(dp.total_net_weight(), 60);
 }
@@ -467,7 +467,7 @@ fn unfreeze_balance_v2_then_withdraw_after_expiry() {
     freeze_v2::validate_unfreeze_balance_v2(&accounts, &dp, &unfreeze).unwrap();
     let votes = VotesStore::new(mem());
     let delegation = DelegationStore::new(mem());
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &unfreeze)
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, None, &unfreeze)
         .unwrap();
 
     // Fast-forward; the unfreeze entry's expiry is at now + 1 day.

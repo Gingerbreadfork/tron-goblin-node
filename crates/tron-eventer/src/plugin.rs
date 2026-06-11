@@ -56,6 +56,11 @@ pub struct PluginParams {
     pub contract_parse: bool,
     /// Per-trigger enable table.
     pub topics: Vec<TopicEnable>,
+    /// Resolved `event.subscribe.filter` values — applied by wrapping
+    /// the built listener in a
+    /// [`FilteredListener`](crate::listeners::FilteredListener)
+    /// inside [`PluginRegistry::build_bus`].
+    pub filter: crate::listeners::TriggerFilter,
 }
 
 /// One row from `event.subscribe.topics[]`, resolved to a
@@ -155,6 +160,26 @@ impl PluginRegistry {
         self.factories.is_empty()
     }
 
+    /// Resolve a config `path` file stem to a registered factory id:
+    /// exact match first, then "stem CONTAINS id" (java plugin zips are
+    /// named `plugin-kafka-1.0.0.zip` — the stem embeds the id).
+    pub fn resolve_id(&self, stem: &str) -> Option<String> {
+        let lower = stem.to_lowercase();
+        if let Some(f) = self
+            .factories
+            .iter()
+            .rev()
+            .find(|f| f.id().eq_ignore_ascii_case(stem))
+        {
+            return Some(f.id().to_string());
+        }
+        self.factories
+            .iter()
+            .rev()
+            .find(|f| lower.contains(&f.id().to_lowercase()))
+            .map(|f| f.id().to_string())
+    }
+
     /// Build a single-listener [`EventBus`] using the factory
     /// matching `plugin_id`. The most-recently-registered factory
     /// wins on duplicate ids.
@@ -170,6 +195,8 @@ impl PluginRegistry {
             .find(|f| f.id().eq_ignore_ascii_case(plugin_id))
             .ok_or_else(|| PluginError::UnknownPlugin(plugin_id.to_string()))?;
         let listener = factory.build(params)?;
+        let listener =
+            crate::listeners::FilteredListener::wrap(listener, params.filter.clone());
         Ok(EventBus::new(vec![listener]))
     }
 

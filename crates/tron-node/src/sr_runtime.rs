@@ -217,6 +217,10 @@ pub struct ProducedBlockNotice {
 /// The SR block-production loop. Constructed once at startup and
 /// spawned as a tokio task.
 pub struct SrRuntime {
+    /// Witness-HA election gate (java `BlockHandleImpl.getState()` →
+    /// `BACKUP_IS_NOT_MASTER`). `None` = no backup group configured →
+    /// always produce.
+    backup: Option<crate::backup::BackupHandle>,
     state: StateBackends,
     blocks_backend: Arc<dyn KvBackend>,
     witness_schedule_backend: Arc<dyn KvBackend>,
@@ -256,6 +260,13 @@ pub struct SrRuntime {
 }
 
 impl SrRuntime {
+    /// Attach the witness-HA election handle — production is skipped
+    /// while this node isn't the backup-group MASTER.
+    pub fn with_backup(mut self, backup: crate::backup::BackupHandle) -> Self {
+        self.backup = Some(backup);
+        self
+    }
+
     /// Construct a fresh runtime. The returned `produced_tx` is the
     /// channel that per-peer drivers must subscribe to; clones are
     /// cheap (tokio broadcast handles are `Arc`-backed internally).
@@ -286,6 +297,7 @@ impl SrRuntime {
             checkpoint: None,
             pubsub: None,
             index_hook: None,
+            backup: None,
         }
     }
 
@@ -435,6 +447,14 @@ impl SrRuntime {
         &self,
         last_produced_slot: i64,
     ) -> Result<Option<ProducedBlockNotice>, SrRuntimeError> {
+        // Witness HA: only the backup-group MASTER may produce (java
+        // checks BackupManager status before every attempt).
+        if let Some(backup) = &self.backup {
+            if !backup.is_master() {
+                return Ok(None);
+            }
+        }
+
         let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
 
         // Need a head and a genesis time to compute slots.

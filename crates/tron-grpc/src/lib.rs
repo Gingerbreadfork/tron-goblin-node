@@ -41,10 +41,11 @@ pub mod firehose;
 mod database;
 mod monitor;
 mod prover;
+pub mod rate_limit;
 mod service;
 mod shielded;
 mod wallet_extension;
 mod wallet_solidity;
 mod zen_builder;
 
-pub use service::{start_server, WalletService};
+pub use service::{start_server, start_server_with_limits, start_server_with_limits_and_gates, WalletService};

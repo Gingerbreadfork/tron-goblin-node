@@ -231,6 +231,26 @@ pub trait Host {
 
     /// TRC-10 token balance of `address` for `token_id`. Default: 0.
     #[inline]
+    /// TRON fork: is the `ALLOW_TVM_SELFDESTRUCT_RESTRICTION` proposal
+    /// (#94 / TIP-6780) active? Drives the custom SELFDESTRUCT
+    /// instruction's gas and destroy semantics.
+    fn tron_selfdestruct_restriction(&self) -> bool {
+        false
+    }
+
+    /// TRON fork: was `address` created in the CURRENT transaction
+    /// (java-tron `Repository.isNewContract`)? Used by the SELFDESTRUCT
+    /// restriction to decide destroy-vs-transfer.
+    fn tron_account_created_locally(&self, _address: Address) -> bool {
+        false
+    }
+
+    /// TRON fork: SELFDESTRUCT chainbase side-effects (see
+    /// `TronDatabaseExt::tron_suicide`). Returns `0` ok / `-1` revert.
+    fn tron_suicide(&mut self, _owner: Address, _obtainer: Address, _will_destroy: bool) -> i64 {
+        0
+    }
+
     fn tron_token_balance(&self, _address: Address, _token_id: i64) -> i64 {
         0
     }

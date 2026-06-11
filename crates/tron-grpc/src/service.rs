@@ -2029,16 +2029,30 @@ impl Wallet for WalletService {
         }
         let mut addr = [0u8; 21];
         addr.copy_from_slice(&v);
-        // Real reward needs Vi-accumulator math across cycles — for
-        // now report the account's cached allowance.
-        let acct = self
-            .state
-            .accounts
-            .get(&Address::from_raw(addr))
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        Ok(Response::new(NumberMessage { num: acct.allowance }))
+        // Full `MortgageService.queryReward` parity: allowance plus the
+        // unclaimed Vi-accumulator (and legacy-cycle) reward. Falls back
+        // to allowance-only when the delegation store isn't attached
+        // (minimal test configurations).
+        let address = Address::from_raw(addr);
+        let num = match self.state.delegation.as_ref() {
+            Some(delegation) => tron_tvm::reward::query_reward(
+                &address,
+                &self.state.accounts,
+                delegation,
+                &self.state.dyn_props,
+                self.state.reward_vi.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("reward read: {e}")))?,
+            None => self
+                .state
+                .accounts
+                .get(&address)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .allowance,
+        };
+        Ok(Response::new(NumberMessage { num }))
     }
 
     async fn get_delegated_resource_account_index(
@@ -2779,21 +2793,18 @@ impl Wallet for WalletService {
     }
 
     // =========================================================
-    // Shielded TRC-20 — TX construction, scan, sig.
+    // Shielded TRC-20 / native — TX construction, scan, sig.
     //
-    // All of the following require infrastructure we don't ship in
-    // a node binary (proving keys + Groth16 prover for construction,
-    // ChaCha20-Poly1305 trial decryption + per-block walk for scan,
-    // RedJubjub signing for spend auth). java-tron bundles these
-    // because its gRPC server doubles as a wallet; tron-goblin-node's gRPC
-    // is node-only. Clients that need these talk to a wallet library
-    // (`zcash_primitives` + `zcash_proofs` on Rust, `tronweb-shielded`
-    // in JS) and use the node only for SUBMISSION via
-    // `broadcast_transaction` — which works today.
-    //
-    // The honest gRPC response is FailedPrecondition with a clear
-    // message naming what's missing. Promotes silently to a real
-    // implementation once the proving-key + scan-index work lands.
+    // FULLY IMPLEMENTED in-process: the Sapling MPC proving
+    // parameters are embedded via `wagyu-zcash-parameters` (no
+    // download, no JNI — java needs librustzcash through the FFI for
+    // the same job), Groth16 proofs run through `bellman` on a
+    // blocking thread (~1-2 s per spend/output), note scanning
+    // trial-decrypts with `sapling-crypto`'s ChaCha20-Poly1305, and
+    // spend-auth / binding signatures use `redjubjub`. See
+    // `prover.rs` (proof construction), `zen_builder.rs`
+    // (mint/transfer/burn parameter assembly + calldata packing) and
+    // `shielded.rs` (key derivation, vouchers, scanning).
     // =========================================================
 
     async fn create_shielded_transaction(
@@ -3041,6 +3052,45 @@ pub async fn start_server(
     addr: SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
+    start_server_with_limits(
+        state,
+        addr,
+        shutdown,
+        tron_rpc::RateLimitRegistry::empty(),
+        tron_rpc::GlobalRateLimiter::disabled(),
+    )
+    .await
+}
+
+/// [`start_server`] with rate-limit enforcement: the per-method
+/// registry comes from `rate.limiter.rpc` config rows
+/// (`protocol.Wallet/GetAccount`-style components), the global limiter
+/// from `rate.limiter.global*`. Overruns answer `RESOURCE_EXHAUSTED`
+/// — java-tron's `RateLimiterInterceptor` semantics.
+pub async fn start_server_with_limits(
+    state: RpcState,
+    addr: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    limits: tron_rpc::RateLimitRegistry,
+    global: tron_rpc::GlobalRateLimiter,
+) -> Result<(), tonic::transport::Error> {
+    start_server_with_limits_and_gates(state, addr, shutdown, limits, global, false).await
+}
+
+/// [`start_server_with_limits`] plus the lite-fullnode history gate
+/// (java `LiteFnQueryGrpcInterceptor`): `lite_gate = true` closes the
+/// history-query methods with `UNAVAILABLE`.
+pub async fn start_server_with_limits_and_gates(
+    state: RpcState,
+    addr: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    limits: tron_rpc::RateLimitRegistry,
+    global: tron_rpc::GlobalRateLimiter,
+    lite_gate: bool,
+) -> Result<(), tonic::transport::Error> {
+    let rate_limit_layer = (!limits.is_empty() || !global.is_disabled())
+        .then(|| crate::rate_limit::GrpcRateLimitLayer::new(limits, global));
+    let lite_gate_layer = lite_gate.then_some(crate::rate_limit::LiteGateLayer);
     let firehose = state.firehose.clone();
     let wallet = WalletService::new(state);
     let wallet_solidity = wallet.clone();
@@ -3052,6 +3102,8 @@ pub async fn start_server(
         "gRPC server listening (Wallet + WalletSolidity + Monitor + Database + WalletExtension)"
     );
     Server::builder()
+        .layer(tower::util::option_layer(lite_gate_layer))
+        .layer(tower::util::option_layer(rate_limit_layer))
         .timeout(GRPC_REQUEST_TIMEOUT)
         .concurrency_limit_per_connection(GRPC_CONCURRENCY_PER_CONN)
         .max_concurrent_streams(Some(GRPC_MAX_CONCURRENT_STREAMS))

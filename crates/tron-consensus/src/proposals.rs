@@ -141,6 +141,27 @@ pub fn activate_expired_proposals(
                                     .put_long(b"TOTAL_ENERGY_CURRENT_LIMIT", *value);
                             }
                         }
+                        // ALLOW_TVM_VOTE(59) / ALLOW_NEW_REWARD(67) also arm
+                        // the Vi reward algorithm — java's
+                        // `saveNewRewardAlgorithmEffectiveCycle()`:
+                        // NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE =
+                        // currentCycle + 1, STICKY (written only while the
+                        // key is still unset / Long.MAX_VALUE, so whichever
+                        // of the two proposals activates first pins it).
+                        59 | 67 => {
+                            let existing = dyn_props
+                                .get_long(b"NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE")
+                                .unwrap_or(i64::MAX);
+                            if existing == i64::MAX {
+                                let current = dyn_props
+                                    .get_long(b"CURRENT_CYCLE_NUMBER")
+                                    .unwrap_or(0);
+                                dyn_props.put_long(
+                                    b"NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE",
+                                    current + 1,
+                                );
+                            }
+                        }
                         _ => {}
                     }
                     report
@@ -258,6 +279,10 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         89 => b"ALLOW_TVM_BLOB",
         92 => b"PROPOSAL_EXPIRE_TIME",
         94 => b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION",
+        95 => b"ALLOW_TVM_PRAGUE",
+        96 => b"ALLOW_TVM_OSAKA",
+        97 => b"ALLOW_HARDEN_RESOURCE_CALCULATION",
+        98 => b"ALLOW_HARDEN_EXCHANGE_CALCULATION",
         _ => return None,
     })
 }

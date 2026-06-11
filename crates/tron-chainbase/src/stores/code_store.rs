@@ -30,6 +30,14 @@ impl CodeStore {
         Ok(())
     }
 
+    /// Remove a code row -- SELFDESTRUCT cleanup. Idempotent. (The
+    /// store is address-keyed on TRON; callers pass the 21-byte
+    /// address like `get`.)
+    pub fn delete(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.backend.delete(key)?;
+        Ok(())
+    }
+
     pub fn get(&self, code_hash: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self.backend.get(code_hash)?)
     }

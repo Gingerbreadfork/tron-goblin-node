@@ -86,6 +86,19 @@ pub struct ProposalSet {
     /// precompiles: `verifyMintProof`, `verifyTransferProof`,
     /// `verifyBurnProof`, `merkleHash`.
     pub allow_shielded_trc20_transaction: bool,
+    /// `ALLOW_TVM_SELFDESTRUCT_RESTRICTION` (proposal #94 / TIP-6780) —
+    /// SELFDESTRUCT destroys only contracts created in the same tx;
+    /// pre-existing contracts just transfer their balance (java's
+    /// `suicide2`). Decoupled from the Cancun opcode spec: the journal
+    /// gate is overridden per-tx from this flag, and the SELFDESTRUCT
+    /// base energy becomes `SUICIDE_V2` (5000).
+    pub allow_tvm_selfdestruct_restriction: bool,
+    /// `ALLOW_TVM_PRAGUE` (proposal #95). Mapped to revm `PRAGUE`.
+    pub allow_tvm_prague: bool,
+    /// `ALLOW_TVM_OSAKA` (proposal #96) — P256VERIFY (TIP-7951), CLZ
+    /// (TIP-7939), ModExp bounds/repricing (TIP-7883). Mapped to revm
+    /// `OSAKA`.
+    pub allow_tvm_osaka: bool,
 }
 
 impl ProposalSet {
@@ -110,6 +123,9 @@ impl ProposalSet {
             allow_tvm_freeze_v2: flag(b"ALLOW_TVM_FREEZE_V2"),
             allow_tvm_compatible_evm: flag(b"ALLOW_TVM_COMPATIBLE_EVM"),
             allow_shielded_trc20_transaction: flag(b"ALLOW_SHIELDED_TRC20_TRANSACTION"),
+            allow_tvm_selfdestruct_restriction: flag(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION"),
+            allow_tvm_prague: flag(b"ALLOW_TVM_PRAGUE"),
+            allow_tvm_osaka: flag(b"ALLOW_TVM_OSAKA"),
         }
     }
 
@@ -132,6 +148,13 @@ impl ProposalSet {
             allow_tvm_freeze_v2: true,
             allow_tvm_compatible_evm: true,
             allow_shielded_trc20_transaction: true,
+            // NOT enabled here: #94 changes destroy semantics and adds
+            // SUICIDE_V2 base energy (test fixtures predate it), and
+            // Prague/Osaka aren't activated on mainnet. Tests that
+            // exercise them opt in explicitly.
+            allow_tvm_selfdestruct_restriction: false,
+            allow_tvm_prague: false,
+            allow_tvm_osaka: false,
         }
     }
 
@@ -144,6 +167,12 @@ impl ProposalSet {
     /// Default (no proposals): `BYZANTIUM` — the original TVM behavior
     /// before any of the post-Byzantium proposals shipped.
     pub fn resolve_spec(&self) -> SpecId {
+        if self.allow_tvm_osaka {
+            return SpecId::OSAKA;
+        }
+        if self.allow_tvm_prague {
+            return SpecId::PRAGUE;
+        }
         if self.allow_tvm_cancun {
             return SpecId::CANCUN;
         }

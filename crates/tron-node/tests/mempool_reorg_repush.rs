@@ -66,6 +66,7 @@ fn build_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, SnapshotStack) 
         contract_state: Some(snapshot_state(&mut stores)),
         block_index: Some(Arc::new(MemBackend::new())),
         witness_schedule: Some(snapshot_state(&mut stores)),
+        reward_vi: None,
     };
     let stack = SnapshotStack::from_named(stores);
     (state, blocks_be, stack)
@@ -434,6 +435,7 @@ fn legacy_state() -> (StateBackends, Arc<dyn KvBackend>) {
         contract_state: Some(Arc::new(MemBackend::new())),
         block_index: Some(Arc::new(MemBackend::new())),
         witness_schedule: Some(Arc::new(MemBackend::new())),
+        reward_vi: None,
     };
     (raw_state, blocks_be)
 }

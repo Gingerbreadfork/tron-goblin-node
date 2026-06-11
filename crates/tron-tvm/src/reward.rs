@@ -17,7 +17,7 @@
 //! beyond any plausible TRON state).
 
 use tron_chainbase::{
-    AccountStore, DelegationStore, DynamicPropertiesStore, StoreError,
+    AccountStore, DelegationStore, DynamicPropertiesStore, RewardViStore, StoreError,
 };
 use tron_crypto::address::Address;
 
@@ -30,6 +30,19 @@ pub const CURRENT_CYCLE_NUMBER_KEY: &[u8] = b"CURRENT_CYCLE_NUMBER";
 /// Change-delegation flag key. java's on-disk key is `CHANGE_DELEGATION`
 /// (no `ALLOW_` prefix — a java naming quirk; see the chainbase keys doc).
 pub const ALLOW_CHANGE_DELEGATION_KEY: &[u8] = b"CHANGE_DELEGATION";
+
+/// First cycle the Vi-accumulator ("new reward") algorithm applies to.
+/// Set once when `ALLOW_NEW_REWARD` / `ALLOW_TVM_VOTE` activated;
+/// `i64::MAX` (java `Long.MAX_VALUE`) when the new algorithm was never
+/// enabled. Cycles BEFORE this use the legacy per-cycle ratio math —
+/// see [`old_reward`].
+pub const NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY: &[u8] =
+    b"NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE";
+
+/// Proposal #79. When on, legacy-cycle rewards are served from the
+/// background-computed `reward-vi` store (java's `RewardViCalService`,
+/// merkle-pinned) instead of the O(cycles) per-cycle ratio loop.
+pub const ALLOW_OLD_REWARD_OPT_KEY: &[u8] = b"ALLOW_OLD_REWARD_OPT";
 
 // =============================================================================
 // Per-block + per-maintenance reward distribution
@@ -264,101 +277,213 @@ mod encode_tests {
     }
 }
 
-/// Compute `MortgageService.queryReward(voter)` against the live stores.
+/// Compute `MortgageService.queryReward(voter)` against the live stores —
+/// an exact port, including the legacy-algorithm branch:
 ///
-/// Reads:
-/// * `accounts.get(voter)` → votes list + allowance
-/// * `delegation.get_begin_cycle` / `get_end_cycle`
-/// * `delegation.get_witness_vi_raw(cycle, witness)` for each `(cycle,
-///   witness)` window
-/// * `dyn_props.get_long(CURRENT_CYCLE_NUMBER)`
+/// 1. `0` when `ALLOW_CHANGE_DELEGATION` is off or the account is missing.
+/// 2. `allowance` when `begin_cycle > current_cycle`.
+/// 3. Latest-cycle catch-up: when `begin_cycle + 1 == end_cycle` and the
+///    cycle has finalised, the single-cycle reward is computed against
+///    the votes SNAPSHOT stored in `account_vote(begin_cycle)` (the votes
+///    active when that cycle ran), then `begin_cycle += 1` (unconditional
+///    — java increments even when no snapshot exists).
+/// 4. `end_cycle = current_cycle`; empty live votes → `reward + allowance`.
+/// 5. Bulk window `[begin_cycle, current_cycle)` against the live votes.
 ///
-/// Returns `0` for accounts with no votes (matches java-tron: they have
-/// no claim on cycle-emitted rewards). The terminal cycle range walked
-/// is `[begin_cycle, end_cycle)`; for the "current cycle" partial reward
-/// the simple short-circuit matches java-tron's pre-`ALLOW_NEW_RESOURCE_MODEL`
-/// behavior.
+/// Each window goes through [`compute_reward_window`], which routes
+/// pre-new-algorithm cycles to the legacy math (see [`old_reward`]).
+///
+/// `reward_vi` is the `reward-vi` store used by the `ALLOW_OLD_REWARD_OPT`
+/// fast path; pass `None` only in contexts that never see pre-switch
+/// accounts (the production node always wires it).
 pub fn query_reward(
     voter: &Address,
     accounts: &AccountStore,
     delegation: &DelegationStore,
     dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
 ) -> Result<i64, StoreError> {
+    if dyn_props.get_long(ALLOW_CHANGE_DELEGATION_KEY).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
     let Some(account) = accounts.get(voter)? else {
         return Ok(0);
     };
     let allowance = account.allowance;
 
+    let mut begin_cycle = delegation.get_begin_cycle(voter);
+    let mut end_cycle = delegation.get_end_cycle(voter);
+    let current_cycle = dyn_props.get_long(CURRENT_CYCLE_NUMBER_KEY).unwrap_or(0);
+    let mut reward: i64 = 0;
+
+    if begin_cycle > current_cycle {
+        return Ok(allowance);
+    }
+    // Latest-cycle catch-up — computed against the SNAPSHOT votes.
+    if begin_cycle + 1 == end_cycle && begin_cycle < current_cycle {
+        if let Some(snap) = delegation.get_account_vote(begin_cycle, voter)? {
+            reward = compute_reward_window(
+                begin_cycle,
+                end_cycle,
+                &snap.votes,
+                delegation,
+                dyn_props,
+                reward_vi,
+            );
+        }
+        begin_cycle += 1;
+    }
+    end_cycle = current_cycle;
     if account.votes.is_empty() {
-        return Ok(allowance);
+        return Ok(reward.saturating_add(allowance));
     }
+    if begin_cycle < end_cycle {
+        reward = reward.saturating_add(compute_reward_window(
+            begin_cycle,
+            end_cycle,
+            &account.votes,
+            delegation,
+            dyn_props,
+            reward_vi,
+        ));
+    }
+    Ok(reward.saturating_add(allowance))
+}
 
-    let begin_cycle = delegation.get_begin_cycle(voter);
-    let end_cycle = delegation.get_end_cycle(voter);
-
-    // No cycles to walk → just whatever's already finalized in allowance.
+/// `MortgageService.computeReward(beginCycle, endCycle, account)` — sum
+/// the voter's reward across `[begin_cycle, end_cycle)`, routing cycles
+/// before `NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE` through the legacy math
+/// and the rest through the Vi-accumulator walk.
+pub fn compute_reward_window(
+    mut begin_cycle: i64,
+    end_cycle: i64,
+    votes: &[tron_proto::Vote],
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> i64 {
     if begin_cycle >= end_cycle {
-        return Ok(allowance);
+        return 0;
     }
+    let mut reward: i64 = 0;
+    let new_algorithm_cycle = dyn_props
+        .get_long(NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY)
+        .unwrap_or(i64::MAX);
+    if begin_cycle < new_algorithm_cycle {
+        let old_end_cycle = end_cycle.min(new_algorithm_cycle);
+        reward = old_reward(begin_cycle, old_end_cycle, votes, delegation, dyn_props, reward_vi);
+        begin_cycle = old_end_cycle;
+    }
+    if begin_cycle < end_cycle {
+        reward = reward.saturating_add(vi_window_reward(begin_cycle, end_cycle, votes, |cycle, witness| {
+            read_vi(delegation, cycle, witness)
+        }));
+    }
+    reward
+}
 
-    // Vi delta from `begin_cycle - 1` to `end_cycle - 1` per witness.
-    // For each vote: vote_count * (Vi_end - Vi_begin) / DECIMAL.
-    let mut reward: i128 = 0;
-    for vote in &account.votes {
+/// The Vi-accumulator window: per witness,
+/// `delta = Vi(end - 1) - Vi(begin - 1)`; non-positive deltas are
+/// SKIPPED (java: `if (deltaVi.signum() <= 0) continue`), then
+/// `delta * vote_count / 1e18` floor-divided like java's BigInteger.
+fn vi_window_reward(
+    begin_cycle: i64,
+    end_cycle: i64,
+    votes: &[tron_proto::Vote],
+    read_vi_at: impl Fn(i64, &Address) -> i128,
+) -> i64 {
+    let mut reward: i64 = 0;
+    for vote in votes {
         if vote.vote_address.len() != 21 {
             continue;
         }
         let mut buf = [0u8; 21];
         buf.copy_from_slice(&vote.vote_address);
         let witness = Address::from_raw(buf);
-
-        let vi_end = read_vi(delegation, end_cycle - 1, &witness);
-        let vi_begin = read_vi(delegation, begin_cycle - 1, &witness);
-        let delta = vi_end - vi_begin;
-
-        // i128 math; saturate at i64 on the way out.
-        let contribution = (delta as i128).saturating_mul(vote.vote_count as i128) / REWARD_VI_DECIMAL;
-        reward = reward.saturating_add(contribution);
-    }
-
-    // ====================================================================
-    // Partial current-cycle reward
-    // ====================================================================
-    //
-    // If the voter has voted in `current_cycle` but the cycle isn't
-    // finalised yet (no Vi has been written for `current_cycle`), they
-    // still earn a partial reward up to NOW based on the witness's
-    // current `vote_count` share.
-    //
-    // java-tron's `MortgageService.queryReward` extends the loop by one
-    // more step: `Vi(current_cycle) - Vi(end_cycle - 1)` if the voter
-    // has an entry in `delegation.account_vote(current_cycle, voter)`.
-    // We mirror that here when the cycle keys are present.
-    let current_cycle = dyn_props.get_long(CURRENT_CYCLE_NUMBER_KEY).unwrap_or(0);
-    if current_cycle >= end_cycle {
-        // Was the voter active in the most recent cycle window? java-tron
-        // reads `delegation.account_vote(current_cycle, voter)`. If
-        // present, the voter participates in the current-cycle reward.
-        if delegation.get_account_vote(current_cycle, voter)?.is_some() {
-            for vote in &account.votes {
-                if vote.vote_address.len() != 21 {
-                    continue;
-                }
-                let mut buf = [0u8; 21];
-                buf.copy_from_slice(&vote.vote_address);
-                let witness = Address::from_raw(buf);
-                let vi_now = read_vi(delegation, current_cycle, &witness);
-                let vi_ref = read_vi(delegation, end_cycle - 1, &witness);
-                let delta = vi_now - vi_ref;
-                let contribution =
-                    delta.saturating_mul(vote.vote_count as i128) / REWARD_VI_DECIMAL;
-                reward = reward.saturating_add(contribution);
-            }
+        let begin_vi = read_vi_at(begin_cycle - 1, &witness);
+        let end_vi = read_vi_at(end_cycle - 1, &witness);
+        let delta = end_vi - begin_vi;
+        if delta <= 0 {
+            continue;
         }
+        let contribution = delta.saturating_mul(vote.vote_count as i128) / REWARD_VI_DECIMAL;
+        reward = reward
+            .saturating_add(contribution.clamp(i64::MIN as i128, i64::MAX as i128) as i64);
     }
+    reward
+}
 
-    let total = reward.saturating_add(allowance as i128);
-    Ok(total.min(i64::MAX as i128).max(0) as i64)
+/// `MortgageService.getOldReward` — rewards for cycles BEFORE the new
+/// algorithm activated.
+///
+/// With `ALLOW_OLD_REWARD_OPT` (proposal #79) on AND the `reward-vi`
+/// store available, the answer is a Vi walk over the background-computed
+/// store (java's `RewardViCalService.getNewRewardAlgorithmReward` —
+/// values merkle-pinned in java's config, present in any imported
+/// mainnet DB). Otherwise the legacy O(cycles) loop: per cycle, per
+/// vote, `reward += userVote/totalVote * totalReward` in `double` with
+/// java's compound-assignment narrowing (the whole sum is computed in
+/// `double` and truncated on every addition — replicated bit-for-bit).
+fn old_reward(
+    begin_cycle: i64,
+    end_cycle: i64,
+    votes: &[tron_proto::Vote],
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> i64 {
+    if begin_cycle >= end_cycle {
+        return 0;
+    }
+    if dyn_props.get_long(ALLOW_OLD_REWARD_OPT_KEY).unwrap_or(0) == 1 {
+        if let Some(store) = reward_vi {
+            return vi_window_reward(begin_cycle, end_cycle, votes, |cycle, witness| {
+                match store.get(&DelegationStore::vi_key(cycle, witness)) {
+                    Ok(Some(bytes)) => decode_signed_be_i128(&bytes),
+                    _ => 0,
+                }
+            });
+        }
+        // Opt flag on but no store wired — fall through to the exact
+        // legacy loop. Same values up to double-vs-BigInteger rounding;
+        // production always wires the store so this branch is test-only.
+    }
+    let mut reward: i64 = 0;
+    for cycle in begin_cycle..end_cycle {
+        reward = old_reward_one_cycle(cycle, votes, delegation, reward);
+    }
+    reward
+}
+
+/// One legacy cycle: java's `computeReward(cycle, votes)` folded into the
+/// running total with `long += double` semantics (`reward = (long)(reward
+/// + voteRate * totalReward)` — the addition happens in `double`).
+fn old_reward_one_cycle(
+    cycle: i64,
+    votes: &[tron_proto::Vote],
+    delegation: &DelegationStore,
+    mut reward: i64,
+) -> i64 {
+    use tron_chainbase::REMARK;
+    for vote in votes {
+        if vote.vote_address.len() != 21 {
+            continue;
+        }
+        let mut buf = [0u8; 21];
+        buf.copy_from_slice(&vote.vote_address);
+        let witness = Address::from_raw(buf);
+        let total_reward = delegation.get_reward(cycle, &witness);
+        if total_reward <= 0 {
+            continue;
+        }
+        let total_vote = delegation.get_witness_vote(cycle, &witness);
+        if total_vote == REMARK || total_vote == 0 {
+            continue;
+        }
+        let vote_rate = vote.vote_count as f64 / total_vote as f64;
+        reward = (reward as f64 + vote_rate * total_reward as f64) as i64;
+    }
+    reward
 }
 
 /// Persist the reward claim — the write-side counterpart to
@@ -389,6 +514,7 @@ pub fn withdraw_reward(
     accounts: &AccountStore,
     delegation: &DelegationStore,
     dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
 ) -> Result<i64, StoreError> {
     use tron_proto::Account;
 
@@ -422,10 +548,19 @@ pub fn withdraw_reward(
     // active at the time the cycle ran.
     if begin_cycle + 1 == end_cycle && begin_cycle < current_cycle {
         if let Some(snap) = delegation.get_account_vote(begin_cycle, address)? {
-            let reward_one = reward_for_window(&snap, delegation, begin_cycle, end_cycle);
+            let reward_one = compute_reward_window(
+                begin_cycle,
+                end_cycle,
+                &snap.votes,
+                delegation,
+                dyn_props,
+                reward_vi,
+            );
             paid = paid.saturating_add(reward_one);
-            begin_cycle += 1;
         }
+        // java increments OUTSIDE the snapshot null-check — a voter with
+        // no recorded snapshot still skips past the finalised cycle.
+        begin_cycle += 1;
     }
 
     // ── 2. Bulk window [begin_cycle, current_cycle) ───────────────────
@@ -445,7 +580,14 @@ pub fn withdraw_reward(
     }
 
     if begin_cycle < end_cycle {
-        let reward_bulk = reward_for_window(&account, delegation, begin_cycle, end_cycle);
+        let reward_bulk = compute_reward_window(
+            begin_cycle,
+            end_cycle,
+            &account.votes,
+            delegation,
+            dyn_props,
+            reward_vi,
+        );
         paid = paid.saturating_add(reward_bulk);
     }
 
@@ -467,35 +609,6 @@ pub fn withdraw_reward(
     delegation.set_account_vote(end_cycle, address, &snapshot)?;
 
     Ok(paid)
-}
-
-/// Pure helper: sum rewards across `[begin_cycle, end_cycle)` for the
-/// votes in `account` using `Vi(end-1) - Vi(begin-1)` per witness. Used
-/// by both the catch-up and bulk paths of `withdraw_reward`.
-fn reward_for_window(
-    account: &tron_proto::Account,
-    delegation: &DelegationStore,
-    begin_cycle: i64,
-    end_cycle: i64,
-) -> i64 {
-    if begin_cycle >= end_cycle {
-        return 0;
-    }
-    let mut total: i128 = 0;
-    for vote in &account.votes {
-        if vote.vote_address.len() != 21 {
-            continue;
-        }
-        let mut buf = [0u8; 21];
-        buf.copy_from_slice(&vote.vote_address);
-        let witness = Address::from_raw(buf);
-        let vi_end = read_vi(delegation, end_cycle - 1, &witness);
-        let vi_begin = read_vi(delegation, begin_cycle - 1, &witness);
-        let delta = vi_end - vi_begin;
-        let contribution = delta.saturating_mul(vote.vote_count as i128) / REWARD_VI_DECIMAL;
-        total = total.saturating_add(contribution);
-    }
-    total.min(i64::MAX as i128).max(0) as i64
 }
 
 /// Read the Vi-accumulator value for `(cycle, witness)` and decode it

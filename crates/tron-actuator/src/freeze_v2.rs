@@ -209,6 +209,7 @@ pub fn execute_unfreeze_balance_v2(
     dyn_props: &DynamicPropertiesStore,
     votes_store: &VotesStore,
     delegation: &DelegationStore,
+    reward_vi: Option<&tron_chainbase::RewardViStore>,
     contract: &UnfreezeBalanceV2Contract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -217,7 +218,7 @@ pub fn execute_unfreeze_balance_v2(
     // (`mortgageService.withdrawReward` at the top of
     // `UnfreezeBalanceV2Actuator.execute`) — before the stake, and
     // therefore the vote list below, changes.
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props)?;
+    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut account = accounts
         .get(&owner)?

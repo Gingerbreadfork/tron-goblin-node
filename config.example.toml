@@ -351,11 +351,70 @@ enable = false
 retain_mb = 32768
 
 # -----------------------------------------------------------------------------
+# [rate_limiter] — rate.limiter.* enforcement (java-tron parity).
+# Per-component rows gate HTTP servlets (component = path tail OR java's
+# servlet class name, e.g. "GetAccountServlet"), the JSON-RPC endpoint
+# (component = "jsonrpc" / "JsonRpcServlet"), and gRPC methods
+# (component = "protocol.Wallet/GetAccount"). Strategies:
+# QpsRateLimiterAdapter (params "qps=N"), IPQPSRateLimiterAdapter
+# ("qps=N" per source IP), GlobalPreemptibleAdapter ("permit=N"
+# concurrent calls). Overruns answer HTTP 429 / gRPC RESOURCE_EXHAUSTED.
+# -----------------------------------------------------------------------------
+[rate_limiter]
+# Node-wide ceilings applied after any per-component limit (0 disables).
+global_qps = 50000
+global_ip_qps = 10000
+
+# Per-endpoint rows (java config.conf shapes accepted):
+# [[rate_limiter.http]]
+# component = "GetAccountServlet"
+# strategy = "IPQPSRateLimiterAdapter"
+# params = "qps=10"
+#
+# [[rate_limiter.rpc]]
+# component = "protocol.Wallet/GetAccount"
+# strategy = "QpsRateLimiterAdapter"
+# params = "qps=100"
+
+# -----------------------------------------------------------------------------
+# [event] — event.subscribe.* plugin loader (java-tron eventplugin parity).
+# Compiled-in sinks: kafka. Triggers (block/transaction/contractevent/
+# contractlog/solidity) post the same camelCase JSON shapes as java's
+# plugin, addresses base58check. Filters (block range / contract address /
+# topic) apply to the contract trigger families, like java's matchFilter.
+# -----------------------------------------------------------------------------
+# [event]
+# enable = true
+# path = "kafka"                  # plugin id (java zip stems like
+#                                 # "plugin-kafka-1.0.0" resolve too)
+# server = "127.0.0.1:9092"       # bootstrap servers (comma-separated)
+# send_queue_length = 1000        # bounded sink queue (drop-on-full)
+# topics = [
+#   { trigger_name = "block",         enable = true, topic = "block" },
+#   { trigger_name = "transaction",   enable = true, topic = "transaction" },
+#   { trigger_name = "contractevent", enable = true, topic = "contractevent" },
+#   { trigger_name = "contractlog",   enable = true, topic = "contractlog" },
+#   { trigger_name = "solidity",      enable = true, topic = "solidity" },
+# ]
+# [event.filter]
+# from_block = ""
+# to_block = ""
+# contract_addresses = []
+# contract_topics = []
+
+# -----------------------------------------------------------------------------
+# [node_backup] — witness HA (java node.backup.*): UDP keepalive election
+# between machines sharing one witness key; only the elected MASTER
+# produces. Configure the SAME group on every member:
+# [node_backup]
+# port = 10001
+# priority = 8                  # higher wins; ties: higher IP string
+# keep_alive_interval = 3000    # ms; timeout = 6× this
+# members = ["10.0.0.2", "10.0.0.3"]   # the OTHER machines
+
+# -----------------------------------------------------------------------------
 # Schema-only sections (parsed for java-tron config.conf compatibility, but
 # their runtimes are not yet wired — setting them is currently a no-op):
-#   [event]        — event.subscribe.* plugin loader
-#   [node_backup]  — node.backup.* SR active/standby election
-#   [rate_limiter] — rate.limiter.* per-endpoint limits
 #   [committee]    — committee.* governance bootstrap values
 #   [local_witness]— top-level localwitness* key sources
 # -----------------------------------------------------------------------------

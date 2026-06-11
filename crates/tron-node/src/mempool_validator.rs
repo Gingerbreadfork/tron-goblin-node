@@ -121,6 +121,8 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
             market_orders: &market_orders,
             nullifiers: &nullifiers,
             merkle_trees: merkle_trees.as_ref(),
+            // Admission checks never reach legacy-reward settlement depth.
+            reward_vi: None,
         };
         // `ActuatorTxCtx::default()` zeros the sighash; only the
         // shielded-transfer actuator consults it, and the executor

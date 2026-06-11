@@ -55,6 +55,8 @@ fn fresh_stores() -> VmStores {
         block_index: None,
         contracts: None,
         votes: Some(Arc::new(VotesStore::new(mem()))),
+        reward_vi: None,
+    abi: None,
     }
 }
 

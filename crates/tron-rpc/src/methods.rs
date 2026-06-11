@@ -958,7 +958,8 @@ pub fn get_reward(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(d) = &s.delegation else {
         return Ok(json!(0));
     };
-    let reward = tron_tvm::reward::query_reward(&addr, &s.accounts, d, &s.dyn_props)
+    let reward =
+        tron_tvm::reward::query_reward(&addr, &s.accounts, d, &s.dyn_props, s.reward_vi.as_deref())
         .map_err(|e| RpcError::internal(format!("reward read: {e}")))?;
     Ok(json!(reward))
 }
@@ -1588,6 +1589,12 @@ pub fn build_call_vm_stores(b: &crate::state::EthCallBackends) -> tron_tvm::exec
         // `triggerConstantContract`) don't exercise VOTEWITNESS —
         // leave `votes` unset so the bridge returns 0 if hit.
         votes: None,
+        // Constant calls CAN hit the RewardBalance precompile; the
+        // eth-call backends don't carry reward-vi today — acceptable
+        // for read-only paths (no consensus impact).
+        reward_vi: None,
+        // Read-only path: deletions never persist (session discarded).
+        abi: None,
     }
 }
 
@@ -4919,6 +4926,47 @@ pub fn get_transaction_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError>
 /// `getTotalTransaction` / `totalTransaction` — chain-wide tx counter.
 /// java-tron's implementation has been deprecated and returns 0
 /// (see `TransactionStore.getTotalTransactions`). We mirror that.
+/// `getTransactionCountByBlockNum(num)` — number of transactions in the
+/// block at `num`. java-tron `GetTransactionCountByBlockNumServlet`
+/// (`{count: -1}` when the block is unknown).
+pub fn get_transaction_count_by_block_num(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let num = p
+        .get(0)
+        .and_then(|v| v.as_i64())
+        .or_else(|| p.get(0).and_then(|v| v.as_str()).and_then(|x| x.parse().ok()))
+        .ok_or_else(|| RpcError::invalid_params("missing block num"))?;
+    let count = s
+        .block_index
+        .get(num)
+        .ok()
+        .and_then(|id| s.blocks.get(&id).ok())
+        .map(|b| b.transactions.len() as i64)
+        .unwrap_or(-1);
+    Ok(json!({ "count": count }))
+}
+
+/// `getCanDelegatedMaxSize(owner_address, type)` — upper bound on the
+/// resource a holder can still delegate. Same conservative shape as
+/// the gRPC `GetCanDelegatedMaxSize`: the frozen-v2 amount for the
+/// type (java additionally subtracts already-delegated + usage-locked;
+/// follow-up once the per-receiver index has a typed helper).
+pub fn get_can_delegated_max_size(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let addr_str = p
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("missing owner_address"))?;
+    let r#type = p.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let addr = parse_eth_address(addr_str)?;
+    let acct = s.accounts.get(&addr).ok().flatten().unwrap_or_default();
+    let max_size: i64 = acct
+        .frozen_v2
+        .iter()
+        .filter(|f| f.r#type == r#type)
+        .map(|f| f.amount)
+        .sum();
+    Ok(json!({ "max_size": max_size }))
+}
+
 pub fn get_total_transaction(_p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
     Ok(json!({ "num": 0_i64 }))
 }

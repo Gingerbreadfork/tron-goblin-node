@@ -66,6 +66,7 @@ fn fresh_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, Arc<dyn KvBacke
         contract_state: Some(snapshot_wrap(&mut backends)),
         block_index: Some(mem()),
         witness_schedule: Some(witness_schedule_be.clone()),
+        reward_vi: None,
     };
     let stack = SnapshotStack::from_named(backends);
     (state, blocks_be, witness_schedule_be, stack)

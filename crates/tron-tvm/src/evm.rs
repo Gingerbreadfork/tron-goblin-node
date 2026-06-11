@@ -35,6 +35,7 @@ use revm::primitives::{
 /// TRON-specific EVM opcodes outside the standard Ethereum range.
 /// Pinned from java-tron's `org.tron.core.vm.OpCode`.
 pub mod opcode {
+    pub const SELFDESTRUCT: u8 = 0xff;
     pub const CALLTOKEN: u8 = 0xd0;
     pub const TOKENBALANCE: u8 = 0xd1;
     pub const CALLTOKENVALUE: u8 = 0xd2;
@@ -74,6 +75,7 @@ struct TronEvmContext {
     dynamic_properties: Arc<DynamicPropertiesStore>,
     delegated_resources: Arc<DelegatedResourceStore>,
     delegation: Arc<DelegationStore>,
+    reward_vi: Option<Arc<tron_chainbase::RewardViStore>>,
     caller: TronAddress,
     callee: TronAddress,
     block_number: i64,
@@ -140,6 +142,7 @@ impl EvmContext for TronEvmContext {
             &self.accounts,
             &self.delegation,
             &self.dynamic_properties,
+            self.reward_vi.as_deref(),
         )?)
     }
 }
@@ -159,6 +162,7 @@ pub struct TronPrecompiles {
     dynamic_properties: Arc<DynamicPropertiesStore>,
     delegated_resources: Arc<DelegatedResourceStore>,
     delegation: Arc<DelegationStore>,
+    reward_vi: Option<Arc<tron_chainbase::RewardViStore>>,
     block_number: i64,
     block_timestamp_ms: i64,
     /// Per-tx hard-fork proposal snapshot. `dispatch_tron` consults
@@ -203,10 +207,22 @@ impl TronPrecompiles {
             dynamic_properties,
             delegated_resources,
             delegation,
+            reward_vi: None,
             block_number,
             block_timestamp_ms,
             proposals,
         }
+    }
+
+    /// Attach the `reward-vi` store so the RewardBalance precompile's
+    /// `query_reward` covers voters whose window predates the new
+    /// reward algorithm (`ALLOW_OLD_REWARD_OPT` fast path).
+    pub fn with_reward_vi(
+        mut self,
+        reward_vi: Option<Arc<tron_chainbase::RewardViStore>>,
+    ) -> Self {
+        self.reward_vi = reward_vi;
+        self
     }
 
     /// Returns true iff the given TRON precompile is enabled under the
@@ -251,7 +267,7 @@ impl TronPrecompiles {
             // off → falls through to an EOA-like call (no precompile
             // dispatch), matching java-tron's `getContractForAddress`
             // returning null.
-            P256Verify => false,
+            P256Verify => self.proposals.allow_tvm_osaka,
         }
     }
 
@@ -297,6 +313,7 @@ impl TronPrecompiles {
             dynamic_properties: Arc::clone(&self.dynamic_properties),
             delegated_resources: Arc::clone(&self.delegated_resources),
             delegation: Arc::clone(&self.delegation),
+            reward_vi: self.reward_vi.clone(),
             caller: evm_to_tron_address(&inputs.caller),
             callee: evm_to_tron_address(&inputs.target_address),
             block_number: self.block_number,
@@ -372,6 +389,20 @@ pub fn install_tron_opcode_stubs<IT, H>(
 {
     use revm::interpreter::instructions::contract;
     use revm::interpreter::Instruction;
+
+    // ---- SELFDESTRUCT (0xff) -- always the TRON variant ----
+    //
+    // java-tron's `suicideAction` / `suicideAction2`: chainbase
+    // side-effects (reward settlement + vote cancellation, TRC-10 sweep,
+    // frozen transfers -- each internally gated by its own proposal) +
+    // `canSuicide` validation + the #94 destroy rule and SUICIDE_V2
+    // energy. With every proposal off it degrades to the standard
+    // pre-Cancun selfdestruct.
+    instructions.insert_instruction(
+        opcode::SELFDESTRUCT,
+        Instruction::new(revm::interpreter::instructions::host::tron_selfdestruct::<IT, H>),
+        0,
+    );
 
     // ---- ALLOW_TVM_TRANSFER_TRC10 (0xd0..0xd3) ----
     if proposals.allow_tvm_transfer_trc10 {

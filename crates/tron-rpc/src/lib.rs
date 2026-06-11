@@ -28,9 +28,11 @@ pub use filters::{FilterKind, FilterRegistry, LogFilter};
 pub use mempool::{InMemoryMempool, Mempool, SubmitOutcome};
 pub use metrics::Metrics;
 pub use pubsub::{HeadEvent, LogEvent, PubSubBroker, SyncEvent};
+pub mod lite_gate;
 pub use rate_limit::{
-    build_rate_limit, component_for_http_path, parse_params, IpQpsBuckets,
-    PreemptibleCounter, QpsBucket, RateLimit, RateLimitRegistry,
+    build_rate_limit, component_for_http_path, normalize_component, parse_params,
+    GlobalRateLimiter, IpQpsBuckets, PreemptibleCounter, QpsBucket, RateLimit,
+    RateLimitRegistry,
 };
 pub use server::{serve, RpcServer};
 pub use state::{EthCallBackends, RpcState};

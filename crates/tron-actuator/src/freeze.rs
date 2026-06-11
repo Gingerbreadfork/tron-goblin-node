@@ -245,6 +245,7 @@ pub fn execute_unfreeze_balance(
     delegation: &DelegationStore,
     delegated_resources: &DelegatedResourceStore,
     index: Option<&DelegatedResourceAccountIndexStore>,
+    reward_vi: Option<&tron_chainbase::RewardViStore>,
     contract: &UnfreezeBalanceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -253,7 +254,7 @@ pub fn execute_unfreeze_balance(
     // (`mortgageService.withdrawReward(ownerAddress)` at the top of
     // `UnfreezeBalanceActuator.execute`) — the reward window must close
     // against the votes/cycle markers as they stood.
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props)?;
+    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut account = accounts
         .get(&owner)?

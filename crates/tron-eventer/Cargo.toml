@@ -7,9 +7,11 @@ license.workspace = true
 description = "Event subscribe / logsfilter: emits per-block, per-tx, per-contract-event/log triggers in java-tron's logsfilter shape so external analytics consumers (Kafka, MongoDB, in-process) can subscribe without translating types."
 
 [dependencies]
+tron-crypto = { path = "../tron-crypto" }
 tron-proto = { path = "../tron-proto" }
 tron-types = { path = "../tron-types" }
 hex.workspace = true
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

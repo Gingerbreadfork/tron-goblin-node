@@ -26,7 +26,7 @@ use revm::primitives::Address;
 use tron_chainbase::DelegatedResourceStore;
 use tron_crypto::address::Address as TronAddress;
 
-use crate::database::{evm_to_tron_address, TronDatabase};
+use crate::database::{evm_to_tron_address, tron_to_evm_address, TronDatabase};
 
 impl TronDatabaseExt for TronDatabase {
     fn tron_token_balance(&self, address: Address, token_id: i64) -> i64 {
@@ -82,6 +82,307 @@ impl TronDatabaseExt for TronDatabase {
         self.last_balance_delta
             .take()
             .unwrap_or((Address::ZERO, 0))
+    }
+
+    fn tron_take_balance_deltas(&mut self) -> Vec<(Address, i64)> {
+        std::mem::take(&mut self.pending_balance_deltas)
+    }
+
+    /// java-tron `Program.suicide` / `suicide2` -- the chainbase half.
+    ///
+    /// The EVM journal already handles the TRX balance (owner ->
+    /// obtainer, or owner -> burn account for a self-target destroy via
+    /// the journal-cfg redirect) and the destroy/no-op decision. This
+    /// bridge ports everything java does on its `Repository`:
+    ///
+    /// * `canSuicide` (pre-#94) / `canSuicide2` (#94) validation --
+    ///   outstanding v1/v2 delegations (or, under #94, unexpired frozen
+    ///   v1) make the whole frame REVERT (`-1`).
+    /// * `withdrawRewardAndCancelVote` (gated `ALLOW_TVM_VOTE`): settle
+    ///   pending voter rewards, clear votes + the votes-store row, fold
+    ///   `allowance` into balance (EVM-side via the delta channel).
+    /// * TRC-10 sweep (gated `ALLOW_TVM_TRANSFER_TRC10`): every
+    ///   `asset_v2` entry moves to the inheritor.
+    /// * Frozen v1 (gated `ALLOW_TVM_FREEZE`): total-weight accounting,
+    ///   frozen balances credited to the inheritor as TRX; owner's
+    ///   frozen rows cleared under #94 (pre-#94 the row is deleted
+    ///   anyway).
+    /// * Frozen v2 (gated `ALLOW_TVM_FREEZE_V2`): frozen entries move to
+    ///   the inheritor, usage windows merge (`unDelegateIncrease`),
+    ///   expired unfreezes credit the inheritor as TRX, owner's v2
+    ///   state cleared.
+    ///
+    /// The inheritor is the burn account when `obtainer == owner`
+    /// (java's blackhole), the obtainer otherwise. A non-destroying
+    /// self-target suicide (#94, pre-existing contract) is a pure no-op
+    /// after validation -- java `suicide2` returns right after the
+    /// internal-tx record.
+    fn tron_suicide(&mut self, owner: Address, obtainer: Address, will_destroy: bool) -> i64 {
+        use tron_types::resource::{self as res, ResourceKind, ResourceGates};
+
+        let Some(dyn_props) = self.dyn_props.clone() else {
+            return 0; // read-only setup: nothing to validate or move
+        };
+        let owner_t = evm_to_tron_address(&owner);
+        let obtainer_t = evm_to_tron_address(&obtainer);
+        let Ok(Some(mut owner_account)) = self.accounts.get(&owner_t) else {
+            return 0;
+        };
+
+        let now_ms = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+        let allow_freeze = dyn_props.get_long(b"ALLOW_TVM_FREEZE").unwrap_or(0) == 1;
+        let allow_freeze_v2 = dyn_props.get_long(b"ALLOW_TVM_FREEZE_V2").unwrap_or(0) == 1;
+        let allow_vote = dyn_props.get_long(b"ALLOW_TVM_VOTE").unwrap_or(0) == 1;
+        let allow_trc10 = dyn_props.get_long(b"ALLOW_TVM_TRANSFER_TRC10").unwrap_or(0) == 1;
+        let restriction = dyn_props
+            .get_long(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION")
+            .unwrap_or(0)
+            == 1;
+
+        // ---- validation: canSuicide (pre-#94) / canSuicide2 (#94) ----
+        let delegated_v1_clear = owner_account.delegated_frozen_balance_for_bandwidth == 0
+            && owner_account
+                .account_resource
+                .as_ref()
+                .map(|r| r.delegated_frozen_balance_for_energy)
+                .unwrap_or(0)
+                == 0;
+        let frozen_v1_unexpired = owner_account
+            .frozen
+            .iter()
+            .any(|f| f.expire_time > now_ms)
+            || owner_account
+                .account_resource
+                .as_ref()
+                .and_then(|r| r.frozen_balance_for_energy.as_ref())
+                .map(|f| f.frozen_balance > 0 && f.expire_time > now_ms)
+                .unwrap_or(false);
+        let freeze_v1_ok = if !allow_freeze {
+            true
+        } else if restriction {
+            // canSuicide2's freezeV1Check: unexpired frozen ALSO blocks.
+            !frozen_v1_unexpired && delegated_v1_clear
+        } else {
+            // canSuicide's freezeCheck: delegations only.
+            delegated_v1_clear
+        };
+        let freeze_v2_ok = !allow_freeze_v2 || {
+            let delegated_clear = owner_account.delegated_frozen_v2_balance_for_bandwidth == 0
+                && owner_account
+                    .account_resource
+                    .as_ref()
+                    .map(|r| r.delegated_frozen_v2_balance_for_energy)
+                    .unwrap_or(0)
+                    == 0;
+            let unfrozen_pending = owner_account
+                .unfrozen_v2
+                .iter()
+                .any(|u| u.unfreeze_expire_time > now_ms);
+            delegated_clear && !unfrozen_pending
+        };
+        if !(freeze_v1_ok && freeze_v2_ok) {
+            return -1;
+        }
+
+        let self_target = owner_t == obtainer_t;
+        if self_target && !will_destroy {
+            // suicide2 on a pre-existing contract with itself as the
+            // beneficiary: validated, recorded, otherwise untouched.
+            return 0;
+        }
+
+        // The burn account inherits on a self-target destroy.
+        let inheritor_t = if self_target {
+            tron_crypto::address::Address::from_raw(BLACKHOLE_ADDRESS)
+        } else {
+            obtainer_t
+        };
+
+        // ---- withdrawRewardAndCancelVote (suicide: always; suicide2:
+        //      only on the transfer path -- both reach here) ----
+        if allow_vote {
+            if let Some(delegation) = self.delegation.clone() {
+                let _ = crate::reward::withdraw_reward(
+                    &owner_t,
+                    &self.accounts,
+                    &delegation,
+                    &dyn_props,
+                    self.reward_vi.as_deref(),
+                );
+                // Re-read: withdraw_reward may have grown the allowance.
+                if let Ok(Some(acc)) = self.accounts.get(&owner_t) {
+                    owner_account = acc;
+                }
+            }
+            if !owner_account.votes.is_empty() {
+                if let Some(votes_store) = self.votes.as_ref() {
+                    let mut votes_row = match votes_store.get(&owner_t) {
+                        Ok(Some(v)) => {
+                            let mut v = v;
+                            v.new_votes.clear();
+                            v
+                        }
+                        _ => tron_proto::Votes {
+                            address: owner_t.as_bytes().to_vec(),
+                            old_votes: owner_account.votes.clone(),
+                            new_votes: Vec::new(),
+                        },
+                    };
+                    votes_row.address = owner_t.as_bytes().to_vec();
+                    votes_store
+                        .put(&owner_t, &votes_row)
+                        .expect("db error in tron_suicide writing votes row");
+                }
+                owner_account.votes.clear();
+                owner_account.old_tron_power = 0;
+            }
+            // Fold allowance into balance: chainbase keeps the
+            // allowance/latest-withdraw fields, the EVM journal gets the
+            // balance credit. java truncates the withdraw time to whole
+            // seconds (block timestamp word * 1000).
+            let allowance = owner_account.allowance;
+            if allowance != 0 {
+                self.pending_balance_deltas.push((owner, allowance));
+            }
+            owner_account.allowance = 0;
+            owner_account.latest_withdraw_time = (now_ms / 1000) * 1000;
+        }
+
+        // Make sure the inheritor exists on chain (java
+        // `createAccountIfNotExist`).
+        let mut inheritor_account = match self.accounts.get(&inheritor_t) {
+            Ok(Some(acc)) => acc,
+            _ => tron_proto::Account {
+                address: inheritor_t.as_bytes().to_vec(),
+                create_time: now_ms,
+                ..Default::default()
+            },
+        };
+
+        // ---- TRC-10 sweep ----
+        if allow_trc10 {
+            for (token, amount) in std::mem::take(&mut owner_account.asset_v2) {
+                if amount == 0 {
+                    continue;
+                }
+                let slot = inheritor_account.asset_v2.entry(token).or_insert(0);
+                *slot = slot.saturating_add(amount);
+            }
+        }
+
+        // ---- frozen v1 ----
+        if allow_freeze {
+            let frozen_bw = owner_account
+                .frozen
+                .first()
+                .map(|f| f.frozen_balance)
+                .unwrap_or(0);
+            let frozen_energy = owner_account
+                .account_resource
+                .as_ref()
+                .and_then(|r| r.frozen_balance_for_energy.as_ref())
+                .map(|f| f.frozen_balance)
+                .unwrap_or(0);
+            dyn_props.add_total_net_weight(-frozen_bw / TRX_PRECISION);
+            dyn_props.add_total_energy_weight(-frozen_energy / TRX_PRECISION);
+            let total = frozen_bw.saturating_add(frozen_energy);
+            if total != 0 {
+                self.pending_balance_deltas
+                    .push((tron_to_evm_address(&inheritor_t), total));
+            }
+            if restriction {
+                // java clearOwnerFreeze (only under #94 -- pre-#94 the
+                // whole row is deleted at commit anyway).
+                owner_account.frozen.clear();
+                if let Some(r) = owner_account.account_resource.as_mut() {
+                    r.frozen_balance_for_energy = None;
+                }
+            }
+        }
+
+        // ---- frozen v2 ----
+        if allow_freeze_v2 {
+            let gates = ResourceGates {
+                support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
+                support_allow_cancel_all_unfreeze_v2: dyn_props
+                    .support_allow_cancel_all_unfreeze_v2(),
+            };
+            let now_slot = dyn_props.head_slot();
+
+            // Transfer frozen v2 entries by type.
+            for f in owner_account.frozen_v2.iter().filter(|f| f.amount > 0) {
+                let slot = inheritor_account
+                    .frozen_v2
+                    .iter_mut()
+                    .find(|i| i.r#type == f.r#type);
+                match slot {
+                    Some(i) => i.amount = i.amount.saturating_add(f.amount),
+                    None => inheritor_account.frozen_v2.push(tron_proto::account::FreezeV2 {
+                        r#type: f.r#type,
+                        amount: f.amount,
+                    }),
+                }
+            }
+
+            // Merge usage windows into the inheritor (java
+            // updateUsageForDelegated + unDelegateIncrease).
+            res::update_usage(&mut owner_account, ResourceKind::Bandwidth, now_slot, gates);
+            res::set_latest_time(&mut owner_account, ResourceKind::Bandwidth, now_slot);
+            if res::usage(&owner_account, ResourceKind::Bandwidth) > 0 {
+                let usage = res::usage(&owner_account, ResourceKind::Bandwidth);
+                res::undelegate_increase(
+                    &mut inheritor_account,
+                    &owner_account,
+                    usage,
+                    ResourceKind::Bandwidth,
+                    now_slot,
+                    gates,
+                );
+            }
+            res::update_usage(&mut owner_account, ResourceKind::Energy, now_slot, gates);
+            res::set_latest_time(&mut owner_account, ResourceKind::Energy, now_slot);
+            if res::usage(&owner_account, ResourceKind::Energy) > 0 {
+                let usage = res::usage(&owner_account, ResourceKind::Energy);
+                res::undelegate_increase(
+                    &mut inheritor_account,
+                    &owner_account,
+                    usage,
+                    ResourceKind::Energy,
+                    now_slot,
+                    gates,
+                );
+            }
+
+            // Expired unfreezes credit the inheritor as TRX.
+            let expired: i64 = owner_account
+                .unfrozen_v2
+                .iter()
+                .filter(|u| u.unfreeze_amount > 0 && u.unfreeze_expire_time <= now_ms)
+                .map(|u| u.unfreeze_amount)
+                .sum();
+            if expired > 0 {
+                self.pending_balance_deltas
+                    .push((tron_to_evm_address(&inheritor_t), expired));
+            }
+
+            // clearOwnerFreezeV2.
+            owner_account.frozen_v2.clear();
+            owner_account.unfrozen_v2.clear();
+            res::set_usage(&mut owner_account, ResourceKind::Bandwidth, 0);
+            res::set_new_window_size(&mut owner_account, ResourceKind::Bandwidth, 0);
+            res::set_usage(&mut owner_account, ResourceKind::Energy, 0);
+            res::set_new_window_size(&mut owner_account, ResourceKind::Energy, 0);
+        }
+
+        self.accounts
+            .put(&owner_t, &owner_account)
+            .expect("db error in tron_suicide writing owner account");
+        if inheritor_t != owner_t {
+            self.accounts
+                .put(&inheritor_t, &inheritor_account)
+                .expect("db error in tron_suicide writing inheritor account");
+        }
+        0
     }
 
     fn tron_freeze(
@@ -204,7 +505,7 @@ impl TronDatabaseExt for TronDatabase {
         if let (Some(delegation), Some(dyn_props)) =
             (self.delegation.as_ref(), self.dyn_props.as_ref())
         {
-            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props)
+            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_vote_witness settling rewards");
         }
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
@@ -254,7 +555,7 @@ impl TronDatabaseExt for TronDatabase {
         // guard (`latest_withdraw_time + 24h`) failed withdrawals java
         // accepts.
         if let Some(delegation) = self.delegation.as_ref() {
-            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props)
+            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
         }
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
@@ -359,7 +660,7 @@ impl TronDatabaseExt for TronDatabase {
         // java's TVM `UnfreezeBalanceV2Processor.execute` settles pending
         // voter rewards first, mirroring the actuator.
         if let Some(delegation) = self.delegation.as_ref() {
-            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props)
+            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
                 .expect(
                     "db error in TronDatabaseExt::tron_unfreeze_balance_v2 settling rewards",
                 );
@@ -704,6 +1005,15 @@ impl TronDatabaseExt for TronDatabase {
 /// already depends on `tron-tvm` for shielded verifier keys, a
 /// dep we can't cycle back through).
 const TRX_PRECISION: i64 = 1_000_000;
+
+/// Mainnet burn account ("Blackhole",
+/// `TLsV52sRDL79HXGGm9yzwKibb6BeruhUzy`) -- the self-target suicide
+/// inheritor, java-tron `Repository.getBlackHoleAddress()`.
+const BLACKHOLE_ADDRESS: [u8; 21] = [
+    0x41, 0x77, 0x94, 0x4d, 0x19, 0xc0, 0x52, 0xb7, 0x3e, 0xe2, 0x28, 0x68, 0x23, 0xaa, 0x83,
+    0xf8, 0x13, 0x8c, 0xb7, 0x03, 0x2f,
+];
+
 const FROZEN_PERIOD_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
 fn self_freeze_expire(

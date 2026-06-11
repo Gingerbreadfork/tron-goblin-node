@@ -45,6 +45,10 @@ group = "0.13"
 tron-crypto = { path = "../tron-crypto" }
 tron-types = { path = "../tron-types" }
 tonic = { workspace = true }
+# Per-method rate-limit layer (java RateLimiterInterceptor) sits at the
+# tower/http level where the URI path carries the method name.
+tower = "0.4"
+http = "1"
 tokio-stream = "0.1"
 tron-index = { path = "../tron-index" }
 prost.workspace = true

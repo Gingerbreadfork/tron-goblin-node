@@ -173,7 +173,8 @@ fn engine_backfills_and_resumes_over_rocksdb() {
             contract_state: Some(mem()),
             block_index: Some(block_index_be.clone()),
             witness_schedule: Some(mem()),
-        };
+            reward_vi: None,
+    };
         AccountStore::new(state.accounts.clone())
             .put(
                 &Address::from_raw(alice),

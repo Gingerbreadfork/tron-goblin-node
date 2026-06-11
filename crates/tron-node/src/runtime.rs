@@ -599,9 +599,21 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .map_err(|e| RunError::Rpc(e.to_string()))?;
         info!(%bound, "JSON-RPC listening");
         let mut sd = shutdown.subscribe();
+        // Rate limits: java's JsonRpcServlet sits behind the same
+        // rate.limiter.http chain — the `jsonrpc` component (servlet
+        // suffix normalized) + the node-wide global limiter.
+        let jsonrpc_limits = build_rate_limit_registry(&config.rate_limiter.http);
+        let jsonrpc_global = tron_rpc::GlobalRateLimiter::new(
+            config.rate_limiter.global_qps,
+            config.rate_limiter.global_ip_qps,
+        );
         handles.push(tokio::spawn(async move {
-            let app = tron_rpc::server::router(rpc_state);
-            let server = axum::serve(listener, app.into_make_service());
+            let app =
+                tron_rpc::server::router_with_limits(rpc_state, jsonrpc_limits, jsonrpc_global);
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            );
             tokio::select! {
                 r = server => {
                     if let Err(e) = r {
@@ -614,6 +626,18 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             }
         }));
     }
+
+    // === Lite-fullnode history gate (java LiteFnQuery* filters) ===
+    let lite_gate_enabled = {
+        let lite = stores.is_lite_node();
+        if lite && !config.open_history_query_when_lite_fn {
+            info!(
+                "lite dataset detected: history-query APIs closed \
+                 (set open_history_query_when_lite_fn = true to serve them anyway)"
+            );
+        }
+        lite && !config.open_history_query_when_lite_fn
+    };
 
     // === gRPC server ===
     //
@@ -638,11 +662,29 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .parse()
             .map_err(|e: std::net::AddrParseError| RunError::Rpc(e.to_string()))?;
         let mut sd = shutdown.subscribe();
+        // Per-method limits from rate.limiter.rpc
+        // (`protocol.Wallet/GetAccount`-style components) + the global
+        // ceiling — java's RateLimiterInterceptor + GlobalRateLimiter.
+        let grpc_limits = build_rate_limit_registry(&config.rate_limiter.rpc);
+        let grpc_global = tron_rpc::GlobalRateLimiter::new(
+            config.rate_limiter.global_qps,
+            config.rate_limiter.global_ip_qps,
+        );
+        let lite_gate_for_grpc = lite_gate_enabled;
         handles.push(tokio::spawn(async move {
             let shutdown_fut = async move {
                 let _ = sd.recv().await;
             };
-            if let Err(e) = tron_grpc::start_server(grpc_state, addr, shutdown_fut).await {
+            if let Err(e) = tron_grpc::start_server_with_limits_and_gates(
+                grpc_state,
+                addr,
+                shutdown_fut,
+                grpc_limits,
+                grpc_global,
+                lite_gate_for_grpc,
+            )
+            .await
+            {
                 error!(error = %e, "gRPC server exited");
             }
         }));
@@ -692,13 +734,23 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // through unlimited, matching java-tron's interceptor
         // behavior on unconfigured servlets.
         let http_limits = build_rate_limit_registry(&config.rate_limiter.http);
+        let http_global = tron_rpc::GlobalRateLimiter::new(
+            config.rate_limiter.global_qps,
+            config.rate_limiter.global_ip_qps,
+        );
+        let lite_gate_for_http = lite_gate_enabled;
         handles.push(tokio::spawn(async move {
             let shutdown_fut = async move {
                 let _ = sd.recv().await;
             };
-            let app = tron_rpc::http_rest::router_with_rate_limits(http_state, http_limits);
-            let server = axum::serve(listener, app.into_make_service())
-                .with_graceful_shutdown(shutdown_fut);
+            let app =
+                tron_rpc::http_rest::router_with_limits(http_state, http_limits, http_global);
+            let app = tron_rpc::lite_gate::layer(app, lite_gate_for_http);
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_fut);
             if let Err(e) = server.await {
                 error!(error = %e, "HTTP REST server exited");
             }
@@ -754,6 +806,28 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         .with_metrics(metrics.clone())
         .with_exec_config(exec_config)
         .with_pubsub(pubsub.clone());
+        // Witness HA: when a backup group is configured, run the UDP
+        // keepalive election and gate production on MASTER status
+        // (java BackupManager + BlockHandleImpl.BACKUP_IS_NOT_MASTER).
+        let runtime = if !config.node_backup.members.is_empty() {
+            let mut sd_backup = shutdown.subscribe();
+            let (backup_handle, backup_fut) = crate::backup::start(
+                config.node_backup.clone(),
+                async move {
+                    let _ = sd_backup.recv().await;
+                },
+            );
+            handles.push(tokio::spawn(backup_fut));
+            info!(
+                members = config.node_backup.members.len(),
+                priority = config.node_backup.priority,
+                port = config.node_backup.port,
+                "witness HA: backup election active — production gated on MASTER"
+            );
+            runtime.with_backup(backup_handle)
+        } else {
+            runtime
+        };
         let runtime = match &index_hook {
             Some(hook) => runtime.with_index_hook(hook.clone()),
             None => runtime,
@@ -1343,6 +1417,30 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             pool_size = rotation_pool.len(),
             "peer drivers: configured peers pinned, rest rotate the full discovered pool"
         );
+        // === Event subscription ([event] → plugin registry → EventBus) ===
+        //
+        // java-tron's EventPluginLoader equivalent: the registry holds the
+        // compiled-in sinks (kafka today); `[event] enable = true` +
+        // `path` pick one and every applied block fans out the java-shaped
+        // triggers (block/transaction/contractevent/contractlog/solidity),
+        // post-filter. Disabled → empty bus, zero per-block cost.
+        let event_bus = {
+            let mut registry = tron_eventer::PluginRegistry::new();
+            registry.register(tron_eventer_kafka::KafkaPluginFactory);
+            match crate::event_loader::build_event_bus(config.event.as_ref(), &registry) {
+                Ok(bus) => {
+                    if !bus.is_empty() {
+                        info!("event plugin: bus active");
+                    }
+                    bus
+                }
+                Err(e) => {
+                    error!(error = %e, "event plugin: loader failed; continuing WITHOUT event subscription");
+                    tron_eventer::EventBus::default()
+                }
+            }
+        };
+
         // Pipelined block apply (`vm.pipelined_apply`, default on): the
         // leader's drain batches overlap each block's commit + undo-log
         // I/O with the next block's execution. Gated off when this node
@@ -1423,6 +1521,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             };
             let fetch_pool_for_peer = fetch_pool.clone();
             let index_hook_for_peer = index_hook.clone();
+            let event_bus_for_peer = event_bus.clone();
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
                     .with_metrics(metrics_for_peer)
@@ -1467,6 +1566,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 if pipelined_apply_enabled {
                     driver = driver.with_pipelined_apply();
                 }
+                driver = driver.with_event_bus(event_bus_for_peer);
                 (driver_label, driver.run(sd).await)
             }));
         }
@@ -1597,7 +1697,10 @@ fn build_rate_limit_registry(
 ) -> tron_rpc::RateLimitRegistry {
     let mut map = std::collections::HashMap::new();
     for item in items {
-        let key = item.component.to_lowercase();
+        // Lowercase + strip java's `Servlet` class-name suffix so a
+        // config.conf copied verbatim from java-tron matches our
+        // path-tail components.
+        let key = tron_rpc::normalize_component(&item.component);
         match tron_rpc::build_rate_limit(&item.strategy, &item.params) {
             Some(limit) => {
                 map.insert(key, limit);

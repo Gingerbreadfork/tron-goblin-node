@@ -242,7 +242,7 @@ fn window_optimized(account: &Account, kind: ResourceKind) -> bool {
 }
 
 /// java-tron `AccountCapsule.setNewWindowSize(resourceCode, v)`.
-fn set_new_window_size(account: &mut Account, kind: ResourceKind, v: i64) {
+pub fn set_new_window_size(account: &mut Account, kind: ResourceKind, v: i64) {
     match kind {
         ResourceKind::Bandwidth => account.net_window_size = v,
         ResourceKind::Energy => {

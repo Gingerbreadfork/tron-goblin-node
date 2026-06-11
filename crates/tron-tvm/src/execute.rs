@@ -47,6 +47,14 @@ use crate::evm::TronPrecompiles;
 /// Mirrors java-tron's `VMConfig.allowDynamicEnergy()` gate: when off,
 /// the per-contract `energy_factor` (even if non-zero in chainbase) must
 /// NOT multiply opcode gas. See `actuator/.../vm/VM.java` line ~27.
+/// Mainnet burn account (`TLsV52sRDL79HXGGm9yzwKibb6BeruhUzy`) as a
+/// 20-byte EVM address -- the journal's self-target SELFDESTRUCT
+/// redirect (java `Repository.getBlackHoleAddress()`).
+const BLACKHOLE_EVM_ADDRESS: [u8; 20] = [
+    0x77, 0x94, 0x4d, 0x19, 0xc0, 0x52, 0xb7, 0x3e, 0xe2, 0x28, 0x68, 0x23, 0xaa, 0x83, 0xf8,
+    0x13, 0x8c, 0xb7, 0x03, 0x2f,
+];
+
 fn dynamic_energy_active(dyn_props: &DynamicPropertiesStore) -> bool {
     dyn_props.get_long(b"ALLOW_DYNAMIC_ENERGY").unwrap_or(0) == 1
 }
@@ -75,6 +83,16 @@ pub struct VmStores {
     /// read-only callers (`eth_call` etc.) that don't trigger the
     /// state-mutating opcodes can omit it.
     pub votes: Option<Arc<tron_chainbase::VotesStore>>,
+    /// `reward-vi` store — the `ALLOW_OLD_REWARD_OPT` legacy-reward fast
+    /// path consulted by the RewardBalance precompile and by reward
+    /// settlement inside the staking opcode bridges. Optional; only
+    /// voters whose reward window predates the new reward algorithm
+    /// read it.
+    pub reward_vi: Option<Arc<tron_chainbase::RewardViStore>>,
+    /// ABI store — SELFDESTRUCT contract-row cleanup (java's
+    /// `deleteContract` drops the abi row alongside account/code/
+    /// contract). Optional; read-only callers skip it.
+    pub abi: Option<Arc<tron_chainbase::AbiStore>>,
 }
 
 /// Per-block environment the EVM needs (BLOCKNUMBER, TIMESTAMP, ...).
@@ -323,6 +341,12 @@ fn execute_trigger_inner(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    if let Some(rv) = stores.reward_vi.clone() {
+        tron_db = tron_db.with_reward_vi(rv);
+    }
+    if let Some(abi) = stores.abi.clone() {
+        tron_db = tron_db.with_abi(abi);
+    }
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
     let mut ctx = Context::mainnet()
@@ -350,7 +374,8 @@ fn execute_trigger_inner(
         block.block_number,
         block.block_timestamp_ms,
         proposals,
-    );
+    )
+    .with_reward_vi(stores.reward_vi.clone());
     let mut instructions = EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(spec);
     // TRON fork: replace the spec-adjusted static gas table with TRON's static
     // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
@@ -370,6 +395,18 @@ fn execute_trigger_inner(
     }
     if let Some((dl, _)) = deadline {
         trc10_inspector = trc10_inspector.with_deadline(dl);
+    }
+    // TRON SELFDESTRUCT semantics: the journal's destroy rule follows
+    // proposal #94 (not the Cancun opcode spec), and a self-target
+    // destroy credits the burn account when TRC-10 transfers are live.
+    {
+        use revm::context_interface::JournalTr as _;
+        ctx.journaled_state.set_tron_selfdestruct_overrides(
+            Some(proposals.allow_tvm_selfdestruct_restriction),
+            proposals
+                .allow_tvm_transfer_trc10
+                .then(|| EvmAddress::from_slice(&BLACKHOLE_EVM_ADDRESS)),
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -531,6 +568,12 @@ fn execute_trigger_inner_with_tracer(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    if let Some(rv) = stores.reward_vi.clone() {
+        tron_db = tron_db.with_reward_vi(rv);
+    }
+    if let Some(abi) = stores.abi.clone() {
+        tron_db = tron_db.with_abi(abi);
+    }
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
     let mut ctx = Context::mainnet()
@@ -558,7 +601,8 @@ fn execute_trigger_inner_with_tracer(
         block.block_number,
         block.block_timestamp_ms,
         proposals,
-    );
+    )
+    .with_reward_vi(stores.reward_vi.clone());
     let mut instructions = EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(spec);
     // TRON fork: replace the spec-adjusted static gas table with TRON's static
     // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
@@ -579,6 +623,18 @@ fn execute_trigger_inner_with_tracer(
     }
     if let Some((dl, _)) = deadline {
         trc10_inspector = trc10_inspector.with_deadline(dl);
+    }
+    // TRON SELFDESTRUCT semantics: the journal's destroy rule follows
+    // proposal #94 (not the Cancun opcode spec), and a self-target
+    // destroy credits the burn account when TRC-10 transfers are live.
+    {
+        use revm::context_interface::JournalTr as _;
+        ctx.journaled_state.set_tron_selfdestruct_overrides(
+            Some(proposals.allow_tvm_selfdestruct_restriction),
+            proposals
+                .allow_tvm_transfer_trc10
+                .then(|| EvmAddress::from_slice(&BLACKHOLE_EVM_ADDRESS)),
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -867,9 +923,15 @@ pub fn execute_create_with_trace(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    if let Some(rv) = stores.reward_vi.clone() {
+        tron_db = tron_db.with_reward_vi(rv);
+    }
+    if let Some(abi) = stores.abi.clone() {
+        tron_db = tron_db.with_abi(abi);
+    }
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
-    let ctx = Context::mainnet()
+    let mut ctx = Context::mainnet()
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
@@ -889,7 +951,8 @@ pub fn execute_create_with_trace(
         block.block_number,
         block.block_timestamp_ms,
         proposals,
-    );
+    )
+    .with_reward_vi(stores.reward_vi.clone());
     let mut instructions = EthInstructions::<EthInterpreter, _>::new_mainnet_with_spec(spec);
     // TRON fork: replace the spec-adjusted static gas table with TRON's static
     // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
@@ -902,6 +965,18 @@ pub fn execute_create_with_trace(
         trc10 = trc10.with_dynamic_energy(
             Arc::clone(&stores.contract_state),
             Arc::clone(&stores.dynamic_properties),
+        );
+    }
+    // TRON SELFDESTRUCT semantics: the journal's destroy rule follows
+    // proposal #94 (not the Cancun opcode spec), and a self-target
+    // destroy credits the burn account when TRC-10 transfers are live.
+    {
+        use revm::context_interface::JournalTr as _;
+        ctx.journaled_state.set_tron_selfdestruct_overrides(
+            Some(proposals.allow_tvm_selfdestruct_restriction),
+            proposals
+                .allow_tvm_transfer_trc10
+                .then(|| EvmAddress::from_slice(&BLACKHOLE_EVM_ADDRESS)),
         );
     }
     let mut evm = Evm {

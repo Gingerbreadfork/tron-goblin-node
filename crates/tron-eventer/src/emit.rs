@@ -14,12 +14,18 @@ use crate::trigger::{names, BlockEvent, TransactionEvent};
 /// One tx's post-execution data — the minimal slice the eventer needs
 /// from a per-tx execution outcome. Decouples this crate from the
 /// executor's `TxResult`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TxOutcomeSlice {
     pub tx_id: [u8; 32],
     /// `"SUCCESS"` / `"REVERT"` / `"FAILED"` etc. — the textual form
     /// java-tron writes into `contractResult`.
     pub contract_result: String,
+    /// Receipt fields java's `TransactionLogTrigger` copies from
+    /// `TransactionInfo` — zero when the caller doesn't track them.
+    pub energy_usage_total: i64,
+    pub energy_fee: i64,
+    pub net_usage: i64,
+    pub net_fee: i64,
 }
 
 /// Emit a block-level trigger plus one transaction-level trigger per
@@ -61,7 +67,7 @@ pub fn emit_block_and_transactions(
     // caller provides a richer outcome slice — keeping this helper
     // dep-free of the executor.
     for (index, (tx, outcome)) in block.transactions.iter().zip(tx_outcomes.iter()).enumerate() {
-        let (contract_type, from_address, to_address) = inspect_first_contract(tx);
+        let decoded = inspect_first_contract(tx);
         let tx_event = TransactionEvent {
             trigger_name: names::TRANSACTION,
             time_stamp: timestamp_ms,
@@ -69,46 +75,112 @@ pub fn emit_block_and_transactions(
             block_hash: hex::encode(block_id),
             block_number,
             transaction_index: index as i32,
-            contract_type,
+            contract_type: decoded.contract_type,
             contract_result: outcome.contract_result.clone(),
-            from_address,
-            to_address,
-            contract_address: String::new(),
+            from_address: decoded.from_address,
+            to_address: decoded.to_address,
+            contract_address: decoded.contract_address,
             fee_limit: tx.raw_data.as_ref().map(|r| r.fee_limit).unwrap_or(0),
-            energy_usage_total: 0,
-            energy_fee: 0,
-            net_usage: 0,
-            net_fee: 0,
-            contract_call_value: 0,
-            asset_name: String::new(),
-            asset_amount: 0,
+            energy_usage_total: outcome.energy_usage_total,
+            energy_fee: outcome.energy_fee,
+            net_usage: outcome.net_usage,
+            net_fee: outcome.net_fee,
+            contract_call_value: decoded.call_value,
+            asset_name: decoded.asset_name,
+            asset_amount: decoded.asset_amount,
             latest_solidified_block_number: latest_solidified,
-            data: String::new(),
+            data: decoded.data,
         };
         bus.emit_transaction(&tx_event);
     }
 }
 
-/// Extract `(contract_type_name, owner_address_hex, to_address_hex)`
-/// from the first contract in the tx. java-tron's
-/// `TransactionLogTriggerCapsule` uses the same "first contract"
-/// shortcut — multi-contract txs are unusual on mainnet.
-fn inspect_first_contract(tx: &tron_proto::Transaction) -> (String, String, String) {
+/// Fields java's `TransactionLogTriggerCapsule` decodes from the tx's
+/// first contract (per-type `switch`). Addresses are base58check —
+/// java posts `StringUtil.encode58Check(...)`.
+#[derive(Debug, Default)]
+struct DecodedContract {
+    contract_type: String,
+    from_address: String,
+    to_address: String,
+    contract_address: String,
+    call_value: i64,
+    asset_name: String,
+    asset_amount: i64,
+    /// `TriggerSmartContract.data` as lowercase hex (java
+    /// `Hex.toHexString`).
+    data: String,
+}
+
+fn b58(addr: &[u8]) -> String {
+    if addr.len() == 21 {
+        tron_crypto::base58check::encode_check(addr)
+    } else {
+        String::new()
+    }
+}
+
+/// Decode the trigger-relevant fields from the tx's first contract.
+/// Mirrors java-tron's `TransactionLogTriggerCapsule` per-type switch
+/// for the contract families it special-cases; everything else gets
+/// the type name only.
+fn inspect_first_contract(tx: &tron_proto::Transaction) -> DecodedContract {
+    use prost::Message as _;
+
+    let mut out = DecodedContract::default();
     let Some(raw) = tx.raw_data.as_ref() else {
-        return (String::new(), String::new(), String::new());
+        return out;
     };
     let Some(contract) = raw.contract.first() else {
-        return (String::new(), String::new(), String::new());
+        return out;
     };
-    let name = ContractType::try_from(contract.r#type)
+    let ty = ContractType::try_from(contract.r#type).ok();
+    out.contract_type = ty
         .map(|t| format!("{t:?}"))
-        .unwrap_or_else(|_| format!("Unknown({})", contract.r#type));
-    // Common pattern across most contract types: the first 21-byte
-    // field in the `Any.value` is `owner_address`. We can't decode the
-    // typed contract without knowing the type, so leave addresses
-    // blank — caller can provide richer extraction if needed.
-    let _ = contract;
-    (name, String::new(), String::new())
+        .unwrap_or_else(|| format!("Unknown({})", contract.r#type));
+    let Some(any) = contract.parameter.as_ref() else {
+        return out;
+    };
+    match ty {
+        Some(ContractType::TransferContract) => {
+            if let Ok(c) = tron_proto::TransferContract::decode(any.value.as_slice()) {
+                out.from_address = b58(&c.owner_address);
+                out.to_address = b58(&c.to_address);
+                out.call_value = c.amount;
+                // java: assetName = "trx", assetAmount = amount.
+                out.asset_name = "trx".to_string();
+                out.asset_amount = c.amount;
+            }
+        }
+        Some(ContractType::TransferAssetContract) => {
+            if let Ok(c) = tron_proto::TransferAssetContract::decode(any.value.as_slice()) {
+                out.from_address = b58(&c.owner_address);
+                out.to_address = b58(&c.to_address);
+                out.asset_name = String::from_utf8_lossy(&c.asset_name).into_owned();
+                out.asset_amount = c.amount;
+            }
+        }
+        Some(ContractType::TriggerSmartContract) => {
+            if let Ok(c) = tron_proto::TriggerSmartContract::decode(any.value.as_slice()) {
+                out.from_address = b58(&c.owner_address);
+                out.to_address = b58(&c.contract_address);
+                out.contract_address = b58(&c.contract_address);
+                out.call_value = c.call_value;
+                out.data = hex::encode(&c.data);
+            }
+        }
+        Some(ContractType::CreateSmartContract) => {
+            if let Ok(c) = tron_proto::CreateSmartContract::decode(any.value.as_slice()) {
+                out.from_address = b58(&c.owner_address);
+                if let Some(nc) = c.new_contract.as_ref() {
+                    out.contract_address = b58(&nc.contract_address);
+                    out.call_value = nc.call_value;
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -162,6 +234,7 @@ mod tests {
         let outcomes = vec![TxOutcomeSlice {
             tx_id: [0xcd; 32],
             contract_result: "SUCCESS".into(),
+            ..Default::default()
         }];
 
         emit_block_and_transactions(&bus, &block, &[0xab; 32], &outcomes, 41);

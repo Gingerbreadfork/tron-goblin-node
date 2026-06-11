@@ -421,13 +421,18 @@ pub fn db_lite(
         }
     }
 
-    // Step 4: write lite.info marker.
+    // Step 4: write lite.info marker + java-tron's info.properties
+    // (LiteFullNodeTool writes `split_block_num` — tooling that
+    // recognises java lite datasets recognises ours too).
     let info_path = dst_db.join("lite.info");
     let info_body = format!(
         "kind=snapshot\nlatest_block={latest_block}\nrecent_blocks={recent_blocks}\nprune_below={prune_below}\nblocks_pruned={pruned}\n",
     );
     std::fs::write(&info_path, info_body)
         .map_err(|e| AdminError::Io(format!("write {}: {e}", info_path.display())))?;
+    let props_path = dst_db.join("info.properties");
+    std::fs::write(&props_path, format!("split_block_num={prune_below}\n"))
+        .map_err(|e| AdminError::Io(format!("write {}: {e}", props_path.display())))?;
 
     info!(
         from = %src.display(),
@@ -548,6 +553,7 @@ mod tests {
             market_pair_to_price: mem(),
             market_pair_price_to_order: mem(),
             balance_trace: mem(),
+            reward_vi: mem(),
             witness_schedule: mem(),
             block_undo: mem(),
             pbft_sign_data: mem(),

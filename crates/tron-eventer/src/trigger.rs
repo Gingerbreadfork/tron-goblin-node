@@ -25,7 +25,7 @@ pub mod names {
 /// Mirrors `BlockLogTrigger.java`. The `transaction_list` field carries
 /// the tx_ids (lowercase hex, no `0x`) in the order they appear in the
 /// block, matching java-tron's serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlockEvent {
     #[serde(rename = "triggerName")]
     pub trigger_name: &'static str,
@@ -68,7 +68,7 @@ impl BlockEvent {
 /// Mirrors `TransactionLogTrigger.java`. Fields that are non-applicable
 /// to a given contract type are zero / empty (matches java-tron, which
 /// uses primitive defaults).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TransactionEvent {
     #[serde(rename = "triggerName")]
     pub trigger_name: &'static str,
@@ -119,7 +119,7 @@ pub struct TransactionEvent {
 /// couldn't decode it — the consumer gets the raw topics + data).
 ///
 /// Mirrors `ContractLogTrigger.java`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContractLogEvent {
     #[serde(rename = "triggerName")]
     pub trigger_name: &'static str,
@@ -156,7 +156,7 @@ pub struct ContractLogEvent {
 /// event name + named args.
 ///
 /// Mirrors `ContractEventTrigger.java`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContractEvent {
     #[serde(rename = "triggerName")]
     pub trigger_name: &'static str,
@@ -198,7 +198,7 @@ pub struct ContractEvent {
 
 /// Solidity-block trigger — fired when a block crosses the solidified
 /// threshold (PBFT 2/3 + commit). Mirrors `SolidityTrigger.java`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SolidifiedBlockEvent {
     #[serde(rename = "triggerName")]
     pub trigger_name: &'static str,

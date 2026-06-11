@@ -62,6 +62,7 @@ fn fresh_state() -> (StateBackends, Arc<dyn KvBackend>, Arc<dyn KvBackend>) {
         contract_state: Some(mem()),
         block_index: Some(mem()),
         witness_schedule: Some(witness_schedule_be.clone()),
+        reward_vi: None,
     };
     (state, blocks_be, witness_schedule_be)
 }

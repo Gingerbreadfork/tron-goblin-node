@@ -483,7 +483,7 @@ fn withdraw_rejects_missing_owner() {
         owner_address: ALICE.to_vec(),
     };
     let delegation = DelegationStore::new(mem());
-    let err = witness::validate_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap_err();
+    let err = witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing));
 }
 
@@ -496,7 +496,7 @@ fn withdraw_rejects_no_allowance() {
         owner_address: ALICE.to_vec(),
     };
     let delegation = DelegationStore::new(mem());
-    let err = witness::validate_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap_err();
+    let err = witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NoAllowance));
 }
 
@@ -517,7 +517,7 @@ fn withdraw_rejects_too_soon_after_previous() {
         owner_address: ALICE.to_vec(),
     };
     let delegation = DelegationStore::new(mem());
-    let err = witness::validate_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap_err();
+    let err = witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::WithdrawTooSoon { .. }));
 }
 
@@ -538,8 +538,8 @@ fn withdraw_drains_allowance_into_balance() {
         owner_address: ALICE.to_vec(),
     };
     let delegation = DelegationStore::new(mem());
-    witness::validate_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap();
-    witness::execute_withdraw_balance(&accounts, &dp, &delegation, &c).unwrap();
+    witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap();
+    witness::execute_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap();
     let post = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(post.balance, 1_050_000);
     assert_eq!(post.allowance, 0);

@@ -74,6 +74,21 @@ pub struct TronDatabase {
     pub votes: Option<Arc<tron_chainbase::VotesStore>>,
     pub delegated_resources: Option<Arc<tron_chainbase::DelegatedResourceStore>>,
     pub delegation: Option<Arc<tron_chainbase::DelegationStore>>,
+    /// `reward-vi` store backing the `ALLOW_OLD_REWARD_OPT` legacy-reward
+    /// fast path inside `withdraw_reward` (VOTEWITNESS / WITHDRAWREWARD /
+    /// UNFREEZE bridges settle rewards first). Optional like the other
+    /// staking stores; `None` only matters for voters whose reward window
+    /// predates the new reward algorithm.
+    pub reward_vi: Option<Arc<tron_chainbase::RewardViStore>>,
+    /// ABI store -- only consulted by the SELFDESTRUCT commit path
+    /// (java-tron `TransactionTrace.deleteContract` removes the
+    /// account, code, contract AND abi rows for destroyed contracts).
+    pub abi: Option<Arc<tron_chainbase::AbiStore>>,
+    /// Multi-delta sibling of `last_balance_delta`: the suicide bridge
+    /// can move several balances at once (allowance fold, frozen
+    /// transfer, expired-unfreeze credit). Drained by
+    /// `tron_take_balance_deltas` after each bridge call.
+    pub pending_balance_deltas: Vec<(EvmAddress, i64)>,
     /// Side-channel: each state-mutating `tron_*` bridge sets this
     /// to `(target_addr, signed_delta)` describing the EVM-side
     /// balance change that should be journaled. `Host for Context`
@@ -108,9 +123,25 @@ impl TronDatabase {
             votes: None,
             delegated_resources: None,
             delegation: None,
+            reward_vi: None,
+            abi: None,
+            pending_balance_deltas: Vec::new(),
             last_balance_delta: None,
             version_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Attach the ABI store (SELFDESTRUCT contract-row cleanup).
+    pub fn with_abi(mut self, abi: Arc<tron_chainbase::AbiStore>) -> Self {
+        self.abi = Some(abi);
+        self
+    }
+
+    /// Attach the `reward-vi` store (legacy-reward `ALLOW_OLD_REWARD_OPT`
+    /// fast path inside reward settlement).
+    pub fn with_reward_vi(mut self, reward_vi: Arc<tron_chainbase::RewardViStore>) -> Self {
+        self.reward_vi = Some(reward_vi);
+        self
     }
 
     /// Attach a [`BlockIndexStore`] so `BLOCKHASH(n)` returns real hashes.
@@ -337,9 +368,26 @@ impl DatabaseCommit for TronDatabase {
             // java-tron's behavior — historical state isn't garbage-
             // collected on selfdestruct).
             if account.is_selfdestructed() {
+                // java-tron `TransactionTrace.deleteContract`: a destroyed
+                // contract loses its account, code, SmartContract AND abi
+                // rows (storage rows stay -- never GC'd, see above). Without
+                // this, a CREATE2 redeploy at the same address would
+                // resurrect the old code.
                 self.accounts
                     .delete(&tron_addr)
                     .expect("db error in DatabaseCommit::commit deleting selfdestructed account");
+                self.code
+                    .delete(tron_addr.as_bytes())
+                    .expect("db error in DatabaseCommit::commit deleting selfdestructed code");
+                if let Some(contracts) = &self.contracts {
+                    contracts
+                        .delete(&tron_addr)
+                        .expect("db error in DatabaseCommit::commit deleting selfdestructed contract");
+                }
+                if let Some(abi) = &self.abi {
+                    abi.delete(&tron_addr)
+                        .expect("db error in DatabaseCommit::commit deleting selfdestructed abi");
+                }
                 continue;
             }
 

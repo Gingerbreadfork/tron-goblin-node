@@ -38,6 +38,7 @@ pub mod trigger;
 
 pub use bus::{EventBus, EventBusBuilder};
 pub use emit::{emit_block_and_transactions, TxOutcomeSlice};
+pub use listeners::{FilteredListener, TriggerFilter};
 pub use listener::EventListener;
 pub use plugin::{PluginError, PluginFactory, PluginParams, PluginRegistry, TopicEnable};
 pub use trigger::{

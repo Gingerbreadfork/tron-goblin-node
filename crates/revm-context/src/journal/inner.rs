@@ -40,6 +40,18 @@ pub struct JournalCfg {
     /// [EIP-161]: https://eips.ethereum.org/EIPS/eip-161
     /// [EIP-6780]: https://eips.ethereum.org/EIPS/eip-6780
     pub spec: SpecId,
+    /// TRON fork: when `Some`, overrides the EIP-6780 gate in
+    /// [`JournalInner::selfdestruct`] -- TRON gates the restriction on
+    /// the `ALLOW_TVM_SELFDESTRUCT_RESTRICTION` proposal (#94), not on
+    /// the Cancun opcode spec (which TRON activates separately for
+    /// TLOAD/TSTORE/MCOPY). `None` keeps upstream behavior.
+    pub tron_selfdestruct_restriction: Option<bool>,
+    /// TRON fork: when `Some`, a destroying SELFDESTRUCT whose
+    /// beneficiary is the contract itself credits this address (TRON's
+    /// black-hole / burn account) instead of silently zeroing the
+    /// balance -- java-tron `Program.suicide` under
+    /// `allowTvmTransferTrc10`. `None` keeps upstream burn-by-zeroing.
+    pub tron_blackhole: Option<Address>,
     /// Whether EIP-7708 (ETH transfers emit logs) is disabled.
     pub eip7708_disabled: bool,
     /// Whether EIP-7708 delayed burn logging is disabled.
@@ -670,6 +682,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             target_account.info.balance += acc_balance;
         }
 
+        // TRON fork: a self-target destroy redirects the balance to the
+        // burn account -- make sure it's loaded before we borrow `address`.
+        let tron_burn_target = match self.cfg.tron_blackhole {
+            Some(bh) if target == address && bh != address => {
+                self.load_account_optional(db, bh, false, false)?;
+                Some(bh)
+            }
+            _ => None,
+        };
+
         let acc = self.state.get_mut(&address).unwrap();
         let balance = acc.info.balance;
 
@@ -681,7 +703,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             SelfdestructionRevertStatus::RepeatedSelfdestruction
         };
 
-        let is_cancun_enabled = spec.is_enabled_in(CANCUN);
+        // TRON fork: proposal #94 overrides the spec-derived 6780 gate.
+        let is_cancun_enabled = self
+            .cfg
+            .tron_selfdestruct_restriction
+            .unwrap_or_else(|| spec.is_enabled_in(CANCUN));
 
         // EIP-6780 (Cancun hard-fork): selfdestruct only if contract is created in the same tx
         let journal_entry = if acc.is_created_locally() || !is_cancun_enabled {
@@ -696,6 +722,22 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             acc.mark_selfdestructed_locally();
             acc.info.balance = U256::ZERO;
 
+            // TRON fork: self-target destroy credits the burn account.
+            // Encoding the burn account as the journal entry's `target`
+            // keeps the revert symmetric (revert subtracts from target).
+            let entry_target = if let Some(bh) = tron_burn_target {
+                if !balance.is_zero() {
+                    let bh_acc = self.state.get_mut(&bh).unwrap();
+                    Self::touch_account(&mut self.journal, bh, bh_acc);
+                    bh_acc.info.balance += balance;
+                    bh
+                } else {
+                    target
+                }
+            } else {
+                target
+            };
+
             // EIP-7708: emit appropriate log for selfdestruct
             if target != address {
                 // Transfer log for balance transferred to different address
@@ -706,7 +748,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             }
             Some(ENTRY::account_destroyed(
                 address,
-                target,
+                entry_target,
                 destroyed_status,
                 balance,
             ))

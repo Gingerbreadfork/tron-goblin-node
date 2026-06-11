@@ -90,7 +90,8 @@ fn fresh_state() -> (StateBackends, Arc<dyn KvBackend>) {
             contract_state: Some(mem()),
             block_index: Some(mem()),
             witness_schedule: Some(mem()),
-        },
+            reward_vi: None,
+    },
         blocks_be,
     )
 }
@@ -346,11 +347,14 @@ async fn contract_event_with_abi_decoded_via_bus() {
     let mut saw_block = false;
     let mut saw_transaction = false;
     let mut saw_event: Option<tron_eventer::ContractEvent> = None;
-    for _ in 0..3 {
+    for _ in 0..4 {
         match rx.recv().await {
             Some(TriggerMessage::Block(_)) => saw_block = true,
             Some(TriggerMessage::Transaction(_)) => saw_transaction = true,
             Some(TriggerMessage::ContractEvent(ev)) => saw_event = Some(ev),
+            // The solidified pointer advances during apply — its
+            // trigger interleaves with the block/tx/event ones.
+            Some(TriggerMessage::SolidifiedBlock(_)) => {}
             Some(other) => panic!("unexpected trigger: {other:?}"),
             None => break,
         }
@@ -378,14 +382,23 @@ async fn contract_event_with_abi_decoded_via_bus() {
     assert_eq!(ev.data_map.len(), 1, "Transfer has 1 data param (value)");
     assert!(ev.data_map.contains_key("value"));
 
-    // Contract address is the 21-byte TRON form (0x41 prefix + 20 bytes).
-    assert_eq!(ev.contract_address, hex::encode(contract_addr));
+    // Addresses are base58check — what java-tron's event plugin posts.
+    assert_eq!(
+        ev.contract_address,
+        tron_crypto::base58check::encode_check(&contract_addr)
+    );
     // Origin = the tx signer (the caller). caller_address matches for
     // the top-level frame.
-    assert_eq!(ev.origin_address, hex::encode(caller));
+    assert_eq!(
+        ev.origin_address,
+        tron_crypto::base58check::encode_check(&caller)
+    );
     // Creator = the contract's deployer per the SmartContract record we
     // installed above.
-    assert_eq!(ev.creator_address, hex::encode(caller));
+    assert_eq!(
+        ev.creator_address,
+        tron_crypto::base58check::encode_check(&caller)
+    );
 }
 
 #[tokio::test]
@@ -417,12 +430,13 @@ async fn contract_log_falls_back_when_no_abi_registered() {
 
     let mut saw_log: Option<tron_eventer::ContractLogEvent> = None;
     let mut saw_event_unexpected = false;
-    for _ in 0..3 {
+    for _ in 0..4 {
         match rx.recv().await {
             Some(TriggerMessage::Block(_)) => {}
             Some(TriggerMessage::Transaction(_)) => {}
             Some(TriggerMessage::ContractLog(log)) => saw_log = Some(log),
             Some(TriggerMessage::ContractEvent(_)) => saw_event_unexpected = true,
+            Some(TriggerMessage::SolidifiedBlock(_)) => {}
             Some(other) => panic!("unexpected trigger: {other:?}"),
             None => break,
         }
@@ -434,5 +448,8 @@ async fn contract_log_falls_back_when_no_abi_registered() {
     let log = saw_log.expect("ContractLogEvent missing");
     assert_eq!(log.topic_list.len(), 3, "LOG3 has 3 topics");
     assert_eq!(log.topic_list[0], hex::encode(TRANSFER_TOPIC0));
-    assert_eq!(log.contract_address, hex::encode(contract_addr));
+    assert_eq!(
+        log.contract_address,
+        tron_crypto::base58check::encode_check(&contract_addr)
+    );
 }

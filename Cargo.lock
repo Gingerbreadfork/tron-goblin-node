@@ -2894,6 +2894,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kafka"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2054ba4edcb4dcda4209e138c7e88caf26d4a325b3db76fbdb6ca5eecc23e426"
+dependencies = [
+ "byteorder",
+ "crc",
+ "flate2",
+ "fnv",
+ "ref_slice",
+ "snap",
+ "thiserror 1.0.69",
+ "tracing",
+ "twox-hash",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4045,6 +4062,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "ref_slice"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4ed1d73fb92eba9b841ba2aef69533a060ccc0d3ec71c90aeda5996d4afb7a9"
 
 [[package]]
 name = "regex"
@@ -5690,6 +5713,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -5831,8 +5855,20 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tron-crypto",
  "tron-proto",
  "tron-types",
+]
+
+[[package]]
+name = "tron-eventer-kafka"
+version = "0.0.1"
+dependencies = [
+ "kafka",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tron-eventer",
 ]
 
 [[package]]
@@ -5908,6 +5944,7 @@ dependencies = [
  "group",
  "hex",
  "hex-literal",
+ "http",
  "incrementalmerkletree",
  "jubjub",
  "prost",
@@ -5921,6 +5958,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tower 0.4.13",
  "tracing",
  "tron-actuator",
  "tron-chainbase",
@@ -6022,6 +6060,7 @@ dependencies = [
  "tron-consensus",
  "tron-crypto",
  "tron-eventer",
+ "tron-eventer-kafka",
  "tron-executor",
  "tron-grpc",
  "tron-index",
@@ -6210,6 +6249,17 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "rand 0.8.6",
+ "static_assertions",
 ]
 
 [[package]]

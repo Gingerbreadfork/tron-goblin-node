@@ -296,6 +296,7 @@ fn unfreeze_v1_returns_only_expired_entries() {
         &delegation,
         &DelegatedResourceStore::new(mem()),
         None,
+        None,
         &c,
     )
     .unwrap();
@@ -678,7 +679,7 @@ fn unfreeze_v2_partial_unfreeze_only_subtracts_delta_from_global_weight() {
     };
     let votes = VotesStore::new(mem());
     let delegation = DelegationStore::new(mem());
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &c_unfreeze)
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, None, &c_unfreeze)
         .unwrap();
     assert_eq!(dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0), 70);
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -711,7 +712,7 @@ fn unfreeze_v2_full_unfreeze_zeroes_resource_bucket_and_global_weight() {
     };
     let votes = VotesStore::new(mem());
     let delegation = DelegationStore::new(mem());
-    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, &c_unfreeze)
+    freeze_v2::execute_unfreeze_balance_v2(&accounts, &dp, &votes, &delegation, None, &c_unfreeze)
         .unwrap();
     assert_eq!(dp.get_long(b"TOTAL_ENERGY_WEIGHT").unwrap_or(0), 0);
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();

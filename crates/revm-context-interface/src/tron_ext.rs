@@ -192,6 +192,29 @@ pub trait TronDatabaseExt {
     /// the TRON-side staking fields with a stale account.
     ///
     /// Default returns `(Address::ZERO, 0)` for stock databases.
+    /// SELFDESTRUCT chainbase side-effects -- java-tron `Program.suicide`
+    /// / `suicide2` minus the EVM-journal balance moves (those stay in
+    /// the journal): validation (`canSuicide` / `canSuicide2`), reward
+    /// settlement + vote cancellation, TRC-10 sweep, frozen v1/v2
+    /// transfer to the inheritor, expired-unfreeze credit.
+    ///
+    /// `will_destroy` mirrors `is_created_locally || !restriction`.
+    /// Returns `0` on success, `-1` when the suicide must REVERT
+    /// (outstanding delegations -- java's `canSuicide*` returning false).
+    /// Balance changes are reported through
+    /// [`tron_take_balance_deltas`](Self::tron_take_balance_deltas).
+    fn tron_suicide(&mut self, _owner: Address, _obtainer: Address, _will_destroy: bool) -> i64 {
+        0
+    }
+
+    /// Drain ALL pending EVM-balance deltas accumulated by the last
+    /// bridge call (multi-delta sibling of
+    /// [`tron_take_last_balance_delta`](Self::tron_take_last_balance_delta)
+    /// -- suicide can move several balances at once).
+    fn tron_take_balance_deltas(&mut self) -> Vec<(Address, i64)> {
+        Vec::new()
+    }
+
     fn tron_take_last_balance_delta(&mut self) -> (Address, i64) {
         (Address::ZERO, 0)
     }

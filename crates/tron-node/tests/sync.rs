@@ -56,6 +56,7 @@ fn fresh_state() -> (StateBackends, Arc<dyn KvBackend>) {
         contract_state: Some(mem()),
         block_index: Some(mem()),
         witness_schedule: Some(mem()),
+        reward_vi: None,
     };
     (state, blocks_be)
 }
@@ -920,4 +921,126 @@ fn solidified_gate_rejects_head_promotion_that_diverges_from_solidified() {
     // Executed canonical head also unchanged.
     assert_eq!(driver.head_number(), 3);
     let _ = id_4b; // silence unused warning on the early-return path
+}
+
+#[test]
+fn reorg_to_fork_two_blocks_deeper_switches_in_one_promotion() {
+    use tron_chainbase::BlockUndoStore;
+    // Adversarial shape: the sibling fork grows SILENTLY (side-fork
+    // pushes) until it is 2+ blocks past the canonical head, then the
+    // single promoting push must roll back the canonical chain and
+    // apply EVERY fork block (java Manager.switchFork walks the whole
+    // branch, not just one block).
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let undo_be: Arc<dyn KvBackend> = mem();
+    let mut driver = make_driver(state.clone(), blocks_be)
+        .with_undo_store(BlockUndoStore::new(undo_be));
+
+    let g = build_block(1, [0u8; 32]);
+    let gid = block_id_from_block(&g).unwrap();
+    driver.accept_block(&g, None);
+
+    // Canonical: 2a, 3a.
+    let b2a = build_block(2, *gid.as_bytes());
+    let id_2a = block_id_from_block(&b2a).unwrap();
+    driver.accept_block(&b2a, Some(gid));
+    let b3a = build_block(3, *id_2a.as_bytes());
+    let id_3a = block_id_from_block(&b3a).unwrap();
+    driver.accept_block(&b3a, Some(id_2a));
+    assert_eq!(driver.head_number(), 3);
+
+    // Fork: 2b (side), 3b (same height as head — still side).
+    let b2b = build_block_salted(2, *gid.as_bytes(), 77);
+    let id_2b = block_id_from_block(&b2b).unwrap();
+    assert!(matches!(
+        driver.accept_block(&b2b, Some(gid)),
+        AcceptOutcome::SideFork(_)
+    ));
+    let b3b = build_block_salted(3, *id_2b.as_bytes(), 77);
+    let id_3b = block_id_from_block(&b3b).unwrap();
+    assert!(matches!(
+        driver.accept_block(&b3b, Some(id_2b)),
+        AcceptOutcome::SideFork(_)
+    ));
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    assert_eq!(
+        dp.latest_block_header_hash().unwrap(),
+        Some(*id_3a.as_bytes()),
+        "canonical untouched while the fork grows level"
+    );
+
+    // 4b promotes the fork — the reorg must re-apply 2b AND 3b AND 4b.
+    let b4b = build_block_salted(4, *id_3b.as_bytes(), 77);
+    let id_4b = block_id_from_block(&b4b).unwrap();
+    match driver.accept_block(&b4b, Some(id_3b)) {
+        AcceptOutcome::Accepted(id) => assert_eq!(id, id_4b),
+        other => panic!("expected Accepted after deep reorg, got {other:?}"),
+    }
+    assert_eq!(driver.head_number(), 4);
+    assert_eq!(
+        dp.latest_block_header_hash().unwrap(),
+        Some(*id_4b.as_bytes()),
+        "head switched to the deeper fork"
+    );
+    // The num → id index must point at the b-chain on every height.
+    let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+    assert_eq!(bi.get(2).unwrap(), id_2b);
+    assert_eq!(bi.get(3).unwrap(), id_3b);
+    assert_eq!(bi.get(4).unwrap(), id_4b);
+}
+
+#[test]
+fn orphan_chain_recovers_via_reorg_after_parent_arrives() {
+    use tron_chainbase::BlockUndoStore;
+    // Out-of-order delivery at the tip: child 3x arrives before its
+    // parent 2x. The child is stashed as unlinked; when 2x arrives,
+    // KhaosDb cascade-promotes the orphan to fork-tree head WITHOUT
+    // executing it (the push outcome for 2x reports the head moved away
+    // from 2x). The chain must still converge: the next push triggers
+    // the reorg path, which replays the whole un-executed branch.
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let undo_be: Arc<dyn KvBackend> = mem();
+    let mut driver = make_driver(state.clone(), blocks_be)
+        .with_undo_store(BlockUndoStore::new(undo_be));
+
+    let g = build_block(1, [0u8; 32]);
+    let gid = block_id_from_block(&g).unwrap();
+    driver.accept_block(&g, None);
+
+    let b2 = build_block(2, *gid.as_bytes());
+    let id_2 = block_id_from_block(&b2).unwrap();
+    let b3 = build_block(3, *id_2.as_bytes());
+    let id_3 = block_id_from_block(&b3).unwrap();
+    let b4 = build_block(4, *id_3.as_bytes());
+    let id_4 = block_id_from_block(&b4).unwrap();
+
+    // Child first — rejected as unlinked (stashed).
+    assert!(matches!(
+        driver.accept_block(&b3, Some(id_2)),
+        AcceptOutcome::RejectedValidation(reason) if reason.contains("unlinked")
+    ));
+
+    // Parent arrives: khaos promotes 2→3, head moves PAST 2 — the push
+    // reports a non-extension outcome and nothing executes yet.
+    let outcome_2 = driver.accept_block(&b2, Some(gid));
+    assert!(
+        !matches!(outcome_2, AcceptOutcome::Accepted(_)),
+        "parent push must not report Accepted when the orphan cascade moved the head: {outcome_2:?}"
+    );
+
+    // The NEXT block converges the executed chain onto the fork-tree
+    // head via the reorg path (replays 2, 3, then 4).
+    match driver.accept_block(&b4, Some(id_3)) {
+        AcceptOutcome::Accepted(id) => assert_eq!(id, id_4),
+        other => panic!("expected Accepted via reorg replay, got {other:?}"),
+    }
+    assert_eq!(driver.head_number(), 4);
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    assert_eq!(
+        dp.latest_block_header_hash().unwrap(),
+        Some(*id_4.as_bytes()),
+        "executed head converged onto the promoted orphan chain"
+    );
 }

@@ -56,11 +56,14 @@ pub fn build_event_bus(
     if cfg.path.trim().is_empty() {
         return Err(EventLoaderError::MissingPath);
     }
-    let plugin_id = std::path::Path::new(&cfg.path)
+    let stem = std::path::Path::new(&cfg.path)
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| EventLoaderError::UnstemmablePath(cfg.path.clone()))?
         .to_string();
+    // java plugin zips are named `plugin-kafka-1.0.0.zip` — resolve the
+    // registered id from the stem (exact, then substring).
+    let plugin_id = registry.resolve_id(&stem).unwrap_or(stem);
 
     let params = PluginParams {
         path: cfg.path.clone(),
@@ -72,10 +75,55 @@ pub fn build_event_bus(
         start_sync_block_num: cfg.start_sync_block_num,
         contract_parse: cfg.contract_parse,
         topics: cfg.topics.iter().map(topic_to_enable).collect(),
+        filter: resolve_filter(&cfg.filter),
     };
 
     let bus = registry.build_bus(&params, &plugin_id)?;
     Ok(bus)
+}
+
+/// Map the `[event.filter]` config block onto the listener-side
+/// [`tron_eventer::TriggerFilter`]: block-range strings parse via the
+/// same rules the JSON-RPC filters use ("", "earliest", "latest" or a
+/// decimal), contract addresses normalise to base58check (the format
+/// the triggers carry), topics to lowercase hex without `0x`.
+fn resolve_filter(f: &crate::config::EventFilterConfig) -> tron_eventer::TriggerFilter {
+    let from_block = crate::config::FilterQuery::parse_from_block(&f.from_block).unwrap_or(0);
+    let to_block = crate::config::FilterQuery::parse_to_block(&f.to_block).unwrap_or(-1);
+    let contract_addresses = f
+        .contract_addresses
+        .iter()
+        .filter_map(|a| normalize_filter_address(a))
+        .collect();
+    let contract_topics = f
+        .contract_topics
+        .iter()
+        .map(|t| t.trim_start_matches("0x").to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    tron_eventer::TriggerFilter {
+        from_block,
+        to_block,
+        contract_addresses,
+        contract_topics,
+    }
+}
+
+/// Accept `T...` base58check or `41...` hex; emit base58check.
+fn normalize_filter_address(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if input.starts_with('T') {
+        return Some(input.to_string());
+    }
+    let hex_str = input.trim_start_matches("0x");
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.len() != 21 {
+        return None;
+    }
+    Some(tron_crypto::base58check::encode_check(&bytes))
 }
 
 fn topic_to_enable(t: &EventTopicConfig) -> TopicEnable {

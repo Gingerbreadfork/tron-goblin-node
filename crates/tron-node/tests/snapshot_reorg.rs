@@ -61,6 +61,7 @@ fn build_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, SnapshotStack) 
         contract_state: Some(snapshot_state(&mut stores)),
         block_index: Some(Arc::new(MemBackend::new())),
         witness_schedule: Some(snapshot_state(&mut stores)),
+        reward_vi: None,
     };
     let stack = SnapshotStack::from_named(stores);
     (state, blocks_be, stack)

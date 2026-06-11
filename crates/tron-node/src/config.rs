@@ -42,6 +42,12 @@ pub struct NodeConfig {
     /// produces+broadcasts a block when we do.
     #[serde(default)]
     pub witness: Option<WitnessConfig>,
+    /// java-tron `node.openHistoryQueryWhenLiteFN`: when the node runs
+    /// on a LITE dataset (history pruned), the history-query APIs are
+    /// closed with java's "this API is closed because this node is a
+    /// lite fullnode" unless this is set. Default `false`.
+    #[serde(default, alias = "openHistoryQueryWhenLiteFN")]
+    pub open_history_query_when_lite_fn: bool,
 
     /// RocksDB tuning + DB-lifecycle settings.
     #[serde(default)]
@@ -1065,6 +1071,7 @@ impl Default for NodeConfig {
             node_backup: NodeBackupConfig::default(),
             vm: VmConfig::default(),
             rate_limiter: RateLimiterConfig::default(),
+            open_history_query_when_lite_fn: false,
             local_witness: LocalWitnessConfig::default(),
             committee: CommitteeConfig::default(),
             index: IndexConfig::default(),
@@ -1172,7 +1179,7 @@ fn default_chain_id() -> u64 {
 /// component (HTTP servlet name or gRPC method) to a strategy +
 /// params string. Also covers the per-frame-type P2P rate caps that
 /// each `PeerConnection` registers on its `P2pRateLimiter`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimiterConfig {
     #[serde(default)]
     pub http: Vec<RateLimiterItem>,
@@ -1183,6 +1190,37 @@ pub struct RateLimiterConfig {
     /// disconnect}` with the same defaults (3.0/3.0/1.0 qps).
     #[serde(default)]
     pub p2p: RateLimiterP2pConfig,
+    /// Node-wide request ceiling applied to every HTTP servlet, the
+    /// JSON-RPC endpoint, and every gRPC call AFTER any per-component
+    /// limit — java-tron's `rate.limiter.global.qps`. `0` disables.
+    #[serde(default = "default_global_qps", alias = "globalQps")]
+    pub global_qps: f64,
+    /// Per-source-IP companion ceiling — java-tron's
+    /// `rate.limiter.global.ip.qps`. `0` disables.
+    #[serde(default = "default_global_ip_qps", alias = "globalIpQps")]
+    pub global_ip_qps: f64,
+}
+
+fn default_global_qps() -> f64 {
+    50_000.0
+}
+
+fn default_global_ip_qps() -> f64 {
+    10_000.0
+}
+
+impl Default for RateLimiterConfig {
+    fn default() -> Self {
+        Self {
+            http: Vec::new(),
+            rpc: Vec::new(),
+            p2p: RateLimiterP2pConfig::default(),
+            // java defaults: the global ceilings are armed even with no
+            // [rate_limiter] section configured.
+            global_qps: default_global_qps(),
+            global_ip_qps: default_global_ip_qps(),
+        }
+    }
 }
 
 impl RateLimiterConfig {

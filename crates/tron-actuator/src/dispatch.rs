@@ -54,6 +54,12 @@ pub struct ActuatorStores<'a> {
     /// the commitment-append on execute (legacy behaviour for non-
     /// shielded configurations).
     pub merkle_trees: Option<&'a IncrementalMerkleTreeStore>,
+    /// Optional: the `reward-vi` store backing the `ALLOW_OLD_REWARD_OPT`
+    /// legacy-reward fast path inside reward settlement (vote / unfreeze /
+    /// withdraw actuators). Read-only; only consulted for voters whose
+    /// reward window predates the new reward algorithm. Production wires
+    /// it; `None` in setups that never replay pre-switch accounts.
+    pub reward_vi: Option<&'a tron_chainbase::RewardViStore>,
 }
 
 /// Per-transaction context needed by actuators that can't be derived
@@ -120,6 +126,7 @@ pub fn dispatch_validate(
                 stores.accounts,
                 stores.dyn_props,
                 stores.delegation,
+                stores.reward_vi,
                 &c,
             )
         }
@@ -359,6 +366,7 @@ pub fn dispatch_execute(
                 stores.votes,
                 stores.delegation,
                 stores.dyn_props,
+                stores.reward_vi,
                 &c,
             )?;
             Ok(ExecutionResult::default())
@@ -386,6 +394,7 @@ pub fn dispatch_execute(
                 stores.accounts,
                 stores.dyn_props,
                 stores.delegation,
+                stores.reward_vi,
                 &c,
             )
         }
@@ -456,6 +465,7 @@ pub fn dispatch_execute(
                 stores.delegation,
                 stores.delegated_resources,
                 stores.delegated_resource_account_index,
+                stores.reward_vi,
                 &c,
             )
         }
@@ -470,6 +480,7 @@ pub fn dispatch_execute(
                 stores.dyn_props,
                 stores.votes,
                 stores.delegation,
+                stores.reward_vi,
                 &c,
             )
         }

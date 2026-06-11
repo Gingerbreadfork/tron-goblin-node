@@ -173,7 +173,8 @@ impl StateBundle {
             contract_state: None,
             block_index: None,
             witness_schedule: None,
-        }
+            reward_vi: None,
+    }
     }
 }
 
