@@ -104,7 +104,13 @@ pub struct TronDatabase {
     /// `true`/`false` are cached only for contracts that exist; a missing
     /// row is left uncached so a contract created earlier in the same tx is
     /// still observed.
-    version_cache: RefCell<HashMap<TronAddress, bool>>,
+    /// Memoized per contract: `(is_v1_storage_layout, addr_hash)`. `addr_hash`
+    /// is java's storage-key prefix source — `sha3(address)` normally, or
+    /// `sha3(address ++ trxHash)` for CREATE2 contracts (see
+    /// [`StorageRowStore::addr_hash`]). Both inputs (`version`, `trxHash`) are
+    /// immutable post-deploy, so caching avoids re-reading the contract row for
+    /// every slot of a storage-heavy call.
+    version_cache: RefCell<HashMap<TronAddress, (bool, [u8; 32])>>,
     /// Root transaction id (`sha256(raw_data)`) of the tx executing on this
     /// `TronDatabase`. Feeds nested-CREATE address derivation
     /// (`0x41 || sha3omit12(rootTxId || nonce_be8)`). Zero on read-only setups
@@ -220,36 +226,47 @@ impl TronDatabase {
         self
     }
 
-    /// Compose a storage-row key for the given contract address +
-    /// slot, switching on the contract's `version` field. v1 contracts
-    /// (pre-`ALLOW_TVM_VOTE`) hash the slot before composition;
-    /// everything else uses the slot raw.
+    /// Compose a storage-row key for the given contract address + slot,
+    /// matching java-tron's `Storage`/`RepositoryImpl.getStorage` exactly:
+    /// the 16-byte key prefix is `sha3(address)` normally but
+    /// `sha3(address ++ trxHash)` for a CREATE2-deployed contract (one whose
+    /// `SmartContract.trxHash` is set), and the slot is hashed first only for
+    /// v1 (`version == 1`, pre-`ALLOW_TVM_VOTE`) contracts. Missing the trxHash
+    /// prefix points every CREATE2 contract's storage (e.g. all DEX pairs) at
+    /// the wrong key, so reads come back zero — invisible on self-synced state
+    /// (we wrote AND read at the wrong prefix) but fatal against a real
+    /// java-tron snapshot.
     fn compose_storage_key(&self, addr: &TronAddress, slot: &[u8; 32]) -> [u8; 32] {
+        // A contract CREATE2-deployed earlier in THIS tx isn't in the
+        // ContractStore until commit, but java's in-memory deposit already
+        // addresses its storage with the trxHash (= this tx's root id) prefix.
+        let evm = tron_to_evm_address(addr);
+        if let Some((_creator, is_create2)) = self.pending_created_contracts.get(&evm) {
+            let trx_hash: &[u8] = if *is_create2 { &self.root_tx_id } else { &[] };
+            let ah = StorageRowStore::addr_hash(addr, trx_hash);
+            // Nested creates are version 0 → v2 (raw slot).
+            return StorageRowStore::compose_key_with_addr_hash(&ah, slot, false);
+        }
         if let Some(contracts) = &self.contracts {
-            // `version` is immutable post-deploy, so memoize it per-tx —
-            // identical v1/v2 decision as a fresh read, but skips re-reading
-            // and re-decoding the contract row for every slot of a
-            // storage-heavy call.
             let cached = self.version_cache.borrow().get(addr).copied();
-            let is_v1 = match cached {
+            let (is_v1, ah) = match cached {
                 Some(v) => v,
                 None => match contracts.get(addr) {
                     Ok(Some(c)) => {
-                        let v = c.version == 1;
-                        self.version_cache.borrow_mut().insert(*addr, v);
-                        v
+                        let v1 = c.version == 1;
+                        let ah = StorageRowStore::addr_hash(addr, &c.trx_hash);
+                        self.version_cache.borrow_mut().insert(*addr, (v1, ah));
+                        (v1, ah)
                     }
-                    // Not found / read error → v2, and don't cache (a
-                    // contract created later in this tx must still be seen).
-                    _ => false,
+                    // Not found / read error → plain prefix + v2, and don't
+                    // cache (a contract created later in this tx must still be
+                    // observed once its row lands).
+                    _ => (false, StorageRowStore::addr_hash(addr, &[])),
                 },
             };
-            if is_v1 {
-                return StorageRowStore::compose_key_v1(addr, slot);
-            }
+            return StorageRowStore::compose_key_with_addr_hash(&ah, slot, is_v1);
         }
-        // v2 layout: matches every contract deployed after the
-        // ALLOW_TVM_VOTE proposal landed (most of mainnet).
+        // No ContractStore attached (read-only / test setups): plain v2.
         StorageRowStore::compose_key(addr, slot)
     }
 }

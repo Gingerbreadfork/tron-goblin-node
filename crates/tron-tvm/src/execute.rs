@@ -298,6 +298,29 @@ pub fn execute_trigger_with_deadline(
     )
 }
 
+/// TRON's `CHAINID` opcode value (java `Program.getChainId`): the genesis
+/// block id, truncated to its last 4 bytes when
+/// `ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAINID` or `ALLOW_TVM_COMPATIBLE_EVM` is
+/// active — both true on current mainnet, giving `0x2b6653dc` (728126428).
+/// Every EIP-712 signature (meta-tx forwarders, ERC-20 `permit`, …) folds this
+/// into its domain separator, so a wrong value makes `ecrecover` return the
+/// wrong signer and the contract revert. The non-truncated 32-byte form is
+/// pre-proposal history we never re-execute from a snapshot (and can't fit a
+/// `u64`), so we always truncate. Returns 0 when no block index is attached
+/// (read-only setups that never touch CHAINID).
+fn chain_id_from_genesis(genesis: &[u8; 32]) -> u64 {
+    u32::from_be_bytes([genesis[28], genesis[29], genesis[30], genesis[31]]) as u64
+}
+
+fn tron_chain_id(stores: &VmStores) -> u64 {
+    stores
+        .block_index
+        .as_ref()
+        .and_then(|bi| bi.get(0).ok())
+        .map(|g| chain_id_from_genesis(g.as_bytes()))
+        .unwrap_or(0)
+}
+
 fn execute_trigger_inner(
     stores: &VmStores,
     block: VmBlockEnv,
@@ -378,6 +401,7 @@ fn execute_trigger_inner(
     }
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
+    let chain_id = tron_chain_id(stores);
     let mut ctx = Context::mainnet()
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
@@ -386,6 +410,12 @@ fn execute_trigger_inner(
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
             cfg.gas_params = crate::tron_gas_params();
+            // TRON fork: CHAINID is the genesis-block-id-derived value, NOT an
+            // EIP-155 chain id — EIP-712 domain separators depend on it. TRON
+            // transactions carry no EIP-155 chain id, so the tx-level chain-id
+            // check must stay OFF (else every tx is rejected InvalidChainId).
+            cfg.chain_id = chain_id;
+            cfg.tx_chain_id_check = false;
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -609,6 +639,7 @@ fn execute_trigger_inner_with_tracer(
     }
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
+    let chain_id = tron_chain_id(stores);
     let mut ctx = Context::mainnet()
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
@@ -617,6 +648,12 @@ fn execute_trigger_inner_with_tracer(
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
             cfg.gas_params = crate::tron_gas_params();
+            // TRON fork: CHAINID is the genesis-block-id-derived value, NOT an
+            // EIP-155 chain id — EIP-712 domain separators depend on it. TRON
+            // transactions carry no EIP-155 chain id, so the tx-level chain-id
+            // check must stay OFF (else every tx is rejected InvalidChainId).
+            cfg.chain_id = chain_id;
+            cfg.tx_chain_id_check = false;
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -975,6 +1012,7 @@ pub fn execute_create_with_trace(
     }
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
+    let chain_id = tron_chain_id(stores);
     let mut ctx = Context::mainnet()
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
@@ -983,6 +1021,12 @@ pub fn execute_create_with_trace(
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
             cfg.gas_params = crate::tron_gas_params();
+            // TRON fork: CHAINID is the genesis-block-id-derived value, NOT an
+            // EIP-155 chain id — EIP-712 domain separators depend on it. TRON
+            // transactions carry no EIP-155 chain id, so the tx-level chain-id
+            // check must stay OFF (else every tx is rejected InvalidChainId).
+            cfg.chain_id = chain_id;
+            cfg.tx_chain_id_check = false;
         });
     let precompiles = TronPrecompiles::new(
         spec,
@@ -1204,6 +1248,27 @@ fn parse_tron_address_to_evm(raw: &[u8]) -> Result<EvmAddress, String> {
 #[allow(dead_code)]
 fn _evm_addr_dance(a: EvmAddress) -> tron_crypto::address::Address {
     evm_to_tron_address(&a)
+}
+
+#[cfg(test)]
+mod chain_id_tests {
+    use super::chain_id_from_genesis;
+
+    /// Mainnet ground truth: the genesis block id is
+    /// `00000000000000001ebf88508a03865c71d452e25f4d51194196a1d22b6653dc`; java
+    /// `Program.getChainId` truncates to the last 4 bytes (ALLOW_OPTIMIZED…/
+    /// ALLOW_TVM_COMPATIBLE_EVM active on mainnet) → `0x2b6653dc` (728126428),
+    /// the value every TRON EIP-712 signature folds into its domain separator.
+    #[test]
+    fn mainnet_chain_id_is_genesis_last_four_bytes() {
+        let mut genesis = [0u8; 32];
+        for (i, byte) in genesis.iter_mut().enumerate() {
+            let s = "00000000000000001ebf88508a03865c71d452e25f4d51194196a1d22b6653dc";
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        assert_eq!(chain_id_from_genesis(&genesis), 0x2b6653dc);
+        assert_eq!(chain_id_from_genesis(&genesis), 728126428);
+    }
 }
 
 #[cfg(test)]

@@ -85,27 +85,78 @@ pub fn set_block_cache_bytes(bytes: usize) {
 /// `cpus × ~30` threads. A single shared Env bounds the pool across all
 /// stores, matching java-tron's single-DB-with-column-families thread
 /// model.
-const DEFAULT_BACKGROUND_THREADS: i32 = 4;
-const DEFAULT_HIGH_PRI_FLUSH_THREADS: i32 = 2;
+/// Detected logical CPU count (`available_parallelism`, 4 on failure). The
+/// flush/compaction pools below scale off this — two fixed flush threads
+/// throttled a 32-core host into periodic write stalls.
+fn detected_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
 
-/// Allow one extra in-flight immutable memtable so a flush of the hot
-/// stores (`account`, `storage-row`) doesn't immediately stall writes.
-/// Kept at the RocksDB default (2) — the earlier bump to 4 multiplied
-/// per-store memtable RAM and, summed across ~42 separate store
-/// instances, was a major contributor to multi-GB memory growth. The
-/// shared [`WriteBufferManager`] below is what actually bounds aggregate
-/// memtable memory now, independent of this per-store count.
-const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 2;
+/// Total system RAM in bytes (Linux `/proc/meminfo`). Falls back to 8 GiB so
+/// the write-buffer budget stays at its historical 1 GiB floor when unknown.
+fn detected_mem_total_bytes() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))
+                .and_then(|v| v.trim().strip_suffix(" kB"))
+                .and_then(|n| n.trim().parse::<usize>().ok())
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(8 * 1024 * 1024 * 1024)
+}
+
+/// Background COMPACTION threads for the shared [`Env`]. Because each store is
+/// a *separate* RocksDB instance (one DB per directory, the java-tron layout),
+/// per-DB `increase_parallelism` would spawn `cpus × ~30` threads; a single
+/// shared Env bounds the pool across all stores. Scaled with cores and clamped
+/// to `4..=16` — the floor preserves the old fixed default on small VMs.
+fn background_threads() -> i32 {
+    (detected_cores() as i32).clamp(4, 16)
+}
+
+/// High-priority FLUSH threads for the shared [`Env`], scaled with cores and
+/// clamped to `2..=8`. Two (the old fixed value) was far too few for the ~88
+/// separate store instances on a many-core host: when several hot stores
+/// flushed at once they queued on two threads, a store's 2nd memtable filled
+/// before its first flush drained, and RocksDB STOPPED that store's writes
+/// (`max_write_buffer_number`) — stalling block apply and making the node fall
+/// behind the tip every few minutes.
+fn flush_threads() -> i32 {
+    ((detected_cores() / 4) as i32).clamp(2, 8)
+}
+
+/// In-flight memtables allowed per store before writes stall. Raised from the
+/// RocksDB default (2 — only ONE immutable memtable of headroom, which the
+/// stall evidence showed a hot store routinely overran) to 4. The earlier
+/// concern that this multiplies per-store memtable RAM no longer applies: the
+/// shared [`WriteBufferManager`] caps the aggregate independently of this
+/// per-store count, so the extra headroom rides out flush latency without
+/// growing total memory.
+const DEFAULT_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 
 /// Aggregate memtable budget shared across EVERY store this process opens.
 /// Each store is a separate RocksDB instance, so without a shared manager
 /// total memtable RAM = `write_buffer_size × max_write_buffer_number ×
-/// store_count` (≈ 64 MiB × 2 × 42 ≈ 5 GiB, and far more at the old
-/// `×4`). A single `WriteBufferManager` caps the SUM regardless of store
-/// count — the fix for the unbounded memtable growth that drove the node
-/// to ~18 GiB. `allow_stall = true` applies write back-pressure when the
-/// budget is hit instead of letting memory balloon.
-const WRITE_BUFFER_MANAGER_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
+/// store_count` would be unbounded across ~88 instances. A single
+/// `WriteBufferManager` caps the SUM regardless of store count — the fix for
+/// the unbounded memtable growth that drove the node to ~18 GiB.
+/// `allow_stall = true` applies write back-pressure when the budget is hit
+/// instead of letting memory balloon.
+///
+/// Sized as `max(1 GiB, RAM/16)`, capped at 16 GiB: the 1 GiB floor preserves
+/// small-VM behavior, while on a big box the higher ceiling stops the
+/// `allow_stall` back-pressure from firing under normal tip write rates (a flat
+/// 1 GiB on a 125 GiB host triggered flush cascades every few minutes). It's a
+/// CAP, not an allocation — RAM actually used stays bounded by write rate ×
+/// flush latency, which is small now that flushes keep up.
+fn write_buffer_manager_bytes() -> usize {
+    const ONE_GIB: usize = 1024 * 1024 * 1024;
+    (detected_mem_total_bytes() / 16).clamp(ONE_GIB, 16 * ONE_GIB)
+}
 
 /// The shared block cache. Created once, referenced by every tuned open path so
 /// memory is bounded process-wide. Uses RocksDB's **HyperClockCache** rather than
@@ -129,7 +180,7 @@ fn shared_write_buffer_manager() -> &'static WriteBufferManager {
     static WBM: OnceLock<WriteBufferManager> = OnceLock::new();
     WBM.get_or_init(|| {
         WriteBufferManager::new_write_buffer_manager(
-            WRITE_BUFFER_MANAGER_BYTES,
+            write_buffer_manager_bytes(),
             /* allow_stall */ true,
         )
     })
@@ -142,8 +193,8 @@ fn shared_env() -> Option<&'static Env> {
     static ENV: OnceLock<Option<Env>> = OnceLock::new();
     ENV.get_or_init(|| match Env::new() {
         Ok(mut env) => {
-            env.set_background_threads(DEFAULT_BACKGROUND_THREADS);
-            env.set_high_priority_background_threads(DEFAULT_HIGH_PRI_FLUSH_THREADS);
+            env.set_background_threads(background_threads());
+            env.set_high_priority_background_threads(flush_threads());
             Some(env)
         }
         Err(_) => None,

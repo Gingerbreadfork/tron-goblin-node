@@ -46,26 +46,55 @@ impl StorageRowStore {
         Self { backend }
     }
 
-    /// Compose the composite storage-row key for a v2 contract (slot
-    /// taken as-is). For v1 contracts use [`compose_key_v1`].
-    pub fn compose_key(address: &Address, slot: &[u8; 32]) -> [u8; KEY_LEN] {
-        let addr_hash = keccak256(address.as_bytes());
+    /// java-tron's storage `addrHash` (the key's 16-byte prefix source).
+    /// Normally `sha3(address)`, but for a CREATE2-deployed contract — one
+    /// whose `SmartContract.trxHash` is non-empty — it is
+    /// `sha3(address ++ trxHash)` (java `Storage.generateAddrHash`, set in
+    /// `RepositoryImpl.getStorage`). Getting this wrong points every storage
+    /// access for that contract at the wrong key, so reads come back zero.
+    pub fn addr_hash(address: &Address, trx_hash: &[u8]) -> [u8; 32] {
+        if trx_hash.is_empty() {
+            keccak256(address.as_bytes())
+        } else {
+            let mut buf = Vec::with_capacity(address.as_bytes().len() + trx_hash.len());
+            buf.extend_from_slice(address.as_bytes());
+            buf.extend_from_slice(trx_hash);
+            keccak256(&buf)
+        }
+    }
+
+    /// Compose a storage-row key from a precomputed `addr_hash` (see
+    /// [`addr_hash`](Self::addr_hash)). `v1 == true` hashes the slot first
+    /// (pre-`ALLOW_TVM_VOTE` layout); v2 takes the slot raw.
+    pub fn compose_key_with_addr_hash(
+        addr_hash: &[u8; 32],
+        slot: &[u8; 32],
+        v1: bool,
+    ) -> [u8; KEY_LEN] {
         let mut out = [0u8; KEY_LEN];
         out[..PREFIX_BYTES].copy_from_slice(&addr_hash[..PREFIX_BYTES]);
-        out[PREFIX_BYTES..].copy_from_slice(&slot[PREFIX_BYTES..]);
+        if v1 {
+            let slot_hash = keccak256(slot);
+            out[PREFIX_BYTES..].copy_from_slice(&slot_hash[PREFIX_BYTES..]);
+        } else {
+            out[PREFIX_BYTES..].copy_from_slice(&slot[PREFIX_BYTES..]);
+        }
         out
+    }
+
+    /// Compose the composite storage-row key for a v2 contract (slot
+    /// taken as-is) using the plain `sha3(address)` prefix. For v1 contracts
+    /// use [`compose_key_v1`]; for CREATE2 contracts compose via
+    /// [`addr_hash`](Self::addr_hash) + [`compose_key_with_addr_hash`].
+    pub fn compose_key(address: &Address, slot: &[u8; 32]) -> [u8; KEY_LEN] {
+        Self::compose_key_with_addr_hash(&Self::addr_hash(address, &[]), slot, false)
     }
 
     /// V1-contract key: the slot is first hashed (`keccak256`) before
     /// composition. Used for contracts deployed before
     /// `ALLOW_TVM_VOTE` / TVM v2.
     pub fn compose_key_v1(address: &Address, slot: &[u8; 32]) -> [u8; KEY_LEN] {
-        let addr_hash = keccak256(address.as_bytes());
-        let slot_hash = keccak256(slot);
-        let mut out = [0u8; KEY_LEN];
-        out[..PREFIX_BYTES].copy_from_slice(&addr_hash[..PREFIX_BYTES]);
-        out[PREFIX_BYTES..].copy_from_slice(&slot_hash[PREFIX_BYTES..]);
-        out
+        Self::compose_key_with_addr_hash(&Self::addr_hash(address, &[]), slot, true)
     }
 
     pub fn put(&self, key: &[u8; KEY_LEN], value: &[u8]) -> Result<(), StoreError> {
@@ -101,5 +130,55 @@ impl StorageRowStore {
                 Some((key, v))
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod addr_hash_tests {
+    use super::*;
+
+    fn hexvec(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Ground-truth from mainnet: the SunSwap pair
+    /// `41c83479647bd52ebed75603368c84289cf119daef` is CREATE2-deployed with
+    /// `trxHash = abfcccef…`, so java-tron addresses its storage at
+    /// `sha3(address ++ trxHash)`, NOT `sha3(address)`. Reading it at the plain
+    /// prefix returns zero (the bug that made every DEX swap revert with
+    /// INSUFFICIENT_LIQUIDITY against a real java snapshot).
+    #[test]
+    fn create2_contract_uses_trxhash_prefixed_addr_hash() {
+        let mut a = [0u8; 21];
+        a.copy_from_slice(&hexvec("41c83479647bd52ebed75603368c84289cf119daef"));
+        let addr = Address::from_raw(a);
+        let trx = hexvec("abfcccef8d2493686308172a9caee8a378ba7652d7714e298058c33aa082a59b");
+
+        let plain = StorageRowStore::addr_hash(&addr, &[]);
+        let with_trx = StorageRowStore::addr_hash(&addr, &trx);
+        assert_ne!(plain, with_trx, "trxHash prefix must differ from plain");
+        assert_eq!(plain, keccak256(addr.as_bytes()), "plain = sha3(address)");
+        let mut merged = addr.as_bytes().to_vec();
+        merged.extend_from_slice(&trx);
+        assert_eq!(with_trx, keccak256(&merged), "create2 = sha3(address ++ trxHash)");
+
+        // Empty trxHash must fall back to the plain prefix (java
+        // `ByteUtil.isNullOrZeroArray` guard).
+        assert_eq!(StorageRowStore::addr_hash(&addr, &[]), plain);
+
+        // The fully-composed keys for the reserves slot (8, v2/raw) must differ.
+        let mut slot8 = [0u8; 32];
+        slot8[31] = 8;
+        let k_plain = StorageRowStore::compose_key(&addr, &slot8);
+        let k_trx = StorageRowStore::compose_key_with_addr_hash(&with_trx, &slot8, false);
+        assert_ne!(k_plain, k_trx);
+        // compose_key_with_addr_hash(plain) must equal the legacy compose_key.
+        assert_eq!(
+            StorageRowStore::compose_key_with_addr_hash(&plain, &slot8, false),
+            k_plain
+        );
     }
 }
