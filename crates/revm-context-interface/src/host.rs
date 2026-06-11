@@ -271,6 +271,37 @@ pub trait Host {
         0
     }
 
+    /// **TRON fork** — the root transaction id (`sha256(raw_data)`) of the tx
+    /// currently executing. Used to derive nested-CREATE addresses
+    /// (`0x41 || sha3omit12(rootTxId || nonce_be8)`). Default `ZERO`.
+    #[inline]
+    fn tron_root_tx_id(&self) -> B256 {
+        B256::ZERO
+    }
+
+    /// **TRON fork** — return the current value of this transaction's
+    /// internal-transaction nonce counter, then increment it (post-increment).
+    /// java-tron bumps this counter (`Program.increaseNonce`) on every nested
+    /// CALL (non-precompile), CREATE/CREATE2, SELFDESTRUCT and staking opcode;
+    /// a nested CREATE's address uses the value BEFORE its own bump. Default 0.
+    #[inline]
+    fn tron_bump_create_nonce(&mut self) -> u64 {
+        0
+    }
+
+    /// **TRON fork** — record that a nested CREATE/CREATE2 opcode is deploying a
+    /// contract at `address`, created by `creator` (the executing contract's
+    /// address — java-tron's `getContextAddress`). java-tron's
+    /// `Program.createContractImpl` writes a `SmartContract` row
+    /// (`consumeUserResourcePercent = 100`, `originAddress = creator`,
+    /// `trxHash = rootTxId` iff CREATE2) and marks the account
+    /// `CreatedByContract` / `AccountType.Contract` at this point. The host
+    /// defers the actual chainbase write to commit, applying it only to
+    /// addresses that survive (a reverted create never commits). Default no-op.
+    #[inline]
+    fn tron_record_created_contract(&mut self, _address: Address, _creator: Address, _is_create2: bool) {
+    }
+
     /// **TRON fork** — `FREEZEEXPIRETIME` (0xd7). Default 0.
     #[inline]
     fn tron_freeze_expire_time(

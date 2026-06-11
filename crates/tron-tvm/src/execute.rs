@@ -198,7 +198,22 @@ pub fn execute_trigger_with_trace(
     contract: &TriggerSmartContract,
     energy_limit: u64,
 ) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
-    execute_trigger_inner(stores, block, contract, energy_limit, None, None)
+    execute_trigger_inner(stores, block, contract, energy_limit, None, None, None)
+}
+
+/// As [`execute_trigger_with_trace`] but threads the real root transaction id
+/// (`sha256(raw_data)`) so nested `CREATE` opcodes derive consensus-correct
+/// addresses (`0x41 || sha3omit12(rootTxId || nonce_be8)`). The consensus
+/// executor MUST use this variant; read-only RPC paths that never persist a
+/// nested deploy can stay on the tx-id-less wrapper.
+pub fn execute_trigger_with_trace_tx_id(
+    stores: &VmStores,
+    block: VmBlockEnv,
+    contract: &TriggerSmartContract,
+    energy_limit: u64,
+    tx_id: [u8; 32],
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
+    execute_trigger_inner(stores, block, contract, energy_limit, None, None, Some(tx_id))
 }
 
 /// Same as [`execute_trigger_with_trace`] plus a `tx_gas_limit_cap`
@@ -214,7 +229,15 @@ pub fn execute_trigger_with_gas_cap(
     energy_limit: u64,
     gas_cap_override: u64,
 ) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
-    execute_trigger_inner(stores, block, contract, energy_limit, Some(gas_cap_override), None)
+    execute_trigger_inner(
+        stores,
+        block,
+        contract,
+        energy_limit,
+        Some(gas_cap_override),
+        None,
+        None,
+    )
 }
 
 /// As [`execute_trigger_with_gas_cap`] plus an attached
@@ -242,6 +265,7 @@ pub fn execute_trigger_with_tracer(
         Some(gas_cap_override),
         None,
         Some(tracer),
+        None,
     )
 }
 
@@ -270,6 +294,7 @@ pub fn execute_trigger_with_deadline(
         energy_limit,
         Some(gas_cap_override),
         Some((deadline, timeout_ms)),
+        None,
     )
 }
 
@@ -280,6 +305,7 @@ fn execute_trigger_inner(
     energy_limit: u64,
     gas_cap_override: Option<u64>,
     deadline: Option<(std::time::Instant, u64)>,
+    root_tx_id: Option<[u8; 32]>,
 ) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     let owner_bytes = match parse_tron_address_to_evm(&contract.owner_address) {
         Ok(a) => a,
@@ -324,6 +350,9 @@ fn execute_trigger_inner(
         Arc::clone(&stores.code),
         Arc::clone(&stores.storage),
     );
+    if let Some(tx_id) = root_tx_id {
+        tron_db = tron_db.with_root_tx_id(tx_id);
+    }
     if let Some(idx) = &stores.block_index {
         tron_db = tron_db.with_block_index(Arc::clone(idx));
     }
@@ -501,6 +530,7 @@ fn execute_trigger_inner_with_tracer(
     gas_cap_override: Option<u64>,
     deadline: Option<(std::time::Instant, u64)>,
     tracer: Option<crate::tracer::StructLogTracer>,
+    root_tx_id: Option<[u8; 32]>,
 ) -> (
     VmOutcome,
     Vec<crate::internal_tx::InternalTxTrace>,
@@ -551,6 +581,9 @@ fn execute_trigger_inner_with_tracer(
         Arc::clone(&stores.code),
         Arc::clone(&stores.storage),
     );
+    if let Some(tx_id) = root_tx_id {
+        tron_db = tron_db.with_root_tx_id(tx_id);
+    }
     if let Some(idx) = &stores.block_index {
         tron_db = tron_db.with_block_index(Arc::clone(idx));
     }
@@ -791,9 +824,27 @@ fn apply_top_level_trc10(
     Ok(())
 }
 
+/// Derive a top-level `CreateSmartContract`'s contract address.
+///
+/// java-tron `WalletUtil.generateContractAddress(Transaction)`:
+/// `0x41 || sha3omit12(txRawDataHash(32) ++ ownerAddress(21))`. The hash
+/// input is the tx id FIRST, then the 21-byte owner — verified against
+/// mainnet (factory `TEo47ug…`, its creator, and the deploy tx reproduce
+/// the on-chain address only in this order; owner-first does not).
+pub fn derive_top_level_contract_address(tx_id: &[u8; 32], owner_address: &[u8]) -> [u8; 21] {
+    let mut hash_input = Vec::with_capacity(32 + owner_address.len());
+    hash_input.extend_from_slice(tx_id);
+    hash_input.extend_from_slice(owner_address);
+    let h = tron_crypto::hash::keccak256(&hash_input);
+    let mut tron_addr = [0u8; 21];
+    tron_addr[0] = 0x41;
+    tron_addr[1..].copy_from_slice(&h[12..]);
+    tron_addr
+}
+
 /// Execute a `CreateSmartContract` through the TVM.
 ///
-/// TRON's contract-address derivation is `0x41 || keccak256(owner || tx_id)[12..]`.
+/// TRON's contract-address derivation is `0x41 || keccak256(tx_id || owner)[12..]`.
 /// This differs from Ethereum's `keccak256(rlp([sender, nonce]))[12..]`,
 /// so we don't use revm's `TxKind::Create` directly — instead we:
 ///
@@ -858,15 +909,7 @@ pub fn execute_create_with_trace(
         Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0),
     };
 
-    // Derive the TRON contract address from `owner_address || tx_id`.
-    // java-tron: `Hash.sha3omit12(owner || tx_id)` → 20 bytes, prefixed 0x41.
-    let mut hash_input = Vec::with_capacity(21 + 32);
-    hash_input.extend_from_slice(&contract.owner_address);
-    hash_input.extend_from_slice(tx_id);
-    let h = tron_crypto::hash::keccak256(&hash_input);
-    let mut tron_addr = [0u8; 21];
-    tron_addr[0] = 0x41;
-    tron_addr[1..].copy_from_slice(&h[12..]);
+    let tron_addr = derive_top_level_contract_address(tx_id, &contract.owner_address);
     let tron_contract_addr =
         tron_crypto::address::Address::from_raw(tron_addr);
     let evm_contract_addr = EvmAddress::from_slice(&tron_addr[1..]);
@@ -905,7 +948,8 @@ pub fn execute_create_with_trace(
         Arc::clone(&stores.accounts),
         Arc::clone(&stores.code),
         Arc::clone(&stores.storage),
-    );
+    )
+    .with_root_tx_id(*tx_id);
     if let Some(idx) = &stores.block_index {
         tron_db = tron_db.with_block_index(Arc::clone(idx));
     }
@@ -1059,14 +1103,48 @@ pub fn execute_create_with_trace(
                         .put(tron_contract_addr.as_bytes(), &runtime_code)
                         .expect("db error in execute_create writing runtime code");
                 }
-                // Replace init code on the Account with the runtime code.
+                // Replace init code on the Account with the runtime code, and
+                // mark it a contract account. java-tron VMActuator:
+                // `createAccount(addr, newSmartContract.getName(), Contract)` —
+                // the account carries the DECLARED contract name (not
+                // "CreatedByContract", which is the nested-create marker) and
+                // `AccountType.Contract` (consensus-relevant: TransferActuator
+                // rejects plain TRX transfers to Contract-type accounts).
                 if let Ok(Some(mut acct)) = stores.accounts.get(&tron_contract_addr) {
                     acct.code = runtime_code;
                     acct.code_hash = runtime_hash;
+                    acct.r#type = tron_proto::AccountType::Contract as i32;
+                    if acct.account_name.is_empty() {
+                        acct.account_name = smart_contract.name.clone().into_bytes();
+                    }
                     stores
                         .accounts
                         .put(&tron_contract_addr, &acct)
                         .expect("db error in execute_create finalizing contract account");
+                }
+                // Persist the `SmartContract` row + ABI. java-tron
+                // `rootRepository.createContract(addr, ContractCapsule(newSmartContract))`
+                // where `newSmartContract` is the tx's `new_contract` with
+                // `contractAddress` set and `version` per ALLOW_TVM_COMPATIBLE_EVM
+                // (currently OFF on mainnet → version stays as sent, 0). Without
+                // this the later energy split (origin / consumeUserResourcePercent
+                // / originEnergyLimit) degenerates and `getcontract` returns null.
+                // `ContractStore::put` strips the ABI; we store it separately.
+                if let Some(contracts) = &stores.contracts {
+                    let mut row = smart_contract.clone();
+                    row.contract_address = tron_contract_addr.as_bytes().to_vec();
+                    // ALLOW_TVM_COMPATIBLE_EVM is OFF on mainnet → java
+                    // `clearVersion()` (version 0); don't let a tx-supplied
+                    // version persist (it would also flip the storage layout).
+                    row.version = 0;
+                    contracts
+                        .put(&tron_contract_addr, &row)
+                        .expect("db error in execute_create writing contract row");
+                }
+                if let (Some(abi_store), Some(abi)) = (&stores.abi, &smart_contract.abi) {
+                    abi_store
+                        .put(&tron_contract_addr, abi)
+                        .expect("db error in execute_create writing contract abi");
                 }
                 VmOutcome::Success {
                     return_data: tron_contract_addr.as_bytes().to_vec(),
@@ -1126,4 +1204,59 @@ fn parse_tron_address_to_evm(raw: &[u8]) -> Result<EvmAddress, String> {
 #[allow(dead_code)]
 fn _evm_addr_dance(a: EvmAddress) -> tron_crypto::address::Address {
     evm_to_tron_address(&a)
+}
+
+#[cfg(test)]
+mod address_derivation_tests {
+    use super::derive_top_level_contract_address;
+
+    fn hex21(s: &str) -> [u8; 21] {
+        let v = hex_to_vec(s);
+        let mut a = [0u8; 21];
+        a.copy_from_slice(&v);
+        a
+    }
+    fn hex_to_vec(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Mainnet ground truth: the deposit-shell factory `TEo47ugrPSLShwhZ…`
+    /// (`4134ed0e191531d0410613527d3d491dda030d8b5c`) was deployed by creator
+    /// `TPjPdMafdiYxyWdaGiMe2ZHjZsi85JmXMX`
+    /// (`4196f4ceb72e6573a3e0042ecd6d2e6dacd4265e53`) in tx
+    /// `9e3e34b3ab07c8b6918b7d1e84624895cd105a16d13817864e4721c90fcc8784`.
+    /// `0x41 || sha3omit12(tx_id || owner)` must reproduce the on-chain address.
+    #[test]
+    fn top_level_create_matches_mainnet_ground_truth() {
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&hex_to_vec(
+            "9e3e34b3ab07c8b6918b7d1e84624895cd105a16d13817864e4721c90fcc8784",
+        ));
+        let owner = hex_to_vec("4196f4ceb72e6573a3e0042ecd6d2e6dacd4265e53");
+        let got = derive_top_level_contract_address(&tx_id, &owner);
+        assert_eq!(got, hex21("4134ed0e191531d0410613527d3d491dda030d8b5c"));
+    }
+
+    /// Owner-first (the old, wrong order) must NOT match — guards against a
+    /// regression that swaps the operands back.
+    #[test]
+    fn owner_first_order_does_not_match() {
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&hex_to_vec(
+            "9e3e34b3ab07c8b6918b7d1e84624895cd105a16d13817864e4721c90fcc8784",
+        ));
+        let owner = hex_to_vec("4196f4ceb72e6573a3e0042ecd6d2e6dacd4265e53");
+        // Reconstruct the old owner-first hash and confirm it differs.
+        let mut wrong = Vec::new();
+        wrong.extend_from_slice(&owner);
+        wrong.extend_from_slice(&tx_id);
+        let h = tron_crypto::hash::keccak256(&wrong);
+        let mut wrong_addr = [0u8; 21];
+        wrong_addr[0] = 0x41;
+        wrong_addr[1..].copy_from_slice(&h[12..]);
+        assert_ne!(wrong_addr, hex21("4134ed0e191531d0410613527d3d491dda030d8b5c"));
+    }
 }

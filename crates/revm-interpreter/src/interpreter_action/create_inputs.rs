@@ -54,12 +54,23 @@ impl CreateInputs {
     /// Returns the address that this create call will create.
     ///
     /// The result is cached to avoid redundant keccak computations.
+    ///
+    /// **TRON fork:** CREATE2 uses java-tron's
+    /// `WalletUtil.generateContractAddress2` layout, which is
+    /// `sha3omit12(senderAddress21 ++ salt ++ sha3(initCode))` where
+    /// `senderAddress21` is the 21-byte `0x41`-prefixed creating-contract
+    /// address. Byte-for-byte this is the standard EVM CREATE2 preimage with
+    /// the `0xff` domain-separator replaced by `0x41` (verified live against
+    /// java-tron deposit-shell factories). The plain CREATE branch here is
+    /// only reached by inspectors as an informational best-effort guess — the
+    /// consensus address comes from the host's tx-id/nonce derivation in
+    /// `make_create_frame`, since TRON has no account nonce.
     pub fn created_address(&self, nonce: u64) -> Address {
         *self.cached_address.get_or_init(|| match self.scheme {
             CreateScheme::Create => self.caller.create(nonce),
-            CreateScheme::Create2 { salt } => self
-                .caller
-                .create2(salt.to_be_bytes(), self.init_code_hash()),
+            CreateScheme::Create2 { salt } => {
+                tron_create2_address(&self.caller, B256::from(salt.to_be_bytes()), self.init_code_hash())
+            }
             CreateScheme::Custom { address } => address,
         })
     }
@@ -136,5 +147,86 @@ impl CreateInputs {
     /// Set the state gas reservoir (EIP-8037).
     pub const fn set_reservoir(&mut self, reservoir: u64) {
         self.reservoir = reservoir;
+    }
+}
+
+/// java-tron CREATE2 contract-address derivation
+/// (`WalletUtil.generateContractAddress2`).
+///
+/// `0x41 || sha3omit12( 0x41 ++ caller(20) ++ salt(32) ++ keccak(initCode)(32) )`.
+/// The returned [`Address`] is the 20-byte EVM half (`[12..]` of the hash); the
+/// `0x41` TRON prefix is reattached at commit. The preimage is the standard
+/// EVM CREATE2 preimage with the `0xff` domain byte replaced by `0x41`.
+pub fn tron_create2_address(caller: &Address, salt: B256, init_code_hash: B256) -> Address {
+    let mut buf = [0u8; 1 + 20 + 32 + 32];
+    buf[0] = 0x41;
+    buf[1..21].copy_from_slice(caller.as_slice());
+    buf[21..53].copy_from_slice(salt.as_slice());
+    buf[53..85].copy_from_slice(init_code_hash.as_slice());
+    Address::from_word(keccak256(buf))
+}
+
+/// java-tron nested-CREATE contract-address derivation
+/// (`TransactionUtil.generateContractAddress(rootTxId, nonce)`).
+///
+/// `0x41 || sha3omit12( rootTxId(32) ++ nonce_be(8) )`. The returned
+/// [`Address`] is the 20-byte EVM half. `nonce` is java-tron's per-transaction
+/// internal-transaction counter (NOT an account nonce — TRON accounts have
+/// none), supplied by the host.
+pub fn tron_create_address(root_tx_id: B256, nonce: u64) -> Address {
+    let mut buf = [0u8; 32 + 8];
+    buf[..32].copy_from_slice(root_tx_id.as_slice());
+    buf[32..].copy_from_slice(&nonce.to_be_bytes());
+    Address::from_word(keccak256(buf))
+}
+
+#[cfg(test)]
+mod tron_address_tests {
+    use super::*;
+
+    fn b256_hex(s: &str) -> B256 {
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        B256::from(out)
+    }
+    fn addr_hex(s: &str) -> Address {
+        let mut out = [0u8; 20];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        Address::from(out)
+    }
+
+    /// CREATE2 preimage differs from EVM only in the leading domain byte
+    /// (`0x41` vs `0xff`), so the TRON address must NOT equal alloy's.
+    #[test]
+    fn create2_differs_from_evm_by_domain_byte() {
+        let caller = addr_hex("34ed0e191531d0410613527d3d491dda030d8b5c");
+        let salt = b256_hex("00000000000000000000000000000000000000000000000000000000deadbeef");
+        let code_hash =
+            b256_hex("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+        let tron = tron_create2_address(&caller, salt, code_hash);
+        let evm = caller.create2(salt.0, code_hash);
+        assert_ne!(tron, evm);
+        // Recompute the TRON preimage by hand to pin the byte layout.
+        let mut buf = Vec::new();
+        buf.push(0x41u8);
+        buf.extend_from_slice(caller.as_slice());
+        buf.extend_from_slice(salt.as_slice());
+        buf.extend_from_slice(code_hash.as_slice());
+        assert_eq!(tron, Address::from_word(keccak256(&buf)));
+    }
+
+    /// Nested-CREATE address pins the `rootTxId || nonce_be8` layout.
+    #[test]
+    fn nested_create_layout() {
+        let root = b256_hex("9e3e34b3ab07c8b6918b7d1e84624895cd105a16d13817864e4721c90fcc8784");
+        let got = tron_create_address(root, 7);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(root.as_slice());
+        buf.extend_from_slice(&7u64.to_be_bytes());
+        assert_eq!(got, Address::from_word(keccak256(&buf)));
     }
 }

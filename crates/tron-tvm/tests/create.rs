@@ -29,8 +29,31 @@ fn fresh_stores() -> VmStores {
         contracts: None,
         votes: None,
         reward_vi: None,
-    abi: None,
+        abi: None,
     }
+}
+
+/// Like [`fresh_stores`] but with the `ContractStore` + `AbiStore` attached, so
+/// deploy paths persist `SmartContract` rows.
+fn fresh_stores_with_contracts() -> VmStores {
+    let mut s = fresh_stores();
+    s.contracts = Some(Arc::new(tron_chainbase::ContractStore::new(mem())));
+    s.abi = Some(Arc::new(tron_chainbase::AbiStore::new(mem())));
+    s
+}
+
+/// java-tron CREATE2 address: `0x41 || sha3omit12(0x41 ++ caller20 ++ salt32 ++ keccak(init))`.
+fn tron_create2(caller21: &[u8; 21], salt: [u8; 32], init_code: &[u8]) -> [u8; 21] {
+    let mut buf = Vec::new();
+    buf.push(0x41u8);
+    buf.extend_from_slice(&caller21[1..]); // 20-byte EVM half
+    buf.extend_from_slice(&salt);
+    buf.extend_from_slice(&tron_crypto::hash::keccak256(init_code));
+    let h = tron_crypto::hash::keccak256(&buf);
+    let mut out = [0u8; 21];
+    out[0] = 0x41;
+    out[1..].copy_from_slice(&h[12..]);
+    out
 }
 
 #[test]
@@ -131,15 +154,21 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
     assert_eq!(contract_addr_bytes[0], 0x41);
 
     // Verify the derived address matches the TRON formula:
-    // 0x41 || keccak256(owner || tx_id)[12..]
+    // 0x41 || sha3omit12(tx_id || owner)[12..] (java-tron
+    // WalletUtil.generateContractAddress: tx id FIRST, then the 21-byte owner).
     let mut hash_input = Vec::new();
-    hash_input.extend_from_slice(&owner_bytes);
     hash_input.extend_from_slice(&tx_id);
+    hash_input.extend_from_slice(&owner_bytes);
     let h = tron_crypto::hash::keccak256(&hash_input);
     let mut expected_addr = [0u8; 21];
     expected_addr[0] = 0x41;
     expected_addr[1..].copy_from_slice(&h[12..]);
     assert_eq!(contract_addr_bytes, expected_addr.to_vec());
+    // And it must match the shared derivation helper.
+    assert_eq!(
+        contract_addr_bytes,
+        tron_tvm::execute::derive_top_level_contract_address(&tx_id, &owner_bytes).to_vec()
+    );
 
     // Verify the deployed runtime code is stored on the Account.
     let contract_addr = Address::from_raw(expected_addr);
@@ -298,4 +327,303 @@ fn execute_create_halts_when_code_deposit_charge_exceeds_budget() {
     addr[0] = 0x41;
     addr[1..].copy_from_slice(&h[12..]);
     assert!(stores.accounts.get(&Address::from_raw(addr)).unwrap().is_none());
+}
+
+#[test]
+fn top_level_create_writes_contract_row_and_marks_account() {
+    let stores = fresh_stores_with_contracts();
+
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xa2);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner_bytes),
+            &Account {
+                address: owner_bytes.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Init code returns a 1-byte STOP runtime: PUSH1 1, PUSH1 0, RETURN reads
+    // mem[0..1] (zero) → runtime [0x00].
+    let init_code = vec![0x60, 0x01, 0x60, 0x00, 0xf3];
+
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            bytecode: init_code,
+            consume_user_resource_percent: 75,
+            origin_energy_limit: 5_000_000,
+            name: "MyToken".to_string(),
+            abi: Some(Abi::default()),
+            ..Default::default()
+        }),
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    let tx_id = [0xee; 32];
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 0,
+        },
+        &create,
+        &tx_id,
+        2_000_000,
+    );
+    let addr_bytes = match outcome {
+        VmOutcome::Success { return_data, .. } => return_data,
+        other => panic!("expected Success, got {other:?}"),
+    };
+    let mut addr = [0u8; 21];
+    addr.copy_from_slice(&addr_bytes);
+    let contract_addr = Address::from_raw(addr);
+
+    // Account is marked a contract with the DECLARED name.
+    let acct = stores.accounts.get(&contract_addr).unwrap().unwrap();
+    assert_eq!(acct.r#type, tron_proto::AccountType::Contract as i32);
+    assert_eq!(acct.account_name, b"MyToken".to_vec());
+
+    // Contract row persisted with the tx's economic fields and version 0.
+    let row = stores
+        .contracts
+        .as_ref()
+        .unwrap()
+        .get(&contract_addr)
+        .unwrap()
+        .expect("contract row missing after top-level deploy");
+    assert_eq!(row.consume_user_resource_percent, 75);
+    assert_eq!(row.origin_energy_limit, 5_000_000);
+    assert_eq!(row.origin_address, owner_bytes.to_vec());
+    assert_eq!(row.contract_address, addr.to_vec());
+    assert_eq!(row.version, 0);
+    assert!(row.abi.is_none(), "ContractStore must strip ABI");
+}
+
+#[test]
+fn nested_create2_writes_contract_row_and_marks_account() {
+    use tron_proto::TriggerSmartContract;
+    use tron_tvm::execute::execute_trigger_with_trace_tx_id;
+
+    let stores = fresh_stores_with_contracts();
+    // CREATE2 (0xf5) needs the Petersburg spec → ALLOW_TVM_CONSTANTINOPLE.
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+
+    // Child init code: PUSH1 1, PUSH1 0, RETURN → returns mem[0..1] = [0x00].
+    let child_init: [u8; 5] = [0x60, 0x01, 0x60, 0x00, 0xf3];
+
+    // Factory runtime: MSTORE the 5-byte child init at mem[27..32], then
+    // CREATE2(value=0, offset=27, length=5, salt=0); STOP.
+    let factory_runtime = vec![
+        0x64, child_init[0], child_init[1], child_init[2], child_init[3], child_init[4], // PUSH5 child_init
+        0x60, 0x00, // PUSH1 0
+        0x52, // MSTORE
+        0x60, 0x00, // PUSH1 0  (salt)
+        0x60, 0x05, // PUSH1 5  (length)
+        0x60, 0x1b, // PUSH1 27 (offset)
+        0x60, 0x00, // PUSH1 0  (value)
+        0xf5, // CREATE2
+        0x00, // STOP
+    ];
+
+    // Caller (EOA) with balance.
+    let mut caller = [0u8; 21];
+    caller[0] = 0x41;
+    caller[1..].fill(0xa3);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(caller),
+            &Account {
+                address: caller.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Pre-install the factory as a contract account with its runtime code.
+    let mut factory = [0u8; 21];
+    factory[0] = 0x41;
+    factory[1..].fill(0xbb);
+    let factory_addr = Address::from_raw(factory);
+    let factory_code_hash = tron_crypto::hash::keccak256(&factory_runtime);
+    stores
+        .accounts
+        .put(
+            &factory_addr,
+            &Account {
+                address: factory.to_vec(),
+                balance: 0,
+                code: factory_runtime.clone(),
+                code_hash: factory_code_hash.to_vec(),
+                r#type: tron_proto::AccountType::Contract as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .code
+        .put(factory_addr.as_bytes(), &factory_runtime)
+        .unwrap();
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: factory.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    let tx_id = [0x7c; 32];
+    let (outcome, _traces, _pen) = execute_trigger_with_trace_tx_id(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 0,
+        },
+        &trigger,
+        2_000_000,
+        tx_id,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+
+    // The CREATE2 child must exist at the java-tron-derived address.
+    let child = tron_create2(&factory, [0u8; 32], &child_init);
+    let child_addr = Address::from_raw(child);
+    let child_acct = stores
+        .accounts
+        .get(&child_addr)
+        .unwrap()
+        .expect("CREATE2 child account missing");
+    assert_eq!(child_acct.r#type, tron_proto::AccountType::Contract as i32);
+    assert_eq!(child_acct.account_name, b"CreatedByContract".to_vec());
+
+    // Contract row: percent 100, origin = factory, trx_hash = root tx id.
+    let row = stores
+        .contracts
+        .as_ref()
+        .unwrap()
+        .get(&child_addr)
+        .unwrap()
+        .expect("CREATE2 child contract row missing");
+    assert_eq!(row.consume_user_resource_percent, 100);
+    assert_eq!(row.origin_address, factory.to_vec());
+    assert_eq!(row.trx_hash, tx_id.to_vec());
+    assert_eq!(row.contract_address, child.to_vec());
+    assert_eq!(row.version, 0);
+}
+
+/// java-tron nested CREATE address: `0x41 || sha3omit12(rootTxId ++ nonce_be8)`.
+fn tron_create(root_tx_id: &[u8; 32], nonce: u64) -> [u8; 21] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(root_tx_id);
+    buf.extend_from_slice(&nonce.to_be_bytes());
+    let h = tron_crypto::hash::keccak256(&buf);
+    let mut out = [0u8; 21];
+    out[0] = 0x41;
+    out[1..].copy_from_slice(&h[12..]);
+    out
+}
+
+/// End-to-end: a staking opcode (FREEZEBALANCEV2) executed before a nested
+/// CREATE must advance the per-tx internal-tx nonce counter, so the CREATE's
+/// child lands at the nonce=1 address — NOT the nonce=0 address it would use if
+/// the staking bump were missing. This proves the bridge bump and the frame's
+/// create-nonce read share one counter (full java-tron parity for
+/// staking-then-deploy).
+#[test]
+fn staking_opcode_shifts_following_nested_create_address() {
+    let stores = fresh_stores_with_contracts();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_FREEZE_V2", 1);
+
+    // Runtime: FREEZEBALANCEV2(1 TRX, resource 0), POP, then CREATE a child.
+    let child_init: [u8; 5] = [0x60, 0x01, 0x60, 0x00, 0xf3];
+    let runtime = vec![
+        0x62, 0x0f, 0x42, 0x40, // PUSH3 1_000_000  (frozenBalance, pushed first/deeper)
+        0x60, 0x00, // PUSH1 0  (resourceType, on top)
+        0xda, // FREEZEBALANCEV2  -> bumps the nonce counter (0 -> 1)
+        0x50, // POP  (discard success flag)
+        0x64, child_init[0], child_init[1], child_init[2], child_init[3], child_init[4], // PUSH5 child_init
+        0x60, 0x00, // PUSH1 0
+        0x52, // MSTORE
+        0x60, 0x05, // PUSH1 5  (length)
+        0x60, 0x1b, // PUSH1 27 (offset)
+        0x60, 0x00, // PUSH1 0  (value)
+        0xf0, // CREATE  (plain) -> uses nonce=1
+        0x00, // STOP
+    ];
+
+    let mut caller = [0u8; 21];
+    caller[0] = 0x41;
+    caller[1..].fill(0xc1);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(caller),
+            &Account { address: caller.to_vec(), balance: 1_000_000_000, ..Default::default() },
+        )
+        .unwrap();
+
+    let mut factory = [0u8; 21];
+    factory[0] = 0x41;
+    factory[1..].fill(0xc2);
+    let factory_addr = Address::from_raw(factory);
+    stores
+        .accounts
+        .put(
+            &factory_addr,
+            &Account {
+                address: factory.to_vec(),
+                balance: 100_000_000, // enough to freeze 1 TRX
+                code: runtime.clone(),
+                code_hash: tron_crypto::hash::keccak256(&runtime).to_vec(),
+                r#type: tron_proto::AccountType::Contract as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores.code.put(factory_addr.as_bytes(), &runtime).unwrap();
+
+    let trigger = tron_proto::TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: factory.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    let tx_id = [0x9a; 32];
+    let (outcome, _t, _p) = tron_tvm::execute::execute_trigger_with_trace_tx_id(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_000_000 },
+        &trigger,
+        3_000_000,
+        tx_id,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+
+    // Child must be at the nonce=1 address (staking op bumped the counter)…
+    let child_n1 = Address::from_raw(tron_create(&tx_id, 1));
+    assert!(
+        stores.accounts.get(&child_n1).unwrap().is_some(),
+        "child should deploy at the nonce=1 address (staking opcode bumped the nonce)"
+    );
+    // …and NOT at the nonce=0 address (which is where the pre-fix bug would put it).
+    let child_n0 = Address::from_raw(tron_create(&tx_id, 0));
+    assert!(
+        stores.accounts.get(&child_n0).unwrap().is_none(),
+        "child must NOT be at the nonce=0 address"
+    );
 }

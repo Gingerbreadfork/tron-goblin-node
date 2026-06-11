@@ -222,6 +222,26 @@ pub trait TronDatabaseExt {
     fn tron_take_last_balance_delta(&mut self) -> (Address, i64) {
         (Address::ZERO, 0)
     }
+
+    /// See [`crate::host::Host::tron_root_tx_id`].
+    fn tron_root_tx_id(&self) -> primitives::B256 {
+        primitives::B256::ZERO
+    }
+
+    /// See [`crate::host::Host::tron_bump_create_nonce`]. Post-increment:
+    /// returns the current counter value, then advances it by one.
+    fn tron_bump_create_nonce(&mut self) -> u64 {
+        0
+    }
+
+    /// See [`crate::host::Host::tron_record_created_contract`].
+    fn tron_record_created_contract(
+        &mut self,
+        _address: Address,
+        _creator: Address,
+        _is_create2: bool,
+    ) {
+    }
 }
 
 // ---- No-op impls for revm-internal database types ----

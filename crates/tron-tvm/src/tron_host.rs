@@ -51,6 +51,21 @@ impl TronDatabaseExt for TronDatabase {
         }
     }
 
+    fn tron_root_tx_id(&self) -> revm::primitives::B256 {
+        revm::primitives::B256::from(self.root_tx_id)
+    }
+
+    fn tron_bump_create_nonce(&mut self) -> u64 {
+        let n = self.create_nonce;
+        self.create_nonce += 1;
+        n
+    }
+
+    fn tron_record_created_contract(&mut self, address: Address, creator: Address, is_create2: bool) {
+        self.pending_created_contracts
+            .insert(address, (creator, is_create2));
+    }
+
     fn tron_freeze_expire_time(
         &self,
         caller_address: Address,
@@ -183,6 +198,13 @@ impl TronDatabaseExt for TronDatabase {
         if !(freeze_v1_ok && freeze_v2_ok) {
             return -1;
         }
+
+        // java bumps the nonce in `suicide`/`suicide2` AFTER the
+        // `canSuicide`/`canSuicide2` validation (the opcode action validates,
+        // then calls the handler whose first act is `increaseNonce`). It fires
+        // even on the self-target path (the `owner == obtainer` check comes
+        // after `increaseNonce`), so bump before the self-target early return.
+        self.note_internal_tx_nonce();
 
         let self_target = owner_t == obtainer_t;
         if self_target && !will_destroy {
@@ -363,6 +385,14 @@ impl TronDatabaseExt for TronDatabase {
             if expired > 0 {
                 self.pending_balance_deltas
                     .push((tron_to_evm_address(&inheritor_t), expired));
+                // java's conditional second `increaseNonce`
+                // ("withdrawExpireUnfreezeWhileSuiciding"). Only `suicide2`
+                // (selfdestruct restriction active) takes this transfer path;
+                // the pre-restriction `suicide` does not, so gate on
+                // `restriction` to avoid an over-bump in that historical case.
+                if restriction {
+                    self.note_internal_tx_nonce();
+                }
             }
 
             // clearOwnerFreezeV2.
@@ -393,6 +423,9 @@ impl TronDatabaseExt for TronDatabase {
         resource_type: u32,
         receiver_address: Option<Address>,
     ) -> i64 {
+        // java `Program.freeze` bumps the nonce at the top of the handler,
+        // before its validate (`increaseNonce` precedes `processor.validate`).
+        self.note_internal_tx_nonce();
         let _ = receiver_address; // v1 didn't really use it on chain
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
@@ -449,6 +482,8 @@ impl TronDatabaseExt for TronDatabase {
         resource_type: u32,
         receiver_address: Option<Address>,
     ) -> i64 {
+        // java `Program.unfreeze`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let _ = receiver_address;
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
@@ -495,6 +530,8 @@ impl TronDatabaseExt for TronDatabase {
     }
 
     fn tron_vote_witness(&mut self, caller: Address, witnesses: &[(Address, i64)]) -> i64 {
+        // java `Program.voteWitness`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let Some(votes_store) = self.votes.as_ref() else {
             return 0;
         };
@@ -543,6 +580,8 @@ impl TronDatabaseExt for TronDatabase {
     }
 
     fn tron_withdraw_reward(&mut self, caller: Address) -> i64 {
+        // java `Program.withdrawReward`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
         };
@@ -589,6 +628,8 @@ impl TronDatabaseExt for TronDatabase {
         frozen_balance: i64,
         resource_type: u32,
     ) -> i64 {
+        // java `Program.freezeBalanceV2`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
         };
@@ -649,6 +690,10 @@ impl TronDatabaseExt for TronDatabase {
         unfreeze_balance: i64,
         resource_type: u32,
     ) -> i64 {
+        // java `Program.unfreezeBalanceV2`: increaseNonce at the top, before
+        // validate. A second bump happens below iff it auto-withdraws an
+        // expired unfreeze (`unfreezeExpireBalance > 0`).
+        self.note_internal_tx_nonce();
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
         };
@@ -735,11 +780,18 @@ impl TronDatabaseExt for TronDatabase {
         // Credit the expired-sweep to the caller's journaled balance.
         if swept > 0 {
             self.last_balance_delta = Some((caller, swept));
+            // java's conditional second `increaseNonce`
+            // ("withdrawExpireUnfreezeWhileUnfreezing").
+            self.note_internal_tx_nonce();
         }
         1
     }
 
     fn tron_cancel_all_unfreeze_v2(&mut self, caller: Address) -> i64 {
+        // java `Program.cancelAllUnfreezeV2Action`: increaseNonce at the top,
+        // before validate. A second bump happens below iff it auto-withdraws an
+        // expired unfreeze (`WITHDRAW_EXPIRE_BALANCE > 0`).
+        self.note_internal_tx_nonce();
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
         };
@@ -810,11 +862,16 @@ impl TronDatabaseExt for TronDatabase {
         // `setBalance(balance + withdrawExpireBalance)`).
         if withdraw > 0 {
             self.last_balance_delta = Some((caller, withdraw));
+            // java's conditional second `increaseNonce`
+            // ("withdrawExpireUnfreezeWhileCanceling").
+            self.note_internal_tx_nonce();
         }
         1
     }
 
     fn tron_withdraw_expire_unfreeze(&mut self, caller: Address) -> i64 {
+        // java `Program.withdrawExpireUnfreeze`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let Some(dyn_props) = self.dyn_props.as_ref() else {
             return 0;
         };
@@ -859,6 +916,8 @@ impl TronDatabaseExt for TronDatabase {
         _lock: bool,
         _lock_period: i64,
     ) -> i64 {
+        // java `Program.delegateResource`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let Some(resources) = self.delegated_resources.as_ref() else {
             return 0;
         };
@@ -964,6 +1023,8 @@ impl TronDatabaseExt for TronDatabase {
         receiver_address: Address,
         resource_type: u32,
     ) -> i64 {
+        // java `Program.unDelegateResource`: increaseNonce at the top, before validate.
+        self.note_internal_tx_nonce();
         let Some(resources) = self.delegated_resources.as_ref() else {
             return 0;
         };
@@ -1361,5 +1422,67 @@ mod tests {
             3,
             "weight restored only for the re-staked 3 TRX (floor(3e6/1e6)=3)"
         );
+        // java's `cancelAllUnfreezeV2` does TWO increaseNonce here: one at the
+        // top + one for the auto-withdrawn expired unfreeze.
+        assert_eq!(db.create_nonce, 2, "always-bump + expired-withdraw bump");
+    }
+
+    /// Every state-mutating Stake 1.0/2.0 opcode bumps the per-tx
+    /// internal-transaction nonce counter once at the top (java
+    /// `Program.increaseNonce`, before its `validate`) — so a nested CREATE
+    /// later in the same tx derives the java-tron-correct address. Exercised
+    /// store-less: the bump fires before each bridge's store guard, then the
+    /// bridge returns 0.
+    #[test]
+    fn staking_opcodes_each_bump_internal_tx_nonce_once() {
+        let mut db = make_db();
+        let caller = evm_addr_from_tron(tron_addr(0xaa));
+        let receiver = evm_addr_from_tron(tron_addr(0xbb));
+        assert_eq!(db.create_nonce, 0);
+        db.tron_freeze(caller, 1_000_000, 3, 0, None);
+        db.tron_unfreeze(caller, 0, None);
+        db.tron_freeze_balance_v2(caller, 1_000_000, 0);
+        db.tron_unfreeze_balance_v2(caller, 1_000_000, 0);
+        db.tron_withdraw_expire_unfreeze(caller);
+        db.tron_cancel_all_unfreeze_v2(caller);
+        db.tron_delegate_resource(caller, 1_000_000, receiver, 0, false, 0);
+        db.tron_undelegate_resource(caller, 1_000_000, receiver, 0);
+        db.tron_vote_witness(caller, &[]);
+        db.tron_withdraw_reward(caller);
+        assert_eq!(
+            db.create_nonce, 10,
+            "10 staking opcodes, one nonce bump each"
+        );
+    }
+
+    /// SELFDESTRUCT bumps the nonce once (after `canSuicide` validation, which
+    /// java runs in the opcode action before calling the handler). A clean
+    /// account with no frozen/delegated balances passes validation.
+    #[test]
+    fn selfdestruct_bumps_internal_tx_nonce_after_validation() {
+        let (db, dyn_props) = make_staking_db();
+        dyn_props.save_latest_block_header_timestamp(1_000_000);
+        let owner = tron_addr(0x61);
+        let obtainer = tron_addr(0x62);
+        for a in [owner, obtainer] {
+            db.accounts
+                .put(
+                    &TronAddress::from_raw(a),
+                    &Account {
+                        address: a.to_vec(),
+                        balance: 5_000_000,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let mut db = db;
+        let rc = db.tron_suicide(
+            evm_addr_from_tron(owner),
+            evm_addr_from_tron(obtainer),
+            true,
+        );
+        assert_eq!(rc, 0, "valid suicide returns ok");
+        assert_eq!(db.create_nonce, 1, "one bump after canSuicide validation");
     }
 }

@@ -15,6 +15,7 @@ use interpreter::{
     interpreter::{EthInterpreter, ExtBytecode},
     interpreter_action::FrameInit,
     interpreter_types::ReturnData,
+    interpreter_action::tron_create_address,
     CallInput, CallInputs, CallOutcome, CallValue, CreateInputs, CreateOutcome, CreateScheme,
     FrameInput, Gas, InputsImpl, InstructionResult, Interpreter, InterpreterAction,
     InterpreterResult, InterpreterTypes, SharedMemory,
@@ -230,6 +231,18 @@ impl EthFrame<EthInterpreter> {
             })));
         }
 
+        // TRON fork: advance the per-tx internal-transaction nonce counter for a
+        // regular (non-precompile) call — java-tron's `callToAddress` calls
+        // `increaseNonce` after the depth + balance checks, before building the
+        // child program, and does so even when the target has no code (an EOA /
+        // empty account); `callToPrecompiledAddress` does NOT (handled by the
+        // early return above). `depth == 0` is the transaction-entry frame,
+        // which is not an internal transaction, so it never bumps. The value
+        // matters only for a later nested CREATE's address.
+        if depth >= 1 {
+            ctx.tron_bump_create_nonce();
+        }
+
         // Get bytecode and hash - either from known_bytecode or load from account
         let (bytecode_hash, bytecode) = inputs.known_bytecode.clone();
 
@@ -305,19 +318,49 @@ impl EthFrame<EthInterpreter> {
             return return_error(InstructionResult::OutOfFunds);
         }
 
-        // Increase nonce of caller and check if it overflows
-        let old_nonce = caller_info.nonce();
+        // Increase nonce of caller and check if it overflows. TRON accounts
+        // have no nonce, so this bump is journal-only (discarded at commit) and
+        // its value is NOT used for the address — but keep it so revm's
+        // collision/empty-account checkpoint logic behaves as upstream.
         if !caller_info.bump_nonce() {
             return return_error(InstructionResult::Return);
         };
 
-        // Create address — uses OnceCell cache so that if an inspector already called
-        // `created_address`, the expensive keccak256 is not recomputed.
-        let created_address = inputs.created_address(old_nonce);
         let init_code_hash = matches!(inputs.scheme(), CreateScheme::Create2 { .. })
             .then(|| inputs.init_code_hash());
 
         drop(caller_info); // Drop caller info to avoid borrow checker issues.
+
+        // TRON fork: derive the contract address java-tron's way and advance the
+        // per-tx internal-transaction nonce counter. java-tron's `increaseNonce`
+        // fires here (after the depth + balance checks above, before the
+        // collision check), so a balance/depth failure does NOT bump — matching
+        // the early returns above. CREATE uses the nonce BEFORE its own bump
+        // (`generateContractAddress(rootTxId, nonce)`); CREATE2 ignores it but
+        // still bumps (`createContractImpl` always increments). The 20-byte
+        // result is the EVM half; the `0x41` TRON prefix is reattached at commit.
+        let (created_address, is_create2) = match inputs.scheme() {
+            CreateScheme::Create => {
+                let nonce = context.tron_bump_create_nonce();
+                (tron_create_address(context.tron_root_tx_id(), nonce), false)
+            }
+            CreateScheme::Create2 { .. } => {
+                let addr = inputs.created_address(0);
+                context.tron_bump_create_nonce();
+                (addr, true)
+            }
+            CreateScheme::Custom { address } => (address, false),
+        };
+        // TRON fork: record the nested deploy so commit can write the
+        // `SmartContract` row + `CreatedByContract` account fields java-tron's
+        // `createContractImpl` creates here. Recorded for every CREATE/CREATE2
+        // (Custom is our pre-installed top-level path, handled in execute.rs);
+        // a create that later reverts simply never reaches commit, so the
+        // deferred write is dropped.
+        if !matches!(inputs.scheme(), CreateScheme::Custom { .. }) {
+            context.tron_record_created_contract(created_address, inputs.caller(), is_create2);
+        }
+        let journal = context.journal_mut();
 
         // warm load account.
         journal.load_account(created_address)?;

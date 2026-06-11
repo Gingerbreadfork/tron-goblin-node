@@ -657,6 +657,20 @@ impl<
         self.journaled_state.db().tron_is_contract(address)
     }
 
+    fn tron_root_tx_id(&self) -> B256 {
+        self.journaled_state.db().tron_root_tx_id()
+    }
+
+    fn tron_bump_create_nonce(&mut self) -> u64 {
+        self.journaled_state.db_mut().tron_bump_create_nonce()
+    }
+
+    fn tron_record_created_contract(&mut self, address: Address, creator: Address, is_create2: bool) {
+        self.journaled_state
+            .db_mut()
+            .tron_record_created_contract(address, creator, is_create2)
+    }
+
     fn tron_freeze_expire_time(
         &self,
         caller_address: Address,

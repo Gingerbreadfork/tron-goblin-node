@@ -150,6 +150,23 @@ pub struct ExecConfig {
     /// on the snapshot-stack path the report's `state_deltas` stays
     /// `None`. Defaults to `false` (no allocation, no clone).
     pub capture_state_deltas: bool,
+    /// **Tripwire** for silent VM state divergence. When a VM tx
+    /// (`TriggerSmartContract` / `CreateSmartContract`) executes to a
+    /// *success-vs-failure* result that disagrees with the block's stored
+    /// `ret[0].contractRet`, java-tron's `TransactionTrace.check()` rejects the
+    /// block ("different resultCode"). A SUCCESS tx mutates state while a failed
+    /// one doesn't, so this disagreement is exactly the class of silent
+    /// divergence the address-derivation bugs produced (a tx that canon
+    /// SUCCEEDed but we no-opped). The success/failure mismatch is **always**
+    /// logged regardless of this flag (it can't false-positive on our coarser
+    /// failure-*code* mapping — REVERT vs OUT_OF_ENERGY vs UNKNOWN detail
+    /// mismatches are ignored entirely, since both sides agree the tx failed
+    /// and a failed tx mutates no state beyond fees). With this flag
+    /// `true`, a success/failure disagreement also hard-rejects the block
+    /// instead of poisoning state. `OUT_OF_TIME` is excluded both ways (it is
+    /// node-local; java retries rather than failing). Defaults to `false`
+    /// (log-only) so an imperfect mapping can't wedge sync.
+    pub verify_contract_ret: bool,
 }
 
 impl Default for ExecConfig {
@@ -182,6 +199,10 @@ impl Default for ExecConfig {
             parallel_exec: false,
             // Archive capture is an explicit archive-node opt-in.
             capture_state_deltas: false,
+            // Log-only by default: the success/failure tripwire always logs,
+            // but hard-rejection is opt-in so a coarse failure-code mapping
+            // can never wedge sync.
+            verify_contract_ret: false,
         }
     }
 }
@@ -1068,6 +1089,16 @@ pub enum BlockExecError {
     )]
     StateRootMismatch {
         block_num: i64,
+        expected: String,
+        computed: String,
+    },
+    #[error(
+        "contractRet mismatch at block {block_num} tx {tx_id}: \
+         block says {expected}, we computed {computed} (success/failure disagreement)"
+    )]
+    ContractRetMismatch {
+        block_num: i64,
+        tx_id: String,
         expected: String,
         computed: String,
     },
@@ -2164,6 +2195,68 @@ fn execute_block_logic(
             .collect()
     });
 
+    // === 2c. contractRet tripwire (silent-divergence guard) ===
+    //
+    // Compare each VM tx's computed result against the block's stored
+    // `ret[0].contractRet`, but only on the consensus-critical axis:
+    // did we agree on success vs failure? A SUCCESS tx mutates state; a
+    // failed one does not (beyond fees) — so a success/failure disagreement
+    // is real divergence (java-tron `TransactionTrace.check`). Failure-code
+    // *detail* mismatches (our coarse Halt→UNKNOWN mapping vs java's specific
+    // code) are ignored. `OUT_OF_TIME` is node-local (java retries) and
+    // excluded on either side. Always logged; hard-rejects only when
+    // `verify_contract_ret` is set.
+    {
+        use tron_proto::transaction::result::ContractResult;
+        const SUCCESS: i32 = ContractResult::Success as i32;
+        const OUT_OF_TIME: i32 = ContractResult::OutOfTime as i32;
+        let ret_name = |x: i32| {
+            ContractResult::try_from(x)
+                .map(|c| c.as_str_name())
+                .unwrap_or("?")
+        };
+        for (tx, res) in block.transactions.iter().zip(tx_results.iter()) {
+            let is_vm = matches!(
+                res.contract_type,
+                Some(ContractType::TriggerSmartContract | ContractType::CreateSmartContract)
+            );
+            if !is_vm {
+                continue;
+            }
+            let Some(expected) = tx.ret.first().map(|r| r.contract_ret) else {
+                continue; // no stored ret to compare against
+            };
+            let computed = res.receipt.result;
+            if expected == computed
+                || expected == OUT_OF_TIME
+                || computed == OUT_OF_TIME
+            {
+                continue;
+            }
+            // Only a success-vs-failure disagreement is real divergence.
+            if (expected == SUCCESS) != (computed == SUCCESS) {
+                let tx_hex: String =
+                    res.tx_id.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!(
+                    "CONTRACTRET DIVERGENCE block {} tx {}: block={} computed={} \
+                     (success/failure disagreement — state may have diverged)",
+                    raw.number,
+                    tx_hex,
+                    ret_name(expected),
+                    ret_name(computed),
+                );
+                if config.verify_contract_ret {
+                    return Err(BlockExecError::ContractRetMismatch {
+                        block_num: raw.number,
+                        tx_id: tx_hex,
+                        expected: ret_name(expected).to_string(),
+                        computed: ret_name(computed).to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     // === 3. Head-pointer update (directly on base) ===
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     // Snapshot the previous block's timestamp BEFORE overwriting —
@@ -3167,12 +3260,14 @@ fn execute_vm_tx(
                 };
             let caller = address_from_proto(&trigger.owner_address);
             let contract_addr = address_from_proto(&trigger.contract_address);
-            let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_trigger_with_trace(
-                &vm_stores,
-                block_env,
-                &trigger,
-                energy_limit,
-            );
+            let (outcome, traces, energy_penalty) =
+                tron_tvm::execute::execute_trigger_with_trace_tx_id(
+                    &vm_stores,
+                    block_env,
+                    &trigger,
+                    energy_limit,
+                    tx_id,
+                );
             (caller, contract_addr, outcome, traces, energy_penalty)
         }
         ContractType::CreateSmartContract => {

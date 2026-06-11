@@ -5,7 +5,7 @@ mod create_outcome;
 
 pub use call_inputs::{CallInput, CallInputs, CallScheme, CallValue};
 pub use call_outcome::CallOutcome;
-pub use create_inputs::CreateInputs;
+pub use create_inputs::{tron_create2_address, tron_create_address, CreateInputs};
 pub use create_outcome::CreateOutcome;
 use primitives::Bytes;
 

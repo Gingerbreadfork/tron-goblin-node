@@ -105,6 +105,26 @@ pub struct TronDatabase {
     /// row is left uncached so a contract created earlier in the same tx is
     /// still observed.
     version_cache: RefCell<HashMap<TronAddress, bool>>,
+    /// Root transaction id (`sha256(raw_data)`) of the tx executing on this
+    /// `TronDatabase`. Feeds nested-CREATE address derivation
+    /// (`0x41 || sha3omit12(rootTxId || nonce_be8)`). Zero on read-only setups
+    /// that never deploy (eth_call), where it is unused.
+    pub(crate) root_tx_id: [u8; 32],
+    /// java-tron's per-tx internal-transaction nonce counter
+    /// (`Program.nonce`). Starts at 0; the frame layer post-increments it on
+    /// every nested CALL (non-precompile) / CREATE / CREATE2 (and, via the
+    /// opcode bridges, SELFDESTRUCT + staking ops). A nested CREATE's address
+    /// uses the value BEFORE its own bump. One `TronDatabase` per tx ⇒ one
+    /// counter per tx.
+    pub(crate) create_nonce: u64,
+    /// Nested CREATE/CREATE2 deploys recorded by the frame layer, keyed by the
+    /// EVM contract address → (creator EVM address, is_create2). `commit`
+    /// drains this to write each survivor's `SmartContract` row +
+    /// `CreatedByContract` / `AccountType::Contract` account fields (java-tron
+    /// `Program.createContractImpl`). A create that reverts never reaches
+    /// commit, so its entry — though still present here — is simply ignored
+    /// (commit only acts on addresses that show up in the committed change set).
+    pub(crate) pending_created_contracts: HashMap<EvmAddress, (EvmAddress, bool)>,
 }
 
 impl TronDatabase {
@@ -128,7 +148,29 @@ impl TronDatabase {
             pending_balance_deltas: Vec::new(),
             last_balance_delta: None,
             version_cache: RefCell::new(HashMap::new()),
+            root_tx_id: [0u8; 32],
+            create_nonce: 0,
+            pending_created_contracts: HashMap::new(),
         }
+    }
+
+    /// Set the root transaction id used for nested-CREATE address derivation.
+    /// Must be the same `sha256(raw_data)` tx id the executor computes for the
+    /// transaction whose VM call this `TronDatabase` backs.
+    pub fn with_root_tx_id(mut self, tx_id: [u8; 32]) -> Self {
+        self.root_tx_id = tx_id;
+        self
+    }
+
+    /// Advance the per-tx internal-transaction nonce counter by one — call once
+    /// per java-tron `Program.increaseNonce`. Used by the staking / SELFDESTRUCT
+    /// opcode bridges, which each create one (or, when they auto-withdraw an
+    /// expired unfreeze, two) internal transactions java assigns nonces to. The
+    /// frame layer bumps for nested CALL/CREATE separately. Only the cumulative
+    /// count matters (a later nested CREATE's address reads it); ordering within
+    /// a single opcode is irrelevant since no CREATE interleaves.
+    pub(crate) fn note_internal_tx_nonce(&mut self) {
+        self.create_nonce += 1;
     }
 
     /// Attach the ABI store (SELFDESTRUCT contract-row cleanup).
@@ -409,6 +451,20 @@ impl DatabaseCommit for TronDatabase {
                     ..Default::default()
                 });
 
+            // TRON fork: if a nested CREATE/CREATE2 deployed this address (and
+            // it survived to commit), mark the account `CreatedByContract` /
+            // `AccountType::Contract` — java-tron `Program.createContractImpl`
+            // → `deposit.createAccount(addr, "CreatedByContract", Contract)`.
+            // type=Contract is consensus-relevant (TransferActuator rejects
+            // plain TRX transfers to Contract-type accounts).
+            let created_contract = self.pending_created_contracts.get(&address).copied();
+            if created_contract.is_some() {
+                tron_account.r#type = tron_proto::AccountType::Contract as i32;
+                if tron_account.account_name.is_empty() {
+                    tron_account.account_name = b"CreatedByContract".to_vec();
+                }
+            }
+
             // Balance round-trip: revm balance is U256 in sun. We saturate
             // at i64::MAX which is ~9.2 × 10^18 sun ≈ 9.2 × 10^12 TRX,
             // far above any plausible single-account holding.
@@ -440,6 +496,43 @@ impl DatabaseCommit for TronDatabase {
             self.accounts
                 .put(&tron_addr, &tron_account)
                 .expect("db error in DatabaseCommit::commit writing account");
+
+            // TRON fork: write the `SmartContract` row for a surviving nested
+            // deploy. java-tron `createContractImpl` builds
+            // `SmartContract{ contractAddress, consumeUserResourcePercent=100,
+            // originAddress=creator, trxHash=rootTxId iff CREATE2, version=1 }`
+            // (no ABI/name/bytecode/originEnergyLimit — those stay default; the
+            // ABI lives in `AbiStore`, which a nested deploy never populates).
+            // `code_hash` is left empty, matching java's lazy fill on first
+            // EXTCODEHASH. Needs the `ContractStore`; read-only setups omit it.
+            if let (Some((creator, is_create2)), Some(contracts)) =
+                (created_contract, &self.contracts)
+            {
+                let creator_tron = evm_to_tron_address(&creator);
+                let smart_contract = tron_proto::SmartContract {
+                    origin_address: creator_tron.as_bytes().to_vec(),
+                    contract_address: tron_addr.as_bytes().to_vec(),
+                    consume_user_resource_percent: 100,
+                    trx_hash: if is_create2 {
+                        self.root_tx_id.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    // version stays 0: java-tron only sets it (to
+                    // `getContractVersion`) when ALLOW_TVM_COMPATIBLE_EVM is
+                    // active, which is currently OFF on mainnet (verified:
+                    // getAllowTvmCompatibleEvm == 0, and live contracts read
+                    // back version 0). version 0 also selects the v2 (raw-slot)
+                    // storage layout in `compose_storage_key`, which is correct
+                    // for every post-ALLOW_TVM_VOTE contract — writing 1 here
+                    // would wrongly switch the contract to the v1 pre-hashed
+                    // slot layout and corrupt all its storage access.
+                    ..Default::default()
+                };
+                contracts
+                    .put(&tron_addr, &smart_contract)
+                    .expect("db error in DatabaseCommit::commit writing contract row");
+            }
 
             // Apply storage diffs.
             for (slot_key, slot) in &account.storage {

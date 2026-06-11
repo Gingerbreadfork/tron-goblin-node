@@ -463,6 +463,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // Flipped on below when the historical-state archive
                     // ([index] capture_state_deltas) is enabled.
                     capture_state_deltas: false,
+                    // Log-only: the success/failure contractRet tripwire always
+                    // logs a divergence at ERROR, but does not hard-reject the
+                    // block (which would halt sync). Flip to `true` for a strict
+                    // validation re-sync once a clean run confirms no remaining
+                    // divergence (e.g. after re-syncing past the address-fix).
+                    verify_contract_ret: false,
                 };
                 (
                     vm.support_constant,
