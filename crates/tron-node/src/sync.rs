@@ -1028,6 +1028,25 @@ pub struct SyncDriver {
     /// leader applies the bodies in chain order from the pool. `None` ⇒ the
     /// proven single-peer fetch+apply path is used verbatim (safe fallback).
     fetch_pool: Option<Arc<SyncFetchPool>>,
+    /// Master switch for pipelined block apply (`vm.pipelined_apply`):
+    /// while the leader bulk-drains the fetch pool, each block's commit
+    /// I/O (checkpoint-manifest fsync + per-store batches + undo-log
+    /// fsync) runs on a background committer thread, overlapped with the
+    /// next block's execution. Identical writes in identical order —
+    /// only the overlap changes. Requires the undo + checkpoint path;
+    /// the runtime leaves this off for witness nodes (the SR runtime
+    /// applies blocks outside this driver) and snapshot-stack reorg mode.
+    pipelined_apply: bool,
+    /// Lazily-built pipeline (first drain batch on this driver). Reset to
+    /// `None` permanently if a pipelined commit ever fails — subsequent
+    /// applies fall back to the classic synchronous path.
+    pipeline: Option<tron_executor::ApplyPipeline>,
+    /// `true` only inside a `drain_pool` batch — the window in which
+    /// `accept_block` routes execution through the pipeline. Everything
+    /// outside the drain loop (watchdogs, locators, leadership churn,
+    /// the at-tip apply path) sees fully-committed state because the
+    /// batch always ends with a flush.
+    pipeline_open: bool,
 }
 
 impl SyncDriver {
@@ -1081,6 +1100,9 @@ impl SyncDriver {
             fetch_pool: None,
             pending_raw_block: None,
             leadership: None,
+            pipelined_apply: false,
+            pipeline: None,
+            pipeline_open: false,
         }
     }
 
@@ -1110,6 +1132,76 @@ impl SyncDriver {
     pub fn with_fetch_pool(mut self, pool: Arc<SyncFetchPool>) -> Self {
         self.fetch_pool = Some(pool);
         self
+    }
+
+    /// Enable pipelined block apply for this driver's drain batches
+    /// (`vm.pipelined_apply`). Effective only on the undo + checkpoint
+    /// commit path; the snapshot-stack path ignores it. Callers must NOT
+    /// enable this on a node whose SR runtime applies blocks to the same
+    /// state concurrently — the runtime gates on `[witness]` being unset.
+    pub fn with_pipelined_apply(mut self) -> Self {
+        self.pipelined_apply = true;
+        self
+    }
+
+    /// The state view `accept_block` must read through: the pipeline's
+    /// overlay view when pipelining is active (so the executed head /
+    /// block-signer / solidified-gate reads see a block whose commit is
+    /// still in flight), the base stores otherwise. With no block in
+    /// flight the two are identical — the overlay is empty.
+    fn exec_state_view(&self) -> &StateBackends {
+        match &self.pipeline {
+            Some(p) => p.view(),
+            None => &self.state,
+        }
+    }
+
+    /// Open the pipelining window for a drain batch. Builds the
+    /// [`tron_executor::ApplyPipeline`] on first use; standby drivers
+    /// that never lead never pay for it. No-op unless `pipelined_apply`
+    /// is set and this driver runs the undo + checkpoint path.
+    fn open_pipeline(&mut self) {
+        if !self.pipelined_apply || self.snapshot_stack.is_some() {
+            return;
+        }
+        if self.pipeline.is_none() {
+            if let (Some(undo), Some(cp)) = (self.undo_store.clone(), self.checkpoint.clone()) {
+                self.pipeline =
+                    Some(tron_executor::ApplyPipeline::new(&self.state, undo, cp));
+            }
+        }
+        if self.pipeline.is_some() {
+            self.pipeline_open = true;
+        }
+    }
+
+    /// Close the pipelining window: join any in-flight commit so that
+    /// everything outside the drain batch (watchdogs, locators, RPC,
+    /// leadership transfer, the at-tip apply path) observes fully
+    /// committed base state.
+    fn close_pipeline(&mut self) {
+        self.pipeline_open = false;
+        self.flush_pipeline();
+    }
+
+    /// Join any in-flight pipelined commit. On failure the pipeline is
+    /// torn down for good — the block's state writes repair from its
+    /// fsync'd checkpoint manifest on the next startup, and the head /
+    /// fork-tree divergence self-recovers exactly like a classic-path
+    /// commit error (unlinked churn until the stall watchdog resets).
+    fn flush_pipeline(&mut self) {
+        let Some(p) = self.pipeline.as_mut() else {
+            return;
+        };
+        if let Err(e) = p.flush() {
+            error!(
+                error = %e,
+                "pipelined block commit failed; disabling pipelined apply on this driver \
+                 (state repairs from the retained checkpoint manifest on restart)"
+            );
+            self.pipeline = None;
+            self.pipeline_open = false;
+        }
     }
 
     /// Whether this driver may act as the active syncer right now —
@@ -1268,6 +1360,13 @@ impl SyncDriver {
         prev_id: &mut Option<BlockId>,
         last_block_ts: &mut i64,
     ) -> usize {
+        // Open the pipelining window for this batch: blocks applied below
+        // overlap their commit + undo I/O with the next block's execution
+        // (`vm.pipelined_apply`). The window closes with a flush before
+        // returning, so everything outside this loop — watchdogs,
+        // leadership transfer, locator building, the at-tip apply path —
+        // observes fully committed base state.
+        self.open_pipeline();
         let mut applied = 0usize;
         while applied < Self::MAX_DRAIN_PER_CALL {
             let Some(front) = expected.front().copied() else {
@@ -1294,6 +1393,7 @@ impl SyncDriver {
             self.apply_block(&block, raw, block_num, peer, prev_id, last_block_ts);
             applied += 1;
         }
+        self.close_pipeline();
         applied
     }
 
@@ -4138,7 +4238,10 @@ impl SyncDriver {
         // This does NOT check slot scheduling — who's *due* this slot is a
         // separate consensus concern (`tron-consensus`); here we only prove
         // the block was signed by a key authorized for its claimed witness.
-        let expected = match expected_block_signer(block, &self.state) {
+        // Read through the pipeline view: the producer account may have been
+        // touched by the immediately-preceding block, whose commit can still
+        // be in flight mid-drain.
+        let expected = match expected_block_signer(block, self.exec_state_view()) {
             Ok(addr) => addr,
             Err(e) => return AcceptOutcome::RejectedValidation(format!("witness sig: {e}")),
         };
@@ -4320,8 +4423,10 @@ impl SyncDriver {
         // NOT the caller-supplied `prev_id` — the dispatcher loop may
         // pass a per-stream parent that doesn't reflect the canonical
         // tip. The DPS hash is authoritative for "what we've actually
-        // executed against."
-        let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
+        // executed against." Read through the pipeline view: mid-drain
+        // the head pointer of the previous block may still be in the
+        // pipeline overlay rather than the base store.
+        let dp = DynamicPropertiesStore::new(self.exec_state_view().dyn_props.clone());
         let executed_head = dp
             .latest_block_header_hash()
             .ok()
@@ -4337,6 +4442,10 @@ impl SyncDriver {
             (Some(_), None) => false,
         };
         if needs_reorg {
+            // Both reorg paths read the executed head from the BASE
+            // stores and mutate them directly (rollback + re-apply), so
+            // nothing may be left pending in the apply pipeline.
+            self.flush_pipeline();
             // Snapshot-stack path takes priority: when wired, the
             // tentative-write layers from the divergent old chain
             // get revoked one-by-one and the new fork applies under
@@ -4408,8 +4517,25 @@ impl SyncDriver {
         // on next startup if we crash mid-flush).
         // Expected parent is the authoritative executed head, not the
         // stream-hint `prev_id` (see the clean-extension note above).
-        let exec_result = match (&self.undo_store, &self.checkpoint) {
-            (Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
+        //
+        // Mid-drain with `vm.pipelined_apply`, the undo+checkpoint route
+        // goes through the pipeline instead: same execution, same writes
+        // in the same order, but the commit + undo-log I/O runs on a
+        // background committer thread, overlapped with the NEXT block's
+        // execution. `Ok` then means "executed and visible through the
+        // pipeline view"; durability is joined by the next apply or by
+        // the drain-batch flush. A commit failure surfaces there with
+        // the same blast radius as a classic-path commit error.
+        let exec_config = self.exec_config;
+        let pipeline = self
+            .pipeline_open
+            .then_some(())
+            .and(self.pipeline.as_mut());
+        let exec_result = match (pipeline, &self.undo_store, &self.checkpoint) {
+            (Some(pipeline), Some(_), Some(_)) => {
+                pipeline.apply(block, executed_head, &exec_config)
+            }
+            (_, Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                 &self.state,
                 block,
                 executed_head,
@@ -4417,14 +4543,14 @@ impl SyncDriver {
                 cp,
                 &self.exec_config,
             ),
-            (Some(undo), None) => tron_executor::execute_block_with_undo_and_config(
+            (_, Some(undo), None) => tron_executor::execute_block_with_undo_and_config(
                 &self.state,
                 block,
                 executed_head,
                 undo,
                 &self.exec_config,
             ),
-            (None, _) => tron_executor::execute_block_with_config(
+            (_, None, _) => tron_executor::execute_block_with_config(
                 &self.state,
                 block,
                 executed_head,
@@ -4865,8 +4991,13 @@ impl SyncDriver {
     fn advance_solid_from_window(&self) {
         // Active-witness count drives the ⌈2/3⌉ threshold; read it from the
         // witness schedule (27 on mainnet). No schedule store / empty list
-        // → can't size the threshold, so leave solidity untouched.
-        let Some(ws) = &self.state.witness_schedule else {
+        // → can't size the threshold, so leave solidity untouched. Read via
+        // the pipeline view so a maintenance block's schedule rotation is
+        // visible even while its commit is in flight. The dyn_props
+        // read+WRITE below stays on the base store — the pipeline overlay
+        // is read-only, and the solidified key is owned by this sync
+        // thread (the executor never writes it), so base is exact.
+        let Some(ws) = &self.exec_state_view().witness_schedule else {
             return;
         };
         let active_count = match WitnessScheduleStore::new(ws.clone()).load_active() {
@@ -5039,7 +5170,12 @@ impl SyncDriver {
             return None;
         }
 
-        let dp = DynamicPropertiesStore::new(self.state.dyn_props.clone());
+        // Read through the pipeline view — mid-drain the executed head may
+        // still be in the pipeline overlay, and missing it here would send
+        // every block down the expensive ancestor-walk path. (The solidified
+        // pointer itself is written only by this sync thread, never by the
+        // executor, so it's identical through either view.)
+        let dp = DynamicPropertiesStore::new(self.exec_state_view().dyn_props.clone());
         let solid_num = dp.latest_solidified_block_num().unwrap_or(0);
         if solid_num < 1 {
             return None;
@@ -7659,5 +7795,198 @@ mod leadership_tests {
         // The stalled leader still nominally holds it until an *eligible*
         // peer takes over.
         assert!(l.claim_or_check("good", STALE, false), "incumbent retains regardless of eligibility");
+    }
+}
+
+#[cfg(test)]
+mod pipelined_apply_tests {
+    //! Driver-level wiring of `vm.pipelined_apply`: with the pipeline
+    //! window open, `accept_block` must (a) read the executed head and
+    //! block-signer state through the pipeline VIEW — otherwise a chain
+    //! extension whose parent commit is still in flight would be
+    //! misclassified as a fork — and (b) end the batch with base state
+    //! byte-identical to the classic synchronous path.
+
+    use super::*;
+    use hex_literal::hex;
+    use tron_chainbase::MemBackend;
+    use tron_proto::BlockHeader;
+    use tron_types::sign_block;
+
+    const ALICE: [u8; 21] = hex!("412e988a386a799f506693793c6a5af6b54dfaabfb");
+    const ALICE_PRIV: [u8; 32] =
+        hex!("1234567890123456789012345678901234567890123456789012345678901234");
+
+    fn mem() -> Arc<dyn KvBackend> {
+        Arc::new(MemBackend::new())
+    }
+
+    fn mem_state() -> StateBackends {
+        StateBackends {
+            accounts: mem(),
+            witnesses: mem(),
+            votes: mem(),
+            delegation: mem(),
+            delegated_resources: mem(),
+            delegated_resource_account_index: None,
+            dyn_props: mem(),
+            proposals: mem(),
+            name_index: mem(),
+            id_index: mem(),
+            asset_v1: mem(),
+            asset_v2: mem(),
+            contracts: mem(),
+            abi: mem(),
+            exchange_v1: mem(),
+            exchange_v2: mem(),
+            market_orders: mem(),
+            nullifiers: mem(),
+            merkle_trees: None,
+            code: Some(mem()),
+            storage_row: Some(mem()),
+            contract_state: Some(mem()),
+            block_index: Some(mem()),
+            witness_schedule: Some(mem()),
+        }
+    }
+
+    fn driver_with(state: StateBackends, blocks_be: Arc<dyn KvBackend>) -> SyncDriver {
+        let cfg = SyncConfig {
+            peers: vec![],
+            max_blocks: None,
+            tail_interval: Duration::from_millis(1),
+            initial_backoff: Duration::from_millis(1),
+            blocks_backend: blocks_be,
+            progress_log_interval: 0,
+            advertise_port: 18_888,
+            tip_test: false,
+            p2p_rate_limits: Default::default(),
+            fetch_block_timeout: Duration::from_millis(200),
+            peer_is_fast_forward: false,
+        };
+        SyncDriver::new(state, cfg)
+    }
+
+    fn signed_block(num: i64, parent_hash: [u8; 32]) -> Block {
+        let mut block = Block {
+            transactions: Vec::new(),
+            block_header: Some(BlockHeader {
+                raw_data: Some(tron_proto::block_header::Raw {
+                    timestamp: 1_700_000_000_000 + num * 3000,
+                    tx_trie_root: tron_types::calc_tx_trie_root(&[])
+                        .map(|h| h.to_vec())
+                        .unwrap_or_default(),
+                    parent_hash: parent_hash.to_vec(),
+                    number: num,
+                    witness_id: 0,
+                    witness_address: ALICE.to_vec(),
+                    version: 28,
+                    account_state_root: Vec::new(),
+                }),
+                witness_signature: Vec::new(),
+            }),
+        };
+        sign_block(&mut block, &ALICE_PRIV).expect("sign");
+        block
+    }
+
+    fn tmp_checkpoint_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tron-sync-pipeline-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Accept `n` chained signed blocks; returns the final head id.
+    fn accept_chain(driver: &mut SyncDriver, n: i64) -> BlockId {
+        let mut parent = [0u8; 32];
+        let mut last = None;
+        for num in 1..=n {
+            let block = signed_block(num, parent);
+            let outcome = driver.accept_block(&block, last);
+            let AcceptOutcome::Accepted(id) = outcome else {
+                panic!("block {num} not accepted: {outcome:?}");
+            };
+            parent = *id.as_bytes();
+            last = Some(id);
+        }
+        last.unwrap()
+    }
+
+    /// With the pipeline open, a chain extension must be accepted even
+    /// though the parent block's commit may still be in flight — the
+    /// executed-head read goes through the pipeline view. The batch
+    /// flush then leaves base state identical to the classic path.
+    #[test]
+    fn pipelined_accept_extends_chain_and_matches_classic_state() {
+        // Classic reference driver (undo + checkpoint, no pipeline).
+        let state_ref = mem_state();
+        let root_ref = tmp_checkpoint_root("classic");
+        let mut classic = driver_with(state_ref.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_checkpoint(tron_chainbase::CheckPointV2::new(&root_ref));
+        accept_chain(&mut classic, 4);
+
+        // Pipelined driver, window held open across the whole chain.
+        let state_pip = mem_state();
+        let root_pip = tmp_checkpoint_root("pipelined");
+        let mut pipelined = driver_with(state_pip.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_checkpoint(tron_chainbase::CheckPointV2::new(&root_pip))
+            .with_pipelined_apply();
+        pipelined.open_pipeline();
+        assert!(pipelined.pipeline_open, "pipeline must open on the undo+checkpoint path");
+        let head = accept_chain(&mut pipelined, 4);
+
+        // Mid-batch: the VIEW must already be at the head…
+        let dp_view = DynamicPropertiesStore::new(pipelined.exec_state_view().dyn_props.clone());
+        assert_eq!(dp_view.latest_block_header_number().unwrap(), 4);
+
+        // …and after the batch flush, base agrees byte-for-byte.
+        pipelined.close_pipeline();
+        assert!(pipelined.pipeline.is_some(), "flush must not tear the pipeline down on success");
+        let dp_base = DynamicPropertiesStore::new(state_pip.dyn_props.clone());
+        assert_eq!(dp_base.latest_block_header_number().unwrap(), 4);
+        assert_eq!(
+            dp_base.latest_block_header_hash().unwrap().map(BlockId::from_raw),
+            Some(head)
+        );
+        assert_eq!(
+            state_ref.dyn_props.scan_all().unwrap(),
+            state_pip.dyn_props.scan_all().unwrap(),
+            "pipelined dyn_props must match the classic path"
+        );
+        assert_eq!(
+            state_ref.accounts.scan_all().unwrap(),
+            state_pip.accounts.scan_all().unwrap(),
+            "pipelined accounts must match the classic path"
+        );
+        assert_eq!(
+            state_ref.witnesses.scan_all().unwrap(),
+            state_pip.witnesses.scan_all().unwrap(),
+            "pipelined witnesses must match the classic path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_ref);
+        let _ = std::fs::remove_dir_all(&root_pip);
+    }
+
+    /// Without `with_pipelined_apply`, opening the window is a no-op and
+    /// the classic synchronous path runs (guards against accidental
+    /// always-on pipelining for drivers that never opted in).
+    #[test]
+    fn pipeline_does_not_open_unless_enabled() {
+        let state = mem_state();
+        let root = tmp_checkpoint_root("disabled");
+        let mut driver = driver_with(state, mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_checkpoint(tron_chainbase::CheckPointV2::new(&root));
+        driver.open_pipeline();
+        assert!(!driver.pipeline_open);
+        assert!(driver.pipeline.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

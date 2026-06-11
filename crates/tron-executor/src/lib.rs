@@ -34,7 +34,10 @@ pub mod adaptive;
 pub mod bandwidth;
 pub mod energy;
 pub mod parallel;
+pub mod pipeline;
 pub mod resource;
+
+pub use pipeline::ApplyPipeline;
 
 use std::sync::Arc;
 
@@ -1475,23 +1478,12 @@ impl BlockSession {
     /// Commit every store's overlay to its base backend under one
     /// cross-store atomicity boundary: the [`CheckPointV2`] manifest.
     ///
-    /// Mirrors java-tron's `SnapshotManager.flush`:
-    ///   1. Drain each session into per-store `(ops, undo_pairs)`.
-    ///   2. Build a flat manifest of every `(db_name, key, value)`.
-    ///   3. Atomically write the manifest (tmp + rename + fsync).
-    ///   4. Apply each per-store `write_batch` against the base
-    ///      backend (skipping the session overlay — we already
-    ///      drained it).
-    ///   5. Delete the checkpoint.
-    ///
-    /// If the process crashes between (3) and (4) — or between (4)
-    /// and (5) — the next startup runs [`replay_checkpoints`] which
-    /// re-applies the manifest entries and deletes the checkpoint.
-    /// (3)→(4) is the critical window: the manifest gives us a
-    /// durable, atomic record of *all* the writes the block intended,
-    /// so re-applying it restores the cross-store invariant. The
-    /// (4)→(5) replay is harmless — re-applying writes that already
-    /// landed produces the same state.
+    /// Composition of [`drain_block_session`] (capture pre-images +
+    /// build the undo record) and [`commit_drained`] (manifest +
+    /// per-store flush + durability barriers) — the same two halves
+    /// the pipelined applier runs on separate threads. Keeping one
+    /// implementation for both paths means a future correctness change
+    /// can't land on only one of them.
     fn commit_with_checkpoint_and_undo(
         self,
         checkpoint: &tron_chainbase::CheckPointV2,
@@ -1502,166 +1494,227 @@ impl BlockSession {
         (tron_chainbase::BlockUndoRecord, Option<Vec<CapturedDelta>>),
         tron_chainbase::CheckpointError,
     > {
-        use tron_chainbase::{CheckpointEntry, KvBackend, UndoStoreId as Id, WriteOp};
+        let drained = drain_block_session(self, state, capture_deltas)
+            .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+        commit_drained(&drained.stores, checkpoint, state, defer_store_fsync)?;
+        Ok((drained.record, drained.deltas))
+    }
+}
 
-        // (1) Drain every per-store session, capturing pre-images for
-        //     undo. Pair each batch with the BASE backend we'll write
-        //     it to in step (4). Order matters only for replay
-        //     determinism; we use the variant order of StoreId.
-        let mut drained: Vec<(Id, Arc<dyn KvBackend>, Vec<WriteOp>, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
-        let mut take = |id: Id,
-                        session: Arc<tron_chainbase::SessionBackend>,
-                        base: Arc<dyn KvBackend>|
-         -> Result<(), tron_chainbase::CheckpointError> {
-            let (ops, undo) = session
-                .drain_pending_with_undo()
-                .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
-            if !ops.is_empty() {
-                drained.push((id, base, ops, undo));
-            }
-            Ok(())
-        };
-        take(Id::Accounts, self.accounts, state.accounts.clone())?;
-        take(Id::Witnesses, self.witnesses, state.witnesses.clone())?;
-        take(Id::Votes, self.votes, state.votes.clone())?;
-        take(Id::Delegation, self.delegation, state.delegation.clone())?;
-        take(Id::DelegatedResources, self.delegated_resources, state.delegated_resources.clone())?;
-        take(Id::DynProps, self.dyn_props, state.dyn_props.clone())?;
-        take(Id::Proposals, self.proposals, state.proposals.clone())?;
-        take(Id::NameIndex, self.name_index, state.name_index.clone())?;
-        take(Id::IdIndex, self.id_index, state.id_index.clone())?;
-        take(Id::AssetV1, self.asset_v1, state.asset_v1.clone())?;
-        take(Id::AssetV2, self.asset_v2, state.asset_v2.clone())?;
-        take(Id::Contracts, self.contracts, state.contracts.clone())?;
-        take(Id::Abi, self.abi, state.abi.clone())?;
-        take(Id::ExchangeV1, self.exchange_v1, state.exchange_v1.clone())?;
-        take(Id::ExchangeV2, self.exchange_v2, state.exchange_v2.clone())?;
-        take(Id::MarketOrders, self.market_orders, state.market_orders.clone())?;
-        take(Id::Nullifiers, self.nullifiers, state.nullifiers.clone())?;
-        if let (Some(s), Some(b)) = (
-            self.delegated_resource_account_index,
-            state.delegated_resource_account_index.clone(),
-        ) {
-            take(Id::DelegatedResourceAccountIndex, s, b)?;
-        }
-        if let (Some(s), Some(b)) = (self.merkle_trees, state.merkle_trees.clone()) {
-            take(Id::MerkleTrees, s, b)?;
-        }
-        if let (Some(s), Some(b)) = (self.code, state.code.clone()) {
-            take(Id::Code, s, b)?;
-        }
-        if let (Some(s), Some(b)) = (self.storage_row, state.storage_row.clone()) {
-            take(Id::StorageRow, s, b)?;
-        }
-        if let (Some(s), Some(b)) = (self.contract_state, state.contract_state.clone()) {
-            take(Id::ContractState, s, b)?;
-        }
-        if let (Some(s), Some(b)) = (self.block_index, state.block_index.clone()) {
-            take(Id::BlockIndex, s, b)?;
-        }
-        if let (Some(s), Some(b)) = (self.witness_schedule, state.witness_schedule.clone()) {
-            take(Id::WitnessSchedule, s, b)?;
-        }
+/// One block's fully-drained write-set, ready to commit: per-store
+/// batches paired with the base backend they flush to, plus the undo
+/// record (pre-images) and optional captured deltas built from the
+/// same drain pass.
+pub(crate) struct DrainedBlock {
+    /// `(store, base_backend, ops)` for every store the block wrote,
+    /// in `StoreId` variant order (replay determinism). Stores with
+    /// no writes are omitted.
+    pub(crate) stores: Vec<(
+        tron_chainbase::UndoStoreId,
+        Arc<dyn tron_chainbase::KvBackend>,
+        Vec<tron_chainbase::WriteOp>,
+    )>,
+    pub(crate) record: tron_chainbase::BlockUndoRecord,
+    pub(crate) deltas: Option<Vec<CapturedDelta>>,
+}
 
-        // (2) Build the manifest. Empty block? Skip the manifest
-        //     write entirely — there's nothing to make atomic and no
-        //     point creating a checkpoint dir we'll immediately delete.
-        let mut record = tron_chainbase::BlockUndoRecord::new();
-        if drained.is_empty() {
-            return Ok((record, capture_deltas.then(Vec::new)));
+/// Drain every per-store session of `session`, capturing pre-images
+/// for undo. The pre-image reads go through each session's PARENT
+/// (whatever the session was wrapped over — base stores on the
+/// classic path, the pending overlay on the pipelined path), so they
+/// capture the true pre-block state in both. `targets` supplies the
+/// BASE backend each batch will later flush to via [`commit_drained`].
+pub(crate) fn drain_block_session(
+    session: BlockSession,
+    targets: &StateBackends,
+    capture_deltas: bool,
+) -> Result<DrainedBlock, tron_chainbase::KvError> {
+    use tron_chainbase::{KvBackend, UndoStoreId as Id, WriteOp};
+
+    let mut record = tron_chainbase::BlockUndoRecord::new();
+    let mut deltas: Option<Vec<CapturedDelta>> = capture_deltas.then(Vec::new);
+    let mut stores: Vec<(Id, Arc<dyn KvBackend>, Vec<WriteOp>)> = Vec::new();
+    let mut take = |id: Id,
+                    session: Arc<tron_chainbase::SessionBackend>,
+                    base: Arc<dyn KvBackend>|
+     -> Result<(), tron_chainbase::KvError> {
+        let (ops, undo) = session.drain_pending_with_undo()?;
+        if ops.is_empty() {
+            return Ok(());
         }
-        let mut entries: Vec<CheckpointEntry> = Vec::new();
-        for (id, _, ops, _) in &drained {
-            let db_name = id.db_name();
-            for op in ops {
-                let (key, value) = match op {
+        // Capture before `undo` is consumed for the record — ops and
+        // undo are parallel (same drain loop, same key order).
+        if let Some(deltas) = deltas.as_mut() {
+            for (op, (_, before)) in ops.iter().zip(undo.iter()) {
+                let (key, after) = match op {
                     WriteOp::Put(k, v) => (k.clone(), Some(v.clone())),
                     WriteOp::Delete(k) => (k.clone(), None),
                 };
-                entries.push(CheckpointEntry {
-                    db_name: db_name.to_string(),
-                    key,
-                    value,
-                });
+                deltas.push(CapturedDelta { store: id, key, before: before.clone(), after });
             }
         }
-
-        // (3) Atomic commit point — the manifest is now durable.
-        //     If we crash anywhere from here on, recovery replays it.
-        let checkpoint_id = checkpoint.write(&entries)?;
-
-        // (4) Per-store flush. Each call goes straight to the base
-        //     backend (not the drained session).
-        //
-        //     Steady state (`defer_store_fsync == false`): use
-        //     `write_batch_sync` — RocksDB native WriteBatch with
-        //     `WriteOptions { sync: true }`. The fsync is required so
-        //     step (5)'s manifest delete is safe: once we return from
-        //     write_batch_sync the per-store WAL is on disk, so losing
-        //     the manifest no longer means losing the writes.
-        //
-        //     Catch-up (`defer_store_fsync == true`): use the non-sync
-        //     `write_batch`. The writes still go to each store's WAL
-        //     (just without the fsync); the manifest written in step (3)
-        //     IS fsync'd, so it remains a complete, durable record of
-        //     this block's cross-store writes. We therefore RETAIN the
-        //     manifest (skip step 5) — on a crash the startup replay
-        //     re-applies it idempotently, so nothing is lost. The
-        //     expensive per-store fsync is amortized by the barrier below.
-        let mut deltas: Option<Vec<CapturedDelta>> = capture_deltas.then(Vec::new);
-        for (id, base, ops, undo) in drained {
-            if defer_store_fsync {
-                base.write_batch(&ops)
-                    .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
-            } else {
-                base.write_batch_sync(&ops)
-                    .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
-            }
-            // Capture before `undo` is consumed for the record — ops
-            // and undo are parallel (same drain loop, same key order).
-            if let Some(deltas) = deltas.as_mut() {
-                for (op, (_, before)) in ops.into_iter().zip(undo.iter()) {
-                    let (key, after) = match op {
-                        WriteOp::Put(k, v) => (k, Some(v)),
-                        WriteOp::Delete(k) => (k, None),
-                    };
-                    deltas.push(CapturedDelta { store: id, key, before: before.clone(), after });
-                }
-            }
-            for (key, before) in undo {
-                record.push(tron_chainbase::UndoEntry { store: id, key, before });
-            }
+        for (key, before) in undo {
+            record.push(tron_chainbase::UndoEntry { store: id, key, before });
         }
-
-        if defer_store_fsync {
-            // (5-defer) Retain THIS block's manifest (writes aren't fsync'd
-            //     yet). Every DEFER_FSYNC_BARRIER_BLOCKS accumulated
-            //     manifests, run the durability barrier: fsync every base
-            //     store's WAL FIRST, THEN drop all retained manifests.
-            //     Order is critical — fsync before delete — so a crash
-            //     mid-barrier (stores durable, manifests still present)
-            //     only causes a harmless idempotent replay, never loss.
-            if checkpoint.list()?.len() >= DEFER_FSYNC_BARRIER_BLOCKS {
-                flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
-            }
-        } else {
-            // (5) Steady state: this block's writes are durable.
-            checkpoint.delete(checkpoint_id)?;
-            // If we just transitioned out of catch-up, deferred manifests
-            // from earlier blocks may still be retained. This block's
-            // per-store write_batch_sync only fsync'd the stores IT wrote,
-            // so explicitly barrier (fsync ALL stores, then clear) to make
-            // those earlier deferred writes durable before dropping their
-            // manifests.
-            if !checkpoint.list()?.is_empty() {
-                flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
-            }
-        }
-        if let Some(d) = deltas.as_mut() {
-            d.sort_by(|a, b| (a.store as u8, &a.key).cmp(&(b.store as u8, &b.key)));
-        }
-        Ok((record, deltas))
+        stores.push((id, base, ops));
+        Ok(())
+    };
+    take(Id::Accounts, session.accounts, targets.accounts.clone())?;
+    take(Id::Witnesses, session.witnesses, targets.witnesses.clone())?;
+    take(Id::Votes, session.votes, targets.votes.clone())?;
+    take(Id::Delegation, session.delegation, targets.delegation.clone())?;
+    take(Id::DelegatedResources, session.delegated_resources, targets.delegated_resources.clone())?;
+    take(Id::DynProps, session.dyn_props, targets.dyn_props.clone())?;
+    take(Id::Proposals, session.proposals, targets.proposals.clone())?;
+    take(Id::NameIndex, session.name_index, targets.name_index.clone())?;
+    take(Id::IdIndex, session.id_index, targets.id_index.clone())?;
+    take(Id::AssetV1, session.asset_v1, targets.asset_v1.clone())?;
+    take(Id::AssetV2, session.asset_v2, targets.asset_v2.clone())?;
+    take(Id::Contracts, session.contracts, targets.contracts.clone())?;
+    take(Id::Abi, session.abi, targets.abi.clone())?;
+    take(Id::ExchangeV1, session.exchange_v1, targets.exchange_v1.clone())?;
+    take(Id::ExchangeV2, session.exchange_v2, targets.exchange_v2.clone())?;
+    take(Id::MarketOrders, session.market_orders, targets.market_orders.clone())?;
+    take(Id::Nullifiers, session.nullifiers, targets.nullifiers.clone())?;
+    if let (Some(s), Some(b)) = (
+        session.delegated_resource_account_index,
+        targets.delegated_resource_account_index.clone(),
+    ) {
+        take(Id::DelegatedResourceAccountIndex, s, b)?;
     }
+    if let (Some(s), Some(b)) = (session.merkle_trees, targets.merkle_trees.clone()) {
+        take(Id::MerkleTrees, s, b)?;
+    }
+    if let (Some(s), Some(b)) = (session.code, targets.code.clone()) {
+        take(Id::Code, s, b)?;
+    }
+    if let (Some(s), Some(b)) = (session.storage_row, targets.storage_row.clone()) {
+        take(Id::StorageRow, s, b)?;
+    }
+    if let (Some(s), Some(b)) = (session.contract_state, targets.contract_state.clone()) {
+        take(Id::ContractState, s, b)?;
+    }
+    if let (Some(s), Some(b)) = (session.block_index, targets.block_index.clone()) {
+        take(Id::BlockIndex, s, b)?;
+    }
+    if let (Some(s), Some(b)) = (session.witness_schedule, targets.witness_schedule.clone()) {
+        take(Id::WitnessSchedule, s, b)?;
+    }
+    if let Some(d) = deltas.as_mut() {
+        d.sort_by(|a, b| (a.store as u8, &a.key).cmp(&(b.store as u8, &b.key)));
+    }
+    Ok(DrainedBlock { stores, record, deltas })
+}
+
+/// Flush a drained block's per-store batches under one cross-store
+/// atomicity boundary: the [`CheckPointV2`] manifest.
+///
+/// Mirrors java-tron's `SnapshotManager.flush`:
+///   2. Build a flat manifest of every `(db_name, key, value)`.
+///   3. Atomically write the manifest (tmp + rename + fsync).
+///   4. Apply each per-store `write_batch` against the base
+///      backend (skipping the session overlay — already drained).
+///   5. Delete the checkpoint.
+///
+/// If the process crashes between (3) and (4) — or between (4)
+/// and (5) — the next startup runs `replay_checkpoints` which
+/// re-applies the manifest entries and deletes the checkpoint.
+/// (3)→(4) is the critical window: the manifest gives us a
+/// durable, atomic record of *all* the writes the block intended,
+/// so re-applying it restores the cross-store invariant. The
+/// (4)→(5) replay is harmless — re-applying writes that already
+/// landed produces the same state.
+pub(crate) fn commit_drained(
+    stores: &[(
+        tron_chainbase::UndoStoreId,
+        Arc<dyn tron_chainbase::KvBackend>,
+        Vec<tron_chainbase::WriteOp>,
+    )],
+    checkpoint: &tron_chainbase::CheckPointV2,
+    state: &StateBackends,
+    defer_store_fsync: bool,
+) -> Result<(), tron_chainbase::CheckpointError> {
+    use tron_chainbase::{CheckpointEntry, WriteOp};
+
+    // (2) Build the manifest. Empty block? Skip the manifest
+    //     write entirely — there's nothing to make atomic and no
+    //     point creating a checkpoint dir we'll immediately delete.
+    if stores.is_empty() {
+        return Ok(());
+    }
+    let mut entries: Vec<CheckpointEntry> = Vec::new();
+    for (id, _, ops) in stores {
+        let db_name = id.db_name();
+        for op in ops {
+            let (key, value) = match op {
+                WriteOp::Put(k, v) => (k.clone(), Some(v.clone())),
+                WriteOp::Delete(k) => (k.clone(), None),
+            };
+            entries.push(CheckpointEntry {
+                db_name: db_name.to_string(),
+                key,
+                value,
+            });
+        }
+    }
+
+    // (3) Atomic commit point — the manifest is now durable.
+    //     If we crash anywhere from here on, recovery replays it.
+    let checkpoint_id = checkpoint.write(&entries)?;
+
+    // (4) Per-store flush. Each call goes straight to the base
+    //     backend (not the drained session).
+    //
+    //     Steady state (`defer_store_fsync == false`): use
+    //     `write_batch_sync` — RocksDB native WriteBatch with
+    //     `WriteOptions { sync: true }`. The fsync is required so
+    //     step (5)'s manifest delete is safe: once we return from
+    //     write_batch_sync the per-store WAL is on disk, so losing
+    //     the manifest no longer means losing the writes.
+    //
+    //     Catch-up (`defer_store_fsync == true`): use the non-sync
+    //     `write_batch`. The writes still go to each store's WAL
+    //     (just without the fsync); the manifest written in step (3)
+    //     IS fsync'd, so it remains a complete, durable record of
+    //     this block's cross-store writes. We therefore RETAIN the
+    //     manifest (skip step 5) — on a crash the startup replay
+    //     re-applies it idempotently, so nothing is lost. The
+    //     expensive per-store fsync is amortized by the barrier below.
+    for (_, base, ops) in stores {
+        if defer_store_fsync {
+            base.write_batch(ops)
+                .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+        } else {
+            base.write_batch_sync(ops)
+                .map_err(|e| tron_chainbase::CheckpointError::Decode(e.to_string()))?;
+        }
+    }
+
+    if defer_store_fsync {
+        // (5-defer) Retain THIS block's manifest (writes aren't fsync'd
+        //     yet). Every DEFER_FSYNC_BARRIER_BLOCKS accumulated
+        //     manifests, run the durability barrier: fsync every base
+        //     store's WAL FIRST, THEN drop all retained manifests.
+        //     Order is critical — fsync before delete — so a crash
+        //     mid-barrier (stores durable, manifests still present)
+        //     only causes a harmless idempotent replay, never loss.
+        if checkpoint.list()?.len() >= DEFER_FSYNC_BARRIER_BLOCKS {
+            flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
+        }
+    } else {
+        // (5) Steady state: this block's writes are durable.
+        checkpoint.delete(checkpoint_id)?;
+        // If we just transitioned out of catch-up, deferred manifests
+        // from earlier blocks may still be retained. This block's
+        // per-store write_batch_sync only fsync'd the stores IT wrote,
+        // so explicitly barrier (fsync ALL stores, then clear) to make
+        // those earlier deferred writes durable before dropping their
+        // manifests.
+        if !checkpoint.list()?.is_empty() {
+            flush_state_wals_and_clear_checkpoints(state, checkpoint)?;
+        }
+    }
+    Ok(())
 }
 
 /// Durability barrier for the deferred-fsync catch-up path: fsync every

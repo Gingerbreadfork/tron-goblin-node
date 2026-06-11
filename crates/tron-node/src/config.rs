@@ -759,6 +759,24 @@ pub struct VmConfig {
     /// per-block convergence: `rounds`/`reexecs`/`converged`).
     #[serde(default, alias = "parallelExec")]
     pub parallel_exec: bool,
+    /// Overlap each applied block's commit I/O (cross-store checkpoint
+    /// manifest fsync + per-store write batches + undo-log fsync) with the
+    /// next block's execution while bulk-draining the sync fetch pool.
+    /// Byte-identical writes in the same order — only the overlap changes;
+    /// the pipeline is flushed at the end of every drain batch and before
+    /// any reorg, so everything outside the drain loop observes fully
+    /// committed state. Auto-disabled when the node produces blocks
+    /// (`[witness]`) or runs the snapshot-stack reorg path
+    /// (`storage.snapshot_reorg`).
+    ///
+    /// **Default `true`.** Set `false` to A/B against the strictly serial
+    /// apply path.
+    #[serde(default = "default_vm_pipelined_apply", alias = "pipelinedApply")]
+    pub pipelined_apply: bool,
+}
+
+fn default_vm_pipelined_apply() -> bool {
+    true
 }
 
 impl Default for VmConfig {
@@ -778,6 +796,7 @@ impl Default for VmConfig {
             save_cancel_all_unfreeze_v2_details: false,
             constant_call_timeout_ms: 0,
             parallel_exec: false,
+            pipelined_apply: default_vm_pipelined_apply(),
         }
     }
 }

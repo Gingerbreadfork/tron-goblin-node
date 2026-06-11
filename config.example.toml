@@ -229,6 +229,12 @@ estimate_energy = false
 # Compiled-bytecode LRU cache size.
 lru_cache_size = 500
 
+# Overlap each applied block's commit + undo-log fsync with the next block's
+# execution during bulk sync (identical writes in identical order — only the
+# overlap changes; flushed at every batch end and before any reorg).
+# Auto-disabled in witness mode. Set false to A/B the strictly serial apply.
+pipelined_apply = true                    # [wired]
+
 
 # -----------------------------------------------------------------------------
 # [index] — built-in address-history indexer + TronGrid-style /v1 API

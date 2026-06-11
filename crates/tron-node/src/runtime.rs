@@ -1343,6 +1343,17 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             pool_size = rotation_pool.len(),
             "peer drivers: configured peers pinned, rest rotate the full discovered pool"
         );
+        // Pipelined block apply (`vm.pipelined_apply`, default on): the
+        // leader's drain batches overlap each block's commit + undo-log
+        // I/O with the next block's execution. Gated off when this node
+        // produces blocks — the SR runtime applies its own blocks to the
+        // shared state outside the sync driver, and the pipeline's
+        // visibility overlay must be the only in-flight writer. The
+        // snapshot-stack reorg path ignores the flag internally.
+        let pipelined_apply_enabled = config.vm.pipelined_apply && config.witness.is_none();
+        if config.vm.pipelined_apply && config.witness.is_some() {
+            info!("vm.pipelined_apply disabled: witness mode applies blocks outside the sync drivers");
+        }
         for (driver_peers, pinned) in driver_specs {
             let peer_is_fast_forward = pinned
                 && driver_peers
@@ -1452,6 +1463,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 }
                 if let Some(snap) = sr_snapshot_for_peer {
                     driver = driver.with_sr_snapshot(snap);
+                }
+                if pipelined_apply_enabled {
+                    driver = driver.with_pipelined_apply();
                 }
                 (driver_label, driver.run(sd).await)
             }));
