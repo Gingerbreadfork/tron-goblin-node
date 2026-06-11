@@ -246,6 +246,22 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             crate::logfmt::utc_millis(ts),
             crate::logfmt::duration_ms((now_ms - ts).max(0)),
         );
+
+        // Cross-store consistency guard: an imported snapshot whose stores
+        // were captured at different heights (a live-node copy without a
+        // quiescent flush) opens fine but SILENTLY diverges from consensus
+        // once we apply blocks on top — the head pointer describes one
+        // height while the account/block stores hold another, baking a
+        // permanent offset into resource weights and fees. Surface it
+        // loudly at startup rather than letting the operator chase ghost
+        // state-diff mismatches.
+        for w in crate::snapshot_import::startup_consistency_warnings(&stores, num) {
+            warn!(
+                "snapshot consistency: {w} — this node will diverge from consensus; \
+                 re-import from a CONSISTENT snapshot (stop the source node before copying, \
+                 or use its snapshot-export tooling)"
+            );
+        }
     }
 
     // Tip-test mode: spoof the local head pointer so SyncBlockChain

@@ -415,6 +415,21 @@ fn print_import_report(
         "  stores:                 {}",
         report.stores.join(", ")
     );
+    if report.consistency_warnings.is_empty() {
+        println!("  consistency:            OK (head pointer matches block stores)");
+    } else {
+        eprintln!();
+        eprintln!("  ⚠️  CROSS-STORE INCONSISTENCY — this snapshot will diverge from consensus:");
+        for w in &report.consistency_warnings {
+            eprintln!("      - {w}");
+        }
+        eprintln!(
+            "  The stores were captured at different heights (typical of copying a LIVE node's\n  \
+             db without stopping it first). Applying blocks on top of this base silently drifts\n  \
+             account balances / resource weights. Re-import from a CONSISTENT snapshot: stop the\n  \
+             source node before copying its db, or use its snapshot-export/checkpoint tooling."
+        );
+    }
 }
 
 /// `tron-node admin <subcommand>` — DB lifecycle commands.

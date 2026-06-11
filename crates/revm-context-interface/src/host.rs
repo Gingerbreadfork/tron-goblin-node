@@ -251,6 +251,8 @@ pub trait Host {
         0
     }
 
+    /// TRON fork: TRC-10 token balance of `address` for `token_id` (the
+    /// `tokenbalance(trcToken)` extension opcode). Default: `0`.
     fn tron_token_balance(&self, _address: Address, _token_id: i64) -> i64 {
         0
     }

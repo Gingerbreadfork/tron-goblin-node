@@ -1711,3 +1711,90 @@ fn halt_after_sstore_drops_storage_write_but_charges_energy() {
         initial_balance
     );
 }
+
+/// The closest offline analogue of the live catch-up condition for a
+/// USDT-shaped contract: a hot contract that BOTH writes storage (the
+/// INC slot chain — like a balance map) AND accumulates dynamic energy
+/// (deferred per-contract fold), hammered by many conflicting callers,
+/// across MULTIPLE blocks through the apply PIPELINE with
+/// `defer_store_fsync` — exactly how the rig replays mainnet during
+/// catch-up (parallel_exec + pipeline + deferred fsync together).
+///
+/// Storage (conflict keys, MVCC) + energy_usage (deferred fold) +
+/// pipeline overlay (cross-block pending reads) + conflict-driven
+/// re-execution all interact here in one fixture. Must be byte-identical
+/// to classic serial, including the ContractState.energy_usage chain.
+#[test]
+fn pipelined_parallel_storage_plus_dynamic_energy_matches_serial() {
+    use tron_chainbase::{BlockUndoStore, CheckPointV2, ContractStateStore, DynamicPropertiesStore, MemBackend};
+    use tron_executor::{execute_block_with_undo_checkpoint_and_config, ApplyPipeline, ExecConfig};
+    use tron_proto::ContractState;
+
+    // INC: slot0 = SLOAD(slot0) + 1; SSTORE; STOP — storage + energy.
+    let inc_code: Vec<u8> = vec![0x60,0x00,0x54,0x60,0x01,0x01,0x60,0x00,0x55,0x00];
+    let c_addr = addr_with_byte(0xe7);
+    const CYCLE: i64 = 100;
+    const BLOCKS: usize = 5;
+    // 8 callers; every block ALL of them hit the SAME contract → max
+    // conflict on slot0 + the shared deferred energy_usage.
+    let callers: Vec<([u8;32],[u8;21])> = (0..8u8).map(|i| caller_keypair(0x60 + i)).collect();
+
+    let setup = |state: &StateBackends| {
+        install_contract(state, c_addr, &inc_code);
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        dp.put_long(b"ALLOW_DYNAMIC_ENERGY", 1);
+        dp.put_long(b"DYNAMIC_ENERGY_THRESHOLD", 1_000_000_000);
+        dp.put_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR", 1_000);
+        dp.put_long(b"DYNAMIC_ENERGY_MAX_FACTOR", 100_000);
+        dp.save_current_cycle_number(CYCLE);
+        let cs = ContractStateStore::new(state.contract_state.as_ref().unwrap().clone());
+        cs.put(&Address::from_raw(c_addr), &ContractState {
+            update_cycle: CYCLE, energy_factor: 3_000, energy_usage: 0,
+        }).unwrap();
+        let accounts = AccountStore::new(state.accounts.clone());
+        for (_, caller) in &callers {
+            accounts.put(&Address::from_raw(*caller), &Account {
+                address: caller.to_vec(), balance: 1_000_000_000_000, ..Default::default()
+            }).unwrap();
+        }
+    };
+    let block_txs = || callers.iter().map(|(pk,c)| trigger_tx(pk, *c, c_addr)).collect::<Vec<_>>();
+    let chain = || {
+        let mut blocks=Vec::new(); let mut parent=[0u8;32];
+        for k in 1..=BLOCKS as i64 {
+            let b = make_block(k, parent, block_txs());
+            parent = *tron_types::block_id_from_block(&b).unwrap().as_bytes();
+            blocks.push(b);
+        }
+        blocks
+    };
+
+    // Classic serial reference.
+    let serial_cfg = ExecConfig::unsigned();
+    let s = build_state(); setup(&s);
+    let undo_s = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_s = std::env::temp_dir().join(format!("tron-se-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let cp_s = CheckPointV2::new(&root_s);
+    for b in chain() {
+        execute_block_with_undo_checkpoint_and_config(&s, &b, None, &undo_s, &cp_s, &serial_cfg).expect("serial");
+    }
+
+    // Parallel + pipeline + defer fsync (the catch-up shape).
+    let par_cfg = ExecConfig { parallel_exec: true, defer_store_fsync: true, ..ExecConfig::unsigned() };
+    let p = build_state(); setup(&p);
+    let undo_p = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_p = std::env::temp_dir().join(format!("tron-pe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let cp_p = CheckPointV2::new(&root_p);
+    let mut pipe = ApplyPipeline::new(&p, undo_p, cp_p);
+    for b in chain() { pipe.apply(&b, None, &par_cfg).expect("pipelined"); }
+    pipe.flush().expect("flush");
+
+    let read_cs = |st: &StateBackends| ContractStateStore::new(st.contract_state.as_ref().unwrap().clone())
+        .get(&Address::from_raw(c_addr)).unwrap().expect("cs");
+    let scs = read_cs(&s); let pcs = read_cs(&p);
+    assert!(scs.energy_usage > 0, "energy not exercised");
+    assert_eq!(scs.energy_usage, pcs.energy_usage, "energy_usage diverged (serial={} parallel={})", scs.energy_usage, pcs.energy_usage);
+    assert_eq!(scs.energy_factor, pcs.energy_factor, "factor diverged");
+    assert_eq!(dump_vm_state(&s), dump_vm_state(&p), "storage+energy pipeline state diverged from serial");
+    let _ = std::fs::remove_dir_all(&root_s); let _ = std::fs::remove_dir_all(&root_p);
+}

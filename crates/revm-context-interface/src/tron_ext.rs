@@ -215,6 +215,10 @@ pub trait TronDatabaseExt {
         Vec::new()
     }
 
+    /// Take (and clear) the single pending EVM-balance delta from the last
+    /// bridge call -- the journaled `(address, signed_amount)` a TRON precompile
+    /// (freeze/unfreeze/withdraw) asks the Host to apply so subsequent `BALANCE`
+    /// reads and the commit observe the post-call view. `(ZERO, 0)` when none.
     fn tron_take_last_balance_delta(&mut self) -> (Address, i64) {
         (Address::ZERO, 0)
     }

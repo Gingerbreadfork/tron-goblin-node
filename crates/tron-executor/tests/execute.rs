@@ -808,6 +808,509 @@ fn signed_transfer_tx(priv_key: &[u8; 32], owner: [u8; 21], to: [u8; 21], amount
 /// serial reads ALICE's freeze (weight > 0) → frozen-quota path → different BOB
 /// account proto + different fee accumulators. Must be byte-identical.
 #[test]
+fn parallel_many_freezes_one_block_weight_matches_serial() {
+    // The live-divergent counter is TOTAL_NET_WEIGHT (+ ENERGY/TRON_POWER).
+    // It is a CONFLICT key under Block-STM (read-for-decisions, not
+    // delta-ized): MANY freeze txs in one block each read the running
+    // weight and write weight+own_delta. If value-based validation fails
+    // to re-execute a later freeze against an earlier freeze's committed
+    // write, a delta is lost → the final weight is base+Σ MINUS the
+    // dropped deltas — exactly "ours TOTAL_NET_WEIGHT below java",
+    // permanently (it's an accumulator). Interleave bandwidth-reading
+    // transfers so the scheduler sees the full read/write web.
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    const FREEZERS: u8 = 8;
+    let freezers: Vec<([u8;32],[u8;21])> = (0..FREEZERS).map(|i| derive_keypair(0xA0 + i)).collect();
+    let (charlie_priv, charlie) = derive_keypair(0xB7);
+    fn rcpt() -> [u8;21] { let mut a=[0u8;21]; a[0]=0x41; a[20]=0xe1; a }
+
+    let setup = |b: &StateBundle| {
+        b.dyn_props.save_unfreeze_delay_days(14);
+        for (_, f) in &freezers { put_account(&b.accounts, *f, 10_000_000_000_000); }
+        put_account(&b.accounts, rcpt(), 1);
+        b.accounts.put(&addr(charlie), &Account {
+            address: charlie.to_vec(), balance: 1_000_000_000, r#type: AccountType::Normal as i32,
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 1_000_000_000 }],
+            ..Default::default()
+        }).unwrap();
+    };
+    // Sign a FreezeBalanceV2 with an arbitrary key (freeze_v2_bw_tx only
+    // signs for ALICE).
+    let signed_freeze = |pk: &[u8;32], owner: [u8;21], amount: i64| -> Transaction {
+        use prost::Message as _;
+        let c = tron_proto::FreezeBalanceV2Contract { owner_address: owner.to_vec(), frozen_balance: amount, resource: 0 };
+        let mut tx = Transaction {
+            raw_data: Some(tron_proto::transaction::Raw {
+                ref_block_bytes: vec![0,1], ref_block_num: 0, ref_block_hash: vec![0u8;8],
+                expiration: 1_700_000_000_000 + 86_400_000, auths: Vec::new(), data: Vec::new(),
+                contract: vec![tron_proto::transaction::Contract {
+                    r#type: ContractType::FreezeBalanceV2Contract as i32,
+                    parameter: Some(prost_types::Any {
+                        type_url: "type.googleapis.com/protocol.FreezeBalanceV2Contract".into(),
+                        value: c.encode_to_vec(),
+                    }),
+                    provider: Vec::new(), contract_name: Vec::new(), permission_id: 0,
+                }],
+                scripts: Vec::new(), timestamp: 1_700_000_000_000, fee_limit: 0,
+            }),
+            signature: Vec::new(), ret: Vec::new(),
+        };
+        tron_types::sign_transaction(&mut tx, pk).expect("sign");
+        tx
+    };
+    // One block: 8 distinct freezers each freeze a DIFFERENT amount (so a
+    // dropped delta is detectable), plus a weight-reading transfer.
+    let txs = || {
+        let mut v: Vec<Transaction> = freezers.iter().enumerate()
+            .map(|(i,(pk,f))| signed_freeze(pk, *f, 1_000_000_000 * (i as i64 + 1)))
+            .collect();
+        v.push(signed_transfer_tx(&charlie_priv, charlie, rcpt(), 1));
+        v
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig { parallel_exec: true, ..ExecConfig::unsigned() };
+    let s = StateBundle::fresh(); setup(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1,[0u8;32],txs()), None, &serial_cfg).expect("serial");
+    let p_ = StateBundle::fresh(); setup(&p_);
+    let rp = execute_block_with_config(&p_.backends(), &build_block(1,[0u8;32],txs()), None, &par_cfg).expect("parallel");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert!(so.iter().all(|o| o=="Success"), "setup wrong: {so:?}");
+    assert_eq!(so, po, "tx outcomes diverged");
+    let wt_s = s.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_NET_WEIGHT).unwrap_or(0);
+    let wt_p = p_.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_NET_WEIGHT).unwrap_or(0);
+    // Σ of frozen/TRX_PRECISION: amounts 1e9..8e9 → weight deltas 1000..8000 = 36000.
+    assert!(wt_s > 0, "weight moved");
+    assert_eq!(wt_s, wt_p, "TOTAL_NET_WEIGHT lost a delta under parallel (serial={wt_s} parallel={wt_p})");
+    assert_eq!(dump_state(&s), dump_state(&p_), "many-freeze block diverged from serial");
+}
+
+/// LIVE-DIVERGENCE REPRO (mainnet rig, energy-rental contracts): several
+/// `UnDelegateResource` txs from the SAME (owner → receiver) in one block, each
+/// draining the full delegation. In SERIAL the first drains the (owner,to)
+/// `DelegatedResource` record (record deleted, `delegated_frozen_v2_balance_for_
+/// energy` → 0, `frozen_v2[ENERGY]` += DELEG) and the rest fail validation
+/// (`NothingToUndelegate`). Under Block-STM each undelegate validates
+/// `available >= balance` against the per-(owner,to) record; if a later
+/// undelegate is NOT re-validated against an earlier one's committed draw-down,
+/// more than one "succeeds" and the owner's `delegated_frozen_v2_balance_for_
+/// energy` is driven NEGATIVE — exactly the −4.58M-TRX `deleg_v2_en` seen on a
+/// real rig contract (`TCw6YaWm…`). Parallel MUST equal serial.
+#[test]
+fn parallel_conflicting_undelegate_matches_serial() {
+    use prost::Message as _;
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    const DELEG: i64 = 9_000_000_000;
+    let (owner_priv, owner) = derive_keypair(0xD1);
+    let (_recv_priv, receiver) = derive_keypair(0xD2);
+
+    let setup = |b: &StateBundle| {
+        b.dyn_props.save_unfreeze_delay_days(14);
+        b.dyn_props.put_long(
+            tron_chainbase::dynamic_properties_keys::ALLOW_DELEGATE_RESOURCE,
+            1,
+        );
+        // Non-zero weights so undelegate's usage-transfer math has a divisor.
+        b.dyn_props.save_total_energy_weight(1_000_000);
+        b.dyn_props.save_total_energy_current_limit(90_000_000_000);
+        // Owner holds the delegated-OUT side (no held frozen_v2 yet).
+        let owner_res = tron_proto::account::AccountResource {
+            delegated_frozen_v2_balance_for_energy: DELEG,
+            ..Default::default()
+        };
+        b.accounts
+            .put(
+                &addr(owner),
+                &Account {
+                    address: owner.to_vec(),
+                    balance: 1_000_000_000,
+                    r#type: AccountType::Normal as i32,
+                    account_resource: Some(owner_res),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Receiver holds the acquired side.
+        let recv_res = tron_proto::account::AccountResource {
+            acquired_delegated_frozen_v2_balance_for_energy: DELEG,
+            ..Default::default()
+        };
+        b.accounts
+            .put(
+                &addr(receiver),
+                &Account {
+                    address: receiver.to_vec(),
+                    balance: 1,
+                    r#type: AccountType::Normal as i32,
+                    account_resource: Some(recv_res),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The single (owner → receiver) unlocked delegation record.
+        let key = DelegatedResourceStore::v2_unlocked_key(&addr(owner), &addr(receiver));
+        b.delegated_resources
+            .put_raw(
+                &key,
+                &tron_proto::DelegatedResource {
+                    from: owner.to_vec(),
+                    to: receiver.to_vec(),
+                    frozen_balance_for_bandwidth: 0,
+                    frozen_balance_for_energy: DELEG,
+                    expire_time_for_bandwidth: 0,
+                    expire_time_for_energy: 0,
+                },
+            )
+            .unwrap();
+    };
+
+    let undelegate = |amount: i64| -> Transaction {
+        let c = tron_proto::UnDelegateResourceContract {
+            owner_address: owner.to_vec(),
+            receiver_address: receiver.to_vec(),
+            resource: 1, // ENERGY
+            balance: amount,
+        };
+        let mut tx = Transaction {
+            raw_data: Some(TxRaw {
+                ref_block_bytes: vec![0, 1],
+                ref_block_num: 0,
+                ref_block_hash: vec![0u8; 8],
+                expiration: 1_700_000_000_000 + 86_400_000,
+                auths: Vec::new(),
+                data: Vec::new(),
+                contract: vec![TxContract {
+                    r#type: ContractType::UnDelegateResourceContract as i32,
+                    parameter: Some(Any {
+                        type_url: "type.googleapis.com/protocol.UnDelegateResourceContract".into(),
+                        value: c.encode_to_vec(),
+                    }),
+                    provider: Vec::new(),
+                    contract_name: Vec::new(),
+                    permission_id: 0,
+                }],
+                scripts: Vec::new(),
+                timestamp: 1_700_000_000_000,
+                fee_limit: 0,
+            }),
+            signature: Vec::new(),
+            ret: Vec::new(),
+        };
+        tron_types::sign_transaction(&mut tx, &owner_priv).expect("sign");
+        tx
+    };
+    let txs = || vec![undelegate(DELEG), undelegate(DELEG), undelegate(DELEG)];
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig { parallel_exec: true, ..ExecConfig::unsigned() };
+    let s = StateBundle::fresh();
+    setup(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+    let p_ = StateBundle::fresh();
+    setup(&p_);
+    let rp = execute_block_with_config(&p_.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let s_succ = so.iter().filter(|o| o.as_str() == "Success").count();
+    assert_eq!(s_succ, 1, "serial: exactly one undelegate should succeed, got {so:?}");
+    assert_eq!(so, po, "undelegate outcomes diverged serial vs parallel: {so:?} vs {po:?}");
+
+    let owner_acc = p_.accounts.get(&addr(owner)).unwrap().unwrap();
+    let deleg_en = owner_acc
+        .account_resource
+        .as_ref()
+        .map(|r| r.delegated_frozen_v2_balance_for_energy)
+        .unwrap_or(0);
+    assert!(deleg_en >= 0, "parallel drove delegated_frozen_v2_balance_for_energy NEGATIVE: {deleg_en}");
+    assert_eq!(dump_state(&s), dump_state(&p_), "conflicting-undelegate block diverged from serial");
+}
+
+/// LIVE-DIVERGENCE REPRO #2 (energy-rental contract fan-out): ONE owner
+/// delegates energy to MANY receivers in a single block. Every delegate
+/// read-modify-writes the SAME owner account (`frozen_v2[ENERGY] -= b`,
+/// `delegated_frozen_v2_balance_for_energy += b`), so all N txs conflict on the
+/// owner account. If Block-STM loses any owner write (or applies one twice),
+/// the owner's held/delegated split diverges from serial — the live signature
+/// (held LOWER + delegated HIGHER than java, basis doubled on `TQ2PvH3c…`).
+/// Parallel MUST equal serial across the full state.
+#[test]
+fn parallel_many_delegates_same_owner_matches_serial() {
+    use prost::Message as _;
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    const N: i64 = 8;
+    const EACH: i64 = 1_000_000_000;
+    let (owner_priv, owner) = derive_keypair(0xC1);
+    let receivers: Vec<[u8; 21]> = (0..N as u8).map(|i| derive_keypair(0xE0 + i).1).collect();
+
+    let setup = |b: &StateBundle| {
+        b.dyn_props.save_unfreeze_delay_days(14);
+        b.dyn_props.put_long(
+            tron_chainbase::dynamic_properties_keys::ALLOW_DELEGATE_RESOURCE,
+            1,
+        );
+        b.dyn_props.save_total_energy_weight(1_000_000);
+        b.dyn_props.save_total_energy_current_limit(90_000_000_000);
+        // Owner holds exactly N*EACH energy frozen-V2 to delegate out.
+        b.accounts
+            .put(
+                &addr(owner),
+                &Account {
+                    address: owner.to_vec(),
+                    balance: 1_000_000_000,
+                    r#type: AccountType::Normal as i32,
+                    frozen_v2: vec![tron_proto::account::FreezeV2 {
+                        r#type: 1, // ENERGY
+                        amount: N * EACH,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for r in &receivers {
+            put_account(&b.accounts, *r, 1);
+        }
+    };
+
+    let delegate = |to: [u8; 21], amount: i64| -> Transaction {
+        let c = tron_proto::DelegateResourceContract {
+            owner_address: owner.to_vec(),
+            receiver_address: to.to_vec(),
+            resource: 1, // ENERGY
+            balance: amount,
+            lock: false,
+            lock_period: 0,
+        };
+        let mut tx = Transaction {
+            raw_data: Some(TxRaw {
+                ref_block_bytes: vec![0, 1],
+                ref_block_num: 0,
+                ref_block_hash: vec![0u8; 8],
+                expiration: 1_700_000_000_000 + 86_400_000,
+                auths: Vec::new(),
+                data: Vec::new(),
+                contract: vec![TxContract {
+                    r#type: ContractType::DelegateResourceContract as i32,
+                    parameter: Some(Any {
+                        type_url: "type.googleapis.com/protocol.DelegateResourceContract".into(),
+                        value: c.encode_to_vec(),
+                    }),
+                    provider: Vec::new(),
+                    contract_name: Vec::new(),
+                    permission_id: 0,
+                }],
+                scripts: Vec::new(),
+                timestamp: 1_700_000_000_000,
+                fee_limit: 0,
+            }),
+            signature: Vec::new(),
+            ret: Vec::new(),
+        };
+        tron_types::sign_transaction(&mut tx, &owner_priv).expect("sign");
+        tx
+    };
+    let txs = || receivers.iter().map(|r| delegate(*r, EACH)).collect::<Vec<_>>();
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig { parallel_exec: true, ..ExecConfig::unsigned() };
+    let s = StateBundle::fresh();
+    setup(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+    let p_ = StateBundle::fresh();
+    setup(&p_);
+    let rp = execute_block_with_config(&p_.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert!(so.iter().all(|o| o.as_str() == "Success"), "serial setup wrong: {so:?}");
+    assert_eq!(so, po, "delegate outcomes diverged serial vs parallel");
+
+    // After N delegates of EACH, owner must hold 0 frozen + N*EACH delegated.
+    let oa = p_.accounts.get(&addr(owner)).unwrap().unwrap();
+    let held: i64 = oa.frozen_v2.iter().filter(|f| f.r#type == 1).map(|f| f.amount).sum();
+    let deleg = oa.account_resource.as_ref().map(|r| r.delegated_frozen_v2_balance_for_energy).unwrap_or(0);
+    assert_eq!(held, 0, "parallel: owner held energy should be 0, got {held}");
+    assert_eq!(deleg, N * EACH, "parallel: owner delegated energy should be {}, got {deleg}", N * EACH);
+    assert_eq!(dump_state(&s), dump_state(&p_), "many-delegate block diverged from serial");
+}
+
+/// LIVE-DIVERGENCE REPRO #3 (full energy-rental churn): ONE owner, in a single
+/// block, delegates EACH energy to receiver R_i and then undelegates it back —
+/// for many receivers, interleaved. Every tx RMWs the same owner account and
+/// each undelegate depends on (and must re-validate against) its delegate's
+/// committed write to the per-(owner,R_i) record. This is the densest
+/// owner-account conflict web (the shape the real rig contracts run). Parallel
+/// MUST end byte-identical to serial, with no negative delegated balance.
+#[test]
+fn parallel_delegate_undelegate_churn_matches_serial() {
+    use prost::Message as _;
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    const N: usize = 12;
+    const EACH: i64 = 1_000_000_000;
+    let (owner_priv, owner) = derive_keypair(0xF1);
+    let receivers: Vec<[u8; 21]> = (0..N as u8).map(|i| derive_keypair(0x30 + i).1).collect();
+
+    let setup = |b: &StateBundle| {
+        b.dyn_props.save_unfreeze_delay_days(14);
+        b.dyn_props.put_long(
+            tron_chainbase::dynamic_properties_keys::ALLOW_DELEGATE_RESOURCE,
+            1,
+        );
+        b.dyn_props.save_total_energy_weight(1_000_000);
+        b.dyn_props.save_total_energy_current_limit(90_000_000_000);
+        b.accounts
+            .put(
+                &addr(owner),
+                &Account {
+                    address: owner.to_vec(),
+                    balance: 1_000_000_000,
+                    r#type: AccountType::Normal as i32,
+                    frozen_v2: vec![tron_proto::account::FreezeV2 {
+                        r#type: 1,
+                        amount: (N as i64) * EACH,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for r in &receivers {
+            put_account(&b.accounts, *r, 1);
+        }
+    };
+
+    let deleg_tx = |to: [u8; 21], undelegate: bool| -> Transaction {
+        let (ty, type_url, value) = if undelegate {
+            let c = tron_proto::UnDelegateResourceContract {
+                owner_address: owner.to_vec(),
+                receiver_address: to.to_vec(),
+                resource: 1,
+                balance: EACH,
+            };
+            (
+                ContractType::UnDelegateResourceContract as i32,
+                "type.googleapis.com/protocol.UnDelegateResourceContract",
+                c.encode_to_vec(),
+            )
+        } else {
+            let c = tron_proto::DelegateResourceContract {
+                owner_address: owner.to_vec(),
+                receiver_address: to.to_vec(),
+                resource: 1,
+                balance: EACH,
+                lock: false,
+                lock_period: 0,
+            };
+            (
+                ContractType::DelegateResourceContract as i32,
+                "type.googleapis.com/protocol.DelegateResourceContract",
+                c.encode_to_vec(),
+            )
+        };
+        let mut tx = Transaction {
+            raw_data: Some(TxRaw {
+                ref_block_bytes: vec![0, 1],
+                ref_block_num: 0,
+                ref_block_hash: vec![0u8; 8],
+                expiration: 1_700_000_000_000 + 86_400_000,
+                auths: Vec::new(),
+                data: Vec::new(),
+                contract: vec![TxContract {
+                    r#type: ty,
+                    parameter: Some(Any { type_url: type_url.into(), value }),
+                    provider: Vec::new(),
+                    contract_name: Vec::new(),
+                    permission_id: 0,
+                }],
+                scripts: Vec::new(),
+                timestamp: 1_700_000_000_000,
+                fee_limit: 0,
+            }),
+            signature: Vec::new(),
+            ret: Vec::new(),
+        };
+        tron_types::sign_transaction(&mut tx, &owner_priv).expect("sign");
+        tx
+    };
+    // delegate R0, undelegate R0, delegate R1, undelegate R1, ...
+    let txs = || {
+        let mut v = Vec::new();
+        for r in &receivers {
+            v.push(deleg_tx(*r, false));
+            v.push(deleg_tx(*r, true));
+        }
+        v
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig { parallel_exec: true, ..ExecConfig::unsigned() };
+    let s = StateBundle::fresh();
+    setup(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+    let p_ = StateBundle::fresh();
+    setup(&p_);
+    let rp = execute_block_with_config(&p_.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, po, "delegate/undelegate churn outcomes diverged: {so:?} vs {po:?}");
+
+    let oa = p_.accounts.get(&addr(owner)).unwrap().unwrap();
+    let deleg = oa.account_resource.as_ref().map(|r| r.delegated_frozen_v2_balance_for_energy).unwrap_or(0);
+    assert!(deleg >= 0, "parallel: delegated energy NEGATIVE: {deleg}");
+    assert_eq!(dump_state(&s), dump_state(&p_), "delegate/undelegate churn diverged from serial");
+}
+
+/// SCOPE PROBE: is the lost-update general to any chained same-account RMW, or
+/// specific to delegate/undelegate? One sender makes N transfers to N receivers
+/// in one block — each tx RMWs the sender's balance + bandwidth window, a dense
+/// dependency chain on a single account. If THIS diverges, the bug hits every
+/// block with multiple txs from the same signer (exchanges, contracts).
+#[test]
+fn parallel_same_sender_many_transfers_matches_serial() {
+    use tron_executor::{execute_block_with_config, ExecConfig};
+    const N: usize = 12;
+    let (sender_priv, sender) = derive_keypair(0x5A);
+    let receivers: Vec<[u8; 21]> = (0..N as u8).map(|i| derive_keypair(0x60 + i).1).collect();
+    let setup = |b: &StateBundle| {
+        put_account(&b.accounts, sender, 100_000_000_000);
+        for r in &receivers {
+            put_account(&b.accounts, *r, 1);
+        }
+    };
+    let txs = || {
+        receivers
+            .iter()
+            .map(|r| signed_transfer_tx(&sender_priv, sender, *r, 1_000_000))
+            .collect::<Vec<_>>()
+    };
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig { parallel_exec: true, ..ExecConfig::unsigned() };
+    let s = StateBundle::fresh();
+    setup(&s);
+    let _ = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg).expect("serial");
+    let p_ = StateBundle::fresh();
+    setup(&p_);
+    let _ = execute_block_with_config(&p_.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg).expect("parallel");
+    let ss = s.accounts.get(&addr(sender)).unwrap().unwrap();
+    let sp = p_.accounts.get(&addr(sender)).unwrap().unwrap();
+    assert_eq!(ss.balance, sp.balance, "sender balance: serial={} parallel={}", ss.balance, sp.balance);
+    assert_eq!(ss.free_net_usage, sp.free_net_usage, "sender free_net_usage: serial={} parallel={}", ss.free_net_usage, sp.free_net_usage);
+    assert_eq!(dump_state(&s), dump_state(&p_), "same-sender transfers diverged from serial");
+}
+
+#[test]
 fn parallel_weight_dependent_block_is_byte_identical_to_serial() {
     use tron_executor::{execute_block_with_config, ExecConfig};
 
@@ -1263,4 +1766,373 @@ fn actuator_fee_is_reported_on_the_result() {
         state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
         10_000_000 - 500 - 1_000_000 - 100_000
     );
+}
+
+#[test]
+fn parallel_conflicting_create_account_burn_matches_serial() {
+    // The LIVE-divergent shape: ONE hot sender does MANY transfers to
+    // fresh accounts in the same block. Same sender on every tx → a
+    // write-write conflict on its account row → Block-STM RE-EXECUTES
+    // the conflicting txs. Each create-account tx also bumps the
+    // delta-ized BURN_TRX_AMOUNT / TOTAL_CREATE_ACCOUNT_COST counters
+    // (the create fee burn). If a re-executed tx's delta is counted
+    // more than once, BURN_TRX over-counts vs serial — the live
+    // "ours burns more" signal. This forces that path.
+    use tron_executor::{execute_block_with_config, ExecConfig};
+
+    fn fresh_rcpt(n: u16) -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1] = 0xf0;
+        a[18] = (n >> 8) as u8;
+        a[19] = n as u8;
+        a[20] = 0xcd;
+        a
+    }
+
+    // ONE sender, no frozen bandwidth → each create-account charges the
+    // flat fee (burned). 8 transfers to 8 fresh accounts in one block.
+    let (priv_key, sender) = derive_keypair(0xC1);
+    const N: u16 = 8;
+    let fund = |b: &StateBundle| {
+        put_account(&b.accounts, sender, 1_000_000_000);
+    };
+    let txs = || {
+        (0..N)
+            .map(|i| signed_transfer_tx(&priv_key, sender, fresh_rcpt(i), 1000))
+            .collect::<Vec<_>>()
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig { parallel_exec: true, ..ExecConfig::unsigned() };
+
+    let s = StateBundle::fresh();
+    fund(&s);
+    let rs = execute_block_with_config(&s.backends(), &build_block(1, [0u8; 32], txs()), None, &serial_cfg).expect("serial");
+
+    let p = StateBundle::fresh();
+    fund(&p);
+    let rp = execute_block_with_config(&p.backends(), &build_block(1, [0u8; 32], txs()), None, &par_cfg).expect("parallel");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert_eq!(so, po, "tx outcomes diverged");
+    assert!(so.iter().all(|o| o == "Success"), "setup wrong: {so:?}");
+
+    let burn_s = s.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::BURN_TRX_AMOUNT).unwrap_or(0);
+    let burn_p = p.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::BURN_TRX_AMOUNT).unwrap_or(0);
+    let cac_s = s.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_CREATE_ACCOUNT_COST).unwrap_or(0);
+    let cac_p = p.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_CREATE_ACCOUNT_COST).unwrap_or(0);
+    assert!(burn_s > 0, "non-vacuous: burn moved");
+    assert_eq!(burn_s, burn_p, "BURN_TRX_AMOUNT diverged under conflict re-execution (serial={burn_s} parallel={burn_p})");
+    assert_eq!(cac_s, cac_p, "TOTAL_CREATE_ACCOUNT_COST diverged (serial={cac_s} parallel={cac_p})");
+    assert_eq!(dump_state(&s), dump_state(&p), "conflicting create-account state diverged from serial");
+}
+
+#[test]
+fn pipelined_parallel_create_account_chain_matches_classic_serial() {
+    // The live-divergent path: transfers to NON-EXISTENT recipients
+    // (account creation + create-account bandwidth/fee), executed with
+    // parallel_exec + the apply pipeline + deferred fsync, vs classic
+    // serial. Each created account, the create-account fee burn
+    // (TOTAL_CREATE_ACCOUNT_COST, BURN_TRX), and the windowed bandwidth
+    // must match serial byte-for-byte across blocks.
+    use tron_chainbase::{BlockUndoStore, CheckPointV2, MemBackend};
+    use tron_executor::{
+        execute_block_with_undo_checkpoint_and_config, ApplyPipeline, ExecConfig,
+    };
+
+    fn fresh_rcpt(block: u8, n: u8) -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1] = 0xe0 + block;
+        a[19] = n;
+        a[20] = 0xab;
+        a
+    }
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tron-pipe-ca-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    const SENDERS: u8 = 6;
+    const BLOCKS: u8 = 4;
+    let keypairs: Vec<([u8; 32], [u8; 21])> =
+        (0..SENDERS).map(|i| derive_keypair(0x90 + i)).collect();
+    // Senders have NO frozen bandwidth → create-account falls to the
+    // flat create-account fee path (burned from balance).
+    let fund = |b: &StateBundle| {
+        for (_, sender) in &keypairs {
+            put_account(&b.accounts, *sender, 1_000_000_000);
+        }
+        // recipients deliberately NOT pre-created.
+    };
+    let block_txs = |k: u8| {
+        keypairs
+            .iter()
+            .enumerate()
+            .map(|(i, (priv_key, sender))| {
+                signed_transfer_tx(priv_key, *sender, fresh_rcpt(k - 1, i as u8), 1000)
+            })
+            .collect::<Vec<_>>()
+    };
+    let chain = || {
+        let mut blocks = Vec::new();
+        let mut parent = [0u8; 32];
+        for k in 1..=BLOCKS {
+            let b = build_block(k as i64, parent, block_txs(k));
+            parent = *tron_types::block_id_from_block(&b).unwrap().as_bytes();
+            blocks.push(b);
+        }
+        blocks
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let s = StateBundle::fresh();
+    fund(&s);
+    let undo_s = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_s = tmp_root("serial");
+    let cp_s = CheckPointV2::new(&root_s);
+    let mut serial_outcomes = Vec::new();
+    for b in chain() {
+        let r = execute_block_with_undo_checkpoint_and_config(
+            &s.backends(), &b, None, &undo_s, &cp_s, &serial_cfg,
+        ).expect("serial apply");
+        for t in &r.tx_results {
+            serial_outcomes.push(format!("{:?}", t.outcome));
+        }
+    }
+
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        defer_store_fsync: true,
+        ..ExecConfig::unsigned()
+    };
+    let p = StateBundle::fresh();
+    fund(&p);
+    let undo_p = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_p = tmp_root("pipelined");
+    let cp_p = CheckPointV2::new(&root_p);
+    let backends = p.backends();
+    let mut pipeline = ApplyPipeline::new(&backends, undo_p, cp_p);
+    let mut par_outcomes = Vec::new();
+    for b in chain() {
+        let r = pipeline.apply(&b, None, &par_cfg).expect("pipelined apply");
+        for t in &r.tx_results {
+            par_outcomes.push(format!("{:?}", t.outcome));
+        }
+    }
+    pipeline.flush().expect("flush");
+
+    assert!(
+        serial_outcomes.iter().all(|o| o == "Success"),
+        "setup wrong, a serial tx failed: {serial_outcomes:?}"
+    );
+    assert_eq!(serial_outcomes, par_outcomes, "tx outcomes diverged");
+    assert_eq!(
+        dump_state(&s),
+        dump_state(&p),
+        "pipelined+parallel create-account state diverged from classic serial"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_s);
+    let _ = std::fs::remove_dir_all(&root_p);
+}
+
+#[test]
+fn pipelined_parallel_weight_chain_matches_classic_serial() {
+    // Catch-up shape of the weight hazard: across MULTIPLE blocks through
+    // the apply pipeline, a FreezeBalanceV2 (writes TOTAL_NET_WEIGHT) and
+    // a bandwidth-reading transfer (reads it for the frozen-quota gate)
+    // interleave. Block N's weight write is pending in the pipeline
+    // overlay while block N+1 reads it. Must equal classic serial across
+    // every store + the global weight counters.
+    use tron_chainbase::{BlockUndoStore, CheckPointV2, MemBackend};
+    use tron_executor::{execute_block_with_undo_checkpoint_and_config, ApplyPipeline, ExecConfig};
+
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("tron-pipe-wt-{tag}-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+    }
+    let (charlie_priv, charlie) = derive_keypair(0xD7);
+    fn rcpt(k: u8) -> [u8;21] { let mut a=[0u8;21]; a[0]=0x41; a[1]=0xd0+k; a[20]=0xe1; a }
+    const BLOCKS: u8 = 4;
+    let setup = |b: &StateBundle| {
+        b.dyn_props.save_unfreeze_delay_days(14);
+        put_account(&b.accounts, ALICE, 10_000_000_000_000);
+        for k in 0..BLOCKS { put_account(&b.accounts, rcpt(k), 1); }
+        b.accounts.put(&addr(charlie), &Account {
+            address: charlie.to_vec(), balance: 1_000_000_000, r#type: AccountType::Normal as i32,
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 1_000_000_000 }],
+            ..Default::default()
+        }).unwrap();
+    };
+    // Each block: ALICE freezes a chunk (bumps weight), CHARLIE transfers
+    // (reads weight). Weight chains across blocks.
+    let block_txs = |k: u8| vec![
+        freeze_v2_bw_tx(ALICE, 1_000_000_000_000),
+        signed_transfer_tx(&charlie_priv, charlie, rcpt(k-1), 1),
+    ];
+    let chain = || {
+        let mut blocks=Vec::new(); let mut parent=[0u8;32];
+        for k in 1..=BLOCKS {
+            let b = build_block(k as i64, parent, block_txs(k));
+            parent = *tron_types::block_id_from_block(&b).unwrap().as_bytes();
+            blocks.push(b);
+        }
+        blocks
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let s = StateBundle::fresh(); setup(&s);
+    let undo_s = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_s = tmp_root("serial"); let cp_s = CheckPointV2::new(&root_s);
+    for b in chain() {
+        execute_block_with_undo_checkpoint_and_config(&s.backends(), &b, None, &undo_s, &cp_s, &serial_cfg).expect("serial");
+    }
+
+    let par_cfg = ExecConfig { parallel_exec: true, defer_store_fsync: true, ..ExecConfig::unsigned() };
+    let p = StateBundle::fresh(); setup(&p);
+    let undo_p = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_p = tmp_root("pipe"); let cp_p = CheckPointV2::new(&root_p);
+    let backends = p.backends();
+    let mut pipe = ApplyPipeline::new(&backends, undo_p, cp_p);
+    for b in chain() { pipe.apply(&b, None, &par_cfg).expect("pipelined"); }
+    pipe.flush().expect("flush");
+
+    let wt_s = s.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_NET_WEIGHT).unwrap_or(0);
+    let wt_p = p.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_NET_WEIGHT).unwrap_or(0);
+    assert!(wt_s > 0, "weight moved");
+    assert_eq!(wt_s, wt_p, "TOTAL_NET_WEIGHT diverged under pipeline (serial={wt_s} parallel={wt_p})");
+    assert_eq!(dump_state(&s), dump_state(&p), "pipelined weight-chain state diverged from serial");
+    let _ = std::fs::remove_dir_all(&root_s); let _ = std::fs::remove_dir_all(&root_p);
+}
+
+#[test]
+fn pipelined_parallel_free_net_chain_matches_classic_serial() {
+    // RIG-SHAPED reproduction: multi-block chains of free-net transfers
+    // executed with BOTH `vm.parallel_exec` (Block-STM + the deferred
+    // PUBLIC_NET fold) AND the apply pipeline (block N's writes pending
+    // in the overlay while block N+1 executes). The deferred fold and
+    // every per-account read of block N+1 must see block N's pending
+    // writes through the overlay; any miss diverges the windowed
+    // bandwidth accounting and the balances — exactly the live drift
+    // class (fee-sized balance deltas, PUBLIC_NET divergence).
+    use tron_chainbase::{BlockUndoStore, CheckPointV2, MemBackend};
+    use tron_executor::{
+        execute_block_with_undo_checkpoint_and_config, ApplyPipeline, ExecConfig,
+    };
+
+    fn rcpt(block: u8, n: u8) -> [u8; 21] {
+        let mut a = [0u8; 21];
+        a[0] = 0x41;
+        a[1] = 0xc0 + block;
+        a[20] = n;
+        a
+    }
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tron-pipe-par-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    const SENDERS: u8 = 8;
+    const BLOCKS: u8 = 4;
+    let keypairs: Vec<([u8; 32], [u8; 21])> =
+        (0..SENDERS).map(|i| derive_keypair(0x70 + i)).collect();
+    let fund = |b: &StateBundle| {
+        for (_, sender) in &keypairs {
+            put_account(&b.accounts, *sender, 1_000_000_000);
+        }
+        for blk in 0..BLOCKS {
+            for i in 0..SENDERS {
+                put_account(&b.accounts, rcpt(blk, i), 1);
+            }
+        }
+    };
+    // Block `k` (1-based): every sender pays a fresh recipient — the
+    // sender rows + PUBLIC_NET_USAGE chain across blocks.
+    let block_txs = |k: u8| {
+        keypairs
+            .iter()
+            .enumerate()
+            .map(|(i, (priv_key, sender))| {
+                signed_transfer_tx(priv_key, *sender, rcpt(k - 1, i as u8), 100 + k as i64)
+            })
+            .collect::<Vec<_>>()
+    };
+    let chain = || {
+        let mut blocks = Vec::new();
+        let mut parent = [0u8; 32];
+        for k in 1..=BLOCKS {
+            let b = build_block(k as i64, parent, block_txs(k));
+            parent = *tron_types::block_id_from_block(&b).unwrap().as_bytes();
+            blocks.push(b);
+        }
+        blocks
+    };
+
+    // Classic serial reference.
+    let serial_cfg = ExecConfig::unsigned();
+    let s = StateBundle::fresh();
+    fund(&s);
+    let undo_s = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_s = tmp_root("serial");
+    let cp_s = CheckPointV2::new(&root_s);
+    for b in chain() {
+        execute_block_with_undo_checkpoint_and_config(
+            &s.backends(),
+            &b,
+            None,
+            &undo_s,
+            &cp_s,
+            &serial_cfg,
+        )
+        .expect("serial apply");
+    }
+
+    // Pipelined + parallel + deferred fsync — the rig's catch-up shape.
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        defer_store_fsync: true,
+        ..ExecConfig::unsigned()
+    };
+    let p = StateBundle::fresh();
+    fund(&p);
+    let undo_p = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
+    let root_p = tmp_root("pipelined");
+    let cp_p = CheckPointV2::new(&root_p);
+    let backends = p.backends();
+    let mut pipeline = ApplyPipeline::new(&backends, undo_p, cp_p);
+    for b in chain() {
+        pipeline.apply(&b, None, &par_cfg).expect("pipelined apply");
+    }
+    pipeline.flush().expect("flush");
+
+    // The free-net counter must have moved (non-vacuous) and match.
+    let su = s.dyn_props.public_net_usage();
+    assert!(su > 0, "free-net path not exercised");
+    assert_eq!(
+        su,
+        p.dyn_props.public_net_usage(),
+        "deferred PUBLIC_NET fold diverged under the pipeline"
+    );
+    // Every store byte-for-byte.
+    assert_eq!(
+        dump_state(&s),
+        dump_state(&p),
+        "pipelined+parallel state diverged from classic serial"
+    );
+
+    let _ = std::fs::remove_dir_all(&root_s);
+    let _ = std::fs::remove_dir_all(&root_p);
 }

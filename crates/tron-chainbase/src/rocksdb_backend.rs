@@ -346,6 +346,26 @@ impl RocksDbBackend {
         Ok(Self { db: Arc::new(db) })
     }
 
+    /// Refresh a secondary's view to the primary's latest **flushed +
+    /// WAL'd** state. A freshly-opened secondary only sees the SST files
+    /// that existed at open time — everything the primary has written
+    /// since (and anything still in its memtable that hasn't reached an
+    /// SST) is invisible until this is called. The live-import path MUST
+    /// call this on every store right before scanning, otherwise it
+    /// copies a stale, **per-store-skewed** view: each store's last-seen
+    /// height differs, so chain-global accumulators in `properties`
+    /// (head pointer, `TOTAL_NET_WEIGHT`, …) end up inconsistent with the
+    /// per-account frozen balances in `account`. That skew bakes a
+    /// permanent offset into every bandwidth/fee calculation and never
+    /// re-converges (the weights are delta-accumulators on a wrong base).
+    ///
+    /// No-op / error on a non-secondary handle — only call on one opened
+    /// via [`open_as_secondary`](Self::open_as_secondary).
+    pub fn try_catch_up_with_primary(&self) -> Result<(), RocksDbError> {
+        self.db.try_catch_up_with_primary()?;
+        Ok(())
+    }
+
     /// Open with a custom [`Options`] block. Use for byte-for-byte parity
     /// with a specific java-tron `dbSettings`.
     pub fn open_with(path: impl AsRef<Path>, opts: Options) -> Result<Self, RocksDbError> {

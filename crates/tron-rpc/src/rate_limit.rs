@@ -65,8 +65,12 @@ impl RateLimit {
     }
 }
 
-/// Global QPS bucket. One-permit burst, refill at `qps` permits/sec
-/// (Guava `RateLimiter.create(qps)` stable-rate semantics).
+/// QPS bucket with Guava `RateLimiter.create(qps)` semantics: permits
+/// refill at `qps`/sec and can ACCUMULATE up to one second's worth
+/// (`maxBurstSeconds = 1.0`), so `qps` truly concurrent requests are
+/// admitted before throttling starts. (The previous one-permit burst
+/// rejected the second of any two simultaneous requests regardless of
+/// the configured rate — far stricter than java.)
 #[derive(Debug)]
 pub struct QpsBucket {
     qps: f64,
@@ -84,17 +88,19 @@ impl QpsBucket {
         Self {
             qps,
             inner: Mutex::new(QpsInner {
-                permits: 1.0,
+                // Guava starts full: a fresh limiter admits a burst.
+                permits: qps.max(1.0),
                 last_refill: Instant::now(),
             }),
         }
     }
 
     pub fn try_acquire(&self) -> bool {
+        let max_burst = self.qps.max(1.0); // Guava maxBurstSeconds = 1.0
         let mut g = self.inner.lock().unwrap();
         let now = Instant::now();
         let dt = now.saturating_duration_since(g.last_refill).as_secs_f64();
-        g.permits = (g.permits + dt * self.qps).min(1.0);
+        g.permits = (g.permits + dt * self.qps).min(max_burst);
         g.last_refill = now;
         if g.permits >= 1.0 {
             g.permits -= 1.0;
@@ -370,12 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn qps_bucket_refills_at_rate() {
-        let b = QpsBucket::new(100.0);
+    fn qps_bucket_allows_guava_burst_then_blocks_then_refills() {
+        // Guava semantics: a fresh limiter holds a full second of
+        // permits (here 2), then refills at the configured rate.
+        let b = QpsBucket::new(2.0);
+        assert!(b.try_acquire(), "burst permit 1");
+        assert!(b.try_acquire(), "burst permit 2");
+        assert!(!b.try_acquire(), "burst exhausted");
+        sleep(Duration::from_millis(600)); // ~1.2 permits refilled
         assert!(b.try_acquire());
-        assert!(!b.try_acquire());
-        sleep(Duration::from_millis(30));
-        assert!(b.try_acquire());
+        assert!(!b.try_acquire(), "only ~one permit refilled");
     }
 
     #[test]

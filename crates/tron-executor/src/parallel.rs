@@ -392,13 +392,18 @@ pub(crate) fn execute_block_parallel(
         (0..n).map(|_| Arc::new(TxCaptureCell::new())).collect();
     let incarnation: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
     let results: Vec<Mutex<Option<TxResult>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    // `finalized[i]` = tx i's result is settled (validated against finalized lower
-    // txs) and will not change. `deps[i]` = the lower tx indices whose speculative
-    // writes tx i actually read in its latest incarnation (its read-set's
-    // `Version` origins). A tx is only re-executed/finalized once all of *those*
-    // are finalized, so each tx re-executes ~once instead of once-per-round —
-    // turning an O(depth²) chain cascade into O(n) total work.
+    // `finalized[i]` = tx i is committed (validated against an mv in which every
+    // lower tx is committed and immutable) — set only by the contiguous-prefix
+    // commit loop below.
     let finalized: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    // `deps[i]` = the distinct LOWER tx indices whose speculative writes tx i read
+    // in its latest incarnation (its read-set's `Version` origins). Used ONLY to
+    // GATE re-execution (re-running a tx whose deps aren't committed just reads the
+    // same stale values again — wasted work, and for contract txs that means a
+    // wasted EVM run). It does NOT affect finalization, which stays the sound
+    // contiguous-prefix commit below — so an incomplete dep set (a hidden dep from
+    // a key read as absent) can at worst cost ONE extra re-execution before the new
+    // dep is recorded, never a wrong commit.
     let deps: Vec<Mutex<Vec<u32>>> = (0..n).map(|_| Mutex::new(Vec::new())).collect();
 
     // Build each tx's versioned `StateBackends` ONCE and reuse it across all of
@@ -412,22 +417,8 @@ pub(crate) fn execute_block_parallel(
         .map(|i| versioned_state(state, &mv, i as u32, &captures[i], &acc, now_cycle))
         .collect();
 
-    // Recompute tx i's dependency set from its latest incarnation's reads
-    // (tracked incrementally in the capture — no read-set rescan).
-    let recompute_deps = |i: usize| {
-        let d = captures[i].borrow().dep_set();
-        *deps[i].lock().expect("deps poisoned") = d;
-    };
-    let deps_all_final = |i: usize| -> bool {
-        deps[i]
-            .lock()
-            .expect("deps poisoned")
-            .iter()
-            .all(|&j| finalized[j as usize].load(Ordering::Relaxed))
-    };
-
     // Execute (or re-execute) tx `i` at its current incarnation, publishing its
-    // write-set to the multi-version memory and recording its result + deps.
+    // write-set to the multi-version memory and recording its result.
     let run = |i: usize| {
         let inc = incarnation[i].load(Ordering::Relaxed);
         let old_keys = {
@@ -470,65 +461,105 @@ pub(crate) fn execute_block_parallel(
             &write_set,
         );
         *results[i].lock().expect("result poisoned") = Some(r);
-        recompute_deps(i);
+        *deps[i].lock().expect("deps poisoned") = captures[i].borrow().dep_set();
     };
 
     // Round 0: speculate everything.
     (0..n).into_par_iter().for_each(|i| run(i));
 
-    // Dependency-ordered finalization. Each round picks the txs whose dependencies
-    // are all finalized ("ready") and settles them: a ready tx whose read-set
-    // still validates is finalized as-is (NO re-execution — the common case for
-    // independent txs); one that doesn't is re-executed exactly once (it now reads
-    // only finalized values) and finalized if it then validates with all deps
-    // final. The lowest non-finalized tx always has all-finalized deps (reads only
-    // resolve to lower indices), so ≥1 tx finalizes per round ⇒ progress is
-    // guaranteed and the loop converges in ≤ n rounds (the bound is a backstop).
-    // Crucially, only *ready* txs are touched each round, so a depth-d chain costs
-    // ~d cheap rounds + ~n re-executions total, not the O(d²) the round-robin
-    // re-execute-everything scheduler cost. `BLOCKSTM_DEBUG` logs the shape.
+    // Contiguous-prefix commit. A tx may be finalized ONLY once every
+    // lower-indexed tx is already finalized AND its own read-set validates
+    // against the resulting (stable) multi-version memory. This is the textbook
+    // Block-STM commit rule, and it is the SOUND replacement for the earlier
+    // dependency-ordered finalization, which finalized any tx whose *tracked*
+    // deps were final. That optimization was unsound: a tx's read-set captures
+    // only the lower writes it actually OBSERVED, so a tx that read a key as
+    // absent (or read a stale lower value) has a hidden dependency on any lower
+    // tx that later WRITES that key — e.g. an UnDelegateResource that read its
+    // (owner,to) record as absent because the same block's DelegateResource had
+    // not published yet. Such a tx has no tracked dep on the writer, gets marked
+    // "ready", and validates during the window where the writer is mid-re-
+    // execution (its new write not yet in the mv) → it finalizes against a stale
+    // read. Committing in strict index order, with re-execution barriered from
+    // the commit-advance below, removes that race: each finalized tx is validated
+    // against an mv in which every lower tx is final and immutable.
+    //
+    // Cost: independent txs still finalize in ONE post-speculation round (their
+    // round-0 read-sets validate, the whole prefix advances at once). A depth-d
+    // dependency chain costs ~d rounds; each round re-executes only the txs whose
+    // read-set is currently invalid (a cheap value-based check), so a tx re-runs
+    // ~once — when the lower write it depends on first commits — not once-per-round.
     let dbg = std::env::var("BLOCKSTM_DEBUG").is_ok();
     let mut converged = false;
     let mut rounds = 0usize;
     let mut reexecs = 0usize;
+    let mut committed = 0usize; // every tx < committed is finalized & immutable
     for _ in 0..=n {
-        let ready: Vec<usize> = (0..n)
-            .into_par_iter()
-            .filter(|&i| !finalized[i].load(Ordering::Relaxed) && deps_all_final(i))
-            .collect();
-        if ready.is_empty() {
-            converged = (0..n).all(|i| finalized[i].load(Ordering::Relaxed));
+        if committed == n {
+            converged = true;
             break;
         }
         rounds += 1;
-        let round_reexecs: usize = ready
-            .par_iter()
-            .map(|&i| {
-                let valid = {
+        // Re-execute, in parallel, every not-yet-committed tx that is BOTH stale
+        // (read-set no longer validates) AND dep-ready (every lower tx it read is
+        // already committed). The dep-ready gate is the throughput lever: without
+        // it a deep dependency chain re-runs its whole tail every round (O(n²) — and
+        // for contract txs that is O(n²) wasted EVM runs); gated, each tx re-runs
+        // ~once, when the lower write it depends on first commits. The frontier tx
+        // (`committed`) reads only committed-or-base state so it is always dep-ready,
+        // guaranteeing ≥1 re-run-or-commit per round. The rayon join is a BARRIER:
+        // all re-executions publish before the commit-advance reads the mv, so no tx
+        // is validated against a value a concurrently re-executing lower tx is about
+        // to overwrite.
+        let to_run: Vec<usize> = (committed..n)
+            .into_par_iter()
+            .filter(|&i| {
+                let dep_ready = deps[i]
+                    .lock()
+                    .expect("deps poisoned")
+                    .iter()
+                    .all(|&j| (j as usize) < committed);
+                dep_ready && {
                     let cap = captures[i].borrow();
-                    mv.validate(i as u32, &cap.reads)
-                };
-                if valid {
-                    finalized[i].store(true, Ordering::Relaxed);
-                    0
-                } else {
-                    incarnation[i].fetch_add(1, Ordering::Relaxed);
-                    run(i);
-                    // The re-execution read only finalized lower values for its
-                    // prior deps; if it discovered no *new* unfinalized dep and now
-                    // validates, it's settled. Otherwise it waits for the new dep.
-                    let revalid = {
-                        let cap = captures[i].borrow();
-                        mv.validate(i as u32, &cap.reads)
-                    };
-                    if revalid && deps_all_final(i) {
-                        finalized[i].store(true, Ordering::Relaxed);
-                    }
-                    1
+                    !mv.validate(i as u32, &cap.reads)
                 }
             })
-            .sum();
+            .collect();
+        let round_reexecs = to_run.len();
+        to_run.par_iter().for_each(|&i| {
+            incarnation[i].fetch_add(1, Ordering::Relaxed);
+            run(i);
+        });
         reexecs += round_reexecs;
+        // Re-validate the uncommitted range against the now-stable mv (in
+        // parallel — the barrier above means no writer is in flight), then
+        // advance the commit frontier over the longest CONTIGUOUS run of valid
+        // txs. Each committed tx reads only lower (already-committed) state, so a
+        // passing validation means it computed exactly what serial would. The
+        // boolean prefix-walk is the only sequential part and is trivially cheap.
+        let valid: Vec<bool> = (committed..n)
+            .into_par_iter()
+            .map(|i| {
+                let cap = captures[i].borrow();
+                mv.validate(i as u32, &cap.reads)
+            })
+            .collect();
+        let mut advanced = 0usize;
+        for &ok in &valid {
+            if !ok {
+                break;
+            }
+            finalized[committed + advanced].store(true, Ordering::Relaxed);
+            advanced += 1;
+        }
+        committed += advanced;
+        // Progress is guaranteed: the lowest non-committed tx reads only
+        // committed lower state, so after its re-execution it must validate. If a
+        // round somehow makes no progress with nothing left to re-execute, bail
+        // to the serial fallback rather than spin.
+        if advanced == 0 && round_reexecs == 0 {
+            break;
+        }
     }
     if dbg {
         eprintln!("[blockstm] n={n} rounds={rounds} reexecs={reexecs} converged={converged}");

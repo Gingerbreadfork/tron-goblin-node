@@ -604,12 +604,11 @@ impl TronDatabaseExt for TronDatabase {
         }
         account.balance -= frozen_balance;
         let resource = resource_type as i32;
-        let old_resource_balance = account
-            .frozen_v2
-            .iter()
-            .find(|f| f.r#type == resource)
-            .map(|f| f.amount)
-            .unwrap_or(0);
+        // Weight is floored from `getFrozenV2BalanceWithDelegated` (held +
+        // delegated-out), read BEFORE the stake is added — java's
+        // `FreezeBalanceV2Processor`. Adding `frozen_balance` to held leaves
+        // delegated unchanged, so `new_basis == old_basis + frozen_balance`.
+        let old_basis = frozen_v2_basis_with_delegated(&account, resource);
         let slot = account.frozen_v2.iter_mut().find(|f| f.r#type == resource);
         match slot {
             Some(f) => {
@@ -628,13 +627,13 @@ impl TronDatabaseExt for TronDatabase {
         self.accounts
             .put(&owner, &account)
             .expect("db error in TronDatabaseExt::tron_freeze_balance_v2 writing owner account");
-        let new_resource_balance = old_resource_balance.saturating_add(frozen_balance);
-        let weight_delta =
-            new_resource_balance / TRX_PRECISION - old_resource_balance / TRX_PRECISION;
+        let new_basis = old_basis.saturating_add(frozen_balance);
+        let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
         if weight_delta != 0 {
             match resource {
                 0 => dyn_props.add_total_net_weight(weight_delta),
                 1 => dyn_props.add_total_energy_weight(weight_delta),
+                2 => dyn_props.add_total_tron_power_weight(weight_delta),
                 _ => {}
             }
         }
@@ -687,6 +686,10 @@ impl TronDatabaseExt for TronDatabase {
             None => return 0,
         };
         let resource = resource_type as i32;
+        // Weight is floored from `getFrozenV2BalanceWithDelegated` (held +
+        // delegated-out), read BEFORE the unstake is removed — java's
+        // `UnfreezeBalanceV2Processor.updateTotalResourceWeight`.
+        let old_basis = frozen_v2_basis_with_delegated(&account, resource);
         // Find the matching FreezeV2 slot and subtract.
         let slot = account.frozen_v2.iter_mut().find(|f| f.r#type == resource);
         let old_resource_balance = slot.as_ref().map(|f| f.amount).unwrap_or(0);
@@ -717,13 +720,15 @@ impl TronDatabaseExt for TronDatabase {
         self.accounts
             .put(&owner, &account)
             .expect("db error in TronDatabaseExt::tron_unfreeze_balance_v2 writing owner account");
-        // Shrink chain-wide weight by the unfrozen amount.
-        let weight_delta = (old_resource_balance - unfreeze_balance) / TRX_PRECISION
-            - old_resource_balance / TRX_PRECISION;
+        // Shrink chain-wide weight by the floored basis change (delegated-out
+        // unchanged, so `new_basis == old_basis - unfreeze_balance`).
+        let weight_delta =
+            (old_basis - unfreeze_balance) / TRX_PRECISION - old_basis / TRX_PRECISION;
         if weight_delta != 0 {
             match resource {
                 0 => dyn_props.add_total_net_weight(weight_delta),
                 1 => dyn_props.add_total_energy_weight(weight_delta),
+                2 => dyn_props.add_total_tron_power_weight(weight_delta),
                 _ => {}
             }
         }
@@ -735,6 +740,9 @@ impl TronDatabaseExt for TronDatabase {
     }
 
     fn tron_cancel_all_unfreeze_v2(&mut self, caller: Address) -> i64 {
+        let Some(dyn_props) = self.dyn_props.as_ref() else {
+            return 0;
+        };
         let owner = evm_to_tron_address(&caller);
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
             return 0;
@@ -742,24 +750,67 @@ impl TronDatabaseExt for TronDatabase {
         if account.unfrozen_v2.is_empty() {
             return 0;
         }
-        // Re-stake every pending unfreeze entry into the matching
-        // FreezeV2 slot. Mirrors `CancelAllUnfreezeV2Actuator.execute`.
+        let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+        // Weight basis (held + delegated-out) per resource, captured BEFORE any
+        // pending entry is restored — java's `CancelAllUnfreezeV2Processor`
+        // (mirrors our actuator `execute_cancel_all_unfreeze_v2`). EXPIRED entries
+        // are withdrawn to balance (NOT re-staked) and don't move the weight (it
+        // was already shrunk when they were unfrozen); only not-yet-expired
+        // entries are restored to FreezeV2 and bump the weight back.
+        let old_net = frozen_v2_basis_with_delegated(&account, 0);
+        let old_energy = frozen_v2_basis_with_delegated(&account, 1);
+        let old_tp = frozen_v2_basis_with_delegated(&account, 2);
+        let (mut restored_net, mut restored_energy, mut restored_tp) = (0i64, 0i64, 0i64);
+        let mut withdraw: i64 = 0;
         let pending: Vec<tron_proto::account::UnFreezeV2> = std::mem::take(&mut account.unfrozen_v2);
         for u in pending {
-            let slot = account.frozen_v2.iter_mut().find(|f| f.r#type == u.r#type);
-            match slot {
-                Some(f) => {
-                    f.amount = f.amount.saturating_add(u.unfreeze_amount);
-                }
+            if u.unfreeze_expire_time <= now {
+                // Expired → withdraw to balance.
+                withdraw = withdraw.saturating_add(u.unfreeze_amount);
+                continue;
+            }
+            // Not yet expired → restore to the matching FreezeV2 slot.
+            match u.r#type {
+                0 => restored_net = restored_net.saturating_add(u.unfreeze_amount),
+                1 => restored_energy = restored_energy.saturating_add(u.unfreeze_amount),
+                2 => restored_tp = restored_tp.saturating_add(u.unfreeze_amount),
+                _ => {}
+            }
+            match account.frozen_v2.iter_mut().find(|f| f.r#type == u.r#type) {
+                Some(f) => f.amount = f.amount.saturating_add(u.unfreeze_amount),
                 None => account.frozen_v2.push(tron_proto::account::FreezeV2 {
                     r#type: u.r#type,
                     amount: u.unfreeze_amount,
                 }),
             }
         }
+        if withdraw > 0 {
+            account.balance = account.balance.saturating_add(withdraw);
+        }
         self.accounts
             .put(&owner, &account)
             .expect("db error in TronDatabaseExt::tron_cancel_all_unfreeze_v2 writing owner account");
+        // Restore the chain-wide weight for the re-staked (not-expired) entries
+        // (`floor(old + restored) - floor(old)`, byte-identical to java's
+        // per-entry fold by telescoping).
+        let net_delta = (old_net + restored_net) / TRX_PRECISION - old_net / TRX_PRECISION;
+        let energy_delta =
+            (old_energy + restored_energy) / TRX_PRECISION - old_energy / TRX_PRECISION;
+        let tp_delta = (old_tp + restored_tp) / TRX_PRECISION - old_tp / TRX_PRECISION;
+        if net_delta != 0 {
+            dyn_props.add_total_net_weight(net_delta);
+        }
+        if energy_delta != 0 {
+            dyn_props.add_total_energy_weight(energy_delta);
+        }
+        if tp_delta != 0 {
+            dyn_props.add_total_tron_power_weight(tp_delta);
+        }
+        // Journal the expired-sweep balance to the caller (matches the on-chain
+        // `setBalance(balance + withdrawExpireBalance)`).
+        if withdraw > 0 {
+            self.last_balance_delta = Some((caller, withdraw));
+        }
         1
     }
 
@@ -1016,6 +1067,32 @@ const BLACKHOLE_ADDRESS: [u8; 21] = [
 
 const FROZEN_PERIOD_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
+/// java-tron `AccountCapsule.getFrozenV2BalanceWithDelegated(resource)` — the
+/// held FreezeV2 of `resource` PLUS the balance this account has delegated OUT
+/// for that resource. This is the basis the chain-wide weight is floored from in
+/// the v2 freeze/unfreeze/cancel paths. Flooring `held` alone (as the old TVM
+/// code did) drifts from java for any account that has delegated resources out,
+/// since `floor(held + delegated)` ≠ `floor(held)`. For TRON_POWER (resource 2)
+/// there is no delegation, so this reduces to `getTronPowerFrozenV2Balance()`.
+fn frozen_v2_basis_with_delegated(account: &tron_proto::Account, resource: i32) -> i64 {
+    let held: i64 = account
+        .frozen_v2
+        .iter()
+        .filter(|f| f.r#type == resource)
+        .map(|f| f.amount)
+        .sum();
+    let delegated = match resource {
+        0 => account.delegated_frozen_v2_balance_for_bandwidth,
+        1 => account
+            .account_resource
+            .as_ref()
+            .map(|r| r.delegated_frozen_v2_balance_for_energy)
+            .unwrap_or(0),
+        _ => 0,
+    };
+    held.saturating_add(delegated)
+}
+
 fn self_freeze_expire(
     db: &TronDatabase,
     owner: &TronAddress,
@@ -1157,5 +1234,132 @@ mod tests {
             &db,
             evm_addr_from_tron(tron_addr(0xee))
         ));
+    }
+
+    // ---- v2 stake weight: with-delegated basis + TRON_POWER (java parity) ----
+
+    use tron_chainbase::{
+        DelegatedResourceStore, DelegationStore, DynamicPropertiesStore, VotesStore,
+    };
+    use tron_proto::account::{AccountResource, FreezeV2, UnFreezeV2};
+
+    /// A `TronDatabase` wired with the staking stores + an `ALLOW_TVM_FREEZE_V2`
+    /// dyn_props so the v2 freeze/unfreeze/cancel bridges execute.
+    fn make_staking_db() -> (TronDatabase, Arc<DynamicPropertiesStore>) {
+        let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let accounts = Arc::new(AccountStore::new(backend));
+        let code = Arc::new(CodeStore::new(Arc::new(MemBackend::new())));
+        let storage = Arc::new(StorageRowStore::new(Arc::new(MemBackend::new())));
+        let dyn_props = Arc::new(DynamicPropertiesStore::new(Arc::new(MemBackend::new())));
+        dyn_props.put_long(b"ALLOW_TVM_FREEZE_V2", 1);
+        dyn_props.put_long(b"UNFREEZE_DELAY_DAYS", 14);
+        let votes = Arc::new(VotesStore::new(Arc::new(MemBackend::new())));
+        let delegated = Arc::new(DelegatedResourceStore::new(Arc::new(MemBackend::new())));
+        let delegation = Arc::new(DelegationStore::new(Arc::new(MemBackend::new())));
+        let db = TronDatabase::new(accounts, code, storage).with_staking_stores(
+            dyn_props.clone(),
+            Some(votes),
+            delegated,
+            delegation,
+        );
+        (db, dyn_props)
+    }
+
+    /// Regression: the TVM `freezeBalanceV2` weight delta must floor the
+    /// `getFrozenV2BalanceWithDelegated` basis (held + delegated-OUT), NOT held
+    /// alone. With held=0.4 TRX + delegated-out=0.3 TRX (basis 0.7) and a 1.5-TRX
+    /// freeze, java adds `floor(2.2)-floor(0.7) = 2`; the old held-only code added
+    /// `floor(1.9)-floor(0.4) = 1` — a permanent `TOTAL_ENERGY_WEIGHT` drift.
+    #[test]
+    fn tvm_freeze_v2_floors_weight_on_with_delegated_basis() {
+        let (db, dyn_props) = make_staking_db();
+        let owner = tron_addr(0x51);
+        db.accounts
+            .put(
+                &TronAddress::from_raw(owner),
+                &Account {
+                    address: owner.to_vec(),
+                    balance: 100_000_000,
+                    frozen_v2: vec![FreezeV2 { r#type: 1, amount: 400_000 }],
+                    account_resource: Some(AccountResource {
+                        delegated_frozen_v2_balance_for_energy: 300_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut db = db;
+        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 1_500_000, 1);
+        assert_eq!(r, 1, "freeze should succeed");
+        assert_eq!(
+            dyn_props.total_energy_weight(),
+            2,
+            "energy weight must use with-delegated basis: floor(2.2)-floor(0.7)=2 (old held-only bug gave 1)"
+        );
+    }
+
+    /// Regression: the TVM v2 freeze/unfreeze must update `TOTAL_TRON_POWER_WEIGHT`
+    /// for resource TRON_POWER (2) — the old code's `_ => {}` arm dropped it.
+    #[test]
+    fn tvm_freeze_v2_updates_tron_power_weight() {
+        let (db, dyn_props) = make_staking_db();
+        let owner = tron_addr(0x52);
+        db.accounts
+            .put(
+                &TronAddress::from_raw(owner),
+                &Account { address: owner.to_vec(), balance: 100_000_000, ..Default::default() },
+            )
+            .unwrap();
+        let mut db = db;
+        assert_eq!(db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 5_000_000, 2), 1);
+        assert_eq!(
+            dyn_props.total_tron_power_weight(),
+            5,
+            "TRON_POWER freeze must bump TOTAL_TRON_POWER_WEIGHT (floor(5e6/1e6)=5)"
+        );
+        // And unfreezing it back removes the weight.
+        assert_eq!(db.tron_unfreeze_balance_v2(evm_addr_from_tron(owner), 5_000_000, 2), 1);
+        assert_eq!(dyn_props.total_tron_power_weight(), 0, "unfreeze must restore TP weight");
+    }
+
+    /// Regression: TVM `cancelAllUnfreezeV2` must (a) withdraw EXPIRED pending
+    /// unfreezes to BALANCE (not re-freeze them) and (b) restore the weight for
+    /// the NOT-expired ones. The old code re-froze everything and never touched
+    /// the weight.
+    #[test]
+    fn tvm_cancel_all_unfreeze_v2_splits_expired_and_restores_weight() {
+        let (db, dyn_props) = make_staking_db();
+        dyn_props.save_latest_block_header_timestamp(1_000_000);
+        let owner = tron_addr(0x53);
+        db.accounts
+            .put(
+                &TronAddress::from_raw(owner),
+                &Account {
+                    address: owner.to_vec(),
+                    balance: 10_000_000,
+                    // already-counted-out weight is 0 here (no held frozen).
+                    unfrozen_v2: vec![
+                        // expired (expire <= now) → withdraw to balance.
+                        UnFreezeV2 { r#type: 1, unfreeze_amount: 2_000_000, unfreeze_expire_time: 500_000 },
+                        // not expired (expire > now) → re-freeze + weight.
+                        UnFreezeV2 { r#type: 1, unfreeze_amount: 3_000_000, unfreeze_expire_time: 2_000_000 },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut db = db;
+        assert_eq!(db.tron_cancel_all_unfreeze_v2(evm_addr_from_tron(owner)), 1);
+        let acct = db.accounts.get(&TronAddress::from_raw(owner)).unwrap().unwrap();
+        let held_en: i64 = acct.frozen_v2.iter().filter(|f| f.r#type == 1).map(|f| f.amount).sum();
+        assert_eq!(held_en, 3_000_000, "only the not-expired entry is re-staked");
+        assert!(acct.unfrozen_v2.is_empty(), "pending unfreezes cleared");
+        assert_eq!(acct.balance, 12_000_000, "expired 2 TRX withdrawn to balance");
+        assert_eq!(
+            dyn_props.total_energy_weight(),
+            3,
+            "weight restored only for the re-staked 3 TRX (floor(3e6/1e6)=3)"
+        );
     }
 }

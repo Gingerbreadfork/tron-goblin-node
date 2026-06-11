@@ -83,6 +83,14 @@ pub struct ImportReport {
     pub witness_count: usize,
     /// Per-store subdir names planted, in import order.
     pub stores: Vec<String>,
+    /// Cross-store consistency problems detected in the imported state
+    /// (empty = clean). A non-empty list means the snapshot's stores
+    /// reflect *different heights* — the hallmark of a snapshot copied
+    /// from a LIVE node without a quiescent flush. Such a base silently
+    /// diverges from consensus once the node applies blocks on top of
+    /// it, so the caller should refuse to run on it and re-import from a
+    /// consistent snapshot.
+    pub consistency_warnings: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -583,6 +591,20 @@ pub fn import_live(
             store: name.clone(),
             source: e,
         })?;
+        // Refresh the secondary to the primary's latest flushed + WAL'd
+        // state BEFORE scanning. Without this the scan copies only the
+        // SSTs that existed at open time (stale, and skewed differently
+        // per store), which produces a cross-store-inconsistent import:
+        // `properties` (head + TOTAL_NET_WEIGHT) ends up at a different
+        // height than `account` (frozen balances), and that mismatch
+        // permanently biases every bandwidth/fee calculation. It can't
+        // make the import perfectly consistent (each store is still an
+        // independent DB at its own catch-up point), but it minimises the
+        // window — see the consistency caveat in this fn's doc.
+        src.try_catch_up_with_primary().map_err(|e| ImportError::RocksDb {
+            store: name.clone(),
+            source: e,
+        })?;
         let dst = match comparator {
             Some((cmp_name, cmp_fn)) => {
                 RocksDbBackend::open_with_comparator(&dest, None, cmp_name, cmp_fn)
@@ -668,6 +690,8 @@ fn build_report(
         .map_err(|e| ImportError::Verification(format!("witness scan: {e}")))?
         .len();
 
+    let consistency_warnings = check_cross_store_consistency(stores, head_num);
+
     Ok(ImportReport {
         stores_imported: store_names.len(),
         bytes_copied,
@@ -676,7 +700,87 @@ fn build_report(
         solidified_block_number: solid_num,
         witness_count,
         stores: store_names,
+        consistency_warnings,
     })
+}
+
+/// Cheap cross-store consistency probe — catches a snapshot whose stores
+/// were captured at *different heights* (a live-node copy without a
+/// quiescent flush). Such a snapshot opens and reads fine but silently
+/// diverges from consensus the moment the node applies a block on top,
+/// because the head pointer (in `properties`) describes one height while
+/// the account / block stores hold another.
+///
+/// We check the head pointer (`properties`) against the block stores,
+/// which is robust and O(1):
+///   * the block at the head NUMBER (`block_index[head]`) must resolve to
+///     the head HASH stored in `properties`, and
+///   * that block must actually exist in the block store.
+///
+/// A mismatch means `properties` is at a different height than
+/// `block-index` / `block` — definitive cross-store skew. (It can't prove
+/// `account` is consistent too, but in practice the same copy that skews
+/// the block stores skews the account store, and this is the cheap,
+/// false-positive-free signal.) Returns a human-readable warning per
+/// problem found; empty means the head is internally consistent.
+/// Public entry for the daemon startup guard — same probe
+/// [`check_cross_store_consistency`] runs after an import, exposed so
+/// `runtime` can re-check on every boot (an operator may have imported
+/// with an older binary, or copied a data dir in by hand).
+pub fn startup_consistency_warnings(
+    stores: &crate::storage::OpenedStores,
+    head_num: i64,
+) -> Vec<String> {
+    check_cross_store_consistency(stores, head_num)
+}
+
+fn check_cross_store_consistency(
+    stores: &crate::storage::OpenedStores,
+    head_num: i64,
+) -> Vec<String> {
+    use tron_chainbase::{
+        BlockIndexStore, BlockStore, DynamicPropertiesStore,
+    };
+
+    let mut warnings = Vec::new();
+    if head_num <= 0 {
+        return warnings; // pre-genesis / empty snapshot — nothing to cross-check.
+    }
+    let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
+    let Some(head_hash) = dp.latest_block_header_hash().ok().flatten() else {
+        warnings.push(format!(
+            "properties says head #{head_num} but carries no head hash (skewed/partial snapshot)"
+        ));
+        return warnings;
+    };
+    let head_id = tron_types::BlockId::from_raw(head_hash);
+
+    let index = BlockIndexStore::new(stores.block_index.clone());
+    match index.get(head_num) {
+        Ok(indexed) if indexed == head_id => {}
+        Ok(indexed) => warnings.push(format!(
+            "head pointer skew: properties head #{head_num} = {} but block-index[#{head_num}] = {} \
+             — the snapshot's stores are at DIFFERENT heights (likely a live-node copy without a \
+             quiescent flush); the node will diverge from consensus. Re-import from a consistent \
+             snapshot (stop the source node before copying, or use its snapshot export).",
+            hex_encode(*head_id.as_bytes()),
+            hex_encode(*indexed.as_bytes()),
+        )),
+        Err(e) => warnings.push(format!(
+            "head pointer skew: properties head #{head_num} but block-index[#{head_num}] is \
+             unreadable ({e}) — cross-store-inconsistent snapshot; re-import from a consistent source."
+        )),
+    }
+
+    let block_store = BlockStore::new(stores.blocks.clone());
+    if block_store.get(&head_id).is_err() {
+        warnings.push(format!(
+            "head pointer skew: properties head #{head_num} ({}) is absent from the block store \
+             — cross-store-inconsistent snapshot; re-import from a consistent source.",
+            hex_encode(*head_id.as_bytes()),
+        ));
+    }
+    warnings
 }
 
 /// Recursive `std::fs::copy` walk. Returns the total bytes copied so
@@ -886,6 +990,58 @@ mod tests {
         drop(stores);
         // Return the actual store root the node created (now `database/`).
         crate::storage::resolve_db_root(&data)
+    }
+
+    /// The cross-store consistency guard must PASS a snapshot whose head
+    /// pointer agrees with the block stores, and FLAG one where the head
+    /// pointer (properties) is at a different height than block-index —
+    /// the signature of a live-node copy captured mid-write.
+    #[serial_test::serial(snapshot)]
+    #[test]
+    fn consistency_check_flags_head_store_skew() {
+        use tron_chainbase::{BlockIndexStore, BlockStore, DynamicPropertiesStore};
+        use tron_types::{build_genesis_block, genesis_block_id, mainnet_inputs};
+
+        let data = temp_dir("consistency");
+        std::fs::create_dir_all(&data).unwrap();
+        let stores = OpenedStores::open(&data).expect("open");
+        let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
+        let bi = BlockIndexStore::new(stores.block_index.clone());
+        let bs = BlockStore::new(stores.blocks.clone());
+
+        // A block id whose encoded height is 7 (first 8 bytes BE).
+        let mut raw7 = [0u8; 32];
+        raw7[..8].copy_from_slice(&7u64.to_be_bytes());
+        raw7[8] = 0xab;
+        let id7 = tron_types::BlockId::from_raw(raw7);
+        // Store a real block under that id + index it at height 7.
+        let inputs = mainnet_inputs();
+        let block = build_genesis_block(&inputs);
+        let _ = (genesis_block_id(&inputs),); // keep import used
+        bs.put(&id7, &block).unwrap();
+        bi.put(&id7).unwrap(); // indexes at id7.num() == 7
+
+        // CONSISTENT: properties head #7 == block-index[7] == stored block.
+        dp.save_latest_block_header_number(7);
+        dp.save_latest_block_header_hash(id7.as_bytes());
+        let clean = startup_consistency_warnings(&stores, 7);
+        assert!(clean.is_empty(), "consistent snapshot wrongly flagged: {clean:?}");
+
+        // SKEWED: bump the head pointer to #9 but leave block-index/block
+        // at #7 — exactly what a mid-write live copy produces.
+        dp.save_latest_block_header_number(9);
+        let skewed = startup_consistency_warnings(&stores, 9);
+        assert!(
+            !skewed.is_empty(),
+            "head-store skew not detected (head #9 but block-index has no #9)"
+        );
+        assert!(
+            skewed.iter().any(|w| w.contains("skew") || w.contains("DIFFERENT heights") || w.contains("unreadable")),
+            "warning lacks a skew explanation: {skewed:?}"
+        );
+
+        drop(stores);
+        cleanup(&data);
     }
 
     #[serial_test::serial(snapshot)]
