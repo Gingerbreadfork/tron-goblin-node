@@ -32,11 +32,13 @@ Concretely, this means:
 - **Byte-exact RocksDB compatibility.** A java-tron snapshot can be
   planted under `data_dir/db/` with `tron-node import-snapshot`,
   and the daemon picks up where the java node left off.
-- **Wire-compatible P2P.** The TRON adv-broadcast protocol
-  (`HelloMessage`, `BlockInventory`, `Inventory`, `FetchInvData`,
-  `Block`, `Trx`) is implemented at the byte level. A
-  `tron-goblin-node` instance hand-shakes with a java-tron mainnet
-  peer and pulls real blocks.
+- **Wire-compatible P2P, both directions.** The TRON adv-broadcast
+  protocol (`HelloMessage`, `BlockInventory`, `Inventory`,
+  `FetchInvData`, `Block`, `Trx`) is implemented at the byte level. A
+  `tron-goblin-node` instance hand-shakes with java-tron mainnet peers
+  and pulls real blocks — and, as a full peer, it also **listens for
+  inbound connections** and serves the sync protocol, so other nodes
+  (java-tron included) can sync *from* it.
 - **java-tron API surface.** JSON-RPC (`eth_*` + `wallet/*`) and
   gRPC (Wallet / WalletSolidity / Database / Monitor / Network) are
   both served. TronWeb, the Java SDK, and TronGrid clients can
@@ -135,9 +137,12 @@ What works today:
   live-tip `BlockInventory` advertise at head), pipelined with
   rate-limit + keepalive parity. A single **active syncer** is elected
   across the per-peer driver fleet (the rest stay connected as standby
-  and fail over if it stalls), inbound `SyncBlockChain` is **served** so
-  peers can sync *from* us, and the Hello advertises a truthful
-  solid/lowest block. Fetch is **cooperative across the peer fleet** — many
+  and fail over if it stalls), the node **listens for inbound peers**
+  (binds the P2P port, completes the responder handshake, and serves
+  `SyncBlockChain` → inventory and `FetchInvData` → blocks) so other
+  nodes — java-tron included — can sync *from* it, and the Hello
+  advertises a truthful solid/lowest block. Fetch is **cooperative
+  across the peer fleet** — many
   peers download the backlog into a shared pool in parallel while one
   driver applies in chain order. Live-validated catching up a multi-day
   backlog off public mainnet and holding the tip, not just against a
@@ -185,7 +190,8 @@ What works today:
   exposes metrics across chain head, sync flow, reorg / fork-tree
   outcomes, SR block production, PBFT message traffic, mempool
   (size + accepted + evicted + rejected-by-reason labels), active
-  peers, per-method RPC counters, and the indexer (cursor / lag /
+  peers (incl. inbound peers syncing *from* us + requests served),
+  per-method RPC counters, and the indexer (cursor / lag /
   backfill edges, per-namespace row counters, archive coverage,
   firehose head-seq and unwind counters).
 
@@ -218,23 +224,23 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **2202** |
+| Workspace tests passing | **2251** |
 | Ignored (gated on Sapling proving, ~50 MB params + 1–2 s each) | 9 |
-| Integration test files (`crates/*/tests/`) | 119 |
-| Source modules with `#[cfg(test)]` blocks | 112 |
+| Integration test files (`crates/*/tests/`) | 121 |
+| Source modules with `#[cfg(test)]` blocks | 117 |
 
 Per-crate breakdown of the test surface (where coverage lives is
 where parity risk lives):
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `tron-node`      | 356 | `tron-types`     |  58 |
+| `tron-node`      | 366 | `tron-types`     |  58 |
 | `tron-actuator`  | 321 | `tron-net`       |  57 |
-| `tron-rpc`       | 309 | `tron-index`     |  55 |
-| `tron-tvm`       | 285 | `tron-crypto`    |  34 |
-| `tron-chainbase` | 220 | `tron-mempool`   |  25 |
-| `tron-executor`  | 135 | `tron-wallet`    |  22 |
-| `tron-consensus` |  88 | `tron-eventer`   |  14 |
+| `tron-rpc`       | 314 | `tron-index`     |  55 |
+| `tron-tvm`       | 297 | `tron-crypto`    |  34 |
+| `tron-chainbase` | 226 | `tron-mempool`   |  25 |
+| `tron-executor`  | 149 | `tron-wallet`    |  22 |
+| `tron-consensus` |  88 | `tron-eventer`   |  16 |
 | `tron-grpc`      |  66 | `tron-firehose-*`|   8 |
 | `tron-proto`     |   8 | `tron-replay`    |   6 |
 
@@ -343,7 +349,7 @@ The full workspace compiles in ~3–5 minutes on a modern machine.
 Tests:
 
 ```sh
-cargo test --workspace            # 2200+ tests, all defaults
+cargo test --workspace            # 2250+ tests, all defaults
 cargo test --workspace --release -- --ignored
                                   # adds 9 Sapling-proving tests
                                   # (~50 MB Groth16 params + 1-2s each)
@@ -383,6 +389,12 @@ TCP reachability pre-flight, log capture, and a post-run summary:
 ```
 
 Run with `--help` for all options.
+
+By default the node is a **full peer**: it listens on the P2P port
+(`18888`) and serves blocks to nodes that sync *from* it, in addition to
+dialing peers to sync itself. For other peers to actually reach you, that
+port must be open through your firewall / NAT (port-forward). To run as a
+firewalled, outbound-only sync client instead, set `[p2p] listen = false`.
 
 To plant a java-tron snapshot first (skip the genesis-walk and start
 from a recent state):
@@ -484,8 +496,10 @@ Every `[index]` knob is annotated in
   no LevelDB backend. A java-tron snapshot is a `tron-node` data directory
   after `import-snapshot`, **provided it was written with `db.engine =
   ROCKSDB`**; LevelDB snapshots are not supported.
-- **P2P**: byte-exact handshake + adv-broadcast. The node identifies
-  itself on the wire as `tron-goblin/0.0.1`.
+- **P2P**: byte-exact handshake + adv-broadcast, **inbound and
+  outbound** — the node dials peers to sync and also listens on the P2P
+  port (`18888` by default; `[p2p] listen`) to serve peers that sync
+  from it. Identifies itself on the wire as `tron-goblin/0.0.1`.
 - **JSON-RPC + gRPC**: response shapes match java-tron's. Deliberate
   deviations (e.g. `createtransaction` permissiveness, `getaccount`
   on unknown addresses) are pinned in tests and documented at the

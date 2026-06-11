@@ -41,6 +41,20 @@ pub fn utc_millis(ms: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// Epoch-millis → `"YYYY-MM-DD HH:MM:SS.mmm"` (UTC) — the per-line log
+/// timestamp. Like [`utc_millis`] but keeps millisecond precision and drops the
+/// `Z` (the whole log stream is UTC). Negative input clamps to the epoch.
+pub fn log_timestamp(ms: i64) -> String {
+    let ms = ms.max(0);
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, mo, d) = civil_from_days(days);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{millis:03}")
+}
+
 /// Coarse human duration from millis, top two units: `"3d 2h"`, `"5m 12s"`,
 /// `"4s"`. Non-positive renders as `"0s"` (treats "block in the future" from
 /// minor clock skew as "at tip").
@@ -100,6 +114,13 @@ mod tests {
         assert_eq!(utc_millis(1), "1970-01-01 00:00:00Z");
         // Unset.
         assert_eq!(utc_millis(0), "—");
+    }
+
+    #[test]
+    fn log_timestamp_keeps_millis_and_drops_z() {
+        assert_eq!(log_timestamp(1_700_000_000_123), "2023-11-14 22:13:20.123");
+        assert_eq!(log_timestamp(0), "1970-01-01 00:00:00.000");
+        assert_eq!(log_timestamp(-5), "1970-01-01 00:00:00.000");
     }
 
     #[test]

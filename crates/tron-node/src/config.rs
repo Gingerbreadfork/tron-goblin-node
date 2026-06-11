@@ -1927,6 +1927,8 @@ mod tests {
         assert_eq!(cfg.metrics.port, 9090);
         assert_eq!(cfg.p2p.advertise_port, 18888);
         assert_eq!(cfg.p2p.max_peers, 60);
+        assert!(cfg.p2p.listen);
+        assert_eq!(cfg.p2p.listen_host, "0.0.0.0");
         assert!(cfg.p2p.discover_enable);
         // No [witness] table → sync-only.
         assert!(cfg.witness.is_none());

@@ -942,22 +942,47 @@ fn run_init(args: &[String]) -> ExitCode {
     }
 }
 
+/// Compact UTC log timestamp — `YYYY-MM-DD HH:MM:SS.mmm`, no `T`/`Z`/nanos —
+/// replacing tracing's verbose default (`2026-06-11T08:31:53.427701Z`).
+struct CompactUtcTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for CompactUtcTime {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        write!(w, "{}", tron_node::logfmt::log_timestamp(ms))
+    }
+}
+
 /// Initialize the `tracing` subscriber:
 ///
 /// * `EnvFilter` reads `RUST_LOG` (e.g. `RUST_LOG=info,tron_node=debug`).
 ///   Defaults to `info` when unset so a flagless invocation emits the
 ///   key lifecycle lines without being noisy.
 /// * `fmt::Layer` writes to stderr (so stdout stays clean for piped
-///   subcommands like `dump-state`).
+///   subcommands like `dump-state`), with a compact UTC timestamp.
+/// * **Color is auto-detected**: ANSI escapes are emitted ONLY when stderr is
+///   a real terminal and `NO_COLOR` is unset (https://no-color.org). Tracing's
+///   default emits ANSI unconditionally, which fills redirected logs (files,
+///   `journald`, `tmux capture`) with `^[[2m…` escape soup — the main reason the
+///   logs read as garbled when captured.
 ///
 /// Called once at the top of `main()`. Safe to call before any
 /// subcommand parsing — the subscriber is global.
 fn init_tracing() {
+    use std::io::IsTerminal as _;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
+        .with_ansi(ansi)
+        .with_timer(CompactUtcTime)
         .with_target(false);
     let _ = tracing_subscriber::registry()
         .with(filter)

@@ -114,14 +114,28 @@ discover_tree_query_timeout_ms = 5000
 node_discovery_persist = true
 node_discovery_persist_interval_ms = 60000
 
-# Port advertised to peers in Hello messages. 18888 is mainnet's P2P port.
-# A valid non-zero port is required even for sync-only nodes that don't listen.
+# Port advertised to peers in Hello messages, and (when `listen = true`) the
+# port the inbound listener binds. 18888 is mainnet's P2P port. A valid non-zero
+# port is required even for outbound-only nodes — java-tron's NetUtil.validNode
+# rejects port 0 with BAD_PROTOCOL.
 advertise_port = 18888
 
 # Max concurrent peer connections (each = one tokio task + one TCP socket).
 # 60 spreads thinly across many ASNs to find archive-capable peers without
-# tripping any single host's same-IP cap.
+# tripping any single host's same-IP cap. Also caps concurrent INBOUND peers.
 max_peers = 60
+
+# Accept INBOUND connections so other peers (java-tron deployments and our own
+# kind) can sync FROM us. When true, we bind `listen_host:advertise_port` and
+# serve the sync protocol (SyncBlockChain -> inventory, FetchInvData -> blocks)
+# over accepted connections. A full node should be reachable; set false for a
+# pure outbound-only / firewalled sync client. (For external peers to reach you,
+# the port must be open through your firewall / NAT.)
+listen = true
+
+# Interface the inbound listener binds. "0.0.0.0" = all interfaces; use
+# "127.0.0.1" to accept only local connections. Only consulted when listen = true.
+listen_host = "0.0.0.0"
 
 # Heartbeat: log an "applied block" line every N blocks. 0 = quiet (failures
 # only), 1 = every block, 100 = a usable progress trail during a long sync.
