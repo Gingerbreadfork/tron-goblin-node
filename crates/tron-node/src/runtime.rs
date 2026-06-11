@@ -1223,6 +1223,19 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         );
         combined_peers = shuffled;
     }
+
+    // Shared process-wide inbound-bytes budget (N-3): a single ceiling on
+    // frame bytes being buffered across ALL peer connections — the inbound
+    // server AND every outbound dialer draw from this one pool. Without it
+    // the per-frame `MAX_FRAME_BYTES` (10 MiB) multiplies into
+    // `peers × 10 MiB` of potentially-pinned RAM under a many-peer flood
+    // (~2 GiB at 200 peers). 512 MiB sits far above normal use (a handful
+    // of peers mid-block is tens of MiB) while capping the pathological case;
+    // a peer whose frame would breach the ceiling is shed with
+    // `FrameError::BudgetExceeded` and reconnects.
+    const INBOUND_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+    let inbound_budget = tron_net::InboundByteBudget::new(INBOUND_BUDGET_BYTES);
+
     // Inbound P2P listener — lets other peers (java-tron deployments and our
     // own kind) sync FROM us. Independent of the outbound dialers below: we
     // serve even with zero configured outbound peers. Bind failures are
@@ -1233,16 +1246,19 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         match format!("{listen_host}:{listen_port}").parse::<std::net::SocketAddr>() {
             Ok(addr) => {
                 let inbound_state = stores.to_state_backends();
-                let server = std::sync::Arc::new(crate::inbound::InboundServer::new(
-                    inbound_state.block_index.clone(),
-                    stores.blocks.clone(),
-                    inbound_state.dyn_props.clone(),
-                    Some(mempool.clone()),
-                    tron_types::genesis_block_id(&tron_types::mainnet_inputs()),
-                    config.p2p.advertise_port,
-                    Some(metrics.clone()),
-                    config.p2p.max_peers,
-                ));
+                let server = std::sync::Arc::new(
+                    crate::inbound::InboundServer::new(
+                        inbound_state.block_index.clone(),
+                        stores.blocks.clone(),
+                        inbound_state.dyn_props.clone(),
+                        Some(mempool.clone()),
+                        tron_types::genesis_block_id(&tron_types::mainnet_inputs()),
+                        config.p2p.advertise_port,
+                        Some(metrics.clone()),
+                        config.p2p.max_peers,
+                    )
+                    .with_inbound_budget(inbound_budget.clone()),
+                );
                 let sd = shutdown.subscribe();
                 handles.push(tokio::spawn(crate::inbound::run_inbound_listener(
                     server, addr, sd,
@@ -1570,11 +1586,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             let fetch_pool_for_peer = fetch_pool.clone();
             let index_hook_for_peer = index_hook.clone();
             let event_bus_for_peer = event_bus.clone();
+            let inbound_budget_for_peer = inbound_budget.clone();
             driver_handles.push(tokio::spawn(async move {
                 let mut driver = crate::sync::SyncDriver::new(state_for_peer, cfg)
                     .with_metrics(metrics_for_peer)
                     .with_mempool(mempool_for_peer)
                     .with_undo_store(undo_for_peer)
+                    .with_inbound_budget(inbound_budget_for_peer)
                     .with_peer_state(peer_state_for_peer)
                     .with_node_statistics(node_stats_for_peer)
                     .with_peer_registry(peer_registry_for_peer)

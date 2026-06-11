@@ -36,7 +36,8 @@ use tracing::{debug, info, warn};
 use tron_chainbase::{BlockIndexStore, DynamicPropertiesStore, KvBackend};
 use tron_mempool::TxMempool;
 use tron_net::{
-    Frame, HelloInputs, Libp2pHelloInputs, MessageType, PeerConnection, MAINNET_P2P_VERSION,
+    Frame, HelloInputs, InboundByteBudget, Libp2pHelloInputs, MessageType, PeerConnection,
+    MAINNET_P2P_VERSION,
 };
 use tron_proto::Endpoint;
 use tron_types::BlockId;
@@ -66,6 +67,10 @@ pub struct InboundServer {
     metrics: Option<Arc<tron_rpc::Metrics>>,
     max_inbound: usize,
     inbound: AtomicUsize,
+    /// Shared process-wide inbound-bytes budget (N-3). When set, every
+    /// accepted peer's inbound frames draw from this pool along with the
+    /// outbound dialers, capping total buffered bytes across all peers.
+    inbound_budget: Option<InboundByteBudget>,
 }
 
 impl InboundServer {
@@ -90,7 +95,16 @@ impl InboundServer {
             metrics,
             max_inbound: max_inbound.max(1),
             inbound: AtomicUsize::new(0),
+            inbound_budget: None,
         }
+    }
+
+    /// Attach the shared process-wide inbound-bytes budget (N-3). Use the
+    /// SAME [`InboundByteBudget`] as the outbound dialers so the cap spans
+    /// every connection.
+    pub fn with_inbound_budget(mut self, budget: InboundByteBudget) -> Self {
+        self.inbound_budget = Some(budget);
+        self
     }
 
     fn head_number(&self) -> i64 {
@@ -228,6 +242,9 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut conn = PeerConnection::new(stream);
+    if let Some(budget) = &server.inbound_budget {
+        conn = conn.with_inbound_budget(budget.clone());
+    }
     let node_id = random_node_id();
     let ts = now_ms();
 

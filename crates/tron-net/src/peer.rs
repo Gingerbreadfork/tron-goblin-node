@@ -33,7 +33,7 @@ use tron_proto::{DisconnectMessage, Endpoint, HelloMessage, ReasonCode};
 
 use crate::hello::{build_hello, HelloInputs};
 use crate::message_type::MessageType;
-use crate::transport::{Frame, FrameError, TronFrameCodec, MAX_FRAME_BYTES};
+use crate::transport::{Frame, FrameError, InboundByteBudget, TronFrameCodec, MAX_FRAME_BYTES};
 
 /// Inputs needed for the libp2p-layer (connection-level) Hello.
 ///
@@ -72,6 +72,11 @@ pub enum TronState {
 /// file descriptor indefinitely (slowloris — N-1). Override per-connection
 /// with [`PeerConnection::with_handshake_timeout`].
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Length of a node-id (uncompressed-pubkey identifier) in bytes —
+/// java-tron's `Constant.NODE_ID_LEN`. A peer's handshake `from.node_id`
+/// must be exactly this, when present (N-31).
+pub const NODE_ID_LEN: usize = 64;
 
 /// Max time to establish the TCP connection in [`PeerConnection::dial`] before
 /// giving up. A bare `TcpStream::connect` to a dead/firewalled host blocks for
@@ -165,6 +170,16 @@ where
         self
     }
 
+    /// Attach a shared inbound-bytes budget (N-3) so this connection's
+    /// inbound frames count against a process-wide ceiling along with every
+    /// other connection sharing the same [`InboundByteBudget`]. Builder-style;
+    /// call right after [`Self::new`]/[`Self::dial`] (before any IO). Hand the
+    /// SAME budget to every connection for the cap to be global.
+    pub fn with_inbound_budget(mut self, budget: InboundByteBudget) -> Self {
+        self.framed.codec_mut().set_budget(budget);
+        self
+    }
+
     /// Write one codec frame with the send timeout applied. EVERY outbound
     /// write must funnel through here — an un-bounded `framed.send` against
     /// a peer that stopped reading parks the task forever (see
@@ -240,6 +255,18 @@ where
                 ours: local_network_id,
                 theirs: peer_hello.network_id,
             });
+        }
+
+        // Validate the peer's advertised node-id length (N-31). java-tron's
+        // `Node` requires exactly `Constant.NODE_ID_LEN` (64) bytes. We accept
+        // an absent / empty id (some peers omit it and accept implicitly), but
+        // reject a present-but-wrong-length id so an attacker can't push an
+        // oversized blob through the handshake into discovery / routing state.
+        if let Some(from) = peer_hello.from.as_ref() {
+            let id_len = from.node_id.len();
+            if id_len != 0 && id_len != NODE_ID_LEN {
+                return Err(HandshakeError::InvalidNodeId { len: id_len });
+            }
         }
 
         // Post-libp2p-handshake, BOTH directions wrap frames in
@@ -462,6 +489,15 @@ where
         }))
     }
 
+    /// Test-only: force the post-libp2p `compress_wrap` state so the
+    /// CompressMessage wrap/unwrap codepath (the most attack-exposed and
+    /// thinnest-tested per N-6 / N-37) can be exercised without driving a
+    /// full handshake.
+    #[cfg(test)]
+    pub(crate) fn set_compress_wrap_for_test(&mut self, on: bool) {
+        self.compress_wrap = on;
+    }
+
     async fn next_frame_required(&mut self) -> Result<Frame, HandshakeError> {
         // Bound the read so a peer that connects but never sends can't
         // pin this task and its FD forever (N-1). Both handshake phases
@@ -602,6 +638,8 @@ pub enum HandshakeError {
     Libp2pDisconnected(i32),
     #[error("incompatible libp2p network id: ours={ours}, theirs={theirs}")]
     IncompatibleNetworkId { ours: i32, theirs: i32 },
+    #[error("invalid node-id length {len} (expected {NODE_ID_LEN} or absent)")]
+    InvalidNodeId { len: usize },
     #[error("frame error: {0}")]
     Frame(#[from] FrameError),
     #[error("decode: {0}")]
@@ -642,12 +680,243 @@ fn libp2p_handshake_code_name(code: i32) -> &'static str {
 mod tests {
     use super::*;
 
+    // === compress-wrap codepath coverage (N-6 / N-37) ===
+    //
+    // Post-libp2p-handshake every frame is wrapped in a `CompressMessage`
+    // whose first proto byte doubles as the codec "type byte". These tests
+    // drive that wrap/unwrap directly — the happy paths (uncompressed +
+    // snappy) and the negative paths a hostile peer can reach, asserting we
+    // surface a clean `FrameError` (which the caller counts as a peer
+    // failure) instead of panicking.
+
+    use tron_proto::libp2p::{compress_message::CompressType, CompressMessage};
+
+    fn duplex_pair() -> (
+        PeerConnection<tokio::io::DuplexStream>,
+        PeerConnection<tokio::io::DuplexStream>,
+    ) {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        (PeerConnection::new(a), PeerConnection::new(b))
+    }
+
+    /// Put a raw `CompressMessage` on the wire from an UN-wrapped sender —
+    /// reproducing exactly what a peer's wrapped frame looks like, so the
+    /// receiver's `compress_wrap` unwrap path is what's under test.
+    async fn send_raw_compress(
+        sender: &mut PeerConnection<tokio::io::DuplexStream>,
+        msg: CompressMessage,
+    ) {
+        let proto = msg.encode_to_vec();
+        assert!(!proto.is_empty(), "test CompressMessage must encode to >=1 byte");
+        let ty = MessageType::from_byte(proto[0]).expect("first proto byte is a valid type tag");
+        sender
+            .send_frame(Frame {
+                ty,
+                payload: Bytes::from(proto[1..].to_vec()),
+            })
+            .await
+            .expect("raw send");
+    }
+
+    #[tokio::test]
+    async fn compress_wrap_uncompressed_round_trip() {
+        let (mut tx, mut rx) = duplex_pair();
+        tx.set_compress_wrap_for_test(true);
+        rx.set_compress_wrap_for_test(true);
+        let payload = Bytes::from(b"a short, incompressible-ish blob".to_vec());
+        tx.send_frame(Frame { ty: MessageType::Block, payload: payload.clone() })
+            .await
+            .expect("send");
+        let got = rx.next_frame().await.expect("ok").expect("a frame");
+        assert_eq!(got.ty, MessageType::Block);
+        assert_eq!(got.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn compress_wrap_snappy_round_trip() {
+        let (mut tx, mut rx) = duplex_pair();
+        tx.set_compress_wrap_for_test(true);
+        rx.set_compress_wrap_for_test(true);
+        // Highly compressible → the sender picks snappy, exercising the
+        // decompress path on receive.
+        let payload = Bytes::from(vec![0x7u8; 4096]);
+        tx.send_frame(Frame { ty: MessageType::Trxs, payload: payload.clone() })
+            .await
+            .expect("send");
+        let got = rx.next_frame().await.expect("ok").expect("a frame");
+        assert_eq!(got.ty, MessageType::Trxs);
+        assert_eq!(got.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn compress_wrap_rejects_invalid_inner_type() {
+        let (mut tx, mut rx) = duplex_pair();
+        rx.set_compress_wrap_for_test(true);
+        // Inner data leads with 0x0a — a reserved/undefined message-type byte.
+        let msg = CompressMessage {
+            r#type: CompressType::Uncompress as i32,
+            data: vec![0x0a, 0xAA, 0xBB],
+        };
+        send_raw_compress(&mut tx, msg).await;
+        let err = rx.next_frame().await.expect_err("invalid inner type");
+        assert!(matches!(err, FrameError::BadType(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn compress_wrap_rejects_unknown_compress_type() {
+        let (mut tx, mut rx) = duplex_pair();
+        rx.set_compress_wrap_for_test(true);
+        let msg = CompressMessage { r#type: 99, data: vec![0x02, 0x01] };
+        send_raw_compress(&mut tx, msg).await;
+        let err = rx.next_frame().await.expect_err("unknown compress type");
+        assert!(matches!(err, FrameError::Io(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn compress_wrap_rejects_garbage_proto() {
+        let (mut tx, mut rx) = duplex_pair();
+        rx.set_compress_wrap_for_test(true);
+        // A non-wrapped sender emits a frame whose reassembled proto bytes
+        // (`[ty][payload]`) are not a valid CompressMessage.
+        tx.send_frame(Frame {
+            ty: MessageType::SyncBlockChain, // 0x08 — a valid proto field tag
+            payload: Bytes::from(vec![0xFF, 0xFF, 0xFF, 0xFF]),
+        })
+        .await
+        .expect("send");
+        let err = rx.next_frame().await.expect_err("garbage proto");
+        assert!(matches!(err, FrameError::Io(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn compress_wrap_rejects_snappy_bomb_on_receive() {
+        let (mut tx, mut rx) = duplex_pair();
+        rx.set_compress_wrap_for_test(true);
+        // A snappy frame that declares a huge decompressed size — the receive
+        // path must reject it by size (N-4) rather than allocating. Its
+        // *compressed* form (~0.5 MiB) is larger than the duplex buffer, so the
+        // send must run concurrently with the receiver draining it.
+        let bomb = snap::raw::Encoder::new()
+            .compress_vec(&vec![0u8; MAX_FRAME_BYTES + 1024 * 1024])
+            .unwrap();
+        assert!(bomb.len() < MAX_FRAME_BYTES);
+        let msg = CompressMessage { r#type: CompressType::Snappy as i32, data: bomb };
+        let send_task = tokio::spawn(async move {
+            send_raw_compress(&mut tx, msg).await;
+        });
+        let err = rx.next_frame().await.expect_err("snappy bomb");
+        assert!(matches!(err, FrameError::TooLarge), "got {err:?}");
+        let _ = send_task.await;
+    }
+
     #[test]
     fn snappy_decompress_checked_round_trips_normal_frames() {
         let original = b"hello snappy world".repeat(64);
         let compressed = snap::raw::Encoder::new().compress_vec(&original).unwrap();
         let got = snappy_decompress_checked(&compressed).expect("normal frame decompresses");
         assert_eq!(got, original);
+    }
+
+    #[tokio::test]
+    async fn libp2p_handshake_rejects_wrong_length_node_id() {
+        use tron_proto::libp2p::ConnectHelloMessage;
+        use tron_proto::Endpoint;
+
+        // The remote sends a valid-looking ConnectHello (matching network id,
+        // code 0) but a `from.node_id` that is not 64 bytes — must be rejected
+        // (N-31) so an oversized/garbage id can't pass into our routing layer.
+        let (a, b) = tokio::io::duplex(8192);
+        let mut us = PeerConnection::new(a);
+        let mut peer = PeerConnection::new(b);
+
+        let peer_task = tokio::spawn(async move {
+            // Read our outbound libp2p Hello, then reply with the bad id.
+            let _ours = peer.next_frame().await.expect("read our hello");
+            let bad = ConnectHelloMessage {
+                from: Some(Endpoint {
+                    address: b"127.0.0.1".to_vec(),
+                    address_ipv6: vec![],
+                    port: 18_888,
+                    node_id: vec![0u8; 10], // wrong length
+                }),
+                network_id: 11_111,
+                code: 0,
+                timestamp: 0,
+                version: 2,
+            };
+            peer.send_frame(Frame {
+                ty: MessageType::Libp2pHandshakeHello,
+                payload: Bytes::from(bad.encode_to_vec()),
+            })
+            .await
+            .expect("send bad hello");
+        });
+
+        let local = Libp2pHelloInputs {
+            from: Endpoint {
+                address: b"127.0.0.1".to_vec(),
+                address_ipv6: vec![],
+                port: 18_888,
+                node_id: vec![0u8; NODE_ID_LEN],
+            },
+            network_id: 11_111,
+            version: 2,
+            timestamp_ms: 0,
+        };
+        let err = us.libp2p_handshake(local).await.unwrap_err();
+        assert!(
+            matches!(err, HandshakeError::InvalidNodeId { len: 10 }),
+            "got {err:?}"
+        );
+        let _ = peer_task.await;
+    }
+
+    #[tokio::test]
+    async fn libp2p_handshake_accepts_64_byte_node_id() {
+        use tron_proto::libp2p::ConnectHelloMessage;
+        use tron_proto::Endpoint;
+
+        // A 64-byte id is accepted (the normal mainnet case).
+        let (a, b) = tokio::io::duplex(8192);
+        let mut us = PeerConnection::new(a);
+        let mut peer = PeerConnection::new(b);
+
+        let peer_task = tokio::spawn(async move {
+            let _ours = peer.next_frame().await.expect("read our hello");
+            let good = ConnectHelloMessage {
+                from: Some(Endpoint {
+                    address: b"127.0.0.1".to_vec(),
+                    address_ipv6: vec![],
+                    port: 18_888,
+                    node_id: vec![7u8; NODE_ID_LEN],
+                }),
+                network_id: 11_111,
+                code: 0,
+                timestamp: 0,
+                version: 2,
+            };
+            peer.send_frame(Frame {
+                ty: MessageType::Libp2pHandshakeHello,
+                payload: Bytes::from(good.encode_to_vec()),
+            })
+            .await
+            .expect("send good hello");
+        });
+
+        let local = Libp2pHelloInputs {
+            from: Endpoint {
+                address: b"127.0.0.1".to_vec(),
+                address_ipv6: vec![],
+                port: 18_888,
+                node_id: vec![0u8; NODE_ID_LEN],
+            },
+            network_id: 11_111,
+            version: 2,
+            timestamp_ms: 0,
+        };
+        let ok = us.libp2p_handshake(local).await;
+        assert!(ok.is_ok(), "64-byte id accepted: {ok:?}");
+        let _ = peer_task.await;
     }
 
     #[test]

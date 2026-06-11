@@ -211,15 +211,28 @@ fn verify_root_signature(
     Err("root signature does not match the tree's pubkey".to_string())
 }
 
-/// Walk the tree at `tree_url` and return every IPv4 endpoint found.
+/// Hard caps on a single tree walk so a malicious or misconfigured tree
+/// can't drive an unbounded number of DNS queries against us / the
+/// resolver (N-16). A well-formed mainnet tree is shallow — a handful of
+/// branch records and a few hundred leaves — so these ceilings sit far
+/// above legitimate use while still bounding the worst case. The
+/// `visited` set already prevents re-walking a repeated hash; these cap
+/// the count of *distinct* records we'll chase.
+const MAX_BRANCHES: usize = 4_096;
+const MAX_LEAVES: usize = 16_384;
+const MAX_LOOKUPS: usize = 32_768;
+
+/// Walk the tree at `tree_url` and return every endpoint found.
 ///
 /// `query_timeout` is per individual DNS lookup; the overall walk takes
 /// at most `query_timeout * (branches + 1)`. A well-formed mainnet tree
 /// is shallow (a handful of branches, hundreds of leaves), so a 3-5s
-/// per-query budget keeps total walk time under 30s in practice.
+/// per-query budget keeps total walk time under 30s in practice. The walk
+/// is additionally bounded by [`MAX_BRANCHES`] / [`MAX_LEAVES`] /
+/// [`MAX_LOOKUPS`] (N-16).
 ///
-/// Returns `Ok([])` if the tree contains only IPv6 endpoints (we don't
-/// dial v6 from the TCP side) or only link entries we can't follow.
+/// Returns `Ok([])` if the tree contains only link entries we can't
+/// follow. IPv6 endpoints are included alongside IPv4 (N-21).
 pub async fn resolve(
     tree_url: &str,
     query_timeout: Duration,
@@ -285,10 +298,19 @@ pub async fn resolve(
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut branches_walked = 0usize;
     let mut leaves_walked = 0usize;
+    let mut lookups = 0usize;
 
     while let Some(hash) = pending.pop_front() {
         if !visited.insert(hash.clone()) {
             continue;
+        }
+        // Bound total distinct lookups so an adversarial tree (deep / wide,
+        // all distinct hashes) can't drive unbounded DNS traffic (N-16).
+        lookups += 1;
+        if lookups > MAX_LOOKUPS {
+            warn!(domain = tree.domain.as_str(), cap = MAX_LOOKUPS,
+                  "dns: tree walk hit lookup cap; stopping early");
+            break;
         }
         let label = format!("{hash}.{}", tree.domain);
         let txt = match lookup_txt(&resolver, &label, query_timeout).await {
@@ -301,6 +323,11 @@ pub async fn resolve(
 
         if let Some(rest) = txt.strip_prefix("tree-branch:") {
             branches_walked += 1;
+            if branches_walked > MAX_BRANCHES {
+                warn!(domain = tree.domain.as_str(), cap = MAX_BRANCHES,
+                      "dns: tree walk hit branch cap; stopping early");
+                break;
+            }
             for child in rest.split(',') {
                 let child = child.trim();
                 if !child.is_empty() {
@@ -309,6 +336,11 @@ pub async fn resolve(
             }
         } else if let Some(rest) = txt.strip_prefix("nodes:") {
             leaves_walked += 1;
+            if leaves_walked > MAX_LEAVES {
+                warn!(domain = tree.domain.as_str(), cap = MAX_LEAVES,
+                      "dns: tree walk hit leaf cap; stopping early");
+                break;
+            }
             let payload = rest.trim_matches('"');
             let bytes = match base64_url_decode(payload) {
                 Ok(b) => b,
@@ -325,7 +357,7 @@ pub async fn resolve(
                 }
             };
             for ep in endpoints.nodes {
-                if let Some(addr) = parse_ipv4_endpoint(&ep) {
+                if let Some(addr) = parse_endpoint(&ep) {
                     out.push(addr);
                 }
             }
@@ -425,19 +457,27 @@ fn decode_root_signature(field: &[u8]) -> Result<Vec<u8>, String> {
     base64_url_decode(s.trim()).map_err(|e| format!("base64 decode: {e}"))
 }
 
-/// Build a `SocketAddr` from a proto `Endpoint`. IPv4 only. Returns
-/// `None` for invalid ports, unparseable IP strings, or IPv6-only
-/// entries.
-fn parse_ipv4_endpoint(ep: &tron_proto::Endpoint) -> Option<SocketAddr> {
+/// Build a `SocketAddr` from a proto `Endpoint`. Prefers the IPv4
+/// `address` string, falling back to the IPv6 `address_ipv6` field so v6
+/// endpoints are no longer silently dropped (N-21). Returns `None` for
+/// invalid ports or entries whose address fields are both empty /
+/// unparseable.
+fn parse_endpoint(ep: &tron_proto::Endpoint) -> Option<SocketAddr> {
     if ep.port <= 0 || ep.port > 65535 {
         return None;
     }
-    let s = std::str::from_utf8(&ep.address).ok()?;
-    if s.is_empty() {
-        return None;
+    let port = ep.port as u16;
+    for field in [&ep.address, &ep.address_ipv6] {
+        if field.is_empty() {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(field) {
+            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                return Some(SocketAddr::new(ip, port));
+            }
+        }
     }
-    let ip: std::net::IpAddr = s.parse().ok()?;
-    Some(SocketAddr::new(ip, ep.port as u16))
+    None
 }
 
 #[cfg(test)]
@@ -530,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ipv4_endpoint_handles_edge_cases() {
+    fn parse_endpoint_handles_edge_cases() {
         use tron_proto::Endpoint;
         // Valid IPv4
         let ep = Endpoint {
@@ -540,7 +580,7 @@ mod tests {
             address_ipv6: vec![],
         };
         assert_eq!(
-            parse_ipv4_endpoint(&ep),
+            parse_endpoint(&ep),
             Some(SocketAddr::from(([10, 0, 0, 1], 18888)))
         );
         // Bad port
@@ -550,23 +590,25 @@ mod tests {
             node_id: vec![],
             address_ipv6: vec![],
         };
-        assert!(parse_ipv4_endpoint(&ep).is_none());
-        // Empty address (IPv6-only entry)
+        assert!(parse_endpoint(&ep).is_none());
+        // IPv6-only entry — now parsed rather than dropped (N-21).
         let ep = Endpoint {
             address: vec![],
             port: 18888,
             node_id: vec![],
-            address_ipv6: b"::1".to_vec(),
+            address_ipv6: b"2001:db8::1".to_vec(),
         };
-        assert!(parse_ipv4_endpoint(&ep).is_none());
-        // Non-ASCII address
+        let got = parse_endpoint(&ep).expect("v6 endpoint parses");
+        assert!(got.is_ipv6());
+        assert_eq!(got.port(), 18888);
+        // Non-ASCII address with no v6 fallback → None
         let ep = Endpoint {
             address: vec![0xFF, 0xFE, 0xFD],
             port: 18888,
             node_id: vec![],
             address_ipv6: vec![],
         };
-        assert!(parse_ipv4_endpoint(&ep).is_none());
+        assert!(parse_endpoint(&ep).is_none());
     }
 
     #[test]

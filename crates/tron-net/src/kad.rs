@@ -36,6 +36,32 @@
 //! parallel queries per round and up to [`MAX_STEPS`] rounds, matching
 //! java-tron's `DiscoverTask.discover`.
 //!
+//! ## Security boundary (plaintext UDP, no authentication)
+//!
+//! Discovery runs over **unauthenticated, unencrypted UDP** — there is no
+//! TLS and no per-packet signature, exactly like java-tron's libp2p
+//! discovery. A datagram's protobuf `from` field is *attacker-controlled*
+//! and the source IP can be spoofed. The service therefore treats every
+//! claim as a hint to be proven, not a fact:
+//!
+//! * **Bonding before table membership (N-9 / N-32).** A node enters the
+//!   routing table *only* after it answers a `KAD_PING` we sent with a
+//!   `KAD_PONG` from that same socket address. `KAD_NEIGHBORS` referrals
+//!   and unsolicited `KAD_PING`s never insert directly — they trigger a
+//!   verification ping, and the peer is promoted only when its `KAD_PONG`
+//!   proves it is reachable at the advertised address. This defeats
+//!   third-party node-id / address injection (eclipse).
+//! * **Anti-amplification (N-18).** The large `KAD_NEIGHBORS` reply is
+//!   sent **only to bonded peers**. A spoofed source can never bond, so
+//!   the UDP reflection/amplification vector is closed; the only replies a
+//!   non-bonded source can elicit (`KAD_PONG` to its `KAD_PING`) are the
+//!   same size as the request.
+//! * **Per-IP rate limit + temporary bans (N-18 / N-22).** Inbound packets
+//!   are rate-limited per source IP; repeated malformed packets earn a
+//!   temporary ban.
+//! * **Subnet diversity (N-10).** A single public `/24` (v4) or `/48` (v6)
+//!   may occupy only [`MAX_PER_GROUP`] table slots.
+//!
 //! ## Distance metric
 //!
 //! [`distance`] mirrors `NodeEntry.distance` from java-tron exactly —
@@ -54,12 +80,14 @@
 //! * No bucket-trim threshold at 3000 nodes. Practical mainnet routing
 //!   tables stabilize around 200-400 entries; the threshold is dead code
 //!   in the upstream.
-//! * IPv4 only. Endpoints with only an `address_ipv6` are skipped.
+//! * IPv4 and IPv6 endpoints are both accepted (N-21). The TCP dial side
+//!   fails an unroutable v6 address fast via its connect timeout, so a v6
+//!   endpoint on a v4-only host degrades like any other dead peer rather
+//!   than being silently discarded.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use prost::Message;
@@ -92,6 +120,54 @@ pub const WAIT_TIME: Duration = Duration::from_millis(100);
 /// us). Otherwise target a random id (to scatter the table).
 pub const SELF_LOOKUP_EVERY: u32 = 5;
 
+/// Max routing-table entries that may share one public `/24` (v4) or
+/// `/48` (v6). Bounds how much of the table a single subnet operator can
+/// occupy (eclipse defense, N-10). Loopback / private / link-local
+/// addresses are exempt (they are not eclipse-relevant and keep
+/// loopback-based tests working).
+pub const MAX_PER_GROUP: usize = 4;
+
+/// How long a `KAD_PING` we sent stays "pending" while we wait for the
+/// peer's `KAD_PONG` to promote it into the table. After this the
+/// expectation is dropped so a never-answering address can't pin a
+/// pending slot forever.
+const PENDING_EXPIRY: Duration = Duration::from_secs(30);
+
+/// Inbound-packet rate-limit window per source IP (N-18).
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Max inbound discovery packets accepted from one source IP per
+/// [`RATE_WINDOW`]. Discovery is low-rate (a handful of packets per peer
+/// per bootstrap / lookup round), so this is generous for honest peers
+/// while still capping a flood.
+const MAX_PACKETS_PER_WINDOW: u32 = 64;
+/// Malformed-packet strikes from one IP within [`STRIKE_WINDOW`] that
+/// trip a temporary ban (N-22).
+const MAX_STRIKES: u32 = 8;
+/// Rolling window over which malformed-packet strikes accumulate.
+const STRIKE_WINDOW: Duration = Duration::from_secs(60);
+/// How long a misbehaving IP stays banned (N-22).
+const BAN_DURATION: Duration = Duration::from_secs(10 * 60);
+
+/// Hard ceiling on the number of distinct source IPs the defense maps
+/// (`rate`, `strikes`) track at once, and on retained `banned` entries.
+/// The maps are pruned only once per [`DISCOVER_CYCLE`]; without a size
+/// cap a spoofed-source UDP flood (millions of distinct fake source IPs
+/// between prunes) would grow them without bound → memory exhaustion.
+/// At the cap we stop tracking NEW ips — the packet is still admitted,
+/// because amplification is blocked by the bonding gate (which a spoofed
+/// source can never pass), not by the per-IP counter — so memory is
+/// bounded without dropping legitimate peers. 65 536 × ~100 B ≈ 6.5 MiB.
+const MAX_TRACKED_IPS: usize = 65_536;
+/// Hard ceiling on outstanding (un-ponged) bonding pings. Bounds the
+/// `pending` set against a flood of `KAD_NEIGHBORS` referrals naming many
+/// distinct addresses (which also bounds referral-driven ping fan-out).
+const MAX_PENDING: usize = 8_192;
+/// Max referred endpoints we will bond-ping from a single `KAD_NEIGHBORS`,
+/// so a bonded peer can't turn one referral packet into a large outbound
+/// ping fan-out (reflection). A well-formed NEIGHBORS carries `<=`
+/// [`BUCKET_SIZE`] anyway.
+const MAX_REFERRALS_PER_NEIGHBORS: usize = BUCKET_SIZE;
+
 /// XOR-distance bin per java-tron `NodeEntry.distance`. Returns a value
 /// in `[0, BINS-1]` suitable as a bucket index.
 ///
@@ -119,6 +195,34 @@ pub(crate) fn distance(owner_id: &[u8], target_id: &[u8]) -> usize {
         }
     }
     (d - 1).max(0) as usize
+}
+
+/// Eclipse-diversity group for `ip`, or `None` if the address is exempt
+/// from the per-group cap (loopback / private / link-local / unspecified —
+/// not reachable on the public network, so not an eclipse lever). Public
+/// v4 groups by `/24`, public v6 by `/48`.
+fn diversity_group(ip: &IpAddr) -> Option<String> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+            {
+                return None;
+            }
+            let o = v4.octets();
+            Some(format!("v4:{}.{}.{}", o[0], o[1], o[2]))
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return None;
+            }
+            let s = v6.segments();
+            Some(format!("v6:{:x}:{:x}:{:x}", s[0], s[1], s[2]))
+        }
+    }
 }
 
 /// A peer in the discovery network.
@@ -204,6 +308,11 @@ pub struct RoutingTable {
     home_id: Vec<u8>,
     buckets: Vec<KBucket>,
     by_host: HashMap<String, usize>,
+    /// Addresses we have sent a `KAD_PING` to and are awaiting a
+    /// `KAD_PONG` from. Only a peer with an entry here can be promoted
+    /// into the table — proving it answered at its real source address
+    /// (N-9 / N-32). Pruned by [`Self::prune_pending`].
+    pending: HashMap<SocketAddr, Instant>,
 }
 
 impl RoutingTable {
@@ -216,6 +325,7 @@ impl RoutingTable {
             home_id,
             buckets,
             by_host: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -223,11 +333,20 @@ impl RoutingTable {
         distance(&self.home_id, node_id).min(BINS - 1)
     }
 
-    /// Insert `node`. If the appropriate bucket is full, drop the
-    /// candidate (the LRU's host_key is returned so the caller knows
-    /// who *would* have been evicted under a true ping-replace policy).
-    /// Returns `Some(host_key)` if the candidate was dropped due to a
-    /// full bucket.
+    /// Count current entries whose address falls in eclipse-diversity
+    /// `group`.
+    fn count_in_group(&self, group: &str) -> usize {
+        self.buckets
+            .iter()
+            .flat_map(|b| b.entries.iter())
+            .filter(|e| diversity_group(&e.node.addr.ip()).as_deref() == Some(group))
+            .count()
+    }
+
+    /// Insert `node`. If the appropriate bucket is full, or the node's
+    /// public `/24`/`/48` is already at [`MAX_PER_GROUP`], the candidate
+    /// is dropped and its host_key returned. Returns `None` when the node
+    /// was inserted or was already present (refreshed).
     pub fn add(&mut self, node: Node) -> Option<String> {
         let key = node.host_key();
         if key == self.home_host_key_placeholder() {
@@ -238,6 +357,12 @@ impl RoutingTable {
             let entry = NodeEntry { node, modified: Instant::now() };
             self.buckets[idx].add(entry);
             return None;
+        }
+        // Subnet-diversity cap for a NEW node (N-10).
+        if let Some(group) = diversity_group(&node.addr.ip()) {
+            if self.count_in_group(&group) >= MAX_PER_GROUP {
+                return Some(key);
+            }
         }
         let idx = self.bucket_idx(&node.id);
         let entry = NodeEntry { node: node.clone(), modified: Instant::now() };
@@ -263,6 +388,40 @@ impl RoutingTable {
         if let Some(&idx) = self.by_host.get(host_key) {
             self.buckets[idx].touch(host_key);
         }
+    }
+
+    /// True if `host_key` is a verified (bonded) table member.
+    fn is_member(&self, host_key: &str) -> bool {
+        self.by_host.contains_key(host_key)
+    }
+
+    /// Record that we just sent a `KAD_PING` to `addr` and expect a
+    /// `KAD_PONG` back to promote it. Bounded by [`MAX_PENDING`] so a flood
+    /// of referrals naming distinct addresses can't grow it without limit;
+    /// an existing entry is always refreshed.
+    fn note_pending(&mut self, addr: SocketAddr) {
+        if !self.pending.contains_key(&addr) && self.pending.len() >= MAX_PENDING {
+            return;
+        }
+        self.pending.insert(addr, Instant::now());
+    }
+
+    /// True if `addr` has an outstanding ping awaiting a pong.
+    fn has_pending(&self, addr: &SocketAddr) -> bool {
+        self.pending.contains_key(addr)
+    }
+
+    /// Consume the pending expectation for `addr` (returns whether one
+    /// existed). A pong only promotes a node if we solicited it.
+    fn take_pending(&mut self, addr: &SocketAddr) -> bool {
+        self.pending.remove(addr).is_some()
+    }
+
+    /// Drop pending entries older than [`PENDING_EXPIRY`].
+    fn prune_pending(&mut self, max_age: Duration) {
+        let now = Instant::now();
+        self.pending
+            .retain(|_, t| now.duration_since(*t) < max_age);
     }
 
     /// Return up to `n` nodes ordered by XOR distance to `target`.
@@ -301,6 +460,29 @@ impl RoutingTable {
     }
 }
 
+/// Per-source-IP fixed window for inbound-packet rate limiting (N-18).
+struct RateWindow {
+    start: Instant,
+    count: u32,
+}
+
+/// Per-source-IP malformed-packet strike accumulator (N-22).
+struct Strikes {
+    count: u32,
+    since: Instant,
+}
+
+/// Abuse-defense bookkeeping, keyed by source IP. Separate from the
+/// routing table so the per-packet admission check never contends the
+/// table lock.
+#[derive(Default)]
+struct DefenseState {
+    rate: HashMap<IpAddr, RateWindow>,
+    /// IP → instant the ban lifts.
+    banned: HashMap<IpAddr, Instant>,
+    strikes: HashMap<IpAddr, Strikes>,
+}
+
 /// Long-running DHT service. Spawn [`KadService::run`] as a tokio task;
 /// hand out [`KadService::handle`] clones to subsystems that want to
 /// read the live peer set.
@@ -310,6 +492,7 @@ pub struct KadService {
     network_id: i32,
     table: Arc<RwLock<RoutingTable>>,
     seeds: Vec<SocketAddr>,
+    defense: Mutex<DefenseState>,
 }
 
 /// Clone-friendly read handle. Cheap to clone (Arc-shared table).
@@ -318,13 +501,24 @@ pub struct KadHandle {
     table: Arc<RwLock<RoutingTable>>,
 }
 
+/// Recover a poisoned `RwLock` read guard instead of propagating the
+/// panic. The routing table is advisory state — a thread that panicked
+/// mid-update leaves it at worst slightly stale, never corrupt enough to
+/// justify taking down all of discovery (N-13).
+fn read_table(lock: &RwLock<RoutingTable>) -> RwLockReadGuard<'_, RoutingTable> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-recovering write guard (see [`read_table`]).
+fn write_table(lock: &RwLock<RoutingTable>) -> RwLockWriteGuard<'_, RoutingTable> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
 impl KadHandle {
     /// Snapshot of every peer the DHT currently knows about (including
     /// seeds and any node discovered via `NEIGHBORS` responses).
     pub fn known_peers(&self) -> Vec<SocketAddr> {
-        self.table
-            .read()
-            .expect("kad table poisoned")
+        read_table(&self.table)
             .all_nodes()
             .into_iter()
             .map(|n| n.addr)
@@ -333,7 +527,7 @@ impl KadHandle {
 
     /// Number of entries currently in the table.
     pub fn count(&self) -> usize {
-        self.table.read().expect("kad table poisoned").count()
+        read_table(&self.table).count()
     }
 }
 
@@ -362,6 +556,7 @@ impl KadService {
             network_id,
             table,
             seeds,
+            defense: Mutex::new(DefenseState::default()),
         })
     }
 
@@ -369,6 +564,124 @@ impl KadService {
     /// subsystems (e.g. the TCP sync-driver pool).
     pub fn handle(&self) -> KadHandle {
         KadHandle { table: self.table.clone() }
+    }
+
+    fn defense(&self) -> std::sync::MutexGuard<'_, DefenseState> {
+        self.defense.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Admission check for an inbound packet from `ip`: returns `false`
+    /// (drop the packet) if the IP is banned or has exceeded its per-IP
+    /// rate budget for the current window (N-18 / N-22).
+    fn admit(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut d = self.defense();
+        if let Some(&until) = d.banned.get(&ip) {
+            if now < until {
+                return false;
+            }
+            d.banned.remove(&ip);
+        }
+        match d.rate.get_mut(&ip) {
+            Some(w) => {
+                if now.duration_since(w.start) >= RATE_WINDOW {
+                    w.start = now;
+                    w.count = 0;
+                }
+                w.count = w.count.saturating_add(1);
+                // Over budget: drop, but do NOT strike — an honest peer can
+                // burst briefly. Only malformed packets earn strikes.
+                w.count <= MAX_PACKETS_PER_WINDOW
+            }
+            None => {
+                // New source IP. Bound the map: under a spoofed-source flood
+                // we stop tracking new ips rather than grow without limit
+                // (memory DoS). Untracked ips are admitted — the bonding gate,
+                // not this counter, is what blocks amplification.
+                if d.rate.len() >= MAX_TRACKED_IPS {
+                    return true;
+                }
+                d.rate.insert(ip, RateWindow { start: now, count: 1 });
+                true
+            }
+        }
+    }
+
+    /// Record a protocol-abuse strike for `ip` (a malformed packet). On
+    /// the [`MAX_STRIKES`]th strike within [`STRIKE_WINDOW`], the IP is
+    /// banned for [`BAN_DURATION`] (N-22).
+    fn strike(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut d = self.defense();
+        // Bound the strikes map: don't let a spoofed-source flood of
+        // malformed packets grow it without limit (an untracked new ip just
+        // isn't strike-counted this round).
+        if !d.strikes.contains_key(&ip) && d.strikes.len() >= MAX_TRACKED_IPS {
+            return;
+        }
+        let banned = {
+            let s = d.strikes.entry(ip).or_insert(Strikes { count: 0, since: now });
+            if now.duration_since(s.since) >= STRIKE_WINDOW {
+                s.count = 0;
+                s.since = now;
+            }
+            s.count = s.count.saturating_add(1);
+            s.count >= MAX_STRIKES
+        };
+        if banned {
+            d.strikes.remove(&ip);
+            // Cap retained bans too; if the ban map is somehow full, the worst
+            // case is this abusive ip isn't banned (it's still rate-limited).
+            if d.banned.len() < MAX_TRACKED_IPS {
+                d.banned.insert(ip, now + BAN_DURATION);
+                warn!(ip = %ip, "kad: peer banned for repeated malformed packets");
+            }
+        }
+    }
+
+    /// Drop expired bans / stale rate + strike entries so the defense
+    /// maps don't grow without bound.
+    fn prune_defense(&self) {
+        let now = Instant::now();
+        let mut d = self.defense();
+        d.banned.retain(|_, until| *until > now);
+        d.rate
+            .retain(|_, w| now.duration_since(w.start) < RATE_WINDOW * 4);
+        d.strikes
+            .retain(|_, s| now.duration_since(s.since) < STRIKE_WINDOW);
+    }
+
+    /// True if `addr` is a bonded (PONG-verified) table member.
+    fn is_bonded(&self, addr: &SocketAddr) -> bool {
+        read_table(&self.table).is_member(&addr.to_string())
+    }
+
+    /// Start bonding with `addr` (ping it so its pong can promote it),
+    /// unless it is already a member or already has an outstanding ping.
+    async fn bond(&self, addr: SocketAddr) {
+        {
+            let t = read_table(&self.table);
+            let key = addr.to_string();
+            if t.is_member(&key) || t.has_pending(&addr) {
+                return;
+            }
+        }
+        self.send_ping(addr).await;
+    }
+
+    /// Handle a `KAD_PONG` from `addr`: promote it into the table iff we
+    /// solicited the pong (had a pending ping out to it) — proving it is
+    /// reachable at this exact source address (N-9 / N-32). An already
+    /// bonded peer is just refreshed. An unsolicited pong from an unknown
+    /// address is ignored (anti-spoof).
+    fn promote(&self, addr: SocketAddr, node_id: Vec<u8>) {
+        let mut t = write_table(&self.table);
+        let key = addr.to_string();
+        if t.take_pending(&addr) {
+            t.add(Node { id: node_id, addr });
+        } else if t.is_member(&key) {
+            t.touch(&key);
+        }
     }
 
     /// Run forever (until `shutdown` resolves). Spawns nothing — the
@@ -380,10 +693,10 @@ impl KadService {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        // Seed the table + ping each seed to learn its real node-id.
+        // Ping each seed to learn its real node-id and bond it. Seeds are
+        // NOT inserted as placeholders any more — they enter the table only
+        // when they pong (N-9), exactly like any other peer.
         for seed in &self.seeds {
-            let placeholder = Node { id: vec![0u8; 64], addr: *seed };
-            let _ = self.table.write().expect("kad table poisoned").add(placeholder);
             self.send_ping(*seed).await;
         }
         // `unwrap_or` would EAGERLY evaluate `self.seeds[0]` even on the Ok path
@@ -440,16 +753,22 @@ impl KadService {
     }
 
     async fn handle_packet(&self, ty: u8, payload: &[u8], from: SocketAddr) {
+        // Per-IP admission: drop banned / rate-flooding sources before any
+        // work or reply (N-18 / N-22).
+        if !self.admit(from.ip()) {
+            return;
+        }
         match ty {
             KAD_PING => {
                 let Ok(ping) = PingMessage::decode(payload) else {
+                    self.strike(from.ip());
                     debug!(from = %from, "kad: malformed PING");
                     return;
                 };
-                let from_id = ping.from.as_ref().map(|e| e.node_id.clone()).unwrap_or_default();
-                self.touch_or_add(from, from_id);
                 // Reply with PONG. `echo` carries the ping's version per
-                // upstream convention.
+                // upstream convention. PONG is the same size class as the
+                // PING, so replying to an unbonded/spoofable source is not an
+                // amplification lever.
                 let pong = PongMessage {
                     from: Some(self.home.clone()),
                     echo: ping.version,
@@ -457,33 +776,39 @@ impl KadService {
                 };
                 let bytes = encode_packet(KAD_PONG, &pong.encode_to_vec());
                 let _ = self.socket.send_to(&bytes, from).await;
+                // Bond before table membership: an inbound ping does NOT
+                // insert the sender; we ping it back and let its pong prove
+                // reachability at this address (N-9 / N-32).
+                if self.is_bonded(&from) {
+                    write_table(&self.table).touch(&from.to_string());
+                } else {
+                    self.bond(from).await;
+                }
             }
             KAD_PONG => {
                 let Ok(pong) = PongMessage::decode(payload) else {
+                    self.strike(from.ip());
                     return;
                 };
                 let from_id = pong.from.as_ref().map(|e| e.node_id.clone()).unwrap_or_default();
-                self.touch_or_add(from, from_id);
+                self.promote(from, from_id);
             }
             KAD_FIND_NODE => {
                 let Ok(find) = FindNeighbours::decode(payload) else {
+                    self.strike(from.ip());
                     return;
                 };
-                let from_id = find.from.as_ref().map(|e| e.node_id.clone()).unwrap_or_default();
-                self.touch_or_add(from, from_id);
-                let closest = self
-                    .table
-                    .read()
-                    .expect("kad table poisoned")
-                    .closest(&find.target_id, BUCKET_SIZE);
+                // Anti-amplification (N-18): the NEIGHBORS reply is the only
+                // large response. Send it ONLY to a bonded peer — a spoofed
+                // source can never bond, so the reflection vector is closed.
+                if !self.is_bonded(&from) {
+                    return;
+                }
+                write_table(&self.table).touch(&from.to_string());
+                let closest = read_table(&self.table).closest(&find.target_id, BUCKET_SIZE);
                 let neighbours: Vec<Endpoint> = closest
                     .into_iter()
-                    .map(|n| Endpoint {
-                        address: n.addr.ip().to_string().into_bytes(),
-                        port: n.addr.port() as i32,
-                        node_id: n.id,
-                        address_ipv6: vec![],
-                    })
+                    .map(|n| endpoint_for(&n))
                     .collect();
                 let resp = Neighbours {
                     from: Some(self.home.clone()),
@@ -495,29 +820,38 @@ impl KadService {
             }
             KAD_NEIGHBORS => {
                 let Ok(resp) = Neighbours::decode(payload) else {
+                    self.strike(from.ip());
                     return;
                 };
-                let from_id = resp.from.as_ref().map(|e| e.node_id.clone()).unwrap_or_default();
-                self.touch_or_add(from, from_id);
-                // For each new endpoint: insert + ping to confirm liveness.
-                let mut to_ping = Vec::new();
+                // Only accept referrals from a peer we've already bonded with —
+                // otherwise an unsolicited NEIGHBORS could inject arbitrary
+                // addresses for us to ping (N-9).
+                if !self.is_bonded(&from) {
+                    return;
+                }
+                write_table(&self.table).touch(&from.to_string());
+                // For each referred endpoint: ping to bond — do NOT add to the
+                // table on a third party's say-so. The endpoint enters only
+                // when IT pongs us (N-9 / N-32).
+                let mut to_bond = Vec::new();
                 {
-                    let mut t = self.table.write().expect("kad table poisoned");
+                    let t = read_table(&self.table);
                     for ep in &resp.neighbours {
+                        // Cap fan-out per packet so a bonded peer can't turn one
+                        // referral into a large outbound ping burst (reflection).
+                        if to_bond.len() >= MAX_REFERRALS_PER_NEIGHBORS {
+                            break;
+                        }
                         let Some(addr) = parse_endpoint(ep) else {
                             continue;
                         };
-                        let key = addr.to_string();
-                        if t.by_host.contains_key(&key) {
+                        if t.is_member(&addr.to_string()) || t.has_pending(&addr) {
                             continue;
                         }
-                        let node = Node { id: ep.node_id.clone(), addr };
-                        if t.add(node).is_none() {
-                            to_ping.push(addr);
-                        }
+                        to_bond.push(addr);
                     }
                 }
-                for addr in to_ping {
+                for addr in to_bond {
                     self.send_ping(addr).await;
                 }
             }
@@ -527,18 +861,10 @@ impl KadService {
         }
     }
 
-    fn touch_or_add(&self, addr: SocketAddr, node_id: Vec<u8>) {
-        let key = addr.to_string();
-        let mut t = self.table.write().expect("kad table poisoned");
-        if t.by_host.contains_key(&key) {
-            t.touch(&key);
-        } else {
-            let node = Node { id: node_id, addr };
-            let _ = t.add(node);
-        }
-    }
-
     async fn send_ping(&self, to: SocketAddr) {
+        // Record the bonding expectation BEFORE the send so a fast pong
+        // can't race ahead of us noting the pending entry.
+        write_table(&self.table).note_pending(to);
         let ping = PingMessage {
             from: Some(self.home.clone()),
             to: Some(Endpoint {
@@ -573,6 +899,9 @@ impl KadService {
         let mut loop_num: u32 = 0;
         loop {
             ticker.tick().await;
+            // House-keeping: expire stale pending bonds + defense entries.
+            write_table(&self.table).prune_pending(PENDING_EXPIRY);
+            self.prune_defense();
             loop_num = loop_num.wrapping_add(1);
             let target = if loop_num % SELF_LOOKUP_EVERY == 0 {
                 self.home.node_id.clone()
@@ -581,7 +910,7 @@ impl KadService {
             };
             self.iterative_lookup(&target).await;
             debug!(
-                table_size = self.table.read().map(|t| t.count()).unwrap_or(0),
+                table_size = read_table(&self.table).count(),
                 "kad: discover cycle done"
             );
         }
@@ -590,11 +919,7 @@ impl KadService {
     async fn iterative_lookup(&self, target: &[u8]) {
         let mut tried: HashSet<SocketAddr> = HashSet::new();
         for _round in 0..MAX_STEPS {
-            let candidates = self
-                .table
-                .read()
-                .expect("kad table poisoned")
-                .closest(target, ALPHA * 2);
+            let candidates = read_table(&self.table).closest(target, ALPHA * 2);
             let mut sent_this_round = 0usize;
             for node in candidates {
                 if tried.contains(&node.addr) {
@@ -630,17 +955,43 @@ fn random_node_id() -> Vec<u8> {
     id
 }
 
+/// Build a wire `Endpoint` for a routing-table node, placing the address
+/// string in the v4 or v6 field as appropriate (N-21).
+fn endpoint_for(n: &Node) -> Endpoint {
+    let (address, address_ipv6) = match n.addr.ip() {
+        IpAddr::V4(v4) => (v4.to_string().into_bytes(), vec![]),
+        IpAddr::V6(v6) => (vec![], v6.to_string().into_bytes()),
+    };
+    Endpoint {
+        address,
+        port: n.addr.port() as i32,
+        node_id: n.id.clone(),
+        address_ipv6,
+    }
+}
+
 /// Parse a wire `Endpoint` into a `SocketAddr`. Returns `None` for the
-/// upstream's malformed-record cases: zero / out-of-range port, address
-/// not a valid ASCII-encoded IPv4 string. IPv6-only endpoints are
-/// dropped (we don't dial v6 from the TCP side either).
+/// upstream's malformed-record cases: zero / out-of-range port, or an
+/// address that is neither a valid ASCII-encoded IPv4 (`address`) nor
+/// IPv6 (`address_ipv6`) string. IPv6 endpoints are now kept rather than
+/// silently dropped (N-21).
 fn parse_endpoint(ep: &Endpoint) -> Option<SocketAddr> {
     if ep.port <= 0 || ep.port > 65535 {
         return None;
     }
-    let s = std::str::from_utf8(&ep.address).ok()?;
-    let ip: std::net::IpAddr = s.parse().ok()?;
-    Some(SocketAddr::new(ip, ep.port as u16))
+    let port = ep.port as u16;
+    // Prefer the v4 address string; fall back to the v6 field.
+    for field in [&ep.address, &ep.address_ipv6] {
+        if field.is_empty() {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(field) {
+            if let Ok(ip) = s.parse::<IpAddr>() {
+                return Some(SocketAddr::new(ip, port));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -758,6 +1109,49 @@ mod tests {
     }
 
     #[test]
+    fn public_subnet_diversity_cap_enforced() {
+        // A single public /24 may occupy at most MAX_PER_GROUP slots; the
+        // next same-/24 node is dropped, but a different /24 still fits.
+        let mut t = RoutingTable::new(vec![0u8; 64]);
+        for i in 0..(MAX_PER_GROUP as u8) {
+            let n = Node { id: vec![i; 64], addr: SocketAddr::from(([203, 0, 113, i], 18_888)) };
+            assert!(t.add(n).is_none(), "within cap at i={i}");
+        }
+        // One more in the SAME /24 → dropped.
+        let over = Node { id: vec![0x99; 64], addr: SocketAddr::from(([203, 0, 113, 200], 18_888)) };
+        assert!(t.add(over).is_some(), "same-/24 over cap is dropped");
+        assert_eq!(t.count(), MAX_PER_GROUP);
+        // A different /24 still gets in.
+        let other = Node { id: vec![0x77; 64], addr: SocketAddr::from(([198, 51, 100, 1], 18_888)) };
+        assert!(t.add(other).is_none(), "different /24 admitted");
+        assert_eq!(t.count(), MAX_PER_GROUP + 1);
+    }
+
+    #[test]
+    fn loopback_is_exempt_from_diversity_cap() {
+        // Loopback (used pervasively in tests) is not eclipse-relevant and
+        // must not be capped, or local multi-node tests break.
+        let mut t = RoutingTable::new(vec![0u8; 64]);
+        for i in 1..=(MAX_PER_GROUP as u8 + 3) {
+            assert!(t.add(mk_node(i, 18_888, i)).is_none(), "loopback never capped");
+        }
+        assert_eq!(t.count(), MAX_PER_GROUP + 3);
+    }
+
+    #[test]
+    fn pending_gate_promotes_only_solicited() {
+        let mut t = RoutingTable::new(vec![0u8; 64]);
+        let addr = SocketAddr::from(([198, 51, 100, 7], 18_888));
+        // No pending entry → a "pong" must not promote.
+        assert!(!t.take_pending(&addr));
+        // After we record a ping, the pong promotes.
+        t.note_pending(addr);
+        assert!(t.has_pending(&addr));
+        assert!(t.take_pending(&addr));
+        assert!(!t.has_pending(&addr), "consumed");
+    }
+
+    #[test]
     fn parse_endpoint_rejects_bad_port_and_address() {
         // port = 0
         let ep = Endpoint { address: b"127.0.0.1".to_vec(), port: 0, node_id: vec![], address_ipv6: vec![] };
@@ -765,9 +1159,42 @@ mod tests {
         // non-ascii-ip address
         let ep = Endpoint { address: vec![0xFF, 0xFE, 0xFD], port: 18_888, node_id: vec![], address_ipv6: vec![] };
         assert!(parse_endpoint(&ep).is_none());
-        // valid
+        // valid v4
         let ep = Endpoint { address: b"10.0.0.1".to_vec(), port: 18_888, node_id: vec![], address_ipv6: vec![] };
         assert_eq!(parse_endpoint(&ep), Some(SocketAddr::from(([10, 0, 0, 1], 18_888))));
+    }
+
+    #[test]
+    fn parse_endpoint_accepts_ipv6_field() {
+        // IPv6-only endpoint: v4 `address` empty, `address_ipv6` carries the
+        // ASCII v6 string. Previously dropped silently (N-21) — now parsed.
+        let ep = Endpoint {
+            address: vec![],
+            port: 18_888,
+            node_id: vec![],
+            address_ipv6: b"2001:db8::1".to_vec(),
+        };
+        let got = parse_endpoint(&ep).expect("v6 endpoint parses");
+        assert!(got.is_ipv6());
+        assert_eq!(got.port(), 18_888);
+    }
+
+    #[test]
+    fn diversity_group_exempts_private_and_loopback() {
+        assert!(diversity_group(&"127.0.0.1".parse().unwrap()).is_none());
+        assert!(diversity_group(&"10.1.2.3".parse().unwrap()).is_none());
+        assert!(diversity_group(&"192.168.1.1".parse().unwrap()).is_none());
+        // Public addresses are grouped by /24.
+        assert_eq!(
+            diversity_group(&"203.0.113.5".parse().unwrap()),
+            diversity_group(&"203.0.113.250".parse().unwrap()),
+            "same /24 → same group"
+        );
+        assert_ne!(
+            diversity_group(&"203.0.113.5".parse().unwrap()),
+            diversity_group(&"203.0.114.5".parse().unwrap()),
+            "different /24 → different group"
+        );
     }
 
     #[tokio::test]
@@ -827,7 +1254,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kad_handles_find_node_with_neighbours() {
+    async fn kad_find_node_requires_bonding_then_returns_neighbours() {
+        // The NEIGHBORS reply is gated on bonding (N-18). A peer must first
+        // PING (and receive our verification PONG/PING) to become bonded
+        // before a FIND_NODE is answered. Drive the full bond → find_node
+        // exchange and assert NEIGHBORS comes back only after bonding.
         let kad = KadService::new(
             "127.0.0.1:0".parse().unwrap(),
             vec![0xAAu8; 64],
@@ -838,9 +1269,9 @@ mod tests {
         .await
         .expect("bind kad");
         let bound = kad.socket.local_addr().unwrap();
-        // Pre-seed table with a few nodes.
+        // Pre-seed the table with peers to return as neighbours.
         for i in 1..=5u8 {
-            kad.table.write().unwrap().add(mk_node(i, 10_000 + i as u16, i));
+            write_table(&kad.table).add(mk_node(i, 10_000 + i as u16, i));
         }
         let me = Arc::new(kad);
         let recv = {
@@ -849,32 +1280,154 @@ mod tests {
         };
 
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer.local_addr().unwrap().port();
+        let peer_ep = Endpoint {
+            address: b"127.0.0.1".to_vec(),
+            port: peer_port as i32,
+            node_id: vec![0x33; 64],
+            address_ipv6: vec![],
+        };
+
+        // 1) Unbonded FIND_NODE → no reply (anti-amplification gate).
         let find = FindNeighbours {
-            from: Some(Endpoint {
-                address: b"127.0.0.1".to_vec(),
-                port: peer.local_addr().unwrap().port() as i32,
-                node_id: vec![0x33; 64],
-                address_ipv6: vec![],
-            }),
+            from: Some(peer_ep.clone()),
             target_id: vec![0x03; 64],
             timestamp: now_ms(),
         };
         peer.send_to(&encode_packet(KAD_FIND_NODE, &find.encode_to_vec()), bound)
             .await
             .unwrap();
-
         let mut buf = vec![0u8; UDP_MAX_PACKET_BYTES];
-        let (n, _from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        let early = tokio::time::timeout(Duration::from_millis(300), peer.recv_from(&mut buf)).await;
+        assert!(early.is_err(), "unbonded FIND_NODE must not be answered");
+
+        // 2) Bond: PING the service. It replies PONG and pings us back to
+        //    verify; we PONG that to complete the bond.
+        let ping = PingMessage {
+            from: Some(peer_ep.clone()),
+            to: Some(Endpoint {
+                address: b"127.0.0.1".to_vec(),
+                port: bound.port() as i32,
+                node_id: vec![],
+                address_ipv6: vec![],
+            }),
+            version: 11_111,
+            timestamp: now_ms(),
+        };
+        peer.send_to(&encode_packet(KAD_PING, &ping.encode_to_vec()), bound)
             .await
-            .expect("neighbours timeout")
             .unwrap();
-        let (ty, payload) = decode_packet(&buf[..n]).unwrap();
-        assert_eq!(ty, KAD_NEIGHBORS);
-        let resp = Neighbours::decode(payload).unwrap();
+        // Drain packets from the service until we've seen its verification
+        // PING, answering it with a PONG so the bond completes.
+        let bond_deadline = Duration::from_secs(2);
+        loop {
+            let (n, _from) = tokio::time::timeout(bond_deadline, peer.recv_from(&mut buf))
+                .await
+                .expect("expected a packet from service")
+                .unwrap();
+            let (ty, payload) = decode_packet(&buf[..n]).unwrap();
+            if ty == KAD_PING {
+                // Answer the verification ping → promotes us to bonded.
+                let pong = PongMessage {
+                    from: Some(peer_ep.clone()),
+                    echo: PingMessage::decode(payload).map(|p| p.version).unwrap_or(0),
+                    timestamp: now_ms(),
+                };
+                peer.send_to(&encode_packet(KAD_PONG, &pong.encode_to_vec()), bound)
+                    .await
+                    .unwrap();
+                break;
+            }
+            // ty == KAD_PONG (reply to our ping): keep draining for the ping.
+        }
+        // Give the service a moment to process our bonding PONG.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(me.is_bonded(&SocketAddr::from(([127, 0, 0, 1], peer_port))), "bonded after pong");
+
+        // 3) Bonded FIND_NODE → NEIGHBORS returned.
+        peer.send_to(&encode_packet(KAD_FIND_NODE, &find.encode_to_vec()), bound)
+            .await
+            .unwrap();
+        let resp = loop {
+            let (n, _from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .expect("neighbours timeout")
+                .unwrap();
+            let (ty, payload) = decode_packet(&buf[..n]).unwrap();
+            if ty == KAD_NEIGHBORS {
+                break Neighbours::decode(payload).unwrap();
+            }
+        };
         assert!(!resp.neighbours.is_empty(), "should return some neighbours");
         // Closest to id=3 is id=3 itself.
         assert_eq!(resp.neighbours[0].node_id[0], 3);
 
         recv.abort();
+    }
+
+    #[tokio::test]
+    async fn banned_ip_is_dropped_by_admission() {
+        let kad = KadService::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![0xAAu8; 64],
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            11_111,
+            vec![],
+        )
+        .await
+        .expect("bind kad");
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        // Accumulate strikes to the ban threshold.
+        for _ in 0..MAX_STRIKES {
+            kad.strike(ip);
+        }
+        assert!(!kad.admit(ip), "ip should be banned after MAX_STRIKES");
+        // A different IP is unaffected.
+        assert!(kad.admit("203.0.113.10".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_drops_floods() {
+        let kad = KadService::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![0xAAu8; 64],
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            11_111,
+            vec![],
+        )
+        .await
+        .expect("bind kad");
+        let ip: IpAddr = "198.51.100.4".parse().unwrap();
+        for _ in 0..MAX_PACKETS_PER_WINDOW {
+            assert!(kad.admit(ip), "within budget");
+        }
+        assert!(!kad.admit(ip), "over budget in the same window is dropped");
+        // Flooding does not itself ban (honest bursts allowed).
+        assert!(kad.defense().banned.get(&ip).is_none());
+    }
+
+    #[tokio::test]
+    async fn defense_maps_are_bounded_under_distinct_source_flood() {
+        // A spoofed-source flood with more distinct IPs than the cap must NOT
+        // grow the rate map without bound (the memory-DoS this guards). Once at
+        // the cap, new ips are admitted (the bonding gate, not this counter,
+        // blocks amplification) but not tracked.
+        let kad = KadService::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![0xAAu8; 64],
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            11_111,
+            vec![],
+        )
+        .await
+        .expect("bind kad");
+        for i in 0..(MAX_TRACKED_IPS as u32 + 2_000) {
+            let ip = IpAddr::from(i.to_be_bytes());
+            assert!(kad.admit(ip), "untracked overflow ips are still admitted");
+        }
+        assert!(
+            kad.defense().rate.len() <= MAX_TRACKED_IPS,
+            "rate map must stay bounded by MAX_TRACKED_IPS"
+        );
     }
 }

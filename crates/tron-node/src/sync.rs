@@ -860,6 +860,11 @@ pub struct SyncDriver {
     /// in `accept_block` on the first push (when the chain is empty
     /// at startup) or by `seed_khaos_from_head` after a restart.
     khaos_started: bool,
+    /// Optional process-wide inbound-bytes budget (N-3). When set, every
+    /// dialed connection draws inbound frame bytes from this shared pool so
+    /// the total buffered across all peers (outbound dialers + the inbound
+    /// server) is capped below `peers × MAX_FRAME_BYTES`.
+    inbound_budget: Option<tron_net::InboundByteBudget>,
     /// Per-block undo log for KhaosDb Phase B reorg-with-rollback.
     /// Optional because lightweight tests / read-only nodes don't need
     /// the rollback infrastructure. When `None`, `accept_block` uses
@@ -1072,6 +1077,7 @@ impl SyncDriver {
             khaos_started: false,
             last_progress_log: None,
             at_tip: false,
+            inbound_budget: None,
             undo_store: None,
             checkpoint: None,
             produced_blocks_tx: None,
@@ -1679,6 +1685,14 @@ impl SyncDriver {
         self
     }
 
+    /// Attach the shared process-wide inbound-bytes budget (N-3). Every
+    /// driver and the inbound server should share the SAME budget so the
+    /// cap is global across all connections.
+    pub fn with_inbound_budget(mut self, budget: tron_net::InboundByteBudget) -> Self {
+        self.inbound_budget = Some(budget);
+        self
+    }
+
     /// Attach a cross-store checkpoint. Only takes effect on the
     /// BlockSession path (i.e., when an undo store is attached and
     /// no snapshot stack is attached) — the snapshot-stack path
@@ -2203,6 +2217,11 @@ impl SyncDriver {
             Ok(c) => c,
             Err(e) => return PeerOutcome::PeerFailure(format!("dial: {e}")),
         };
+        // Count this connection's inbound frames against the shared
+        // process-wide byte budget (N-3), if one is configured.
+        if let Some(budget) = &self.inbound_budget {
+            conn = conn.with_inbound_budget(budget.clone());
+        }
         let genesis = genesis_block_id(&mainnet_inputs());
         let head = self.resume_head().unwrap_or(genesis);
         let now = std::time::SystemTime::now()
