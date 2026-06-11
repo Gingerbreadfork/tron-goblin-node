@@ -66,9 +66,15 @@ fn main() {
     ];
 
     for path in &inputs {
-        println!("cargo:rerun-if-changed={}", path.display());
         assert!(path.exists(), "missing proto: {}", path.display());
     }
+    // Watch the whole include roots, not just the explicit compile `inputs`
+    // (F-52). Emitting any `rerun-if-changed` narrows cargo's watch to exactly
+    // the listed paths, so editing a TRANSITIVELY-imported `.proto` (one pulled
+    // in via `import` but not itself a top-level input) would otherwise leave
+    // codegen stale. Cargo scans these directories recursively.
+    println!("cargo:rerun-if-changed={}", proto_root.display());
+    println!("cargo:rerun-if-changed={}", vendored.display());
 
     let mut config = prost_build::Config::new();
     // Use BTreeMap for every proto `map<K,V>` field. The prost default

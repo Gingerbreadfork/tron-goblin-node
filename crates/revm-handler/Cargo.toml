@@ -13,6 +13,7 @@
 edition = "2021"
 rust-version = "1.91.0"
 name = "revm-handler"
+publish.workspace = true
 version = "20.0.2"
 authors = ["Dragan Rakita <dragan0rakita@gmail.com>"]
 build = false

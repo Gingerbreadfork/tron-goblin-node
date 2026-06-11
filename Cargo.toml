@@ -48,6 +48,10 @@ edition = "2021"
 rust-version = "1.80"
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/gingerbreadfork/tron-goblin-node"
+# None of these crates are meant for crates.io — they're an internal workspace
+# (and the four `revm-*` entries are forks that would collide with upstream).
+# `publish = false` is a hard guard against an accidental `cargo publish`.
+publish = false
 
 [workspace.dependencies]
 # Hashing

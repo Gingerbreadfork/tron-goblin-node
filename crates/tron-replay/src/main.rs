@@ -494,6 +494,19 @@ fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(hdr) as usize;
+    // Guard the length prefix before allocating (F-39): a corrupt or hostile
+    // stream can declare up to 4 GiB in 4 bytes. A single framed block is far
+    // under the P2P frame cap, so reuse it as the upper bound rather than
+    // trusting the header.
+    if len > tron_net::MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame length {len} exceeds cap {} bytes",
+                tron_net::MAX_FRAME_BYTES
+            ),
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     match Block::decode(buf.as_slice()) {
@@ -594,4 +607,37 @@ fn derive_address(priv_key: &[u8; 32]) -> Address {
     let h = keccak256(&bytes[1..]);
     prefixed[1..].copy_from_slice(&h[12..32]);
     Address::from_raw(prefixed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_frame_rejects_oversized_length_header() {
+        // F-39: a 4-byte length declaring more than the frame cap must be
+        // refused as InvalidData BEFORE the (up to ~4 GiB) allocation — the
+        // guard fires on the header alone, with no body bytes present.
+        let huge = (tron_net::MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+        let mut cur = io::Cursor::new(huge.to_vec());
+        match read_frame(&mut cur) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("oversized frame must error, not return a Frame"),
+        }
+    }
+
+    #[test]
+    fn read_frame_roundtrips_a_block_within_the_cap() {
+        // The happy path still works: write a block, read it back, then EOF.
+        let block = Block::default();
+        let mut buf = Vec::new();
+        write_block(&mut buf, &block).unwrap();
+        let mut cur = io::Cursor::new(buf);
+        let f = read_frame(&mut cur).unwrap();
+        assert!(matches!(f, Frame::Block(_)));
+        if let Frame::Block(b) = f {
+            assert_eq!(b, block);
+        }
+        assert!(matches!(read_frame(&mut cur).unwrap(), Frame::Eof));
+    }
 }
