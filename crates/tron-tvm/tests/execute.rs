@@ -117,6 +117,49 @@ fn execute_trigger_succeeds_for_simple_return_contract() {
     }
 }
 
+/// Regression: the `TIMESTAMP` / `NUMBER` opcodes must reflect the executing
+/// block's env. They previously returned the revm BlockEnv defaults
+/// (timestamp=1, number=0) because the block env was never populated, so any
+/// `block.timestamp - t` underflowed (Panic 0x11) — the root cause of the
+/// energy-rental / DeFi contractRet divergence cascade. TIMESTAMP is in
+/// SECONDS (java `getTimestamp() / 1000`).
+#[test]
+fn block_timestamp_and_number_opcodes_reflect_block_env() {
+    let stores = fresh_stores();
+    let owner = fund_account(&stores, 0xa7, 1_000_000_000);
+    let mk_trigger = |c: [u8; 21]| TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: c.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let env = || VmBlockEnv {
+        block_number: 83_316_753,
+        block_timestamp_ms: 1_700_000_001_000,
+    };
+    let read_word = |o: VmOutcome| -> i64 {
+        match o {
+            VmOutcome::Success { return_data, .. } => {
+                assert_eq!(return_data.len(), 32);
+                i64::from_be_bytes(return_data[24..32].try_into().unwrap())
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    };
+
+    // TIMESTAMP PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+    let ts_c = install_contract(&stores, 0x71, &[0x42, 0x60, 0, 0x52, 0x60, 0x20, 0x60, 0, 0xf3]);
+    let ts = read_word(execute_trigger(&stores, env(), &mk_trigger(ts_c), 100_000));
+    assert_eq!(ts, 1_700_000_001, "TIMESTAMP = block ts in seconds, not 1");
+
+    // NUMBER PUSH1 0 MSTORE PUSH1 0x20 PUSH1 0 RETURN
+    let num_c = install_contract(&stores, 0x72, &[0x43, 0x60, 0, 0x52, 0x60, 0x20, 0x60, 0, 0xf3]);
+    let num = read_word(execute_trigger(&stores, env(), &mk_trigger(num_c), 100_000));
+    assert_eq!(num, 83_316_753, "NUMBER = block number, not 0");
+}
+
 #[test]
 fn execute_trigger_top_level_calltoken_transfers_trc10_before_evm_runs() {
     use tron_crypto::address::Address;

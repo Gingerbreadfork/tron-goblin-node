@@ -139,28 +139,30 @@ impl RecoverableSignature {
 
     /// Decode from the on-chain transaction layout.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SigError> {
-        if bytes.len() != SIGNATURE_BYTES {
+        // java-tron requires `>= 65` (ECKey.signatureToAddress: "Signature
+        // truncated, expected 65 bytes"), and `Rsv.fromSignature` reads
+        // r=[0..32], s=[32..64], v=byte[64] — any trailing bytes are ignored.
+        // Some wallets pad `v` to a 4-byte word, producing 68-byte signatures
+        // that are valid on-chain; rejecting `!= 65` made our node fail signer
+        // recovery on those txs and reject them (→ DEFAULT) while java accepts.
+        if bytes.len() < SIGNATURE_BYTES {
             return Err(SigError::InvalidSignature);
         }
-        // java-tron's `ECDSASignature.toByteArray` normalises v by subtracting
-        // 27 if it was in the header-prefix range, so on the wire we can see
-        // either 0..3 (canonical) or 27..30 (legacy). Accept both.
-        let raw_v = bytes[64];
-        let recovery_id = if raw_v >= HEADER_PREFIX_BASE {
-            // Same "subtract 4 if >= 31" trick that ECKey.signatureToKeyBytes uses
-            // for the compressed-pubkey marker. recId always ends up in 0..3.
-            let normalised = if raw_v >= HEADER_PREFIX_BASE + 4 {
-                raw_v - 4
-            } else {
-                raw_v
-            };
-            normalised - HEADER_PREFIX_BASE
-        } else {
-            raw_v
-        };
-        if recovery_id > 3 {
+        // Recovery id, exactly as java-tron derives it:
+        //   `Rsv.fromSignature`:        if v < 27 { v += 27 }
+        //   `ECKey.signatureToKeyBytes`: require 27 <= v <= 34;
+        //                                if v >= 31 { v -= 4 }; recId = v - 27.
+        // So on-the-wire v ∈ {0..7} (canonical / compressed marker) or
+        // {27..34} (legacy header prefix) all fold to recId ∈ {0..3}.
+        let mut v = bytes[64];
+        if v < HEADER_PREFIX_BASE {
+            v = v.wrapping_add(HEADER_PREFIX_BASE);
+        }
+        if !(HEADER_PREFIX_BASE..=34).contains(&v) {
             return Err(SigError::InvalidRecoveryId);
         }
+        let header = if v >= HEADER_PREFIX_BASE + 4 { v - 4 } else { v };
+        let recovery_id = header - HEADER_PREFIX_BASE;
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];
         r.copy_from_slice(&bytes[0..32]);

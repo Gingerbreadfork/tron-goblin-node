@@ -357,7 +357,7 @@ pub fn dispatch_execute(
         }
         ContractType::TransferAssetContract => {
             let c = unpack::<tron_proto::TransferAssetContract>(parameter)?;
-            crate::asset::execute_transfer_asset(stores.accounts, &c)
+            crate::asset::execute_transfer_asset(stores.accounts, stores.dyn_props, &c)
         }
         ContractType::VoteWitnessContract => {
             let c = unpack::<tron_proto::VoteWitnessContract>(parameter)?;

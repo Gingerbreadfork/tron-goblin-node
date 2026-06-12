@@ -304,32 +304,48 @@ mod fee_limit_tests {
 
     /// Strict mode + the canonical mainnet `DEFAULT_ENERGY_FEE = 100`:
     /// every 100 sun of `fee_limit` buys one unit of energy.
+    /// A generous `max_fee_limit` for tests that exercise the energy-division
+    /// path rather than the upper-bound gate (java's genesis default is
+    /// 1_000_000_000 sun; `i64::MAX` keeps any fee_limit below the cap).
+    const TEST_MAX_FEE_LIMIT: i64 = i64::MAX;
+
     #[test]
     fn strict_mode_divides_fee_limit_by_energy_fee() {
-        assert_eq!(compute_vm_energy_limit(1_000_000, 100, true), Ok(10_000));
-        assert_eq!(compute_vm_energy_limit(100, 100, true), Ok(1));
+        assert_eq!(compute_vm_energy_limit(1_000_000, 100, TEST_MAX_FEE_LIMIT, true), Ok(10_000));
+        assert_eq!(compute_vm_energy_limit(100, 100, TEST_MAX_FEE_LIMIT, true), Ok(1));
         // Truncates toward zero (i.e. caller paid for partial energy
         // but doesn't get a full unit — matches java-tron's integer
         // division).
-        assert_eq!(compute_vm_energy_limit(99, 100, true), Ok(0));
+        assert_eq!(compute_vm_energy_limit(99, 100, TEST_MAX_FEE_LIMIT, true), Ok(0));
     }
 
-    /// Strict mode rejects `fee_limit <= 0` (the proto default and the
-    /// trivial misconfiguration). Mirrors java-tron's
-    /// `validateFeeLimit` gate.
+    /// `fee_limit == 0` is VALID in java (`feeLimit >= 0`): a caller who pays
+    /// energy entirely from staked resources sets no TRX burn cap. The energy
+    /// budget derived from it is simply 0 (the VM then runs on the contract's
+    /// own staked energy). Rejecting it diverged from java.
     #[test]
-    fn strict_mode_rejects_zero_and_negative_fee_limit() {
+    fn strict_mode_accepts_zero_fee_limit() {
+        assert_eq!(compute_vm_energy_limit(0, 100, TEST_MAX_FEE_LIMIT, true), Ok(0));
+    }
+
+    /// Strict mode rejects `fee_limit < 0` and `fee_limit > max_fee_limit` —
+    /// byte-for-byte java's `VMActuator.validate` gate.
+    #[test]
+    fn strict_mode_rejects_negative_or_over_max_fee_limit() {
         assert_eq!(
-            compute_vm_energy_limit(0, 100, true),
-            Err(TxOutcome::InvalidFeeLimit { fee_limit: 0 })
-        );
-        assert_eq!(
-            compute_vm_energy_limit(-1, 100, true),
+            compute_vm_energy_limit(-1, 100, TEST_MAX_FEE_LIMIT, true),
             Err(TxOutcome::InvalidFeeLimit { fee_limit: -1 })
         );
         assert_eq!(
-            compute_vm_energy_limit(i64::MIN, 100, true),
+            compute_vm_energy_limit(i64::MIN, 100, TEST_MAX_FEE_LIMIT, true),
             Err(TxOutcome::InvalidFeeLimit { fee_limit: i64::MIN })
+        );
+        // Over the mainnet ceiling (1e9 sun): rejected before energy derivation.
+        let max = 1_000_000_000;
+        assert_eq!(compute_vm_energy_limit(max, 100, max, true), Ok(max as u64 / 100));
+        assert_eq!(
+            compute_vm_energy_limit(max + 1, 100, max, true),
+            Err(TxOutcome::InvalidFeeLimit { fee_limit: max + 1 })
         );
     }
 
@@ -339,12 +355,12 @@ mod fee_limit_tests {
     /// `..Default::default()` (so `fee_limit = 0`) keep running.
     #[test]
     fn lenient_mode_always_returns_test_fallback() {
-        assert_eq!(compute_vm_energy_limit(0, 100, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
-        assert_eq!(compute_vm_energy_limit(-1, 100, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
+        assert_eq!(compute_vm_energy_limit(0, 100, TEST_MAX_FEE_LIMIT, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
+        assert_eq!(compute_vm_energy_limit(-1, 100, TEST_MAX_FEE_LIMIT, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
         // Even a real-looking fee_limit is ignored in lenient mode —
         // the helper's job is to keep test fixtures predictable, not
         // to interpolate.
-        assert_eq!(compute_vm_energy_limit(1_000_000, 100, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
+        assert_eq!(compute_vm_energy_limit(1_000_000, 100, TEST_MAX_FEE_LIMIT, false), Ok(TEST_FALLBACK_ENERGY_LIMIT));
     }
 
     /// Defensive clamp against a misconfigured `energy_fee = 0` (or
@@ -355,36 +371,37 @@ mod fee_limit_tests {
         // energy_fee = 0 → treated as 1 → energy_limit = fee_limit
         // (capped by MAX).
         assert_eq!(
-            compute_vm_energy_limit(500, 0, true),
+            compute_vm_energy_limit(500, 0, TEST_MAX_FEE_LIMIT, true),
             Ok(500)
         );
         assert_eq!(
-            compute_vm_energy_limit(500, -42, true),
+            compute_vm_energy_limit(500, -42, TEST_MAX_FEE_LIMIT, true),
             Ok(500)
         );
     }
 
     /// The safety ceiling fires when `fee_limit / energy_fee` would
     /// otherwise exceed 1B energy. Keeps the revm `u64` gas counter
-    /// well within arithmetic safety bounds.
+    /// well within arithmetic safety bounds. (Uses `TEST_MAX_FEE_LIMIT`
+    /// so the upper-bound gate doesn't reject these large fee_limits first.)
     #[test]
     fn safety_ceiling_caps_runaway_fee_limits() {
         // fee_limit = i64::MAX, energy_fee = 1 → would derive
         // i64::MAX-as-u64 = 9.2e18; expect clamp at 1B.
         assert_eq!(
-            compute_vm_energy_limit(i64::MAX, 1, true),
+            compute_vm_energy_limit(i64::MAX, 1, TEST_MAX_FEE_LIMIT, true),
             Ok(MAX_VM_ENERGY_LIMIT)
         );
         // Just over the ceiling → still clamped.
         let just_over = (MAX_VM_ENERGY_LIMIT + 1) as i64 * 100;
         assert_eq!(
-            compute_vm_energy_limit(just_over, 100, true),
+            compute_vm_energy_limit(just_over, 100, TEST_MAX_FEE_LIMIT, true),
             Ok(MAX_VM_ENERGY_LIMIT)
         );
         // Exactly at the ceiling → returned unchanged.
         let at_cap = (MAX_VM_ENERGY_LIMIT as i64) * 100;
         assert_eq!(
-            compute_vm_energy_limit(at_cap, 100, true),
+            compute_vm_energy_limit(at_cap, 100, TEST_MAX_FEE_LIMIT, true),
             Ok(MAX_VM_ENERGY_LIMIT)
         );
     }
@@ -2170,6 +2187,7 @@ fn execute_block_logic(
             state,
             &block.transactions,
             config,
+            raw.number,
             block_timestamp_ms,
             now_slot,
             &precomputed_signers,
@@ -2187,6 +2205,7 @@ fn execute_block_logic(
                     state,
                     tx,
                     config,
+                    raw.number,
                     block_timestamp_ms,
                     now_slot,
                     &precomputed_signers[i],
@@ -2215,42 +2234,77 @@ fn execute_block_logic(
                 .map(|c| c.as_str_name())
                 .unwrap_or("?")
         };
+        use tron_proto::transaction::result::Code;
+        const RET_SUCCESS: i32 = Code::Sucess as i32;
         for (tx, res) in block.transactions.iter().zip(tx_results.iter()) {
             let is_vm = matches!(
                 res.contract_type,
                 Some(ContractType::TriggerSmartContract | ContractType::CreateSmartContract)
             );
-            if !is_vm {
-                continue;
-            }
-            let Some(expected) = tx.ret.first().map(|r| r.contract_ret) else {
+            let Some(stored) = tx.ret.first() else {
                 continue; // no stored ret to compare against
             };
-            let computed = res.receipt.result;
-            if expected == computed
-                || expected == OUT_OF_TIME
-                || computed == OUT_OF_TIME
-            {
-                continue;
-            }
+            // Whether the tx succeeded on-chain (java) vs in our node. VM txs
+            // compare the contractRet; non-VM txs (Transfer, AccountPermission-
+            // Update, Freeze, …) compare the tx-level `ret` code — the old
+            // tripwire skipped these, so a non-VM tx our node wrongly rejected
+            // silently diverged balances/permissions and cascaded into the VM
+            // reverts we then saw.
+            let (expected, computed, expected_ok, computed_ok) = if is_vm {
+                let expected = stored.contract_ret;
+                let computed = res.receipt.result;
+                if expected == computed || expected == OUT_OF_TIME || computed == OUT_OF_TIME {
+                    continue;
+                }
+                (
+                    ret_name(expected).to_string(),
+                    ret_name(computed).to_string(),
+                    expected == SUCCESS,
+                    computed == SUCCESS,
+                )
+            } else {
+                let expected_ok = stored.ret == RET_SUCCESS;
+                let computed_ok = matches!(res.outcome, TxOutcome::Success);
+                (
+                    format!("ret={}", if expected_ok { "SUCCESS" } else { "FAILED" }),
+                    format!("{:?}", res.contract_type),
+                    expected_ok,
+                    computed_ok,
+                )
+            };
             // Only a success-vs-failure disagreement is real divergence.
-            if (expected == SUCCESS) != (computed == SUCCESS) {
+            if expected_ok != computed_ok {
                 let tx_hex: String =
                     res.tx_id.iter().map(|b| format!("{b:02x}")).collect();
+                // Decode the VM revert payload so the divergence line carries
+                // *why* it reverted (Error(string) / Panic(code)), plus the
+                // outcome variant for DEFAULTs that never reached the VM.
+                let reason = {
+                    let d = &res.vm_return_data;
+                    if d.len() >= 4 && d[..4] == [0x08, 0xc3, 0x79, 0xa0] && d.len() >= 68 {
+                        let off = 4 + 64;
+                        let len = u32::from_be_bytes(d[off - 4..off].try_into().unwrap()) as usize;
+                        let s = d.get(off..off + len.min(d.len().saturating_sub(off))).unwrap_or(&[]);
+                        format!("Error({:?})", String::from_utf8_lossy(s))
+                    } else if d.len() >= 36 && d[..4] == [0x4e, 0x48, 0x7b, 0x71] {
+                        format!("Panic(0x{:x})", u64::from_be_bytes(d[28..36].try_into().unwrap()))
+                    } else if d.is_empty() {
+                        format!("{:?}", res.outcome)
+                    } else {
+                        format!("raw:0x{}", d.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>())
+                    }
+                };
                 eprintln!(
-                    "CONTRACTRET DIVERGENCE block {} tx {}: block={} computed={} \
+                    "CONTRACTRET DIVERGENCE block {} tx {}: block={} computed={} reason={} \
                      (success/failure disagreement — state may have diverged)",
-                    raw.number,
-                    tx_hex,
-                    ret_name(expected),
-                    ret_name(computed),
+                    raw.number, tx_hex, expected, computed, reason,
                 );
                 if config.verify_contract_ret {
                     return Err(BlockExecError::ContractRetMismatch {
                         block_num: raw.number,
                         tx_id: tx_hex,
-                        expected: ret_name(expected).to_string(),
-                        computed: ret_name(computed).to_string(),
+                        expected,
+                        computed,
                     });
                 }
             }
@@ -2692,6 +2746,7 @@ pub(crate) fn execute_one_tx(
     state: &StateBackends,
     tx: &Transaction,
     config: &ExecConfig,
+    block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
@@ -2703,6 +2758,7 @@ pub(crate) fn execute_one_tx(
         &TxIsolation::Session(&session),
         tx,
         config,
+        block_number,
         block_timestamp_ms,
         now_slot,
         precomputed_signers,
@@ -2714,11 +2770,13 @@ pub(crate) fn execute_one_tx(
 /// writes and revert are provided by the `VersionedBackend` capture itself
 /// (`iso = Capture`): a failed tx clears its buffered writes/deltas. Removes a
 /// whole copy-on-write overlay (and its ~24-backend fork) from every state op.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_one_tx_versioned(
     view: &StateBackends,
     capture: &tron_chainbase::blockstm::TxCaptureCell,
     tx: &Transaction,
     config: &ExecConfig,
+    block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
@@ -2728,6 +2786,7 @@ pub(crate) fn execute_one_tx_versioned(
         &TxIsolation::Capture(capture),
         tx,
         config,
+        block_number,
         block_timestamp_ms,
         now_slot,
         precomputed_signers,
@@ -2738,11 +2797,13 @@ pub(crate) fn execute_one_tx_versioned(
 /// (a serial session overlay OR the Block-STM versioned backend) and
 /// commits/reverts via `iso`. Both callers go through this one body, so serial
 /// and parallel are byte-identical by construction.
+#[allow(clippy::too_many_arguments)]
 fn execute_one_tx_isolated(
     view: &StateBackends,
     iso: &TxIsolation,
     tx: &Transaction,
     config: &ExecConfig,
+    block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
@@ -2775,18 +2836,26 @@ fn execute_one_tx_isolated(
     // mempool, so without this gate a stale, signed transaction could
     // be replayed inside a block at any time.
     //
-    // Compared against the BLOCK timestamp (not wall-clock) so the
-    // outcome is deterministic across replays of the same block and
-    // matches what every other node will compute. `expiration == 0` is
-    // the "unset" sentinel java-tron uses and we leave it untouched.
-    if raw.expiration > 0 && raw.expiration <= block_timestamp_ms {
+    // Compared against the **committed head** timestamp (block N-1), NOT the
+    // block being applied (N) — java's `Manager.validateCommon` rejects iff
+    // `expiration <= headBlockTime`, and `headBlockTime` is the head pointer,
+    // which only advances to block N AFTER the tx loop. Using block N's
+    // timestamp wrongly expired any tx whose `expiration == N.timestamp`
+    // (java accepts those, since `N.ts > (N-1).ts`), silently dropping the tx
+    // and diverging balances. `now_slot` is the head slot, so the head's
+    // timestamp is `now_slot * interval` (mainnet block timestamps are
+    // slot-aligned and genesis ts = 0). `expiration == 0` is the "unset"
+    // sentinel java-tron uses and we leave it untouched.
+    const BLOCK_PRODUCED_INTERVAL_MS: i64 = 3_000;
+    let head_block_time_ms = now_slot.saturating_mul(BLOCK_PRODUCED_INTERVAL_MS);
+    if raw.expiration > 0 && raw.expiration <= head_block_time_ms {
         // No state was mutated — the session is fresh, no revert needed.
         return TxResult {
             tx_id,
             contract_type: None,
             outcome: TxOutcome::Expired {
                 expiration_ms: raw.expiration,
-                block_timestamp_ms,
+                block_timestamp_ms: head_block_time_ms,
             },
             ..TxResult::empty()
         };
@@ -2995,7 +3064,10 @@ fn execute_one_tx_isolated(
         ty,
         ContractType::TriggerSmartContract | ContractType::CreateSmartContract
     ) {
-        return execute_vm_tx(view, iso, tx_id, ty, parameter, config, raw.fee_limit, receipt);
+        return execute_vm_tx(
+            view, iso, tx_id, ty, parameter, config, raw.fee_limit, block_number,
+            block_timestamp_ms, receipt,
+        );
     }
 
     // Validate. On reject: revert (drops any pending writes — though
@@ -3081,9 +3153,12 @@ const MAX_VM_ENERGY_LIMIT: u64 = 1_000_000_000;
 /// `energy_fee` per java-tron's `Manager.processTransaction` formula:
 /// `energyLimit = feeLimit / energyFee`, clamped to a safety ceiling.
 ///
-/// Returns `Err(TxOutcome::InvalidFeeLimit { .. })` when strict mode
-/// is on and `fee_limit <= 0` (matches java-tron's `validateFeeLimit`
-/// gate; the proto default of 0 is rejected). Returns
+/// Returns `Err(TxOutcome::InvalidFeeLimit { .. })` when strict mode is on and
+/// `fee_limit < 0 || fee_limit > max_fee_limit` — byte-for-byte java-tron's
+/// `VMActuator.validate` gate (`feeLimit < 0 || feeLimit > getMaxFeeLimit()`).
+/// Crucially `fee_limit == 0` is VALID in java (a caller who pays energy
+/// entirely from staked resources needs no TRX burn cap); rejecting it (the
+/// old `<= 0`) diverged from java, which executed the tx. Returns
 /// [`TEST_FALLBACK_ENERGY_LIMIT`] when strict mode is off (the
 /// `ExecConfig::unsigned()` escape hatch for tests / dry-run).
 ///
@@ -3095,12 +3170,13 @@ const MAX_VM_ENERGY_LIMIT: u64 = 1_000_000_000;
 fn compute_vm_energy_limit(
     fee_limit: i64,
     energy_fee: i64,
+    max_fee_limit: i64,
     require_fee_limit: bool,
 ) -> Result<u64, TxOutcome> {
     if !require_fee_limit {
         return Ok(TEST_FALLBACK_ENERGY_LIMIT);
     }
-    if fee_limit <= 0 {
+    if fee_limit < 0 || fee_limit > max_fee_limit {
         return Err(TxOutcome::InvalidFeeLimit { fee_limit });
     }
     let divisor = energy_fee.max(1) as u64;
@@ -3108,6 +3184,91 @@ fn compute_vm_energy_limit(
     Ok(derived.min(MAX_VM_ENERGY_LIMIT))
 }
 
+/// Real `TriggerSmartContract` VM energy budget — java
+/// `VMActuator.getTotalEnergyLimit(creator, caller, ...)` (fix-ratio path).
+/// Reads the caller's account + the contract row (for origin / percent /
+/// origin_energy_limit) + the origin's account from the pre-execution `view`,
+/// then delegates the arithmetic to [`energy::vm_energy_budget_trigger`].
+/// Capped at [`MAX_VM_ENERGY_LIMIT`] for the revm `u64` gas counter. Returns 0
+/// when the caller account is unrecoverable (the VM will preflight-fail, just
+/// as java would have rejected at validate).
+fn vm_energy_budget_for_trigger(
+    view: &StateBackends,
+    dp: &tron_chainbase::DynamicPropertiesStore,
+    caller: Option<&Address>,
+    contract_addr: Option<&Address>,
+    call_value: i64,
+    fee_limit: i64,
+    now_slot: i64,
+) -> u64 {
+    let Some(caller) = caller else {
+        return 0;
+    };
+    let accounts = tron_chainbase::AccountStore::new(view.accounts.clone() as _);
+    let Ok(Some(caller_acct)) = accounts.get(caller) else {
+        return 0;
+    };
+    // Resolve the contract's origin / consume_user_resource_percent /
+    // origin_energy_limit. A missing contract row, or an origin equal to the
+    // caller, collapses to the caller-only budget (creator = None).
+    let (creator_acct, percent, raw_origin_energy_limit) = match contract_addr {
+        Some(ca) => {
+            let contracts = tron_chainbase::ContractStore::new(view.contracts.clone() as _);
+            match contracts.get(ca) {
+                Ok(Some(sc)) => {
+                    let creator = match address_from_proto(&sc.origin_address) {
+                        Some(o) if &o != caller => accounts.get(&o).ok().flatten(),
+                        _ => None,
+                    };
+                    (
+                        creator,
+                        sc.consume_user_resource_percent,
+                        sc.origin_energy_limit,
+                    )
+                }
+                _ => (None, 0, 0),
+            }
+        }
+        None => (None, 0, 0),
+    };
+    let budget = energy::vm_energy_budget_trigger(
+        dp,
+        &caller_acct,
+        creator_acct.as_ref(),
+        percent,
+        raw_origin_energy_limit,
+        fee_limit,
+        call_value,
+        now_slot,
+    );
+    budget.max(0).min(MAX_VM_ENERGY_LIMIT as i64) as u64
+}
+
+/// Real `CreateSmartContract` VM energy budget — java
+/// `getAccountEnergyLimitWithFixRatio(caller, feeLimit, callValue)` (the
+/// creator IS the caller, so no origin split). Capped at
+/// [`MAX_VM_ENERGY_LIMIT`].
+fn vm_energy_budget_for_create(
+    view: &StateBackends,
+    dp: &tron_chainbase::DynamicPropertiesStore,
+    caller: Option<&Address>,
+    call_value: i64,
+    fee_limit: i64,
+    now_slot: i64,
+) -> u64 {
+    let Some(caller) = caller else {
+        return 0;
+    };
+    let accounts = tron_chainbase::AccountStore::new(view.accounts.clone() as _);
+    let Ok(Some(caller_acct)) = accounts.get(caller) else {
+        return 0;
+    };
+    let budget =
+        energy::account_energy_limit_with_fix_ratio(&caller_acct, dp, fee_limit, call_value, now_slot);
+    budget.max(0).min(MAX_VM_ENERGY_LIMIT as i64) as u64
+}
+
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn execute_vm_tx(
     view: &StateBackends,
@@ -3117,6 +3278,13 @@ fn execute_vm_tx(
     parameter: &prost_types::Any,
     config: &ExecConfig,
     fee_limit: i64,
+    // The EXECUTING block's number + timestamp (block N), for the VM's
+    // NUMBER/TIMESTAMP opcodes. NOT the committed head (N-1): java's
+    // ProgramInvokeFactory reads them straight off the block being processed,
+    // while the dyn-props head pointer only advances after the tx loop. The
+    // resource model still reads the head (N-1) via the dyn-props store.
+    block_number: i64,
+    block_timestamp_ms: i64,
     mut receipt: TxReceipt,
 ) -> TxResult {
     use tron_chainbase::{
@@ -3202,16 +3370,15 @@ fn execute_vm_tx(
         abi: Some(Arc::new(tron_chainbase::AbiStore::new(view.abi.clone()))),
     };
 
-    // Read current block number/time from the dyn-props session (so we
-    // see this block's header if it's been written; otherwise the last
-    // committed one).
+    // `block_number` / `block_timestamp_ms` are the EXECUTING block's (passed
+    // in) — used for the VM block env. The dyn-props head (N-1) is read
+    // separately by the resource model inside the VM.
     let dp = DPS::new(view.dyn_props.clone() as _);
-    let block_number = dp.latest_block_header_number().unwrap_or(0);
-    let block_timestamp_ms = dp.latest_block_header_timestamp().unwrap_or(0);
 
     let energy_limit = match compute_vm_energy_limit(
         fee_limit,
         dp.energy_fee(),
+        dp.max_fee_limit(),
         config.require_fee_limit,
     ) {
         Ok(limit) => limit,
@@ -3260,6 +3427,25 @@ fn execute_vm_tx(
                 };
             let caller = address_from_proto(&trigger.owner_address);
             let contract_addr = address_from_proto(&trigger.contract_address);
+            // Real VM energy budget (java `getTotalEnergyLimit`): the bare
+            // `energy_limit` from the fee-limit gate is only the
+            // `feeLimit/energyFee` term. In strict (consensus) mode replace it
+            // with the full budget = caller's staked + balance-buyable energy
+            // (capped by feeLimit) PLUS the contract creator's subsidy. Lenient
+            // mode (unsigned/test) keeps the historical fallback.
+            let energy_limit = if config.require_fee_limit {
+                vm_energy_budget_for_trigger(
+                    view,
+                    &dp,
+                    caller.as_ref(),
+                    contract_addr.as_ref(),
+                    trigger.call_value,
+                    fee_limit,
+                    now_slot,
+                )
+            } else {
+                energy_limit
+            };
             let (outcome, traces, energy_penalty) =
                 tron_tvm::execute::execute_trigger_with_trace_tx_id(
                     &vm_stores,
@@ -3292,6 +3478,19 @@ fn execute_vm_tx(
                 .new_contract
                 .as_ref()
                 .and_then(|c| address_from_proto(&c.origin_address));
+            // Real VM energy budget — caller-only (creator == caller for a
+            // deploy), java `getAccountEnergyLimitWithFixRatio`. Strict mode
+            // only; lenient keeps the fallback.
+            let energy_limit = if config.require_fee_limit {
+                let call_value = create
+                    .new_contract
+                    .as_ref()
+                    .map(|c| c.call_value)
+                    .unwrap_or(0);
+                vm_energy_budget_for_create(view, &dp, caller.as_ref(), call_value, fee_limit, now_slot)
+            } else {
+                energy_limit
+            };
             let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_create_with_trace(
                 &vm_stores,
                 block_env,
@@ -3364,10 +3563,15 @@ fn execute_vm_tx(
                     match contracts.get(&contract_addr) {
                         Ok(Some(sc)) => {
                             let origin = address_from_proto(&sc.origin_address);
+                            // java `ContractCapsule.getOriginEnergyLimit` remaps
+                            // a stored 0 (old contracts) to the creator default
+                            // (10M) — without it the origin can't subsidize and
+                            // the caller is over-charged. Same remap the energy
+                            // budget uses, so budget and charge stay consistent.
                             (
                                 origin,
                                 sc.consume_user_resource_percent,
-                                sc.origin_energy_limit,
+                                energy::effective_origin_energy_limit(sc.origin_energy_limit),
                             )
                         }
                         _ => (None, 0, 0),

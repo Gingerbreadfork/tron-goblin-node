@@ -78,12 +78,16 @@ pub fn execute_create_account(
     owner_account.balance = check_sub(owner_account.balance, fee)?;
     accounts.put(&owner, &owner_account)?;
 
-    let new_account = Account {
+    let mut new_account = Account {
         address: new_addr.as_bytes().to_vec(),
         r#type: contract.r#type, // matches enum value passed in
         create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
         ..Default::default()
     };
+    // java's CreateAccountActuator builds the new AccountCapsule with
+    // `withDefaultPermission = getAllowMultiSign() == 1`, attaching the
+    // default owner + active[id=2] permission.
+    crate::permission::apply_default_account_permissions(&mut new_account, dyn_props);
     accounts.put(&new_addr, &new_account)?;
 
     Ok(ExecutionResult {
@@ -260,24 +264,19 @@ pub fn validate_account_permission_update(
         check_permission(witness_perm, dyn_props)?;
     }
 
-    for (idx, active) in contract.actives.iter().enumerate() {
+    for active in contract.actives.iter() {
         if active.r#type != PermissionType::Active as i32 {
             return Err(ActuatorError::Validate("active permission type is error"));
         }
-        // Enforce `actives[i].id == 2 + i` — java-tron's
-        // `AccountPermissionUpdateActuator` assigns these IDs
-        // contiguously starting at 2, and `resolve_permission`
-        // relies on the invariant being honored across writes.
-        // Without this gate, a contract could write actives with
-        // arbitrary IDs (e.g. duplicates, or values > 9), confusing
-        // every downstream lookup and breaking the multi-sig contract
-        // type → permission mapping. Owner=0, Witness=1, Active=2..9.
-        let expected_id = 2 + idx as i32;
-        if active.id != expected_id {
-            return Err(ActuatorError::Validate(
-                "active permission id must be 2 + index (contiguous from 2)",
-            ));
-        }
+        // NB: java-tron's `validate()` does NOT check the active permission
+        // `id` here — it *ignores* the contract-supplied ids and reassigns
+        // them contiguously (2 + index) at execute time
+        // (`AccountCapsule.updatePermissions`). Enforcing `id == 2 + i` in
+        // validate wrongly rejected on-chain `AccountPermissionUpdate` txs
+        // whose actives carried other ids (e.g. all 0 from some wallets),
+        // which then cascaded into "permission_id 2 not found" on every later
+        // multi-sig tx for that account. The reassignment happens in
+        // `execute_account_permission_update`.
         check_permission(active, dyn_props)?;
     }
 
@@ -409,9 +408,29 @@ pub fn execute_account_permission_update(
         .get_long(b"UPDATE_ACCOUNT_PERMISSION_FEE")
         .unwrap_or(0);
     account.balance = check_sub(account.balance, fee)?;
-    account.owner_permission = contract.owner.clone();
-    account.witness_permission = contract.witness.clone();
-    account.active_permission = contract.actives.clone();
+    // java `AccountCapsule.updatePermissions`: the stored ids are FORCED —
+    // owner→0, witness→1 (only when the account is a witness), actives→2+index
+    // — regardless of what the contract supplied.
+    account.owner_permission = contract.owner.clone().map(|mut p| {
+        p.id = 0;
+        p
+    });
+    if account.is_witness {
+        account.witness_permission = contract.witness.clone().map(|mut p| {
+            p.id = 1;
+            p
+        });
+    }
+    account.active_permission = contract
+        .actives
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut p = p.clone();
+            p.id = 2 + i as i32;
+            p
+        })
+        .collect();
     accounts.put(&owner, &account)?;
 
     Ok(ExecutionResult {

@@ -13,6 +13,7 @@ pub mod backend;
 pub mod blockstm;
 pub mod checkpoint_v2;
 pub mod pending_overlay;
+pub mod permissions;
 pub mod rocksdb_backend;
 pub mod session;
 pub mod snapshot;
@@ -25,6 +26,7 @@ pub use checkpoint_v2::{
     CheckpointId, CHECKPOINT_DIR_NAME,
 };
 pub use pending_overlay::PendingOverlay;
+pub use permissions::{apply_default_account_permissions, default_account_permissions};
 pub use rocksdb_backend::{set_block_cache_bytes, RocksDbBackend, RocksDbError};
 pub use session::SessionBackend;
 pub use snapshot::SnapshotKvBackend;

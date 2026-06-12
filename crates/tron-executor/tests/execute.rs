@@ -546,12 +546,15 @@ fn expired_tx_is_rejected_at_block_apply_and_state_unchanged() {
     put_account(&state.accounts, ALICE, 1_000_000);
     put_account(&state.accounts, BOB, 0);
 
-    // Build a transfer tx, then back-date its expiration to one ms
-    // BEFORE what `build_block(1, …)` will stamp as the block
-    // timestamp. Re-sign because mutating raw_data changed the digest.
+    // The expiration check runs against the COMMITTED HEAD timestamp (block
+    // N-1), matching java's `Manager.validateCommon` (`expiration <=
+    // headBlockTime`), NOT the block being applied. Seed a slot-aligned head
+    // timestamp; an `expiration <= head_ts` tx is expired.
+    let head_ts = 1_700_000_001_000; // divisible by 3000 (slot-aligned)
+    state.dyn_props.save_latest_block_header_timestamp(head_ts);
+
     let mut tx = transfer_tx(ALICE, BOB, 100);
-    let block_ts = 1_700_000_000_000 + 3000; // mirrors build_block formula
-    tx.raw_data.as_mut().unwrap().expiration = block_ts - 1;
+    tx.raw_data.as_mut().unwrap().expiration = head_ts; // == head → expired (<=)
     // sign_transaction pushes (multi-sig semantics) — clear first so we
     // re-sign exactly once after the raw_data mutation above.
     tx.signature.clear();
@@ -566,8 +569,8 @@ fn expired_tx_is_rejected_at_block_apply_and_state_unchanged() {
     let tx_result = &report.tx_results[0];
     match &tx_result.outcome {
         TxOutcome::Expired { expiration_ms, block_timestamp_ms } => {
-            assert_eq!(*expiration_ms, block_ts - 1);
-            assert_eq!(*block_timestamp_ms, block_ts);
+            assert_eq!(*expiration_ms, head_ts);
+            assert_eq!(*block_timestamp_ms, head_ts); // head_block_time
         }
         other => panic!("expected TxOutcome::Expired, got {other:?}"),
     }

@@ -352,6 +352,107 @@ pub fn all_frozen_balance_for_energy(account: &Account) -> i64 {
         .saturating_add(res.acquired_delegated_frozen_v2_balance_for_energy)
 }
 
+/// java-tron `RepositoryImpl.usageToBalance(usage, totalWeight, totalLimit)` —
+/// convert a recovered usage figure back into the sun-denominated balance it
+/// represents.
+///
+/// `harden` selects java's two arithmetic modes (gated by
+/// `ALLOW_HARDEN_RESOURCE_CALCULATION`, proposal #97 — **NOT active on
+/// mainnet**, so the legacy `double` path is the byte-exact one there):
+/// * harden:   `usage * totalWeight * TRX_PRECISION / totalLimit` (BigInteger / i128, exact).
+/// * legacy:   `(long)((double)usage * totalWeight / totalLimit * TRX_PRECISION)`
+///   — the division happens *before* the `TRX_PRECISION` multiply and the whole
+///   chain is IEEE-754 `double`, so the result differs from the exact value
+///   whenever `usage * totalWeight` exceeds 2^53. We must reproduce that loss.
+pub fn usage_to_balance(usage: i64, total_weight: i64, total_limit: i64, harden: bool) -> i64 {
+    if total_limit <= 0 {
+        return 0;
+    }
+    if harden {
+        ((usage as i128) * (total_weight as i128) * (TRX_PRECISION as i128)
+            / (total_limit as i128)) as i64
+    } else {
+        ((usage as f64) * (total_weight as f64) / (total_limit as f64) * (TRX_PRECISION as f64))
+            as i64
+    }
+}
+
+/// java-tron `StrictMath.round(double)` = `floor(a + 0.5)` (the
+/// `disableJavaLangMath = true` path active on mainnet). Usages are
+/// non-negative so this is the only case that matters.
+fn strict_round(a: f64) -> i64 {
+    (a + 0.5).floor() as i64
+}
+
+fn div_ceil_i64(n: i64, d: i64) -> i64 {
+    if d == 0 {
+        return 0;
+    }
+    let q = n / d;
+    if n % d > 0 {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// java-tron `ResourceProcessor.increase` on the **legacy** (`long` / `double`)
+/// path — used when `ALLOW_HARDEN_RESOURCE_CALCULATION` is off (mainnet). Uses
+/// wrapping `long` multiplies (java silently overflows here) and the `double`
+/// decay + `StrictMath.round` step.
+fn increase_legacy(last_usage: i64, usage: i64, last_time: i64, now: i64, window: i64) -> i64 {
+    if window <= 0 {
+        return 0;
+    }
+    let mut average_last = div_ceil_i64(last_usage.wrapping_mul(PRECISION), window);
+    let average_usage = div_ceil_i64(usage.wrapping_mul(PRECISION), window);
+    if last_time != now {
+        if last_time + window > now {
+            let delta = now - last_time;
+            let decay = (window - delta) as f64 / window as f64;
+            average_last = strict_round(average_last as f64 * decay);
+        } else {
+            average_last = 0;
+        }
+    }
+    let total = average_last.wrapping_add(average_usage);
+    total.wrapping_mul(window) / PRECISION
+}
+
+/// java-tron `RepositoryImpl.getAccount{Net,Energy}UsageBalanceAndRestoreSeconds`
+/// — `(usageBalanceInSun, restoreSeconds)` for the account's *current* (decayed)
+/// usage. Returns `(0, 0)` once the usage window has fully elapsed
+/// (`now >= latestConsumeTime + windowSize`), matching java's `Pair.of(0L, 0L)`.
+///
+/// `now_slot` is `getHeadSlot()`. `total_weight` / `total_limit` are the
+/// chain-global `TOTAL_{NET,ENERGY}_WEIGHT` / `TOTAL_NET_LIMIT` /
+/// `TOTAL_ENERGY_CURRENT_LIMIT`. `harden` is `ALLOW_HARDEN_RESOURCE_CALCULATION`
+/// (false on mainnet → legacy arithmetic).
+pub fn account_usage_balance_and_restore_seconds(
+    account: &Account,
+    kind: ResourceKind,
+    now_slot: i64,
+    total_weight: i64,
+    total_limit: i64,
+    harden: bool,
+) -> (i64, i64) {
+    let usage_now = usage(account, kind);
+    let latest = last_consume_time(account, kind);
+    let window = window_size(account, kind);
+    if now_slot >= latest + window {
+        return (0, 0);
+    }
+    let restore_slots = latest + window - now_slot;
+    // java `recover(usage, latestConsumeTime, now, windowSize)`.
+    let new_usage = if harden {
+        increase(usage_now, 0, latest, now_slot, window)
+    } else {
+        increase_legacy(usage_now, 0, latest, now_slot, window)
+    };
+    let balance = usage_to_balance(new_usage, total_weight, total_limit, harden);
+    (balance, restore_slots * BLOCK_PRODUCED_INTERVAL_MS / 1_000)
+}
+
 // =============================================================================
 // Account-aware windowed-average (writes the per-account window back)
 // =============================================================================

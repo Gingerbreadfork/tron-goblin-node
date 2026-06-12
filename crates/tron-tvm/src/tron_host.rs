@@ -146,7 +146,10 @@ impl TronDatabaseExt for TronDatabase {
 
         let now_ms = dyn_props.latest_block_header_timestamp().unwrap_or(0);
         let allow_freeze = dyn_props.get_long(b"ALLOW_TVM_FREEZE").unwrap_or(0) == 1;
-        let allow_freeze_v2 = dyn_props.get_long(b"ALLOW_TVM_FREEZE_V2").unwrap_or(0) == 1;
+        // java derives allowTvmFreezeV2 from supportUnfreezeDelay()
+        // (UNFREEZE_DELAY_DAYS > 0) — there is NO ALLOW_TVM_FREEZE_V2 key, so
+        // reading it returned false on every real snapshot.
+        let allow_freeze_v2 = dyn_props.support_unfreeze_delay();
         let allow_vote = dyn_props.get_long(b"ALLOW_TVM_VOTE").unwrap_or(0) == 1;
         let allow_trc10 = dyn_props.get_long(b"ALLOW_TVM_TRANSFER_TRC10").unwrap_or(0) == 1;
         let restriction = dyn_props

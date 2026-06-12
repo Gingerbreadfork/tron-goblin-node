@@ -458,15 +458,16 @@ impl DatabaseCommit for TronDatabase {
 
             // Read existing account (if any) so we preserve TRON-only
             // fields (votes, frozen, asset map, …) across the EVM commit.
-            let mut tron_account = self
-                .accounts
-                .get(&tron_addr)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| tron_proto::Account {
-                    address: tron_addr.as_bytes().to_vec(),
-                    ..Default::default()
-                });
+            let existing = self.accounts.get(&tron_addr).ok().flatten();
+            // Whether the VM is creating this account from nothing — used below
+            // to mirror java's `createNormalAccount`, which attaches the
+            // default owner+active[id=2] permission to a freshly-created
+            // *normal* (non-contract) account when multisig is enabled.
+            let is_new_account = existing.is_none();
+            let mut tron_account = existing.unwrap_or_else(|| tron_proto::Account {
+                address: tron_addr.as_bytes().to_vec(),
+                ..Default::default()
+            });
 
             // TRON fork: if a nested CREATE/CREATE2 deployed this address (and
             // it survived to commit), mark the account `CreatedByContract` /
@@ -507,6 +508,18 @@ impl DatabaseCommit for TronDatabase {
                         .expect("db error in DatabaseCommit::commit writing code");
                     tron_account.code_hash = account.info.code_hash.to_vec();
                     tron_account.code = raw.to_vec();
+                }
+            }
+
+            // java's `RepositoryImpl.createNormalAccount` attaches the default
+            // owner+active[id=2] permission (when ALLOW_MULTI_SIGN is on) to a
+            // freshly-created *normal* account — i.e. a plain EOA the VM
+            // brought into existence by transferring value to it. Deployed
+            // contracts (in `pending_created_contracts`, or anything that now
+            // carries code) get no default permission, matching java.
+            if is_new_account && created_contract.is_none() && tron_account.code.is_empty() {
+                if let Some(dyn_props) = &self.dyn_props {
+                    tron_chainbase::apply_default_account_permissions(&mut tron_account, dyn_props);
                 }
             }
 

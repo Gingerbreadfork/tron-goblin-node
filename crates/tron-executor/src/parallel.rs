@@ -377,10 +377,12 @@ fn account_field_diff(base: Option<&[u8]>, fin: Option<&[u8]>) -> String {
 /// the bound — a should-never-happen safety hatch (dependencies are acyclic by
 /// index) so the caller can fall back to the serial loop rather than risk a wrong
 /// state. The serial path is always the source of truth.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_block_parallel(
     state: &StateBackends,
     txs: &[Transaction],
     config: &ExecConfig,
+    block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
     signers: &[Result<Vec<Address>, String>],
@@ -434,6 +436,7 @@ pub(crate) fn execute_block_parallel(
             &captures[i],
             &txs[i],
             config,
+            block_number,
             block_timestamp_ms,
             now_slot,
             &signers[i],

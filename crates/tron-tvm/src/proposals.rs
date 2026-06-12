@@ -120,7 +120,15 @@ impl ProposalSet {
             allow_tvm_transfer_trc10: flag(b"ALLOW_TVM_TRANSFER_TRC10"),
             allow_tvm_freeze: flag(b"ALLOW_TVM_FREEZE"),
             allow_tvm_vote: flag(b"ALLOW_TVM_VOTE"),
-            allow_tvm_freeze_v2: flag(b"ALLOW_TVM_FREEZE_V2"),
+            // java-tron has NO `ALLOW_TVM_FREEZE_V2` dyn-props key: it derives
+            // `VMConfig.allowTvmFreezeV2` from `supportUnfreezeDelay()` at
+            // config-load (`ConfigLoader.initAllowTvmFreezeV2(ds.supportUnfreezeDelay()?1:0)`,
+            // and `supportUnfreezeDelay() = getUnfreezeDelayDays() > 0`).
+            // Reading the (always-absent) key returned false on every real
+            // snapshot — disabling all Stake-2.0 opcodes AND the FreezeV2
+            // precompiles (CheckUnDelegateResource etc.), so every resource-
+            // rental / delegation-market contract reverted.
+            allow_tvm_freeze_v2: dps.support_unfreeze_delay(),
             allow_tvm_compatible_evm: flag(b"ALLOW_TVM_COMPATIBLE_EVM"),
             allow_shielded_trc20_transaction: flag(b"ALLOW_SHIELDED_TRC20_TRANSACTION"),
             allow_tvm_selfdestruct_restriction: flag(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION"),
@@ -306,12 +314,14 @@ mod tests {
             b"ALLOW_TVM_TRANSFER_TRC10",
             b"ALLOW_TVM_FREEZE",
             b"ALLOW_TVM_VOTE",
-            b"ALLOW_TVM_FREEZE_V2",
             b"ALLOW_TVM_COMPATIBLE_EVM",
             b"ALLOW_SHIELDED_TRC20_TRANSACTION",
         ] {
             dps.put_long(key, 1);
         }
+        // `allow_tvm_freeze_v2` is derived from `supportUnfreezeDelay()` =
+        // `UNFREEZE_DELAY_DAYS > 0` (java has no ALLOW_TVM_FREEZE_V2 key).
+        dps.put_long(b"UNFREEZE_DELAY_DAYS", 14);
         assert_eq!(ProposalSet::from_store(&dps), ProposalSet::all_enabled());
     }
 }

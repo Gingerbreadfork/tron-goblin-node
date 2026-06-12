@@ -69,6 +69,7 @@ pub fn validate_transfer_asset(
 
 pub fn execute_transfer_asset(
     accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &TransferAssetContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -78,11 +79,22 @@ pub fn execute_transfer_asset(
     let mut owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    let mut to_account = accounts.get(&to)?.unwrap_or_else(|| tron_proto::Account {
-        address: to.as_bytes().to_vec(),
-        r#type: tron_proto::AccountType::Normal as i32,
-        ..Default::default()
-    });
+    let mut to_account = match accounts.get(&to)? {
+        Some(a) => a,
+        None => {
+            // New recipient: java's TransferAssetActuator builds the
+            // AccountCapsule with create_time + the default owner+active[id=2]
+            // permission (`withDefaultPermission = getAllowMultiSign() == 1`).
+            let mut a = tron_proto::Account {
+                address: to.as_bytes().to_vec(),
+                r#type: tron_proto::AccountType::Normal as i32,
+                create_time: dyn_props.latest_block_header_timestamp().unwrap_or(0),
+                ..Default::default()
+            };
+            crate::permission::apply_default_account_permissions(&mut a, dyn_props);
+            a
+        }
+    };
 
     // Merge optimized accounts' TRC10 balances inline before mutating, so the
     // debit sees the real balance and the credit adds to (not overwrites) any

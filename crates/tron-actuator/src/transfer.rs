@@ -116,7 +116,7 @@ pub fn execute_transfer(
         fee = fee
             .checked_add(create_fee)
             .ok_or(ActuatorError::Overflow)?;
-        let new_acct = Account {
+        let mut new_acct = Account {
             address: to.as_bytes().to_vec(),
             r#type: tron_proto::AccountType::Normal as i32,
             create_time: dynamic_properties
@@ -124,6 +124,10 @@ pub fn execute_transfer(
                 .unwrap_or(0),
             ..Default::default()
         };
+        // java attaches the default owner+active[id=2] permission to every
+        // account it creates when ALLOW_MULTI_SIGN is on (TransferActuator →
+        // `new AccountCapsule(.., withDefaultPermission, ..)`).
+        crate::permission::apply_default_account_permissions(&mut new_acct, dynamic_properties);
         to_account = Some(new_acct);
         created_recipient = true;
     }

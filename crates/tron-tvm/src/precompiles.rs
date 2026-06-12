@@ -19,6 +19,10 @@ use crate::address::*;
 use crate::context::{EvmContext, EvmContextError};
 use tron_crypto::address::{Address, ADDRESS_LENGTH};
 use tron_crypto::hash::keccak256;
+use tron_types::resource::{
+    account_usage_balance_and_restore_seconds, all_frozen_balance_for_bandwidth,
+    all_frozen_balance_for_energy, ResourceKind, BLOCK_PRODUCED_INTERVAL_MS,
+};
 
 pub type PrecompileResult = Result<Vec<u8>, PrecompileError>;
 
@@ -247,6 +251,16 @@ impl PrecompileImpl {
         input: &[u8],
         ctx: &dyn EvmContext,
     ) -> PrecompileResult {
+        let result = self.execute_inner(input, ctx);
+        maybe_trace_resource_precompile(self, input, ctx, &result);
+        result
+    }
+
+    fn execute_inner(
+        self,
+        input: &[u8],
+        ctx: &dyn EvmContext,
+    ) -> PrecompileResult {
         match self {
             // === Implemented ===
             Self::BatchValidateSign => batch_validate_sign(input),
@@ -458,6 +472,21 @@ fn data_boolean(v: bool) -> Vec<u8> {
     out
 }
 
+/// java-tron `DataWord.longValueSafe()` — the low 64 bits as a signed long,
+/// saturated to `i64::MAX` when the word occupies more than 8 bytes (so an
+/// out-of-range `amount`/`type` clamps instead of wrapping).
+fn word_to_long_safe(word: &[u8; WORD_SIZE]) -> i64 {
+    if word[..24].iter().any(|&b| b != 0) {
+        return i64::MAX;
+    }
+    let v = i64::from_be_bytes(word[24..32].try_into().unwrap());
+    if v < 0 {
+        i64::MAX
+    } else {
+        v
+    }
+}
+
 /// Decode a 32-byte word as a TRON address: take the last 20 bytes and
 /// prepend the mainnet `0x41` prefix. Matches java-tron's
 /// `DataWord.toTronAddress`.
@@ -589,39 +618,38 @@ fn reward_balance(ctx: &dyn EvmContext) -> PrecompileResult {
 // GetChainParameter (0x0100000b)
 // =============================================================================
 
+/// java-tron `GetChainParameter` — `ChainParameterEnum.fromCode(code)`. Only
+/// SIX codes exist (java's enum); everything else (and code 0) returns 0. The
+/// earlier mapping used a completely different, invented code table (code 3 →
+/// TRANSACTION_FEE instead of TOTAL_ENERGY_CURRENT_LIMIT, etc.), so every
+/// energy-rental contract that read the energy limit/weight here got garbage
+/// and reverted "not enough energy".
 fn get_chain_parameter(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     if input.len() != WORD_SIZE {
         return Ok(long_to_32_bytes(0));
     }
-    // The input word's last 8 bytes hold the parameter selector.
-    let mut be = [0u8; 8];
-    be.copy_from_slice(&input[24..32]);
-    let selector = i64::from_be_bytes(be);
-    let key = parameter_key(selector);
-    let value = ctx.chain_parameter_long(key)?.unwrap_or(0);
+    let mut word = [0u8; WORD_SIZE];
+    word.copy_from_slice(input);
+    let code = word_to_long_safe(&word);
+    let value = match code {
+        // 1 TOTAL_NET_LIMIT — getTotalNetLimit() (init default 43_200_000_000).
+        1 => ctx
+            .chain_parameter_long(b"TOTAL_NET_LIMIT")?
+            .unwrap_or(43_200_000_000),
+        // 2 TOTAL_NET_WEIGHT
+        2 => ctx.chain_parameter_long(b"TOTAL_NET_WEIGHT")?.unwrap_or(0),
+        // 3 TOTAL_ENERGY_CURRENT_LIMIT
+        3 => ctx
+            .chain_parameter_long(b"TOTAL_ENERGY_CURRENT_LIMIT")?
+            .unwrap_or(0),
+        // 4 TOTAL_ENERGY_WEIGHT
+        4 => ctx.chain_parameter_long(b"TOTAL_ENERGY_WEIGHT")?.unwrap_or(0),
+        // 5 UNFREEZE_DELAY_DAYS
+        5 => ctx.chain_parameter_long(b"UNFREEZE_DELAY_DAYS")?.unwrap_or(0),
+        // 0 INVALID_PARAMETER_KEY + any unknown code → 0.
+        _ => 0,
+    };
     Ok(long_to_32_bytes(value))
-}
-
-/// Selector → DynamicPropertiesStore key.
-///
-/// java-tron has a hardcoded switch over selectors in
-/// `GetChainParameter.execute`. Most entries map 1:1 to a key in
-/// `DynamicPropertiesStore`. This Phase-1 list covers the most-used
-/// parameters; missing selectors fall back to a zero result.
-fn parameter_key(selector: i64) -> &'static [u8] {
-    match selector {
-        0 => b"MAINTENANCE_TIME_INTERVAL",
-        1 => b"ACCOUNT_UPGRADE_COST",
-        2 => b"CREATE_ACCOUNT_FEE",
-        3 => b"TRANSACTION_FEE",
-        4 => b"ASSET_ISSUE_FEE",
-        5 => b"WITNESS_PAY_PER_BLOCK",
-        6 => b"WITNESS_STANDBY_ALLOWANCE",
-        7 => b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT",
-        // ... ~70 more selectors in java-tron. Falls through to "" below for
-        // anything we haven't pinned yet — caller gets 0.
-        _ => b"",
-    }
 }
 
 // =============================================================================
@@ -895,6 +923,93 @@ const RESOURCE_BANDWIDTH: i32 = 0;
 const RESOURCE_ENERGY: i32 = 1;
 // const RESOURCE_TRON_POWER: i32 = 2;  // not handled by these precompiles
 
+/// Diagnostic: when `TRON_PRECOMPILE_TRACE_BLOCK` is set to a block number,
+/// log every FreezeV2 resource-precompile call (address, input, output) made
+/// while executing that block. Off (zero overhead) unless the env var is set —
+/// used to capture clean-state precompile I/O at a known divergence block
+/// without a debugger or archive replay.
+fn maybe_trace_resource_precompile(
+    p: PrecompileImpl,
+    input: &[u8],
+    ctx: &dyn EvmContext,
+    result: &PrecompileResult,
+) {
+    use std::sync::OnceLock;
+    // Temporary investigation default: trace the first known divergence blocks
+    // (a56d573d @83316753 + the next two REVERTs) automatically, so a normal
+    // fresh-snapshot re-sync captures the clean-state precompile I/O with no env
+    // var to remember. Override with TRON_PRECOMPILE_TRACE_BLOCK=<n> (single
+    // block), or disable with TRON_PRECOMPILE_TRACE_BLOCK=0.
+    static TRACE_BLOCKS: OnceLock<Vec<i64>> = OnceLock::new();
+    let targets = TRACE_BLOCKS.get_or_init(|| {
+        // Off by default now that the precompiles are confirmed byte-exact;
+        // re-enable for a specific block with TRON_PRECOMPILE_TRACE_BLOCK=<n>.
+        match std::env::var("TRON_PRECOMPILE_TRACE_BLOCK") {
+            Ok(s) => s.trim().parse::<i64>().ok().filter(|&n| n != 0).into_iter().collect(),
+            Err(_) => Vec::new(),
+        }
+    });
+    let blk = ctx.block_number();
+    if !targets.contains(&blk) {
+        return;
+    }
+    let target = blk;
+    let name = match p {
+        PrecompileImpl::GetChainParameter
+        | PrecompileImpl::AvailableUnfreezeV2Size
+        | PrecompileImpl::UnfreezableBalanceV2
+        | PrecompileImpl::ExpireUnfreezeBalanceV2
+        | PrecompileImpl::DelegatableResource
+        | PrecompileImpl::ResourceV2
+        | PrecompileImpl::CheckUnDelegateResource
+        | PrecompileImpl::ResourceUsage
+        | PrecompileImpl::TotalResource
+        | PrecompileImpl::TotalDelegatedResource
+        | PrecompileImpl::TotalAcquiredResource => format!("{p:?}"),
+        _ => return,
+    };
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let out = match result {
+        Ok(o) => hex(o),
+        Err(e) => format!("<err {e:?}>"),
+    };
+    eprintln!(
+        "PRECOMPILE_TRACE blk={} {} caller={} in={} out={}",
+        target,
+        name,
+        hex(ctx.caller().as_bytes()),
+        hex(input),
+        out,
+    );
+    // Dump the resolved target account's resource fields + the chain-global
+    // weights/limits so the precompile math can be verified against java
+    // byte-for-byte from the log alone (word[0] is the target for every member).
+    if input.len() >= WORD_SIZE {
+        let mut w = [0u8; WORD_SIZE];
+        w.copy_from_slice(&input[..WORD_SIZE]);
+        let addr = word_to_tron_address(&w);
+        if let Ok(Some(a)) = ctx.get_account(&addr) {
+            let ar = a.account_resource.clone().unwrap_or_default();
+            let g = |k: &[u8]| ctx.chain_parameter_long(k).ok().flatten().unwrap_or(0);
+            eprintln!(
+                "  TRACE_ACCT {} now_slot={} TEW={} TEL={} TNW={} TNL={} \
+                 e_usage={} e_lct={} e_winsz={} e_winopt={} n_usage={} n_lct={} n_winsz={} n_winopt={} \
+                 fv2_e={} fv2_n={} v1_e={} dlg_v1e={} dlg_v2e={} acq_v1e={} acq_v2e={}",
+                hex(addr.as_bytes()),
+                ctx.latest_block_timestamp_ms() / BLOCK_PRODUCED_INTERVAL_MS,
+                g(b"TOTAL_ENERGY_WEIGHT"), g(b"TOTAL_ENERGY_CURRENT_LIMIT"),
+                g(b"TOTAL_NET_WEIGHT"), g(b"TOTAL_NET_LIMIT"),
+                ar.energy_usage, ar.latest_consume_time_for_energy, ar.energy_window_size, ar.energy_window_optimized,
+                a.net_usage, a.latest_consume_time, a.net_window_size, a.net_window_optimized,
+                frozen_v2_balance(&a, RESOURCE_ENERGY), frozen_v2_balance(&a, RESOURCE_BANDWIDTH),
+                ar.frozen_balance_for_energy.as_ref().map(|f| f.frozen_balance).unwrap_or(0),
+                ar.delegated_frozen_balance_for_energy, ar.delegated_frozen_v2_balance_for_energy,
+                ar.acquired_delegated_frozen_balance_for_energy, ar.acquired_delegated_frozen_v2_balance_for_energy,
+            );
+        }
+    }
+}
+
 fn parse_address_and_type(input: &[u8]) -> Option<(Address, i32)> {
     if input.len() != 2 * WORD_SIZE {
         return None;
@@ -925,6 +1040,21 @@ fn frozen_v2_balance(account: &tron_proto::Account, resource_type: i32) -> i64 {
         .sum()
 }
 
+/// Own v1 (Stake-1.0) frozen balance — java `AccountCapsule.getFrozenBalance`
+/// (bandwidth = sum of the `frozen` list) / `getEnergyFrozenBalance`.
+fn frozen_v1(account: &tron_proto::Account, resource_type: i32) -> i64 {
+    match resource_type {
+        RESOURCE_BANDWIDTH => account.frozen.iter().map(|f| f.frozen_balance).sum(),
+        RESOURCE_ENERGY => account
+            .account_resource
+            .as_ref()
+            .and_then(|r| r.frozen_balance_for_energy.as_ref())
+            .map(|f| f.frozen_balance)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Delegated-out v2 for the given resource type. The Bandwidth value
 /// lives at the top level; Energy lives nested under `account_resource`.
 fn delegated_v2(account: &tron_proto::Account, resource_type: i32) -> i64 {
@@ -952,17 +1082,84 @@ fn acquired_delegated_v2(account: &tron_proto::Account, resource_type: i32) -> i
     }
 }
 
-/// Current usage. Bandwidth = `net_usage`; Energy = `energy_usage`.
-fn resource_usage(account: &tron_proto::Account, resource_type: i32) -> i64 {
+/// Delegated-out v1 (Stake-1.0) for the given resource type.
+fn delegated_v1(account: &tron_proto::Account, resource_type: i32) -> i64 {
     match resource_type {
-        RESOURCE_BANDWIDTH => account.net_usage,
+        RESOURCE_BANDWIDTH => account.delegated_frozen_balance_for_bandwidth,
         RESOURCE_ENERGY => account
             .account_resource
             .as_ref()
-            .map(|r| r.energy_usage)
+            .map(|r| r.delegated_frozen_balance_for_energy)
             .unwrap_or(0),
         _ => 0,
     }
+}
+
+/// Delegated-in (acquired) v1 for the given resource type.
+fn acquired_delegated_v1(account: &tron_proto::Account, resource_type: i32) -> i64 {
+    match resource_type {
+        RESOURCE_BANDWIDTH => account.acquired_delegated_frozen_balance_for_bandwidth,
+        RESOURCE_ENERGY => account
+            .account_resource
+            .as_ref()
+            .map(|r| r.acquired_delegated_frozen_balance_for_energy)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// java-tron `AccountCapsule.getTotalDelegatedFrozenBalanceFor{Bandwidth,Energy}`
+/// — Stake-1.0 + Stake-2.0 delegated-out.
+fn total_delegated(account: &tron_proto::Account, resource_type: i32) -> i64 {
+    delegated_v1(account, resource_type).saturating_add(delegated_v2(account, resource_type))
+}
+
+/// java-tron `AccountCapsule.getTotalAcquiredDelegatedFrozenBalanceFor{…}` —
+/// Stake-1.0 + Stake-2.0 acquired (delegated-in).
+fn total_acquired(account: &tron_proto::Account, resource_type: i32) -> i64 {
+    acquired_delegated_v1(account, resource_type)
+        .saturating_add(acquired_delegated_v2(account, resource_type))
+}
+
+/// Map the precompile's `i32` resource selector to [`ResourceKind`].
+fn resource_kind(resource_type: i32) -> Option<ResourceKind> {
+    match resource_type {
+        RESOURCE_BANDWIDTH => Some(ResourceKind::Bandwidth),
+        RESOURCE_ENERGY => Some(ResourceKind::Energy),
+        _ => None,
+    }
+}
+
+/// `(usageBalanceInSun, restoreSeconds)` for an account's current decayed usage
+/// — java's `getAccount{Net,Energy}UsageBalanceAndRestoreSeconds`. Reads the
+/// chain-global weights/limits from dyn-props.
+fn account_usage_balance(
+    account: &tron_proto::Account,
+    kind: ResourceKind,
+    ctx: &dyn EvmContext,
+) -> Result<(i64, i64), EvmContextError> {
+    // java `getHeadSlot()` = getLatestBlockHeaderTimestamp()/interval — the
+    // committed head (block N-1 during apply), NOT the executing block.
+    let now_slot = ctx.latest_block_timestamp_ms() / BLOCK_PRODUCED_INTERVAL_MS;
+    let (total_weight, total_limit) = match kind {
+        ResourceKind::Bandwidth => (
+            ctx.chain_parameter_long(b"TOTAL_NET_WEIGHT")?.unwrap_or(0),
+            ctx.chain_parameter_long(b"TOTAL_NET_LIMIT")?.unwrap_or(0),
+        ),
+        ResourceKind::Energy => (
+            ctx.chain_parameter_long(b"TOTAL_ENERGY_WEIGHT")?.unwrap_or(0),
+            ctx.chain_parameter_long(b"TOTAL_ENERGY_CURRENT_LIMIT")?.unwrap_or(0),
+        ),
+    };
+    // ALLOW_HARDEN_RESOURCE_CALCULATION (proposal #97) is OFF on mainnet → the
+    // legacy double/long arithmetic is the byte-exact path.
+    let harden = ctx
+        .chain_parameter_long(b"ALLOW_HARDEN_RESOURCE_CALCULATION")?
+        .unwrap_or(0)
+        == 1;
+    Ok(account_usage_balance_and_restore_seconds(
+        account, kind, now_slot, total_weight, total_limit, harden,
+    ))
 }
 
 // === 0x0100000c — AvailableUnfreezeV2Size ====================================
@@ -977,48 +1174,64 @@ fn available_unfreeze_v2_size(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let account = ctx.get_account(&addr)?;
-    let used = account
-        .map(|a| a.unfrozen_v2.len() as i64)
-        .unwrap_or(0);
-    Ok(long_to_32_bytes(MAX_UNFREEZE_V2_SIZE.saturating_sub(used).max(0)))
+    let account = match ctx.get_account(&addr)? {
+        Some(a) => a,
+        None => return Ok(long_to_32_bytes(0)),
+    };
+    // java `getUnfreezingV2Count(now)` counts only entries still unfreezing
+    // (expire > now); matured ones have freed their slot. java's
+    // `now = getLatestBlockHeaderTimestamp()` = the committed head.
+    let now = ctx.latest_block_timestamp_ms();
+    let unfreezing = account
+        .unfrozen_v2
+        .iter()
+        .filter(|u| u.unfreeze_expire_time > now)
+        .count() as i64;
+    Ok(long_to_32_bytes(MAX_UNFREEZE_V2_SIZE.saturating_sub(unfreezing).max(0)))
 }
 
 // === 0x0100000d — UnfreezableBalanceV2 ======================================
 
-/// Sum of mature `unfrozen_v2` entries (expiry ≤ now). java-tron uses the
-/// current block timestamp; we use `ctx.block_timestamp_ms`.
+/// java-tron `FreezeV2Util.queryUnfreezableBalanceV2` — the account's currently
+/// **frozen-v2 balance** for the resource (what is eligible to be unfrozen), NOT
+/// the already-unfrozen/withdrawable amount (that is `ExpireUnfreezeBalanceV2`).
+/// `getFrozenV2BalanceFor{Bandwidth,Energy}` / `getTronPowerFrozenV2Balance`.
 fn unfreezable_balance_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let (addr, rtype) = match parse_address_and_type(input) {
         Some(p) => p,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let now = ctx.block_timestamp_ms();
     let account = match ctx.get_account(&addr)? {
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let total: i64 = account
-        .unfrozen_v2
-        .iter()
-        .filter(|u| u.r#type == rtype && u.unfreeze_expire_time <= now)
-        .map(|u| u.unfreeze_amount)
-        .sum();
-    Ok(long_to_32_bytes(total))
+    // type 0/1/2 (BANDWIDTH/ENERGY/TRON_POWER) all map to a frozen_v2 sum;
+    // any other type yields 0 (no matching frozen_v2 entries).
+    Ok(long_to_32_bytes(frozen_v2_balance(&account, rtype)))
 }
 
 // === 0x0100000e — ExpireUnfreezeBalanceV2 ===================================
 
-/// Like `UnfreezableBalanceV2`, but the cut-off time is supplied as an
-/// argument rather than read from the current block.
+/// java-tron `ExpireUnfreezeBalanceV2` — the total withdrawable amount across
+/// **all resource types** whose unfreeze matures at or before `time` (supplied
+/// in **seconds**, converted to ms). Input is two words `(address, time)`; there
+/// is no resource-type argument (withdrawal returns plain TRX).
 fn expire_unfreeze_balance_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
-    if input.len() != 3 * WORD_SIZE {
+    if input.len() != 2 * WORD_SIZE {
         return Ok(long_to_32_bytes(0));
     }
     let words = parse_words(input);
     let addr = word_to_tron_address(&words[0]);
-    let cutoff = i64::from_be_bytes(words[1][24..32].try_into().unwrap());
-    let rtype = i64::from_be_bytes(words[2][24..32].try_into().unwrap()) as i32;
+    let time_secs = word_to_long_safe(&words[1]);
+    if time_secs < 0 {
+        return Ok(long_to_32_bytes(0));
+    }
+    // java: `time >= Long.MAX/1000 ? Long.MAX : time * 1000`.
+    let time_ms = if time_secs >= i64::MAX / 1_000 {
+        i64::MAX
+    } else {
+        time_secs * 1_000
+    };
     let account = match ctx.get_account(&addr)? {
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
@@ -1026,7 +1239,7 @@ fn expire_unfreeze_balance_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
     let total: i64 = account
         .unfrozen_v2
         .iter()
-        .filter(|u| u.r#type == rtype && u.unfreeze_expire_time <= cutoff)
+        .filter(|u| u.unfreeze_expire_time <= time_ms)
         .map(|u| u.unfreeze_amount)
         .sum();
     Ok(long_to_32_bytes(total))
@@ -1036,106 +1249,179 @@ fn expire_unfreeze_balance_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
 
 /// `frozen_v2[type] - delegated_v2[type]` — the amount this account can
 /// still delegate out for the given resource.
+/// java-tron `FreezeV2Util.queryDelegatableResource` — how much of the account's
+/// own frozen-v2 balance is free to delegate: `frozenV2 - v2Usage`, where
+/// `v2Usage = usageBalance - v1Frozen - acquiredV1 - acquiredV2` (clamped ≥ 0).
+/// When the account has no current usage, the whole frozen-v2 balance is free.
 fn delegatable_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let (addr, rtype) = match parse_address_and_type(input) {
         Some(p) => p,
         None => return Ok(long_to_32_bytes(0)),
     };
+    let Some(kind) = resource_kind(rtype) else {
+        return Ok(long_to_32_bytes(0));
+    };
     let account = match ctx.get_account(&addr)? {
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let frozen = frozen_v2_balance(&account, rtype);
-    let delegated = delegated_v2(&account, rtype);
-    Ok(long_to_32_bytes(frozen.saturating_sub(delegated).max(0)))
+    let frozen_v2_resource = frozen_v2_balance(&account, rtype);
+    let (usage_balance, _restore) = account_usage_balance(&account, kind, ctx)?;
+    if usage_balance <= 0 {
+        return Ok(long_to_32_bytes(frozen_v2_resource));
+    }
+    // java `getV2{Net,Energy}Usage`.
+    let v2_usage = usage_balance
+        .saturating_sub(frozen_v1(&account, rtype))
+        .saturating_sub(acquired_delegated_v1(&account, rtype))
+        .saturating_sub(acquired_delegated_v2(&account, rtype))
+        .max(0);
+    Ok(long_to_32_bytes(frozen_v2_resource.saturating_sub(v2_usage).max(0)))
 }
 
 // === 0x01000010 — ResourceV2 ================================================
 
 /// Just `frozen_v2[type]`.
+/// java-tron `ResourceV2` — input is **three** words `(target, from, type)`.
+/// When `from == target` it is the account's own frozen-v2 balance
+/// (`queryUnfreezableBalanceV2`); otherwise it is the resource `from`
+/// delegated to `target` (`queryResourceV2`), summing the unlocked + locked
+/// v2 delegation rows.
 fn resource_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
-    let (addr, rtype) = match parse_address_and_type(input) {
-        Some(p) => p,
-        None => return Ok(long_to_32_bytes(0)),
+    if input.len() != 3 * WORD_SIZE {
+        return Ok(long_to_32_bytes(0));
+    }
+    let words = parse_words(input);
+    let target = word_to_tron_address(&words[0]);
+    let from = word_to_tron_address(&words[1]);
+    let rtype = word_to_long_safe(&words[2]) as i32;
+
+    if from == target {
+        // queryUnfreezableBalanceV2(from, type)
+        let balance = match ctx.get_account(&from)? {
+            Some(a) => frozen_v2_balance(&a, rtype),
+            None => 0,
+        };
+        return Ok(long_to_32_bytes(balance));
+    }
+
+    // queryResourceV2(from, target, type): unlocked + locked delegation rows.
+    let pick = |dr: &tron_proto::DelegatedResource| match rtype {
+        RESOURCE_BANDWIDTH => dr.frozen_balance_for_bandwidth,
+        RESOURCE_ENERGY => dr.frozen_balance_for_energy,
+        _ => 0,
     };
-    let account = match ctx.get_account(&addr)? {
-        Some(a) => a,
-        None => return Ok(long_to_32_bytes(0)),
-    };
-    Ok(long_to_32_bytes(frozen_v2_balance(&account, rtype)))
+    let unlocked = ctx.get_delegated_resource(&from, &target)?;
+    let locked = ctx.get_locked_delegated_resource(&from, &target)?;
+    if unlocked.is_none() && locked.is_none() {
+        return Ok(long_to_32_bytes(0));
+    }
+    if !matches!(rtype, RESOURCE_BANDWIDTH | RESOURCE_ENERGY) {
+        return Ok(long_to_32_bytes(0));
+    }
+    let amount = unlocked.as_ref().map(pick).unwrap_or(0)
+        .saturating_add(locked.as_ref().map(pick).unwrap_or(0));
+    Ok(long_to_32_bytes(amount))
 }
 
 // === 0x01000011 — CheckUnDelegateResource ===================================
 
-/// Inspects a delegation between `caller` (the precompile callee context's
-/// caller) and `target_addr` for `amount` of `resource_type`. Returns three
-/// words concatenated:
+/// java-tron `FreezeV2Util.checkUndelegateResource(address, amount, type)`.
 ///
-///   (free_amount, max_undelegate, expire_time)
+/// Returns three concatenated words `(clean, amount - clean, restoreSeconds)`
+/// where `clean` is the portion of `amount` covered by the *target account's*
+/// currently-unused (decayed) frozen balance for the resource, and
+/// `restoreSeconds` is how long until its in-use portion fully recovers.
 ///
-/// java-tron's exact semantics inspect `DelegatedResourceStore` for the
-/// `(caller, target)` pair, compute how much of the requested amount is
-/// in the "free" portion (no expiry constraint) vs locked until `expire_time`.
+/// NB: despite the opcode name this inspects the **target account's own
+/// resource usage vs. its total frozen balance** — it does *not* look at a
+/// delegation between caller and target. (The earlier placeholder did, which
+/// returned zeros and reverted every energy-rental contract that called it.)
 ///
-/// For now we treat the entire delegation as undelegatable iff the
-/// stored expiry has elapsed, with `expire_time` returned as-is.
+/// Reference: `FreezeV2Util.checkUndelegateResource` +
+/// `RepositoryImpl.getAccount{Net,Energy}UsageBalanceAndRestoreSeconds`.
 fn check_un_delegate_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
+    let zeros = || {
+        let mut z = vec![0u8; 3 * WORD_SIZE];
+        z.fill(0);
+        z
+    };
     if input.len() != 3 * WORD_SIZE {
-        let mut zero = vec![0u8; 3 * WORD_SIZE];
-        // 3 × 32-byte words of zero.
-        for chunk in zero.chunks_mut(WORD_SIZE) {
-            let z = long_to_32_bytes(0);
-            chunk.copy_from_slice(&z);
-        }
-        return Ok(zero);
+        return Ok(zeros());
     }
     let words = parse_words(input);
     let target = word_to_tron_address(&words[0]);
-    let amount = i64::from_be_bytes(words[1][24..32].try_into().unwrap());
-    let rtype = i64::from_be_bytes(words[2][24..32].try_into().unwrap()) as i32;
+    let amount = word_to_long_safe(&words[1]);
+    let rtype = word_to_long_safe(&words[2]) as i32;
 
-    let caller = ctx.caller();
-    let entry = ctx.get_delegated_resource(&caller, &target)?;
-
-    let (delegated, expire) = match entry {
-        Some(dr) => match rtype {
-            RESOURCE_BANDWIDTH => (dr.frozen_balance_for_bandwidth, dr.expire_time_for_bandwidth),
-            RESOURCE_ENERGY => (dr.frozen_balance_for_energy, dr.expire_time_for_energy),
-            _ => (0, 0),
-        },
-        None => (0, 0),
+    // `amount <= 0` / unknown resource type / missing account → zeros.
+    if amount <= 0 {
+        return Ok(zeros());
+    }
+    let account = match ctx.get_account(&target)? {
+        Some(a) => a,
+        None => return Ok(zeros()),
+    };
+    let (kind, resource_limit) = match rtype {
+        RESOURCE_BANDWIDTH => (ResourceKind::Bandwidth, all_frozen_balance_for_bandwidth(&account)),
+        RESOURCE_ENERGY => (ResourceKind::Energy, all_frozen_balance_for_energy(&account)),
+        _ => return Ok(zeros()),
     };
 
-    let now = ctx.block_timestamp_ms();
-    let max_undelegate = if expire <= now { delegated } else { 0 };
-    let free = max_undelegate.min(amount).max(0);
+    let (usage_balance, restore_seconds) = account_usage_balance(&account, kind, ctx)?;
 
-    // Concatenate three words: (free, max_undelegate, expire).
+    // java: `amount = min(amount, resourceLimit)`.
+    let amount = amount.min(resource_limit);
+    let (clean, remaining) = if resource_limit <= usage_balance {
+        (0, amount)
+    } else {
+        // java: `(long)(amount * ((double)(resourceLimit - usageBalance) / resourceLimit))`.
+        let clean =
+            (amount as f64 * ((resource_limit - usage_balance) as f64 / resource_limit as f64)) as i64;
+        (clean, amount - clean)
+    };
+
     let mut out = Vec::with_capacity(3 * WORD_SIZE);
-    out.extend_from_slice(&long_to_32_bytes(free));
-    out.extend_from_slice(&long_to_32_bytes(max_undelegate));
-    out.extend_from_slice(&long_to_32_bytes(expire));
+    out.extend_from_slice(&long_to_32_bytes(clean));
+    out.extend_from_slice(&long_to_32_bytes(remaining));
+    out.extend_from_slice(&long_to_32_bytes(restore_seconds));
     Ok(out)
 }
 
 // === 0x01000012 — ResourceUsage =============================================
 
+/// java-tron `FreezeV2Util.queryFrozenBalanceUsage` — returns the **two-word**
+/// pair `(usageBalanceInSun, restoreSeconds)` (java `encodeRes`), the same
+/// `getAccount{Net,Energy}UsageBalanceAndRestoreSeconds` used by
+/// CheckUnDelegateResource — NOT the raw usage counter.
 fn resource_usage_precompile(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
+    let zeros = || {
+        let mut z = vec![0u8; 2 * WORD_SIZE];
+        z.fill(0);
+        z
+    };
     let (addr, rtype) = match parse_address_and_type(input) {
         Some(p) => p,
-        None => return Ok(long_to_32_bytes(0)),
+        None => return Ok(zeros()),
+    };
+    let Some(kind) = resource_kind(rtype) else {
+        return Ok(zeros());
     };
     let account = match ctx.get_account(&addr)? {
         Some(a) => a,
-        None => return Ok(long_to_32_bytes(0)),
+        None => return Ok(zeros()),
     };
-    Ok(long_to_32_bytes(resource_usage(&account, rtype)))
+    let (balance, restore_seconds) = account_usage_balance(&account, kind, ctx)?;
+    let mut out = Vec::with_capacity(2 * WORD_SIZE);
+    out.extend_from_slice(&long_to_32_bytes(balance));
+    out.extend_from_slice(&long_to_32_bytes(restore_seconds));
+    Ok(out)
 }
 
 // === 0x01000013 — TotalResource =============================================
 
-/// `frozen_v2[type] + acquired_delegated_v2[type]` — everything available
-/// to this account for the resource (own + acquired).
+/// java-tron `AccountCapsule.getAllFrozenBalanceFor{Bandwidth,Energy}` — every
+/// weight source: own v1 frozen + own v2 frozen + acquired-delegated (v1 + v2).
 fn total_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let (addr, rtype) = match parse_address_and_type(input) {
         Some(p) => p,
@@ -1145,13 +1431,18 @@ fn total_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let own = frozen_v2_balance(&account, rtype);
-    let acquired = acquired_delegated_v2(&account, rtype);
-    Ok(long_to_32_bytes(own.saturating_add(acquired)))
+    let total = match rtype {
+        RESOURCE_BANDWIDTH => all_frozen_balance_for_bandwidth(&account),
+        RESOURCE_ENERGY => all_frozen_balance_for_energy(&account),
+        _ => 0,
+    };
+    Ok(long_to_32_bytes(total))
 }
 
 // === 0x01000014 — TotalDelegatedResource ====================================
 
+/// java-tron `AccountCapsule.getTotalDelegatedFrozenBalanceFor{…}` — v1 + v2
+/// delegated-out (the placeholder returned v2 only, undercounting v1 rentals).
 fn total_delegated_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let (addr, rtype) = match parse_address_and_type(input) {
         Some(p) => p,
@@ -1161,11 +1452,13 @@ fn total_delegated_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileRes
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    Ok(long_to_32_bytes(delegated_v2(&account, rtype)))
+    Ok(long_to_32_bytes(total_delegated(&account, rtype)))
 }
 
 // === 0x01000015 — TotalAcquiredResource =====================================
 
+/// java-tron `AccountCapsule.getTotalAcquiredDelegatedFrozenBalanceFor{…}` —
+/// v1 + v2 acquired (delegated-in).
 fn total_acquired_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let (addr, rtype) = match parse_address_and_type(input) {
         Some(p) => p,
@@ -1175,5 +1468,5 @@ fn total_acquired_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResu
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    Ok(long_to_32_bytes(acquired_delegated_v2(&account, rtype)))
+    Ok(long_to_32_bytes(total_acquired(&account, rtype)))
 }

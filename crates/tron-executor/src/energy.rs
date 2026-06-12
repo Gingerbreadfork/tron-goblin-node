@@ -307,10 +307,41 @@ fn origin_percent(consume_user_resource_percent: i64) -> i64 {
     (100 - consume_user_resource_percent).clamp(0, 100)
 }
 
+/// java `EnergyProcessor.getAccountLeftEnergyFromFreeze` — the account's
+/// currently-available staked energy: the global limit derived from its
+/// frozen-for-energy balance minus its windowed-decayed `energy_usage`,
+/// floored at 0. The pre-execution VM energy budget
+/// ([`vm_energy_budget_trigger`] / [`account_energy_limit_with_fix_ratio`]) and
+/// the per-account `origin_quota_left` charge clamp both read through this so
+/// the budget and the charge stay consistent.
+pub fn account_left_energy_from_freeze(
+    account: &Account,
+    dyn_props: &DynamicPropertiesStore,
+    now_slot: i64,
+) -> i64 {
+    let (energy_usage, latest_consume) = account
+        .account_resource
+        .as_ref()
+        .map(|r| (r.energy_usage, r.latest_consume_time_for_energy))
+        .unwrap_or((0, 0));
+    let decayed_usage = if dyn_props.support_unfreeze_delay() {
+        // Window-interpreted decay — see `consume_energy`.
+        recovery_account(
+            account,
+            ResourceKind::Energy,
+            energy_usage,
+            latest_consume,
+            now_slot,
+        )
+    } else {
+        increase_default(energy_usage, 0, latest_consume, now_slot)
+    };
+    let energy_limit = calculate_global_energy_limit(account, dyn_props);
+    energy_limit.saturating_sub(decayed_usage).max(0)
+}
+
 /// How much energy the origin account could pay from its frozen quota
-/// right now. Reads the same `account_resource.energy_usage` +
-/// windowed-decay primitive `consume_energy` uses, so the two stay
-/// consistent. Returns 0 if the account has no row.
+/// right now. Returns 0 if the account has no row.
 ///
 /// Pre-clamping the origin's share by this value guarantees the
 /// subsequent `consume_energy` call against origin can never go through
@@ -325,26 +356,113 @@ fn origin_quota_left(
     let Some(account) = accounts.get(origin)? else {
         return Ok(0);
     };
-    let (energy_usage, latest_consume) = account
-        .account_resource
-        .as_ref()
-        .map(|r| (r.energy_usage, r.latest_consume_time_for_energy))
-        .unwrap_or((0, 0));
-    let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
-    let decayed_usage = if support_unfreeze_delay {
-        // Window-interpreted decay — see `consume_energy`.
-        recovery_account(
-            &account,
-            ResourceKind::Energy,
-            energy_usage,
-            latest_consume,
-            now_slot,
-        )
+    Ok(account_left_energy_from_freeze(&account, dyn_props, now_slot))
+}
+
+/// java `Constant.CREATOR_DEFAULT_ENERGY_LIMIT` (1000 × 10_000). A contract row
+/// whose stored `origin_energy_limit` is the proto default `0`
+/// (`PB_DEFAULT_ENERGY_LIMIT`) predates the per-contract origin cap and is
+/// treated as this value. Mirrors `ContractCapsule.getOriginEnergyLimit`.
+pub const CREATOR_DEFAULT_ENERGY_LIMIT: i64 = 1000 * 10_000;
+
+/// java `ContractCapsule.getOriginEnergyLimit`: a stored `0` maps to
+/// [`CREATOR_DEFAULT_ENERGY_LIMIT`]. Applied to BOTH the pre-execution energy
+/// budget and the post-execution charge so an old contract (`origin_energy_limit
+/// == 0`, common for pre-2020 deploys) lets its origin subsidize the caller's
+/// energy exactly as java does — without this the caller is over-charged for
+/// every call to such a contract.
+pub fn effective_origin_energy_limit(raw_origin_energy_limit: i64) -> i64 {
+    if raw_origin_energy_limit == 0 {
+        CREATOR_DEFAULT_ENERGY_LIMIT
     } else {
-        increase_default(energy_usage, 0, latest_consume, now_slot)
+        raw_origin_energy_limit
+    }
+}
+
+/// sun-per-energy, java `VMActuator`: `energyFee` when `> 0`, else
+/// `VMConstant.SUN_PER_ENERGY` (100). Differs from [`DynamicPropertiesStore::
+/// energy_fee`] only when the stored fee is a non-positive misconfiguration.
+fn sun_per_energy(dyn_props: &DynamicPropertiesStore) -> i64 {
+    let f = dyn_props.energy_fee();
+    if f > 0 {
+        f
+    } else {
+        100
+    }
+}
+
+/// java `VMActuator.getAccountEnergyLimitWithFixRatio` — the CALLER's energy
+/// budget: `min(leftFrozenEnergy + max(balance - callValue, 0) / sunPerEnergy,
+/// feeLimit / sunPerEnergy)`. Pure read (no `energy_usage` reservation write —
+/// our charge in [`consume_energy`] already lands java's net final state, so
+/// replaying java's reserve-then-refund would double-count). Used directly as
+/// the budget for `CreateSmartContract` (caller == origin) and as the caller
+/// term of [`vm_energy_budget_trigger`].
+pub fn account_energy_limit_with_fix_ratio(
+    caller: &Account,
+    dyn_props: &DynamicPropertiesStore,
+    fee_limit: i64,
+    call_value: i64,
+    now_slot: i64,
+) -> i64 {
+    let spe = sun_per_energy(dyn_props);
+    let left_frozen = account_left_energy_from_freeze(caller, dyn_props, now_slot);
+    let energy_from_balance = caller.balance.saturating_sub(call_value).max(0) / spe;
+    let available = left_frozen.saturating_add(energy_from_balance);
+    let energy_from_fee_limit = fee_limit / spe;
+    available.min(energy_from_fee_limit)
+}
+
+/// java `VMActuator.getTotalEnergyLimitWithFixRatio` for a `TriggerSmartContract`
+/// call: the caller's budget plus the contract creator's subsidy.
+///
+/// * `caller` / `creator` are the resolved account rows. Pass `creator = None`
+///   when the contract has no distinct origin (origin == caller, or the
+///   contract row is missing) — then only the caller term applies.
+/// * `consume_user_resource_percent` is the % charged to the caller (clamped to
+///   `[0,100]`); the origin subsidizes `100 - percent`.
+/// * `raw_origin_energy_limit` is the contract's stored cap (the `0 → default`
+///   remap is applied here via [`effective_origin_energy_limit`]).
+///
+/// Pure reads — the actual split charge happens after execution in
+/// [`pay_energy_bill`].
+pub fn vm_energy_budget_trigger(
+    dyn_props: &DynamicPropertiesStore,
+    caller: &Account,
+    creator: Option<&Account>,
+    consume_user_resource_percent: i64,
+    raw_origin_energy_limit: i64,
+    fee_limit: i64,
+    call_value: i64,
+    now_slot: i64,
+) -> i64 {
+    let caller_energy_limit =
+        account_energy_limit_with_fix_ratio(caller, dyn_props, fee_limit, call_value, now_slot);
+    let Some(creator) = creator else {
+        return caller_energy_limit;
     };
-    let energy_limit = calculate_global_energy_limit(&account, dyn_props);
-    Ok(energy_limit.saturating_sub(decayed_usage).max(0))
+    let percent = consume_user_resource_percent.clamp(0, 100);
+    let origin_energy_limit = effective_origin_energy_limit(raw_origin_energy_limit).max(0);
+    // `originEnergyLeft` is only read when the origin actually subsidizes part
+    // of the call (`percent < 100`), matching java.
+    let origin_left = if percent < 100 {
+        account_left_energy_from_freeze(creator, dyn_props, now_slot)
+    } else {
+        0
+    };
+    let creator_energy_limit = if percent <= 0 {
+        origin_left.min(origin_energy_limit)
+    } else if percent < 100 {
+        // min(callerEnergyLimit * (100 - percent) / percent,
+        //     min(originEnergyLeft, originEnergyLimit)) — i128 to avoid the
+        // intermediate multiply overflowing i64.
+        let by_ratio = ((caller_energy_limit as i128) * ((100 - percent) as i128)
+            / (percent as i128)) as i64;
+        by_ratio.min(origin_left.min(origin_energy_limit))
+    } else {
+        0
+    };
+    caller_energy_limit.saturating_add(creator_energy_limit)
 }
 
 /// Top-level energy charge for a smart-contract tx — splits the bill

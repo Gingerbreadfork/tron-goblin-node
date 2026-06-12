@@ -416,6 +416,11 @@ fn resolve_permission(
     }
 }
 
+// The default-permission-on-create logic (java's `withDefaultPermission`
+// branch) lives in `tron-chainbase` so the VM commit path can share it; the
+// actuators reach it through this re-export.
+pub(crate) use tron_chainbase::apply_default_account_permissions;
+
 fn default_permission(ty: PermissionType, owner: &[u8; 21], name: &str) -> Permission {
     Permission {
         r#type: ty as i32,

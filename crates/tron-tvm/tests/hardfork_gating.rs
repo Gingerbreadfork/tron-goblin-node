@@ -299,14 +299,15 @@ fn freezebalancev2_halts_without_freeze_v2_runs_with_it() {
         install_contract(&stores, c, freezebalancev2_bytecode());
         assert!(
             is_halt(&run(&stores, caller, c)),
-            "FREEZEBALANCEV2 must halt without ALLOW_TVM_FREEZE_V2"
+            "FREEZEBALANCEV2 must halt without FreezeV2 (UNFREEZE_DELAY_DAYS == 0)"
         );
     }
     {
         let stores = fresh_stores();
+        // FreezeV2 = supportUnfreezeDelay() = UNFREEZE_DELAY_DAYS > 0.
         stores
             .dynamic_properties
-            .put_long(b"ALLOW_TVM_FREEZE_V2", 1);
+            .put_long(b"UNFREEZE_DELAY_DAYS", 14);
         let caller = install_caller(&stores);
         let c = tron_addr(0xc5);
         install_contract(&stores, c, freezebalancev2_bytecode());

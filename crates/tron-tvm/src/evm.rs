@@ -112,6 +112,15 @@ impl EvmContext for TronEvmContext {
     fn block_timestamp_ms(&self) -> i64 {
         self.block_timestamp_ms
     }
+    fn latest_block_timestamp_ms(&self) -> i64 {
+        // java `getLatestBlockHeaderTimestamp()` — the committed head (block
+        // N-1 during apply, since the header pointer advances only after the
+        // tx loop). Falls back to the executing block's timestamp for contexts
+        // where the head isn't populated.
+        self.dynamic_properties
+            .latest_block_header_timestamp()
+            .unwrap_or(self.block_timestamp_ms)
+    }
     fn all_witnesses(&self) -> Result<Vec<tron_proto::Witness>, EvmContextError> {
         Ok(self
             .witnesses
@@ -131,6 +140,14 @@ impl EvmContext for TronEvmContext {
         // precompiles that read this (CheckUnDelegateResource), v2
         // unlocked is what java-tron consults first.
         let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(from, to);
+        Ok(self.delegated_resources.get_raw(&key)?)
+    }
+    fn get_locked_delegated_resource(
+        &self,
+        from: &TronAddress,
+        to: &TronAddress,
+    ) -> Result<Option<tron_proto::DelegatedResource>, EvmContextError> {
+        let key = tron_chainbase::DelegatedResourceStore::v2_locked_key(from, to);
         Ok(self.delegated_resources.get_raw(&key)?)
     }
     fn dynamic_energy_factor(&self, contract: &TronAddress) -> Result<i64, EvmContextError> {

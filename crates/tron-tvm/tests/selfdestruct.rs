@@ -39,7 +39,8 @@ fn fresh_stores(restriction: bool) -> VmStores {
     dynamic_properties.put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
     dynamic_properties.put_long(b"ALLOW_TVM_FREEZE", 1);
     dynamic_properties.put_long(b"ALLOW_TVM_VOTE", 1);
-    dynamic_properties.put_long(b"ALLOW_TVM_FREEZE_V2", 1);
+    // FreezeV2 = supportUnfreezeDelay() = UNFREEZE_DELAY_DAYS > 0.
+    dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 14);
     if restriction {
         dynamic_properties.put_long(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION", 1);
     }

@@ -8,12 +8,14 @@ use hex_literal::hex;
 use tron_chainbase::{AccountStore, DynamicPropertiesStore, KvBackend, MemBackend};
 use tron_crypto::address::Address;
 use tron_executor::energy::{
-    consume_energy, pay_energy_bill, EnergyBill, EnergyCharge, EnergyError,
+    account_energy_limit_with_fix_ratio, consume_energy, effective_origin_energy_limit,
+    pay_energy_bill, vm_energy_budget_trigger, EnergyBill, EnergyCharge, EnergyError,
 };
 use tron_proto::account::{AccountResource, FreezeV2, Frozen};
 use tron_proto::Account;
 
 const ALICE: [u8; 21] = hex!("412e988a386a799f506693793c6a5af6b54dfaabfb");
+const BOB: [u8; 21] = hex!("41a0b4750e2cd76e19dca331f3cb2b6b7f3d5f8a9c");
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
@@ -587,4 +589,165 @@ fn split_returns_bill_struct_shape() {
     )
     .unwrap();
     let _ = format!("{bill:?}");
+}
+
+// ===========================================================================
+// VM energy BUDGET (java VMActuator.getTotalEnergyLimit, fix-ratio path).
+// Pre-execution read that decides the gas_limit handed to the VM — distinct
+// from the post-execution charge above.
+// ===========================================================================
+
+#[test]
+fn origin_energy_limit_zero_remaps_to_creator_default() {
+    // java Constant: PB_DEFAULT_ENERGY_LIMIT (0) -> CREATOR_DEFAULT (1000*10000).
+    assert_eq!(effective_origin_energy_limit(0), 10_000_000);
+    assert_eq!(effective_origin_energy_limit(1), 1);
+    assert_eq!(effective_origin_energy_limit(50_000_000), 50_000_000);
+}
+
+#[test]
+fn caller_budget_capped_by_balance_minus_call_value() {
+    // Replicates mainnet tx 9928cfa6 (block 83317250): the caller has no
+    // frozen energy and sends call_value with the trigger, so the budget is
+    // (balance - call_value)/energy_fee, NOT the larger fee_limit/energy_fee.
+    // java ran OUT_OF_ENERGY at 14_240; the old budget (fee_limit/100 = 68_116)
+    // wrongly let us succeed.
+    let env = Env::new();
+    let caller = Account {
+        address: ALICE.to_vec(),
+        balance: 220_424_000,
+        ..Default::default()
+    };
+    // energy_fee defaults to 100. fee_limit/100 = 68_116 but only
+    // (220_424_000 - 219_000_000)/100 = 14_240 is backable by balance.
+    let budget = account_energy_limit_with_fix_ratio(
+        &caller,
+        &env.dyn_props,
+        /*fee_limit=*/ 6_811_600,
+        /*call_value=*/ 219_000_000,
+        /*now_slot=*/ 0,
+    );
+    assert_eq!(budget, 14_240);
+}
+
+#[test]
+fn caller_budget_capped_by_fee_limit_when_balance_ample() {
+    let env = Env::new();
+    let caller = Account {
+        address: ALICE.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    // balance/100 = 10_000_000 >> fee_limit/100 = 5_000; min picks fee_limit.
+    let budget = account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, 500_000, 0, 0);
+    assert_eq!(budget, 5_000);
+}
+
+#[test]
+fn caller_frozen_energy_adds_to_budget() {
+    // leftFrozen + balance/fee both count toward `available`.
+    let env = Env::new();
+    seed_global_energy(&env, /*total_limit=*/ 100_000_000_000, /*total_weight=*/ 1_000);
+    let mut caller = Account {
+        address: ALICE.to_vec(),
+        balance: 0,
+        ..Default::default()
+    };
+    caller.frozen_v2.push(FreezeV2 { r#type: 1, amount: 1_000_000_000 });
+    // No balance → available = leftFrozen only. fee_limit huge so the min
+    // picks `available`. Budget must equal the account's left frozen energy.
+    let left = tron_executor::energy::account_left_energy_from_freeze(&caller, &env.dyn_props, 0);
+    assert!(left > 0, "frozen energy should yield a non-zero quota");
+    let budget =
+        account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, i64::MAX / 2, 0, 0);
+    assert_eq!(budget, left);
+}
+
+#[test]
+fn trigger_budget_adds_creator_subsidy_capped_by_origin_energy_limit() {
+    let env = Env::new();
+    seed_global_energy(&env, 100_000_000_000, 1_000);
+    let caller = Account {
+        address: ALICE.to_vec(),
+        balance: 100_000,
+        ..Default::default()
+    };
+    // caller_only = min(100_000/100, fee_limit/100) = min(1000, 100000) = 1000.
+    let caller_only =
+        account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, 10_000_000, 0, 0);
+    assert_eq!(caller_only, 1_000);
+    // Creator holds lots of frozen energy; origin_energy_limit caps its
+    // subsidy at 500. percent = 0 → origin covers the whole call but is
+    // limited to min(originLeft, 500) = 500.
+    let mut creator = Account {
+        address: BOB.to_vec(),
+        balance: 0,
+        ..Default::default()
+    };
+    creator.frozen_v2.push(FreezeV2 { r#type: 1, amount: 1_000_000_000 });
+    let budget = vm_energy_budget_trigger(
+        &env.dyn_props,
+        &caller,
+        Some(&creator),
+        /*percent=*/ 0,
+        /*raw_origin_energy_limit=*/ 500,
+        /*fee_limit=*/ 10_000_000,
+        /*call_value=*/ 0,
+        /*now_slot=*/ 0,
+    );
+    assert_eq!(budget, caller_only + 500);
+}
+
+#[test]
+fn trigger_budget_percent_100_means_no_creator_subsidy() {
+    let env = Env::new();
+    seed_global_energy(&env, 100_000_000_000, 1_000);
+    let caller = Account {
+        address: ALICE.to_vec(),
+        balance: 100_000,
+        ..Default::default()
+    };
+    let mut creator = Account {
+        address: BOB.to_vec(),
+        balance: 0,
+        ..Default::default()
+    };
+    creator.frozen_v2.push(FreezeV2 { r#type: 1, amount: 1_000_000_000 });
+    let caller_only =
+        account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, 5_000_000, 0, 0);
+    // percent == 100 → caller pays everything, creator contributes nothing.
+    let budget = vm_energy_budget_trigger(
+        &env.dyn_props,
+        &caller,
+        Some(&creator),
+        100,
+        500,
+        5_000_000,
+        0,
+        0,
+    );
+    assert_eq!(budget, caller_only);
+}
+
+#[test]
+fn trigger_budget_no_creator_is_caller_only() {
+    let env = Env::new();
+    let caller = Account {
+        address: ALICE.to_vec(),
+        balance: 1_000_000,
+        ..Default::default()
+    };
+    let caller_only =
+        account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, 1_000_000, 0, 0);
+    let budget = vm_energy_budget_trigger(
+        &env.dyn_props,
+        &caller,
+        None,
+        100,
+        0,
+        1_000_000,
+        0,
+        0,
+    );
+    assert_eq!(budget, caller_only);
 }

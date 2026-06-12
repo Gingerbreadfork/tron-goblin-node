@@ -42,8 +42,19 @@ pub trait EvmContext {
     /// expiry windows.
     fn block_number(&self) -> i64;
 
-    /// Latest block timestamp in milliseconds.
+    /// The **executing block's** timestamp in milliseconds — what the
+    /// `TIMESTAMP` opcode reflects (block N during apply).
     fn block_timestamp_ms(&self) -> i64;
+
+    /// The **committed head's** block timestamp in milliseconds — java's
+    /// `getLatestBlockHeaderTimestamp()`, which the resource model's
+    /// `getHeadSlot()` reads. During block-N apply this is block N-1 (the head
+    /// pointer is only advanced after the tx loop), so it differs from
+    /// [`Self::block_timestamp_ms`]. Defaults to `block_timestamp_ms()` for
+    /// contexts (mocks / constant calls) where the two coincide.
+    fn latest_block_timestamp_ms(&self) -> i64 {
+        self.block_timestamp_ms()
+    }
 
     /// Snapshot every registered witness. Used by `TotalVoteCount` and
     /// any consensus path that needs to sum across the entire SR set.
@@ -64,6 +75,21 @@ pub trait EvmContext {
         from: &Address,
         to: &Address,
     ) -> Result<Option<DelegatedResource>, EvmContextError>;
+
+    /// Read the **locked** v2 delegated-resource record for `(from, to)` —
+    /// the row a `DelegateResourceContract` with `lock = true` writes under
+    /// the locked-prefix key. Distinct from [`Self::get_delegated_resource`]
+    /// (which reads the unlocked row). `ResourceV2` sums both.
+    ///
+    /// Defaults to `None` so callers/mocks that don't model locked
+    /// delegations keep compiling; chainbase-backed impls override it.
+    fn get_locked_delegated_resource(
+        &self,
+        _from: &Address,
+        _to: &Address,
+    ) -> Result<Option<DelegatedResource>, EvmContextError> {
+        Ok(None)
+    }
 
     /// Per-contract dynamic energy penalty factor. Returns `0` (no
     /// penalty) for accounts that aren't contracts or that haven't

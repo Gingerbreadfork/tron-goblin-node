@@ -466,6 +466,16 @@ impl DynamicPropertiesStore {
         self.put_long(keys::ENERGY_FEE, v);
     }
 
+    /// `MAX_FEE_LIMIT` — the ceiling a VM transaction's `fee_limit` may not
+    /// exceed (java-tron `getMaxFeeLimit`, initialized to `1_000_000_000` sun
+    /// at genesis and adjustable by proposal within `[0, 10_000_000_000]`).
+    /// java's `VMActuator.validate` rejects `feeLimit < 0 || feeLimit >
+    /// getMaxFeeLimit()`. We fall back to the genesis default if the key is
+    /// somehow absent.
+    pub fn max_fee_limit(&self) -> i64 {
+        self.get_long(b"MAX_FEE_LIMIT").unwrap_or(1_000_000_000)
+    }
+
     pub fn transaction_fee(&self) -> i64 {
         self.get_long(keys::TRANSACTION_FEE).unwrap_or(Self::DEFAULT_TRANSACTION_FEE)
     }

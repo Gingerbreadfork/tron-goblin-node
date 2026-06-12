@@ -175,11 +175,12 @@ fn available_unfreeze_v2_size_zero_when_at_cap() {
 
 #[test]
 fn available_unfreeze_v2_size_zero_for_unknown_account() {
+    // java `queryAvailableUnfreezeV2Size` returns 0 when the account is absent.
     let ctx = MockCtx::default();
     let out = PrecompileImpl::AvailableUnfreezeV2Size
         .execute(&addr_word(&alice()), &ctx)
         .unwrap();
-    assert_eq!(read_long(&out), 32);
+    assert_eq!(read_long(&out), 0);
 }
 
 // =============================================================================
@@ -187,27 +188,17 @@ fn available_unfreeze_v2_size_zero_for_unknown_account() {
 // =============================================================================
 
 #[test]
-fn unfreezable_balance_v2_sums_only_mature_entries() {
+fn unfreezable_balance_v2_returns_frozen_v2_balance() {
+    // java `queryUnfreezableBalanceV2` = the currently-frozen v2 balance for
+    // the resource (eligible to be unfrozen), NOT the already-unfrozen amount.
     let mut ctx = MockCtx::default();
-    ctx.block_timestamp_ms = 5_000;
-    let mut acct = freeze_v2_account(alice(), 0, 0);
-    acct.unfrozen_v2 = vec![
-        UnFreezeV2 {
-            r#type: 0,
-            unfreeze_amount: 100,
-            unfreeze_expire_time: 4_000, // mature
-        },
-        UnFreezeV2 {
-            r#type: 0,
-            unfreeze_amount: 200,
-            unfreeze_expire_time: 5_000, // mature (≤ now)
-        },
-        UnFreezeV2 {
-            r#type: 0,
-            unfreeze_amount: 50,
-            unfreeze_expire_time: 9_000, // future
-        },
-    ];
+    let mut acct = freeze_v2_account(alice(), 0, 700);
+    // Pending unfreezes are irrelevant to this precompile.
+    acct.unfrozen_v2 = vec![UnFreezeV2 {
+        r#type: 0,
+        unfreeze_amount: 999,
+        unfreeze_expire_time: 1,
+    }];
     put_account(&mut ctx, alice(), acct);
     let mut input = [0u8; 64];
     input[..32].copy_from_slice(&addr_word(&alice()));
@@ -215,26 +206,17 @@ fn unfreezable_balance_v2_sums_only_mature_entries() {
     let out = PrecompileImpl::UnfreezableBalanceV2
         .execute(&input, &ctx)
         .unwrap();
-    assert_eq!(read_long(&out), 300);
+    assert_eq!(read_long(&out), 700);
 }
 
 #[test]
 fn unfreezable_balance_v2_filters_by_resource_type() {
     let mut ctx = MockCtx::default();
-    ctx.block_timestamp_ms = 5_000;
-    let mut acct = freeze_v2_account(alice(), 0, 0);
-    acct.unfrozen_v2 = vec![
-        UnFreezeV2 {
-            r#type: 0, // bandwidth
-            unfreeze_amount: 100,
-            unfreeze_expire_time: 4_000,
-        },
-        UnFreezeV2 {
-            r#type: 1, // energy
-            unfreeze_amount: 999,
-            unfreeze_expire_time: 4_000,
-        },
-    ];
+    let mut acct = freeze_v2_account(alice(), 0, 100); // bandwidth frozen-v2
+    acct.frozen_v2.push(FreezeV2Entry {
+        r#type: 1,
+        amount: 999,
+    }); // energy frozen-v2
     put_account(&mut ctx, alice(), acct);
     let mut input = [0u8; 64];
     input[..32].copy_from_slice(&addr_word(&alice()));
@@ -242,7 +224,7 @@ fn unfreezable_balance_v2_filters_by_resource_type() {
     let out = PrecompileImpl::UnfreezableBalanceV2
         .execute(&input, &ctx)
         .unwrap();
-    assert_eq!(read_long(&out), 100); // only bandwidth, not 1099
+    assert_eq!(read_long(&out), 100); // bandwidth only, not 999 energy
 }
 
 #[test]
@@ -266,29 +248,29 @@ fn expire_unfreeze_balance_v2_uses_explicit_cutoff_argument() {
     let mut ctx = MockCtx::default();
     ctx.block_timestamp_ms = 1; // not used by this precompile
     let mut acct = freeze_v2_account(alice(), 0, 0);
+    // Expiry is in ms; the `time` arg is in SECONDS (×1000). No type filter.
     acct.unfrozen_v2 = vec![
         UnFreezeV2 {
             r#type: 0,
             unfreeze_amount: 100,
-            unfreeze_expire_time: 4_000,
+            unfreeze_expire_time: 4_000_000,
         },
         UnFreezeV2 {
-            r#type: 0,
+            r#type: 1, // different type — still counted
             unfreeze_amount: 200,
-            unfreeze_expire_time: 7_000,
+            unfreeze_expire_time: 7_000_000,
         },
         UnFreezeV2 {
             r#type: 0,
             unfreeze_amount: 50,
-            unfreeze_expire_time: 9_000,
+            unfreeze_expire_time: 9_000_000,
         },
     ];
     put_account(&mut ctx, alice(), acct);
-    // cutoff = 7_500 → first two entries mature, last not.
-    let mut input = [0u8; 96];
+    // time = 7_500 s → 7_500_000 ms; first two entries mature, last not.
+    let mut input = [0u8; 64];
     input[..32].copy_from_slice(&addr_word(&alice()));
     input[32..64].copy_from_slice(&long_word(7_500));
-    input[64..96].copy_from_slice(&type_word(0));
     let out = PrecompileImpl::ExpireUnfreezeBalanceV2
         .execute(&input, &ctx)
         .unwrap();
@@ -299,7 +281,7 @@ fn expire_unfreeze_balance_v2_uses_explicit_cutoff_argument() {
 fn expire_unfreeze_balance_v2_zero_for_wrong_input_length() {
     let ctx = MockCtx::default();
     let out = PrecompileImpl::ExpireUnfreezeBalanceV2
-        .execute(&[0u8; 64], &ctx) // 2 words instead of 3
+        .execute(&[0u8; 96], &ctx) // 3 words — java wants exactly 2
         .unwrap();
     assert_eq!(read_long(&out), 0);
 }
@@ -309,7 +291,10 @@ fn expire_unfreeze_balance_v2_zero_for_wrong_input_length() {
 // =============================================================================
 
 #[test]
-fn delegatable_resource_is_frozen_minus_already_delegated() {
+fn delegatable_resource_is_full_frozen_when_no_usage() {
+    // java `queryDelegatableResource` = frozenV2 - v2Usage. With no current
+    // usage the whole frozen-v2 balance is delegatable (delegated-out is NOT
+    // subtracted — that was the old placeholder's formula).
     let mut ctx = MockCtx::default();
     let mut acct = freeze_v2_account(alice(), 0, 1000);
     acct.delegated_frozen_v2_balance_for_bandwidth = 300;
@@ -320,33 +305,25 @@ fn delegatable_resource_is_frozen_minus_already_delegated() {
     let out = PrecompileImpl::DelegatableResource
         .execute(&input, &ctx)
         .unwrap();
-    assert_eq!(read_long(&out), 700);
+    assert_eq!(read_long(&out), 1000);
 }
 
 #[test]
-fn delegatable_resource_clamps_to_zero_when_delegated_exceeds_frozen() {
+fn delegatable_resource_subtracts_v2_usage() {
+    // frozenV2=5_000, usageBalance=1_000, no v1/acquired → v2Usage=1_000;
+    // delegatable = 5_000 - 1_000 = 4_000.
     let mut ctx = MockCtx::default();
-    let mut acct = freeze_v2_account(alice(), 0, 100);
-    acct.delegated_frozen_v2_balance_for_bandwidth = 500; // exceeds frozen
-    put_account(&mut ctx, alice(), acct);
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(&addr_word(&alice()));
-    input[32..64].copy_from_slice(&type_word(0));
-    let out = PrecompileImpl::DelegatableResource
-        .execute(&input, &ctx)
-        .unwrap();
-    assert_eq!(read_long(&out), 0);
-}
-
-#[test]
-fn delegatable_resource_uses_energy_field_for_resource_type_1() {
-    let mut ctx = MockCtx::default();
-    let mut acct = freeze_v2_account(alice(), 1, 2000); // energy
-    let res = AccountResource {
-        delegated_frozen_v2_balance_for_energy: 700,
+    ctx.block_timestamp_ms = 3_000_000; // now_slot 1_000
+    ctx.chain_params.insert(b"TOTAL_ENERGY_WEIGHT".to_vec(), 1_000);
+    ctx.chain_params
+        .insert(b"TOTAL_ENERGY_CURRENT_LIMIT".to_vec(), 28_800_000_000);
+    let mut acct = freeze_v2_account(alice(), 1, 5_000);
+    acct.account_resource = Some(AccountResource {
+        energy_usage: 28_800,
+        latest_consume_time_for_energy: 1_000,
+        energy_window_size: 0,
         ..Default::default()
-    };
-    acct.account_resource = Some(res);
+    });
     put_account(&mut ctx, alice(), acct);
     let mut input = [0u8; 64];
     input[..32].copy_from_slice(&addr_word(&alice()));
@@ -354,15 +331,24 @@ fn delegatable_resource_uses_energy_field_for_resource_type_1() {
     let out = PrecompileImpl::DelegatableResource
         .execute(&input, &ctx)
         .unwrap();
-    assert_eq!(read_long(&out), 1_300);
+    assert_eq!(read_long(&out), 4_000);
 }
 
 // =============================================================================
 // ResourceV2 — 0x01000010 (just `frozen_v2[type]`)
 // =============================================================================
 
+/// 3-word `(target, from, type)` ResourceV2 input.
+fn resource_v2_input(target: &Address, from: &Address, rtype: i32) -> [u8; 96] {
+    let mut input = [0u8; 96];
+    input[..32].copy_from_slice(&addr_word(target));
+    input[32..64].copy_from_slice(&addr_word(from));
+    input[64..96].copy_from_slice(&type_word(rtype));
+    input
+}
+
 #[test]
-fn resource_v2_returns_frozen_amount_for_resource() {
+fn resource_v2_self_returns_frozen_amount_for_resource() {
     let mut ctx = MockCtx::default();
     let mut acct = freeze_v2_account(alice(), 0, 555);
     acct.frozen_v2.push(FreezeV2Entry {
@@ -370,25 +356,42 @@ fn resource_v2_returns_frozen_amount_for_resource() {
         amount: 222,
     });
     put_account(&mut ctx, alice(), acct);
-    // Bandwidth
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(&addr_word(&alice()));
-    input[32..64].copy_from_slice(&type_word(0));
-    let out_bw = PrecompileImpl::ResourceV2.execute(&input, &ctx).unwrap();
+    // from == target → own frozen-v2 balance per type.
+    let out_bw = PrecompileImpl::ResourceV2
+        .execute(&resource_v2_input(&alice(), &alice(), 0), &ctx)
+        .unwrap();
     assert_eq!(read_long(&out_bw), 555);
-    // Energy
-    input[32..64].copy_from_slice(&type_word(1));
-    let out_en = PrecompileImpl::ResourceV2.execute(&input, &ctx).unwrap();
+    let out_en = PrecompileImpl::ResourceV2
+        .execute(&resource_v2_input(&alice(), &alice(), 1), &ctx)
+        .unwrap();
     assert_eq!(read_long(&out_en), 222);
+}
+
+#[test]
+fn resource_v2_cross_returns_delegated_amount() {
+    let mut ctx = MockCtx::default();
+    ctx.delegated_resources.insert(
+        (alice(), bob()),
+        DelegatedResource {
+            from: alice().as_bytes().to_vec(),
+            to: bob().as_bytes().to_vec(),
+            frozen_balance_for_bandwidth: 321,
+            ..Default::default()
+        },
+    );
+    let out = PrecompileImpl::ResourceV2
+        .execute(&resource_v2_input(&bob(), &alice(), 0), &ctx)
+        .unwrap();
+    assert_eq!(read_long(&out), 321);
 }
 
 #[test]
 fn resource_v2_zero_for_unknown_account() {
     let ctx = MockCtx::default();
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(&addr_word(&alice()));
-    input[32..64].copy_from_slice(&type_word(0));
-    let out = PrecompileImpl::ResourceV2.execute(&input, &ctx).unwrap();
+    // from == target, missing account → 0.
+    let out = PrecompileImpl::ResourceV2
+        .execute(&resource_v2_input(&alice(), &alice(), 0), &ctx)
+        .unwrap();
     assert_eq!(read_long(&out), 0);
 }
 
@@ -429,25 +432,40 @@ fn check_un_delegate_resource_zero_for_wrong_input_length() {
 // =============================================================================
 
 #[test]
-fn resource_usage_returns_net_usage_for_bandwidth() {
+fn resource_usage_returns_balance_restore_pair() {
+    // java ResourceUsage = the two-word (usageBalanceInSun, restoreSeconds)
+    // pair — NOT the raw usage counter. Same math as CheckUnDelegateResource.
     let mut ctx = MockCtx::default();
-    let acct = Account {
+    ctx.block_timestamp_ms = 3_000_000; // now_slot 1_000
+    ctx.chain_params.insert(b"TOTAL_ENERGY_WEIGHT".to_vec(), 1_000);
+    ctx.chain_params
+        .insert(b"TOTAL_ENERGY_CURRENT_LIMIT".to_vec(), 28_800_000_000);
+    let mut acct = Account {
         address: alice().as_bytes().to_vec(),
         r#type: AccountType::Normal as i32,
-        net_usage: 12_345,
         ..Default::default()
     };
+    acct.account_resource = Some(AccountResource {
+        energy_usage: 28_800,
+        latest_consume_time_for_energy: 1_000,
+        energy_window_size: 0,
+        ..Default::default()
+    });
     put_account(&mut ctx, alice(), acct);
     let mut input = [0u8; 64];
     input[..32].copy_from_slice(&addr_word(&alice()));
-    input[32..64].copy_from_slice(&type_word(0));
+    input[32..64].copy_from_slice(&type_word(1));
     let out = PrecompileImpl::ResourceUsage.execute(&input, &ctx).unwrap();
-    assert_eq!(read_long(&out), 12_345);
+    assert_eq!(out.len(), 64);
+    assert_eq!(read_long(&out[0..32]), 1_000, "usage balance");
+    assert_eq!(read_long(&out[32..64]), 86_400, "restore seconds");
 }
 
 #[test]
-fn resource_usage_returns_energy_usage_for_resource_type_1() {
+fn resource_usage_zero_pair_for_fully_recovered_account() {
+    // now far past the usage window → (0, 0).
     let mut ctx = MockCtx::default();
+    ctx.block_timestamp_ms = 200_000_000;
     let mut acct = Account {
         address: alice().as_bytes().to_vec(),
         r#type: AccountType::Normal as i32,
@@ -462,7 +480,8 @@ fn resource_usage_returns_energy_usage_for_resource_type_1() {
     input[..32].copy_from_slice(&addr_word(&alice()));
     input[32..64].copy_from_slice(&type_word(1));
     let out = PrecompileImpl::ResourceUsage.execute(&input, &ctx).unwrap();
-    assert_eq!(read_long(&out), 99_999);
+    assert_eq!(read_long(&out[0..32]), 0);
+    assert_eq!(read_long(&out[32..64]), 0);
 }
 
 // =============================================================================
@@ -580,14 +599,15 @@ fn total_acquired_resource_returns_only_incoming_for_energy() {
 // Cross-precompile invariants
 // =============================================================================
 
-/// The semantic relation between the 5 query precompiles:
-///   delegatable = own_frozen - own_delegated
-///   total_resource = own_frozen + acquired_delegated
-///   total_delegated = own_delegated
-///   total_acquired = acquired_delegated
-///   resource_v2 = own_frozen
+/// The semantic relation between the 5 query precompiles (java semantics):
+///   resource_v2(self)   = own_frozen_v2
+///   delegatable         = own_frozen_v2 - v2_usage  (== own_frozen_v2 at zero usage)
+///   total_resource      = own_frozen_v2 + acquired_delegated  (+ v1 sources)
+///   total_delegated     = own_delegated (v1 + v2)
+///   total_acquired      = acquired_delegated (v1 + v2)
 ///
-/// Pinning these as a single test catches accidental cross-wiring.
+/// Pinning these as a single test catches accidental cross-wiring. (No usage
+/// is set, so `delegatable == frozen`.)
 #[test]
 fn stake_v2_query_precompiles_obey_cross_method_identities() {
     let mut ctx = MockCtx::default();
@@ -600,7 +620,11 @@ fn stake_v2_query_precompiles_obey_cross_method_identities() {
     input[..32].copy_from_slice(&addr_word(&alice()));
     input[32..64].copy_from_slice(&type_word(0));
 
-    let frozen = read_long(&PrecompileImpl::ResourceV2.execute(&input, &ctx).unwrap());
+    let frozen = read_long(
+        &PrecompileImpl::ResourceV2
+            .execute(&resource_v2_input(&alice(), &alice(), 0), &ctx)
+            .unwrap(),
+    );
     let delegatable = read_long(
         &PrecompileImpl::DelegatableResource
             .execute(&input, &ctx)
@@ -623,12 +647,10 @@ fn stake_v2_query_precompiles_obey_cross_method_identities() {
     );
 
     assert_eq!(frozen, 1_000_000);
-    assert_eq!(delegatable, 700_000);
+    assert_eq!(delegatable, 1_000_000); // no usage → full frozen is delegatable
     assert_eq!(total_resource, 1_100_000);
     assert_eq!(total_delegated, 300_000);
     assert_eq!(total_acquired, 100_000);
-    // Identity: delegatable + delegated == frozen.
-    assert_eq!(delegatable + total_delegated, frozen);
     // Identity: total_resource - acquired == frozen.
     assert_eq!(total_resource - total_acquired, frozen);
 }

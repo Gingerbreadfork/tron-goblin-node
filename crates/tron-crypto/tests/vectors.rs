@@ -144,6 +144,31 @@ fn signature_on_chain_layout_round_trip() {
     sig.verify_prehash(&pk, &prehash).unwrap();
 }
 
+/// Regression: java-tron accepts signatures of length **>= 65** (it reads
+/// r=[0..32], s=[32..64], v=byte[64] and ignores the rest). Some wallets pad
+/// `v` to a 4-byte word → 68-byte on-chain signatures. We must parse them the
+/// same (rejecting them made our node DEFAULT those txs while java executed).
+#[test]
+fn from_bytes_accepts_oversized_signature_ignoring_trailing_bytes() {
+    let priv_key = [7u8; 32];
+    let prehash = keccak256(b"oversized v");
+    let sig = RecoverableSignature::sign_prehash(&priv_key, &prehash).unwrap();
+    let bytes65 = sig.to_bytes();
+
+    // Append 3 zero bytes (the wallet's 4-byte v padding) → 68 bytes.
+    let mut bytes68 = bytes65.to_vec();
+    bytes68.extend_from_slice(&[0, 0, 0]);
+    let decoded = RecoverableSignature::from_bytes(&bytes68).unwrap();
+    assert_eq!(decoded, sig, "68-byte sig parses identically to the 65-byte one");
+
+    // And it still recovers the right key.
+    let pk = decoded.recover_uncompressed_pubkey(&prehash).unwrap();
+    sig.verify_prehash(&pk, &prehash).unwrap();
+
+    // Shorter than 65 is still rejected (matches java's `< 65` guard).
+    assert!(RecoverableSignature::from_bytes(&bytes65[..64]).is_err());
+}
+
 /// Encode/decode round trip via the header-prefix (`[v||r||s]`) layout.
 #[test]
 fn signature_header_prefix_layout_round_trip() {

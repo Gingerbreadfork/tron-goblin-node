@@ -662,7 +662,7 @@ fn asset_issue_then_transfer() {
         amount: 100,
     };
     asset::validate_transfer_asset(&accounts, &xfer).unwrap();
-    asset::execute_transfer_asset(&accounts, &xfer).unwrap();
+    asset::execute_transfer_asset(&accounts, &dp, &xfer).unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(bob.asset_v2.get(&token_id).copied().unwrap_or(0), 100);
 }

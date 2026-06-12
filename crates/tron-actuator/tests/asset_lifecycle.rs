@@ -383,7 +383,8 @@ fn transfer_asset_from_optimized_account_sees_store_balance() {
     };
     // validate must see the store balance (1000), not the empty inline 0.
     asset::validate_transfer_asset(&accounts, &c).expect("validate sees store balance");
-    asset::execute_transfer_asset(&accounts, &c).expect("execute");
+    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+        .expect("execute");
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
@@ -503,7 +504,7 @@ fn transfer_asset_creates_recipient_account_if_missing() {
         amount: 250,
     };
     asset::validate_transfer_asset(&accounts, &c).unwrap();
-    asset::execute_transfer_asset(&accounts, &c).unwrap();
+    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 750);
@@ -533,8 +534,8 @@ fn transfer_asset_preserves_balance_invariant_under_split_transfers() {
         asset_name: b"1000001".to_vec(),
         amount: 250,
     };
-    asset::execute_transfer_asset(&accounts, &c1).unwrap();
-    asset::execute_transfer_asset(&accounts, &c2).unwrap();
+    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c1).unwrap();
+    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c2).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     let total = alice.asset_v2.get("1000001").copied().unwrap_or(0)
@@ -562,7 +563,7 @@ fn transfer_asset_v1_fallback_works_when_only_v1_entry_exists() {
         amount: 100,
     };
     asset::validate_transfer_asset(&accounts, &c).unwrap();
-    asset::execute_transfer_asset(&accounts, &c).unwrap();
+    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     // V1 slot decremented.

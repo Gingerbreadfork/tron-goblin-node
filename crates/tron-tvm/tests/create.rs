@@ -545,7 +545,9 @@ fn tron_create(root_tx_id: &[u8; 32], nonce: u64) -> [u8; 21] {
 #[test]
 fn staking_opcode_shifts_following_nested_create_address() {
     let stores = fresh_stores_with_contracts();
-    stores.dynamic_properties.put_long(b"ALLOW_TVM_FREEZE_V2", 1);
+    // FreezeV2 is gated on supportUnfreezeDelay() = UNFREEZE_DELAY_DAYS > 0
+    // (java has no ALLOW_TVM_FREEZE_V2 dyn-props key).
+    stores.dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 14);
 
     // Runtime: FREEZEBALANCEV2(1 TRX, resource 0), POP, then CREATE a child.
     let child_init: [u8; 5] = [0x60, 0x01, 0x60, 0x00, 0xf3];

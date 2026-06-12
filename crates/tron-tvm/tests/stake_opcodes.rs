@@ -36,7 +36,9 @@ fn fresh_stores() -> VmStores {
     // least one of them, so enable all three at fixture construction.
     dynamic_properties.put_long(b"ALLOW_TVM_FREEZE", 1);
     dynamic_properties.put_long(b"ALLOW_TVM_VOTE", 1);
-    dynamic_properties.put_long(b"ALLOW_TVM_FREEZE_V2", 1);
+    // FreezeV2 = supportUnfreezeDelay() = UNFREEZE_DELAY_DAYS > 0 (java has no
+    // ALLOW_TVM_FREEZE_V2 key); 14 = the mainnet value.
+    dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 14);
     VmStores {
         accounts: Arc::new(AccountStore::new(mem())),
         code: Arc::new(CodeStore::new(mem())),

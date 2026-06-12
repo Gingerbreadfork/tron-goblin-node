@@ -333,21 +333,21 @@ fn unfreezebalancev2_gated_on_freeze_v2() {
     let bc = vec![
         0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xdb, 0x60, 0x00, 0x55, 0x00,
     ];
-    gate(b"ALLOW_TVM_FREEZE_V2", bc, "UNFREEZEBALANCEV2");
+    gate(b"UNFREEZE_DELAY_DAYS", bc, "UNFREEZEBALANCEV2");
 }
 
 #[test]
 fn cancelallunfreezev2_gated_on_freeze_v2() {
     // CANCELALLUNFREEZEV2 PUSH1 0 SSTORE STOP
     let bc = vec![0xdc, 0x60, 0x00, 0x55, 0x00];
-    gate(b"ALLOW_TVM_FREEZE_V2", bc, "CANCELALLUNFREEZEV2");
+    gate(b"UNFREEZE_DELAY_DAYS", bc, "CANCELALLUNFREEZEV2");
 }
 
 #[test]
 fn withdrawexpireunfreeze_gated_on_freeze_v2() {
     // WITHDRAWEXPIREUNFREEZE PUSH1 0 SSTORE STOP
     let bc = vec![0xdd, 0x60, 0x00, 0x55, 0x00];
-    gate(b"ALLOW_TVM_FREEZE_V2", bc, "WITHDRAWEXPIREUNFREEZE");
+    gate(b"UNFREEZE_DELAY_DAYS", bc, "WITHDRAWEXPIREUNFREEZE");
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn delegateresource_gated_on_freeze_v2() {
     let bc = vec![
         0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xde, 0x60, 0x00, 0x55, 0x00,
     ];
-    gate(b"ALLOW_TVM_FREEZE_V2", bc, "DELEGATERESOURCE");
+    gate(b"UNFREEZE_DELAY_DAYS", bc, "DELEGATERESOURCE");
 }
 
 #[test]
@@ -365,7 +365,7 @@ fn undelegateresource_gated_on_freeze_v2() {
     let bc = vec![
         0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xdf, 0x60, 0x00, 0x55, 0x00,
     ];
-    gate(b"ALLOW_TVM_FREEZE_V2", bc, "UNDELEGATERESOURCE");
+    gate(b"UNFREEZE_DELAY_DAYS", bc, "UNDELEGATERESOURCE");
 }
 
 // ============================================================

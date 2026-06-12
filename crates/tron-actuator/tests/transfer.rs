@@ -213,6 +213,45 @@ fn execute_creates_recipient_when_absent() {
     assert_eq!(bob.balance, 30);
     assert_eq!(bob.r#type, AccountType::Normal as i32);
     assert_eq!(bob.address, BOB.to_vec());
+    // ALLOW_MULTI_SIGN not set in `fresh()` → java's `withDefaultPermission`
+    // is false, so the new account carries no permission.
+    assert!(bob.owner_permission.is_none());
+    assert!(bob.active_permission.is_empty());
+}
+
+#[test]
+fn execute_attaches_default_permission_to_new_recipient_under_multisign() {
+    // java attaches the default owner + active[id=2] permission to every
+    // account it creates when ALLOW_MULTI_SIGN == 1 (mainnet). Without this a
+    // later multi-sig tx (Permission_id=2) from the freshly-created account
+    // diverges from java with "permission_id 2 not found".
+    let (_b, accounts, dyn_props) = fresh();
+    fund(&accounts, ALICE, 100);
+    dyn_props.put_long(b"ALLOW_MULTI_SIGN", 1);
+
+    let contract = transfer(ALICE, BOB, 30);
+    validate_transfer(&accounts, &dyn_props, &contract).unwrap();
+    let result = execute_transfer(&accounts, &dyn_props, &contract).unwrap();
+    assert!(result.created_recipient);
+
+    let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
+    // Default owner permission: id 0, threshold 1, single self-key.
+    let owner = bob.owner_permission.expect("default owner permission");
+    assert_eq!(owner.id, 0);
+    assert_eq!(owner.threshold, 1);
+    assert_eq!(owner.keys.len(), 1);
+    assert_eq!(owner.keys[0].address, BOB.to_vec());
+    assert_eq!(owner.keys[0].weight, 1);
+    // Default active permission: exactly one, id 2, threshold 1, self-key.
+    assert_eq!(bob.active_permission.len(), 1);
+    let active = &bob.active_permission[0];
+    assert_eq!(active.id, 2);
+    assert_eq!(active.threshold, 1);
+    assert_eq!(active.keys.len(), 1);
+    assert_eq!(active.keys[0].address, BOB.to_vec());
+    // operations bitmap falls back to the mainnet default (no dyn-prop set).
+    assert_eq!(active.operations.len(), 32);
+    assert_eq!(&active.operations[..8], &[0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x3e, 0xc3, 0x0f]);
 }
 
 #[test]

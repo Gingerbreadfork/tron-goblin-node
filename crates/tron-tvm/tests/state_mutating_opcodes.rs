@@ -38,9 +38,9 @@ fn fresh_stores() -> VmStores {
     // Enable every proposal the staking opcodes gate on.
     dynamic_properties.put_long(b"ALLOW_TVM_FREEZE", 1);
     dynamic_properties.put_long(b"ALLOW_TVM_VOTE", 1);
-    dynamic_properties.put_long(b"ALLOW_TVM_FREEZE_V2", 1);
-    // Cheap unfreeze delay so tests don't need to wait.
-    dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 0);
+    // FreezeV2 is gated on supportUnfreezeDelay() = UNFREEZE_DELAY_DAYS > 0
+    // (java has no ALLOW_TVM_FREEZE_V2 key); 14 = the mainnet value.
+    dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 14);
     // Block-timestamp anchor so duration math works.
     dynamic_properties.save_latest_block_header_timestamp(1_700_000_000_000);
     VmStores {

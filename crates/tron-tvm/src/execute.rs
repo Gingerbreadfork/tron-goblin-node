@@ -416,6 +416,16 @@ fn execute_trigger_inner(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+        })
+        .modify_block_chained(|b| {
+            // VM block context = the block being executed (java's
+            // ProgramInvokeFactory reads `block.number` and
+            // `block.timestamp / 1000`). Without this the revm BlockEnv
+            // defaults to number=0 / timestamp=1, so every contract reading
+            // `block.timestamp` got `1` and any `block.timestamp - t`
+            // underflowed.
+            b.number = U256::from(block.block_number.max(0) as u64);
+            b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -654,6 +664,16 @@ fn execute_trigger_inner_with_tracer(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+        })
+        .modify_block_chained(|b| {
+            // VM block context = the block being executed (java's
+            // ProgramInvokeFactory reads `block.number` and
+            // `block.timestamp / 1000`). Without this the revm BlockEnv
+            // defaults to number=0 / timestamp=1, so every contract reading
+            // `block.timestamp` got `1` and any `block.timestamp - t`
+            // underflowed.
+            b.number = U256::from(block.block_number.max(0) as u64);
+            b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -1027,6 +1047,16 @@ pub fn execute_create_with_trace(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+        })
+        .modify_block_chained(|b| {
+            // VM block context = the block being executed (java's
+            // ProgramInvokeFactory reads `block.number` and
+            // `block.timestamp / 1000`). Without this the revm BlockEnv
+            // defaults to number=0 / timestamp=1, so every contract reading
+            // `block.timestamp` got `1` and any `block.timestamp - t`
+            // underflowed.
+            b.number = U256::from(block.block_number.max(0) as u64);
+            b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
         });
     let precompiles = TronPrecompiles::new(
         spec,
