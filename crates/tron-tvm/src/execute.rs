@@ -499,7 +499,33 @@ fn execute_trigger_inner(
         Err(e) => return (VmOutcome::PreflightError(format!("TxEnv build: {e:?}")), Vec::new(), 0),
     };
 
+    // TEMP DIAGNOSTIC: per-opcode gas trace for target tx(s) (env
+    // TRON_OP_TRACE_TX = one or more hex tx ids, comma/space-separated). Emits
+    // `OPTRACE …` lines on stderr from the core interpreter (reliable, unlike
+    // the inspector trace). Off by default.
+    let op_trace = root_tx_id
+        .and_then(|id| {
+            std::env::var("TRON_OP_TRACE_TX").ok().map(|want| {
+                let got: String = id.iter().map(|b| format!("{b:02x}")).collect();
+                want.split([',', ' ', '\n', '\t'])
+                    .map(|s| s.trim().trim_start_matches("0x"))
+                    .filter(|s| !s.is_empty())
+                    .any(|s| s == got)
+            })
+        })
+        .unwrap_or(false);
+    if op_trace {
+        let id: String = root_tx_id
+            .map(|id| id.iter().map(|b| format!("{b:02x}")).collect())
+            .unwrap_or_default();
+        eprintln!("OPTRACE_TX_BEGIN {id}");
+        revm::interpreter::set_op_trace(true);
+    }
     let outcome = evm.inspect_tx_commit(tx);
+    if op_trace {
+        revm::interpreter::set_op_trace(false);
+        eprintln!("OPTRACE_TX_END");
+    }
     // If the EVM failed and we did a top-level TRC-10 transfer up front,
     // reverse it so the caller's asset_v2 balance is restored.
     let unwind_on_failure = |stores: &VmStores| {

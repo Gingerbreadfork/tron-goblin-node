@@ -118,6 +118,8 @@ sapling-crypto = { version = "0.7", default-features = false, features = ["std"]
 # fmt subscriber in the binary.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Rolling-file log appender (console + daily-rotated file, like java-tron's logback).
+tracing-appender = "0.2"
 # tar + gzip — for the tron-node snapshot import/export subcommands.
 # `tar` reads/writes USTAR-format archives streaming; `flate2` does
 # gzip on top. Both are pure Rust, no system deps.

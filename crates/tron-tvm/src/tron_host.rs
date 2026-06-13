@@ -1037,7 +1037,14 @@ impl TronDatabaseExt for TronDatabase {
         let owner = evm_to_tron_address(&caller);
         let receiver = evm_to_tron_address(&receiver_address);
         let resource = resource_type as i32;
-        // Look up the v2 (from, to) delegation; subtract.
+        use tron_types::resource::{self as res, ResourceGates, ResourceKind};
+        let kind = if resource == 0 {
+            ResourceKind::Bandwidth
+        } else {
+            ResourceKind::Energy
+        };
+        // Validate: the v2 UNLOCKED (from, to) record must exist with >= balance.
+        // java `UnDelegateResourceProcessor.validate` keys `createDbKeyV2(.., false)`.
         let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(&owner, &receiver);
         let mut record = match resources.get_raw(&key) {
             Ok(Some(r)) => r,
@@ -1051,6 +1058,87 @@ impl TronDatabaseExt for TronDatabase {
         if amount < balance {
             return 0;
         }
+        let Some(dyn_props) = self.dyn_props.clone() else {
+            return 0;
+        };
+        let now_slot = dyn_props.head_slot();
+        let gates = ResourceGates {
+            support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+
+        // Per-resource acquired-delegated read/write helpers (kind-aware).
+        let acquired_v2 = |a: &tron_proto::Account| -> i64 {
+            match resource {
+                0 => a.acquired_delegated_frozen_v2_balance_for_bandwidth,
+                1 => a
+                    .account_resource
+                    .as_ref()
+                    .map(|r| r.acquired_delegated_frozen_v2_balance_for_energy)
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        };
+        let set_acquired_v2 = |a: &mut tron_proto::Account, v: i64| match resource {
+            0 => a.acquired_delegated_frozen_v2_balance_for_bandwidth = v,
+            1 => {
+                a.account_resource
+                    .get_or_insert_with(Default::default)
+                    .acquired_delegated_frozen_v2_balance_for_energy = v;
+            }
+            _ => {}
+        };
+
+        // 1. Receiver: decay its usage to `now_slot`, debit acquired, and transfer
+        //    the usage that the un-delegated balance was carrying back off the
+        //    receiver. java `UnDelegateResourceProcessor.execute` — the missing
+        //    `transferUsage`/`newUsage` step here was the bug: zeroing acquired
+        //    WITHOUT shedding the matching usage left the receiver over-charged
+        //    (its limit dropped but its usage didn't), so it burned TRX where
+        //    java covered from stake.
+        let mut transfer_usage = 0i64;
+        let mut receiver_account = self.accounts.get(&receiver).ok().flatten();
+        if let Some(recv) = receiver_account.as_mut() {
+            res::update_usage(recv, kind, now_slot, gates);
+            let acquired = acquired_v2(recv);
+            if acquired < balance {
+                // TVM suicide + re-create can leave acquired < balance.
+                set_acquired_v2(recv, 0);
+            } else {
+                let (total_limit, total_weight) = match kind {
+                    ResourceKind::Bandwidth => {
+                        (dyn_props.total_net_limit(), dyn_props.total_net_weight())
+                    }
+                    ResourceKind::Energy => (
+                        dyn_props.total_energy_current_limit(),
+                        dyn_props.total_energy_weight(),
+                    ),
+                };
+                let undelegate_max_usage = if total_weight > 0 {
+                    ((balance as f64 / TRX_PRECISION as f64)
+                        * (total_limit as f64 / total_weight as f64)) as i64
+                } else {
+                    0
+                };
+                let all_frozen = match kind {
+                    ResourceKind::Bandwidth => res::all_frozen_balance_for_bandwidth(recv),
+                    ResourceKind::Energy => res::all_frozen_balance_for_energy(recv),
+                };
+                let recv_usage = res::usage(recv, kind);
+                transfer_usage = if all_frozen > 0 {
+                    (recv_usage as f64 * (balance as f64 / all_frozen as f64)) as i64
+                } else {
+                    0
+                };
+                transfer_usage = undelegate_max_usage.min(transfer_usage);
+                set_acquired_v2(recv, acquired - balance);
+            }
+            let new_recv_usage = res::usage(recv, kind) - transfer_usage;
+            res::set_usage(recv, kind, new_recv_usage);
+            res::set_latest_time(recv, kind, now_slot);
+        }
+
+        // 2. Decrement the unlocked record (java `addFrozenBalanceFor*(-balance, 0)`).
         match resource {
             0 => record.frozen_balance_for_bandwidth -= balance,
             1 => record.frozen_balance_for_energy -= balance,
@@ -1059,13 +1147,11 @@ impl TronDatabaseExt for TronDatabase {
         resources
             .put_raw(&key, &record)
             .expect("db error in TronDatabaseExt::tron_undelegate_resource writing delegated resource record");
-        // Credit owner's FreezeV2 back, debit receiver's acquired_*.
+
+        // 3. Owner: credit FreezeV2 back, debit delegated_*, then fold the
+        //    transferred usage in via `unDelegateIncrease`.
         if let Ok(Some(mut owner_account)) = self.accounts.get(&owner) {
-            let slot = owner_account
-                .frozen_v2
-                .iter_mut()
-                .find(|f| f.r#type == resource);
-            match slot {
+            match owner_account.frozen_v2.iter_mut().find(|f| f.r#type == resource) {
                 Some(f) => f.amount = f.amount.saturating_add(balance),
                 None => owner_account.frozen_v2.push(tron_proto::account::FreezeV2 {
                     r#type: resource,
@@ -1086,29 +1172,28 @@ impl TronDatabaseExt for TronDatabase {
                 }
                 _ => {}
             }
+            if let Some(recv) = receiver_account.as_ref() {
+                if transfer_usage > 0 {
+                    res::undelegate_increase(
+                        &mut owner_account,
+                        recv,
+                        transfer_usage,
+                        kind,
+                        now_slot,
+                        gates,
+                    );
+                }
+            }
             self.accounts
                 .put(&owner, &owner_account)
                 .expect("db error in TronDatabaseExt::tron_undelegate_resource writing owner account");
         }
-        if let Ok(Some(mut receiver_account)) = self.accounts.get(&receiver) {
-            match resource {
-                0 => {
-                    receiver_account.acquired_delegated_frozen_v2_balance_for_bandwidth =
-                        receiver_account
-                            .acquired_delegated_frozen_v2_balance_for_bandwidth
-                            .saturating_sub(balance);
-                }
-                1 => {
-                    if let Some(r) = receiver_account.account_resource.as_mut() {
-                        r.acquired_delegated_frozen_v2_balance_for_energy =
-                            r.acquired_delegated_frozen_v2_balance_for_energy
-                                .saturating_sub(balance);
-                    }
-                }
-                _ => {}
-            }
+
+        // 4. Persist the receiver last (mutated in step 1; java puts it earlier but
+        //    it isn't modified after, so the end state matches).
+        if let Some(recv) = receiver_account.as_ref() {
             self.accounts
-                .put(&receiver, &receiver_account)
+                .put(&receiver, recv)
                 .expect("db error in TronDatabaseExt::tron_undelegate_resource writing receiver account");
         }
         1

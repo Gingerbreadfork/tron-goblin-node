@@ -65,6 +65,12 @@ dump-state:       open the storage tree read-only and emit a JSON snapshot of
                   head, chain-wide resource totals, fee accumulators, and witness
                   counters. Designed for divergence triage against java-tron.
 
+diag:             read-only per-row state inspection for java-tron parity diffing.
+                  `diag account <addr>` / `diag delegation <from> <to>` /
+                  `diag dynprop <key>` — decode one store row and diff against
+                  java's getaccount / getdelegatedresourcev2. --data-dir to point
+                  at any (stopped) data-dir or a snapshot. See `diag --help`.
+
 import-snapshot:  plant a java-tron snapshot into data_dir/database/. --from accepts
                   either a directory of per-store subdirs (account/, witness/,
                   properties/, ...) or a tarball (.tar / .tar.gz / .tgz) —
@@ -125,7 +131,8 @@ live blocks.
 ";
 
 fn main() -> ExitCode {
-    init_tracing();
+    // Held for the process lifetime so the non-blocking file appender flushes.
+    let _log_guard = init_tracing();
 
     let args: Vec<String> = std::env::args().collect();
     let Some(cmd) = args.get(1) else {
@@ -142,6 +149,7 @@ fn main() -> ExitCode {
         "export-snapshot" => run_export_snapshot(&args[2..]),
         "verify-snapshot" => run_verify_snapshot(&args[2..]),
         "admin" => run_admin(&args[2..]),
+        "diag" => tron_node::diag::run_diag(&args[2..]),
         "--help" | "-h" | "help" => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -974,20 +982,52 @@ impl tracing_subscriber::fmt::time::FormatTime for CompactUtcTime {
 ///
 /// Called once at the top of `main()`. Safe to call before any
 /// subcommand parsing — the subscriber is global.
-fn init_tracing() {
+/// Logs go to the terminal AND, by default, to a daily-rotated file — mirroring
+/// java-tron's logback console+file setup, so a normal run is captured without
+/// any shell redirection. The file lives at `<TRON_LOG_DIR>/tron-node.log`
+/// (default `./logs/`, rotated daily → `tron-node.log.YYYY-MM-DD`) and is written
+/// without ANSI color. Set `TRON_LOG_FILE=off` to disable the file sink.
+///
+/// Returns the appender's [`WorkerGuard`] (file writes are non-blocking); the
+/// caller must keep it alive for the process lifetime or buffered lines are
+/// dropped on exit. `None` when file logging is disabled.
+#[must_use]
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let fmt_layer = fmt::layer()
+    let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(ansi)
         .with_timer(CompactUtcTime)
         .with_target(false);
+
+    // Daily-rotated file sink (on by default, like java-tron). No ANSI in files.
+    let file_disabled = std::env::var("TRON_LOG_FILE")
+        .map(|v| matches!(v.as_str(), "off" | "0" | "false" | "no"))
+        .unwrap_or(false);
+    let (file_layer, guard) = if file_disabled {
+        (None, None)
+    } else {
+        let dir = std::env::var("TRON_LOG_DIR").unwrap_or_else(|_| "logs".to_string());
+        let _ = std::fs::create_dir_all(&dir);
+        let appender = tracing_appender::rolling::daily(&dir, "tron-node.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let layer = fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_timer(CompactUtcTime)
+            .with_target(false);
+        (Some(layer), Some(guard))
+    };
+
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt_layer)
+        .with(stderr_layer)
+        .with(file_layer)
         .try_init();
+    guard
 }
 
 /// CLI flag parser. Returns a config built by:

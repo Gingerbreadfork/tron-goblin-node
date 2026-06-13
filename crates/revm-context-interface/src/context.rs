@@ -209,6 +209,16 @@ pub struct SStoreResult {
     pub present_value: StorageValue,
     /// New value that is set
     pub new_value: StorageValue,
+    /// TRON parity: `true` if this storage slot was already written (had a
+    /// value-changing SSTORE) earlier in the current transaction. java-tron's
+    /// `getSstoreCost` charges SET (20000) only when `storageLoad(key) == null`
+    /// — and any prior `storageSave` caches the row (non-null), so a re-set of a
+    /// slot that is currently zero must be billed RESET (5000), not SET. revm's
+    /// value-only Frontier rule can't see this (the slot reads
+    /// `original == present == 0`), so the journal is scanned for a prior
+    /// `StorageChanged` on the slot and the result recorded here. See
+    /// `GasParams::sstore_dynamic_gas`.
+    pub prev_written_this_tx: bool,
 }
 
 impl SStoreResult {

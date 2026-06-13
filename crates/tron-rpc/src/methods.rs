@@ -1198,6 +1198,7 @@ fn apply_read_usage_recovery(
         account.net_usage,
         account.latest_consume_time,
         now_slot,
+        dp.allow_harden_resource_calculation(),
     );
     let free_net =
         increase_default(account.free_net_usage, 0, account.latest_consume_free_time, now_slot);
@@ -1208,7 +1209,7 @@ fn apply_read_usage_recovery(
         .as_ref()
         .map(|r| (r.energy_usage, r.latest_consume_time_for_energy));
     let energy = energy_in
-        .map(|(eu, lt)| recovery_account(account, ResourceKind::Energy, eu, lt, now_slot));
+        .map(|(eu, lt)| recovery_account(account, ResourceKind::Energy, eu, lt, now_slot, dp.allow_harden_resource_calculation()));
     account.net_usage = net;
     account.free_net_usage = free_net;
     if let (Some(e), Some(r)) = (energy, account.account_resource.as_mut()) {
@@ -3494,6 +3495,7 @@ pub fn account_resource_view(
         account.net_usage,
         account.latest_consume_time,
         now_slot,
+        dp.allow_harden_resource_calculation(),
     );
     let free_net_used =
         increase_default(account.free_net_usage, 0, account.latest_consume_free_time, now_slot);
@@ -3510,7 +3512,7 @@ pub fn account_resource_view(
             None => (0, 0, 0, 0),
         };
     let energy_used =
-        recovery_account(account, ResourceKind::Energy, energy_usage, last_energy, now_slot);
+        recovery_account(account, ResourceKind::Energy, energy_usage, last_energy, now_slot, dp.allow_harden_resource_calculation());
 
     AccountResourceView {
         free_net_used,
