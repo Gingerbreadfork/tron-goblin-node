@@ -69,21 +69,43 @@ pub fn tron_gas_params() -> GasParams {
 /// TRON's static (per-opcode) energy table.
 ///
 /// revm's Frontier static table already matches TRON's per-opcode costs
-/// (SLOAD 50, CALL 40, EXP base 10, JUMPI 10, …). TRON has one deviation:
-/// **MLOAD / MSTORE / MSTORE8 carry a base of 1** (plus memory expansion), not
-/// Ethereum's VERY_LOW tier (3). Verified against java-tron via
-/// `triggerconstantcontract` — with base 3 our `energy_used` ran exactly
-/// `2 × (#MLOAD + #MSTORE)` high on every call (decimals +8, balanceOf +12,
-/// string returns +30); base 1 makes it match exactly.
+/// (SLOAD 50, CALL 40, EXP base 10, JUMPI 10, …). TRON has two deviations:
+///
+/// 1. **MLOAD / MSTORE / MSTORE8 carry a base of 1** (plus memory expansion),
+///    not Ethereum's VERY_LOW tier (3). Verified against java-tron via
+///    `triggerconstantcontract` — with base 3 our `energy_used` ran exactly
+///    `2 × (#MLOAD + #MSTORE)` high on every call (decimals +8, balanceOf +12,
+///    string returns +30); base 1 makes it match exactly.
+///
+/// 2. **CODECOPY / CALLDATACOPY / RETURNDATACOPY carry NO base** (just memory
+///    expansion + the 3-per-word copy cost), not Ethereum's VERY_LOW tier (3).
+///    java-tron registers these with `EnergyCost::get{Code,CallData,ReturnData}
+///    CopyCost`, each of which returns *only* `calcMemEnergy(...)` (mem + copy)
+///    with no tier added — `OperationRegistry`'s `(opcode, 3, 0, …)` numbers are
+///    the stack in/out arity, not a base. Literal EVM/revm bills a VERY_LOW(3)
+///    base on top, so every copy op ran exactly +3 high: a clean multiple-of-3
+///    `energy_usage_total` over-charge across the mainnet window (1 copy → +3,
+///    11 copies → +33, 300 → +900) that desyncs energy-tight txs. Note the
+///    asymmetry: EXTCODECOPY keeps its base (java `EXT_CODE_COPY = 20`) and
+///    MCOPY keeps VERY_LOW (java `getMCopyCost = VERY_LOW_TIER + calcMemEnergy`),
+///    so only the three bare copies are zeroed here.
 pub fn tron_static_gas_table() -> [u16; 256] {
     // Opcodes: MLOAD=0x51, MSTORE=0x52, MSTORE8=0x53.
     const MLOAD: usize = 0x51;
     const MSTORE: usize = 0x52;
     const MSTORE8: usize = 0x53;
+    // Bare copy opcodes (no base tier in java-tron): CALLDATACOPY=0x37,
+    // CODECOPY=0x39, RETURNDATACOPY=0x3e.
+    const CALLDATACOPY: usize = 0x37;
+    const CODECOPY: usize = 0x39;
+    const RETURNDATACOPY: usize = 0x3e;
     let mut table = revm::interpreter::gas_table();
     table[MLOAD] = 1;
     table[MSTORE] = 1;
     table[MSTORE8] = 1;
+    table[CALLDATACOPY] = 0;
+    table[CODECOPY] = 0;
+    table[RETURNDATACOPY] = 0;
     table
 }
 
@@ -214,4 +236,108 @@ pub enum EnergyError {
     NegativeFactor,
     #[error("arithmetic overflow")]
     Overflow,
+}
+
+#[cfg(test)]
+mod sstore_parity_tests {
+    use super::tron_gas_params;
+    use revm::context_interface::context::SStoreResult;
+    use revm::primitives::U256;
+
+    /// Full TRON SSTORE energy for a `(original, present, new)` transition:
+    /// `sstore_static + sstore_dynamic`. The gas spec is `FRONTIER`, so the
+    /// interpreter passes `is_istanbul = false`.
+    fn sstore_cost(orig: u64, present: u64, new: u64) -> u64 {
+        sstore_cost_w(orig, present, new, false)
+    }
+
+    /// As [`sstore_cost`], with `prev_written` = slot already written this tx.
+    fn sstore_cost_w(orig: u64, present: u64, new: u64, prev_written: bool) -> u64 {
+        let gp = tron_gas_params();
+        let vals = SStoreResult {
+            original_value: U256::from(orig),
+            present_value: U256::from(present),
+            new_value: U256::from(new),
+            prev_written_this_tx: prev_written,
+        };
+        // `is_cold` is ignored on the Frontier branch (no warm/cold split).
+        gp.sstore_static_gas() + gp.sstore_dynamic_gas(false, &vals, false)
+    }
+
+    const SET: u64 = 20_000; // java SET_SSTORE
+    const RESET: u64 = 5_000; // java RESET_SSTORE == CLEAR_SSTORE
+
+    /// Pin the two TRON SSTORE costs so a future schedule edit can't silently
+    /// drift them away from java-tron's `EnergyCost` constants.
+    #[test]
+    fn sstore_set_and_reset_constants() {
+        assert_eq!(sstore_cost(0, 0, 7), SET);
+        assert_eq!(sstore_cost(9, 9, 7), RESET);
+    }
+
+    /// Mirror java-tron `EnergyCost.getSstoreCost`: SET (20000) is charged only
+    /// when `storageLoad(key) == null` — i.e. the slot has no storage row
+    /// (DB-absent and unwritten this tx). Every other transition is 5000.
+    #[test]
+    fn sstore_matches_java_null_model() {
+        // 1. First write to a truly-absent slot (java null) -> SET.
+        assert_eq!(sstore_cost(0, 0, 7), SET);
+        // 2. Writing zero to an absent slot -> new==0 -> 5000.
+        assert_eq!(sstore_cost(0, 0, 0), RESET);
+        // 3. DB-present nonzero, overwritten nonzero (java non-null) -> RESET.
+        assert_eq!(sstore_cost(9, 9, 7), RESET);
+        // 4. DB-present nonzero, cleared to zero (java CLEAR) -> 5000.
+        assert_eq!(sstore_cost(9, 9, 0), RESET);
+        // 5. THE FIX — nonzero slot cleared earlier this tx, re-set nonzero.
+        //    `original != 0`, so RESET. Literal Frontier (`present == 0`) would
+        //    bill SET (20000); java bills 5000 (the row is cached/non-null).
+        assert_eq!(sstore_cost(9, 0, 7), RESET);
+        // 6. THE FIX — absent slot set nonzero earlier this tx, re-set nonzero.
+        //    `present != 0`, so RESET.
+        assert_eq!(sstore_cost(0, 5, 7), RESET);
+        // 5b/6b — the same re-sets but clearing to zero are always 5000.
+        assert_eq!(sstore_cost(9, 0, 0), RESET);
+        assert_eq!(sstore_cost(0, 5, 0), RESET);
+    }
+
+    /// THE case-4 fix — an absent slot (`original == 0`) set to 0 then re-set
+    /// nonzero in the same tx reads `original == present == 0`, so the value-only
+    /// rule mis-bills SET (20000). `prev_written_this_tx` (a prior journal
+    /// `StorageChanged` on the slot) forces RESET (5000) to match java's cached
+    /// row. Proven live on SmartExchangeRouter slot …c894b01f
+    /// (nonzero→0→nonzero), which was billed +15000 before this fix.
+    #[test]
+    fn sstore_prev_written_forces_reset() {
+        // pristine absent slot, never written this tx -> SET.
+        assert_eq!(sstore_cost_w(0, 0, 7, false), SET);
+        // same transition, but the slot was already written this tx -> RESET.
+        assert_eq!(sstore_cost_w(0, 0, 7, true), RESET);
+        // prev_written is irrelevant when not the SET-eligible transition.
+        assert_eq!(sstore_cost_w(9, 9, 7, true), RESET);
+        assert_eq!(sstore_cost_w(0, 0, 0, true), RESET);
+    }
+}
+
+#[cfg(test)]
+mod static_table_parity_tests {
+    use super::tron_static_gas_table;
+
+    /// Pin the per-opcode static bases against java-tron's energy schedule.
+    /// CODECOPY/CALLDATACOPY/RETURNDATACOPY have NO base (their cost is purely
+    /// `mem + 3×words`); EXTCODECOPY keeps `EXT_CODE_COPY = 20`; MCOPY keeps
+    /// VERY_LOW = 3; MLOAD/MSTORE/MSTORE8 are 1.
+    #[test]
+    fn copy_opcode_bases_match_java() {
+        let t = tron_static_gas_table();
+        assert_eq!(t[0x37], 0, "CALLDATACOPY base must be 0");
+        assert_eq!(t[0x39], 0, "CODECOPY base must be 0");
+        assert_eq!(t[0x3e], 0, "RETURNDATACOPY base must be 0");
+        assert_eq!(t[0x3c], 20, "EXTCODECOPY keeps EXT_CODE_COPY=20");
+        assert_eq!(t[0x5e], 3, "MCOPY keeps VERY_LOW=3");
+        assert_eq!(t[0x51], 1, "MLOAD base 1");
+        assert_eq!(t[0x52], 1, "MSTORE base 1");
+        assert_eq!(t[0x53], 1, "MSTORE8 base 1");
+        // sanity: a normal VERY_LOW op is untouched.
+        assert_eq!(t[0x01], 3, "ADD stays VERY_LOW=3");
+    }
 }

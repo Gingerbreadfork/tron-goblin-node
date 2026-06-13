@@ -7,6 +7,7 @@
 pub mod abi_event_decoder;
 pub mod admin;
 pub mod config;
+pub mod diag;
 pub mod dump_state;
 pub mod backup;
 pub mod event_loader;

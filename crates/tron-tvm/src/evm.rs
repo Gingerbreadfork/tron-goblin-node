@@ -431,7 +431,9 @@ pub fn install_tron_opcode_stubs<IT, H>(
         instructions.insert_instruction(
             opcode::TOKENBALANCE,
             Instruction::new(contract::token_balance::<IT, H>),
-            700,
+            // java-tron registers TOKENBALANCE with `EnergyCost::getBalanceCost`
+            // = BALANCE = 20 (not the EIP-150 account-access 700).
+            20,
         );
         instructions.insert_instruction(
             opcode::CALLTOKENVALUE,
@@ -450,7 +452,11 @@ pub fn install_tron_opcode_stubs<IT, H>(
         instructions.insert_instruction(
             opcode::ISCONTRACT,
             Instruction::new(contract::is_contract::<IT, H>),
-            700,
+            // java-tron registers ISCONTRACT with `EnergyCost::getBalanceCost`
+            // = BALANCE = 20 (PrecompiledContracts/OperationRegistry), NOT the
+            // EIP-150 account-access cost 700. Over-charged every ISCONTRACT by
+            // 680 (DexRouter/MarketProxy: +680/tx).
+            20,
         );
     }
 

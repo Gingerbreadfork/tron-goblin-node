@@ -512,7 +512,28 @@ impl GasParams {
         // frontier logic gets charged for every SSTORE operation if original value is zero.
         // this behaviour is fixed in istanbul fork.
         if !is_istanbul {
-            if vals.is_present_zero() && !vals.is_new_zero() {
+            // TRON parity: java-tron's `EnergyCost.getSstoreCost` charges SET
+            // (20000) only when `storageLoad(key) == null` — i.e. the slot has
+            // no row in storage (never written, in DB or earlier this tx).
+            // Literal Frontier keys SET on the *present* value being zero, which
+            // over-charges the common `X → 0 → nonzero` (clear-then-re-set)
+            // pattern within a single tx: the re-set sees `present == 0` and is
+            // billed SET (20000) where java bills RESET (5000), a +15000 energy
+            // divergence that desyncs energy-tight txs (java succeeds, we OOG).
+            //
+            // java prunes zero rows on commit (`Storage.commit` deletes
+            // `isZero` rows), so a persisted row is always non-zero and
+            // `original == 0` ⟺ the slot is DB-absent. But a slot can be
+            // DB-absent yet already written *this tx* (e.g. set → cleared →
+            // re-set): java caches it (non-null) → RESET, while revm sees it as
+            // pristine `original == present == 0` → SET. `prev_written_this_tx`
+            // (set by the journal scan in `sstore_concrete_error`) closes that
+            // gap, so SET fires only for a genuine first write to an absent slot.
+            if vals.is_present_zero()
+                && vals.is_original_zero()
+                && !vals.prev_written_this_tx
+                && !vals.is_new_zero()
+            {
                 return self.sstore_set_without_load_cost();
             } else {
                 return self.sstore_reset_without_cold_load_cost();

@@ -363,7 +363,11 @@ fn energy_costs_match_pinned_values_from_java_tron() {
     assert_eq!(PrecompileImpl::IsSrCandidate.energy_cost(&[]), 20);
     assert_eq!(PrecompileImpl::VoteCount.energy_cost(&[]), 500);
     assert_eq!(PrecompileImpl::RewardBalance.energy_cost(&[]), 500);
-    assert_eq!(PrecompileImpl::GetChainParameter.energy_cost(&[]), 500);
+    // java-tron `GetChainParameter.getEnergyForData` = 50 (not 500), and
+    // `AvailableUnfreezeV2Size` = 50 (not 20) — both verified live against the
+    // mainnet reference node + PrecompiledContracts.java.
+    assert_eq!(PrecompileImpl::GetChainParameter.energy_cost(&[]), 50);
+    assert_eq!(PrecompileImpl::AvailableUnfreezeV2Size.energy_cost(&[]), 50);
     assert_eq!(PrecompileImpl::ValidateMultiSign.energy_cost(&[]), 1500);
     // Shielded zk-SNARK verifiers. Constants pinned against java-tron's
     // `PrecompiledContracts.{VerifyMintProof,VerifyTransferProof,

@@ -25,6 +25,35 @@ use bytecode::Bytecode;
 use context_interface::{cfg::GasParams, host::LoadError};
 use primitives::{hardfork::SpecId, hints_util::cold_path, Bytes};
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    static OP_TRACE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// TEMP DIAGNOSTIC: toggle per-opcode `OPTRACE pc=.. op=0x.. cost=..` stderr
+/// output for the current thread. The executor sets this around a single
+/// target tx so a re-sync emits a reliable per-op gas trace (the core charge
+/// path, unlike the inspector trace which mis-attributes memory gas). Off by
+/// default — no effect on consensus.
+#[cfg(feature = "std")]
+pub fn set_op_trace(on: bool) {
+    OP_TRACE.with(|c| c.set(on));
+}
+#[cfg(not(feature = "std"))]
+pub fn set_op_trace(_on: bool) {}
+
+#[inline(always)]
+fn op_trace_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        OP_TRACE.with(|c| c.get())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
 /// Main interpreter structure that contains all components defined in [`InterpreterTypes`].
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -304,6 +333,29 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // Get current opcode.
         let opcode = self.bytecode.opcode();
 
+        // TEMP DIAGNOSTIC: capture pc + gas + top stack operands before, to emit
+        // a per-op record below. The operands (top-7, hex, top-first) let the
+        // analysis recompute java's memory/copy/log/sstore cost; the gas-before
+        // lets it reconstruct call depth (a gas jump = child returned).
+        let trace = op_trace_on();
+        let (trace_pc, trace_gas, trace_stack) = if trace {
+            let d = self.stack.data();
+            let n = d.len();
+            let mut st = String::new();
+            for i in 0..7 {
+                if i >= n {
+                    break;
+                }
+                if i > 0 {
+                    st.push(',');
+                }
+                let _ = core::fmt::Write::write_fmt(&mut st, format_args!("{:x}", d[n - 1 - i]));
+            }
+            (self.bytecode.pc(), self.gas.remaining(), st)
+        } else {
+            (0, 0, String::new())
+        };
+
         // SAFETY: In analysis we are doing padding of bytecode so that we are sure that last
         // byte instruction is STOP so we are safe to just increment program_counter bcs on last instruction
         // it will do noop and just stop execution of this contract
@@ -320,13 +372,35 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
 
         if self.gas.record_cost_unsafe(static_gas as u64) {
             cold_path();
+            if trace {
+                #[cfg(feature = "std")]
+                std::eprintln!(
+                    "OPTRACE pc={trace_pc} op=0x{opcode:02x} gas={trace_gas} cost=OOG st={trace_stack}"
+                );
+            }
             return Err(InstructionResult::OutOfGas);
         }
 
-        instruction.execute(InstructionContext {
+        let result = instruction.execute(InstructionContext {
             interpreter: self,
             host,
-        })
+        });
+
+        if trace {
+            // Cost = gas consumed by this op's static + dynamic charges. For
+            // CALL/CREATE this also includes the forwarded child budget (the
+            // child runs in its own frame and refunds outside `step`); plain
+            // ops are clean.
+            #[cfg(feature = "std")]
+            {
+                let cost = trace_gas.saturating_sub(self.gas.remaining());
+                std::eprintln!(
+                    "OPTRACE pc={trace_pc} op=0x{opcode:02x} gas={trace_gas} cost={cost} st={trace_stack}"
+                );
+            }
+        }
+
+        result
     }
 
     /// Executes the interpreter until it returns or stops.
@@ -471,6 +545,159 @@ mod tests {
             deserialized.bytecode.pc(),
             "Program counter should be preserved"
         );
+    }
+}
+
+/// DIAGNOSTIC (temporary): step a tiny `PUSH;PUSH;MSTORE;PUSH;MLOAD;STOP`
+/// program one opcode at a time through the CORE interpreter (no inspector)
+/// and print each op's gas cost. Isolates whether the `MLOAD` reports a
+/// wrong per-op cost in the core charging path or only via the trace
+/// inspector. Run with: `cargo test -p revm-interpreter diagnostic_per_op_gas
+/// -- --nocapture --ignored`.
+#[test]
+#[ignore]
+fn diagnostic_per_op_gas() {
+    use super::*;
+    use crate::{
+        host::DummyHost,
+        instructions::{gas_table, instruction_table},
+    };
+    use bytecode::Bytecode;
+    use primitives::Bytes;
+
+    let code = Bytes::from(
+        &[
+            0x60, 0x00, // PUSH1 0 (value)
+            0x60, 0x00, // PUSH1 0 (offset)
+            0x52, // MSTORE  -> expands memory to 1 word
+            0x60, 0x00, // PUSH1 0 (offset)
+            0x51, // MLOAD   -> NO expansion (mem already 1 word) -> static only
+            0x00, // STOP
+        ][..],
+    );
+    let mut interp = Interpreter::<EthInterpreter>::new(
+        SharedMemory::new(),
+        ExtBytecode::new(Bytecode::new_raw(code)),
+        InputsImpl::default(),
+        false,
+        SpecId::default(),
+        100_000,
+    );
+    let table = instruction_table::<EthInterpreter, DummyHost>();
+    let gas = gas_table();
+    let mut host = DummyHost::default();
+    eprintln!("--- per-op gas (core interpreter, no inspector) ---");
+    for _ in 0..20 {
+        let before = interp.gas.remaining();
+        let op = interp.bytecode.opcode();
+        let res = interp.step(&table, &gas, &mut host);
+        let cost = before - interp.gas.remaining();
+        eprintln!("op=0x{op:02x} cost={cost}");
+        if res.is_err() || interp.bytecode.is_end() {
+            break;
+        }
+    }
+}
+
+/// DIAGNOSTIC (temporary): isolate the STATICCALL base cost. With zero
+/// args/return memory and zero requested gas, java charges exactly
+/// CALL_ENERGY=40. 6 PUSH1 (18) + STATICCALL should consume 58 total; 61 means
+/// STATICCALL is over-charged by +3.
+#[test]
+#[ignore]
+fn diagnostic_staticcall_base_cost() {
+    use super::*;
+    use crate::{
+        host::DummyHost,
+        instructions::{gas_table, instruction_table},
+    };
+    use bytecode::Bytecode;
+    use primitives::Bytes;
+    // stack top->down for STATICCALL: gas, addr, argsOffset, argsLen, retOffset, retLen
+    // push reverse: retLen, retOffset, argsLen, argsOffset, addr, gas
+    let code = Bytes::from(
+        &[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // retLen,retOffset,argsLen,argsOffset
+            0x60, 0x42, // addr = 0x42
+            0x60, 0x00, // gas = 0
+            0xfa, // STATICCALL
+            0x00, // STOP
+        ][..],
+    );
+    let mut interp = Interpreter::<EthInterpreter>::new(
+        SharedMemory::new(),
+        ExtBytecode::new(Bytecode::new_raw(code)),
+        InputsImpl::default(),
+        false,
+        SpecId::default(),
+        100_000,
+    );
+    let table = instruction_table::<EthInterpreter, DummyHost>();
+    let gas = gas_table(); // base table = TRON Frontier costs (SLOAD=50, STATICCALL=40)
+    let mut host = DummyHost::default();
+    // step until STATICCALL is charged (it sets a Call action), measuring its cost.
+    for _ in 0..10 {
+        let before = interp.gas.remaining();
+        let op = interp.bytecode.opcode();
+        let _ = interp.step(&table, &gas, &mut host);
+        let cost = before - interp.gas.remaining();
+        eprintln!("op=0x{op:02x} cost={cost}");
+        if op == 0xfa || interp.bytecode.is_end() || interp.bytecode.action().is_some() {
+            eprintln!(">>> STATICCALL total cost = {cost} (java expects 40; 43 => +3 bug)");
+            break;
+        }
+    }
+}
+
+/// DIAGNOSTIC (temporary): isolate a with-value CALL's base cost (the path the
+/// +3 energy over-charge lives in). CALL with value to an empty addr, zero
+/// args/ret/gas: java = CALL_ENERGY(40) + CALLVALUE(9000) + NEWACCOUNT(25000)
+/// = 34040. 7 PUSH1 (21) before it. Anything other than 34040 for the CALL op
+/// is the bug.
+#[test]
+#[ignore]
+fn diagnostic_call_with_value_cost() {
+    use super::*;
+    use crate::{
+        host::DummyHost,
+        instructions::{gas_table, instruction_table},
+    };
+    use bytecode::Bytecode;
+    use primitives::Bytes;
+    // CALL stack top->down: gas, addr, value, argsOffset, argsLen, retOffset, retLen
+    let code = Bytes::from(
+        &[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // retLen,retOffset,argsLen,argsOffset
+            0x60, 0x01, // value = 1
+            0x60, 0x42, // addr = 0x42
+            0x60, 0x00, // gas = 0
+            0xf1, // CALL
+            0x00, // STOP
+        ][..],
+    );
+    let mut interp = Interpreter::<EthInterpreter>::new(
+        SharedMemory::new(),
+        ExtBytecode::new(Bytecode::new_raw(code)),
+        InputsImpl::default(),
+        false,
+        SpecId::default(),
+        100_000,
+    );
+    let table = instruction_table::<EthInterpreter, DummyHost>();
+    let gas = gas_table();
+    let mut host = DummyHost::default();
+    for _ in 0..12 {
+        let before = interp.gas.remaining();
+        let op = interp.bytecode.opcode();
+        let _ = interp.step(&table, &gas, &mut host);
+        let cost = before - interp.gas.remaining();
+        if op == 0xf1 {
+            eprintln!(">>> CALL(value) cost = {cost} (java expects 40+9000+25000=34040)");
+            break;
+        }
+        if interp.bytecode.is_end() || interp.bytecode.action().is_some() {
+            break;
+        }
     }
 }
 

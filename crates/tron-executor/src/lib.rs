@@ -2236,7 +2236,36 @@ fn execute_block_logic(
         };
         use tron_proto::transaction::result::Code;
         const RET_SUCCESS: i32 = Code::Sucess as i32;
+        // TEMP DIAGNOSTIC: per-tx fee/energy/net trace over a block window, so
+        // SILENT charge divergences (fees/energy our node computes differently
+        // from java — which the success/failure contractRet tripwire can't see)
+        // can be diffed against java's `gettransactioninfobyblocknum`. Gated by
+        // TRON_FEE_TRACE_FROM / TRON_FEE_TRACE_TO (block numbers); off by default.
+        let fee_trace = std::env::var("TRON_FEE_TRACE_FROM")
+            .ok()
+            .and_then(|f| f.parse::<i64>().ok())
+            .zip(
+                std::env::var("TRON_FEE_TRACE_TO")
+                    .ok()
+                    .and_then(|t| t.parse::<i64>().ok()),
+            )
+            .map(|(from, to)| raw.number >= from && raw.number <= to)
+            .unwrap_or(false);
         for (tx, res) in block.transactions.iter().zip(tx_results.iter()) {
+            if fee_trace {
+                let id: String = res.tx_id.iter().map(|b| format!("{b:02x}")).collect();
+                let total_fee = res.actuator_fee
+                    + res.receipt.energy_fee
+                    + res.receipt.net_fee
+                    + res.receipt.multi_sign_fee
+                    + res.receipt.memo_fee;
+                eprintln!(
+                    "FEE_TRACE blk={} tx={} fee={} energy_total={} energy_fee={} net_usage={} net_fee={} penalty={}",
+                    raw.number, id, total_fee, res.receipt.energy_usage_total,
+                    res.receipt.energy_fee, res.receipt.net_usage, res.receipt.net_fee,
+                    res.receipt.energy_penalty_total,
+                );
+            }
             let is_vm = matches!(
                 res.contract_type,
                 Some(ContractType::TriggerSmartContract | ContractType::CreateSmartContract)

@@ -195,7 +195,7 @@ impl PrecompileImpl {
             Self::UsedVoteCount => 20,
             Self::ReceivedVoteCount => 20,
             Self::TotalVoteCount => 20,
-            Self::AvailableUnfreezeV2Size => 20,
+            Self::AvailableUnfreezeV2Size => 50,
             Self::UnfreezableBalanceV2 => 50,
             Self::ExpireUnfreezeBalanceV2 => 50,
             Self::DelegatableResource => 50,
@@ -207,7 +207,11 @@ impl PrecompileImpl {
             Self::TotalAcquiredResource => 50,
             Self::RewardBalance => 500,
             Self::VoteCount => 500,
-            Self::GetChainParameter => 500,
+            // java-tron `GetChainParameter.getEnergyForData` returns 50, not 500
+            // (PrecompiledContracts.java) — a 10x over-charge that bit every
+            // contract reading a chain parameter (e.g. SimpleEnergyV1: +450 per
+            // call, +900 on its 2 calls).
+            Self::GetChainParameter => 50,
             // 1 signature = 1500 energy; data layout has 5 header words + 6 words per sig
             Self::BatchValidateSign => {
                 const WORD_SIZE: usize = 32;

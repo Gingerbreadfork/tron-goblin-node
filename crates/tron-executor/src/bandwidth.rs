@@ -390,6 +390,7 @@ fn try_use_asset_account_net(
             issuer_net_usage,
             issuer_last_consume,
             now_slot,
+            stores.dyn_props.allow_harden_resource_calculation(),
         )
     } else {
         increase_default(issuer_net_usage, 0, issuer_last_consume, now_slot)
@@ -510,6 +511,7 @@ fn try_use_account_net(
             account.net_usage,
             last_consume,
             now_slot,
+            dyn_props.allow_harden_resource_calculation(),
         )
     } else {
         increase_default(account.net_usage, 0, last_consume, now_slot)
@@ -636,7 +638,14 @@ fn try_use_net_for_create_new_account(
     let last_consume = account.latest_consume_time;
     let support_unfreeze_delay = dyn_props.support_unfreeze_delay();
     let decayed = if support_unfreeze_delay {
-        recovery_account(account, ResourceKind::Bandwidth, net_usage, last_consume, now_slot)
+        recovery_account(
+            account,
+            ResourceKind::Bandwidth,
+            net_usage,
+            last_consume,
+            now_slot,
+            dyn_props.allow_harden_resource_calculation(),
+        )
     } else {
         increase_default(net_usage, 0, last_consume, now_slot)
     };
@@ -766,10 +775,12 @@ pub fn calculate_global_net_limit(account: &Account, dyn_props: &DynamicProperti
     let froze_balance = all_frozen_balance_for_bandwidth(account);
     let total_limit = dyn_props.total_net_limit();
     let total_weight = dyn_props.total_net_weight();
+    // Off on mainnet → java's legacy `double` scaling (see energy.rs).
+    let harden = dyn_props.allow_harden_resource_calculation();
 
     if dyn_props.support_unfreeze_delay() {
         // V2 path: preserves fractional weight via end-truncation.
-        return calculate_global_limit_v2(froze_balance, total_limit, total_weight);
+        return calculate_global_limit_v2(froze_balance, total_limit, total_weight, harden);
     }
     if froze_balance < TRX_PRECISION {
         return 0;
@@ -780,7 +791,7 @@ pub fn calculate_global_net_limit(account: &Account, dyn_props: &DynamicProperti
     if dyn_props.allow_new_reward() && total_weight <= 0 {
         return 0;
     }
-    calculate_global_limit_v1(froze_balance, total_limit, total_weight)
+    calculate_global_limit_v1(froze_balance, total_limit, total_weight, harden)
 }
 
 /// Sum of all sources of bandwidth weight for `account`. Mirrors

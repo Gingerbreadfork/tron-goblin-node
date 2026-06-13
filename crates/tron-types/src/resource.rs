@@ -24,11 +24,14 @@
 //! and `AccountCapsule.{getWindowSize,getWindowSizeV2,setNewWindowSize,
 //! setNewWindowSizeV2,getUsage,getLastConsumeTime,setUsage,setLatestTime}`.
 //!
-//! **Hardened arithmetic.** Java-tron has two modes — the legacy
-//! `long`-arithmetic path and the `BigInteger` `allowHardenResourceCalculation()`
-//! path. Mainnet has the hardened path on as of v4.7.7; we always use the
-//! hardened path (128-bit intermediates), which (a) cannot overflow for any
-//! plausible input and (b) agrees with the legacy path for non-edge inputs.
+//! **Hardened arithmetic.** java-tron has two modes, gated by
+//! `allowHardenResourceCalculation()` (proposal #97): the hardened `BigInteger`
+//! path (exact integer) and the legacy IEEE-754 `double` path. Proposal #97 is
+//! **NOT active on mainnet**, so the legacy `double` path is the byte-exact one
+//! there — the two disagree once operands exceed 2^53 (large-stake accounts),
+//! and that gap is the staked-vs-burned resource split (`energy_fee`/`net_fee`).
+//! Functions that take a `harden: bool` reproduce BOTH; callers pass
+//! `DynamicPropertiesStore::allow_harden_resource_calculation()`.
 
 use tron_proto::Account;
 
@@ -95,9 +98,16 @@ pub fn increase(last_usage: i64, usage: i64, last_time: i64, now: i64, window: i
 
     if last_time != now {
         if last_time + window > now {
-            let delta = (now - last_time) as i128;
-            // java-tron: `round(averageLastUsage * (windowSize - delta) / windowSize)`.
-            average_last = round_div_i128(average_last * (window_i - delta), window_i);
+            let delta = now - last_time;
+            // java `ResourceProcessor.increase`: the decay is ALWAYS done in
+            // IEEE-754 `double` — `round(averageLastUsage * ((windowSize - delta)
+            // / (double) windowSize))` — regardless of `hardenCalculation()`
+            // (which only switches the `divideCeil` above between BigInteger and
+            // long). Doing it in exact integer (`round_div`) rounds differently
+            // by a few units, which surfaces as the staked-vs-burned resource
+            // split (`energy_fee`/`net_fee`) diverging vs java.
+            let decay = (window - delta) as f64 / window as f64;
+            average_last = strict_round(average_last as f64 * decay) as i128;
         } else {
             average_last = 0;
         }
@@ -120,25 +130,59 @@ pub fn recovery(last_usage: i64, last_time: i64, now: i64, old_window: i64) -> i
 }
 
 /// Global-limit scaling V1 — `weight * totalLimit / totalWeight` where
-/// `weight = frozeBalance / TRX_PRECISION`. Hardened (128-bit).
-pub fn calculate_global_limit_v1(froze_balance: i64, total_limit: i64, total_weight: i64) -> i64 {
+/// `weight = frozeBalance / TRX_PRECISION` (integer divide).
+///
+/// `harden` = `ALLOW_HARDEN_RESOURCE_CALCULATION` (proposal #97, **off on
+/// mainnet**). When off, java's `calculateGlobalEnergyLimit` legacy branch runs
+/// the multiply in IEEE-754 `double`:
+/// `(long)(weight * ((double) totalLimit / totalWeight))` — which rounds
+/// differently from the exact integer result once the operands lose precision,
+/// so we must reproduce it to stay byte-exact on the stake-vs-burn split.
+pub fn calculate_global_limit_v1(
+    froze_balance: i64,
+    total_limit: i64,
+    total_weight: i64,
+    harden: bool,
+) -> i64 {
     if total_weight <= 0 {
         return 0;
     }
     let weight = froze_balance / TRX_PRECISION;
-    ((weight as i128) * (total_limit as i128) / (total_weight as i128)) as i64
+    if harden {
+        ((weight as i128) * (total_limit as i128) / (total_weight as i128)) as i64
+    } else {
+        ((weight as f64) * (total_limit as f64 / total_weight as f64)) as i64
+    }
 }
 
-/// Global-limit scaling V2 — `(frozeBalance * totalLimit) / (TRX_PRECISION *
-/// totalWeight)` with a single truncation at the end, preserving fractional
-/// weight. Used when `supportUnfreezeDelay` is active (mainnet).
-pub fn calculate_global_limit_v2(froze_balance: i64, total_limit: i64, total_weight: i64) -> i64 {
+/// Global-limit scaling for the `supportUnfreezeDelay` path (mainnet).
+///
+/// **Floors `froze / TRX_PRECISION` to whole TRX**, then scales by
+/// `totalLimit / totalWeight`. This matches the java-tron binary **deployed on
+/// mainnet**, whose `calculateGlobalEnergyLimitV2` computes a *long* energy
+/// weight (`frozeBalance / TRX_PRECISION`) — it predates the upstream change
+/// (in the vendored source) that preserves the fractional weight via
+/// `(frozeBalance * totalLimit) / (TRX_PRECISION * totalWeight)`. Proven
+/// byte-exact against mainnet receipts: every divergent account held its energy
+/// purely as *acquired-delegated v2* with a fractional sun balance (e.g.
+/// 14231726819 → weight 14231, not 14231.726819), and the receipts use the
+/// floored weight. `harden` keeps java's int-vs-double split for the final
+/// multiply (identical once the weight is an integer, but mirrored for fidelity).
+pub fn calculate_global_limit_v2(
+    froze_balance: i64,
+    total_limit: i64,
+    total_weight: i64,
+    harden: bool,
+) -> i64 {
     if total_weight <= 0 {
         return 0;
     }
-    let num = (froze_balance as i128) * (total_limit as i128);
-    let den = (TRX_PRECISION as i128) * (total_weight as i128);
-    (num / den) as i64
+    let weight = froze_balance / TRX_PRECISION;
+    if harden {
+        ((weight as i128) * (total_limit as i128) / (total_weight as i128)) as i64
+    } else {
+        ((weight as f64) * (total_limit as f64 / total_weight as f64)) as i64
+    }
 }
 
 /// `divideCeil(a, b)` over i128 — `ceil(a / b)` for `a, b >= 0`.
@@ -153,14 +197,6 @@ fn div_ceil_i128(a: i128, b: i128) -> i128 {
     } else {
         q
     }
-}
-
-/// `Math.round(a / b)` over i128 (`floor(x + 0.5)`) for non-negative inputs.
-fn round_div_i128(a: i128, b: i128) -> i128 {
-    if b == 0 {
-        return 0;
-    }
-    (a + b / 2) / b
 }
 
 /// java-tron `getUsage(usage, windowSize)` = `usage * windowSize / precision`.
@@ -466,8 +502,19 @@ pub fn recovery_account(
     last_usage: i64,
     last_time: i64,
     now: i64,
+    harden: bool,
 ) -> i64 {
-    increase(last_usage, 0, last_time, now, window_size(account, kind))
+    let window = window_size(account, kind);
+    if harden {
+        increase(last_usage, 0, last_time, now, window)
+    } else {
+        // ALLOW_HARDEN_RESOURCE_CALCULATION off (mainnet): java decays the
+        // averaged usage in IEEE-754 `double` and rounds with `StrictMath.round`
+        // (`floor(x + 0.5)`), which differs from the exact integer round-div by a
+        // few units — and that difference is exactly the staked-vs-burned energy
+        // split (`energy_fee`) seen diverging vs java.
+        increase_legacy(last_usage, 0, last_time, now, window)
+    }
 }
 
 /// java-tron `ResourceProcessor.increase(accountCapsule, resourceCode,
@@ -494,8 +541,10 @@ pub fn increase_account(
 
     if last_time != now {
         if last_time + old_window > now {
-            let delta = (now - last_time) as i128;
-            average_last = round_div_i128(average_last * (old_window as i128 - delta), old_window as i128);
+            let delta = now - last_time;
+            // java decays in `double` always (only the divideCeil is harden-gated).
+            let decay = (old_window - delta) as f64 / old_window as f64;
+            average_last = strict_round(average_last as f64 * decay) as i128;
         } else {
             average_last = 0;
         }
@@ -540,8 +589,10 @@ fn increase_v2_account(
 
     if last_time != now {
         if last_time + old_window > now {
-            let delta = (now - last_time) as i128;
-            average_last = round_div_i128(average_last * (old_window as i128 - delta), old_window as i128);
+            let delta = now - last_time;
+            // java decays in `double` always (only the divideCeil is harden-gated).
+            let decay = (old_window - delta) as f64 / old_window as f64;
+            average_last = strict_round(average_last as f64 * decay) as i128;
         } else {
             average_last = 0;
         }
@@ -695,15 +746,39 @@ mod tests {
         assert!((499_999..=500_001).contains(&v), "expected ~500000, got {v}");
     }
 
+    /// Sub-1-TRX froze yields 0 — the deployed mainnet floors `froze /
+    /// TRX_PRECISION`, so 0.5 TRX (500_000 sun) → weight 0 → 0 (it does NOT
+    /// preserve the fractional weight; see `..._floors_to_whole_trx`).
     #[test]
-    fn calculate_global_limit_v2_preserves_fractional_weight() {
-        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000), 250_000);
+    fn calculate_global_limit_v2_sub_trx_froze_is_zero() {
+        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true), 0);
+        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, false), 0);
     }
 
     #[test]
     fn calculate_global_limit_v1_zero_weight_yields_zero() {
-        assert_eq!(calculate_global_limit_v1(1_000_000, 1_000_000, 0), 0);
-        assert_eq!(calculate_global_limit_v2(1_000_000, 1_000_000, 0), 0);
+        assert_eq!(calculate_global_limit_v1(1_000_000, 1_000_000, 0, true), 0);
+        assert_eq!(calculate_global_limit_v2(1_000_000, 1_000_000, 0, true), 0);
+        assert_eq!(calculate_global_limit_v1(1_000_000, 1_000_000, 0, false), 0);
+        assert_eq!(calculate_global_limit_v2(1_000_000, 1_000_000, 0, false), 0);
+    }
+
+    /// The deployed mainnet java-tron FLOORS `froze / TRX_PRECISION` for the
+    /// `supportUnfreezeDelay` limit (its V2 uses a long energy weight, not the
+    /// fractional one). Pinned against the real divergent mainnet tx c169493b
+    /// (caller's whole froze is acquired-delegated v2 = 14231726819 sun, a
+    /// fractional 14231.726819 TRX): the limit floors to weight 14231 → 129993,
+    /// NOT the fractional-weight 129999. So V2 == V1 (floored) on mainnet.
+    #[test]
+    fn calculate_global_limit_v2_floors_to_whole_trx() {
+        let (f, l, w) = (14_231_726_819i64, 180_000_000_000i64, 19_705_467_908i64);
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_993);
+        assert_eq!(calculate_global_limit_v2(f, l, w, false), 129_993);
+        // floored V2 matches V1 exactly (both take whole-TRX weight).
+        assert_eq!(
+            calculate_global_limit_v2(f, l, w, true),
+            calculate_global_limit_v1(f, l, w, true)
+        );
     }
 
     // ---- window-size helpers (java AccountCapsule) -------------------------

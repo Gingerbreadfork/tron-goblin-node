@@ -88,6 +88,15 @@ pub trait JournalEntryTr {
         transient_storage: Option<&mut TransientStorage>,
         is_spurious_dragon_enabled: bool,
     );
+
+    /// TRON parity helper: if this entry records a storage *value* change,
+    /// returns its `(address, key)`. Used by the TRON SSTORE cost model to
+    /// detect whether a slot was already written this transaction (the journal
+    /// is per-tx and revert-safe, so a live `StorageChanged` entry mirrors
+    /// java-tron's row-cache being non-null). Default `None`.
+    fn as_storage_change(&self) -> Option<(Address, StorageKey)> {
+        None
+    }
 }
 
 /// Status of selfdestruction revert.
@@ -273,6 +282,13 @@ impl JournalEntryTr for JournalEntry {
             address,
             key,
             had_value,
+        }
+    }
+
+    fn as_storage_change(&self) -> Option<(Address, StorageKey)> {
+        match self {
+            JournalEntry::StorageChanged { address, key, .. } => Some((*address, *key)),
+            _ => None,
         }
     }
 

@@ -123,6 +123,7 @@ pub fn consume_energy(
             current_usage,
             latest_consume,
             now_slot,
+            dyn_props.allow_harden_resource_calculation(),
         )
     } else {
         increase_default(current_usage, 0, latest_consume, now_slot)
@@ -133,6 +134,7 @@ pub fn consume_energy(
 
     let energy_from_frozen = quota_left.min(energy_used_i);
     let energy_remainder = energy_used_i - energy_from_frozen;
+
     let fee_per_energy = dyn_props.energy_fee().max(0);
     let fee = energy_remainder.saturating_mul(fee_per_energy);
 
@@ -236,9 +238,13 @@ pub fn calculate_global_energy_limit(
     let froze_balance = all_frozen_balance_for_energy(account);
     let total_limit = dyn_props.total_energy_current_limit();
     let total_weight = dyn_props.total_energy_weight();
+    // ALLOW_HARDEN_RESOURCE_CALCULATION (proposal #97) is OFF on mainnet, so
+    // java runs the legacy IEEE-754 `double` scaling; we must match it or the
+    // stake-vs-TRX-burn split (energy_fee) drifts by a few units.
+    let harden = dyn_props.allow_harden_resource_calculation();
 
     if dyn_props.support_unfreeze_delay() {
-        return calculate_global_limit_v2(froze_balance, total_limit, total_weight);
+        return calculate_global_limit_v2(froze_balance, total_limit, total_weight, harden);
     }
     if froze_balance < TRX_PRECISION {
         return 0;
@@ -249,7 +255,7 @@ pub fn calculate_global_energy_limit(
     if dyn_props.allow_new_reward() && total_weight <= 0 {
         return 0;
     }
-    calculate_global_limit_v1(froze_balance, total_limit, total_weight)
+    calculate_global_limit_v1(froze_balance, total_limit, total_weight, harden)
 }
 
 /// Sum of all energy weight: the v2 frozen-for-energy entry, the
@@ -332,6 +338,7 @@ pub fn account_left_energy_from_freeze(
             energy_usage,
             latest_consume,
             now_slot,
+            dyn_props.allow_harden_resource_calculation(),
         )
     } else {
         increase_default(energy_usage, 0, latest_consume, now_slot)

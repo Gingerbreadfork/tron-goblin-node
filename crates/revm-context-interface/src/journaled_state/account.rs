@@ -242,28 +242,54 @@ impl<'a, DB: Database, ENTRY: JournalEntryTr> JournaledAccount<'a, DB, ENTRY> {
 
         // assume that acc exists and load the slot.
         let slot = self.sload_concrete_error(key, skip_cold_load)?;
+        let original_value = slot.original_value();
+        let present_value = slot.present_value();
+        let is_cold = slot.is_cold;
 
-        let ret = Ok(StateLoad::new(
-            SStoreResult {
-                original_value: slot.original_value(),
-                present_value: slot.present_value(),
-                new_value: new,
-            },
-            slot.is_cold,
-        ));
-
-        // when new value is different from present, we need to add a journal entry and make a change.
-        if slot.present_value != new {
-            let previous_value = slot.present_value;
-            // insert value into present state.
+        // Apply the value change now, while the slot is still borrowed; the
+        // journal entry + the TRON "written this tx" scan both need
+        // `self.journal_entries` afterwards, which can't coexist with the slot
+        // borrow.
+        let changed = present_value != new;
+        if changed {
             slot.data.present_value = new;
+        }
+        // slot borrow ends here.
 
-            // add journal entry.
+        // TRON parity: java-tron's `getSstoreCost` bills SET (20000) only when
+        // `storageLoad(key) == null`. A prior `storageSave` this tx caches the
+        // row (non-null), so re-setting a slot that is currently zero must be
+        // RESET (5000). revm's value-only rule can't see this — the slot reads
+        // `original == present == 0` — so detect a prior write by scanning the
+        // per-tx, revert-safe journal for a `StorageChanged` on this slot. Only
+        // the `original==0 && present==0 && new!=0` transition can be mis-billed,
+        // so restrict the O(n) scan to it.
+        let prev_written_this_tx =
+            if original_value.is_zero() && present_value.is_zero() && !new.is_zero() {
+                let addr = self.address;
+                self.journal_entries
+                    .iter()
+                    .any(|e| e.as_storage_change() == Some((addr, key)))
+            } else {
+                false
+            };
+
+        // Record this write's journal entry *after* the scan so the scan only
+        // observes prior writes.
+        if changed {
             self.journal_entries
-                .push(ENTRY::storage_changed(self.address, key, previous_value));
+                .push(ENTRY::storage_changed(self.address, key, present_value));
         }
 
-        ret
+        Ok(StateLoad::new(
+            SStoreResult {
+                original_value,
+                present_value,
+                new_value: new,
+                prev_written_this_tx,
+            },
+            is_cold,
+        ))
     }
 
     /// Loads the code of the account. and returns it as reference.
