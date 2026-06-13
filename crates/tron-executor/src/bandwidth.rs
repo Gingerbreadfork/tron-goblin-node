@@ -716,7 +716,21 @@ fn try_use_free_net(
         return Ok(None);
     }
 
-    let new_free = increase_default(account.free_net_usage, bytes, last_free, now_slot);
+    // java `useFreeNet` grows in TWO steps: it first decays the usage to `now`
+    // (`newFreeNetUsage = increase(freeNetUsage, 0, latestConsumeFreeTime, now)`
+    // — our `decayed_free` above), then sets `latestConsumeFreeTime = now` and
+    // grows FROM THE DECAYED VALUE AT `now`
+    // (`increase(newFreeNetUsage, bytes, now, now)`). That is NOT equivalent to a
+    // single decay-and-grow from the original (`free_net_usage`, `last_free`):
+    // the intermediate `getUsage` requantization between the two steps shifts the
+    // recorded usage by up to 1 byte on ~2.4% of free-net charges, always
+    // upward. Because `free_net_usage` is persisted and free-net consumption
+    // burns no TRX (invisible to fee accounting), that drift accumulates
+    // silently until a free-net-only account near its 600-byte daily cap is
+    // wrongly rejected for "insufficient bandwidth". Every other quota path here
+    // already grows from the decayed value at `now` (`try_use_account_net`, the
+    // asset path, and `final_pub` immediately below).
+    let new_free = increase_default(decayed_free, bytes, now_slot, now_slot);
     let final_pub = increase_default(new_pub, bytes, now_slot, now_slot);
     account.free_net_usage = new_free;
     account.latest_consume_free_time = now_slot;

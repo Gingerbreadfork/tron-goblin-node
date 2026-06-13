@@ -541,3 +541,97 @@ fn support_vm_pads_the_charged_bytes_by_max_result_size() {
         "supportVM adds the 64-byte per-contract result padding"
     );
 }
+
+// ---------------------------------------------------------------------
+// 7. useFreeNet growth mirrors java's two-step increase (not a one-shot)
+// ---------------------------------------------------------------------
+
+/// java `BandwidthProcessor.useFreeNet` grows the free-net usage in two
+/// steps: decay the stored usage to `now`
+/// (`newFreeNetUsage = increase(freeNetUsage, 0, latestConsumeFreeTime, now)`),
+/// then grow from THAT decayed value at `now`
+/// (`increase(newFreeNetUsage, bytes, now, now)`). A single
+/// `increase(freeNetUsage, bytes, latestConsumeFreeTime, now)` is NOT
+/// equivalent — the intermediate `getUsage` requantization shifts the
+/// recorded usage by up to 1 byte on ~2.4% of charges, always upward.
+/// Since free-net usage is persisted and burns no TRX (invisible to fee
+/// diffs), that drift silently accumulates until a free-net-only account
+/// near its daily cap is wrongly rejected for insufficient bandwidth
+/// (live-observed on mainnet acct 413cadd745… at block 83317517, where
+/// java covered net_usage=345 from the free quota but our node rejected
+/// the tx). This guards the two-step growth.
+#[test]
+fn free_net_growth_matches_java_two_step_not_one_shot() {
+    // Seed usage chosen (with the loop below) to land on a divergent
+    // (usage, delta, bytes) point for this tx's charged byte count.
+    let free0: i64 = 200;
+    let l: i64 = 1_000_000; // latest_consume_free_time
+
+    let seed_free_acct = |env: &Env, usage: i64, last: i64| {
+        put(
+            &env.accounts,
+            ALICE,
+            Account {
+                address: ALICE.to_vec(),
+                // No frozen bandwidth and zero balance: forces the free path
+                // (useAccountNet is skipped, and there's nothing to pay a fee).
+                free_net_usage: usage,
+                latest_consume_free_time: last,
+                balance: 0,
+                ..Default::default()
+            },
+        );
+    };
+
+    // Discover this tx's charged byte count via one throwaway free-net charge.
+    let bytes = {
+        let env = Env::new();
+        seed_recipient(&env);
+        seed_free_acct(&env, free0, l);
+        let (tx, contract) = make_transfer_tx();
+        match consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), l + 1)
+            .expect("ok")
+        {
+            BandwidthCharge::Free { bytes, .. } => bytes,
+            other => panic!("expected Free, got {other:?}"),
+        }
+    };
+
+    // `increase` here is the default-window `increase_default` the production
+    // path uses. java's two-step vs the buggy one-shot:
+    let two_step = |delta: i64| {
+        let decayed = increase(free0, 0, l, l + delta);
+        increase(decayed, bytes, l + delta, l + delta)
+    };
+    let one_shot = |delta: i64| increase(free0, bytes, l, l + delta);
+
+    // Pick the first delta where the two genuinely diverge for THIS byte
+    // count, so the assertion below actually guards the regression.
+    let delta = (1..WINDOW_SIZE_BLOCKS)
+        .find(|&d| two_step(d) != one_shot(d))
+        .expect("no divergent delta for these inputs — adjust free0");
+    assert_ne!(
+        two_step(delta),
+        one_shot(delta),
+        "test must exercise the one-shot/two-step divergence"
+    );
+
+    // Real run: the persisted free_net_usage must equal java's two-step value
+    // (the old one-shot code produced `one_shot(delta)` here and would fail).
+    let env = Env::new();
+    seed_recipient(&env);
+    seed_free_acct(&env, free0, l);
+    let (tx, contract) = make_transfer_tx();
+    let now = l + delta;
+    let charge = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), now)
+        .expect("ok");
+    let new_free = match charge {
+        BandwidthCharge::Free { new_free_usage, .. } => new_free_usage,
+        other => panic!("expected Free, got {other:?}"),
+    };
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+
+    assert_eq!(new_free, two_step(delta), "free-net growth must match java useFreeNet");
+    assert_eq!(after.free_net_usage, two_step(delta));
+    assert_ne!(new_free, one_shot(delta), "must not use the one-shot growth");
+}
