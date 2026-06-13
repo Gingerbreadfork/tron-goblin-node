@@ -185,6 +185,43 @@ pub fn calculate_global_limit_v2(
     }
 }
 
+/// **Net**-specific V2 global-limit scaling — java
+/// `BandwidthProcessor.calculateGlobalNetLimitV2`.
+///
+/// Unlike the energy V2 path ([`calculate_global_limit_v2`], which floors the
+/// weight to whole TRX to match the deployed-mainnet *energy* binary), the NET
+/// V2 path **preserves the fractional weight**: the divide by `TRX_PRECISION`
+/// happens only at the very end, so a 214.48-TRX stake yields a strictly larger
+/// limit than a 214-TRX stake. Flooring the weight costs up to 1 byte of
+/// `net_limit`, which wrongly rejects a frozen-net transaction whose quota java
+/// covers — live-proven on mainnet account `413cadd745…` at block 83317517
+/// (floored = 344 < the 345-byte tx; fractional = 345 = java's success, with an
+/// identical `TOTAL_NET_WEIGHT`). The rejected account then spills every tx onto
+/// its free quota until that saturates, so the 1-byte floor cascades into a
+/// chain of contractRet divergences.
+///
+/// * harden: `(frozeBalance * totalLimit) / (TRX_PRECISION * totalWeight)`
+///   (BigInteger / i128, a single end truncation).
+/// * legacy: `(long)((double) frozeBalance / TRX_PRECISION
+///   * ((double) totalLimit / totalWeight))`.
+pub fn calculate_global_net_limit_v2(
+    froze_balance: i64,
+    total_limit: i64,
+    total_weight: i64,
+    harden: bool,
+) -> i64 {
+    if total_weight <= 0 {
+        return 0;
+    }
+    if harden {
+        ((froze_balance as i128) * (total_limit as i128)
+            / ((TRX_PRECISION as i128) * (total_weight as i128))) as i64
+    } else {
+        ((froze_balance as f64 / TRX_PRECISION as f64)
+            * (total_limit as f64 / total_weight as f64)) as i64
+    }
+}
+
 /// `divideCeil(a, b)` over i128 — `ceil(a / b)` for `a, b >= 0`.
 fn div_ceil_i128(a: i128, b: i128) -> i128 {
     if b == 0 {
@@ -779,6 +816,27 @@ mod tests {
             calculate_global_limit_v2(f, l, w, true),
             calculate_global_limit_v1(f, l, w, true)
         );
+    }
+
+    /// The deployed mainnet java-tron PRESERVES the fractional weight for the
+    /// *net* (bandwidth) V2 limit (`calculateGlobalNetLimitV2`) — the opposite
+    /// of the floored *energy* V2 above. Pinned against the real divergent
+    /// mainnet tx cc46b1c7 (acct 413cadd745… @83317517): a 214.48-TRX bandwidth
+    /// stake (214_480_000 sun) with TOTAL_NET_LIMIT 43.2e9 and TOTAL_NET_WEIGHT
+    /// 26_854_832_843 yields net_limit 345 (fractional), which java uses to
+    /// cover the 345-byte tx. Flooring the weight gives 344 — a 1-byte shortfall
+    /// that rejects the tx and cascades the account onto its (saturating) free
+    /// quota.
+    #[test]
+    fn calculate_global_net_limit_v2_preserves_fractional_weight() {
+        let (f, l, w) = (214_480_000i64, 43_200_000_000i64, 26_854_832_843i64);
+        // NET V2 keeps the .48 → 345 (java's covered value), both modes.
+        assert_eq!(calculate_global_net_limit_v2(f, l, w, true), 345);
+        assert_eq!(calculate_global_net_limit_v2(f, l, w, false), 345);
+        // The energy (floored) V2 would give 344 — the 1-byte shortfall that
+        // wrongly rejected the tx before the net/energy split.
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 344);
+        assert_eq!(calculate_global_limit_v2(f, l, w, false), 344);
     }
 
     // ---- window-size helpers (java AccountCapsule) -------------------------

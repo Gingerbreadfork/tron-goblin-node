@@ -45,7 +45,7 @@ use tron_proto::transaction::Contract;
 use tron_proto::{Account, Transaction, TransferAssetContract};
 
 use crate::resource::{
-    calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
+    calculate_global_limit_v1, calculate_global_net_limit_v2, increase_account, increase_default,
     recovery_account, ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
@@ -793,8 +793,11 @@ pub fn calculate_global_net_limit(account: &Account, dyn_props: &DynamicProperti
     let harden = dyn_props.allow_harden_resource_calculation();
 
     if dyn_props.support_unfreeze_delay() {
-        // V2 path: preserves fractional weight via end-truncation.
-        return calculate_global_limit_v2(froze_balance, total_limit, total_weight, harden);
+        // V2 path: preserves fractional weight via end-truncation (java
+        // `calculateGlobalNetLimitV2`). NOT the energy `calculate_global_limit_v2`,
+        // which floors the weight — flooring drops net_limit by up to 1 byte and
+        // wrongly rejects frozen-net txs java covers.
+        return calculate_global_net_limit_v2(froze_balance, total_limit, total_weight, harden);
     }
     if froze_balance < TRX_PRECISION {
         return 0;
