@@ -32,7 +32,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AccountStore, DelegatedResourceStore, DynamicPropertiesStore, KvBackend, RocksDbBackend,
+    AccountStore, ContractStore, DelegatedResourceStore, DynamicPropertiesStore, KvBackend,
+    RocksDbBackend, StorageRowStore,
 };
 use tron_crypto::address::{Address, ADDRESS_LENGTH};
 
@@ -90,6 +91,17 @@ pub fn run_diag(args: &[String]) -> ExitCode {
         "dynprop" => match pos.first() {
             Some(k) => diag_dynprop(&data_dir, k),
             None => return arg_err("dynprop <key-string>"),
+        },
+        "storage" => match (pos.first(), pos.get(1)) {
+            (Some(a), Some(s)) => match (parse_addr(a), parse_slot(s)) {
+                (Ok(addr), Ok(slot)) => diag_storage(&data_dir, &addr, &slot),
+                _ => return arg_err("storage <hex-addr> <hex-slot>"),
+            },
+            _ => return arg_err("storage <hex-addr> <hex-slot>"),
+        },
+        "contractstate" => match pos.first().map(|s| parse_addr(s)) {
+            Some(Ok(addr)) => diag_contractstate(&data_dir, &addr),
+            _ => return arg_err("contractstate <hex-addr>"),
         },
         "--help" | "-h" | "help" => {
             print!("{USAGE}");
@@ -163,6 +175,77 @@ fn diag_delegation(data_dir: &str, from: &Address, to: &Address) -> Result<(), S
     Ok(())
 }
 
+/// Read one contract storage slot, replicating the executor's
+/// `compose_storage_key` (version + CREATE2 trxHash aware) so the result
+/// matches what the VM actually reads/writes. Diff against java's
+/// `getstorageat` (note: java RPC is tip-only, so compare at the same height).
+fn diag_storage(data_dir: &str, addr: &Address, slot: &[u8; 32]) -> Result<(), String> {
+    let contracts = ContractStore::new(open_ro(data_dir, "contract")?);
+    let (is_v1, addr_hash) = match contracts.get(addr).map_err(|e| format!("read contract: {e}"))? {
+        Some(c) => (c.version == 1, StorageRowStore::addr_hash(addr, &c.trx_hash)),
+        // Not a contract row (or absent): plain v2 prefix, empty trx_hash.
+        None => (false, StorageRowStore::addr_hash(addr, &[])),
+    };
+    let rows = StorageRowStore::new(open_ro(data_dir, "storage-row")?);
+    let key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, slot, is_v1);
+    let layout = if is_v1 { "v1" } else { "v2" };
+    match rows.get(&key).map_err(|e| format!("read storage row: {e}"))? {
+        Some(v) => println!(
+            "storage {} slot 0x{} [{layout}]: 0x{}",
+            hex_addr(addr),
+            hex::encode(slot),
+            hex::encode(&v)
+        ),
+        None => println!(
+            "storage {} slot 0x{} [{layout}]: ABSENT (reads as 0)",
+            hex_addr(addr),
+            hex::encode(slot)
+        ),
+    }
+    Ok(())
+}
+
+/// Dump the per-contract dynamic-energy `ContractState` row (`contract-state`
+/// store): the stored `update_cycle` / `energy_factor` / `energy_usage`, plus
+/// the *caught-up* factor at the DB's current cycle — i.e. the factor the VM
+/// would actually apply to this contract's opcodes (`Program
+/// .getContextContractFactor` after `updateContextContractFactor`). Diff
+/// against java's `getcontractinfo` (`contract_state.energy_factor`).
+fn diag_contractstate(data_dir: &str, addr: &Address) -> Result<(), String> {
+    use tron_chainbase::ContractStateStore;
+    let cs = ContractStateStore::new(open_ro(data_dir, "contract-state")?);
+    let dp = DynamicPropertiesStore::new(open_ro(data_dir, "properties")?);
+    let cur_cycle = dp.get_long(b"CURRENT_CYCLE_NUMBER").unwrap_or(0);
+    let threshold = dp.get_long(b"DYNAMIC_ENERGY_THRESHOLD").unwrap_or(0);
+    let increase = dp.get_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR").unwrap_or(0);
+    let max_factor = dp.get_long(b"DYNAMIC_ENERGY_MAX_FACTOR").unwrap_or(0);
+    let allow = dp.get_long(b"ALLOW_DYNAMIC_ENERGY").unwrap_or(0);
+    match cs.get(addr).map_err(|e| format!("read contract-state: {e}"))? {
+        Some(st) => println!(
+            "contractstate {} stored: update_cycle={} energy_factor={} energy_usage={}",
+            hex_addr(addr),
+            st.update_cycle,
+            st.energy_factor,
+            st.energy_usage
+        ),
+        None => println!(
+            "contractstate {}: ABSENT (factor 0, fresh at cycle {cur_cycle})",
+            hex_addr(addr)
+        ),
+    }
+    let caught = cs
+        .caught_up_view(addr, cur_cycle, threshold, increase, max_factor)
+        .map_err(|e| format!("catch-up: {e}"))?;
+    println!(
+        "  caught-up @cycle {cur_cycle} (allow_dynamic={allow} threshold={threshold} \
+increase={increase} max={max_factor}): energy_factor={} (effective multiplier {}.{:04})",
+        caught.energy_factor,
+        (10_000 + caught.energy_factor) / 10_000,
+        ((10_000 + caught.energy_factor) % 10_000).max(0),
+    );
+    Ok(())
+}
+
 fn diag_dynprop(data_dir: &str, key: &str) -> Result<(), String> {
     let dp = DynamicPropertiesStore::new(open_ro(data_dir, "properties")?);
     match dp.get_long(key.as_bytes()) {
@@ -193,6 +276,20 @@ fn parse_addr(s: &str) -> Result<Address, String> {
     Ok(Address::from_raw(buf))
 }
 
+/// Parse a 32-byte storage slot from hex (right-aligned big-endian, so `18`
+/// means slot 0x18); optional `0x` prefix; odd length is zero-padded.
+fn parse_slot(s: &str) -> Result<[u8; 32], String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let s = if s.len() % 2 == 1 { format!("0{s}") } else { s.to_string() };
+    let bytes = hex::decode(&s).map_err(|e| format!("bad slot hex '{s}': {e}"))?;
+    if bytes.len() > 32 {
+        return Err(format!("slot must be <= 32 bytes, got {}", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(out)
+}
+
 fn hex_addr(a: &Address) -> String {
     hex::encode(a.as_bytes())
 }
@@ -204,6 +301,8 @@ USAGE:
   tron-node diag account     <hex-addr>             [--data-dir DIR]
   tron-node diag delegation  <hex-from> <hex-to>    [--data-dir DIR]
   tron-node diag dynprop     <key-string>           [--data-dir DIR]
+  tron-node diag storage     <hex-addr> <hex-slot>  [--data-dir DIR]
+  tron-node diag contractstate <hex-addr>           [--data-dir DIR]
 
 Addresses are 21-byte mainnet hex (42 chars, '41…'), optional '0x' prefix.
 Default --data-dir is ./tron-data. Open is read-only; run with the node stopped.

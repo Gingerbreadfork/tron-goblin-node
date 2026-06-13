@@ -88,7 +88,18 @@ macro_rules! build_evm {
         // `all_enabled` snapshot so behavior matches today's mainnet.
         let proposals = tron_tvm::ProposalSet::all_enabled();
         let spec = proposals.resolve_spec();
-        let ctx = Context::mainnet().with_db(tron_db);
+        // TRON fork: the opcode set comes from `spec` (proposal-resolved), but
+        // the *energy* schedule is TRON's Frontier-era gas table with a
+        // Frontier-pinned gas spec — exactly what production sets in
+        // `execute.rs`. Without this the harness would run default Cancun gas
+        // params and never exercise the TRON energy rules (e.g. the Frontier
+        // new-account CALL charge).
+        let ctx = Context::mainnet()
+            .with_db(tron_db)
+            .modify_cfg_chained(|cfg| {
+                cfg.spec = spec;
+                cfg.gas_params = tron_tvm::tron_gas_params();
+            });
         let precompiles = TronPrecompiles::new(
             spec,
             Arc::clone(&stores.accounts),
@@ -370,4 +381,218 @@ fn tron_extended_opcode_halts_cleanly_not_undefined() {
         }
         other => panic!("expected Halt for CALLTOKEN stub, got {other:?}"),
     }
+}
+
+// ===========================================================================
+// Test 5: a ZERO-VALUE CALL to a dead (never-seen, empty) account must NOT
+// charge java-tron's NEW_ACCT_CALL (25000) energy top-up, while a
+// VALUE-BEARING CALL to the same dead account MUST.
+//
+// java-tron `EnergyCost.getCallCost`:
+//   energyCost = CALL_ENERGY (40)
+//   if (!value.isZero()) {
+//     energyCost += VT_CALL (9000)
+//     if (isDeadAccount(addr)) energyCost += NEW_ACCT_CALL (25000)
+//   }
+// So the 25000 (and the 9000) are charged ONLY when value > 0. TRON pins its
+// gas table to Frontier, where the new-account top-up would otherwise be
+// charged unconditionally (pre-Spurious-Dragon) — over-charging every
+// zero-value CALL to an empty account by 25000. This test pins the
+// value-gating. (Regression for the c29c1baf +225000 = 9 × 25000 over-charge,
+// where a router CALLed the identity precompile 0x04 nine times with value 0.)
+// ===========================================================================
+
+/// Build a contract that does a single CALL and STOPs, with the given value
+/// pushed for the CALL. Stack for CALL (top first): gas,to,value,inOff,inLen,
+/// outOff,outLen — pushed in reverse so `to` and `value` end up just below gas.
+fn call_then_stop_bytecode(to_low_byte: u8, value: u8) -> Vec<u8> {
+    vec![
+        0x60, 0x00, // PUSH1 0   outLen
+        0x60, 0x00, // PUSH1 0   outOff
+        0x60, 0x00, // PUSH1 0   inLen
+        0x60, 0x00, // PUSH1 0   inOff
+        0x60, value, // PUSH1 value
+        0x60, to_low_byte, // PUSH1 to (0x00..0xff address low byte)
+        0x61, 0xff, 0xff, // PUSH2 0xffff  forwarded gas (capped to 63/64 left)
+        0xf1, // CALL
+        0x00, // STOP
+    ]
+}
+
+fn run_call_energy(value: u8, to_low_byte: u8, caller_balance: u64) -> u64 {
+    let stores = fresh_stores();
+    let caller = EvmAddress::from([0xee; 20]);
+    let contract = EvmAddress::from([0xc5; 20]);
+    install_contract(&stores, contract, &call_then_stop_bytecode(to_low_byte, value));
+
+    let caller_tron = evm_to_tron_address(&caller);
+    stores
+        .accounts
+        .put(
+            &caller_tron,
+            &tron_proto::Account {
+                address: caller_tron.as_bytes().to_vec(),
+                balance: caller_balance as i64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Give the contract a balance so a value-bearing CALL can transfer.
+    let contract_tron = evm_to_tron_address(&contract);
+    stores
+        .accounts
+        .put(
+            &contract_tron,
+            &tron_proto::Account {
+                address: contract_tron.as_bytes().to_vec(),
+                balance: 1_000_000,
+                code_hash: code_hash(&call_then_stop_bytecode(to_low_byte, value))
+                    .as_slice()
+                    .to_vec(),
+                code: call_then_stop_bytecode(to_low_byte, value),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Install an EXISTING (alive, non-empty) account at low-byte 0xad so a CALL
+    // to 0x00..00ad never hits the new-account path — the control case.
+    let mut alive_raw = [0u8; 20];
+    alive_raw[19] = 0xad;
+    let alive = EvmAddress::from(alive_raw);
+    let alive_tron = evm_to_tron_address(&alive);
+    stores
+        .accounts
+        .put(
+            &alive_tron,
+            &tron_proto::Account {
+                address: alive_tron.as_bytes().to_vec(),
+                balance: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut evm = build_evm!(stores);
+    let tx = TxEnv::builder()
+        .caller(caller)
+        .kind(TxKind::Call(contract))
+        .gas_limit(1_000_000)
+        .nonce(0)
+        .gas_price(0)
+        .build()
+        .unwrap();
+    let exec = evm.transact_commit(tx).expect("transact failed");
+    assert!(
+        matches!(exec, ExecutionResult::Success { .. }),
+        "expected Success, got {exec:?}"
+    );
+    exec.gas_used()
+}
+
+#[test]
+fn zero_value_call_to_dead_account_does_not_charge_new_acct_energy() {
+    // Two zero-value CALLs, identical except for the target:
+    //   0xbe — a DEAD account (no record installed → empty)
+    //   0xad — an EXISTING account (installed with balance 7 → not empty)
+    // java charges NEW_ACCT_CALL only on value>0, so a zero-value CALL costs
+    // the SAME whether the target is dead or alive. With the Frontier-
+    // unconditional bug, the dead-account path charged +25000.
+    let to_dead = run_call_energy(0x00, 0xbe, 1_000_000_000);
+    let to_alive = run_call_energy(0x00, 0xad, 1_000_000_000);
+    assert_eq!(
+        to_dead, to_alive,
+        "a zero-value CALL must cost the same to a dead vs existing account; a \
+higher dead-account cost means NEW_ACCT_CALL(25000) was wrongly charged"
+    );
+
+    // And confirm the value-bearing CALL to the dead account DOES pay the
+    // NEW_ACCT_CALL top-up: it must exceed the value-bearing call to an alive
+    // account by exactly 25000 (the VT_CALL/stipend/forwarding terms are
+    // identical between the two, so they cancel).
+    let val_dead = run_call_energy(0x01, 0xbe, 1_000_000_000);
+    let val_alive = run_call_energy(0x01, 0xad, 1_000_000_000);
+    assert_eq!(
+        val_dead - val_alive,
+        25_000,
+        "a value-bearing CALL to a DEAD account must pay NEW_ACCT_CALL(25000) \
+more than the same call to an existing account"
+    );
+}
+
+// ===========================================================================
+// Test 6: SSTORE billing for the `0 → 0 → non-zero` pattern.
+//
+// java-tron `EnergyCost.getSstoreCost` uses `storageLoad(key)` (the per-tx
+// repository cache). `storageSave` caches the row on EVERY SSTORE, so once a
+// slot has been written this tx — even a no-op `0 → 0` write — `storageLoad`
+// returns non-null and the NEXT write is billed RESET(5000), not SET(20000).
+// revm normally skips journaling a value-unchanged write, which lost that
+// signal and mis-billed the re-set as SET — a +15000 energy over-charge per
+// occurrence (regression for blk 83317074 tx 27e49687 on contract 3e5f6aed:
+// energy 171672 vs java 156672 = one such re-set).
+// ===========================================================================
+
+/// Run a contract and return its gas_used (top-level call).
+fn run_contract_energy(bytecode: &[u8]) -> u64 {
+    let stores = fresh_stores();
+    let caller = EvmAddress::from([0xee; 20]);
+    let contract = EvmAddress::from([0xc6; 20]);
+    install_contract(&stores, contract, bytecode);
+    let caller_tron = evm_to_tron_address(&caller);
+    stores
+        .accounts
+        .put(
+            &caller_tron,
+            &tron_proto::Account {
+                address: caller_tron.as_bytes().to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut evm = build_evm!(stores);
+    let tx = TxEnv::builder()
+        .caller(caller)
+        .kind(TxKind::Call(contract))
+        .gas_limit(1_000_000)
+        .nonce(0)
+        .gas_price(0)
+        .build()
+        .unwrap();
+    let exec = evm.transact_commit(tx).expect("transact failed");
+    assert!(
+        matches!(exec, ExecutionResult::Success { .. }),
+        "expected Success, got {exec:?}"
+    );
+    exec.gas_used()
+}
+
+#[test]
+fn sstore_zero_then_nonzero_bills_reset_not_set_like_java() {
+    // A: SSTORE slot7 = 0 (a 0→0 no-op write), then SSTORE slot7 = 1.
+    //    java: the first store caches the row → second store is RESET(5000).
+    let a = run_contract_energy(&[
+        0x60, 0x00, 0x60, 0x07, 0x55, // PUSH1 0 PUSH1 7 SSTORE  (slot7 := 0)
+        0x60, 0x01, 0x60, 0x07, 0x55, // PUSH1 1 PUSH1 7 SSTORE  (slot7 := 1)
+        0x00, // STOP
+    ]);
+    // B: a single SSTORE slot7 = 1 on a genuinely fresh slot → SET(20000).
+    let b = run_contract_energy(&[
+        0x60, 0x01, 0x60, 0x07, 0x55, // PUSH1 1 PUSH1 7 SSTORE  (slot7 := 1)
+        0x00, // STOP
+    ]);
+
+    // Energy is execution-only (no 21000 intrinsic in TRON energy), so:
+    //   A = 2×PUSH1(3) + SSTORE_RESET(5000)  [0→0]
+    //     + 2×PUSH1(3) + SSTORE_RESET(5000)  [0→1, RESET with the fix]
+    //     = 12 + 10_000 = 10_012
+    //   B = 2×PUSH1(3) + SSTORE_SET(20_000)  [fresh slot]
+    //     = 6 + 20_000  = 20_006
+    // Without the fix, A's re-set is mis-billed SET(20_000) → A = 25_012.
+    assert_eq!(
+        a, 10_012,
+        "the 0→0→1 pattern must bill BOTH stores RESET(5000) (java parity); \
+25_012 means the re-set was mis-billed SET(20_000)"
+    );
+    assert_eq!(b, 20_006, "a fresh-slot SSTORE must bill SET(20_000)");
 }

@@ -42,8 +42,11 @@ pub fn set_op_trace(on: bool) {
 #[cfg(not(feature = "std"))]
 pub fn set_op_trace(_on: bool) {}
 
+/// Whether per-op tracing is currently enabled for this thread (set per-tx by
+/// the executor when `TRON_OP_TRACE_TX` matches). Public so sibling crates
+/// (e.g. revm-handler's per-frame energy trace) can gate on the same tx.
 #[inline(always)]
-fn op_trace_on() -> bool {
+pub fn op_trace_on() -> bool {
     #[cfg(feature = "std")]
     {
         OP_TRACE.with(|c| c.get())

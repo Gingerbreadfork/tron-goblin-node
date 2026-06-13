@@ -2259,11 +2259,38 @@ fn execute_block_logic(
                     + res.receipt.net_fee
                     + res.receipt.multi_sign_fee
                     + res.receipt.memo_fee;
+                // Event-log fingerprint: count + keccak4 of the canonical
+                // serialization (per log: addr(20) ‖ ntopics(1) ‖ topics ‖
+                // data_len(4 BE) ‖ data). Lets a per-tx diff vs java's receipt
+                // logs catch SILENT storage divergences (a wrong stored value
+                // changes the emitted event — e.g. a DEX pair's Sync reserves —
+                // even when fee/energy/outcome all still match).
+                let log_fp = {
+                    let mut buf = Vec::new();
+                    for lg in &res.vm_logs {
+                        buf.extend_from_slice(&lg.address);
+                        buf.push(lg.topics.len() as u8);
+                        for t in &lg.topics {
+                            buf.extend_from_slice(t);
+                        }
+                        buf.extend_from_slice(&(lg.data.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(&lg.data);
+                    }
+                    let h = sha256(&buf);
+                    format!(
+                        "{}:{:02x}{:02x}{:02x}{:02x}",
+                        res.vm_logs.len(),
+                        h[0],
+                        h[1],
+                        h[2],
+                        h[3]
+                    )
+                };
                 eprintln!(
-                    "FEE_TRACE blk={} tx={} fee={} energy_total={} energy_fee={} net_usage={} net_fee={} penalty={}",
+                    "FEE_TRACE blk={} tx={} fee={} energy_total={} energy_fee={} net_usage={} net_fee={} penalty={} logs={}",
                     raw.number, id, total_fee, res.receipt.energy_usage_total,
                     res.receipt.energy_fee, res.receipt.net_usage, res.receipt.net_fee,
-                    res.receipt.energy_penalty_total,
+                    res.receipt.energy_penalty_total, log_fp,
                 );
             }
             let is_vm = matches!(
