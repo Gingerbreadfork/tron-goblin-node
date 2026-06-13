@@ -66,6 +66,37 @@ pub fn tron_gas_params() -> GasParams {
     CACHE.get_or_init(build_tron_gas_params).clone()
 }
 
+/// TRON's energy schedule, selecting whether CALL/CREATE gas-forwarding retains
+/// 1/64 (EIP-150).
+///
+/// java-tron's `Program.getCallEnergy` retains the 1/64 ONLY when
+/// `allowTvmCompatibleEvm() && getContractVersion() == 1`. With
+/// `ALLOW_TVM_COMPATIBLE_EVM` off — true for all of mainnet to date, where
+/// every live contract is version 0 — it forwards ALL available energy to the
+/// child frame. revm's interpreter otherwise applies the 1/64 retention
+/// unconditionally (its opcode spec is ≥ Tangerine), which starves a sub-call
+/// sitting near the energy limit and OOGs it where java completes (e.g. a
+/// BatchTransfer wrapping a USDT transfer at a tight `fee_limit`). We encode
+/// "no retention" as a 0 divisor in the `call_stipend_reduction` slot.
+///
+/// NOTE: when the flag IS active, java retains only for version-1 (post-fork)
+/// contracts; this per-execution selector would retain for ALL contracts. That
+/// case is unreachable on mainnet (flag off) — refine with per-frame contract
+/// version if the proposal ever activates.
+pub fn tron_gas_params_for(retain_call_gas_64th: bool) -> GasParams {
+    if retain_call_gas_64th {
+        return tron_gas_params();
+    }
+    static NO_RETAIN: OnceLock<GasParams> = OnceLock::new();
+    NO_RETAIN
+        .get_or_init(|| {
+            let mut gp = build_tron_gas_params();
+            gp.override_gas([(GasId::call_stipend_reduction(), 0)].into_iter());
+            gp
+        })
+        .clone()
+}
+
 /// TRON's static (per-opcode) energy table.
 ///
 /// revm's Frontier static table already matches TRON's per-opcode costs
@@ -236,6 +267,29 @@ pub enum EnergyError {
     NegativeFactor,
     #[error("arithmetic overflow")]
     Overflow,
+}
+
+#[cfg(test)]
+mod call_gas_forwarding_tests {
+    use super::{tron_gas_params, tron_gas_params_for};
+
+    /// java-tron retains the EIP-150 1/64 on CALL only when
+    /// `allowTvmCompatibleEvm && version==1`. With the flag OFF (mainnet) it
+    /// forwards ALL available energy; with it ON it keeps the 63/64.
+    #[test]
+    fn call_gas_retention_follows_tvm_compatible_evm_flag() {
+        let g = 64_000u64;
+        // flag off → no retention (forward all). This is the fix that lets a
+        // BatchTransfer→USDT sub-call complete instead of OOG-ing 1/64 short.
+        assert_eq!(tron_gas_params_for(false).call_stipend_reduction(g), g);
+        // flag on → classic 63/64 retention (g - g/64).
+        assert_eq!(
+            tron_gas_params_for(true).call_stipend_reduction(g),
+            g - g / 64
+        );
+        // the default params retain (back-compat with non-execute callers).
+        assert_eq!(tron_gas_params().call_stipend_reduction(g), g - g / 64);
+    }
 }
 
 #[cfg(test)]

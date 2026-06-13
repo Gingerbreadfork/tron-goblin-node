@@ -87,7 +87,8 @@ pub use address::PrecompileAddress;
 pub use context::{EvmContext, EvmContextError};
 pub use energy::{
     effective_energy_cost, energy_fee_in_sun, energy_to_gas, energy_with_dynamic_penalty,
-    gas_to_energy, tron_gas_params, tron_static_gas_table, EnergyError, EnergyParams,
+    gas_to_energy, tron_gas_params, tron_gas_params_for, tron_static_gas_table, EnergyError,
+    EnergyParams,
     DYNAMIC_ENERGY_FACTOR_DECIMAL,
 };
 pub use precompiles::{

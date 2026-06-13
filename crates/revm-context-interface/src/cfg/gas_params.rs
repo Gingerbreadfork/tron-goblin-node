@@ -670,10 +670,22 @@ impl GasParams {
         self.get(GasId::call_stipend())
     }
 
-    /// Call stipend reduction. Call stipend is reduced by 1/64 of the gas limit.
+    /// Call stipend reduction. Call stipend is reduced by 1/64 of the gas limit
+    /// (EIP-150).
+    ///
+    /// A divisor of `0` is the sentinel for **no retention** — forward all
+    /// available gas. java-tron's `Program.getCallEnergy` only retains the 1/64
+    /// when `allowTvmCompatibleEvm() && contractVersion == 1`; with
+    /// `ALLOW_TVM_COMPATIBLE_EVM` off (all of mainnet to date) it forwards
+    /// everything, so TRON sets this slot to 0 (see `tron_gas_params_for`).
     #[inline]
     pub fn call_stipend_reduction(&self, gas_limit: u64) -> u64 {
-        gas_limit - gas_limit / self.get(GasId::call_stipend_reduction())
+        let divisor = self.get(GasId::call_stipend_reduction());
+        if divisor == 0 {
+            gas_limit
+        } else {
+            gas_limit - gas_limit / divisor
+        }
     }
 
     /// Transfer value cost

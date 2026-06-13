@@ -409,7 +409,7 @@ fn execute_trigger_inner(
             // TRON fork: the opcode set comes from `spec` (proposal-resolved),
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
-            cfg.gas_params = crate::tron_gas_params();
+            cfg.gas_params = crate::tron_gas_params_for(proposals.allow_tvm_compatible_evm);
             // TRON fork: CHAINID is the genesis-block-id-derived value, NOT an
             // EIP-155 chain id — EIP-712 domain separators depend on it. TRON
             // transactions carry no EIP-155 chain id, so the tx-level chain-id
@@ -683,7 +683,7 @@ fn execute_trigger_inner_with_tracer(
             // TRON fork: the opcode set comes from `spec` (proposal-resolved),
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
-            cfg.gas_params = crate::tron_gas_params();
+            cfg.gas_params = crate::tron_gas_params_for(proposals.allow_tvm_compatible_evm);
             // TRON fork: CHAINID is the genesis-block-id-derived value, NOT an
             // EIP-155 chain id — EIP-712 domain separators depend on it. TRON
             // transactions carry no EIP-155 chain id, so the tx-level chain-id
@@ -1066,7 +1066,7 @@ pub fn execute_create_with_trace(
             // TRON fork: the opcode set comes from `spec` (proposal-resolved),
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
-            cfg.gas_params = crate::tron_gas_params();
+            cfg.gas_params = crate::tron_gas_params_for(proposals.allow_tvm_compatible_evm);
             // TRON fork: CHAINID is the genesis-block-id-derived value, NOT an
             // EIP-155 chain id — EIP-712 domain separators depend on it. TRON
             // transactions carry no EIP-155 chain id, so the tx-level chain-id
