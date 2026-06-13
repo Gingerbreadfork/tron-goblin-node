@@ -78,6 +78,11 @@ pub trait TronDatabaseExt {
         false
     }
 
+    /// See [`crate::host::Host::tron_account_exists`] — `getAccount(addr) != null`.
+    fn tron_account_exists(&self, _address: Address) -> bool {
+        false
+    }
+
     /// See [`TronHostExt::tron_freeze_expire_time`].
     fn tron_freeze_expire_time(
         &self,

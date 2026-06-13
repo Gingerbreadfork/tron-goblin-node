@@ -189,8 +189,17 @@ pub fn load_account_delegated<H: Host + ?Sized>(
         // a router uses for memory copies. java charges nothing for those.
         // Mirror java's value-gating by treating the new-account rule as
         // value-gated regardless of the (Frontier) gas spec.
+        //
+        // The account is EIP-161 `is_empty` here, but TRON's
+        // `EnergyCost.isDeadAccount` keys on STORE EXISTENCE
+        // (`getAccount(addr) == null`), not emptiness — and TRON never prunes
+        // accounts, so an existing account with a zero balance is alive. Only
+        // charge `NEW_ACCT_CALL` when the account is genuinely absent from the
+        // store; otherwise a value-bearing CALL to an existing-but-empty
+        // account over-charges 25000 energy vs java (default `false` →
+        // upstream EVM keeps the pure `is_empty` behaviour).
         let _ = is_spurious_dragon;
-        if transfers_value {
+        if transfers_value && !host.tron_account_exists(address) {
             cost += host.gas_params().new_account_cost(is_spurious_dragon, true);
             if host.is_amsterdam_eip8037_enabled() {
                 state_gas_cost += host.gas_params().new_account_state_gas(host.cpsb());

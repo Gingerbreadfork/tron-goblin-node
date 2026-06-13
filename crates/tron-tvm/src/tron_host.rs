@@ -51,6 +51,11 @@ impl TronDatabaseExt for TronDatabase {
         }
     }
 
+    fn tron_account_exists(&self, address: Address) -> bool {
+        let tron_addr = evm_to_tron_address(&address);
+        matches!(self.accounts.get(&tron_addr), Ok(Some(_)))
+    }
+
     fn tron_root_tx_id(&self) -> revm::primitives::B256 {
         revm::primitives::B256::from(self.root_tx_id)
     }

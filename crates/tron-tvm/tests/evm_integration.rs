@@ -471,6 +471,25 @@ fn run_call_energy(value: u8, to_low_byte: u8, caller_balance: u64) -> u64 {
             },
         )
         .unwrap();
+    // Install an EXISTING but EMPTY (balance 0, no code) account at 0xae. TRON
+    // never prunes accounts, so a value-bearing CALL to it must NOT pay
+    // NEW_ACCT_CALL — java `isDeadAccount` keys on `getAccount(addr) == null`
+    // (store existence), not EIP-161 emptiness.
+    let mut empty_raw = [0u8; 20];
+    empty_raw[19] = 0xae;
+    let empty_existing = EvmAddress::from(empty_raw);
+    let empty_tron = evm_to_tron_address(&empty_existing);
+    stores
+        .accounts
+        .put(
+            &empty_tron,
+            &tron_proto::Account {
+                address: empty_tron.as_bytes().to_vec(),
+                balance: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let mut evm = build_evm!(stores);
     let tx = TxEnv::builder()
@@ -516,6 +535,32 @@ higher dead-account cost means NEW_ACCT_CALL(25000) was wrongly charged"
         25_000,
         "a value-bearing CALL to a DEAD account must pay NEW_ACCT_CALL(25000) \
 more than the same call to an existing account"
+    );
+}
+
+#[test]
+fn value_call_to_existing_empty_account_does_not_charge_new_acct() {
+    // TRON keys NEW_ACCT_CALL on store EXISTENCE (java `isDeadAccount` =
+    // `getAccount(addr) == null`), NOT EIP-161 emptiness, and never prunes
+    // accounts. A value-bearing CALL to:
+    //   0xbe — genuinely absent (no record)     → pays NEW_ACCT_CALL(25000)
+    //   0xae — EXISTING but balance-0 (empty)    → pays NOTHING extra
+    //   0xad — EXISTING, balance 7 (not empty)   → pays NOTHING extra
+    // revm's EIP-161 `is_empty` would wrongly charge 0xae the 25000 (it looks
+    // identical to an absent account); the `tron_account_exists` gate fixes it.
+    // Regression for mainnet tx c78fa369 (+25000 energy: a value CALL to the
+    // long-lived but zero-balance account c8685ec2).
+    let val_dead = run_call_energy(0x01, 0xbe, 1_000_000_000);
+    let val_empty_existing = run_call_energy(0x01, 0xae, 1_000_000_000);
+    let val_alive = run_call_energy(0x01, 0xad, 1_000_000_000);
+    assert_eq!(
+        val_empty_existing, val_alive,
+        "a value CALL to an existing-but-empty account must NOT pay NEW_ACCT_CALL"
+    );
+    assert_eq!(
+        val_dead - val_empty_existing,
+        25_000,
+        "only the genuinely-absent account pays NEW_ACCT_CALL(25000)"
     );
 }
 

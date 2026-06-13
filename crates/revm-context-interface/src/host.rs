@@ -263,6 +263,19 @@ pub trait Host {
         false
     }
 
+    /// **TRON fork** — `true` if `address` already exists in the account
+    /// store (java `Repository.getAccount(addr) != null`, i.e. NOT
+    /// `isDeadAccount`). TRON never prunes empty accounts, so an existing
+    /// account with a zero balance is still alive and a value-bearing CALL to
+    /// it must NOT pay `NEW_ACCT_CALL` — unlike EIP-161 `is_empty`, which would.
+    /// Default `false` (no TRON store) preserves upstream EVM behaviour: the
+    /// new-account cost then follows the EIP-161 `is_empty` test at the call
+    /// site.
+    #[inline]
+    fn tron_account_exists(&self, _address: Address) -> bool {
+        false
+    }
+
     /// **TRON fork** — per-contract dynamic-energy factor. Read once
     /// at frame setup; the interpreter's `Gas` tracker multiplies every
     /// charge by `(10_000 + factor) / 10_000`. Default `0` = no penalty.

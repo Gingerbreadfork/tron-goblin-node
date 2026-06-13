@@ -657,6 +657,10 @@ impl<
         self.journaled_state.db().tron_is_contract(address)
     }
 
+    fn tron_account_exists(&self, address: Address) -> bool {
+        self.journaled_state.db().tron_account_exists(address)
+    }
+
     fn tron_root_tx_id(&self) -> B256 {
         self.journaled_state.db().tron_root_tx_id()
     }
