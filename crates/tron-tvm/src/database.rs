@@ -565,6 +565,22 @@ impl DatabaseCommit for TronDatabase {
             }
 
             // Apply storage diffs.
+            // TEMP DIAGNOSTIC (TRON_SSTORE_TRACE=<evm-addr-hex>): log every committed
+            // storage write to a target contract (slot, old→new, root tx) so a silent
+            // storage-VALUE divergence vs java can be pinned to the exact tx + op.
+            let sstore_trace: Option<[u8; 20]> =
+                std::env::var("TRON_SSTORE_TRACE").ok().and_then(|h| {
+                    let h = h.trim_start_matches("0x");
+                    if h.len() != 40 {
+                        return None;
+                    }
+                    let mut out = [0u8; 20];
+                    for i in 0..20 {
+                        out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()?;
+                    }
+                    Some(out)
+                });
+            let hx = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
             for (slot_key, slot) in &account.storage {
                 if slot.present_value == slot.original_value {
                     continue;
@@ -572,6 +588,16 @@ impl DatabaseCommit for TronDatabase {
                 let slot_bytes: [u8; 32] = slot_key.to_be_bytes();
                 let composite = self.compose_storage_key(&tron_addr, &slot_bytes);
                 let value_bytes: [u8; 32] = slot.present_value.to_be_bytes();
+                if sstore_trace == Some(address.into_array()) {
+                    let tx = hx(&self.root_tx_id);
+                    eprintln!(
+                        "SSTRACE tx={} slot={} old={} new={}",
+                        &tx[..16.min(tx.len())],
+                        hx(&slot_bytes),
+                        hx(&slot.original_value.to_be_bytes::<32>()),
+                        hx(&value_bytes),
+                    );
+                }
                 self.storage
                     .put(&composite, &value_bytes)
                     .expect("db error in DatabaseCommit::commit writing storage slot");

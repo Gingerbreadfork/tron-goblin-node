@@ -178,11 +178,23 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     let mut code_hash = account.code_hash();
     // New account cost, as account is empty there is no delegated account and we can return early.
     if create_empty_account && account.is_empty {
-        cost += host
-            .gas_params()
-            .new_account_cost(is_spurious_dragon, transfers_value);
-        if host.is_amsterdam_eip8037_enabled() && transfers_value {
-            state_gas_cost += host.gas_params().new_account_state_gas(host.cpsb());
+        // TRON fork: java-tron's `EnergyCost.getCallCost` only charges the
+        // `NEW_ACCT_CALL` (25000) top-up for a CALL to a dead account when the
+        // call ALSO transfers value (`if (!value.isZero()) { ... if
+        // (isDeadAccount(...)) energyCost += NEW_ACCT_CALL; }`). TRON pins its
+        // *gas table* to Frontier, where `new_account_cost` would otherwise
+        // charge the top-up unconditionally (pre-Spurious-Dragon). Frontier's
+        // unconditional rule over-charges every zero-value CALL to an empty
+        // account — e.g. the identity-precompile pattern (CALL 0x04, value 0)
+        // a router uses for memory copies. java charges nothing for those.
+        // Mirror java's value-gating by treating the new-account rule as
+        // value-gated regardless of the (Frontier) gas spec.
+        let _ = is_spurious_dragon;
+        if transfers_value {
+            cost += host.gas_params().new_account_cost(is_spurious_dragon, true);
+            if host.is_amsterdam_eip8037_enabled() {
+                state_gas_cost += host.gas_params().new_account_state_gas(host.cpsb());
+            }
         }
         return Ok((cost, state_gas_cost, bytecode, code_hash));
     }

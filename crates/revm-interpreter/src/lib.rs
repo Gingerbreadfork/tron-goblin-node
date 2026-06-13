@@ -41,8 +41,8 @@ pub use instruction_context::InstructionContext;
 pub use instruction_result::*;
 pub use instructions::{gas_table, instruction_table, GasTable, Instruction, InstructionTable};
 pub use interpreter::{
-    num_words, set_op_trace, InputsImpl, Interpreter, InterpreterResult, SharedMemory, Stack,
-    STACK_LIMIT,
+    num_words, op_trace_on, set_op_trace, InputsImpl, Interpreter, InterpreterResult, SharedMemory,
+    Stack, STACK_LIMIT,
 };
 pub use interpreter_action::{
     CallInput, CallInputs, CallOutcome, CallScheme, CallValue, CreateInputs, CreateOutcome,

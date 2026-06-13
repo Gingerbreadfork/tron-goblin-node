@@ -276,7 +276,18 @@ impl<'a, DB: Database, ENTRY: JournalEntryTr> JournaledAccount<'a, DB, ENTRY> {
 
         // Record this write's journal entry *after* the scan so the scan only
         // observes prior writes.
-        if changed {
+        //
+        // TRON parity: java-tron's `storageSave` caches the row on EVERY SSTORE,
+        // so even a value-unchanged write makes `storageLoad` non-null for the
+        // rest of the tx. revm normally skips journaling a no-op write
+        // (`changed == false`), which loses the "written this tx" signal for the
+        // `0 → 0 → non-zero` pattern: the intermediate `0 → 0` store leaves no
+        // journal entry, so the later re-set's scan above can't see it and
+        // mis-bills SET(20000) where java bills RESET(5000) (a +15000 energy
+        // over-charge). Record the entry for that zero-to-zero case too — it is
+        // revert-safe (`had_value == present_value == 0`, so the revert restores
+        // 0, a true no-op) and makes the prev-written scan match java's cache.
+        if changed || (present_value.is_zero() && new.is_zero()) {
             self.journal_entries
                 .push(ENTRY::storage_changed(self.address, key, present_value));
         }
