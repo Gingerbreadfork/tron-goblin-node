@@ -470,7 +470,7 @@ impl EthFrame<EthInterpreter> {
         // DIAGNOSTIC (gated on TRON_OP_TRACE_TX): per-frame consumed-energy
         // attribution. The op-trace `cost`
         // field is forwarded-gas for CALL/CREATE so it can't be summed; this
-        // logs each returning frame's gas.spent() (its own ops + sub-calls) and
+        // logs each returning frame's gas.total_gas_spent() (its own ops + sub-calls) and
         // the contract, to localize which frame over-charges energy vs java.
         if interpreter::op_trace_on() {
             use interpreter::interpreter_types::InputsTr;
@@ -478,7 +478,7 @@ impl EthFrame<EthInterpreter> {
                 "FRAMETRACE depth={} addr={} spent={} limit={} ok={}",
                 self.depth,
                 self.interpreter.input.target_address(),
-                interpreter_result.gas.spent(),
+                interpreter_result.gas.total_gas_spent(),
                 interpreter_result.gas.limit(),
                 interpreter_result.result.is_ok(),
             );
