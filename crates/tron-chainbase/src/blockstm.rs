@@ -715,6 +715,51 @@ impl KvBackend for VersionedBackend {
             .insert((self.store, key.to_vec()), None);
         Ok(())
     }
+
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        // The MVCC layer has no native full-table scan. Build the key set this
+        // tx can see — every key in the committed `base` plus any this tx itself
+        // wrote — then resolve each through `get()`. Reusing `get()` keeps the
+        // scan byte-identical to the per-key path: the same MVCC visibility
+        // (read-your-writes > highest lower-index version > base) AND the same
+        // read-set recording, so a parallel full-table scan stays
+        // conflict-correct — if a lower-index tx writes any scanned key, this tx
+        // re-validates. Deletes (`get` => `None`) drop out; ascending byte order
+        // is preserved by the `BTreeMap`.
+        //
+        // Without this override `VersionedBackend` inherited the erroring default
+        // `scan_all`, so every full-table scan failed *only under parallel
+        // execution*: the `TotalVoteCount` precompile (`WitnessStore::all`) then
+        // returned failure and any contract that checked the call reverted — a
+        // parallel-vs-serial divergence, since serial runs on a snapshot/session
+        // backend that implements `scan_all`.
+        //
+        // A key *created* by a lower-index tx this block that is neither in base
+        // nor written by this tx is not enumerated, but the stores reachable by a
+        // VM scan (witnesses / proposals / asset-issues) are never created
+        // mid-block by a transaction, so that case does not arise.
+        let mut keys: BTreeMap<Vec<u8>, ()> = self
+            .base
+            .scan_all()?
+            .into_iter()
+            .map(|(k, _)| (k, ()))
+            .collect();
+        {
+            let cap = self.capture.borrow();
+            for (store, key) in cap.writes.keys() {
+                if *store == self.store {
+                    keys.insert(key.clone(), ());
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for (k, ()) in keys {
+            if let Some(v) = self.get(&k)? {
+                out.push((k, v));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -920,5 +965,47 @@ mod tests {
         // A higher tx now sees tx3's put and tombstone.
         assert!(matches!(mv.read(ACC, b"a", 9), ReadOutcome::Versioned { value, .. } if value == val(b"x")));
         assert!(matches!(mv.read(ACC, b"b", 9), ReadOutcome::Versioned { value, .. } if value.is_none()));
+    }
+
+    #[test]
+    fn versioned_scan_all_merges_base_overlay_mvcc_and_records_reads() {
+        // Regression: `VersionedBackend` used to inherit the erroring default
+        // `scan_all`, so full-table scans (the `TotalVoteCount` precompile's
+        // `WitnessStore::all`) failed *only under parallel execution* — the
+        // precompile returned failure and any contract checking the call
+        // reverted, diverging from serial (which uses a backend that implements
+        // `scan_all`).
+        let base = Arc::new(MemBackend::new());
+        base.put(b"a", b"1").unwrap();
+        base.put(b"b", b"2").unwrap();
+        base.put(b"c", b"3").unwrap();
+        let mv = Arc::new(MvMemory::new());
+        // A lower-index tx updated "b".
+        mv.record_writes(v(2, 0), &[(ACC, b"b".to_vec(), val(b"two"))]);
+        let (vb, cap) = versioned(5, base, mv);
+        // This tx deletes "a" and creates "d".
+        vb.delete(b"a").unwrap();
+        vb.put(b"d", b"4").unwrap();
+
+        assert_eq!(
+            vb.scan_all().unwrap(),
+            vec![
+                (b"b".to_vec(), b"two".to_vec()), // lower-tx version, not base "2"
+                (b"c".to_vec(), b"3".to_vec()),   // base
+                (b"d".to_vec(), b"4".to_vec()),   // this tx's own write
+                                                  // "a" deleted by this tx => absent
+            ],
+            "scan merges base + mvcc + own writes, drops deletes, ascending order",
+        );
+
+        // The scan must register cross-tx read deps so a concurrent write to a
+        // scanned key re-validates: "b" (versioned) and "c" (base) are recorded;
+        // "d" is the tx's own write and "a" its own delete (neither a dep).
+        let c = cap.borrow();
+        let read_keys: HashSet<_> = c.reads.iter().map(|r| r.key.clone()).collect();
+        assert!(read_keys.contains(&b"b".to_vec()), "versioned key recorded");
+        assert!(read_keys.contains(&b"c".to_vec()), "base key recorded");
+        assert!(!read_keys.contains(&b"d".to_vec()), "own write is not a read dep");
+        assert!(!read_keys.contains(&b"a".to_vec()), "own delete is not a read dep");
     }
 }
