@@ -505,7 +505,7 @@ fn run_call_energy(value: u8, to_low_byte: u8, caller_balance: u64) -> u64 {
         matches!(exec, ExecutionResult::Success { .. }),
         "expected Success, got {exec:?}"
     );
-    exec.gas_used()
+    exec.tx_gas_used()
 }
 
 #[test]
@@ -609,7 +609,7 @@ fn run_contract_energy(bytecode: &[u8]) -> u64 {
         matches!(exec, ExecutionResult::Success { .. }),
         "expected Success, got {exec:?}"
     );
-    exec.gas_used()
+    exec.tx_gas_used()
 }
 
 #[test]

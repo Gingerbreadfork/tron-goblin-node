@@ -437,7 +437,6 @@ async fn contract_log_falls_back_when_no_abi_registered() {
             Some(TriggerMessage::ContractLog(log)) => saw_log = Some(log),
             Some(TriggerMessage::ContractEvent(_)) => saw_event_unexpected = true,
             Some(TriggerMessage::SolidifiedBlock(_)) => {}
-            Some(other) => panic!("unexpected trigger: {other:?}"),
             None => break,
         }
     }
