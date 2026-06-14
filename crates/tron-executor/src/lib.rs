@@ -2292,6 +2292,23 @@ fn execute_block_logic(
                     res.receipt.energy_fee, res.receipt.net_usage, res.receipt.net_fee,
                     res.receipt.energy_penalty_total, log_fp,
                 );
+                if let Ok(target) = std::env::var("TRON_LOGDUMP") {
+                    if id.starts_with(&target) {
+                        for (i, lg) in res.vm_logs.iter().enumerate() {
+                            let addr: String =
+                                lg.address.iter().map(|b| format!("{b:02x}")).collect();
+                            let topics: String = lg
+                                .topics
+                                .iter()
+                                .map(|t| t.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let data: String =
+                                lg.data.iter().map(|b| format!("{b:02x}")).collect();
+                            eprintln!("LOGDUMP tx={id} log{i} addr={addr} topics=[{topics}] data={data}");
+                        }
+                    }
+                }
             }
             let is_vm = matches!(
                 res.contract_type,

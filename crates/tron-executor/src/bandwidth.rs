@@ -428,6 +428,12 @@ fn try_use_asset_account_net(
     } else {
         increase_default(new_issuer_net_usage, bytes, now_slot, now_slot)
     };
+    // Max-out overshoot cap (see `try_use_account_net`).
+    let final_issuer_net_usage = if bytes == issuer_net_limit.saturating_sub(new_issuer_net_usage) {
+        final_issuer_net_usage.min(issuer_net_limit)
+    } else {
+        final_issuer_net_usage
+    };
 
     // Persist the asset row.
     asset.public_free_asset_net_usage = final_pub_usage;
@@ -533,6 +539,16 @@ fn try_use_account_net(
         increase_account(account, ResourceKind::Bandwidth, cur_usage, bytes, last_consume, now_slot, gates)
     } else {
         increase_default(decayed, bytes, now_slot, now_slot)
+    };
+    // Max-out overshoot cap (mirrors the energy path): staking the exact full
+    // quota (`bytes == net_limit - decayed`) is 100% usage, so the stored
+    // windowed net_usage must land on net_limit, not net_limit+1 (the budget
+    // floors `decayed` but increase() adds `bytes` to the un-floored decayed
+    // average, carrying one extra). Only the full-quota case can overshoot.
+    let new_usage = if bytes == net_limit.saturating_sub(decayed) {
+        new_usage.min(net_limit)
+    } else {
+        new_usage
     };
     account.net_usage = new_usage;
     account.latest_consume_time = now_slot;
@@ -669,6 +685,12 @@ fn try_use_net_for_create_new_account(
         )
     } else {
         increase_default(decayed, net_cost, now_slot, now_slot)
+    };
+    // Max-out overshoot cap (see `try_use_account_net`).
+    let new_usage = if net_cost == net_limit.saturating_sub(decayed) {
+        new_usage.min(net_limit)
+    } else {
+        new_usage
     };
     account.net_usage = new_usage;
     account.latest_consume_time = now_slot;

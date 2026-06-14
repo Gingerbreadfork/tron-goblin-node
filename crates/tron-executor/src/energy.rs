@@ -38,7 +38,8 @@ use tron_proto::Account;
 
 use crate::resource::{
     calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
-    recovery_account, ResourceGates, ResourceKind, TRX_PRECISION,
+    recovery_account, update_usage, usage as resource_usage, window_size, window_size_v2,
+    ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
 /// What happened during a `consume_energy` call.
@@ -89,17 +90,17 @@ pub fn consume_energy(
     energy_used: u64,
     now_slot: i64,
 ) -> Result<EnergyCharge, EnergyError> {
-    if energy_used == 0 {
-        // Nothing to do — but we still want a consistent return shape so
-        // the caller's accounting code is uniform.
-        return Ok(EnergyCharge::Frozen {
-            energy_used: 0,
-            new_energy_usage: account_energy_usage(
-                &accounts.get(caller)?.ok_or(EnergyError::AccountMissing)?,
-            ),
-        });
-    }
-
+    // NOTE: do NOT early-return on `energy_used == 0`. java-tron's
+    // `payEnergyBill` calls `useEnergy(account, usage, now)` even with
+    // `usage == 0` (origin charged 0% under `consume_user_resource_percent
+    // == 100`, or caller charged 0 when the origin covers all), and
+    // `useEnergy` UNCONDITIONALLY decays `energy_usage`, rewrites the
+    // per-account window, and stamps `latest_consume_time`. Skipping that for
+    // a 0 charge left the account's usage stale-high, so its NEXT charge
+    // decayed from the wrong base and over-charged `energy_fee` by a unit or
+    // two — a silent per-account drift that cascades. The executor only calls
+    // into the energy path when the tx's TOTAL energy is > 0 (java's
+    // `energyUsageTotal <= 0` guard), so a 0 here is always a real split slice.
     let energy_used_i = energy_used as i64;
     let mut account = accounts.get(caller)?.ok_or(EnergyError::AccountMissing)?;
 
@@ -113,15 +114,30 @@ pub fn consume_energy(
     let current_usage = res.energy_usage;
     let latest_consume = res.latest_consume_time_for_energy;
     let decayed_usage = if support_unfreeze_delay {
-        // Window-interpreted decay (java `recovery(accountCapsule, …)` →
-        // `getWindowSize`); the raw `energy_window_size` field is
-        // precision-scaled ×1000 on optimized accounts — see the
-        // matching fix in `bandwidth::try_use_account_net`.
+        // java computes the caller's remaining frozen-energy quota in
+        // `ReceiptCapsule.payEnergyBill` via `getAccountLeftEnergyFromFreeze`,
+        // and by then the VM's `updateUsage` has ALREADY decayed+floored
+        // `energy_usage` to `decayed_D` and rewritten the per-account window.
+        // `getAccountLeftEnergyFromFreeze` then `recover(decayed_D, now, now)` —
+        // `lastTime == now` so no further time-decay, but the
+        // `divideCeil(decayed_D*precision, window_after)*window_after/precision`
+        // round-trip can nudge it up a unit. A single `recover(current_usage)`
+        // (one decay, no re-quantize) undershoots that quota by the occasional
+        // unit, so the staked-vs-fee split — and hence the stored
+        // `energy_usage` — drifts vs java. Replicate the two-step quota on a
+        // clone (no mutation of the real account before the balance pre-flight).
+        let gates = ResourceGates {
+            support_unfreeze_delay: true,
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+        let mut q = account.clone();
+        update_usage(&mut q, ResourceKind::Energy, now_slot, gates);
+        let decayed_d = resource_usage(&q, ResourceKind::Energy);
         recovery_account(
-            &account,
+            &q,
             ResourceKind::Energy,
-            current_usage,
-            latest_consume,
+            decayed_d,
+            now_slot,
             now_slot,
             dyn_props.allow_harden_resource_calculation(),
         )
@@ -131,6 +147,9 @@ pub fn consume_energy(
 
     let energy_limit = calculate_global_energy_limit(&account, dyn_props);
     let quota_left = energy_limit.saturating_sub(decayed_usage).max(0);
+    let energy_window_before = window_size(&account, ResourceKind::Energy);
+    let energy_window_before_v2 = window_size_v2(&account, ResourceKind::Energy);
+    let account_pre_decay = account.clone();
 
     let energy_from_frozen = quota_left.min(energy_used_i);
     let energy_remainder = energy_used_i - energy_from_frozen;
@@ -146,50 +165,70 @@ pub fn consume_energy(
         });
     }
 
-    // Apply the frozen-quota slice, if any.
-    let new_energy_usage = if energy_from_frozen > 0 {
-        if support_unfreeze_delay {
-            // java-tron `useEnergy`: the account-aware `increase()`
-            // recomputes AND writes back the per-account energy window
-            // (energy_window_size / energy_window_optimized) in place.
-            let gates = ResourceGates {
-                support_unfreeze_delay: true,
-                support_allow_cancel_all_unfreeze_v2: dyn_props
-                    .support_allow_cancel_all_unfreeze_v2(),
-            };
-            let new = increase_account(
-                &mut account,
-                ResourceKind::Energy,
-                current_usage,
-                energy_from_frozen,
-                latest_consume,
-                now_slot,
-                gates,
-            );
-            let r = account.account_resource.get_or_insert_with(Default::default);
-            r.energy_usage = new;
-            r.latest_consume_time_for_energy = now_slot;
-            new
-        } else {
-            let new = increase_default(decayed_usage, energy_from_frozen, now_slot, now_slot);
-            let new_res = AccountResource {
-                energy_usage: new,
-                latest_consume_time_for_energy: now_slot,
-                ..res.clone()
-            };
-            account.account_resource = Some(new_res);
-            new
-        }
+    // Charge the frozen-quota slice. java-tron's `ReceiptCapsule.payEnergyBill`
+    // ALWAYS calls `EnergyProcessor.useEnergy(account, frozenPortion, now)` —
+    // including when the frozen portion is 0 (the caller pays the whole bill by
+    // fee). `useEnergy` unconditionally decays `energy_usage` (the windowed
+    // `increase()`), rewrites the per-account window, and stamps
+    // `latest_consume_time`. The previous code special-cased `frozen == 0` to
+    // ONLY stamp the time — skipping the decay + window rewrite — which left
+    // `energy_usage` stale-high and the window un-recomputed, so the account's
+    // NEXT charge decayed from the wrong base and over-charged `energy_fee` by a
+    // unit or two: a silent per-account drift that cascades into balance/
+    // contractRet divergences. Run the identical path for `frozen == 0` (the
+    // `increase` with `usage = 0` is exactly java's `useEnergy(.., 0, now)`).
+    let new_energy_usage = if support_unfreeze_delay {
+        // java-tron `useEnergy`: the account-aware `increase()` recomputes AND
+        // writes back the per-account energy window (energy_window_size /
+        // energy_window_optimized) in place.
+        let gates = ResourceGates {
+            support_unfreeze_delay: true,
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+        // java's VM energy accounting is TWO-PHASE, and the two phases do NOT
+        // collapse into a single windowed `increase`:
+        //   1. `VMActuator` pre-consumes the available frozen energy, but first
+        //      calls `EnergyProcessor.updateUsage` — which decays `energy_usage`
+        //      to `now`, FLOORs it (`getUsage = avg*window/precision`) to a
+        //      `decayed_D`, and rewrites the per-account window. The pre-consume
+        //      and `TransactionTrace.resetAccountUsage` then cancel out, leaving
+        //      the account at exactly `(decayed_D, window_after_decay)` with
+        //      `latestConsumeTime = now`.
+        //   2. `ReceiptCapsule.payEnergyBill -> EnergyProcessor.useEnergy` then
+        //      `increase(decayed_D, staked, now, now)` — `lastTime == now`, so
+        //      NO further decay; it adds the staked slice onto the *floored*
+        //      `decayed_D` using `window_after_decay`.
+        // A single `increase(current_usage, staked, lct, now)` keeps the decayed
+        // average UN-floored and decays with the pre-decay window, so its stored
+        // usage drifts a sub-unit from java's. Across the tens of thousands of
+        // delegate/undelegate ops a heavy energy-rental account sees per window,
+        // that sub-unit compounds into the +1 `energy_usage` that shifts every
+        // `CheckUnDelegateResource` read (the af6f4896 / JustLend +6/+7 cascade).
+        // Replicate java's two phases exactly.
+        update_usage(&mut account, ResourceKind::Energy, now_slot, gates);
+        let decayed_d = resource_usage(&account, ResourceKind::Energy);
+        let new = increase_account(
+            &mut account,
+            ResourceKind::Energy,
+            decayed_d,
+            energy_from_frozen,
+            now_slot,
+            now_slot,
+            gates,
+        );
+        let r = account.account_resource.get_or_insert_with(Default::default);
+        r.energy_usage = new;
+        r.latest_consume_time_for_energy = now_slot;
+        new
     } else {
-        // No quota slice — still bump latest_consume_time_for_energy
-        // so the next consume call sees up-to-date state. java-tron's
-        // useEnergy always updates this.
+        let new = increase_default(decayed_usage, energy_from_frozen, now_slot, now_slot);
         let new_res = AccountResource {
+            energy_usage: new,
             latest_consume_time_for_energy: now_slot,
             ..res.clone()
         };
         account.account_resource = Some(new_res);
-        current_usage
+        new
     };
 
     // Apply the TRX fee slice, if any.
@@ -208,6 +247,46 @@ pub fn consume_energy(
     if dyn_props.allow_adaptive_energy() == 1 {
         let cur = dyn_props.block_energy_usage();
         dyn_props.save_block_energy_usage(cur.saturating_add(energy_used_i));
+    }
+
+    if let Ok(t) = std::env::var("TRON_ETRACE") {
+        let addr: String = caller.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        if addr == t {
+            // DECAY-PATH CONSISTENCY CHECK: caller_left uses recovery_account
+            // (increase_legacy), new_usage uses increase_account (increase_v2).
+            // Recompute the decayed usage via the increase_account(usage=0) path
+            // on a clone and compare — a difference proves the two paths decay
+            // the same usage inconsistently (the off-by-1 stake-vs-burn split).
+            let mut clone = account_pre_decay.clone();
+            let gates_dbg = ResourceGates {
+                support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
+                support_allow_cancel_all_unfreeze_v2: dyn_props
+                    .support_allow_cancel_all_unfreeze_v2(),
+            };
+            let decayed_via_increase = increase_account(
+                &mut clone,
+                ResourceKind::Energy,
+                current_usage,
+                0,
+                latest_consume,
+                now_slot,
+                gates_dbg,
+            );
+            eprintln!(
+                "EDECAY addr={addr} cusage={current_usage} decayed_recovery={decayed_usage} decayed_via_increase={decayed_via_increase} delta={}",
+                decayed_via_increase - decayed_usage
+            );
+            eprintln!(
+                "ETRACE addr={addr} cusage={current_usage} lct={latest_consume} now={now_slot} \
+                 win_before={energy_window_before} winv2_before={energy_window_before_v2} \
+                 decayed={decayed_usage} limit={energy_limit} froze={} \
+                 quota_left={quota_left} eused={energy_used_i} from_frozen={energy_from_frozen} \
+                 new_usage={new_energy_usage} win_after={} winv2_after={} fee={fee}",
+                all_frozen_balance_for_energy(&account),
+                window_size(&account, ResourceKind::Energy),
+                window_size_v2(&account, ResourceKind::Energy),
+            );
+        }
     }
 
     Ok(match (energy_from_frozen, energy_remainder) {
@@ -277,14 +356,6 @@ fn all_frozen_balance_for_energy(account: &Account) -> i64 {
     v2.saturating_add(v1)
         .saturating_add(res.acquired_delegated_frozen_balance_for_energy)
         .saturating_add(res.acquired_delegated_frozen_v2_balance_for_energy)
-}
-
-fn account_energy_usage(account: &Account) -> i64 {
-    account
-        .account_resource
-        .as_ref()
-        .map(|r| r.energy_usage)
-        .unwrap_or(0)
 }
 
 fn head_block_timestamp(dyn_props: &DynamicPropertiesStore) -> i64 {
@@ -534,15 +605,19 @@ pub fn pay_energy_bill(
         .max(0);
     let caller_usage = (total_i - origin_usage).max(0) as u64;
 
-    // Debit origin first (frozen-only — guaranteed by the pre-clamp).
-    let origin_charge = if origin_usage > 0 {
-        Some(consume_energy(
-            accounts,
-            dyn_props,
-            origin_addr,
-            origin_usage as u64,
-            now_slot,
-        )?)
+    // Debit origin first (frozen-only — guaranteed by the pre-clamp). java's
+    // `ReceiptCapsule.payEnergyBill` calls `useEnergy(origin, originUsage, now)`
+    // UNCONDITIONALLY when the origin account EXISTS — even `originUsage == 0`,
+    // the common case under `consume_user_resource_percent == 100`: it decays
+    // the origin's `energy_usage` and rewrites its window on EVERY call to its
+    // contract. Skipping the debit for `origin_usage == 0` left popular contract
+    // owners' energy_usage stale-high, drifting their own later charges. A
+    // MISSING origin row collapses to caller-pays-all (java's
+    // `Objects.isNull(origin)` arm — `origin_quota_left` already returned 0, so
+    // `caller_usage == total`), and must not be charged. So decay the origin iff
+    // its account exists.
+    let origin_charge = if accounts.get(origin_addr)?.is_some() {
+        Some(consume_energy(accounts, dyn_props, origin_addr, origin_usage as u64, now_slot)?)
     } else {
         None
     };

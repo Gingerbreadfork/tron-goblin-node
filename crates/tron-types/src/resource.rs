@@ -157,42 +157,56 @@ pub fn calculate_global_limit_v1(
 
 /// Global-limit scaling for the `supportUnfreezeDelay` path (mainnet).
 ///
-/// **Floors `froze / TRX_PRECISION` to whole TRX**, then scales by
-/// `totalLimit / totalWeight`. This matches the java-tron binary **deployed on
-/// mainnet**, whose `calculateGlobalEnergyLimitV2` computes a *long* energy
-/// weight (`frozeBalance / TRX_PRECISION`) — it predates the upstream change
-/// (in the vendored source) that preserves the fractional weight via
-/// `(frozeBalance * totalLimit) / (TRX_PRECISION * totalWeight)`. Proven
-/// byte-exact against mainnet receipts: every divergent account held its energy
-/// purely as *acquired-delegated v2* with a fractional sun balance (e.g.
-/// 14231726819 → weight 14231, not 14231.726819), and the receipts use the
-/// floored weight. `harden` keeps java's int-vs-double split for the final
-/// multiply (identical once the weight is an integer, but mirrored for fidelity).
+/// **Preserves the fractional weight**: `(long)((double) froze / TRX_PRECISION
+/// * ((double) totalLimit / totalWeight))`. This matches the java-tron binary
+/// **deployed on mainnet (GreatVoyage-v4.8.1.1)**, whose
+/// `calculateGlobalEnergyLimitV2` uses a `double` energy weight and has **no**
+/// `hardenCalculation()` branch (the `harden` param is therefore ignored here).
+/// VERIFIED LIVE against the reference node on fractional-froze accounts (e.g.
+/// 410000775507 froze=249403390 → `EnergyLimit` 2342, the fractional value, not
+/// the floored 2338; same for 410000a6824c→229, 410001e051da→2978,
+/// 410004293a36→60 — all fractional).
+///
+/// HISTORICAL NOTE: an earlier reading concluded "energy V2 floors" (matching
+/// the 4.8.0-125 *master* checkout). That was WRONG for the deployed 4.8.1.1
+/// *release* — flooring undershoots every fractional-froze account's limit by a
+/// unit, shifting its stake-vs-burn split and cascading into balance /
+/// contractRet divergences. Now identical to the net V2 path
+/// ([`calculate_global_net_limit_v2`]).
 pub fn calculate_global_limit_v2(
     froze_balance: i64,
     total_limit: i64,
     total_weight: i64,
-    harden: bool,
+    _harden: bool,
 ) -> i64 {
     if total_weight <= 0 {
         return 0;
     }
-    let weight = froze_balance / TRX_PRECISION;
-    if harden {
-        ((weight as i128) * (total_limit as i128) / (total_weight as i128)) as i64
-    } else {
-        ((weight as f64) * (total_limit as f64 / total_weight as f64)) as i64
-    }
+    // DEPLOYED java-tron 4.8.1.1 `calculateGlobalEnergyLimitV2` uses the
+    // **fractional** weight (double), NOT a floored long, and has **no**
+    // `hardenCalculation()` branch (always the double path):
+    //   `(long)((double) frozeBalance / TRX_PRECISION
+    //            * ((double) totalEnergyLimit / totalEnergyWeight))`
+    // VERIFIED LIVE against the reference node: for fractional-froze accounts
+    // (e.g. 410000775507 froze=249403390 → EnergyLimit 2342, not the floored
+    // 2338) java returns the fractional value. The prior "energy V2 floors"
+    // reading came from the 4.8.0-125 *master* checkout (which the deployed
+    // 4.8.1.1 *release* does not track) and was wrong. This mirrors the net V2
+    // path. Flooring undershoots the limit for any account whose energy freeze
+    // carries a fractional-TRX (sub-1e6 sun) balance — typically a pure
+    // acquired-delegated-v2 receiver — shifting its stake-vs-burn split and
+    // cascading into balance/contractRet divergences.
+    ((froze_balance as f64 / TRX_PRECISION as f64)
+        * (total_limit as f64 / total_weight as f64)) as i64
 }
 
 /// **Net**-specific V2 global-limit scaling — java
 /// `BandwidthProcessor.calculateGlobalNetLimitV2`.
 ///
-/// Unlike the energy V2 path ([`calculate_global_limit_v2`], which floors the
-/// weight to whole TRX to match the deployed-mainnet *energy* binary), the NET
-/// V2 path **preserves the fractional weight**: the divide by `TRX_PRECISION`
-/// happens only at the very end, so a 214.48-TRX stake yields a strictly larger
-/// limit than a 214-TRX stake. Flooring the weight costs up to 1 byte of
+/// Like the energy V2 path ([`calculate_global_limit_v2`]), the NET V2 path
+/// **preserves the fractional weight**: the divide by `TRX_PRECISION` happens in
+/// `double`, so a 214.48-TRX stake yields a strictly larger limit than a
+/// 214-TRX stake. Flooring the weight costs up to 1 byte of
 /// `net_limit`, which wrongly rejects a frozen-net transaction whose quota java
 /// covers — live-proven on mainnet account `413cadd745…` at block 83317517
 /// (floored = 344 < the 345-byte tx; fractional = 345 = java's success, with an
@@ -454,7 +468,16 @@ pub fn usage_to_balance(usage: i64, total_weight: i64, total_limit: i64, harden:
 /// `disableJavaLangMath = true` path active on mainnet). Usages are
 /// non-negative so this is the only case that matters.
 fn strict_round(a: f64) -> i64 {
-    (a + 0.5).floor() as i64
+    // java-tron rounds the windowed-average decay with `StrictMath.round`
+    // (`Maths.round(..)` → `StrictMathWrapper.round`/`MathWrapper.round`, both
+    // `StrictMath.round`). That is NOT `floor(a + 0.5)`: the `a + 0.5` form
+    // over-rounds by 1 at the fp edge (e.g. `a = n.499999999999…` where
+    // `a + 0.5` rounds up to `n + 1.0`). `f64::round()` (ties away from zero)
+    // equals `StrictMath.round` for the non-negative inputs here (avg * decay,
+    // decay ∈ [0,1]) and avoids that fp error. Using `floor(a + 0.5)` drifts the
+    // staked-energy/window accounting by a unit at those edges, diverging the
+    // stake-vs-burn split vs java.
+    a.round() as i64
 }
 
 fn div_ceil_i64(n: i64, d: i64) -> i64 {
@@ -754,6 +777,15 @@ fn undelegate_increase_v2(
     set_new_window_size_v2(owner, kind, new_owner_window as i64);
     set_usage(owner, kind, new_owner_usage);
     set_latest_time(owner, kind, now);
+    if std::env::var("TRON_ETRAJ").is_ok() && kind == ResourceKind::Energy {
+        let oh: String = owner.address.iter().map(|b| format!("{b:02x}")).collect();
+        if oh.contains("5a03038f0753dcde97c1c8ca81bde7b168778b63") {
+            eprintln!(
+                "ETRAJ_UNDEL_OWN owner={oh} usage0={owner_usage0} usage_decayed={owner_usage} transfer={transfer_usage} own_winv2={remain_owner_window_v2} recv_winv2={remain_receiver_window_v2} new_usage={new_owner_usage} new_winv2={}",
+                new_owner_window as i64
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -783,13 +815,15 @@ mod tests {
         assert!((499_999..=500_001).contains(&v), "expected ~500000, got {v}");
     }
 
-    /// Sub-1-TRX froze yields 0 — the deployed mainnet floors `froze /
-    /// TRX_PRECISION`, so 0.5 TRX (500_000 sun) → weight 0 → 0 (it does NOT
-    /// preserve the fractional weight; see `..._floors_to_whole_trx`).
+    /// Sub-1-TRX froze still yields a (fractional) limit — the deployed mainnet
+    /// `calculateGlobalEnergyLimitV2` keeps the fractional weight, so 0.5 TRX
+    /// (500_000 sun) → weight 0.5 → 0.5 × (1e12 / 2e6) = 250_000 (NOT 0). V2 has
+    /// no `frozeBalance < TRX_PRECISION → 0` guard (that lives only in the V1
+    /// non-`supportUnfreezeDelay` path).
     #[test]
-    fn calculate_global_limit_v2_sub_trx_froze_is_zero() {
-        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true), 0);
-        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, false), 0);
+    fn calculate_global_limit_v2_sub_trx_froze_is_fractional() {
+        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true), 250_000);
+        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, false), 250_000);
     }
 
     #[test]
@@ -800,22 +834,23 @@ mod tests {
         assert_eq!(calculate_global_limit_v2(1_000_000, 1_000_000, 0, false), 0);
     }
 
-    /// The deployed mainnet java-tron FLOORS `froze / TRX_PRECISION` for the
-    /// `supportUnfreezeDelay` limit (its V2 uses a long energy weight, not the
-    /// fractional one). Pinned against the real divergent mainnet tx c169493b
-    /// (caller's whole froze is acquired-delegated v2 = 14231726819 sun, a
-    /// fractional 14231.726819 TRX): the limit floors to weight 14231 → 129993,
-    /// NOT the fractional-weight 129999. So V2 == V1 (floored) on mainnet.
+    /// The deployed mainnet java-tron (4.8.1.1) PRESERVES the fractional weight
+    /// for the `supportUnfreezeDelay` energy limit — `calculateGlobalEnergyLimitV2`
+    /// uses `(double) frozeBalance / TRX_PRECISION`, NOT a floored long.
+    /// VERIFIED LIVE against the reference node on fractional-froze accounts
+    /// (e.g. 410000775507 froze=249403390 → EnergyLimit 2342, the fractional
+    /// value, not the floored 2338). For 14231726819 sun (14231.726819 TRX) the
+    /// limit is the fractional 129999, NOT the floored 129993 — so V2 ≠ V1
+    /// (only V1, the non-supportUnfreezeDelay path, floors). The earlier
+    /// "energy V2 floors" pin was from the 4.8.0-125 master checkout and wrong.
     #[test]
-    fn calculate_global_limit_v2_floors_to_whole_trx() {
+    fn calculate_global_limit_v2_uses_fractional_weight() {
         let (f, l, w) = (14_231_726_819i64, 180_000_000_000i64, 19_705_467_908i64);
-        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_993);
-        assert_eq!(calculate_global_limit_v2(f, l, w, false), 129_993);
-        // floored V2 matches V1 exactly (both take whole-TRX weight).
-        assert_eq!(
-            calculate_global_limit_v2(f, l, w, true),
-            calculate_global_limit_v1(f, l, w, true)
-        );
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_999);
+        assert_eq!(calculate_global_limit_v2(f, l, w, false), 129_999);
+        // V2 (fractional) is strictly larger than V1 (floored) for fractional froze.
+        assert_eq!(calculate_global_limit_v1(f, l, w, false), 129_993);
+        assert!(calculate_global_limit_v2(f, l, w, false) > calculate_global_limit_v1(f, l, w, false));
     }
 
     /// The deployed mainnet java-tron PRESERVES the fractional weight for the
@@ -833,10 +868,11 @@ mod tests {
         // NET V2 keeps the .48 → 345 (java's covered value), both modes.
         assert_eq!(calculate_global_net_limit_v2(f, l, w, true), 345);
         assert_eq!(calculate_global_net_limit_v2(f, l, w, false), 345);
-        // The energy (floored) V2 would give 344 — the 1-byte shortfall that
-        // wrongly rejected the tx before the net/energy split.
-        assert_eq!(calculate_global_limit_v2(f, l, w, true), 344);
-        assert_eq!(calculate_global_limit_v2(f, l, w, false), 344);
+        // The energy V2 is ALSO fractional on the deployed node (4.8.1.1) → 345,
+        // identical to net here. (The earlier code floored energy to 344; that
+        // was the 1-unit shortfall that cascaded into stake-vs-burn divergences.)
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 345);
+        assert_eq!(calculate_global_limit_v2(f, l, w, false), 345);
     }
 
     // ---- window-size helpers (java AccountCapsule) -------------------------

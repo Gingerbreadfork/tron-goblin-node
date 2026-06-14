@@ -449,6 +449,17 @@ pub fn execute_undelegate_resource(
                 0
             };
             transfer_usage = undelegate_max_usage.min(transfer_usage);
+            if std::env::var("TRON_ETRAJ").is_ok() && kind == ResourceKind::Energy {
+                let oh: String = owner.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+                let rh: String = to.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+                if oh.contains("5a03038f0753dcde97c1c8ca81bde7b168778b63")
+                    || rh.contains("5a03038f0753dcde97c1c8ca81bde7b168778b63")
+                {
+                    eprintln!(
+                        "ETRAJ_UNDEL_RECV owner={oh} recv={rh} balance={balance} recv_usage_decayed={recv_usage} all_frozen={all_frozen} undel_max={undelegate_max_usage} transfer_usage={transfer_usage} L={total_limit} W={total_weight}"
+                    );
+                }
+            }
             set_acquired_delegated_v2(receiver, kind, acquired - balance);
         }
         let new_recv_usage = usage(receiver, kind) - transfer_usage;
