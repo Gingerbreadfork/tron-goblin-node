@@ -644,6 +644,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         // frame creation (e.g. depth limit) ends without an interpreter.
         self.interp_markers.push(false);
         self.frame_starts.push(self.internal_txs.len());
+        self.committed_starts.push(self.committed.len());
         self.internal_txs.push(InternalTxTrace {
             caller_address: *caller.as_bytes(),
             transfer_to_address: *target.as_bytes(),
@@ -681,6 +682,17 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 if let Some(entry) = self.internal_txs.get_mut(start) {
                     let resolved = evm_to_tron_address(&addr);
                     entry.transfer_to_address = *resolved.as_bytes();
+                }
+            }
+        }
+        // Mirror the CALLTOKEN subtree-unwind for CREATE frames: a TRC-10
+        // transfer committed inside a CREATE that reverts must roll back too.
+        if let Some(cstart) = self.committed_starts.pop() {
+            if !outcome.result.result.is_ok() {
+                while self.committed.len() > cstart {
+                    if let Some(t) = self.committed.pop() {
+                        self.unwind_transfer(&t);
+                    }
                 }
             }
         }
