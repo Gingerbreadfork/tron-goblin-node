@@ -1385,6 +1385,38 @@ fn check_un_delegate_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
         (clean, amount - clean)
     };
 
+    // TEMP DIAGNOSTIC (TRON_PCDUMP): dump CheckUnDelegateResource internals for
+    // the energy-market divergence hunt — gated on the queried address so the
+    // volume stays tiny. Lets the af6f4896 word2 (+6/+7) be inverted to the
+    // exact diverging field (resource_limit vs usage_balance vs energy_usage).
+    if std::env::var("TRON_PCDUMP").is_ok() {
+        let th: String = target.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        if th.contains("ed396169118f826b1001231180b3609d6f120a48")
+            || th.contains("e40803bc8cfc145176656d79257a6a478a226839")
+            || th.contains("5a03038f0753dcde97c1c8ca81bde7b168778b63")
+        {
+            let r = account.account_resource.clone().unwrap_or_default();
+            let fv2 = frozen_v2_balance(&account, rtype);
+            let fv1 = frozen_v1(&account, rtype);
+            let aq1 = acquired_delegated_v1(&account, rtype);
+            let aq2 = acquired_delegated_v2(&account, rtype);
+            let tew = ctx.chain_parameter_long(b"TOTAL_ENERGY_WEIGHT").ok().flatten().unwrap_or(0);
+            let tel = ctx
+                .chain_parameter_long(b"TOTAL_ENERGY_CURRENT_LIMIT")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            eprintln!(
+                "PCDUMP addr={th} type={rtype} amount={amount} rl={resource_limit} ub={usage_balance} \
+                 restore={restore_seconds} clean={clean} remaining={remaining} \
+                 e_usage={} lct={} win_raw={} win_opt={} fv2={fv2} fv1={fv1} aq1={aq1} aq2={aq2} \
+                 TEW={tew} TEL={tel}",
+                r.energy_usage, r.latest_consume_time_for_energy, r.energy_window_size,
+                r.energy_window_optimized,
+            );
+        }
+    }
+
     let mut out = Vec::with_capacity(3 * WORD_SIZE);
     out.extend_from_slice(&long_to_32_bytes(clean));
     out.extend_from_slice(&long_to_32_bytes(remaining));

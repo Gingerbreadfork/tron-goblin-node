@@ -462,10 +462,14 @@ fn split_with_consume_user_resource_percent_100_charges_caller_for_everything() 
     )
     .expect("bill ok");
 
-    assert!(
-        bill.origin_charge.is_none(),
-        "percent=100 → origin contributes 0 → no origin charge recorded"
-    );
+    // java-tron's payEnergyBill calls useEnergy(origin, 0, now) even when the
+    // origin contributes 0 (percent=100): the origin's energy_usage is still
+    // decayed + window rewritten. So the charge IS recorded — as Frozen with
+    // energy_used == 0 — not absent.
+    match bill.origin_charge.expect("origin still decayed at 0 usage") {
+        EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 0),
+        other => panic!("expected Frozen{{0}}, got {other:?}"),
+    }
     match bill.caller_charge {
         EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 1_000),
         other => panic!("expected Frozen, got {other:?}"),
@@ -493,7 +497,12 @@ fn split_clamps_out_of_range_consume_user_resource_percent() {
         /*now_slot=*/ 0,
     )
     .expect("bill ok");
-    assert!(bill.origin_charge.is_none());
+    // percent=200 → origin share clamps to 0, but the origin is still decayed
+    // (java useEnergy(origin, 0, now)) → Frozen with energy_used == 0.
+    match bill.origin_charge.expect("origin still decayed at 0 usage") {
+        EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 0),
+        other => panic!("expected Frozen{{0}}, got {other:?}"),
+    }
 
     // percent = -50 → max(0, 100 - (-50)) = 150, clamped to 100 →
     // origin pays everything.
@@ -564,7 +573,13 @@ fn split_origin_zero_origin_energy_limit_charges_caller_for_everything() {
         /*now_slot=*/ 0,
     )
     .expect("bill ok");
-    assert!(bill.origin_charge.is_none(), "origin_energy_limit=0 → no origin charge");
+    // origin_energy_limit=0 clamps the origin's share to 0, but the origin
+    // account EXISTS, so java still decays it (useEnergy(origin, 0, now)) →
+    // Frozen with energy_used == 0 (not absent).
+    match bill.origin_charge.expect("existing origin still decayed at 0 usage") {
+        EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 0),
+        other => panic!("expected Frozen{{0}}, got {other:?}"),
+    }
     match bill.caller_charge {
         EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 1_000),
         other => panic!("expected Frozen, got {other:?}"),

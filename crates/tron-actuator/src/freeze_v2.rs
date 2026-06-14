@@ -105,6 +105,11 @@ pub fn execute_freeze_balance_v2(
     let new_basis = old_basis.saturating_add(contract.frozen_balance);
     let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
     apply_weight_delta(dyn_props, contract.resource, weight_delta);
+    if std::env::var("TRON_WTRACE").is_ok() {
+        eprintln!("WTRACE op=freezeV2 owner={} res={} amount={} old_basis={} new_basis={} delta={} tew={} tnw={}",
+            contract.owner_address.iter().map(|b| format!("{:02x}", b)).collect::<String>(), contract.resource, contract.frozen_balance, old_basis, new_basis, weight_delta,
+            dyn_props.total_energy_weight(), dyn_props.total_net_weight());
+    }
     Ok(ExecutionResult::default())
 }
 
@@ -270,6 +275,11 @@ pub fn execute_unfreeze_balance_v2(
     let new_basis = old_basis.saturating_sub(contract.unfreeze_balance);
     let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
     apply_weight_delta(dyn_props, contract.resource, weight_delta);
+    if std::env::var("TRON_WTRACE").is_ok() {
+        eprintln!("WTRACE op=unfreezeV2 owner={} res={} amount={} old_basis={} new_basis={} delta={} tew={} tnw={}",
+            contract.owner_address.iter().map(|b| format!("{:02x}", b)).collect::<String>(), contract.resource, contract.unfreeze_balance, old_basis, new_basis, weight_delta,
+            dyn_props.total_energy_weight(), dyn_props.total_net_weight());
+    }
 
     // Trim votes the unstake no longer backs — java's `updateVote`
     // (proportional reduction when remaining TRON Power < voted total;
@@ -419,5 +429,10 @@ pub fn execute_cancel_all_unfreeze_v2(
     apply_weight_delta(dyn_props, 0, net_delta);
     apply_weight_delta(dyn_props, 1, energy_delta);
     apply_weight_delta(dyn_props, 2, tp_delta);
+    if std::env::var("TRON_WTRACE").is_ok() {
+        eprintln!("WTRACE op=cancelV2 owner={} restored_net={} restored_energy={} old_net={} old_energy={} net_delta={} energy_delta={} tew={} tnw={}",
+            contract.owner_address.iter().map(|b| format!("{:02x}", b)).collect::<String>(), restored_net, restored_energy, old_net, old_energy, net_delta, energy_delta,
+            dyn_props.total_energy_weight(), dyn_props.total_net_weight());
+    }
     Ok(ExecutionResult::default())
 }
