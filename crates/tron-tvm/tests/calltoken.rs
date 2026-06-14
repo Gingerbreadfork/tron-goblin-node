@@ -95,12 +95,15 @@ fn push1(value: u8) -> Vec<u8> {
 }
 
 /// Build a contract that issues CALLTOKEN to `target` with `token_id`/
-/// `token_value`. Stack order (top first) per java-tron:
-///   [gas, to, callValue, tokenValue, tokenId, inOffset, inSize, outOffset, outSize]
+/// `token_value`. Stack order (top first) per java-tron's `callTokenAction`
+/// + `exeCall` — 8 items, where `value` IS the TRC-10 token amount. There is
+/// NO separate native call-value operand: CALLTOKEN's native `msg.value` is
+/// always 0 (`ProgramInvokeFactory` native side = `ZERO`, token side = value):
+///   [gas, to, value, tokenId, inOffset, inSize, outOffset, outSize]
 ///
 /// Bytecode strategy:
 ///   * Push outSize=0, outOffset=0, inSize=0, inOffset=0
-///   * Push tokenId, tokenValue, callValue=0, target_address, gas=large
+///   * Push tokenId, tokenValue (= value), target_address, gas=large
 ///   * Emit CALLTOKEN (0xd0)
 ///   * STOP
 fn build_calltoken_caller(target: [u8; 21], token_id: i64, token_value: i64) -> Vec<u8> {
@@ -110,8 +113,7 @@ fn build_calltoken_caller(target: [u8; 21], token_id: i64, token_value: i64) -> 
     bc.extend(push1(0));       // inSize = 0
     bc.extend(push1(0));       // inOffset = 0
     bc.extend(push_u256_bytecode(token_id as u128)); // tokenId
-    bc.extend(push_u256_bytecode(token_value as u128)); // tokenValue
-    bc.extend(push1(0));       // callValue (TRX) = 0
+    bc.extend(push_u256_bytecode(token_value as u128)); // value = TRC-10 token amount
     // Push target address (20 bytes of the 21 — strip 0x41 prefix).
     bc.push(0x73); // PUSH20
     bc.extend_from_slice(&target[1..]);
@@ -241,6 +243,94 @@ fn calltoken_transfers_trc10_and_callee_reads_token_data() {
         slot1.as_slice(),
         expected_id.as_slice(),
         "CALLTOKENID inside callee should equal token id"
+    );
+}
+
+/// Regression: a CALLTOKEN callee must see native CALLVALUE (`msg.value`) == 0.
+/// The old code popped a phantom `callValue` operand and passed the TRC-10
+/// token amount as the native call-value, so a callee guarded by
+/// `require(msg.value == 0)` reverted ("trx is not allowed") — the live
+/// SunSwap/USDD-PSM divergence (block 83323740, tx 51eef569). With the fix the
+/// native value is 0 and the asset travels only as the TRC-10 token.
+#[test]
+fn calltoken_callee_sees_zero_native_callvalue() {
+    let stores = fresh_stores();
+    let token_id = 1_000_009i64;
+    let transfer_amount = 221_026_891i64; // a real, non-zero token amount
+    let initial_balance = 1_000_000_000i64;
+
+    let caller_user = tron_addr(0xa2);
+    let caller_contract = tron_addr(0xc2);
+    let receiver_contract = tron_addr(0xc3);
+
+    let mut acct = Account {
+        address: caller_user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    acct.asset_v2.insert(token_id.to_string(), initial_balance);
+    stores.accounts.put(&Address::from_raw(caller_user), &acct).unwrap();
+
+    install_contract_with_balance(
+        &stores,
+        caller_contract,
+        &build_calltoken_caller(receiver_contract, token_id, transfer_amount),
+        token_id,
+        initial_balance,
+    );
+    // Receiver: SSTORE(slot 0, CALLVALUE + 1) ; STOP. The `+1` makes the row
+    // exist even when CALLVALUE is 0 (a bare `SSTORE 0` to an empty slot writes
+    // no row), so we can distinguish "msg.value == 0" from "callee never ran".
+    // Bytecode: CALLVALUE PUSH1 1 ADD PUSH1 0 SSTORE STOP.
+    install_contract_with_balance(
+        &stores,
+        receiver_contract,
+        &[0x34, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00],
+        0,
+        0,
+    );
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: caller_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+        },
+        &trigger,
+        500_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+
+    let slot0_key =
+        StorageRowStore::compose_key(&Address::from_raw(receiver_contract), &[0u8; 32]);
+    let slot0 = stores.storage.get(&slot0_key).unwrap().expect("slot 0 missing");
+    let mut expected = [0u8; 32];
+    expected[31] = 1; // CALLVALUE (must be 0) + 1
+    assert_eq!(
+        slot0.as_slice(),
+        expected.as_slice(),
+        "CALLTOKEN callee's native CALLVALUE (msg.value) must be 0 (stored here as 0+1), \
+         not the token amount",
+    );
+
+    // The TRC-10 token must still have been transferred to the receiver.
+    let recv = stores
+        .accounts
+        .get(&Address::from_raw(receiver_contract))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recv.asset_v2.get(&token_id.to_string()).copied(),
+        Some(transfer_amount),
+        "TRC-10 token must still be credited to the receiver",
     );
 }
 

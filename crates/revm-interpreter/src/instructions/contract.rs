@@ -259,19 +259,21 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
         return Err(InstructionResult::CallNotAllowedInsideStatic);
     }
 
-    // Pop 9 stack items.
-    popn!(
-        [
-            local_gas_limit,
-            to,
-            value,
-            token_value,
-            token_id
-        ],
-        context.interpreter
-    );
+    // java-tron's `callTokenAction` pops exactly [gas, to, value, tokenId]
+    // (exeCall then pops the in/out memory ranges) — 8 stack items, NOT 9.
+    // `value` is the TRC-10 *token* amount paired with `tokenId`; the native
+    // TRX call-value of a CALLTOKEN is always ZERO — `ProgramInvokeFactory`
+    // builds the callee with native side `!isTokenTransfer ? callValue : ZERO`
+    // and token side `callValue`, and `callToAddress` moves the asset via
+    // `addTokenBalance` (never `MUtil.transfer`). The old code popped a phantom
+    // 9th `token_value` and passed `value` as the native call-value, so the
+    // callee saw `msg.value != 0` and any `require(msg.value == 0)` reverted
+    // ("trx is not allowed") — and it also routed the wrong (shifted) tokenId.
+    popn!([local_gas_limit, to, value, token_id], context.interpreter);
     let to = to.into_address();
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
+    // `value` is the TRC-10 token amount; the value-transfer surcharge + 2300
+    // stipend follow java's `callTokenAction` (keyed on a non-zero token amount).
     let has_transfer = !value.is_zero();
 
     let (input, return_memory_offset) =
@@ -286,13 +288,16 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // token id / value at the contract layer; the EVM keeps the truncated
     // value so an in-VM check inside the contract sees the same number.
     let token_id_i64 = u64_from_u256(&token_id) as i64;
-    let token_value_i64 = u64_from_u256(&token_value) as i64;
+    let token_value_i64 = u64_from_u256(&value) as i64;
 
     let caller = context.interpreter.input.target_address();
     let target_address = to;
     let scheme = CallScheme::Call;
     let is_static = false;
-    let call_value = CallValue::Transfer(value);
+    // Native TRX value of a CALLTOKEN is always zero — the TRC-10 asset travels
+    // via `tron_token_*` (the host applies the asset_v2 debit/credit before the
+    // callee's first instruction). Mirrors java's `DataWord.ZERO()` native side.
+    let call_value = CallValue::Transfer(U256::ZERO);
 
     context
         .interpreter
