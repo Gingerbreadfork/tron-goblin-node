@@ -17,66 +17,78 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-shim_dir="$repo_root/.cargo/libclang-shim"
-mkdir -p "$shim_dir"
+SHIM_DIR=".cargo/libclang-shim"
 
-# Search common per-distro locations. macOS path included so the same
-# script bootstraps an Apple-silicon homebrew install.
-search_dirs=(
+mkdir -p "$SHIM_DIR"
+
+# If the caller already knows where libclang lives, respect that first.
+if [[ -n "${LIBCLANG_PATH:-}" ]]; then
+  if [[ -d "$LIBCLANG_PATH" ]]; then
+    FOUND_LIBCLANG="$(find "$LIBCLANG_PATH" -maxdepth 1 \
+      \( -name 'libclang.so' -o -name 'libclang.so.*' -o -name 'libclang.dylib' \) \
+      2>/dev/null | sort -V | tail -n 1 || true)"
+  elif [[ -f "$LIBCLANG_PATH" ]]; then
+    FOUND_LIBCLANG="$LIBCLANG_PATH"
+  else
+    FOUND_LIBCLANG=""
+  fi
+else
+  FOUND_LIBCLANG=""
+fi
+
+# Search common Linux and macOS install locations.
+if [[ -z "$FOUND_LIBCLANG" ]]; then
+  shopt -s nullglob
+
+  SEARCH_DIRS=(
     /usr/lib64
     /usr/lib/x86_64-linux-gnu
     /usr/lib/aarch64-linux-gnu
     /usr/lib
     /usr/local/lib
+
+    # Ubuntu/Debian GitHub Actions runners commonly install libclang here.
+    /usr/lib/llvm-*/lib
+
+    # Homebrew LLVM paths.
     /opt/homebrew/opt/llvm/lib
     /usr/local/opt/llvm/lib
-)
+  )
 
-# Collect matches; `-cpp` excludes libclang-cpp (the C++ API lib) which
-# clang-sys does not want. Sort -V picks the highest version last.
-candidates=()
-for dir in "${search_dirs[@]}"; do
-    [ -d "$dir" ] || continue
-    while IFS= read -r f; do
-        candidates+=("$f")
-    done < <(
-        find "$dir" -maxdepth 1 \
-             \( -name 'libclang.so' \
-                -o -name 'libclang.so.*' \
-                -o -name 'libclang.dylib' \) \
-             ! -name '*-cpp*' \
-             2>/dev/null | sort -V
-    )
-done
+  FOUND_LIBCLANG="$(find "${SEARCH_DIRS[@]}" -maxdepth 1 \
+    \( -name 'libclang.so' -o -name 'libclang.so.*' -o -name 'libclang.dylib' \) \
+    2>/dev/null | sort -V | tail -n 1 || true)"
+fi
 
-if [ ${#candidates[@]} -eq 0 ]; then
-    cat <<'EOF' >&2
+if [[ -z "$FOUND_LIBCLANG" ]]; then
+  cat >&2 <<'EOF'
 ERROR: no libclang library found in standard system paths.
 
 Install your platform's LLVM/clang development package, then re-run:
 
   Fedora / RHEL :  sudo dnf install clang-devel llvm-devel
-  Ubuntu / Deb  :  sudo apt install libclang-dev
+  Ubuntu / Deb  :  sudo apt install libclang-dev llvm-dev
   Arch          :  sudo pacman -S clang
   macOS (brew)  :  brew install llvm
 
 If you've already installed it, set LIBCLANG_PATH manually:
 
   export LIBCLANG_PATH=/path/to/dir/containing/libclang.so
+  export LIBCLANG_PATH=/path/to/libclang.so
 EOF
-    exit 1
+  exit 1
 fi
 
-# Last entry after `sort -V` is the highest version.
-chosen="${candidates[$((${#candidates[@]} - 1))]}"
+rm -f "$SHIM_DIR/libclang.so" "$SHIM_DIR/libclang.dylib"
 
-# Symlink name matches what clang-sys searches for on this OS.
-case "$(uname -s)" in
-    Darwin) link_name="libclang.dylib" ;;
-    *)      link_name="libclang.so"   ;;
+case "$FOUND_LIBCLANG" in
+  *.dylib)
+    ln -s "$FOUND_LIBCLANG" "$SHIM_DIR/libclang.dylib"
+    ;;
+  *)
+    ln -s "$FOUND_LIBCLANG" "$SHIM_DIR/libclang.so"
+    ;;
 esac
 
-ln -sfn "$chosen" "$shim_dir/$link_name"
-
-echo "linked: $shim_dir/$link_name -> $chosen"
+echo "libclang shim created:"
+echo "  $SHIM_DIR -> $FOUND_LIBCLANG"
