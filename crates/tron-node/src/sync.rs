@@ -2594,6 +2594,15 @@ impl SyncDriver {
         let mut was_leader = false;
         let mut last_head_num: i64 = self.head_number();
         let mut last_head_advance = Instant::now();
+        // Companion to the no-advance reset below: catch a leader that IS
+        // advancing its head but only CRAWLING (well below the apply ceiling)
+        // because it's fetch-starved on a slow/lone serving peer. The
+        // no-advance timer can never fire there — every applied block resets
+        // it — yet the node is effectively wedged (observed at cold start near
+        // a low head, where the light-node majority can't serve old blocks and
+        // the one serving peer trickles). Sampled once per `STALL_RESET_AFTER`.
+        let mut crawl_window_head: i64 = last_head_num;
+        let mut crawl_window_at = Instant::now();
         // How far behind wall-clock the head must be for a no-advance stall to
         // count as a wedge (so a healthy node quietly waiting for the next tip
         // block is never reset). Comfortably above normal near-tip lag.
@@ -2601,6 +2610,12 @@ impl SyncDriver {
         // How long the head may sit still (while behind the tip) before the
         // watchdog hard-resets the sync context and reconnects for a clean one.
         const STALL_RESET_AFTER: Duration = Duration::from_secs(45);
+        // Minimum blocks a healthy leader must apply within one
+        // `STALL_RESET_AFTER` window while far behind the tip. The apply ceiling
+        // is ~19 blk/s (≈850 blocks/window) and even an early/heavy-block sync
+        // clears several blk/s, so fewer than this (≈1 blk/s) WITH an empty
+        // ready buffer is a fetch-starved crawl, not legitimate work.
+        const CRAWL_MIN_PROGRESS: i64 = 45;
         // Back-pressure ceiling on fetched-but-unapplied blocks, and how long
         // before a stalled in-flight claim is re-offered to (a DIFFERENT) peer.
         // This is a dead-peer backstop, not a normal-operation timer: during an
@@ -2992,6 +3007,49 @@ impl SyncDriver {
                     return PeerOutcome::PeerFailure(
                         "self-heal: sync wedged behind the tip; reconnecting".to_string(),
                     );
+                }
+
+                // Companion: the head IS advancing but only crawling — the
+                // no-advance reset above can't catch this because every applied
+                // block resets `last_head_advance`. Sample once per window: if
+                // we applied fewer than `CRAWL_MIN_PROGRESS` blocks in the last
+                // `STALL_RESET_AFTER` while far behind the tip AND the ready
+                // buffer is starved (so we're fetch-bound, not apply-bound),
+                // reconnect for a clean context / a different serving peer
+                // (mirrors what a manual restart does on a cold-start crawl).
+                if crawl_window_at.elapsed() >= STALL_RESET_AFTER {
+                    let progressed = head_now - crawl_window_head;
+                    let ready = self
+                        .fetch_pool
+                        .as_ref()
+                        .map(|p| p.fanout_stats().2)
+                        .unwrap_or(usize::MAX);
+                    if multi_peer
+                        && am_leader
+                        && last_block_ts > 0
+                        && behind_ms > STALL_RESET_LAG_MS
+                        && progressed < CRAWL_MIN_PROGRESS
+                        && ready < FETCH_CHUNK_SIZE
+                    {
+                        warn!(
+                            peer,
+                            head = head_now,
+                            behind_s = behind_ms / 1000,
+                            applied_in_window = progressed,
+                            ready,
+                            "sync crawling fetch-starved behind the tip; hard-resetting \
+                             the fetch pool and reconnecting for a clean sync context"
+                        );
+                        if let Some(pool) = &self.fetch_pool {
+                            pool.reset();
+                        }
+                        self.release_leadership(peer);
+                        return PeerOutcome::PeerFailure(
+                            "self-heal: sync crawling fetch-starved; reconnecting".to_string(),
+                        );
+                    }
+                    crawl_window_head = head_now;
+                    crawl_window_at = Instant::now();
                 }
             }
 
