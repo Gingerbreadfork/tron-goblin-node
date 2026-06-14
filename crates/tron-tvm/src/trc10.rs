@@ -65,6 +65,15 @@ struct PendingTransfer {
 pub struct Trc10Inspector {
     /// Stack of pending transfers (one per active CALLTOKEN frame).
     pending: Vec<Option<PendingTransfer>>,
+    /// CALLTOKEN transfers whose immediate callee SUCCEEDED but which are still
+    /// revertible: a token transfer must be rolled back if ANY ancestor frame
+    /// later reverts (java-tron rolls back the whole deposit), not only the
+    /// CALLTOKEN's own callee. Each frame records `committed.len()` in
+    /// `committed_starts` at entry; on a frame revert every transfer pushed
+    /// within that frame's subtree is unwound (LIFO).
+    committed: Vec<PendingTransfer>,
+    /// Per-frame marker into `committed` (parallels `frame_starts`).
+    committed_starts: Vec<usize>,
     accounts: Option<Arc<AccountStore>>,
     /// Optional per-contract dynamic-energy lookup. When set, the
     /// inspector reads the callee's factor at `initialize_interp` and
@@ -153,6 +162,8 @@ impl Trc10Inspector {
     pub fn new(accounts: Arc<AccountStore>) -> Self {
         Self {
             pending: Vec::new(),
+            committed: Vec::new(),
+            committed_starts: Vec::new(),
             accounts: Some(accounts),
             contract_state: None,
             dyn_props: None,
@@ -180,6 +191,50 @@ impl Trc10Inspector {
     /// Returns `None` if no tracer was attached.
     pub fn take_tracer(&mut self) -> Option<crate::tracer::StructLogTracer> {
         self.tracer.take()
+    }
+
+    /// Restore both sides of a TRC-10 CALLTOKEN transfer to their pre-transfer
+    /// `asset_v2` state. Used for an immediate-callee revert AND for unwinding a
+    /// transfer discarded by an ancestor frame's revert.
+    fn unwind_transfer(&self, t: &PendingTransfer) {
+        let accounts = match &self.accounts {
+            Some(a) => Arc::clone(a),
+            None => return,
+        };
+        let mut caller_account = accounts
+            .get(&t.caller_addr)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        match t.caller_pre {
+            Some(v) => {
+                caller_account.asset_v2.insert(t.token_id_key.clone(), v);
+            }
+            None => {
+                caller_account.asset_v2.remove(&t.token_id_key);
+            }
+        }
+        accounts
+            .put(&t.caller_addr, &caller_account)
+            .expect("db error in Trc10Inspector unwinding caller account after revert");
+
+        let mut target_account = accounts
+            .get(&t.target_addr)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        match t.target_pre {
+            Some(v) => {
+                target_account.asset_v2.insert(t.token_id_key.clone(), v);
+            }
+            None => {
+                target_account.asset_v2.remove(&t.token_id_key);
+            }
+        }
+        accounts
+            .put(&t.target_addr, &target_account)
+            .expect("db error in Trc10Inspector unwinding target account after revert");
+        let _ = t.transferred;
     }
 
     /// Attach a wall-clock deadline. From this point on, `step` halts
@@ -394,6 +449,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         // itself) is NOT an internal tx, so skip it.
         let depth = self.frame_starts.len();
         self.frame_starts.push(self.internal_txs.len());
+        self.committed_starts.push(self.committed.len());
         if depth > 0 {
             let trx_value = match inputs.value {
                 revm::interpreter::CallValue::Transfer(v) => v,
@@ -526,64 +582,34 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
             self.record_frame_energy(&outcome.result.gas, outcome.result.result.is_halt());
         }
 
-        let Some(pending) = self.pending.pop() else {
-            return;
-        };
-        let Some(pending) = pending else {
-            return;
-        };
-        let accounts = match &self.accounts {
-            Some(a) => Arc::clone(a),
-            None => return,
-        };
+        let reverted = !outcome.result.result.is_ok();
 
-        // If the call succeeded, leave the transfer in place.
-        if outcome.result.result.is_ok() {
-            return;
-        }
-
-        // On revert/halt: restore both accounts' asset_v2 maps to their
-        // pre-transfer state.
-        let mut caller_account = accounts
-            .get(&pending.caller_addr)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        match pending.caller_pre {
-            Some(v) => {
-                caller_account
-                    .asset_v2
-                    .insert(pending.token_id_key.clone(), v);
-            }
-            None => {
-                caller_account.asset_v2.remove(&pending.token_id_key);
+        // This frame's own CALLTOKEN transfer (if it was a CALLTOKEN). If the
+        // immediate callee reverted, roll it back now. If the callee succeeded,
+        // the transfer is applied but still revertible by an ANCESTOR frame —
+        // park it in `committed` so an ancestor revert can unwind it.
+        if let Some(Some(transfer)) = self.pending.pop() {
+            if reverted {
+                self.unwind_transfer(&transfer);
+            } else {
+                self.committed.push(transfer);
             }
         }
-        accounts
-            .put(&pending.caller_addr, &caller_account)
-            .expect("db error in Trc10Inspector::call_end restoring caller account after revert");
 
-        let mut target_account = accounts
-            .get(&pending.target_addr)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        match pending.target_pre {
-            Some(v) => {
-                target_account
-                    .asset_v2
-                    .insert(pending.token_id_key.clone(), v);
-            }
-            None => {
-                target_account.asset_v2.remove(&pending.token_id_key);
+        // If THIS frame reverted, roll back every CALLTOKEN transfer committed
+        // within its subtree — nested CALLTOKENs whose callees succeeded but are
+        // discarded by this frame's revert (java rolls back the whole deposit).
+        // LIFO order so each transfer's recorded pre-value restores the exact
+        // prior balance even when several touched the same account/token.
+        if let Some(cstart) = self.committed_starts.pop() {
+            if reverted {
+                while self.committed.len() > cstart {
+                    if let Some(t) = self.committed.pop() {
+                        self.unwind_transfer(&t);
+                    }
+                }
             }
         }
-        accounts
-            .put(&pending.target_addr, &target_account)
-            .expect("db error in Trc10Inspector::call_end restoring target account after revert");
-
-        // Suppress unused-field warning while not used.
-        let _ = pending.transferred;
     }
 
     fn create(

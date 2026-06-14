@@ -412,3 +412,106 @@ fn calltoken_unwinds_trc10_transfer_when_callee_reverts() {
         );
     }
 }
+
+/// `build_calltoken_caller` but the trailing STOP becomes REVERT — the CALLTOKEN
+/// callee still succeeds, but this frame reverts afterwards.
+fn build_calltoken_then_revert(target: [u8; 21], token_id: i64, token_value: i64) -> Vec<u8> {
+    let mut bc = build_calltoken_caller(target, token_id, token_value);
+    bc.pop(); // drop trailing STOP (0x00)
+    bc.extend([0x60, 0x00, 0x60, 0x00, 0xfd]); // PUSH1 0 PUSH1 0 REVERT
+    bc
+}
+
+/// Outer contract: CALL `inner` (ignoring its revert via POP) then STOP, so the
+/// overall tx SUCCEEDS while `inner`'s frame reverted.
+fn build_outer_caller(inner: [u8; 21]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend(push1(0)); // retLen
+    bc.extend(push1(0)); // retOff
+    bc.extend(push1(0)); // argsLen
+    bc.extend(push1(0)); // argsOff
+    bc.extend(push1(0)); // value
+    bc.push(0x73); // PUSH20 inner
+    bc.extend_from_slice(&inner[1..]);
+    bc.extend(push_u256_bytecode(300_000)); // gas
+    bc.push(0xf1); // CALL
+    bc.push(0x50); // POP success flag
+    bc.push(0x00); // STOP
+    bc
+}
+
+#[test]
+fn calltoken_transfer_rolls_back_when_an_ancestor_frame_reverts() {
+    // Regression: a CALLTOKEN whose immediate callee SUCCEEDS, but inside a
+    // frame that an ANCESTOR later reverts, must roll back the TRC-10 transfer
+    // (java rolls back the whole deposit on the ancestor revert). The old
+    // inspector finalized the transfer on the callee's success and never
+    // unwound it when an ancestor reverted, so the *sender* lost tokens it
+    // should have kept — the live USDD/GasFree cascade from block 83327784.
+    let stores = fresh_stores();
+    let token_id = 1_000_021i64;
+    let transfer_amount = 500i64;
+    let initial_balance = 10_000i64;
+
+    let user = tron_addr(0xa3);
+    let outer = tron_addr(0xc4); // CALLs inner, ignores its revert, STOPs
+    let inner = tron_addr(0xc5); // CALLTOKEN to receiver (ok) then REVERT
+    let receiver = tron_addr(0xc6); // STOP
+
+    let acct = Account {
+        address: user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    stores.accounts.put(&Address::from_raw(user), &acct).unwrap();
+
+    install_contract_with_balance(&stores, outer, &build_outer_caller(inner), 0, 0);
+    install_contract_with_balance(
+        &stores,
+        inner,
+        &build_calltoken_then_revert(receiver, token_id, transfer_amount),
+        token_id,
+        initial_balance,
+    );
+    install_contract_with_balance(&stores, receiver, &[0x00], 0, 0); // STOP
+
+    let trigger = TriggerSmartContract {
+        owner_address: user.to_vec(),
+        contract_address: outer.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+        },
+        &trigger,
+        1_000_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "outer tx should succeed, got {outcome:?}",
+    );
+
+    let inner_acct = stores
+        .accounts
+        .get(&Address::from_raw(inner))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        inner_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(initial_balance),
+        "sender's TRC-10 balance must be fully restored after the ancestor frame reverted",
+    );
+    let recv_acct = stores.accounts.get(&Address::from_raw(receiver)).unwrap();
+    if let Some(r) = recv_acct {
+        assert!(
+            !r.asset_v2.contains_key(&token_id.to_string()),
+            "receiver must not retain the rolled-back credit",
+        );
+    }
+}
