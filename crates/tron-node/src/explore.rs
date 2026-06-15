@@ -449,7 +449,11 @@ impl ExploreState {
         }
         let peak_tps = g.peak_tps;
 
-        let w = 64;
+        // Adapt to the terminal width so the layout fills wider terminals,
+        // clamped to a readable range (and falls back to 64 when the size is
+        // unknown, e.g. output is piped).
+        let w = term_cols().saturating_sub(2).clamp(64, 88);
+        let colw = w.saturating_sub(3) / 2; // two-column split for the stat rows
         let mut s = String::new();
         s.push_str("\x1b[H");
 
@@ -526,23 +530,23 @@ impl ExploreState {
 
         // Session totals (two columns)
         s.push_str(&section("THIS SESSION", w));
-        s.push_str(&row2(
+        s.push_str(&row2(colw,
             "🔄", "transactions", &commas(g.txs as i64),
             "👛", "active wallets", &compact(g.wallets.len() as u128),
         ));
-        s.push_str(&row2(
+        s.push_str(&row2(colw,
             "💵", "TRX moved", &human_trx(g.trx_sun),
             "💚", "USDT volume", &usd(g.usdt_units),
         ));
-        s.push_str(&row2(
+        s.push_str(&row2(colw,
             "📜", "contract calls", &commas(g.calls as i64),
             "💸", "USDT transfers", &commas(g.usdt_transfers as i64),
         ));
-        s.push_str(&row2(
+        s.push_str(&row2(colw,
             "🪙", "token transfers", &commas(g.token_transfers as i64),
             "🗳", "votes+stakes", &commas((g.votes + g.stakes) as i64),
         ));
-        s.push_str(&row2(
+        s.push_str(&row2(colw,
             "🚀", "busiest block", &format!("{} txs", commas(g.biggest_txs as i64)),
             "🐋", "biggest USDT", &usd(g.biggest_usdt_units),
         ));
@@ -558,7 +562,7 @@ impl ExploreState {
             .txs
             .saturating_sub(trx_c.saturating_add(usdt_c).saturating_add(tok_c));
         let parts = [(trx_c, CYN), (usdt_c, GRN), (tok_c, YEL), (oth_c, MAG)];
-        s.push_str(&line(&format!("   {}", mix_bar(&parts, 46))));
+        s.push_str(&line(&format!("   {}", mix_bar(&parts, w.saturating_sub(3)))));
         let tot = g.txs.max(1);
         let pct = |c: u64| c.saturating_mul(100) / tot;
         s.push_str(&line(&format!(
@@ -738,11 +742,31 @@ fn section(title: &str, w: usize) -> String {
     let dashes = w.saturating_sub(title.len() + 6);
     line(&format!("  {BOLD}{GRY}── {title} {}{RST}", "─".repeat(dashes)))
 }
-fn row2(i1: &str, l1: &str, v1: &str, i2: &str, l2: &str, v2: &str) -> String {
+fn row2(colw: usize, i1: &str, l1: &str, v1: &str, i2: &str, l2: &str, v2: &str) -> String {
     let left = format!("{i1} {GRY}{l1}{RST} {BOLD}{v1}{RST}");
     let right = format!("{i2} {GRY}{l2}{RST} {BOLD}{v2}{RST}");
-    let pad = 32usize.saturating_sub(visible_len(&left));
+    // Pad the left column so the right one starts at the column split point;
+    // keep at least 2 spaces between them if the left value is unusually long.
+    let pad = colw.saturating_sub(visible_len(&left)).max(2);
     line(&format!("   {left}{}{right}", " ".repeat(pad)))
+}
+
+/// Width of the controlling terminal in columns, via `TIOCGWINSZ` on stdout.
+/// Falls back to 80 when the size is unavailable (output piped / not a tty).
+fn term_cols() -> usize {
+    #[cfg(unix)]
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    // Not a tty (piped): honor $COLUMNS if set, else assume a standard 80.
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(80)
 }
 
 /// A stacked, colored proportion bar: each `(count, color)` gets a slice of
