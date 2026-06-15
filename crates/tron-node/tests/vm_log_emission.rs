@@ -301,6 +301,7 @@ fn make_driver(
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     SyncDriver::new(state, cfg).with_event_bus(bus)
 }

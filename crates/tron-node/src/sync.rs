@@ -119,6 +119,16 @@ pub struct SyncConfig {
     /// `FetchInvData`. Mirrors java-tron's `RelayService` +
     /// `peer.isFastForwardPeer()` gate.
     pub peer_is_fast_forward: bool,
+    /// Fast-join "follow-tip" display mode. When `true`, incoming Block
+    /// frames are decoded + DISPLAYED (a friendly per-block line) but —
+    /// exactly like [`Self::tip_test`] — NOT validated, NOT executed, NOT
+    /// stored, and KhaosDb seeding is skipped. The difference from
+    /// `tip_test` is purely presentational (a polished live-view line)
+    /// plus that the head spoof is learned from a peer at runtime rather
+    /// than supplied as a checkpoint flag. The runtime spoofs the
+    /// `DynamicPropertiesStore` head (to the probed network tip) before
+    /// construction, the same as `tip_test`.
+    pub follow_tip: bool,
 }
 
 /// Aggregate statistics across the driver's lifetime.
@@ -845,6 +855,11 @@ pub struct SyncDriver {
     /// (blocks applied, rejected, peer failures, reconnects) are bumped
     /// in parallel with the `DriverStats` struct.
     metrics: Option<Arc<tron_rpc::Metrics>>,
+    /// `--explore` live-dashboard sink. When attached (explore mode), every
+    /// streamed block is folded into the shared session stats instead of
+    /// logging a per-block line — a renderer task paints the dashboard from
+    /// it. Purely a read-only viewer; never on the apply path.
+    explore: Option<Arc<crate::explore::ExploreState>>,
     /// Optional tx mempool. When attached, we subscribe to its
     /// broadcast channel and forward each accepted tx as a `Trx`
     /// frame on the current peer connection.
@@ -1072,6 +1087,7 @@ impl SyncDriver {
             stats: DriverStats::default(),
             node_id,
             metrics: None,
+            explore: None,
             mempool: None,
             khaos: Arc::new(tron_consensus::KhaosDb::new()),
             khaos_started: false,
@@ -1413,6 +1429,47 @@ impl SyncDriver {
     /// at the tip — and logs the catch-up→tip transition once.
     ///
     /// `progress_log_interval == 0` disables it entirely.
+    /// Follow-tip live-view line. Emitted for each streamed block in
+    /// `--follow-tip` mode (never applied — purely a display). Friendly,
+    /// colorless (the global tracing layer adds level color on a TTY), and
+    /// throttled only when `progress_log_interval > 1` so the demo sees every
+    /// block by default. Models the wording the `try.sh` demo narrates.
+    fn log_follow_tip_block(&mut self, block: &Block, block_num: i64, tx_count: usize, peer: &str) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // `progress_log_interval == 0` means "silent"; any value `n` logs
+        // every n-th streamed block (default 100 in normal config, but the
+        // try.sh demo sets it to 1 so every block shows).
+        let interval = self.config.progress_log_interval;
+        if interval == 0 {
+            return;
+        }
+        if interval > 1 && self.stats.blocks_applied % interval != 0 {
+            return;
+        }
+        let block_ts = block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|r| r.timestamp)
+            .unwrap_or(0);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let age_ms = (now_ms - block_ts).max(0);
+        let height = logfmt::commas(block_num);
+        let when = logfmt::utc_millis(block_ts);
+        // One block produced every ~3s; an age under ~2 cadences is "live".
+        if age_ms <= 6_000 {
+            info!("block #{height}  {when}  ({tx_count} txs)  ·  live tip  ·  via {peer}");
+        } else {
+            info!(
+                "block #{height}  {when}  ({tx_count} txs)  ·  {} behind  ·  via {peer}",
+                logfmt::duration_ms(age_ms)
+            );
+        }
+    }
+
     fn log_sync_progress(&mut self, block: &Block, block_num: i64, peer: &str) {
         use std::time::{SystemTime, UNIX_EPOCH};
         if self.config.progress_log_interval == 0 {
@@ -1708,6 +1765,14 @@ impl SyncDriver {
     /// Prometheus counter.
     pub fn with_metrics(mut self, metrics: Arc<tron_rpc::Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach the `--explore` live-dashboard sink. Streamed blocks are folded
+    /// into the shared session stats (deduped across drivers) instead of being
+    /// logged per-block.
+    pub fn with_explore(mut self, explore: Arc<crate::explore::ExploreState>) -> Self {
+        self.explore = Some(explore);
         self
     }
 
@@ -2312,6 +2377,9 @@ impl SyncDriver {
             None => (-1, -1, -1, -1),
         };
         let our_head_at_handshake = self.head_number();
+        if let Some(explore) = &self.explore {
+            explore.note_peer(peer);
+        }
         info!(
             peer,
             our_head = our_head_at_handshake,
@@ -3749,11 +3817,10 @@ impl SyncDriver {
                     if let Ok(id) = block_id_from_block(&block) {
                         fetch_block_scheduler.complete_if_matches(id.as_bytes());
                     }
-                    // Tip-test mode short-circuit: just count + log.
-                    // No validation, no execution, no fork tree, no
-                    // store write. The point is to measure whether
-                    // peers actually serve us recent-tip blocks at
-                    // all, not whether we can apply them.
+                    // Tip-test / follow-tip mode short-circuit: just count +
+                    // display. No validation, no execution, no fork tree, no
+                    // store write. The point is to observe the live block tail
+                    // streaming in, not to apply it (we hold no state).
                     //
                     // We DO advance `prev_id` to the highest received
                     // block so the outer loop's `AskInventory` branch
@@ -3761,7 +3828,7 @@ impl SyncDriver {
                     // keeps the peer streaming us more inventory
                     // instead of dropping us as "client done" after
                     // the first 100-block batch.
-                    if self.config.tip_test {
+                    if self.config.tip_test || self.config.follow_tip {
                         self.stats.blocks_applied += 1;
                         if let Some(m) = &self.metrics {
                             m.inc_blocks_applied();
@@ -3769,8 +3836,49 @@ impl SyncDriver {
                         blocks_in_flight = blocks_in_flight.saturating_sub(1);
                         if let Ok(id) = block_id_from_block(&block) {
                             prev_id = Some(id);
+                            // Follow-tip: advance the spoofed head pointer to
+                            // this block as we display it. We hold no state, so
+                            // "head" is purely the advertised cursor — but it
+                            // must track the tip for the live-tail mechanics to
+                            // work: the `Inventory(BLOCK)` adv path only fetches
+                            // `head + 1`, and the window-refresh gate waits for
+                            // `head >= offered_max`. Without advancing it, head
+                            // would freeze at the initial spoof and we'd stall
+                            // after the first live block. Only ever moves
+                            // forward (a late/duplicate lower block is ignored),
+                            // mirroring a real head pointer. tip_test keeps its
+                            // old behaviour (it bulk-fetches, no head+1 gate).
+                            if self.config.follow_tip && block_num > self.head_number() {
+                                let dp = DynamicPropertiesStore::new(
+                                    self.state.dyn_props.clone(),
+                                );
+                                dp.save_latest_block_header_number(block_num);
+                                dp.save_latest_block_header_hash(id.as_bytes());
+                                last_block_ts = block
+                                    .block_header
+                                    .as_ref()
+                                    .and_then(|h| h.raw_data.as_ref())
+                                    .map(|r| r.timestamp)
+                                    .unwrap_or(last_block_ts);
+                            }
                         }
-                        if self.config.progress_log_interval > 0
+                        if let Some(explore) = &self.explore {
+                            // `--explore` dashboard: fold this block into the
+                            // shared session stats (deduped by number across
+                            // all drivers). The renderer task paints it; no
+                            // per-block log line (it would corrupt the frame).
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            explore.observe_block(&block, block_num, peer, now_ms);
+                        } else if self.config.follow_tip {
+                            // Polished live-view line for the follow-tip demo.
+                            // Every block by default (progress_log_interval
+                            // gates frequency only when set >1). Shows the
+                            // advancing tip height, tx count, and block age.
+                            self.log_follow_tip_block(&block, block_num, tx_count, peer);
+                        } else if self.config.progress_log_interval > 0
                             && self.stats.blocks_applied
                                 % self.config.progress_log_interval
                                 == 0
@@ -4184,6 +4292,19 @@ impl SyncDriver {
     /// Returns empty when there's no usable index (fresh node) — the caller
     /// falls back to the genesis/head id.
     fn build_chain_summary(&self) -> Vec<BlockId> {
+        // Tip-follow / explore mode: we hold NO backfill (only the genesis
+        // block sits in the index) but our head is spoofed to a real recent
+        // tip. Anchoring at the lowest indexed block (genesis) makes the peer
+        // try to serve us the whole chain from block 1 — which it FETCH_FAILs
+        // (lite peers pruned it) — instead of the live tail. So anchor the
+        // locator at our spoofed head: it's a real, recent block id on every
+        // peer's main chain, and java-tron serves the blocks *after* it, i.e.
+        // the live tip stream we actually want.
+        if self.config.tip_test || self.config.follow_tip {
+            if let Some(head) = self.resume_head() {
+                return vec![head];
+            }
+        }
         let head_num = self.head_number();
         let Some(bi) = &self.state.block_index else {
             return Vec::new();
@@ -7395,8 +7516,64 @@ mod solidify_tests {
             p2p_rate_limits: Default::default(),
             fetch_block_timeout: Duration::from_millis(200),
             peer_is_fast_forward: false,
+            follow_tip: false,
         };
         SyncDriver::new(state, cfg)
+    }
+
+    /// Follow-tip advertises the LEARNED tip, not the (empty) DB head.
+    ///
+    /// In `--follow-tip` the runtime probes a peer for the live tip and writes
+    /// it into `DynamicPropertiesStore` before the driver starts (the same
+    /// head spoof `--tip-test` uses). This proves the outbound Hello's head —
+    /// sourced from `resume_head()` / `head_number()` — then reports that
+    /// spoofed tip even though the node holds no blocks at all, so peers treat
+    /// us as caught-up and stream the live tail instead of trying to backfill.
+    #[test]
+    fn follow_tip_advertises_spoofed_tip_not_empty_db_head() {
+        let state = mem_state();
+        let blocks_be: Arc<dyn KvBackend> = mem();
+
+        // A fresh, empty node: no head pointer at all.
+        let driver = driver_with(state.clone(), blocks_be.clone());
+        assert_eq!(driver.head_number(), 0, "empty DB starts at head 0");
+        assert!(driver.resume_head().is_none(), "empty DB has no head id");
+
+        // Spoof the head exactly as `follow_tip_spoof_head` does after a probe.
+        let tip_num: i64 = 83_400_111;
+        let mut tip_hash = [0u8; 32];
+        tip_hash[..8].copy_from_slice(&(tip_num as u64).to_be_bytes());
+        tip_hash[31] = 0xcd;
+        {
+            let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+            dp.save_latest_block_header_number(tip_num);
+            dp.save_latest_block_header_hash(&tip_hash);
+        }
+
+        // A follow-tip driver over the spoofed state now advertises the tip.
+        let cfg = SyncConfig {
+            peers: vec![],
+            max_blocks: None,
+            tail_interval: Duration::from_millis(1),
+            initial_backoff: Duration::from_millis(1),
+            blocks_backend: blocks_be,
+            progress_log_interval: 1,
+            advertise_port: 18_888,
+            tip_test: false,
+            p2p_rate_limits: Default::default(),
+            fetch_block_timeout: Duration::from_millis(200),
+            peer_is_fast_forward: false,
+            follow_tip: true,
+        };
+        let driver = SyncDriver::new(state, cfg);
+        assert_eq!(
+            driver.head_number(),
+            tip_num,
+            "follow-tip head_number reports the learned tip"
+        );
+        let head = driver.resume_head().expect("spoofed head id present");
+        assert_eq!(head.num(), tip_num as u64, "resume_head carries the learned tip number");
+        assert_eq!(head.as_bytes(), &tip_hash, "resume_head carries the learned tip hash");
     }
 
     fn witness(i: usize) -> [u8; 21] {
@@ -7983,6 +8160,7 @@ mod pipelined_apply_tests {
             p2p_rate_limits: Default::default(),
             fetch_block_timeout: Duration::from_millis(200),
             peer_is_fast_forward: false,
+            follow_tip: false,
         };
         SyncDriver::new(state, cfg)
     }

@@ -230,6 +230,7 @@ fn applied_block_flows_through_hook_engine_and_reader() {
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     let block_index_be = state.block_index.as_ref().unwrap().clone();
     let dyn_props_be = state.dyn_props.clone();
@@ -389,6 +390,7 @@ fn rpc_by_id_fallbacks_resolve_through_hook_written_stores() {
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     let accounts_be = state.accounts.clone();
     let block_index_be = state.block_index.as_ref().unwrap().clone();
@@ -503,6 +505,7 @@ fn applied_blocks_archive_historical_state_exactly() {
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     let accounts_be = state.accounts.clone();
     let dyn_props_be = state.dyn_props.clone();

@@ -125,6 +125,7 @@ fn make_driver_with_snapshot(
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     SyncDriver::new(state, cfg).with_snapshot_stack(stack.with_horizon(64))
 }
@@ -217,6 +218,7 @@ fn snapshot_path_caps_depth_at_horizon() {
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     let horizon = 4usize;
     let mut driver = SyncDriver::new(state, cfg).with_snapshot_stack(stack.clone().with_horizon(horizon));

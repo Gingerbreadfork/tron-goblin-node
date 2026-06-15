@@ -982,6 +982,26 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
+    // `--explore` live dashboard: the tip checkpoint has already been spoofed
+    // into the head above (`tip_test`), and `follow_tip` makes the drivers
+    // anchor their locator there and advance as the live tail streams in. Here
+    // we create the shared session-stats sink and spawn the renderer that
+    // paints the dashboard to stdout (logs go to stderr, so they don't
+    // collide). The Arc is cloned into every sync driver below.
+    let explore_state: Option<Arc<crate::explore::ExploreState>> = if config.p2p.explore {
+        let tip = config
+            .p2p
+            .tip_test
+            .as_ref()
+            .map(|c| c.block_num)
+            .unwrap_or(0);
+        let st = Arc::new(crate::explore::ExploreState::new(tip));
+        tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
+        Some(st)
+    } else {
+        None
+    };
+
     // Shared, continuously-grown discovery pool for rotation drivers
     // (java-tron-like always-active discovery). The Kad feeder below
     // appends freshly-discovered peers to it on a timer; each rotation
@@ -1552,6 +1572,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     config.p2p.fetch_block_timeout_ms.clamp(100, 1000),
                 ),
                 peer_is_fast_forward,
+                follow_tip: config.p2p.follow_tip,
             };
             let sd = shutdown.subscribe();
             let state_for_peer = state.clone();
@@ -1590,6 +1611,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 Some(dynamic_pool.clone())
             };
             let fetch_pool_for_peer = fetch_pool.clone();
+            let explore_for_peer = explore_state.clone();
             let index_hook_for_peer = index_hook.clone();
             let event_bus_for_peer = event_bus.clone();
             let inbound_budget_for_peer = inbound_budget.clone();
@@ -1639,6 +1661,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     driver = driver.with_pipelined_apply();
                 }
                 driver = driver.with_event_bus(event_bus_for_peer);
+                if let Some(explore) = explore_for_peer {
+                    driver = driver.with_explore(explore);
+                }
                 (driver_label, driver.run(sd).await)
             }));
         }
@@ -1822,6 +1847,7 @@ fn random_node_id_64() -> Vec<u8> {
     }
     id.to_vec()
 }
+
 
 // ---------------------------------------------------------------------------
 // Address-history index wiring

@@ -1040,6 +1040,25 @@ pub struct P2pConfig {
     /// per-peer pacing unchanged). Off ⇒ the proven single-peer path.
     #[serde(default = "default_multi_peer_fetch", alias = "multiPeerFetch")]
     pub multi_peer_fetch: bool,
+    /// Fast-join "follow-tip" mechanic. Off by default.
+    ///
+    /// When set together with a [`Self::tip_test`] checkpoint, the node treats
+    /// that recent block id as its head, anchors its `SyncBlockChain` locator
+    /// there (so peers serve the *live tail* forward rather than the historical
+    /// backfill), and advances its head as each block streams in — so it keeps
+    /// pulling new blocks as they are produced. Blocks are decoded + DISPLAYED,
+    /// never executed or applied (there is no chain state). This is the engine
+    /// behind [`Self::explore`]; on its own it just emits a per-block line.
+    #[serde(default, alias = "followTip")]
+    pub follow_tip: bool,
+    /// `--explore` live-dashboard mode. Bootstraps from a real recent tip
+    /// (supplied as the flag's `BLOCK_NUM:HEX_HASH` argument, which also
+    /// populates [`Self::tip_test`] and enables [`Self::follow_tip`]), follows
+    /// the live block tail decode-only, and paints a self-updating terminal
+    /// dashboard of real mainnet activity. Off by default; never affects a
+    /// normal syncing node.
+    #[serde(default, alias = "explore")]
+    pub explore: bool,
 }
 
 fn default_multi_peer_fetch() -> bool {
@@ -1125,6 +1144,8 @@ impl Default for P2pConfig {
             fast_forward_nodes: Vec::new(),
             tip_test: None,
             multi_peer_fetch: default_multi_peer_fetch(),
+            follow_tip: false,
+            explore: false,
         }
     }
 }

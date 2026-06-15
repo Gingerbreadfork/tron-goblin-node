@@ -11,6 +11,7 @@ pub mod diag;
 pub mod dump_state;
 pub mod backup;
 pub mod event_loader;
+pub mod explore;
 pub mod fetch_block;
 pub mod firehose;
 pub mod inbound;

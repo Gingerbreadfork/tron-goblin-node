@@ -237,6 +237,7 @@ fn make_driver(
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     SyncDriver::new(state, cfg)
         .with_snapshot_stack(stack.with_horizon(64))
@@ -459,6 +460,7 @@ fn make_driver_legacy(
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     let undo_be: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
     SyncDriver::new(state, cfg)

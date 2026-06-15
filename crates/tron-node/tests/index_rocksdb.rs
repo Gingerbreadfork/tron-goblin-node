@@ -199,6 +199,7 @@ fn engine_backfills_and_resumes_over_rocksdb() {
             p2p_rate_limits: Default::default(),
             fetch_block_timeout: Duration::from_millis(200),
             peer_is_fast_forward: false,
+            follow_tip: false,
         };
         let mut driver = SyncDriver::new(state, cfg).with_index_hook(hook);
 

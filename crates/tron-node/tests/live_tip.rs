@@ -227,6 +227,7 @@ async fn block_inventory_adv_triggers_fetch_inv_data() {
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
         peer_is_fast_forward: false,
+        follow_tip: false,
     };
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let driver_task = tokio::spawn(async move {
