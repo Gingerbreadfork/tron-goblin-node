@@ -1313,10 +1313,14 @@ impl SyncDriver {
                 if let Some(m) = &self.metrics {
                     m.inc_blocks_rejected_execution();
                 }
-                warn!(
+                // A valid, signed, well-formed block we couldn't reproduce the
+                // canonical result for (state-root / contractRet mismatch, or an
+                // execution error) is a genuine consensus divergence — log at
+                // ERROR so it stands out, like the contractRet tripwire.
+                error!(
                     block = block_num,
                     reason = reason.as_str(),
-                    "block rejected: execution"
+                    "block rejected: execution divergence"
                 );
             }
             AcceptOutcome::AlreadyKnown(_id) => {
@@ -2093,7 +2097,7 @@ impl SyncDriver {
                     // metadata but pruned the block bodies — a modern
                     // validator that can't serve archive sync. Count
                     // these; demote on the 2nd occurrence.
-                    let is_fetch_fail = reason.contains("app-disconnected with reason code 19");
+                    let is_fetch_fail = reason.contains("(FETCH_FAIL)");
                     if is_fetch_fail {
                         fetch_fail_count[peer_idx] =
                             fetch_fail_count[peer_idx].saturating_add(1);
@@ -2201,7 +2205,7 @@ impl SyncDriver {
                             "peer unavailable; rotating");
                     } else {
                         warn!(peer = peer.as_str(), reason = reason.as_str(), ?backoff,
-                            "peer rejected us; backing off");
+                            "peer rejected us");
                     }
                     // Serve the backoff as PER-PEER cooldown state, not a
                     // driver-wide sleep. The protection every wait above buys
@@ -2596,12 +2600,6 @@ impl SyncDriver {
         // `sync_started` flips once we've sent it as leader; if we later
         // lose leadership we reset it (and drop queued work) and go quiet.
         let mut sync_started = false;
-        // The most recent sync request we sent THIS peer, for diagnostics: a
-        // P2pDisconnect only carries a numeric ReasonCode (the peer logs its
-        // real `check()` failure on its own side), so on a BAD_PROTOCOL we
-        // surface what we last sent — which is what actually triggered it
-        // (e.g. a regressing locator shows up as last=<lower-than-expected>).
-        let mut last_sync_request = String::from("(none)");
         // When `Some`, a `SyncBlockChain` request is outstanding (we sent a
         // locator at that instant and haven't yet received its
         // `ChainInventory`). CRITICAL: never send a second `SyncBlockChain`
@@ -2927,12 +2925,6 @@ impl SyncDriver {
                     last_num = summary.last().map(|id| id.num()).unwrap_or(0),
                     "sent SyncBlockChain locator (active syncer)"
                 );
-                last_sync_request = format!(
-                    "SyncBlockChain locator first={} last={} len={}",
-                    summary.first().map(|id| id.num()).unwrap_or(0),
-                    summary.last().map(|id| id.num()).unwrap_or(0),
-                    summary.len()
-                );
                 last_request_at = Some(Instant::now());
                 if let Err(e) =
                     tron_net::sync::send_sync_request(&mut conn, &summary).await
@@ -3246,8 +3238,6 @@ impl SyncDriver {
                             }
                             blocks_in_flight += to_fetch.len();
                             last_block_pipeline_at = Instant::now();
-                            last_sync_request =
-                                format!("FetchInvData count={} window<={}", to_fetch.len(), offered_max);
                             if let Err(e) = tron_net::sync::send_fetch_inv_data(
                                 &mut conn,
                                 &to_fetch,
@@ -3268,12 +3258,6 @@ impl SyncDriver {
                                 if summary.is_empty() {
                                     summary.push(prev_id.unwrap_or(genesis));
                                 }
-                                last_sync_request = format!(
-                                    "SyncBlockChain refresh first={} last={} len={}",
-                                    summary.first().map(|id| id.num()).unwrap_or(0),
-                                    summary.last().map(|id| id.num()).unwrap_or(0),
-                                    summary.len()
-                                );
                                 if let Err(e) =
                                     tron_net::sync::send_sync_request(&mut conn, &summary).await
                                 {
@@ -3284,8 +3268,6 @@ impl SyncDriver {
                             } else {
                                 // safe: pending is `AskInventory` only when prev_id is Some.
                                 let id = prev_id.expect("AskInventory requires prev_id");
-                                last_sync_request =
-                                    format!("SyncBlockChain continue last={}", id.num());
                                 if let Err(e) =
                                     tron_net::sync::send_sync_request(&mut conn, &[id]).await
                                 {
@@ -4023,8 +4005,7 @@ impl SyncDriver {
                         .map(|r| r.as_str_name())
                         .unwrap_or("UNKNOWN");
                     return PeerOutcome::PeerFailure(format!(
-                        "peer libp2p-disconnected with reason code {reason} ({name}); \
-                         our last request to it: {last_sync_request}"
+                        "peer libp2p-disconnected code={reason} ({name})"
                     ));
                 }
                 MessageType::P2pDisconnect => {
@@ -4037,8 +4018,7 @@ impl SyncDriver {
                         .map(|r| r.as_str_name())
                         .unwrap_or("UNKNOWN");
                     return PeerOutcome::PeerFailure(format!(
-                        "peer app-disconnected with reason code {reason} ({name}); \
-                         our last request to it: {last_sync_request}"
+                        "peer app-disconnected code={reason} ({name})"
                     ));
                 }
                 MessageType::Trx => {
@@ -7974,15 +7954,15 @@ mod peer_failure_log_tests {
             "FORKED"
         );
         let formatted = format!(
-            "peer app-disconnected with reason code {} ({}); our last request to it: ...",
+            "peer app-disconnected code={} ({})",
             22,
             tron_proto::ReasonCode::try_from(22).unwrap().as_str_name()
         );
         assert!(formatted.contains("(FORKED)"), "matcher would miss: {formatted}");
-        // We match "(FORKED)", not the substring "reason code 22", precisely so
-        // a 3-digit code (220..229) can't false-trip the FORKED handling.
+        // We match "(FORKED)", not the substring "code=22", precisely so a
+        // 3-digit code (220..229) can't false-trip the FORKED handling.
         assert!(
-            !"peer app-disconnected with reason code 220 (SOMETHING_ELSE)".contains("(FORKED)")
+            !"peer app-disconnected code=220 (SOMETHING_ELSE)".contains("(FORKED)")
         );
     }
 
@@ -7993,8 +7973,8 @@ mod peer_failure_log_tests {
             "dial: Connection refused (os error 111)",
             "dial: No route to host (os error 113)",
             "dial: Connection timed out (os error 110)",
-            "peer app-disconnected with reason code 4 (TOO_MANY_PEERS)",
-            "peer app-disconnected with reason code 5 (DUPLICATE_PEER)",
+            "peer app-disconnected code=4 (TOO_MANY_PEERS)",
+            "peer app-disconnected code=5 (DUPLICATE_PEER)",
             "handshake: connection closed before peer Hello arrived",
         ] {
             assert!(is_expected_peer_failure(r), "should be quiet: {r}");
@@ -8002,9 +7982,9 @@ mod peer_failure_log_tests {
         // Protocol/version/message rejections → real signal (warn): these are
         // the ones that mean "we're doing something peers don't like".
         for r in [
-            "peer app-disconnected with reason code 2 (BAD_PROTOCOL)",
-            "peer app-disconnected with reason code 24 (INCOMPATIBLE_VERSION)",
-            "peer libp2p-disconnected with reason code 11 (BAD_MESSAGE)",
+            "peer app-disconnected code=2 (BAD_PROTOCOL)",
+            "peer app-disconnected code=24 (INCOMPATIBLE_VERSION)",
+            "peer libp2p-disconnected code=11 (BAD_MESSAGE)",
             "libp2p_handshake: frame error: unknown message type byte: 0x54",
         ] {
             assert!(!is_expected_peer_failure(r), "should be loud: {r}");
