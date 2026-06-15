@@ -3274,6 +3274,9 @@ fn vm_energy_budget_for_trigger(
     fee_limit: i64,
     now_slot: i64,
 ) -> u64 {
+    // SELF-RENT FIX: one budget per VM tx, before execution — clear prior tx's
+    // captured quotas so only this tx's caller is stored.
+    energy::clear_pre_tx_energy_quota();
     let Some(caller) = caller else {
         return 0;
     };
@@ -3329,6 +3332,9 @@ fn vm_energy_budget_for_create(
     fee_limit: i64,
     now_slot: i64,
 ) -> u64 {
+    // SELF-RENT FIX: one budget per VM tx, before execution — clear prior tx's
+    // captured quotas so only this tx's caller is stored.
+    energy::clear_pre_tx_energy_quota();
     let Some(caller) = caller else {
         return 0;
     };

@@ -182,22 +182,19 @@ pub fn calculate_global_limit_v2(
     if total_weight <= 0 {
         return 0;
     }
-    // DEPLOYED java-tron 4.8.1.1 `calculateGlobalEnergyLimitV2` uses the
-    // **fractional** weight (double), NOT a floored long, and has **no**
-    // `hardenCalculation()` branch (always the double path):
-    //   `(long)((double) frozeBalance / TRX_PRECISION
-    //            * ((double) totalEnergyLimit / totalEnergyWeight))`
-    // VERIFIED LIVE against the reference node: for fractional-froze accounts
-    // (e.g. 410000775507 froze=249403390 → EnergyLimit 2342, not the floored
-    // 2338) java returns the fractional value. The prior "energy V2 floors"
-    // reading came from the 4.8.0-125 *master* checkout (which the deployed
-    // 4.8.1.1 *release* does not track) and was wrong. This mirrors the net V2
-    // path. Flooring undershoots the limit for any account whose energy freeze
-    // carries a fractional-TRX (sub-1e6 sun) balance — typically a pure
-    // acquired-delegated-v2 receiver — shifting its stake-vs-burn split and
-    // cascading into balance/contractRet divergences.
-    ((froze_balance as f64 / TRX_PRECISION as f64)
-        * (total_limit as f64 / total_weight as f64)) as i64
+    // The TX-consensus energy limit FLOORS the weight to a whole-TRX long
+    // FIRST (java `calculateGlobalEnergyLimit` line 150 `energyWeight =
+    // frozeBalance / TRX_PRECISION` — integer division — then
+    // `(long)(energyWeight * ((double) totalEnergyLimit / totalEnergyWeight))`).
+    // PROVEN against java-tron 4.8.1.1 local-replay ground truth for
+    // acquired-delegated-v2 renters: 41727d2f froze=14233172453 → java stake
+    // 129998 == floor(14233)*L/W, NOT the fractional 129999; 41dcda6c→129993,
+    // 4138ce28→130166 — all the floored value. The earlier "fractional"
+    // reading came from `getaccountresource` (a DISPLAY path) and INTRODUCED
+    // 348 energy_fee divergences (+1..+8 stake per renter) that cascade into
+    // the fc772f18 balance failures. Floor matches the deployed TX behavior.
+    let weight = froze_balance / TRX_PRECISION;
+    ((weight as f64) * (total_limit as f64 / total_weight as f64)) as i64
 }
 
 /// **Net**-specific V2 global-limit scaling — java
@@ -777,13 +774,15 @@ fn undelegate_increase_v2(
     set_new_window_size_v2(owner, kind, new_owner_window as i64);
     set_usage(owner, kind, new_owner_usage);
     set_latest_time(owner, kind, now);
-    if std::env::var("TRON_ETRAJ").is_ok() && kind == ResourceKind::Energy {
-        let oh: String = owner.address.iter().map(|b| format!("{b:02x}")).collect();
-        if oh.contains("5a03038f0753dcde97c1c8ca81bde7b168778b63") {
-            eprintln!(
-                "ETRAJ_UNDEL_OWN owner={oh} usage0={owner_usage0} usage_decayed={owner_usage} transfer={transfer_usage} own_winv2={remain_owner_window_v2} recv_winv2={remain_receiver_window_v2} new_usage={new_owner_usage} new_winv2={}",
-                new_owner_window as i64
-            );
+    if let Ok(__tgt) = std::env::var("TRON_ETRAJ") {
+        if kind == ResourceKind::Energy {
+            let oh: String = owner.address.iter().map(|b| format!("{b:02x}")).collect();
+            if oh.contains(__tgt.trim_start_matches("0x")) {
+                eprintln!(
+                    "ETRAJ_UNDEL_OWN owner={oh} usage0={owner_usage0} usage_decayed={owner_usage} transfer={transfer_usage} own_winv2={remain_owner_window_v2} recv_winv2={remain_receiver_window_v2} new_usage={new_owner_usage} new_winv2={}",
+                    new_owner_window as i64
+                );
+            }
         }
     }
 }
@@ -816,14 +815,13 @@ mod tests {
     }
 
     /// Sub-1-TRX froze still yields a (fractional) limit — the deployed mainnet
-    /// `calculateGlobalEnergyLimitV2` keeps the fractional weight, so 0.5 TRX
-    /// (500_000 sun) → weight 0.5 → 0.5 × (1e12 / 2e6) = 250_000 (NOT 0). V2 has
-    /// no `frozeBalance < TRX_PRECISION → 0` guard (that lives only in the V1
-    /// non-`supportUnfreezeDelay` path).
+    /// The TX-consensus energy limit FLOORS the weight to a whole-TRX long
+    /// (java `energyWeight = frozeBalance / TRX_PRECISION`), so 0.5 TRX
+    /// (500_000 sun) → weight 0 → limit 0.
     #[test]
-    fn calculate_global_limit_v2_sub_trx_froze_is_fractional() {
-        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true), 250_000);
-        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, false), 250_000);
+    fn calculate_global_limit_v2_sub_trx_froze_floors_to_zero() {
+        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true), 0);
+        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, false), 0);
     }
 
     #[test]
@@ -834,23 +832,24 @@ mod tests {
         assert_eq!(calculate_global_limit_v2(1_000_000, 1_000_000, 0, false), 0);
     }
 
-    /// The deployed mainnet java-tron (4.8.1.1) PRESERVES the fractional weight
-    /// for the `supportUnfreezeDelay` energy limit — `calculateGlobalEnergyLimitV2`
-    /// uses `(double) frozeBalance / TRX_PRECISION`, NOT a floored long.
-    /// VERIFIED LIVE against the reference node on fractional-froze accounts
-    /// (e.g. 410000775507 froze=249403390 → EnergyLimit 2342, the fractional
-    /// value, not the floored 2338). For 14231726819 sun (14231.726819 TRX) the
-    /// limit is the fractional 129999, NOT the floored 129993 — so V2 ≠ V1
-    /// (only V1, the non-supportUnfreezeDelay path, floors). The earlier
-    /// "energy V2 floors" pin was from the 4.8.0-125 master checkout and wrong.
+    /// The deployed mainnet java-tron (4.8.1.1) TX-consensus energy limit FLOORS
+    /// the weight to a whole-TRX long — PROVEN against java-tron 4.8.1.1
+    /// local-replay ground truth for acquired-delegated-v2 renters: 41727d2f
+    /// froze=14233172453 → java stake 129998 = floor(14233)·L/W (NOT 129999);
+    /// 41dcda6c→129993, 4138ce28→130166. The froze-fractionality CORRELATION is
+    /// the proof: renters with sub-1e6-sun energy freeze diverge by +1..+8, but
+    /// whole-TRX-froze accounts (412a0bc3) match byte-for-byte — so the unit is
+    /// in the limit floor, not payEnergyBill. (Unlike the NET V2 path below,
+    /// which is fractional — energy and net round differently on the deployed
+    /// node.) The earlier "energy V2 fractional" pin was a getaccountresource
+    /// DISPLAY read and introduced 348 energy_fee divergences.
     #[test]
-    fn calculate_global_limit_v2_uses_fractional_weight() {
+    fn calculate_global_limit_v2_floors_weight() {
         let (f, l, w) = (14_231_726_819i64, 180_000_000_000i64, 19_705_467_908i64);
-        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_999);
-        assert_eq!(calculate_global_limit_v2(f, l, w, false), 129_999);
-        // V2 (fractional) is strictly larger than V1 (floored) for fractional froze.
+        // energy V2 == V1 (both floor the whole-TRX weight).
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_993);
+        assert_eq!(calculate_global_limit_v2(f, l, w, false), 129_993);
         assert_eq!(calculate_global_limit_v1(f, l, w, false), 129_993);
-        assert!(calculate_global_limit_v2(f, l, w, false) > calculate_global_limit_v1(f, l, w, false));
     }
 
     /// The deployed mainnet java-tron PRESERVES the fractional weight for the
@@ -868,11 +867,12 @@ mod tests {
         // NET V2 keeps the .48 → 345 (java's covered value), both modes.
         assert_eq!(calculate_global_net_limit_v2(f, l, w, true), 345);
         assert_eq!(calculate_global_net_limit_v2(f, l, w, false), 345);
-        // The energy V2 is ALSO fractional on the deployed node (4.8.1.1) → 345,
-        // identical to net here. (The earlier code floored energy to 344; that
-        // was the 1-unit shortfall that cascaded into stake-vs-burn divergences.)
-        assert_eq!(calculate_global_limit_v2(f, l, w, true), 345);
-        assert_eq!(calculate_global_limit_v2(f, l, w, false), 345);
+        // The energy V2 FLOORS the weight on the deployed node (4.8.1.1) → 344,
+        // UNLIKE net (345). Proven against acquired-delegated renters (see
+        // calculate_global_limit_v2_floors_weight). Energy and net round
+        // differently: net keeps the fraction, energy floors the whole-TRX weight.
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 344);
+        assert_eq!(calculate_global_limit_v2(f, l, w, false), 344);
     }
 
     // ---- window-size helpers (java AccountCapsule) -------------------------

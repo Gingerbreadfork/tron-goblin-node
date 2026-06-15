@@ -42,6 +42,68 @@ use crate::resource::{
     ResourceGates, ResourceKind, TRX_PRECISION,
 };
 
+thread_local! {
+    /// Per-tx capture of each account's BUDGET-TIME energy quota — java
+    /// `VMActuator.getAccountEnergyLimitWithFixRatio` stores `callerEnergyLeft`
+    /// before execution and `ReceiptCapsule.payEnergyBill` splits frozen-vs-fee
+    /// against that STORED value, not a post-execution re-read. Matters when the
+    /// caller self-rents mid-tx (a JustLend rental delegates fresh frozen energy
+    /// back to it) — the re-read quota is then inflated, so we'd bill frozen
+    /// where java bills fee. Keyed by address bytes; cleared per VM tx.
+    static PRE_TX_ENERGY_QUOTA: std::cell::RefCell<std::collections::HashMap<Vec<u8>, i64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Store an account's budget-time energy quota for the self-rent split fix.
+pub fn set_pre_tx_energy_quota(addr: &[u8], quota: i64) {
+    PRE_TX_ENERGY_QUOTA.with(|m| {
+        m.borrow_mut().insert(addr.to_vec(), quota);
+    });
+}
+
+/// Clear the budget-time quota capture (call once per tx, before its budget).
+pub fn clear_pre_tx_energy_quota() {
+    PRE_TX_ENERGY_QUOTA.with(|m| m.borrow_mut().clear());
+}
+
+fn pre_tx_energy_quota_for(addr: &Address) -> Option<i64> {
+    let key: &[u8] = addr.as_bytes();
+    PRE_TX_ENERGY_QUOTA.with(|m| m.borrow().get(key).copied())
+}
+
+/// The two-step caller energy quota (`energy_limit - recover(decayed_D)`),
+/// computed IDENTICALLY to [`consume_energy`]'s `quota_left`, captured at budget
+/// time so the frozen-vs-fee split bills against the PRE-rent value (java
+/// `payEnergyBill` parity).
+pub fn caller_energy_quota_left(
+    account: &Account,
+    dyn_props: &DynamicPropertiesStore,
+    now_slot: i64,
+) -> i64 {
+    let res = account.account_resource.clone().unwrap_or_default();
+    let decayed_usage = if dyn_props.support_unfreeze_delay() {
+        let gates = ResourceGates {
+            support_unfreeze_delay: true,
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+        let mut q = account.clone();
+        update_usage(&mut q, ResourceKind::Energy, now_slot, gates);
+        let decayed_d = resource_usage(&q, ResourceKind::Energy);
+        recovery_account(
+            &q,
+            ResourceKind::Energy,
+            decayed_d,
+            now_slot,
+            now_slot,
+            dyn_props.allow_harden_resource_calculation(),
+        )
+    } else {
+        increase_default(res.energy_usage, 0, res.latest_consume_time_for_energy, now_slot)
+    };
+    let energy_limit = calculate_global_energy_limit(account, dyn_props);
+    energy_limit.saturating_sub(decayed_usage).max(0)
+}
+
 /// What happened during a `consume_energy` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnergyCharge {
@@ -147,6 +209,12 @@ pub fn consume_energy(
 
     let energy_limit = calculate_global_energy_limit(&account, dyn_props);
     let quota_left = energy_limit.saturating_sub(decayed_usage).max(0);
+    // SELF-RENT FIX (verified java-exact, e.g. 9fa74013 energy_fee 0→842900):
+    // bill the frozen-vs-fee split against the budget-time `callerEnergyLeft`,
+    // not this post-execution re-read (which is inflated when the caller
+    // self-rented mid-tx). Identical to `quota_left` when the caller did NOT
+    // self-rent, so a no-op there.
+    let quota_left = pre_tx_energy_quota_for(caller).unwrap_or(quota_left);
     let energy_window_before = window_size(&account, ResourceKind::Energy);
     let energy_window_before_v2 = window_size_v2(&account, ResourceKind::Energy);
     let account_pre_decay = account.clone();
@@ -251,7 +319,7 @@ pub fn consume_energy(
 
     if let Ok(t) = std::env::var("TRON_ETRACE") {
         let addr: String = caller.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        if addr == t {
+        if t.split(',').any(|x| addr == x.trim().trim_start_matches("0x")) {
             // DECAY-PATH CONSISTENCY CHECK: caller_left uses recovery_account
             // (increase_legacy), new_usage uses increase_account (increase_v2).
             // Recompute the decayed usage via the increase_account(usage=0) path
@@ -281,10 +349,12 @@ pub fn consume_energy(
                  win_before={energy_window_before} winv2_before={energy_window_before_v2} \
                  decayed={decayed_usage} limit={energy_limit} froze={} \
                  quota_left={quota_left} eused={energy_used_i} from_frozen={energy_from_frozen} \
-                 new_usage={new_energy_usage} win_after={} winv2_after={} fee={fee}",
+                 new_usage={new_energy_usage} win_after={} winv2_after={} fee={fee} tew={} tel={}",
                 all_frozen_balance_for_energy(&account),
                 window_size(&account, ResourceKind::Energy),
                 window_size_v2(&account, ResourceKind::Energy),
+                dyn_props.total_energy_weight(),
+                dyn_props.total_energy_current_limit(),
             );
         }
     }
@@ -514,6 +584,12 @@ pub fn vm_energy_budget_trigger(
     call_value: i64,
     now_slot: i64,
 ) -> i64 {
+    // SELF-RENT FIX: capture the caller's quota at budget time (before the VM
+    // runs / self-rents) — java's `setCallerEnergyLeft`.
+    set_pre_tx_energy_quota(
+        &caller.address,
+        caller_energy_quota_left(caller, dyn_props, now_slot),
+    );
     let caller_energy_limit =
         account_energy_limit_with_fix_ratio(caller, dyn_props, fee_limit, call_value, now_slot);
     let Some(creator) = creator else {
