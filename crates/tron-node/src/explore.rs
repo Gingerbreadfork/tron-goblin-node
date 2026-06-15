@@ -1,4 +1,4 @@
-//! `--explore` mode: a live TRON mainnet "time machine" dashboard.
+//! `--explore` mode: the live TRON mainnet feed dashboard.
 //!
 //! The node bootstraps from a real recent tip (see `runtime`/`--explore`),
 //! follows the live block tail decode-only, and feeds every block into a
@@ -379,7 +379,7 @@ impl ExploreState {
 
         // Header
         s.push_str(&line(&format!(
-            "{RED}{BOLD}🧌 TRON GOBLIN{RST}  {DIM}·{RST}  {ORG}{BOLD}LIVE MAINNET TIME MACHINE{RST}"
+            "{RED}{BOLD}🧌 TRON GOBLIN{RST}  {DIM}·{RST}  {ORG}{BOLD}MAINNET LIVE FEED{RST}"
         )));
         s.push_str(&rule(w));
 
@@ -468,7 +468,7 @@ impl ExploreState {
         s.push_str(&blank());
 
         // Live feed
-        s.push_str(&section("LIVE FEED", w));
+        s.push_str(&section("BLOCK STREAM", w));
         if g.feed.is_empty() {
             s.push_str(&line(&format!("   {DIM}waiting for the next block…{RST}")));
         }

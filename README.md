@@ -33,26 +33,27 @@ into a self-updating dashboard:
 ```
 
 ```text
-🧌 TRON GOBLIN  ·  LIVE MAINNET TIME MACHINE
+🧌 TRON GOBLIN  ·  MAINNET LIVE FEED
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  📅 2026-06-15 08:16:33 UTC      block #83,614,019
-  🟢 LIVE    ⚡ 263 TPS · peak 715    📦 0.3 blk/s · 🔗 12 peers
-  ⏱ watching 1m 5s · 📦 22 blocks streamed
-  block sizes ▃▂▃▃▄▃▃▁▁▁▁█▆▇▆▄▇▆▄▅▇▆  (txs/block, last 22)
+  📅 2026-06-15 09:11:12 UTC      block #83,615,112
+  🟢 LIVE    ⚡ 221 TPS · peak 663    📦 0.3 blk/s · 🔗 8 peers
+  ⏱ watching 36s · 📦 12 blocks streamed
+  block sizes ▄▃▄▅█▂▅▂▁█▆▃  (txs/block, last 12)
   ── THIS SESSION ──────────────────────────────────────────────
-   🔄 transactions 17,019          👛 active wallets 7,567
-   💵 TRX moved 641K               💚 USDT volume $34.87M
-   📜 contract calls 4,194         💸 USDT transfers 4,124
-   🪙 token transfers 3,957        🗳 votes+stakes 1,904
-   🚀 busiest block 991 txs        🐋 biggest USDT $3.30M
+   🔄 transactions 8,253           👛 active wallets 3,801
+   💵 TRX moved 476K               💚 USDT volume $39.90M
+   📜 contract calls 1,675         💸 USDT transfers 1,632
+   🪙 token transfers 843          🗳 votes+stakes 1,060
+   🚀 busiest block 813 txs        🐋 biggest USDT $12.00M
   ── TX MIX ────────────────────────────────────────────────────
-   ▪ TRX 28%   ▪ USDT 24%   ▪ tokens 23%   ▪ other 23%
-  ── LIVE FEED ─────────────────────────────────────────────────
-   ▸ #83,614,019  864 tx · 235 USDT $686K · 14,163 TRX
-   ▸ #83,614,018  929 tx · 247 USDT $1.13M · 10,942 TRX
+   ▪ TRX 37%   ▪ USDT 19%   ▪ tokens 10%   ▪ other 32%
+  ── BLOCK STREAM ──────────────────────────────────────────────
+   ▸ #83,615,112  654 tx · 105 USDT $1.71M · 1,988 TRX
+   ▸ #83,615,111  749 tx · 156 USDT $11.00M · 2,588 TRX
+   ▸ #83,615,110  804 tx · 185 USDT $1.40M · 2,352 TRX
   ── MILESTONES ────────────────────────────────────────────────
-   🐋 Whale: $3.30M USDT in a single transfer (#83,614,016)
-   🚀 Heavy block: 991 txs in 3 seconds (#83,614,009)
+   🐋 Whale: $12.00M USDT in a single transfer (#83,615,107)
+   🚀 Heavy block: 813 txs in 3 seconds (#83,615,105)
 ```
 
 This is **not** a mock — it's the genuine TRON peer-to-peer protocol at work.

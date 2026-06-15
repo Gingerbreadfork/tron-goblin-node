@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# try.sh — the TRON Goblin "time machine".
+# try.sh — the TRON Goblin live mainnet feed.
 #
 # One command, and within seconds you're watching the REAL TRON mainnet live:
 # blocks landing every ~3s, hundreds of real transactions each, decoded and
@@ -66,7 +66,7 @@ done
 # --- banner ----------------------------------------------------------------
 printf '\n'
 printf '%s  ┌────────────────────────────────────────────────────────────┐%s\n' "$RED" "$RST"
-printf '%s  │   🧌  tron-goblin-node  ·  LIVE MAINNET TIME MACHINE        │%s\n' "$RED" "$RST"
+printf '%s  │   🧌  tron-goblin-node  ·  MAINNET LIVE FEED                │%s\n' "$RED" "$RST"
 printf '%s  └────────────────────────────────────────────────────────────┘%s\n' "$RED" "$RST"
 printf '%s  Real TRON mainnet, streaming into your terminal in seconds.%s\n\n' "$DIM" "$RST"
 
