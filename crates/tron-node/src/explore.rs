@@ -504,7 +504,7 @@ impl ExploreState {
         let sigs = g.sig_direct + g.sig_delegated;
         if sigs > 0 {
             s.push_str(&line(&format!(
-                "  {CYN}🔑 {} producer sigs recovered{RST}  {DIM}{} direct · {} delegated key (cold/hot SR){RST}",
+                "  {CYN}🔑 {} sigs recovered{RST}  {DIM}{} direct · {} delegated (cold/hot){RST}",
                 commas(sigs as i64),
                 commas(g.sig_direct as i64),
                 commas(g.sig_delegated as i64)
@@ -512,7 +512,7 @@ impl ExploreState {
         }
         // Session uptime + blocks + the discovered peer network.
         s.push_str(&line(&format!(
-            "  {GRY}⏱ {} · 📦 {} blocks · 🌐 {} peers found (DNS+Kad) · {} serving{RST}",
+            "  {GRY}⏱ {} · 📦 {} blocks · 🌐 {} peers via DNS+Kad · {} serving{RST}",
             dur(self.start.elapsed().as_millis() as i64),
             commas(g.blocks as i64),
             commas(g.discovered as i64),
@@ -588,25 +588,31 @@ impl ExploreState {
         }
         s.push_str(&blank());
 
-        // Producers — the live DPoS rotation of Super Representatives.
-        s.push_str(&section("PRODUCERS · live SR rotation", w));
+        // Producers — the live DPoS rotation of Super Representatives. The
+        // SR-seen count lives in the header; the chips row fits as many top
+        // producers as the width allows so it never hangs off the side.
+        s.push_str(&section(
+            &format!("PRODUCERS · {} of {} SRs seen", g.producers.len(), ACTIVE_SRS),
+            w,
+        ));
         if g.producers.is_empty() {
-            s.push_str(&line(&format!("   {DIM}waiting…{RST}")));
+            s.push_str(&line(&format!("   {DIM}waiting for the first block…{RST}")));
         } else {
             let mut prod: Vec<([u8; 21], u64)> =
                 g.producers.iter().map(|(k, v)| (*k, *v)).collect();
             prod.sort_by(|a, b| b.1.cmp(&a.1));
-            let chips: Vec<String> = prod
-                .iter()
-                .take(3)
-                .map(|p| format!("{BOLD}{}{RST} {GRY}×{}{RST}", short_addr(&p.0), p.1))
-                .collect();
-            s.push_str(&line(&format!(
-                "   {ORG}🏛{RST} {}   {GRY}· {} of {} SRs seen{RST}",
-                chips.join("   "),
-                prod.len(),
-                ACTIVE_SRS
-            )));
+            let mut chips = format!("   {ORG}🏛{RST}");
+            let mut vis = 5; // "   🏛" — three spaces plus a 2-wide glyph
+            for p in prod.iter() {
+                let chip = format!("  {BOLD}{}{RST} {GRY}×{}{RST}", short_addr(&p.0), p.1);
+                let cvis = visible_len(&chip);
+                if vis + cvis > w {
+                    break;
+                }
+                chips.push_str(&chip);
+                vis += cvis;
+            }
+            s.push_str(&line(&chips));
         }
         s.push_str(&blank());
 
