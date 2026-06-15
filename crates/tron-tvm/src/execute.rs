@@ -878,6 +878,13 @@ fn apply_top_level_trc10(
         .get(&from_addr)
         .map_err(|e| format!("read sender: {e:?}"))?
         .ok_or_else(|| "CALLTOKEN sender account missing".to_string())?;
+    // java-tron reads TRC-10 balances through AccountCapsule.getAssetV2 ->
+    // AssetUtil.importAsset: an asset-optimized account keeps its balances in
+    // the separate account-asset store, NOT inline in the Account proto. Merge
+    // them before the sender-balance check — without this an optimized sender
+    // reads 0 and a valid CALLTOKEN wrongly fails (the actuator paths in
+    // tron-actuator already do this; the VM paths must too).
+    tron_chainbase::import_all_asset(&mut from_acct);
     let from_balance = *from_acct.asset_v2.get(&key).unwrap_or(&0);
     if from_balance < value {
         return Err(format!(
@@ -896,6 +903,10 @@ fn apply_top_level_trc10(
             address: to.to_vec(),
             ..Default::default()
         });
+    // Same import-before-read for the recipient: an existing optimized target
+    // holds its balance in the account-asset store (a freshly-created default
+    // account is not optimized, so this is a no-op for it).
+    tron_chainbase::import_all_asset(&mut to_acct);
     let to_balance = *to_acct.asset_v2.get(&key).unwrap_or(&0);
     let new_to = to_balance
         .checked_add(value)

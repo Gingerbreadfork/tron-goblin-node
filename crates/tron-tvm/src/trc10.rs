@@ -516,6 +516,14 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 ..Default::default()
             });
 
+        // An asset-optimized account holds its TRC-10 balances in the separate
+        // account-asset store, not inline; merge them before reading/mutating
+        // so a nested CALLTOKEN sees the real balance (java getAssetV2 ->
+        // importAsset). Without this an optimized caller reads 0 and the
+        // transfer is silently skipped.
+        tron_chainbase::import_all_asset(&mut caller_account);
+        tron_chainbase::import_all_asset(&mut target_account);
+
         let caller_pre = caller_account.asset_v2.get(&token_id_key).copied();
         let target_pre = target_account.asset_v2.get(&token_id_key).copied();
 

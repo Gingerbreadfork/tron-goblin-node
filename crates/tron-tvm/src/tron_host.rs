@@ -31,9 +31,14 @@ use crate::database::{evm_to_tron_address, tron_to_evm_address, TronDatabase};
 impl TronDatabaseExt for TronDatabase {
     fn tron_token_balance(&self, address: Address, token_id: i64) -> i64 {
         let tron_addr = evm_to_tron_address(&address);
-        let Ok(Some(account)) = self.accounts.get(&tron_addr) else {
+        let Ok(Some(mut account)) = self.accounts.get(&tron_addr) else {
             return 0;
         };
+        // An asset-optimized account holds its TRC-10 balances in the separate
+        // account-asset store, not inline; merge them so the TOKENBALANCE
+        // opcode returns the real balance (java getTokenBalance -> getAssetV2
+        // -> importAsset).
+        tron_chainbase::import_all_asset(&mut account);
         // `Account.asset_v2` is keyed by decimal-string token_id (matches
         // java-tron's `Map<String, Long>` representation).
         account
@@ -291,6 +296,11 @@ impl TronDatabaseExt for TronDatabase {
 
         // ---- TRC-10 sweep ----
         if allow_trc10 {
+            // An asset-optimized contract holds its TRC-10 balances in the
+            // account-asset store, not inline; import them before the sweep so
+            // SELFDESTRUCT forwards the contract's real token holdings to the
+            // inheritor (java AccountCapsule.getAssetMapV2 imports first).
+            tron_chainbase::import_all_asset(&mut owner_account);
             for (token, amount) in std::mem::take(&mut owner_account.asset_v2) {
                 if amount == 0 {
                     continue;
@@ -1348,6 +1358,48 @@ mod tests {
         assert_eq!(
             TronDatabaseExt::tron_token_balance(&db, evm_addr_from_tron(tron_addr(0xbb)), 1_000_001),
             0
+        );
+    }
+
+    #[test]
+    fn token_balance_imports_asset_optimized_balance_from_store() {
+        // Regression for the asset-optimization VM read gap: when mainnet's
+        // getAllowAssetOptimization proposal is active, an `asset_optimized`
+        // account keeps its TRC-10 balances in the separate `account-asset`
+        // store, NOT inline in the Account proto. java reads them through
+        // getAssetV2 -> AssetUtil.importAsset on every access; our VM paths
+        // must do the same. Before the fix, the VM read inline asset_v2 (= 0)
+        // for an optimized holder, so a valid CALLTOKEN/TOKENBALANCE wrongly
+        // saw a zero balance (live symptom: "CALLTOKEN sender has 0 of token
+        // 1005027" while java had ~8.8e9).
+        use tron_chainbase::{set_account_asset_backend, AccountAssetStore};
+
+        let db = make_db();
+        let owner = tron_addr(0xc1);
+
+        // Install the process-wide account-asset backend (java
+        // AssetUtil.setAccountAssetStore). OnceLock set-once: this is the only
+        // setter in this test binary.
+        let asset_backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        set_account_asset_backend(asset_backend.clone());
+
+        // Optimized account: EMPTY inline asset_v2, real balance only in the store.
+        AccountAssetStore::new(asset_backend)
+            .put(&TronAddress::from_raw(owner), b"1005027", 8_888_877_224)
+            .unwrap();
+        let acct = Account {
+            address: owner.to_vec(),
+            asset_optimized: true,
+            ..Default::default()
+        };
+        db.accounts
+            .put(&TronAddress::from_raw(owner), &acct)
+            .unwrap();
+
+        assert_eq!(
+            TronDatabaseExt::tron_token_balance(&db, evm_addr_from_tron(owner), 1_005_027),
+            8_888_877_224,
+            "TOKENBALANCE must import an asset-optimized account's store balance, not read inline 0"
         );
     }
 
