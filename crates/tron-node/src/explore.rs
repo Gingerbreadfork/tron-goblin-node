@@ -21,7 +21,7 @@ use tron_proto::{
     transaction::contract::ContractType, AssetIssueContract, Block, CreateSmartContract,
     TransferContract, TriggerSmartContract,
 };
-use tron_types::block_validate::verify_tx_trie_root;
+use tron_types::block_validate::{verify_tx_trie_root, verify_witness_signature, BlockValidateError};
 
 /// TRON has 27 active Super Representatives producing blocks in rotation.
 const ACTIVE_SRS: usize = 27;
@@ -100,6 +100,10 @@ struct Inner {
     // verification (recomputed decode-only, proving byte-exact behaviour)
     verified_ok: u64,
     verified_bad: u64,
+    // producer signatures recovered from the block: how many were signed by the
+    // SR's own account key vs a delegated witness-permission (cold/hot) key
+    sig_direct: u64,
+    sig_delegated: u64,
     // consensus: which Super Representatives produced the blocks we saw
     producers: HashMap<[u8; 21], u64>,
     // contract methods called, by 4-byte selector
@@ -150,6 +154,8 @@ impl ExploreState {
             peak_tps: 0.0,
             verified_ok: 0,
             verified_bad: 0,
+            sig_direct: 0,
+            sig_delegated: 0,
             producers: HashMap::new(),
             methods: HashMap::new(),
             discovered: 0,
@@ -197,22 +203,27 @@ impl ExploreState {
         g.serving.insert(peer.to_string());
 
         // Independently re-verify the block, decode-only — exactly what makes
-        // this project notable: recompute the transaction Merkle root over the
-        // block's transactions and confirm it matches the root the network
-        // committed in the header. Proves we hash transactions byte-identically
+        // this project notable. (1) Recompute the transaction Merkle root over
+        // the block's transactions and confirm it matches the root the network
+        // committed in the header — proves we hash transactions byte-identically
         // to java-tron, live, for every block.
-        //
-        // We deliberately DON'T recover the producer signature here: ~a quarter
-        // of mainnet blocks are signed with a delegated witness-permission key
-        // (cold/hot key separation under ALLOW_MULTI_SIGN), so the recovered
-        // address is the permission key, not the header's witness address.
-        // Verifying those needs the producer's *account state* (its permission
-        // keys) — which a decode-only viewer doesn't have. The node's stateful
-        // sync DOES verify them, via `tron_executor::expected_block_signer`.
         if verify_tx_trie_root(block).is_ok() {
             g.verified_ok += 1;
         } else {
             g.verified_bad += 1;
+        }
+        // (2) Recover the producer's secp256k1 signature. If it recovers to the
+        // header's witness address, the SR signed with its own account key
+        // (direct). If it recovers to a *different* valid key, the SR signed
+        // with a delegated witness-permission key — cold/hot key separation
+        // under ALLOW_MULTI_SIGN, ~a quarter of mainnet's blocks. (We can't
+        // confirm that delegated key against the SR's account permissions here:
+        // that needs account state, which a decode-only viewer lacks; the node's
+        // stateful sync verifies it via `tron_executor::expected_block_signer`.)
+        match verify_witness_signature(block, None) {
+            Ok(_) => g.sig_direct += 1,
+            Err(BlockValidateError::WitnessMismatch { .. }) => g.sig_delegated += 1,
+            Err(_) => {} // missing / malformed signature (rare) — don't count
         }
         // The producing Super Representative, from the block header.
         if let Some(addr) = block
@@ -484,6 +495,17 @@ impl ExploreState {
             "  {GRN}🔐 {} blocks verified{RST} {vmark}  {DIM}tx Merkle root recomputed = network's{RST}",
             commas(g.verified_ok as i64)
         )));
+        // Producer signatures recovered: SR account key (direct) vs a delegated
+        // cold/hot witness-permission key — a real TRON consensus detail.
+        let sigs = g.sig_direct + g.sig_delegated;
+        if sigs > 0 {
+            s.push_str(&line(&format!(
+                "  {CYN}🔑 {} producer sigs recovered{RST}  {DIM}{} direct · {} delegated key (cold/hot SR){RST}",
+                commas(sigs as i64),
+                commas(g.sig_direct as i64),
+                commas(g.sig_delegated as i64)
+            )));
+        }
         // Session uptime + blocks + the discovered peer network.
         s.push_str(&line(&format!(
             "  {GRY}⏱ {} · 📦 {} blocks · 🌐 {} peers found (DNS+Kad) · {} serving{RST}",
