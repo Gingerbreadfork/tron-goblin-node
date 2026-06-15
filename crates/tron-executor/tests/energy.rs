@@ -9,7 +9,8 @@ use tron_chainbase::{AccountStore, DynamicPropertiesStore, KvBackend, MemBackend
 use tron_crypto::address::Address;
 use tron_executor::energy::{
     account_energy_limit_with_fix_ratio, consume_energy, effective_origin_energy_limit,
-    pay_energy_bill, vm_energy_budget_trigger, EnergyBill, EnergyCharge, EnergyError,
+    get_pre_tx_energy, pay_energy_bill, reset_energy_pre_consume, revert_energy_pre_consume,
+    vm_energy_budget_create, vm_energy_budget_trigger, EnergyBill, EnergyCharge, EnergyError,
 };
 use tron_proto::account::{AccountResource, FreezeV2, Frozen};
 use tron_proto::Account;
@@ -701,9 +702,11 @@ fn trigger_budget_adds_creator_subsidy_capped_by_origin_energy_limit() {
     };
     creator.frozen_v2.push(FreezeV2 { r#type: 1, amount: 1_000_000_000 });
     let budget = vm_energy_budget_trigger(
+        &env.accounts,
         &env.dyn_props,
+        &Address::from_raw(ALICE),
         &caller,
-        Some(&creator),
+        Some((&Address::from_raw(BOB), &creator)),
         /*percent=*/ 0,
         /*raw_origin_energy_limit=*/ 500,
         /*fee_limit=*/ 10_000_000,
@@ -732,9 +735,11 @@ fn trigger_budget_percent_100_means_no_creator_subsidy() {
         account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, 5_000_000, 0, 0);
     // percent == 100 → caller pays everything, creator contributes nothing.
     let budget = vm_energy_budget_trigger(
+        &env.accounts,
         &env.dyn_props,
+        &Address::from_raw(ALICE),
         &caller,
-        Some(&creator),
+        Some((&Address::from_raw(BOB), &creator)),
         100,
         500,
         5_000_000,
@@ -755,7 +760,9 @@ fn trigger_budget_no_creator_is_caller_only() {
     let caller_only =
         account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, 1_000_000, 0, 0);
     let budget = vm_energy_budget_trigger(
+        &env.accounts,
         &env.dyn_props,
+        &Address::from_raw(ALICE),
         &caller,
         None,
         100,
@@ -765,4 +772,136 @@ fn trigger_budget_no_creator_is_caller_only() {
         0,
     );
     assert_eq!(budget, caller_only);
+}
+
+#[test]
+fn preconsume_then_reset_restores_post_decay_state() {
+    // SAFETY PROPERTY (guards the byte-exact majority): java's budget-time
+    // frozen-energy PRE-CONSUME + the SUCCESS-path resetAccountUsage must, for a
+    // tx that touches no energy mid-VM, restore the account EXACTLY to the
+    // post-decay usage — so the net charge is byte-identical to the
+    // no-pre-consume flow. This is the invariant the whole fix rests on.
+    let env = Env::new();
+    seed_global_energy(&env, 100_000_000_000, 1_000);
+    let alice = Address::from_raw(ALICE);
+    let mut caller = Account {
+        address: ALICE.to_vec(),
+        balance: 10_000_000_000,
+        ..Default::default()
+    };
+    // Staked energy + a non-zero, STALE usage so the budget decay is meaningful.
+    caller.frozen_v2.push(FreezeV2 {
+        r#type: 1,
+        amount: 1_000_000_000,
+    });
+    caller.account_resource = Some(AccountResource {
+        energy_usage: 5_000_000,
+        latest_consume_time_for_energy: 0,
+        ..Default::default()
+    });
+    put(&env.accounts, ALICE, caller.clone());
+
+    let now_slot = 1_000; // within the 28800-block window → a partial decay.
+    // BUDGET: decay → pre-consume the frozen quota → persist → capture.
+    let _ = vm_energy_budget_create(
+        &env.accounts,
+        &env.dyn_props,
+        &alice,
+        &caller,
+        10_000_000,
+        0,
+        now_slot,
+    );
+    let cap = get_pre_tx_energy(&alice).expect("budget must capture the caller pre-consume");
+    assert!(
+        cap.usage < 5_000_000,
+        "budget must decay the stale usage (got {} vs 5_000_000)",
+        cap.usage
+    );
+    assert!(
+        cap.merged_usage > cap.usage,
+        "pre-consume must ADD the reserved frozen energy (merged {} vs decayed {})",
+        cap.merged_usage,
+        cap.usage
+    );
+    let persisted = env.accounts.get(&alice).unwrap().unwrap();
+    assert_eq!(
+        persisted.account_resource.as_ref().unwrap().energy_usage,
+        cap.merged_usage,
+        "budget must PERSIST the pre-consumed usage so an in-VM UNDELEGATE reads the un-decayed base"
+    );
+
+    // NO in-VM energy op: the SUCCESS-path reset must restore the EXACT post-decay
+    // usage and leave latest_consume_time at `now`.
+    reset_energy_pre_consume(&env.accounts, &env.dyn_props, &alice, None).unwrap();
+    let after = env.accounts.get(&alice).unwrap().unwrap().account_resource.unwrap();
+    assert_eq!(
+        after.energy_usage, cap.usage,
+        "resetAccountUsage must restore the exact post-decay usage (byte-exact safety property)"
+    );
+    assert_eq!(
+        after.latest_consume_time_for_energy, now_slot,
+        "reset must NOT touch latest_consume_time (stays `now` from the budget)"
+    );
+}
+
+#[test]
+fn revert_undoes_preconsume_to_original_state() {
+    // On a VM REVERT java never commits the budget pre-consume (it lives in the
+    // discarded rootRepository cache), so payEnergyBill decays the ORIGINAL row.
+    // We persist the pre-consume to the outer session (it survives the revert),
+    // so revert_energy_pre_consume must restore the ORIGINAL pre-budget energy
+    // fields — else the caller's usage stays inflated by `reserve` and its next
+    // tx wrongly runs OUT_OF_ENERGY (the regression this guards against).
+    let env = Env::new();
+    seed_global_energy(&env, 100_000_000_000, 1_000);
+    let alice = Address::from_raw(ALICE);
+    let mut caller = Account {
+        address: ALICE.to_vec(),
+        balance: 10_000_000_000,
+        ..Default::default()
+    };
+    caller.frozen_v2.push(FreezeV2 {
+        r#type: 1,
+        amount: 1_000_000_000,
+    });
+    caller.account_resource = Some(AccountResource {
+        energy_usage: 5_000_000,
+        latest_consume_time_for_energy: 0,
+        ..Default::default()
+    });
+    put(&env.accounts, ALICE, caller.clone());
+
+    let now_slot = 1_000;
+    let _ = vm_energy_budget_create(
+        &env.accounts,
+        &env.dyn_props,
+        &alice,
+        &caller,
+        10_000_000,
+        0,
+        now_slot,
+    );
+    // Budget persisted a MUTATED (decayed + pre-consumed) row.
+    let merged = env.accounts.get(&alice).unwrap().unwrap().account_resource.unwrap();
+    assert_ne!(
+        merged.energy_usage, 5_000_000,
+        "budget must have mutated the persisted usage"
+    );
+
+    // REVERT: must restore the ORIGINAL pre-budget fields exactly.
+    revert_energy_pre_consume(&env.accounts, &env.dyn_props, &alice, None).unwrap();
+    let after = env.accounts.get(&alice).unwrap().unwrap().account_resource.unwrap();
+    assert_eq!(
+        after.energy_usage, 5_000_000,
+        "revert must restore the ORIGINAL energy_usage (no `reserve` inflation)"
+    );
+    assert_eq!(
+        after.latest_consume_time_for_energy, 0,
+        "revert must restore the ORIGINAL latest_consume_time"
+    );
+    assert_eq!(
+        after.energy_window_size, 0,
+        "revert must restore the ORIGINAL window"
+    );
 }

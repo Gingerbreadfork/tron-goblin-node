@@ -38,37 +38,186 @@ use tron_proto::Account;
 
 use crate::resource::{
     calculate_global_limit_v1, calculate_global_limit_v2, increase_account, increase_default,
-    recovery_account, update_usage, usage as resource_usage, window_size, window_size_v2,
-    ResourceGates, ResourceKind, TRX_PRECISION,
+    recovery_account, set_latest_time, set_new_window_size, set_new_window_size_v2, set_usage,
+    update_usage, usage as resource_usage, window_size, window_size_v2, ResourceGates,
+    ResourceKind, TRX_PRECISION,
 };
 
+/// Per-account BUDGET-TIME energy capture — java `VMActuator`'s
+/// `getAccountEnergyLimitWithFixRatio` / `getTotalEnergyLimitWithFixRatio`
+/// PRE-CONSUME the caller's (and origin's) available frozen energy *before* the
+/// VM runs (`updateUsage`-decay → `setLatestConsumeTimeForEnergy(now)` →
+/// `setEnergyUsage(increase(usage, min(leftFrozen,feeLimit/spe), now, now))`)
+/// and PERSIST it, so an in-VM `UNDELEGATE`/`DELEGATE` reads the un-decayed,
+/// now-stamped usage. `ReceiptCapsule.payEnergyBill` later splits frozen-vs-fee
+/// against the captured `left` (NOT a post-exec re-read), and on the SUCCESS
+/// path `TransactionTrace.resetAccountUsage(V2)` removes the pre-consumed
+/// window-area using `usage/size/merged_usage/merged_size` — restoring the
+/// post-decay state so a tx that touched no energy mid-VM nets byte-identical.
+#[derive(Clone, Copy, Default)]
+pub struct EnergyPreConsume {
+    /// `callerEnergyLeft` / `originEnergyLeft` — the pay-time frozen-vs-fee
+    /// split clamp (captured pre-consume; the self-rent fix).
+    pub left: i64,
+    /// post-`updateUsage`-decay, pre-merge usage (the `D` the success reset
+    /// restores to).
+    pub usage: i64,
+    /// energy window AFTER the budget decay (v1).
+    pub size: i64,
+    /// energy window AFTER the budget decay (v2 / precision-scaled).
+    pub size_v2: i64,
+    /// usage AFTER the pre-consume merge-add.
+    pub merged_usage: i64,
+    /// energy window AFTER the pre-consume merge-add (v1).
+    pub merged_size: i64,
+    // --- ORIGINAL pre-budget RAW fields (snapshot before updateUsage) ---
+    // On VM revert java never commits the budget pre-consume, so payEnergyBill
+    // reads the ORIGINAL accountStore row and `useEnergy` decays from there.
+    // We persist the pre-consume to the outer session (it survives revert), so
+    // on revert we must RESTORE these to reproduce java's un-decayed base.
+    pub orig_usage: i64,
+    pub orig_lct: i64,
+    pub orig_window: i64,
+    pub orig_window_optimized: bool,
+}
+
 thread_local! {
-    /// Per-tx capture of each account's BUDGET-TIME energy quota — java
-    /// `VMActuator.getAccountEnergyLimitWithFixRatio` stores `callerEnergyLeft`
-    /// before execution and `ReceiptCapsule.payEnergyBill` splits frozen-vs-fee
-    /// against that STORED value, not a post-execution re-read. Matters when the
-    /// caller self-rents mid-tx (a JustLend rental delegates fresh frozen energy
-    /// back to it) — the re-read quota is then inflated, so we'd bill frozen
-    /// where java bills fee. Keyed by address bytes; cleared per VM tx.
-    static PRE_TX_ENERGY_QUOTA: std::cell::RefCell<std::collections::HashMap<Vec<u8>, i64>> =
+    /// Keyed by address bytes; cleared per VM tx (before its budget).
+    static PRE_TX_ENERGY: std::cell::RefCell<std::collections::HashMap<Vec<u8>, EnergyPreConsume>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Store an account's budget-time energy quota for the self-rent split fix.
-pub fn set_pre_tx_energy_quota(addr: &[u8], quota: i64) {
-    PRE_TX_ENERGY_QUOTA.with(|m| {
-        m.borrow_mut().insert(addr.to_vec(), quota);
+fn set_pre_tx_energy(addr: &[u8], cap: EnergyPreConsume) {
+    PRE_TX_ENERGY.with(|m| {
+        m.borrow_mut().insert(addr.to_vec(), cap);
     });
 }
 
-/// Clear the budget-time quota capture (call once per tx, before its budget).
-pub fn clear_pre_tx_energy_quota() {
-    PRE_TX_ENERGY_QUOTA.with(|m| m.borrow_mut().clear());
+/// Budget-time capture for an account (caller or origin), if pre-consumed.
+pub fn get_pre_tx_energy(addr: &Address) -> Option<EnergyPreConsume> {
+    let key: &[u8] = addr.as_bytes();
+    PRE_TX_ENERGY.with(|m| m.borrow().get(key).copied())
 }
 
+/// Clear the budget-time captures (call once per tx, before its budget).
+pub fn clear_pre_tx_energy_quota() {
+    PRE_TX_ENERGY.with(|m| m.borrow_mut().clear());
+}
+
+/// The captured budget-time frozen quota (`left`) for the pay-time split clamp.
 fn pre_tx_energy_quota_for(addr: &Address) -> Option<i64> {
     let key: &[u8] = addr.as_bytes();
-    PRE_TX_ENERGY_QUOTA.with(|m| m.borrow().get(key).copied())
+    PRE_TX_ENERGY.with(|m| m.borrow().get(key).map(|c| c.left))
+}
+
+/// java `VMActuator.getAccountEnergyLimitWithFixRatio` (the pre-consume block,
+/// VMActuator.java:574-591) and the identical origin block in
+/// `getTotalEnergyLimitWithFixRatio` (:757-773): BUDGET-TIME pre-consume of
+/// `reserve` frozen energy onto `account`, mutating it in place (decay →
+/// `lastTime=now` → merge-add `reserve`) and returning the capture
+/// [`reset_account_usage`] needs. Caller only when `support_unfreeze_delay`
+/// (== java `allowTvmFreezeV2`). `left_frozen` is the budget-time
+/// `getAccountLeftEnergyFromFreeze` (the pay-time split clamp). Caller's
+/// `reserve = min(leftFrozen, feeLimit/spe)`; origin's `reserve =
+/// creatorEnergyLimit` (may be 0 at `consume_user_resource_percent == 100`,
+/// in which case this is just a decay + now-stamp + window-rewrite, as java).
+fn apply_energy_pre_consume(
+    account: &mut Account,
+    dyn_props: &DynamicPropertiesStore,
+    now_slot: i64,
+    left_frozen: i64,
+    reserve: i64,
+) -> EnergyPreConsume {
+    let gates = ResourceGates {
+        support_unfreeze_delay: true,
+        support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+    };
+    // Snapshot the ORIGINAL raw energy fields BEFORE any mutation — java never
+    // commits this pre-consume on VM revert, so on revert we restore these so
+    // the charge decays from the original row exactly as java's `useEnergy`.
+    let (orig_usage, orig_lct, orig_window, orig_window_optimized) = account
+        .account_resource
+        .as_ref()
+        .map(|r| {
+            (
+                r.energy_usage,
+                r.latest_consume_time_for_energy,
+                r.energy_window_size,
+                r.energy_window_optimized,
+            )
+        })
+        .unwrap_or((0, 0, 0, false));
+    // c. updateUsage: decay the stored usage to `now`, rewrite the window.
+    update_usage(account, ResourceKind::Energy, now_slot, gates);
+    // d. setLatestConsumeTimeForEnergy(now) — AFTER the decay.
+    set_latest_time(account, ResourceKind::Energy, now_slot);
+    // e. capture the post-decay state (what resetAccountUsage restores to).
+    let usage = resource_usage(account, ResourceKind::Energy);
+    let size = window_size(account, ResourceKind::Energy);
+    let size_v2 = window_size_v2(account, ResourceKind::Energy);
+    // f. pre-consume `reserve`: increase(usage, reserve, now, now). lastTime==now
+    //    so the decay branch is skipped — a pure window-merge add. `increase_account`
+    //    returns the new usage AND rewrites the per-account window in place.
+    let merged_usage =
+        increase_account(account, ResourceKind::Energy, usage, reserve, now_slot, now_slot, gates);
+    set_usage(account, ResourceKind::Energy, merged_usage);
+    // g. capture the post-merge state.
+    let merged_size = window_size(account, ResourceKind::Energy);
+    EnergyPreConsume {
+        left: left_frozen,
+        usage,
+        size,
+        size_v2,
+        merged_usage,
+        merged_size,
+        orig_usage,
+        orig_lct,
+        orig_window,
+        orig_window_optimized,
+    }
+}
+
+/// java `TransactionTrace.resetAccountUsage` / `resetAccountUsageV2`
+/// (TransactionTrace.java:290-325): on the SUCCESS path, REMOVE the budget-time
+/// pre-consumed window-area from `account` (giving back the unused reserved
+/// frozen energy), restoring the post-decay usage/window. For a tx that touched
+/// no energy mid-VM this restores `account` EXACTLY to the captured post-decay
+/// `usage`/window, so the net is byte-identical to the no-pre-consume flow.
+/// Uses raw i64 `wrapping_mul` to match java's `long` area arithmetic (NOT
+/// i128/saturating). Does NOT touch `latest_consume_time` (stays `now`).
+fn reset_account_usage(account: &mut Account, cap: &EnergyPreConsume, support_v2: bool) {
+    let current_size = window_size(account, ResourceKind::Energy);
+    let current_usage = resource_usage(account, ResourceKind::Energy);
+    // newArea = currentUsage*currentSize - (mergedUsage*mergedSize - usage*size)
+    let new_area = current_usage.wrapping_mul(current_size).wrapping_sub(
+        cap.merged_usage
+            .wrapping_mul(cap.merged_size)
+            .wrapping_sub(cap.usage.wrapping_mul(cap.size)),
+    );
+    // If an area-merge happened during suicide, mergedSize != currentSize → keep
+    // the current window; else restore the captured post-decay window.
+    let new_size = if cap.merged_size == current_size { cap.size } else { current_size };
+    if new_size == 0 {
+        return; // defensive: java would ArithmeticException; an energy account never has a 0 window.
+    }
+    let new_usage = (new_area / new_size).max(0);
+    set_usage(account, ResourceKind::Energy, new_usage);
+    if support_v2 {
+        let current_size_v2 = window_size_v2(account, ResourceKind::Energy);
+        let new_size_v2 =
+            if cap.merged_size == current_size { cap.size_v2 } else { current_size_v2 };
+        set_new_window_size_v2(
+            account,
+            ResourceKind::Energy,
+            if new_usage == 0 { 0 } else { new_size_v2 },
+        );
+    } else {
+        set_new_window_size(
+            account,
+            ResourceKind::Energy,
+            if new_usage == 0 { 0 } else { new_size },
+        );
+    }
 }
 
 /// The two-step caller energy quota (`energy_limit - recover(decayed_D)`),
@@ -253,34 +402,26 @@ pub fn consume_energy(
             support_unfreeze_delay: true,
             support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
         };
-        // java's VM energy accounting is TWO-PHASE, and the two phases do NOT
-        // collapse into a single windowed `increase`:
-        //   1. `VMActuator` pre-consumes the available frozen energy, but first
-        //      calls `EnergyProcessor.updateUsage` — which decays `energy_usage`
-        //      to `now`, FLOORs it (`getUsage = avg*window/precision`) to a
-        //      `decayed_D`, and rewrites the per-account window. The pre-consume
-        //      and `TransactionTrace.resetAccountUsage` then cancel out, leaving
-        //      the account at exactly `(decayed_D, window_after_decay)` with
-        //      `latestConsumeTime = now`.
-        //   2. `ReceiptCapsule.payEnergyBill -> EnergyProcessor.useEnergy` then
-        //      `increase(decayed_D, staked, now, now)` — `lastTime == now`, so
-        //      NO further decay; it adds the staked slice onto the *floored*
-        //      `decayed_D` using `window_after_decay`.
-        // A single `increase(current_usage, staked, lct, now)` keeps the decayed
-        // average UN-floored and decays with the pre-decay window, so its stored
-        // usage drifts a sub-unit from java's. Across the tens of thousands of
-        // delegate/undelegate ops a heavy energy-rental account sees per window,
-        // that sub-unit compounds into the +1 `energy_usage` that shifts every
-        // `CheckUnDelegateResource` read (the af6f4896 / JustLend +6/+7 cascade).
-        // Replicate java's two phases exactly.
-        update_usage(&mut account, ResourceKind::Energy, now_slot, gates);
-        let decayed_d = resource_usage(&account, ResourceKind::Energy);
+        // java's VM energy is TWO-PHASE, and the two phases now live in two
+        // places: the budget (`vm_energy_budget_trigger`/`_create`) does phase 1
+        // — `EnergyProcessor.updateUsage` (decay+floor to `decayed_D`, rewrite
+        // window, stamp `latest_consume_time = now`) plus the frozen pre-consume
+        // — and persists it BEFORE the VM, so an in-VM UNDELEGATE/DELEGATE reads
+        // the un-decayed base. On success `TransactionTrace.resetAccountUsage`
+        // then restores `decayed_D` (un-touched-energy txs net unchanged). So by
+        // the time we get here the row is ALREADY at `(decayed_D, window_after,
+        // latest_consume_time = now)` (or, on revert, the un-reset merged value).
+        // Phase 2 — `ReceiptCapsule.payEnergyBill -> EnergyProcessor.useEnergy`
+        // — is then a SINGLE `increase(currentUsage, staked, latestConsumeTime,
+        // now)`. `latestConsumeTime == now` so the decay branch is skipped (pure
+        // window-merge add). Do NOT `updateUsage` again here: that extra
+        // div-ceil re-quantize is not in java's `useEnergy` and would drift.
         let new = increase_account(
             &mut account,
             ResourceKind::Energy,
-            decayed_d,
+            res.energy_usage,
             energy_from_frozen,
-            now_slot,
+            res.latest_consume_time_for_energy,
             now_slot,
             gates,
         );
@@ -561,6 +702,81 @@ pub fn account_energy_limit_with_fix_ratio(
     available.min(energy_from_fee_limit)
 }
 
+/// java `TransactionTrace.pay`'s SUCCESS-path reset (TransactionTrace.java:261-279):
+/// REMOVE the budget-time pre-consumed frozen energy from the ORIGIN (first) and
+/// the CALLER, restoring the post-decay usage so `pay_energy_bill` charges off
+/// the right base. MUST be called only on the VM-success path (java gates on
+/// `exception == null && !isRevert()`); on revert the pre-consume is left in
+/// place (and the charge still applies). No-op under the legacy (pre-Stake2.0)
+/// gate or when an account had no capture. Idempotent within a tx (captures
+/// cleared at the next budget).
+pub fn reset_energy_pre_consume(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    caller: &Address,
+    origin: Option<&Address>,
+) -> Result<(), EnergyError> {
+    if !dyn_props.support_unfreeze_delay() {
+        return Ok(());
+    }
+    let support_v2 = dyn_props.support_allow_cancel_all_unfreeze_v2();
+    // ORIGIN first (java order), only a distinct origin that was pre-consumed.
+    if let Some(o) = origin {
+        if o != caller {
+            if let (Some(cap), Some(mut a)) = (get_pre_tx_energy(o), accounts.get(o)?) {
+                reset_account_usage(&mut a, &cap, support_v2);
+                accounts.put(o, &a)?;
+            }
+        }
+    }
+    if let (Some(cap), Some(mut a)) = (get_pre_tx_energy(caller), accounts.get(caller)?) {
+        reset_account_usage(&mut a, &cap, support_v2);
+        accounts.put(caller, &a)?;
+    }
+    Ok(())
+}
+
+/// VM-REVERT energy handling: on a non-Success VM outcome java NEVER commits the
+/// budget pre-consume (it lives in the discarded `rootRepository` cache), so
+/// `payEnergyBill` reads the ORIGINAL `accountStore` row and `useEnergy` decays
+/// from `(orig_usage, orig_lct)`. Our budget persisted the pre-consume to the
+/// outer session (which SURVIVES the VM revert), so on revert we must UNDO it —
+/// restore the caller (and distinct origin) to their original pre-budget energy
+/// fields — so the subsequent `consume_energy` charge decays from the original
+/// exactly as java. Call ONLY on the non-Success path, under the budget's gate.
+pub fn revert_energy_pre_consume(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    caller: &Address,
+    origin: Option<&Address>,
+) -> Result<(), EnergyError> {
+    if !dyn_props.support_unfreeze_delay() {
+        return Ok(());
+    }
+    // ORIGIN first (java order), distinct origin only.
+    if let Some(o) = origin {
+        if o != caller {
+            if let (Some(cap), Some(mut a)) = (get_pre_tx_energy(o), accounts.get(o)?) {
+                let r = a.account_resource.get_or_insert_with(Default::default);
+                r.energy_usage = cap.orig_usage;
+                r.latest_consume_time_for_energy = cap.orig_lct;
+                r.energy_window_size = cap.orig_window;
+                r.energy_window_optimized = cap.orig_window_optimized;
+                accounts.put(o, &a)?;
+            }
+        }
+    }
+    if let (Some(cap), Some(mut a)) = (get_pre_tx_energy(caller), accounts.get(caller)?) {
+        let r = a.account_resource.get_or_insert_with(Default::default);
+        r.energy_usage = cap.orig_usage;
+        r.latest_consume_time_for_energy = cap.orig_lct;
+        r.energy_window_size = cap.orig_window;
+        r.energy_window_optimized = cap.orig_window_optimized;
+        accounts.put(caller, &a)?;
+    }
+    Ok(())
+}
+
 /// java `VMActuator.getTotalEnergyLimitWithFixRatio` for a `TriggerSmartContract`
 /// call: the caller's budget plus the contract creator's subsidy.
 ///
@@ -575,24 +791,49 @@ pub fn account_energy_limit_with_fix_ratio(
 /// Pure reads — the actual split charge happens after execution in
 /// [`pay_energy_bill`].
 pub fn vm_energy_budget_trigger(
+    accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    caller_addr: &Address,
     caller: &Account,
-    creator: Option<&Account>,
+    creator: Option<(&Address, &Account)>,
     consume_user_resource_percent: i64,
     raw_origin_energy_limit: i64,
     fee_limit: i64,
     call_value: i64,
     now_slot: i64,
 ) -> i64 {
-    // SELF-RENT FIX: capture the caller's quota at budget time (before the VM
-    // runs / self-rents) — java's `setCallerEnergyLeft`.
-    set_pre_tx_energy_quota(
-        &caller.address,
-        caller_energy_quota_left(caller, dyn_props, now_slot),
-    );
-    let caller_energy_limit =
-        account_energy_limit_with_fix_ratio(caller, dyn_props, fee_limit, call_value, now_slot);
-    let Some(creator) = creator else {
+    let spe = sun_per_energy(dyn_props);
+    let energy_from_fee_limit = fee_limit / spe;
+    // CALLER term — java `getAccountEnergyLimitWithFixRatio`. `left_frozen` is
+    // java's `leftFrozenEnergy` (single recover, read BEFORE updateUsage); it is
+    // captured as `callerEnergyLeft` (the pay-time split clamp) AND drives the
+    // pre-consume `reserve`, exactly as java uses the one value for both.
+    let left_frozen = account_left_energy_from_freeze(caller, dyn_props, now_slot);
+    let energy_from_balance = caller.balance.saturating_sub(call_value).max(0) / spe;
+    let caller_energy_limit = left_frozen
+        .saturating_add(energy_from_balance)
+        .min(energy_from_fee_limit);
+    // CALLER pre-consume + capture (java VMActuator.java:574-591), gated on
+    // support_unfreeze_delay (== allowTvmFreezeV2). Persists usage->limit with
+    // lastTime=now BEFORE the VM so an in-VM UNDELEGATE/DELEGATE reads the
+    // un-decayed base. The legacy (pre-Stake2.0) path keeps the old read-only
+    // `left` capture untouched.
+    if dyn_props.support_unfreeze_delay() {
+        let reserve = left_frozen.min(energy_from_fee_limit);
+        let mut c = caller.clone();
+        let cap = apply_energy_pre_consume(&mut c, dyn_props, now_slot, left_frozen, reserve);
+        let _ = accounts.put(caller_addr, &c);
+        set_pre_tx_energy(caller_addr.as_bytes(), cap);
+    } else {
+        set_pre_tx_energy(
+            caller_addr.as_bytes(),
+            EnergyPreConsume {
+                left: caller_energy_quota_left(caller, dyn_props, now_slot),
+                ..Default::default()
+            },
+        );
+    }
+    let Some((creator_addr, creator)) = creator else {
         return caller_energy_limit;
     };
     let percent = consume_user_resource_percent.clamp(0, 100);
@@ -616,7 +857,57 @@ pub fn vm_energy_budget_trigger(
     } else {
         0
     };
+    // ORIGIN pre-consume + capture (java VMActuator.java:757-773). Runs
+    // UNCONDITIONALLY under the gate even at percent==100 (reserve=
+    // creator_energy_limit, which is 0 there → just decay + now-stamp + window
+    // rewrite + persist, as java).
+    if dyn_props.support_unfreeze_delay() {
+        let mut o = creator.clone();
+        let cap =
+            apply_energy_pre_consume(&mut o, dyn_props, now_slot, origin_left, creator_energy_limit);
+        let _ = accounts.put(creator_addr, &o);
+        set_pre_tx_energy(creator_addr.as_bytes(), cap);
+    }
     caller_energy_limit.saturating_add(creator_energy_limit)
+}
+
+/// `CreateSmartContract` energy budget — java
+/// `getAccountEnergyLimitWithFixRatio(caller, ...)` (caller IS the origin, no
+/// split). Persists the caller pre-consume + capture under the gate, exactly
+/// like the caller term of [`vm_energy_budget_trigger`]; NEVER an origin
+/// pre-consume (caller == origin).
+pub fn vm_energy_budget_create(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    caller_addr: &Address,
+    caller: &Account,
+    fee_limit: i64,
+    call_value: i64,
+    now_slot: i64,
+) -> i64 {
+    let spe = sun_per_energy(dyn_props);
+    let energy_from_fee_limit = fee_limit / spe;
+    let left_frozen = account_left_energy_from_freeze(caller, dyn_props, now_slot);
+    let energy_from_balance = caller.balance.saturating_sub(call_value).max(0) / spe;
+    let limit = left_frozen
+        .saturating_add(energy_from_balance)
+        .min(energy_from_fee_limit);
+    if dyn_props.support_unfreeze_delay() {
+        let reserve = left_frozen.min(energy_from_fee_limit);
+        let mut c = caller.clone();
+        let cap = apply_energy_pre_consume(&mut c, dyn_props, now_slot, left_frozen, reserve);
+        let _ = accounts.put(caller_addr, &c);
+        set_pre_tx_energy(caller_addr.as_bytes(), cap);
+    } else {
+        set_pre_tx_energy(
+            caller_addr.as_bytes(),
+            EnergyPreConsume {
+                left: caller_energy_quota_left(caller, dyn_props, now_slot),
+                ..Default::default()
+            },
+        );
+    }
+    limit
 }
 
 /// Top-level energy charge for a smart-contract tx — splits the bill
@@ -674,7 +965,14 @@ pub fn pay_energy_bill(
     // per-contract `origin_energy_limit`. Both clamps are non-negative
     // so the result fits in i64 without overflow concerns.
     let origin_share_raw = total_i.saturating_mul(percent) / 100;
-    let origin_left = origin_quota_left(accounts, dyn_props, origin_addr, now_slot)?;
+    // java `ReceiptCapsule.payEnergyBill` clamps the origin share by the
+    // BUDGET-TIME `originEnergyLeft` captured before execution, not a pay-time
+    // re-read. Prefer the capture (symmetric with the caller split); fall back
+    // to a live read for the legacy (pre-Stake2.0) path with no capture.
+    let origin_left = match pre_tx_energy_quota_for(origin_addr) {
+        Some(left) => left,
+        None => origin_quota_left(accounts, dyn_props, origin_addr, now_slot)?,
+    };
     let origin_usage = origin_share_raw
         .min(origin_left)
         .min(origin_energy_limit.max(0))

@@ -351,7 +351,7 @@ fn set_window_optimized(account: &mut Account, kind: ResourceKind, b: bool) {
 /// java-tron `AccountCapsule.setNewWindowSizeV2(resourceCode, v)` — writes the
 /// window and marks the account window-optimized (so the precision-scaled
 /// value is interpreted correctly on subsequent reads).
-fn set_new_window_size_v2(account: &mut Account, kind: ResourceKind, v: i64) {
+pub fn set_new_window_size_v2(account: &mut Account, kind: ResourceKind, v: i64) {
     set_new_window_size(account, kind, v);
     if !window_optimized(account, kind) {
         set_window_optimized(account, kind, true);

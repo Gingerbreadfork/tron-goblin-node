@@ -3296,8 +3296,11 @@ fn vm_energy_budget_for_trigger(
             let contracts = tron_chainbase::ContractStore::new(view.contracts.clone() as _);
             match contracts.get(ca) {
                 Ok(Some(sc)) => {
+                    // Keep the origin ADDRESS alongside its account row — the
+                    // budget now persists the origin's pre-consume and must
+                    // write it back keyed by address.
                     let creator = match address_from_proto(&sc.origin_address) {
-                        Some(o) if &o != caller => accounts.get(&o).ok().flatten(),
+                        Some(o) if &o != caller => accounts.get(&o).ok().flatten().map(|a| (o, a)),
                         _ => None,
                     };
                     (
@@ -3312,9 +3315,11 @@ fn vm_energy_budget_for_trigger(
         None => (None, 0, 0),
     };
     let budget = energy::vm_energy_budget_trigger(
+        &accounts,
         dp,
+        caller,
         &caller_acct,
-        creator_acct.as_ref(),
+        creator_acct.as_ref().map(|(a, acc)| (a, acc)),
         percent,
         raw_origin_energy_limit,
         fee_limit,
@@ -3347,7 +3352,7 @@ fn vm_energy_budget_for_create(
         return 0;
     };
     let budget =
-        energy::account_energy_limit_with_fix_ratio(&caller_acct, dp, fee_limit, call_value, now_slot);
+        energy::vm_energy_budget_create(&accounts, dp, caller, &caller_acct, fee_limit, call_value, now_slot);
     budget.max(0).min(MAX_VM_ENERGY_LIMIT as i64) as u64
 }
 
@@ -3608,6 +3613,51 @@ fn execute_vm_tx(
             .commit()
             .expect("db error in execute_vm_tx: VmSession::commit flush failed"),
         _ => vm_session.revert(),
+    }
+
+    // The budget pre-consumed the caller's (and origin's) frozen energy and
+    // PERSISTED it before the VM so an in-VM UNDELEGATE/DELEGATE read the
+    // un-decayed base. Now reconcile it like java `TransactionTrace.pay`:
+    //   * SUCCESS → `resetAccountUsage(V2)`: give back the unused pre-consume so
+    //     the charge bills off the post-decay base. Runs even when
+    //     energy_used == 0 (java resets regardless), so it's OUTSIDE the
+    //     `energy_used > 0` guard.
+    //   * REVERT/HALT/etc. → UNDO the pre-consume: java never committed it (it
+    //     lived in the discarded rootRepository cache), so the charge must decay
+    //     from the ORIGINAL row. Our budget persisted to the outer session
+    //     (survives the VM revert), so we restore the original fields here.
+    // Gated on `require_fee_limit` — only strict (consensus) mode ran the budget
+    // pre-consume; lenient/constant-call never captured, so skip (and avoid
+    // reading a stale thread-local capture from a prior strict tx).
+    if config.require_fee_limit {
+        if let Some(caller) = caller_addr {
+            let accounts = AccountStore::new(view.accounts.clone() as _);
+            let dp_store = DynamicPropertiesStore::new(view.dyn_props.clone() as _);
+            // Re-derive the distinct origin exactly as the pay block below.
+            let origin = match &trigger_contract_addr {
+                Some(contract_addr) => {
+                    let contracts = ConS::new(view.contracts.clone() as _);
+                    match contracts.get(contract_addr) {
+                        Ok(Some(sc)) => {
+                            address_from_proto(&sc.origin_address).filter(|o| *o != caller)
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            if matches!(&outcome, tron_tvm::execute::VmOutcome::Success { .. }) {
+                let _ =
+                    energy::reset_energy_pre_consume(&accounts, &dp_store, &caller, origin.as_ref());
+            } else {
+                let _ = energy::revert_energy_pre_consume(
+                    &accounts,
+                    &dp_store,
+                    &caller,
+                    origin.as_ref(),
+                );
+            }
+        }
     }
 
     // Charge energy for the caller. java-tron does this in
