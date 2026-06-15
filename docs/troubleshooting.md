@@ -12,14 +12,15 @@ Then rerun the Cargo command.
 
 ## Build Cannot Find `libclang`
 
-`rocksdb` depends on bindgen through `librocksdb-sys`, which needs libclang.
-Run:
+`rocksdb` → `librocksdb-sys` → `bindgen` needs libclang at build time. It is
+loaded *dynamically* (the `bindgen-runtime` feature), so the versioned
+`libclang.so.NN` your distro ships is discovered automatically — just install
+the package (`clang-devel` / `libclang-dev` / `clang` / `brew install llvm`).
+If libclang lives in a non-standard location, point Cargo at it:
 
 ```sh
-./scripts/setup-libclang.sh
+export LIBCLANG_PATH=/path/to/dir/containing/libclang
 ```
-
-The script creates a shim path used by `.cargo/config.toml`.
 
 ## RocksDB Reports Too Many Open Files
 

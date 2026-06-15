@@ -6,7 +6,6 @@
 - `config.example.toml`: annotated runtime defaults and operator-facing config.
 - `README.md`: public overview, status, build/run notes.
 - `docs/`: task-oriented human docs and AI-focused context.
-- `scripts/setup-libclang.sh`: libclang discovery shim for RocksDB builds.
 - `scripts/sync-from-peer.sh`: controlled sync test helper.
 
 ## Crates by Task

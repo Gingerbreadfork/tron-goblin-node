@@ -11,13 +11,11 @@ ports or relying on this node for critical workflows.
 
 - Rust stable, workspace MSRV 1.80 or newer.
 - `protoc`, used by protobuf build scripts.
-- `libclang`, required by `rocksdb` through `bindgen`.
+- `libclang`, required by `rocksdb` through `bindgen` (loaded dynamically at
+  build time, so a normal install is discovered automatically).
 
-If `libclang` is installed but not discoverable, run:
-
-```sh
-./scripts/setup-libclang.sh
-```
+If `libclang` is installed in a non-standard location, set `LIBCLANG_PATH` to
+the directory containing it.
 
 ## Build and Test
 

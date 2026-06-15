@@ -32,8 +32,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
 
-      - name: Set up libclang shim
-        run: bash scripts/setup-libclang.sh
-
       - name: Run test suite
         run: cargo test --workspace --release

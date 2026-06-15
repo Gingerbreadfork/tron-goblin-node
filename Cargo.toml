@@ -90,8 +90,15 @@ tonic = "0.12"
 tonic-build = "0.12"
 # Base58
 bs58 = "0.5"
-# RocksDB
-rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4"] }
+# RocksDB.
+# `default-features = false` drops the heavy compression backends (zstd/zlib/
+# bzip2) we don't use. We re-add `bindgen-runtime` explicitly: it makes
+# librocksdb-sys's bindgen LOAD libclang dynamically at build time (dlopen,
+# which finds the versioned `libclang.so.NN` every distro ships) instead of
+# statically LINKING `-lclang` (which needs a bare `libclang.so` only the
+# `-devel`/`-dev` packages provide). Without it the build needs the
+# libclang-shim workaround; with it a normal libclang install just works.
+rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4", "bindgen-runtime"] }
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }

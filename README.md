@@ -385,18 +385,13 @@ Prerequisites:
 - **Protoc**. Used by `tron-proto`'s build script. `protoc --version`
   should print `3.x` or `5.x`.
 - **libclang**. Pulled in transitively by `rocksdb` → `librocksdb-sys`
-  → `bindgen`. On Fedora / RHEL / Arch without the `clang` meta-package
-  you'll need to create a `libclang.so` symlink — run the shim
-  script once after cloning:
-
-  ```sh
-  ./scripts/setup-libclang.sh
-  ```
-
-  The script is idempotent and auto-detects the highest-versioned
-  `libclang` on the host (Debian / Ubuntu / macOS paths included).
-  `.cargo/config.toml` points `LIBCLANG_PATH` at the shim directory
-  it creates.
+  → `bindgen`, which loads it *dynamically* at build time (the
+  `bindgen-runtime` feature), so the versioned `libclang.so.NN` every
+  distro ships is found automatically — no symlink or shim needed. Just
+  install your platform's package: `clang-devel`/`llvm-devel` (Fedora /
+  RHEL), `libclang-dev` (Debian / Ubuntu), `clang` (Arch), or `brew
+  install llvm` (macOS). If it lives somewhere non-standard, point
+  `LIBCLANG_PATH` at the directory containing it.
 
 Then:
 
