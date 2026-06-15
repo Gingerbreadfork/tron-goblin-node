@@ -935,25 +935,22 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // === Sync driver: one driver, all peers in rotation ===
     //
     // Peer-set assembly:
-    //   - Start from `config.p2p.peers` (CLI/TOML-supplied).
-    //   - If `config.p2p.use_mainnet_seeds` is on, append the
-    //     `tron_net::MAINNET_SEEDS` list (deduped against `peers`).
-    //   - If the result is empty AND no explicit peers were given,
-    //     fall back to MAINNET_SEEDS so `tron-node start` with no
-    //     flags does something useful.
-    //   - If `config.p2p.discover_enable`, spawn a KadService on the
-    //     advertise port (UDP) bootstrapped from the assembled set,
-    //     wait `discover_bootstrap_ms` for the routing table to fill,
-    //     then merge the discovered peers in (deduped). This is what
-    //     lifts us from "only ever talk to the 13 seeds" to "talk to
-    //     the wider TRON network like a real java-tron node."
+    //   - Start from `config.p2p.peers` (CLI/TOML-supplied). May be empty —
+    //     there is no hardcoded seed list; the node finds peers on its own.
+    //   - The DNS tree (trondisco.net) is walked below and its endpoints merged
+    //     in (deduped), which is the primary bootstrap with no `--peer`.
+    //   - If `config.p2p.discover_enable`, spawn a KadService on the advertise
+    //     port (UDP) bootstrapped from the assembled set, wait
+    //     `discover_bootstrap_ms` for the routing table to fill, then merge the
+    //     discovered peers in (deduped) — talking to the wider TRON network
+    //     like a real java-tron node.
     let seed_peers = assemble_peers(&config.p2p);
     let mut combined_peers = seed_peers.clone();
 
     // Build NodePersistService over the `common` store. java-tron's
     // discovery layer flushes the active table to disk every 60s and
     // re-seeds from it on startup. This is what lets a restart skip
-    // re-bootstrapping from MAINNET_SEEDS when a usable peer set is
+    // re-bootstrapping from discovery when a usable peer set is
     // already on disk.
     let node_persist = crate::node_persist::NodePersistService::new(
         Arc::new(tron_chainbase::CommonStore::new(stores.common.clone())),
@@ -982,25 +979,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
-    // `--explore` live dashboard: the tip checkpoint has already been spoofed
-    // into the head above (`tip_test`), and `follow_tip` makes the drivers
-    // anchor their locator there and advance as the live tail streams in. Here
-    // we create the shared session-stats sink and spawn the renderer that
-    // paints the dashboard to stdout (logs go to stderr, so they don't
-    // collide). The Arc is cloned into every sync driver below.
-    let explore_state: Option<Arc<crate::explore::ExploreState>> = if config.p2p.explore {
-        let tip = config
-            .p2p
-            .tip_test
-            .as_ref()
-            .map(|c| c.block_num)
-            .unwrap_or(0);
-        let st = Arc::new(crate::explore::ExploreState::new(tip));
-        tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
-        Some(st)
-    } else {
-        None
-    };
+    // `--explore` tip discovery + dashboard is set up below, AFTER peer
+    // discovery has populated `combined_peers` (we probe discovered peers for
+    // the live tip, not the overloaded hardcoded seeds).
 
     // Shared, continuously-grown discovery pool for rotation drivers
     // (java-tron-like always-active discovery). The Kad feeder below
@@ -1186,6 +1167,43 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             );
         }
     }
+
+    // `--explore` live dashboard. Bootstrap tip: an explicit `--tip-test`
+    // checkpoint wins; otherwise discover it over p2p from the freshly
+    // DISCOVERED peer pool (not the hardcoded seeds — those bootstrap nodes are
+    // overloaded and ban new dials). We ask peers for their head, spoof ours to
+    // it, then `follow_tip` makes the drivers anchor there and stream the live
+    // tail. The renderer paints the dashboard to stdout (logs go to stderr).
+    let explore_state: Option<Arc<crate::explore::ExploreState>> = if config.p2p.explore {
+        let tip_num = if let Some(cp) = &config.p2p.tip_test {
+            cp.block_num
+        } else {
+            info!("explore: discovering the live tip from the peer network…");
+            match discover_tip(&combined_peers).await {
+                Some((num, hash)) => {
+                    use tron_chainbase::DynamicPropertiesStore;
+                    let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
+                    dp.save_latest_block_header_number(num);
+                    dp.save_latest_block_header_hash(&hash);
+                    info!(tip = num, "explore: locked onto the live tip");
+                    num
+                }
+                None => {
+                    error!(
+                        "explore: couldn't reach a peer to learn the tip — check your \
+                         connection, or pass --peer HOST:18888"
+                    );
+                    0
+                }
+            }
+        };
+        let st = Arc::new(crate::explore::ExploreState::new(tip_num));
+        tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
+        Some(st)
+    } else {
+        None
+    };
+
     // Filter out peers we dialed recently — within the upstream's 60s
     // `bannedNodes` window (plus margin). Re-dialing immediately after
     // a restart would just refresh those bans, locking us out for
@@ -1848,6 +1866,169 @@ fn random_node_id_64() -> Vec<u8> {
     id.to_vec()
 }
 
+/// The synthetic head we advertise while probing for the tip — far above any
+/// real chain height (~30 years of blocks). It just signals "I'm caught up" so
+/// the peer volunteers its own head. Peers that echo our Hello back report this
+/// value as their "head"; we filter those out (see [`pick_anchor_tip`]).
+const PROBE_AHEAD_HEAD: i64 = 900_000_000;
+
+/// Ask one peer for its current head over the real TRON handshake.
+///
+/// We advertise a deliberately far-ahead head, so the peer treats us as
+/// caught-up and replies with a normal reciprocal `HelloMessage` (carrying its
+/// own head) instead of starting to serve us a backfill. A peer that advertises
+/// `head = genesis` only ever gets an `ImplicitAccept` with no head — claiming
+/// to be ahead is what makes the peer volunteer its tip. The peer never
+/// validates our head hash (only the genesis id), so the synthetic head is
+/// fine. Returns the peer's `(head_number, head_hash_32)`.
+async fn probe_peer_head(peer: String) -> Option<(i64, [u8; 32])> {
+    use tron_net::{
+        HandshakeOutcome, HelloInputs, Libp2pHelloInputs, PeerConnection, MAINNET_P2P_VERSION,
+    };
+    use tron_proto::Endpoint;
+    use tron_types::{genesis_block_id, mainnet_inputs, BlockId};
+
+    let genesis = genesis_block_id(&mainnet_inputs());
+    let mut ahead = [0u8; 32];
+    ahead[..8].copy_from_slice(&PROBE_AHEAD_HEAD.to_be_bytes());
+    let ahead_id = BlockId::from_raw(ahead);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let node_id = random_node_id_64();
+
+    let probe = async {
+        let mut conn = match PeerConnection::dial(&peer).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(peer = %peer, "tip probe: dial failed: {e}");
+                return None;
+            }
+        };
+        let from = Endpoint {
+            address: b"127.0.0.1".to_vec(),
+            address_ipv6: Vec::new(),
+            port: 18_888,
+            node_id: node_id.clone(),
+        };
+        if let Err(e) = conn
+            .libp2p_handshake(Libp2pHelloInputs {
+                from: from.clone(),
+                network_id: 11_111,
+                version: 2,
+                timestamp_ms: now,
+            })
+            .await
+        {
+            debug!(peer = %peer, "tip probe: libp2p handshake failed: {e}");
+            return None;
+        }
+        let outcome = match conn
+            .handshake(HelloInputs {
+                from,
+                version: MAINNET_P2P_VERSION,
+                timestamp_ms: now,
+                genesis,
+                solid: ahead_id,
+                head: ahead_id,
+                node_type: 0,
+                lowest_block_num: 0,
+                code_version: b"tron-goblin/0.0.1",
+            })
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                debug!(peer = %peer, "tip probe: app handshake failed: {e}");
+                return None;
+            }
+        };
+        let hello = match outcome {
+            HandshakeOutcome::Verified(h) => h,
+            HandshakeOutcome::ImplicitAccept => {
+                debug!(peer = %peer, "tip probe: implicit accept (no head)");
+                return None;
+            }
+        };
+        let head = hello.head_block_id?;
+        if head.hash.len() != 32 || head.number <= 0 {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&head.hash);
+        Some((head.number, hash))
+    };
+
+    match tokio::time::timeout(Duration::from_secs(10), probe).await {
+        Ok(res) => res,
+        Err(_) => None,
+    }
+}
+
+/// Discover the current mainnet tip over p2p for `--explore`: probe batches of
+/// the DISCOVERED peer pool concurrently, ask each for its head, and take the
+/// highest. No external HTTP and no hardcoded seed list — the node bootstraps
+/// itself with its own protocol over peers it found via discovery. Each round
+/// samples a fresh window of the pool (most peers answer; some are full/busy),
+/// so a handful of healthy nodes is enough. `None` only if nothing answers
+/// across all rounds.
+async fn discover_tip(peers: &[String]) -> Option<(i64, [u8; 32])> {
+    if peers.is_empty() {
+        return None;
+    }
+    const BATCH: usize = 64;
+    // Start at a time-varied offset so restarts don't always hit the same peers.
+    let mut offset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as usize)
+        .unwrap_or(0)
+        % peers.len();
+
+    for _round in 0..4 {
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..BATCH.min(peers.len()) {
+            let peer = peers[(offset + i) % peers.len()].clone();
+            set.spawn(async move { probe_peer_head(peer).await });
+        }
+        offset = (offset + BATCH) % peers.len();
+
+        let mut heads: Vec<(i64, [u8; 32])> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok(Some(h)) = joined {
+                heads.push(h);
+            }
+        }
+        if let Some(tip) = pick_anchor_tip(heads) {
+            return Some(tip);
+        }
+    }
+    None
+}
+
+/// Choose the bootstrap block from a round of probed peer heads.
+///
+/// The discovered pool is a wide mix: nodes at the tip, half-synced nodes far
+/// behind, and a few that echo our far-ahead probe head straight back. So:
+///   1. Drop the echoes (heads at/above the synthetic probe head).
+///   2. The tip is the MAX of what remains (real nodes top out at the live tip;
+///      the many laggards sit below it, so the median/mean would anchor us
+///      hundreds of thousands of blocks back).
+///   3. Anchor at the LOWEST head within a small window below that tip — a
+///      recent block essentially every up-to-date peer holds, so the follow
+///      locator is never rejected with `BAD_PROTOCOL` (vs the bare max, which a
+///      peer one block behind the leader would refuse).
+fn pick_anchor_tip(heads: Vec<(i64, [u8; 32])>) -> Option<(i64, [u8; 32])> {
+    let real: Vec<(i64, [u8; 32])> = heads
+        .into_iter()
+        .filter(|(n, _)| *n > 0 && *n < PROBE_AHEAD_HEAD)
+        .collect();
+    let tip = real.iter().map(|(n, _)| *n).max()?;
+    real.into_iter()
+        .filter(|(n, _)| *n >= tip - 16)
+        .min_by_key(|(n, _)| *n)
+}
+
 
 // ---------------------------------------------------------------------------
 // Address-history index wiring
@@ -2379,24 +2560,15 @@ fn hex_encode(b: &[u8]) -> String {
     s
 }
 
-/// Combine `p2p.peers` with `MAINNET_SEEDS` when seeds are enabled or
-/// when no explicit peers were given. Dedup preserves first-occurrence
-/// order so a user-provided peer always sorts before a seed.
+/// The startup dial list: the explicit `p2p.peers`, deduped (first-occurrence
+/// order preserved). There is no hardcoded seed list — with no `--peer` the
+/// node bootstraps entirely from peer discovery (the DNS tree + Kad DHT).
 pub(crate) fn assemble_peers(p2p: &crate::config::P2pConfig) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in &p2p.peers {
         if seen.insert(p.clone()) {
             out.push(p.clone());
-        }
-    }
-    let want_seeds = p2p.use_mainnet_seeds || p2p.peers.is_empty();
-    if want_seeds {
-        for s in tron_net::MAINNET_SEEDS {
-            let s = (*s).to_string();
-            if seen.insert(s.clone()) {
-                out.push(s);
-            }
         }
     }
     out
@@ -2408,39 +2580,48 @@ mod assemble_peers_tests {
     use crate::config::P2pConfig;
 
     #[test]
-    fn empty_peers_falls_back_to_mainnet_seeds() {
-        let p2p = P2pConfig::default();
-        let peers = assemble_peers(&p2p);
-        assert_eq!(peers.len(), tron_net::MAINNET_SEEDS.len());
+    fn no_peers_means_empty_dial_list_discovery_only() {
+        // No explicit peers: the startup dial list is empty and the node
+        // bootstraps purely via discovery (DNS tree + Kad DHT).
+        assert!(assemble_peers(&P2pConfig::default()).is_empty());
     }
 
     #[test]
-    fn explicit_peers_used_alone_when_seeds_disabled() {
+    fn explicit_peers_used_in_order_and_deduped() {
         let p2p = P2pConfig {
-            peers: vec!["1.2.3.4:18888".into()],
-            use_mainnet_seeds: false,
+            peers: vec![
+                "1.2.3.4:18888".into(),
+                "5.6.7.8:18888".into(),
+                "1.2.3.4:18888".into(),
+            ],
             ..P2pConfig::default()
         };
-        let peers = assemble_peers(&p2p);
-        assert_eq!(peers, vec!["1.2.3.4:18888".to_string()]);
+        assert_eq!(
+            assemble_peers(&p2p),
+            vec!["1.2.3.4:18888".to_string(), "5.6.7.8:18888".to_string()]
+        );
     }
 
     #[test]
-    fn explicit_peers_plus_seeds_dedups_and_orders_explicit_first() {
-        let seed0 = tron_net::MAINNET_SEEDS[0].to_string();
-        let p2p = P2pConfig {
-            peers: vec!["1.2.3.4:18888".into(), seed0.clone()],
-            use_mainnet_seeds: true,
-            ..P2pConfig::default()
+    fn pick_anchor_tip_ignores_echoes_and_laggards() {
+        let id = |n: i64| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&n.to_be_bytes());
+            (n, h)
         };
-        let peers = assemble_peers(&p2p);
-        // First two entries are the explicit peers, in order.
-        assert_eq!(peers[0], "1.2.3.4:18888");
-        assert_eq!(peers[1], seed0);
-        // No duplicates of seed0 later.
-        assert_eq!(peers.iter().filter(|p| **p == seed0).count(), 1);
-        // Length = explicit (2) + remaining seeds.
-        assert_eq!(peers.len(), 1 + tron_net::MAINNET_SEEDS.len());
+        // 5 real near-tip heads + 1 echo (our 900M probe head reflected) + 1
+        // half-synced laggard. Anchor at the lowest of the real cluster.
+        let heads = vec![
+            id(83_615_700),
+            id(83_615_701),
+            id(83_615_699),
+            id(83_615_702),
+            id(83_615_700),
+            id(900_000_000),
+            id(50_000_000),
+        ];
+        assert_eq!(super::pick_anchor_tip(heads).unwrap().0, 83_615_699);
+        assert!(super::pick_anchor_tip(vec![]).is_none());
     }
 
     #[test]

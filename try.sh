@@ -8,15 +8,15 @@
 # USDT transfers, contract calls, tokens, the busiest block, live TPS. No
 # snapshot, no 100GB+ backfill, no hours of syncing.
 #
-# How it works: the node fetches the current chain tip from a public TRON HTTP
-# endpoint (one tiny request), tells its peers it's already at that tip, and the
-# peers stream it the live block tail over the real TRON p2p protocol. Blocks
-# are decoded for display only — never executed (there is no chain state).
+# How it works: the node discovers the current chain tip over the real TRON
+# peer-to-peer protocol (it asks live peers for their head), tells peers it's
+# already there so they stream it the live block tail, and decodes every block
+# for display only — never executed (there is no chain state). No HTTP, no
+# external services: just the node and the network.
 #
 # Usage:
 #   ./try.sh                      # follow the live mainnet tip
 #   ./try.sh --peer HOST:18888    # also pin a specific p2p peer
-#   ./try.sh --endpoint URL       # use a different HTTP endpoint for the tip
 #
 set -euo pipefail
 
@@ -35,16 +35,12 @@ err()  { printf '%s%s%s\n' "$RED" "$*" "$RST" >&2; }
 # --- config ----------------------------------------------------------------
 RPC_PORT=8190
 PEER=""
-ENDPOINT="https://api.trongrid.io"
-# Backup public HTTP endpoints for the one-shot tip fetch.
-ENDPOINTS=("https://api.trongrid.io" "https://api.tronstack.io")
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --peer) shift; PEER="${1:-}"; [ -n "$PEER" ] || { err "--peer needs HOST:PORT"; exit 2; } ;;
-    --endpoint) shift; ENDPOINT="${1:-}"; ENDPOINTS=("$ENDPOINT") ;;
     --rpc-port) shift; RPC_PORT="${1:-}" ;;
-    -h|--help) sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) err "unknown flag: $1 (try --help)"; exit 2 ;;
   esac
   shift
@@ -85,33 +81,6 @@ else
   exit 1
 fi
 
-# --- check curl + python ---------------------------------------------------
-command -v curl >/dev/null 2>&1 || { err "need 'curl' to fetch the chain tip."; exit 1; }
-command -v python3 >/dev/null 2>&1 || { err "need 'python3' to parse the chain tip."; exit 1; }
-
-# --- fetch the live tip ----------------------------------------------------
-say "fetching the current mainnet tip…"
-TIP=""
-for EP in "${ENDPOINTS[@]}"; do
-  JSON="$(curl -s --max-time 10 -X POST "$EP/wallet/getnowblock" -H 'content-type: application/json' 2>/dev/null || true)"
-  TIP="$(printf '%s' "$JSON" | python3 -c '
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    n = d["block_header"]["raw_data"]["number"]; h = d["blockID"]
-    assert isinstance(n, int) and len(h) == 64
-    print(f"{n}:{h}")
-except Exception:
-    pass' 2>/dev/null || true)"
-  if [ -n "$TIP" ]; then ok "live tip: block #${TIP%%:*}  (via ${EP#https://})"; break; fi
-  warn "  $EP unreachable, trying next…"
-done
-if [ -z "$TIP" ]; then
-  err "could not fetch the chain tip from any public endpoint."
-  err "check your internet connection, or pass --endpoint https://your-node"
-  exit 1
-fi
-
 # --- throwaway data dir ----------------------------------------------------
 DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tron-goblin-try.XXXXXX")"
 LOG_FILE="$DATA_DIR/node.log"
@@ -134,18 +103,19 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # --- launch ----------------------------------------------------------------
-say "connecting to mainnet peers and locking onto the tip…"
+say "connecting to mainnet peers and discovering the live tip…"
 sleep 1
 
-PEER_ARGS=(--mainnet-seeds)
+# No seed list — the node finds peers via discovery (DNS tree + Kad DHT).
+PEER_ARGS=()
 [ -n "$PEER" ] && PEER_ARGS+=(--peer "$PEER")
 
 # The dashboard renders on stdout; all logs go to stderr → the log file, so
 # they never corrupt the dashboard. RUST_LOG kept quiet (warnings only).
 RUST_LOG="${RUST_LOG:-warn}" TRON_LOG_FILE=off \
   "$BIN" start \
-    --explore "$TIP" \
-    "${PEER_ARGS[@]}" \
+    --explore \
+    ${PEER_ARGS[@]+"${PEER_ARGS[@]}"} \
     --data-dir "$DATA_DIR" \
     --rpc-port "$RPC_PORT" \
     --no-http --no-grpc --no-metrics \

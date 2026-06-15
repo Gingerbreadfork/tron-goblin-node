@@ -59,8 +59,8 @@ pub use kad::{KadHandle, KadService, Node as KadNode, RoutingTable};
 
 pub use envelope::{decode_envelope, encode_envelope, message_id, EnvelopeError};
 pub use hello::{
-    build_hello, to_wire_block_id, HelloInputs, MAINNET_P2P_VERSION, MAINNET_SEEDS,
-    NILE_P2P_VERSION, SHASTA_P2P_VERSION,
+    build_hello, to_wire_block_id, HelloInputs, MAINNET_P2P_VERSION, NILE_P2P_VERSION,
+    SHASTA_P2P_VERSION,
 };
 pub use message_type::{MessageType, MessageTypeError};
 pub use peer::{

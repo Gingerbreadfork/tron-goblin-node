@@ -942,12 +942,6 @@ pub struct P2pConfig {
     /// count gate.) Default `100` ⇒ enabled.
     #[serde(default = "default_progress_log_interval")]
     pub progress_log_interval: usize,
-    /// Mix `tron_net::MAINNET_SEEDS` into the peer pool, in addition
-    /// to any explicit `peers`. When `peers` is empty, the seeds are
-    /// always used regardless of this flag — so a flagless `tron-node
-    /// start` does something useful.
-    #[serde(default)]
-    pub use_mainnet_seeds: bool,
     /// Port we advertise to peers in our Hello messages. Default
     /// `18888` (java-tron's mainnet P2P port). java-tron's
     /// `NetUtil.validNode` rejects port `0` with `BAD_PROTOCOL`, so
@@ -973,11 +967,9 @@ pub struct P2pConfig {
     /// dial). Only consulted when `listen = true`.
     #[serde(default = "default_listen_host")]
     pub listen_host: String,
-    /// Enable Kademlia DHT peer discovery. When on, bootstraps from
-    /// `peers` + `MAINNET_SEEDS` over UDP, then augments the TCP dial
-    /// list with the discovered peers. Off keeps the legacy
-    /// seeds-only behavior. java-tron parity flag:
-    /// `node.p2p.discover.enable`.
+    /// Enable Kademlia DHT peer discovery. When on, bootstraps from any
+    /// explicit `peers` over UDP, then augments the TCP dial list with the
+    /// discovered peers. java-tron parity flag: `node.p2p.discover.enable`.
     #[serde(default = "default_discover_enable")]
     pub discover_enable: bool,
     /// How long to wait at startup for the DHT bootstrap to populate
@@ -1129,7 +1121,6 @@ impl Default for P2pConfig {
             max_blocks: None,
             disabled: false,
             progress_log_interval: default_progress_log_interval(),
-            use_mainnet_seeds: false,
             advertise_port: default_advertise_port(),
             max_peers: default_max_peers(),
             listen: default_listen(),

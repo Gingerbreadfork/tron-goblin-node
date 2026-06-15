@@ -106,20 +106,17 @@ verify-snapshot:  open an existing data_dir/db/ and print the same report as
 Each --peer flag accepts a HOST:PORT and may be repeated to add more
 peers. --no-rpc / --no-sync disable the respective subsystem.
 
-If no --peer is given (and --no-sync is not set), the daemon falls
-back to the built-in MAINNET_SEEDS list. Pass --mainnet-seeds to mix
-them into an explicit peer set. Peer dial order is randomized
-per-session.
+If no --peer is given (and --no-sync is not set), the daemon finds peers
+on its own via discovery — the DNS tree (trondisco.net) and the Kademlia
+DHT. Peer dial order is randomized per-session.
 
 --progress-log-interval N  during sync, emit a heartbeat every N applied
                            blocks (default 100; set 1 to log every block).
---mainnet-seeds            append the built-in mainnet seed list to --peer.
---explore NUM:HASH         live mainnet time-machine dashboard. Bootstraps
-                           from a real recent tip (NUM:HASH), follows the live
+--explore                  live mainnet dashboard. Discovers the current tip
+                           from peers over p2p (no setup), follows the live
                            block tail, and paints a self-updating terminal
                            dashboard of real mainnet activity (decode-only --
-                           no execution, no state, no snapshot). Easiest via
-                           ./try.sh, which fetches the tip for you.
+                           no execution, no state, no snapshot). Try ./try.sh.
 --metrics-port N           Prometheus /metrics listen port (default 9090).
 --metrics-host HOST        Prometheus /metrics bind host (default 127.0.0.1).
 --no-metrics               disable the Prometheus metrics endpoint.
@@ -1138,46 +1135,20 @@ fn parse_args(args: &[String]) -> Result<NodeConfig, String> {
             "--no-sync" => {
                 config.p2p.disabled = true;
             }
-            "--mainnet-seeds" => {
-                config.p2p.use_mainnet_seeds = true;
-            }
             "--follow-tip" => {
                 config.p2p.follow_tip = true;
             }
             "--explore" => {
-                // `--explore BLOCK_NUM:HEX_HASH` — live mainnet dashboard.
-                // The checkpoint is a real recent tip (try.sh fetches it from a
-                // public endpoint); it seeds the head spoof (tip_test), enables
-                // the live-tail follow mechanic (follow_tip), and turns on the
-                // dashboard renderer (explore).
-                i += 1;
-                let arg = args
-                    .get(i)
-                    .ok_or("--explore needs BLOCK_NUM:HEX_HASH (run ./try.sh)")?;
-                let (num_str, hash_str) = arg
-                    .split_once(':')
-                    .ok_or_else(|| format!("--explore BLOCK_NUM:HEX_HASH (no `:` in {arg})"))?;
-                let block_num: i64 = num_str
-                    .parse()
-                    .map_err(|e| format!("--explore block num: {e}"))?;
-                if hash_str.len() != 64 {
-                    return Err(format!(
-                        "--explore hash must be 64 hex chars (got {})",
-                        hash_str.len()
-                    ));
-                }
-                hex::decode(hash_str).map_err(|e| format!("--explore hex hash: {e}"))?;
-                config.p2p.tip_test = Some(tron_node::config::TipTestCheckpoint {
-                    block_num,
-                    block_id_hex: hash_str.to_string(),
-                });
-                config.p2p.follow_tip = true;
+                // Live mainnet dashboard. Takes no argument: the node discovers
+                // the current tip over p2p (asks peers for their head) and
+                // follows the live tail. `follow_tip` makes the drivers anchor
+                // their locator at that head and advance as blocks arrive; the
+                // single-peer fetch path is far more robust here than the
+                // multi-peer fetch-pool (tuned for bulk catch-up, can wedge in
+                // the stateless decode-only path). An explicit `--tip-test
+                // NUM:HASH` may still be passed to pin the starting tip.
                 config.p2p.explore = true;
-                // Explore only needs to follow the live tail (a tiny gap), and
-                // the simple single-peer "continue from last block" refresh is
-                // far more robust here than the multi-peer fetch-pool (which is
-                // tuned for fast bulk catch-up and can wedge in the stateless
-                // decode-only path). Force the single-peer path.
+                config.p2p.follow_tip = true;
                 config.p2p.multi_peer_fetch = false;
             }
             "--metrics-port" => {

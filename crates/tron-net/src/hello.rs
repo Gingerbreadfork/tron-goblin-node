@@ -20,27 +20,6 @@ pub const NILE_P2P_VERSION: i32 = 201_910_292;
 /// Shasta testnet `node.p2p.version`.
 pub const SHASTA_P2P_VERSION: i32 = 1;
 
-/// Known mainnet seed peers from java-tron's `config.conf` (mainnet
-/// `seed.node.ip.list`). Useful as a fallback peer set when the user
-/// runs `tron-node start` without `--peer` flags. Public mainnet
-/// seeds frequently hit `TOO_MANY_PEERS` — randomizing the dial order
-/// across this pool gives a better acceptance rate.
-pub const MAINNET_SEEDS: &[&str] = &[
-    "3.225.171.164:18888",
-    "52.8.46.215:18888",
-    "3.79.71.167:18888",
-    "108.128.110.16:18888",
-    "18.133.82.227:18888",
-    "35.180.81.133:18888",
-    "13.210.151.5:18888",
-    "18.231.27.82:18888",
-    "3.12.212.122:18888",
-    "52.24.128.7:18888",
-    "15.207.144.3:18888",
-    "3.39.38.55:18888",
-    "54.151.226.240:18888",
-];
-
 /// Inputs for assembling a HelloMessage. Each `*_block_id` argument is the
 /// 32-byte [`tron_types::BlockId`] (first 8 bytes = number). The wire
 /// format carries `(hash, number)` as separate fields — see

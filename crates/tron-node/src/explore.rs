@@ -365,10 +365,11 @@ impl ExploreState {
             .unwrap_or(1.0);
         let tps = win_txs as f64 / span;
         let blk_per_s = win_blocks as f64 / span;
-        // Only track the peak once we're actually following the live tip — the
-        // brief bootstrap catch-up burst would otherwise post a wildly
-        // unrealistic spike (thousands of TPS) that misrepresents mainnet.
-        if g.live && tps > g.peak_tps {
+        // Only track the peak during steady live cadence (~1 block / 3s, i.e.
+        // blk/s well under 1). The brief bootstrap catch-up burst processes
+        // several blocks in a fraction of a second and would otherwise post a
+        // wildly unrealistic TPS spike that misrepresents mainnet.
+        if g.live && blk_per_s <= 1.0 && tps > g.peak_tps {
             g.peak_tps = tps;
         }
         let peak_tps = g.peak_tps;
