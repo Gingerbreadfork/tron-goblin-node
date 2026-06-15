@@ -35,38 +35,48 @@ into a self-updating dashboard:
 ```text
 🧌 TRON GOBLIN  ·  MAINNET LIVE FEED
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  📅 2026-06-15 09:11:12 UTC      block #83,615,112
-  🟢 LIVE    ⚡ 221 TPS · peak 663    📦 0.3 blk/s · 🔗 8 peers
-  ⏱ watching 36s · 📦 12 blocks streamed
-  block sizes ▄▃▄▅█▂▅▂▁█▆▃  (txs/block, last 12)
+  📅 2026-06-15 10:53:15 UTC      block #83,617,153
+  🟢 LIVE    ⚡ 283 TPS · peak 341    📦 0.4 blk/s · 🔗 20 peers
+  🔐 46 blocks verified ✓  tx Merkle root recomputed = network's
+  🔑 46 producer sigs recovered  33 direct · 13 delegated key (cold/hot SR)
+  ⏱ 2m 10s · 📦 46 blocks · 🌐 2,513 peers found (DNS+Kad) · 2 serving
+  block sizes ▂▃▃▂▁█▆▁▅▁▂▃▂▂▃▂▅▂▃▃▄▃▂▅▂▄▇▅▄▄  (txs/block, last 30)
   ── THIS SESSION ──────────────────────────────────────────────
-   🔄 transactions 8,253           👛 active wallets 3,801
-   💵 TRX moved 476K               💚 USDT volume $39.90M
-   📜 contract calls 1,675         💸 USDT transfers 1,632
-   🪙 token transfers 843          🗳 votes+stakes 1,060
-   🚀 busiest block 813 txs        🐋 biggest USDT $12.00M
+   🔄 transactions 26,247          👛 active wallets 10,318
+   💵 TRX moved 770K               💚 USDT volume $75.60M
+   📜 contract calls 6,101         💸 USDT transfers 5,933
+   🪙 token transfers 3,537        🗳 votes+stakes 3,670
+   🚀 busiest block 844 txs        🐋 biggest USDT $7.00M
   ── TX MIX ────────────────────────────────────────────────────
-   ▪ TRX 37%   ▪ USDT 19%   ▪ tokens 10%   ▪ other 32%
+   ▪ TRX 33%  ▪ USDT 22%  ▪ tokens 13%  ▪ other 30%   🔧 transfer 96%
+  ── PRODUCERS · live SR rotation ─────────────────────────────
+   🏛 TQzd66b…SPPZ ×2   TQhuVjZ…PkEX ×2   TSMC4Yz…Bk2E ×2  · 27 of 27 SRs
   ── BLOCK STREAM ──────────────────────────────────────────────
-   ▸ #83,615,112  654 tx · 105 USDT $1.71M · 1,988 TRX
-   ▸ #83,615,111  749 tx · 156 USDT $11.00M · 2,588 TRX
-   ▸ #83,615,110  804 tx · 185 USDT $1.40M · 2,352 TRX
+   ▸ #83,617,153  629 tx · 160 USDT $1.90M · 3,136 TRX
+   ▸ #83,617,152  615 tx · 161 USDT $1.00M · 11,512 TRX
+   ▸ #83,617,151  660 tx · 173 USDT $1.16M · 18,181 TRX
   ── MILESTONES ────────────────────────────────────────────────
-   🐋 Whale: $12.00M USDT in a single transfer (#83,615,107)
-   🚀 Heavy block: 813 txs in 3 seconds (#83,615,105)
+   🐋 Whale: $7.00M USDT in a single transfer
+   🚀 Heavy block: 844 txs in 3 seconds
 ```
 
-This is **not** a mock — it's the genuine TRON peer-to-peer protocol at work.
-`try.sh` grabs the current chain tip, the node tells live peers it's already
-there so they stream it the block tail, and it decodes every block itself: no
-chain state, no execution, no database — just the wire protocol and a parser,
-which is why it starts instantly. The USDT dollar amounts and whale alerts are
-pulled straight out of the real contract calldata.
+This is **not** a mock — it's the genuine TRON peer-to-peer protocol. The node
+finds peers on its own (the DNS tree + Kademlia DHT — no hardcoded seed list),
+learns the current tip straight from them, and follows the live block tail,
+decoding every block itself: no chain state, no execution, no database, which
+is why it starts in seconds.
 
-Pin a specific peer with `./try.sh --peer HOST:18888`. It runs on a throwaway
-temp directory and an isolated RPC port, and cleans up after itself on exit.
-Needs only `curl` + `python3` (to fetch the starting tip) and a release build
-(`cargo build --release`, or drop a `tron-node` binary next to the script).
+And it isn't just *reading* the chain — it's **checking** it. For every block it
+independently recomputes the transaction Merkle root and confirms it matches the
+one the network committed (proving it hashes transactions byte-for-byte like
+java-tron), and it recovers the producer's signature — even spotting the SRs
+that sign with a delegated cold/hot key. USDT dollar amounts come straight out
+of the real contract calldata.
+
+Pin a peer with `./try.sh --peer HOST:18888`. It runs on a throwaway temp
+directory and an isolated RPC port, and cleans up after itself. No API keys, no
+external services — just a release build (`cargo build --release`, or drop a
+`tron-node` binary next to the script).
 
 ## What this is
 
