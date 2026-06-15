@@ -87,6 +87,7 @@ pub fn build_unsigned_tx(
         raw_data: Some(raw),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     })
 }
 

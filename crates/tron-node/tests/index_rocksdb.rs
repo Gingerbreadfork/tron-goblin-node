@@ -81,6 +81,7 @@ fn transfer(priv_key: &[u8; 32], from: [u8; 21], to: [u8; 21], amount: i64, salt
             contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
             ..Default::default()
         }],
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, priv_key).expect("sign");
     tx

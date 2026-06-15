@@ -224,6 +224,7 @@ fn transfer_tx(owner: [u8; 21], to: [u8; 21], amount: i64) -> Transaction {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     // Sign with ALICE_PRIV when ALICE is the owner — every test in this
     // file uses ALICE as the sender. The signature is required since
@@ -357,6 +358,7 @@ fn smart_contract_tx_is_rejected_via_notimplemented() {
         }),
         signature: vec![vec![0u8; 65]],
         ret: Vec::new(),
+        unparsed_field10: None,
     };
 
     let block = build_block(1, [0u8; 32], vec![trigger_tx]);
@@ -403,6 +405,7 @@ fn shielded_transfer_tx_validates_through_real_actuator() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     let block = build_block(1, [0u8; 32], vec![tx]);
     let report = execute_block(&state.backends(), &block, None).unwrap();
@@ -763,6 +766,7 @@ fn freeze_v2_bw_tx(owner: [u8; 21], amount: i64) -> Transaction {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     if owner == ALICE {
         tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("sign");
@@ -858,6 +862,7 @@ fn parallel_many_freezes_one_block_weight_matches_serial() {
                 scripts: Vec::new(), timestamp: 1_700_000_000_000, fee_limit: 0,
             }),
             signature: Vec::new(), ret: Vec::new(),
+            unparsed_field10: None,
         };
         tron_types::sign_transaction(&mut tx, pk).expect("sign");
         tx
@@ -1002,6 +1007,7 @@ fn parallel_conflicting_undelegate_matches_serial() {
             }),
             signature: Vec::new(),
             ret: Vec::new(),
+            unparsed_field10: None,
         };
         tron_types::sign_transaction(&mut tx, &owner_priv).expect("sign");
         tx
@@ -1115,6 +1121,7 @@ fn parallel_many_delegates_same_owner_matches_serial() {
             }),
             signature: Vec::new(),
             ret: Vec::new(),
+            unparsed_field10: None,
         };
         tron_types::sign_transaction(&mut tx, &owner_priv).expect("sign");
         tx
@@ -1240,6 +1247,7 @@ fn parallel_delegate_undelegate_churn_matches_serial() {
             }),
             signature: Vec::new(),
             ret: Vec::new(),
+            unparsed_field10: None,
         };
         tron_types::sign_transaction(&mut tx, &owner_priv).expect("sign");
         tx

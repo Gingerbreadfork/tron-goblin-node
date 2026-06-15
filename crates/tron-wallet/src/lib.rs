@@ -259,6 +259,7 @@ mod tests {
             }),
             signature: Vec::new(),
             ret: Vec::new(),
+            unparsed_field10: None,
         };
         let mut unsigned = Vec::new();
         tx.encode(&mut unsigned).unwrap();

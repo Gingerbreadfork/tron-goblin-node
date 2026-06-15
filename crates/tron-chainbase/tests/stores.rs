@@ -78,6 +78,7 @@ fn sample_transaction(amount: i64) -> Transaction {
         raw_data: Some(raw),
         signature: vec![vec![0xaa; 65]],
         ret: Vec::new(),
+        unparsed_field10: None,
     }
 }
 

@@ -6693,6 +6693,7 @@ mod trx_inventory_tests {
             }),
             signature: vec![],
             ret: vec![],
+            unparsed_field10: None,
         };
         let priv_key = {
             let mut k = [0u8; 32];

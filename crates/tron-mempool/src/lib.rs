@@ -609,6 +609,7 @@ mod tests {
             }),
             signature: vec![],
             ret: vec![],
+            unparsed_field10: None,
         };
         tron_types::sign_transaction(&mut tx, &PRIV).unwrap();
         tx.encode_to_vec()
@@ -645,6 +646,7 @@ mod tests {
             }),
             signature: vec![],
             ret: vec![],
+            unparsed_field10: None,
         };
         let err = m.submit(&tx.encode_to_vec()).unwrap_err();
         assert!(matches!(err, MempoolError::NoSignatures));

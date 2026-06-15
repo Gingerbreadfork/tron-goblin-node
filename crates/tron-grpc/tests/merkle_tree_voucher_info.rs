@@ -86,6 +86,7 @@ fn build_shielded_tx(block_num: u64, tx_offset: u8, output_count: usize) -> (Tra
             raw_data: Some(raw),
             signature: vec![],
             ret: vec![],
+            unparsed_field10: None,
         },
         tx_id,
     )

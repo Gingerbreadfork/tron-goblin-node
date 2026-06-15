@@ -924,6 +924,7 @@ mod serialized_bytes_tests {
             }),
             signature: (0..sigs).map(|i| vec![i as u8; 65]).collect(),
             ret,
+            unparsed_field10: None,
         }
     }
 
@@ -975,5 +976,89 @@ mod serialized_bytes_tests {
                 "serialized_bytes diverged from clear-ret on case {i}"
             );
         }
+    }
+
+    /// Ground-truth regression: real mainnet transactions whose Transaction
+    /// wrapper carries a stray field-10 (unknown to java's schema, preserved
+    /// by java's protobuf and BILLED for bandwidth). These bytes were read
+    /// directly from a java-tron 4.8.1.1 LiteFullNode's block store at the
+    /// stated heights; `bandwidth cost` values were captured from java's own
+    /// `BandwidthProcessor` DEBUG log. Before modelling field 10, prost
+    /// dropped it and `serialized_bytes` under-counted by the field's framed
+    /// size (2..214 bytes), under-charging net bandwidth.
+    #[test]
+    fn serialized_bytes_includes_field10_like_java() {
+        fn hx(s: &str) -> Vec<u8> {
+            (0..s.len() / 2)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        }
+        // tx 9bb2f5e8@83317795 — USDT transfer from 41fe4792. field10 = a
+        // verbatim 211-byte copy of raw_data. java full=499, clearRet=495,
+        // bandwidth cost (clearRet+64) = 559.
+        let usdt = hx("0ad3010a02540f220838fa3a5a2874200140e8a3feaae9335aae01081f12a9010a31747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e54726967676572536d617274436f6e747261637412740a1541fe4792ec35f2c300dc3b4722b3b5fcd2d2b0156a121541a614f803b6fd780986a42c78ec9c7f77e6ded13c2244a9059cbb0000000000000000000000003d93998b456c0366ef4f6a4c973d987196c440f700000000000000000000000000000000000000000000000000000000123d308070fdeafaaae933900180a3c347124134515bd7068e7a71d305f2462c366f7b6edec21ba862b587f2a85ed202d414358247da3515a2972bc387fd58a7ae11ab7bd1d832c2c195f797d3edfc887b25b01c2a02180152d3010a02540f220838fa3a5a2874200140e8a3feaae9335aae01081f12a9010a31747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e54726967676572536d617274436f6e747261637412740a1541fe4792ec35f2c300dc3b4722b3b5fcd2d2b0156a121541a614f803b6fd780986a42c78ec9c7f77e6ded13c2244a9059cbb0000000000000000000000003d93998b456c0366ef4f6a4c973d987196c440f700000000000000000000000000000000000000000000000000000000123d308070fdeafaaae933900180a3c347");
+        let tx = Transaction::decode(usdt.as_slice()).expect("decode usdt tx");
+        // Re-encode must be byte-identical to the consensus tx (full size 499).
+        assert_eq!(tx.encoded_len(), 499, "usdt full re-encode size");
+        assert_eq!(tx.encode_to_vec(), usdt, "usdt re-encode not byte-identical");
+        // clearRet serialized = 495; bandwidth cost (clearRet + 64) = 559.
+        assert_eq!(serialized_bytes(&tx), 495, "usdt clearRet size");
+        assert_eq!(
+            serialized_bytes(&tx) as i64 + MAX_RESULT_SIZE_IN_TX,
+            559,
+            "usdt bandwidth bytesSize must equal java's"
+        );
+        assert_eq!(serialized_bytes(&tx), clear_ret_len(&tx));
+
+        // The other observed shape is an EMPTY field-10 (the two 41fe4792
+        // Transfers 28f55e77@83317791 / a8bc75de@83317803): java still counts
+        // its framing as 2 bytes (`0x52 0x00`). Because field 10 is `optional`,
+        // a present-but-empty value (`Some(vec![])`) re-emits those 2 bytes;
+        // absent (`None`) is a no-op. Assert all three deterministically.
+        let mut t = Transaction {
+            raw_data: Some(tron_proto::transaction::Raw {
+                ref_block_bytes: vec![0xab; 2],
+                ref_block_num: 1,
+                ref_block_hash: vec![0xcd; 8],
+                expiration: 1,
+                timestamp: 1,
+                ..Default::default()
+            }),
+            signature: vec![vec![0u8; 65]],
+            ret: vec![tron_proto::transaction::Result::default()],
+            unparsed_field10: None,
+        };
+        let without = t.encoded_len();
+        // Absent field-10 (well-formed tx) → no size change.
+        assert_eq!(t.encoded_len(), without, "absent field10 must be a no-op");
+        // Present-but-empty field-10 → 2 bytes (key + zero-length varint),
+        // exactly java's accounting for the Transfers.
+        t.unparsed_field10 = Some(Vec::new());
+        assert_eq!(
+            t.encoded_len(),
+            without + 2,
+            "empty field10 must add 2 bytes like java"
+        );
+        // Non-empty field-10 adds key(1) + len-varint(1) + payload.
+        t.unparsed_field10 = Some(vec![0x42; 5]);
+        assert_eq!(
+            t.encoded_len(),
+            without + 1 + 1 + 5,
+            "field10 framing must match java's wire accounting"
+        );
+
+        // prost must DECODE a present-but-empty field 10 as Some(empty) (not
+        // None) and re-emit its 2 bytes — otherwise the 41fe4792 Transfers,
+        // which carry exactly `0x52 0x00`, would lose those 2 bytes on the
+        // decode→serialized_bytes round trip and stay under-charged.
+        let wire = [0x0au8, 0x00, 0x52, 0x00]; // empty raw_data + empty field10
+        let decoded = Transaction::decode(wire.as_slice()).expect("decode empty field10");
+        assert_eq!(
+            decoded.unparsed_field10,
+            Some(Vec::new()),
+            "empty field10 must decode as Some(empty), not None"
+        );
+        assert_eq!(decoded.encode_to_vec(), wire, "must re-emit the empty field10");
+        assert_eq!(serialized_bytes(&decoded), 4);
     }
 }

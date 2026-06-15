@@ -443,6 +443,7 @@ fn shielded_tx(contract: ShieldedTransferContract) -> tron_proto::Transaction {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     }
 }
 

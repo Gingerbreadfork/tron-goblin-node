@@ -249,6 +249,7 @@ fn build_trigger_tx(
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, caller_priv).expect("sign");
     tx

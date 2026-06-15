@@ -167,6 +167,7 @@ fn genesis_transaction(to_address: [u8; 21], amount: i64) -> Transaction {
         raw_data: Some(raw),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     }
 }
 

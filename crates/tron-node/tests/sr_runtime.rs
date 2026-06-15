@@ -376,6 +376,7 @@ async fn produced_block_evicts_its_txs_from_the_mempool() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     sign_transaction(&mut tx, &ALICE_PRIV).expect("sign tx");
     let tx_bytes = tx.encode_to_vec();

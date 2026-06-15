@@ -1933,6 +1933,7 @@ mod scan_tests {
             }),
             signature: vec![],
             ret: vec![],
+            unparsed_field10: None,
         };
 
         let block = Block {

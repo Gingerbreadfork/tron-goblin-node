@@ -127,6 +127,7 @@ fn sample_transfer_tx() -> Transaction {
         raw_data: Some(raw),
         signature: vec![vec![0xaa; 65]],
         ret: Vec::new(),
+        unparsed_field10: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn tx_id_errors_when_raw_data_missing() {
         raw_data: None,
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     assert!(tx_id(&tx).is_err());
 }
@@ -355,6 +357,7 @@ fn signing_a_transaction_with_no_raw_data_errors() {
         raw_data: None,
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     let priv_key = [1u8; 32];
     assert!(sign_transaction(&mut tx, &priv_key).is_err());

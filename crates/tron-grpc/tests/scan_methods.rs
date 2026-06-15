@@ -155,6 +155,7 @@ fn put_block_with_shielded_tx(
         raw_data: Some(raw),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let block = Block {
         block_header: Some(BlockHeader {
@@ -431,6 +432,7 @@ fn put_trc20_event_tx(
         raw_data: Some(raw),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let block = Block {
         block_header: Some(BlockHeader {

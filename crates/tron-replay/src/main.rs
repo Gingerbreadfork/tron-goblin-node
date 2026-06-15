@@ -591,6 +591,7 @@ fn sample_tx(block_num: i64, index_in_block: u8) -> Transaction {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     }
 }
 

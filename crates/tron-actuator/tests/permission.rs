@@ -57,6 +57,7 @@ fn make_transfer_tx(owner: [u8; 21], to: [u8; 21], permission_id: i32) -> Transa
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     }
 }
 

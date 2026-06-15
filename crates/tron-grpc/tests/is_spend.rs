@@ -130,6 +130,7 @@ fn build_state_with_n_outputs(output_count: usize) -> (RpcState, [u8; 32]) {
         raw_data: Some(raw),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let block = Block {
         block_header: Some(BlockHeader {

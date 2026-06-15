@@ -1607,6 +1607,7 @@ async fn get_approved_list_recovers_signers_from_signed_tx() {
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &priv_key).unwrap();
     let raw = format!("0x{}", hex::encode(tx.encode_to_vec()));
@@ -1648,6 +1649,7 @@ async fn get_sign_weight_under_threshold_with_no_account() {
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let raw = format!("0x{}", hex::encode(tx.encode_to_vec()));
     let resp = call(

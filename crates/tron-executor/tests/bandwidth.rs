@@ -111,6 +111,7 @@ fn make_transfer_tx() -> (Transaction, TxContract) {
         }),
         signature: vec![vec![0xaau8; 65]],
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     (tx, contract)
 }
@@ -147,6 +148,7 @@ fn make_transfer_asset_tx(asset_name: &[u8]) -> (Transaction, TxContract) {
         }),
         signature: vec![vec![0xaau8; 65]],
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     (tx, contract)
 }

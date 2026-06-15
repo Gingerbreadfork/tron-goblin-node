@@ -135,6 +135,7 @@ fn transfer_block(num: i64, parent_hash: [u8; 32], from: [u8; 21], to: [u8; 21],
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     Block {
         block_header: Some(BlockHeader {

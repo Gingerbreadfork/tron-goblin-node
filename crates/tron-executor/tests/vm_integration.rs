@@ -187,6 +187,7 @@ fn executor_runs_trigger_smart_contract_end_to_end() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
@@ -268,6 +269,7 @@ fn executor_top_level_calltoken_trigger_runs_with_trc10_transfer() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
@@ -638,6 +640,7 @@ fn trigger_smart_contract_with_wrong_signer_is_rejected_by_permission_check() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     // Sign with BOB's key, even though the transaction says Alice
     // is the owner.
@@ -761,6 +764,7 @@ fn internal_call_trace_is_captured_for_nested_call() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
@@ -874,6 +878,7 @@ fn selfdestruct_emits_suicide_internal_tx() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
@@ -1010,6 +1015,7 @@ fn default_exec_config_drops_internal_tx_traces() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
 
@@ -1117,6 +1123,7 @@ fn trigger_tx(caller_priv: &[u8; 32], caller: [u8; 21], contract: [u8; 21]) -> T
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, caller_priv).expect("sign tx");
     tx
@@ -1551,6 +1558,7 @@ fn revert_after_sstore_drops_storage_write_but_charges_energy() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign");
 
@@ -1676,6 +1684,7 @@ fn halt_after_sstore_drops_storage_write_but_charges_energy() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign");
 

@@ -166,6 +166,7 @@ fn build_trigger_tx(
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, caller_priv).expect("sign tx");
     tx
@@ -330,6 +331,7 @@ fn vm_logs_are_empty_for_non_vm_contract() {
         }),
         signature: Vec::new(),
         ret: Vec::new(),
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign");
 

@@ -135,6 +135,7 @@ fn build_trigger_tx(caller_priv: &[u8; 32], caller: [u8; 21], contract: [u8; 21]
             contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
             ..Default::default()
         }],
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, caller_priv).expect("sign");
     tx
@@ -539,6 +540,7 @@ fn applied_blocks_archive_historical_state_exactly() {
                 contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
                 ..Default::default()
             }],
+            unparsed_field10: None,
         };
         tron_types::sign_transaction(&mut tx, priv_key).expect("sign");
         tx

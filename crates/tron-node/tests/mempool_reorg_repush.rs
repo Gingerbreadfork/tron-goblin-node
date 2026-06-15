@@ -121,6 +121,7 @@ fn signed_transfer(seed: u8, expiration_offset_ms: i64) -> (Transaction, [u8; 32
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let priv_key = {
         let mut k = [0u8; 32];
@@ -164,6 +165,7 @@ fn alice_transfer(to: [u8; 21], amount: i64, expiration_offset_ms: i64) -> Trans
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
     tx

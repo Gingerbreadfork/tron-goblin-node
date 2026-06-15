@@ -448,6 +448,25 @@ message Transaction {
   // only support size = 1,  repeated list here for muti-sig extension
   repeated bytes signature = 2;
   repeated Result ret = 5;
+  // Field 10 is NOT part of java-tron's canonical Transaction schema, but
+  // some on-chain transactions (produced by buggy wallet tooling) carry a
+  // stray length-delimited field at tag 10 in the Transaction wrapper —
+  // sometimes empty, sometimes a verbatim copy of `raw_data`. java-tron's
+  // protobuf parser keeps it as an UnknownField and INCLUDES it in
+  // `getSerializedSize()`, which is what `BandwidthProcessor.consume` bills
+  // (`clearRet().build().getSerializedSize() + MAX_RESULT_SIZE_IN_TX`). prost
+  // silently discards unknown fields on decode, so without modelling field 10
+  // explicitly we re-serialize ~2..214 fewer bytes than the consensus tx and
+  // under-charge bandwidth (e.g. tx 9bb2f5e8@83317795: ours 345 vs java 559).
+  // Declaring it here makes prost preserve and re-emit it byte-identically,
+  // so `serialized_bytes` matches java's wire size. It MUST be `optional` (not
+  // a bare proto3 `bytes`): some of these txs carry an EMPTY field 10
+  // (`0x52 0x00`), which java still counts as 2 bytes, but a bare proto3
+  // `bytes` field omits an empty value on re-encode — losing those 2 bytes and
+  // leaving the Transfers under-charged by 2. `optional` round-trips
+  // present-but-empty as `Some(vec![])` → re-emits `0x52 0x00`. Absent for
+  // every well-formed tx (`None`), so this is a no-op there.
+  optional bytes unparsed_field10 = 10;
 }
 
 message TransactionInfo {

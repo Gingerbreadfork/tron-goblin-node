@@ -56,6 +56,7 @@ fn signed_transfer(seed: u8) -> (Vec<u8>, [u8; 21]) {
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let priv_key = {
         let mut k = [0u8; 32];
@@ -105,6 +106,7 @@ fn signed_trigger_smart(seed: u8) -> (Vec<u8>, [u8; 21]) {
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     let priv_key = {
         let mut k = [0u8; 32];
@@ -262,6 +264,7 @@ fn multiple_txs_from_same_signer_all_appear_in_one_bucket() {
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     };
     tron_types::sign_transaction(&mut tx, &priv_key).unwrap();
     let raw_b = tx.encode_to_vec();

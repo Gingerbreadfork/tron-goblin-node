@@ -18,6 +18,7 @@ fn dummy_tx() -> Transaction {
         }),
         signature: vec![],
         ret: vec![],
+        unparsed_field10: None,
     }
 }
 
