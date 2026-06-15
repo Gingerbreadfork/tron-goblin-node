@@ -200,10 +200,15 @@ impl ExploreState {
         // this project notable: recompute the transaction Merkle root over the
         // block's transactions and confirm it matches the root the network
         // committed in the header. Proves we hash transactions byte-identically
-        // to java-tron, live, for every block. (We don't recover the producer
-        // signature here: ~a quarter of mainnet blocks are SM2-signed, which is
-        // verify-only — no address recovery without the pubkey — so it can't be
-        // checked from the block alone.)
+        // to java-tron, live, for every block.
+        //
+        // We deliberately DON'T recover the producer signature here: ~a quarter
+        // of mainnet blocks are signed with a delegated witness-permission key
+        // (cold/hot key separation under ALLOW_MULTI_SIGN), so the recovered
+        // address is the permission key, not the header's witness address.
+        // Verifying those needs the producer's *account state* (its permission
+        // keys) — which a decode-only viewer doesn't have. The node's stateful
+        // sync DOES verify them, via `tron_executor::expected_block_signer`.
         if verify_tx_trie_root(block).is_ok() {
             g.verified_ok += 1;
         } else {
