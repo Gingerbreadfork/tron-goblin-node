@@ -340,6 +340,13 @@ impl ExploreState {
         }
 
         g.blocks += 1;
+        if g.blocks == 1 {
+            // One-time startup signal (visible at the default warn level) so a
+            // launcher like try.sh can tell live sync actually began and retry
+            // if it never does. The dashboard itself renders to stdout; this
+            // goes to the log on stderr.
+            tracing::warn!(block = block_num, "explore: live sync started");
+        }
         g.txs += b_txs;
         g.trx_sun += b_trx;
         g.usdt_units += b_usdt_units;

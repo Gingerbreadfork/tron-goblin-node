@@ -102,7 +102,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# --- launch ----------------------------------------------------------------
+# --- launch (with retry) ---------------------------------------------------
 say "connecting to mainnet peers and discovering the live tip…"
 sleep 1
 
@@ -110,19 +110,54 @@ sleep 1
 PEER_ARGS=()
 [ -n "$PEER" ] && PEER_ARGS+=(--peer "$PEER")
 
-# The dashboard renders on stdout; all logs go to stderr → the log file, so
-# they never corrupt the dashboard. RUST_LOG kept quiet (warnings only).
-RUST_LOG="${RUST_LOG:-warn}" TRON_LOG_FILE=off \
-  "$BIN" start \
-    --explore \
-    ${PEER_ARGS[@]+"${PEER_ARGS[@]}"} \
-    --data-dir "$DATA_DIR" \
-    --rpc-port "$RPC_PORT" \
-    --no-http --no-grpc --no-metrics \
-    2>"$LOG_FILE" &
-NODE_PID=$!
+# The dashboard renders on stdout; logs go to stderr → the log file (so they
+# never corrupt the dashboard). The node logs "explore: live sync started" on
+# its first streamed block — we watch for it. If a launch never starts syncing
+# (an unlucky peer set, a transient stall), kill it and try again.
+ATTEMPTS=3
+STARTUP_WAIT=50   # seconds to allow sync to begin before retrying
+started=0
+for attempt in $(seq 1 "$ATTEMPTS"); do
+  : >"$LOG_FILE"
+  RUST_LOG="${RUST_LOG:-warn}" TRON_LOG_FILE=off \
+    "$BIN" start \
+      --explore \
+      ${PEER_ARGS[@]+"${PEER_ARGS[@]}"} \
+      --data-dir "$DATA_DIR" \
+      --rpc-port "$RPC_PORT" \
+      --no-http --no-grpc --no-metrics \
+      2>"$LOG_FILE" &
+  NODE_PID=$!
 
-# Wait on the node; if it dies early, surface the log.
+  for _ in $(seq 1 "$STARTUP_WAIT"); do
+    kill -0 "$NODE_PID" 2>/dev/null || break                       # node exited
+    grep -q "explore: live sync started" "$LOG_FILE" 2>/dev/null && { started=1; break; }
+    sleep 1
+  done
+  [ "$started" = 1 ] && break
+
+  # This attempt didn't start syncing — stop it before retrying.
+  if kill -0 "$NODE_PID" 2>/dev/null; then
+    kill "$NODE_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$NODE_PID" 2>/dev/null || break; sleep 0.3; done
+    kill -9 "$NODE_PID" 2>/dev/null || true
+  fi
+  if [ "$attempt" -lt "$ATTEMPTS" ]; then
+    printf '\033[?25h\033[2J\033[H'   # restore cursor + clear the half-drawn dashboard
+    warn "couldn't start syncing (try $attempt/$ATTEMPTS) — retrying with a fresh peer set…"
+    sleep 1
+  fi
+done
+
+if [ "$started" != 1 ]; then
+  printf '\033[?25h\033[2J\033[H'
+  err "couldn't start syncing after $ATTEMPTS tries — check your connection, or pass --peer HOST:18888."
+  tail_lines="$(tail -n 4 "$LOG_FILE" 2>/dev/null || true)"
+  [ -n "$tail_lines" ] && { printf '%s' "$DIM"; echo "$tail_lines"; printf '%s' "$RST"; }
+  exit 1
+fi
+
+# Syncing — hand off to the live dashboard until the user stops it (Ctrl-C).
 wait "$NODE_PID" 2>/dev/null || true
 if [ -s "$LOG_FILE" ]; then
   tail_lines="$(tail -n 3 "$LOG_FILE" 2>/dev/null || true)"

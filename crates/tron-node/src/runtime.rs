@@ -1986,7 +1986,11 @@ async fn discover_tip(peers: &[String]) -> Option<(i64, [u8; 32])> {
         .unwrap_or(0)
         % peers.len();
 
-    for _round in 0..4 {
+    // Keep probing fresh batches of the discovered pool until we learn a tip;
+    // a single unlucky batch (all-busy peers) shouldn't strand startup. Give up
+    // only after a deadline so a genuine no-connectivity case still surfaces.
+    let start = std::time::Instant::now();
+    loop {
         let mut set = tokio::task::JoinSet::new();
         for i in 0..BATCH.min(peers.len()) {
             let peer = peers[(offset + i) % peers.len()].clone();
@@ -2003,8 +2007,11 @@ async fn discover_tip(peers: &[String]) -> Option<(i64, [u8; 32])> {
         if let Some(tip) = pick_anchor_tip(heads) {
             return Some(tip);
         }
+        if start.elapsed() >= Duration::from_secs(30) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    None
 }
 
 /// Choose the bootstrap block from a round of probed peer heads.
