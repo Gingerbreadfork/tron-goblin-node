@@ -2367,7 +2367,11 @@ fn execute_block_logic(
                         format!("raw:0x{}", d.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>())
                     }
                 };
-                eprintln!(
+                // A success/failure disagreement with the canonical block is a
+                // real consensus divergence — log at ERROR so it lands in the
+                // log file and stands out (the message text is preserved for
+                // existing `CONTRACTRET DIVERGENCE` grep workflows).
+                tracing::error!(
                     "CONTRACTRET DIVERGENCE block {} tx {}: block={} computed={} reason={} \
                      (success/failure disagreement — state may have diverged)",
                     raw.number, tx_hex, expected, computed, reason,

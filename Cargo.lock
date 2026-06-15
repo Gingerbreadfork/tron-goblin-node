@@ -5912,6 +5912,7 @@ dependencies = [
  "prost-types",
  "rayon",
  "thiserror 1.0.69",
+ "tracing",
  "tron-actuator",
  "tron-chainbase",
  "tron-consensus",

@@ -20,6 +20,7 @@ prost-types.workspace = true
 thiserror.workspace = true
 hex.workspace = true
 rayon.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
