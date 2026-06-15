@@ -1198,6 +1198,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             }
         };
         let st = Arc::new(crate::explore::ExploreState::new(tip_num));
+        st.set_discovered(combined_peers.len());
         tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
         Some(st)
     } else {
