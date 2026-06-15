@@ -21,6 +21,52 @@ goal.
 > production replacement for java-tron today — though that is the goal.
 
 
+## ⚡ Watch real TRON mainnet, live — in one command
+
+No snapshot, no 100 GB backfill, no hours of syncing. Run one command and
+within seconds you're watching the **real** TRON mainnet stream into your
+terminal — live blocks every ~3s, every transaction decoded and classified
+into a self-updating dashboard:
+
+```sh
+./try.sh
+```
+
+```text
+🧌 TRON GOBLIN  ·  LIVE MAINNET TIME MACHINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📅 2026-06-15 08:16:33 UTC      block #83,614,019
+  🟢 LIVE    ⚡ 263 TPS · peak 715    📦 0.3 blk/s · 🔗 12 peers
+  ⏱ watching 1m 5s · 📦 22 blocks streamed
+  block sizes ▃▂▃▃▄▃▃▁▁▁▁█▆▇▆▄▇▆▄▅▇▆  (txs/block, last 22)
+  ── THIS SESSION ──────────────────────────────────────────────
+   🔄 transactions 17,019          👛 active wallets 7,567
+   💵 TRX moved 641K               💚 USDT volume $34.87M
+   📜 contract calls 4,194         💸 USDT transfers 4,124
+   🪙 token transfers 3,957        🗳 votes+stakes 1,904
+   🚀 busiest block 991 txs        🐋 biggest USDT $3.30M
+  ── TX MIX ────────────────────────────────────────────────────
+   ▪ TRX 28%   ▪ USDT 24%   ▪ tokens 23%   ▪ other 23%
+  ── LIVE FEED ─────────────────────────────────────────────────
+   ▸ #83,614,019  864 tx · 235 USDT $686K · 14,163 TRX
+   ▸ #83,614,018  929 tx · 247 USDT $1.13M · 10,942 TRX
+  ── MILESTONES ────────────────────────────────────────────────
+   🐋 Whale: $3.30M USDT in a single transfer (#83,614,016)
+   🚀 Heavy block: 991 txs in 3 seconds (#83,614,009)
+```
+
+This is **not** a mock — it's the genuine TRON peer-to-peer protocol at work.
+`try.sh` grabs the current chain tip, the node tells live peers it's already
+there so they stream it the block tail, and it decodes every block itself: no
+chain state, no execution, no database — just the wire protocol and a parser,
+which is why it starts instantly. The USDT dollar amounts and whale alerts are
+pulled straight out of the real contract calldata.
+
+Pin a specific peer with `./try.sh --peer HOST:18888`. It runs on a throwaway
+temp directory and an isolated RPC port, and cleans up after itself on exit.
+Needs only `curl` + `python3` (to fetch the starting tip) and a release build
+(`cargo build --release`, or drop a `tron-node` binary next to the script).
+
 ## What this is
 
 `tron-goblin-node` is a workspace of small, focused crates that
