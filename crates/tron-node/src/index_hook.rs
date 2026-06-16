@@ -27,7 +27,7 @@
 //! return data (`contract_result`), and `fee` aggregated exactly as
 //! java-tron does (`ret.fee + energyFee + netFee + multiSignFee +
 //! memoFee`). Byte-exactness against a real java-tron-exported store
-//! remains the plan §16.1 rig acceptance item.
+//! remains a pending end-to-end acceptance check.
 
 use std::sync::Arc;
 

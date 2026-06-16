@@ -2727,10 +2727,10 @@ impl SyncDriver {
         // ping cadence. A fetch worker that fires a 100-block
         // FetchInvData and then goes quiet awaiting the response sends
         // the peer nothing in the meantime; at a 20s interval — plus
-        // the up-to-5s standby poll granularity — our ping landed at
-        // ~20-25s and tripped the peer's deadline. On the rig this
-        // churned every worker (per-peer applied=0, peer_failures
-        // 13-30) and collapsed the fleet onto a single leader. Ping at
+        // the up-to-5s standby poll granularity — the ping landed at
+        // ~20-25s and tripped the peer's deadline. Left unchecked this
+        // churned every worker (applied=0, climbing peer failures) and
+        // collapsed the fleet onto a single leader. Ping at
         // half the interval, and (below) wake the select! exactly on
         // the ping deadline so it's never starved by a parked frame
         // read.
@@ -3330,8 +3330,8 @@ impl SyncDriver {
                         // while receiving no frames on its own connection.
                         // Without this it would trip the keepalive inbound
                         // deadline and drop itself mid-progress — which left the
-                        // fleet thrashing leadership and, observed on the rig,
-                        // stalling sync entirely. `drain_pool` is bounded per call
+                        // fleet thrashing leadership and could stall sync
+                        // entirely. `drain_pool` is bounded per call
                         // (see its cap) so the loop keeps servicing keepalive
                         // pings + leadership re-checks between batches.
                         if applied > 0 {
@@ -4631,7 +4631,7 @@ impl SyncDriver {
         // the serial loop. Set before the snapshot/legacy branch so it covers
         // both. The serial path is always the source of truth (a non-converged
         // round commits nothing and falls back to it). Gated by the
-        // `vm.parallel_exec` master switch (default on) AND a per-block work gate
+        // `vm.parallel_exec` master switch (default off) AND a per-block work gate
         // so light blocks (a few transfers) don't pay the parallel overhead.
         self.exec_config.parallel_exec = self.parallel_exec_enabled
             && is_catching_up(block)

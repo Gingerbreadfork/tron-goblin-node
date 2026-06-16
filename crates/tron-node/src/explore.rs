@@ -104,7 +104,7 @@ struct Inner {
     // SR's own account key vs a delegated witness-permission (cold/hot) key
     sig_direct: u64,
     sig_delegated: u64,
-    // consensus: which Super Representatives produced the blocks we saw
+    // consensus: which Super Representatives produced the observed blocks
     producers: HashMap<[u8; 21], u64>,
     // contract methods called, by 4-byte selector
     methods: HashMap<[u8; 4], u64>,
