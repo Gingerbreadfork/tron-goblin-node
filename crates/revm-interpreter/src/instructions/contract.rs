@@ -495,9 +495,13 @@ pub fn withdraw_reward<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> R
 pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn!([resource_type, frozen_balance], context.interpreter);
     let caller = context.interpreter.input.target_address();
+    let Some(frozen) = u256_to_i64_exact(&frozen_balance) else {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    };
     let result = context.host.tron_freeze_balance_v2(
         caller,
-        u64_from_u256(&frozen_balance) as i64,
+        frozen,
         u64_from_u256(&resource_type) as u32,
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
@@ -509,9 +513,13 @@ pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
 pub fn unfreeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn!([resource_type, unfreeze_balance], context.interpreter);
     let caller = context.interpreter.input.target_address();
+    let Some(unfreeze) = u256_to_i64_exact(&unfreeze_balance) else {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    };
     let result = context.host.tron_unfreeze_balance_v2(
         caller,
-        u64_from_u256(&unfreeze_balance) as i64,
+        unfreeze,
         u64_from_u256(&resource_type) as u32,
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
@@ -553,9 +561,13 @@ pub fn delegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     );
     let caller = context.interpreter.input.target_address();
     let receiver = receiver_address.into_address();
+    let Some(delegate) = u256_to_i64_exact(&delegate_balance) else {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    };
     let result = context.host.tron_delegate_resource(
         caller,
-        u64_from_u256(&delegate_balance) as i64,
+        delegate,
         receiver,
         u64_from_u256(&resource_type) as u32,
         false,
@@ -574,9 +586,13 @@ pub fn undelegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) 
     );
     let caller = context.interpreter.input.target_address();
     let receiver = receiver_address.into_address();
+    let Some(undelegate) = u256_to_i64_exact(&undelegate_balance) else {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    };
     let result = context.host.tron_undelegate_resource(
         caller,
-        u64_from_u256(&undelegate_balance) as i64,
+        undelegate,
         receiver,
         u64_from_u256(&resource_type) as u32,
     );
@@ -588,4 +604,25 @@ pub fn undelegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) 
 fn u64_from_u256(v: &U256) -> u64 {
     let words = v.as_limbs();
     words[0]
+}
+
+/// java `DataWord.sValue().longValueExact()`: the signed 256-bit value, or
+/// `None` when it does not fit in a signed 64-bit integer. java throws
+/// `ArithmeticException` there, which the staking opcodes catch and treat as a
+/// no-op (push 0). Honest callers pass small non-negative amounts and agree
+/// with the old `u64_from_u256(..) as i64`; only a crafted out-of-range word
+/// is now rejected (as java does) instead of silently wrapping into a valid
+/// amount that could slip past the host's balance check.
+fn u256_to_i64_exact(v: &U256) -> Option<i64> {
+    let limbs = v.as_limbs();
+    let low = limbs[0];
+    let high_zero = limbs[1] == 0 && limbs[2] == 0 && limbs[3] == 0;
+    let high_ones = limbs[1] == u64::MAX && limbs[2] == u64::MAX && limbs[3] == u64::MAX;
+    if high_zero && low >> 63 == 0 {
+        Some(low as i64) // non-negative, fits in i64
+    } else if high_ones && low >> 63 == 1 {
+        Some(low as i64) // negative two's-complement, fits in i64
+    } else {
+        None
+    }
 }
