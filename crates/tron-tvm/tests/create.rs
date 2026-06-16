@@ -524,6 +524,125 @@ fn nested_create2_writes_contract_row_and_marks_account() {
     assert_eq!(row.version, 0);
 }
 
+/// Regression (block 83,349,051): java-tron enforces NO contract-code-size
+/// limit, so a contract whose runtime code exceeds the EVM EIP-170 (24576) /
+/// EIP-7954 (32768) caps must still deploy. Before lifting
+/// `limit_contract_code_size`, a nested CREATE2 returning >24 KiB hit
+/// `CreateContractSizeLimit`; since TRON forwards ALL gas to a CREATE frame
+/// (no EIP-150 1/64 retention), that burned the caller's entire forwarded
+/// budget and OOG'd the whole tx — exactly the ~34 KiB SunSwap-V3 pool deploy
+/// that cascaded into thousands of divergences.
+#[test]
+fn nested_create2_deploys_contract_larger_than_eip170_limit() {
+    use tron_proto::TriggerSmartContract;
+    use tron_tvm::execute::execute_trigger_with_trace_tx_id;
+
+    let stores = fresh_stores_with_contracts();
+    // CREATE2 (0xf5) needs the Petersburg spec → ALLOW_TVM_CONSTANTINOPLE.
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+
+    // Child init: PUSH2 40000 (0x9c40), PUSH1 0, RETURN → returns 40000 zero
+    // bytes (an all-STOP runtime) as the deployed code. 40000 > 24576 (EIP-170)
+    // AND > 32768 (EIP-7954), so any EVM code-size cap would reject it.
+    const RUNTIME_LEN: usize = 40_000;
+    let child_init: [u8; 6] = [0x61, 0x9c, 0x40, 0x60, 0x00, 0xf3];
+
+    // Factory runtime: MSTORE the 6-byte child init at mem[26..32], then
+    // CREATE2(value=0, offset=26, length=6, salt=0); STOP.
+    let factory_runtime = vec![
+        0x65, child_init[0], child_init[1], child_init[2], child_init[3], child_init[4],
+        child_init[5], // PUSH6 child_init
+        0x60, 0x00, // PUSH1 0
+        0x52, // MSTORE
+        0x60, 0x00, // PUSH1 0  (salt)
+        0x60, 0x06, // PUSH1 6  (length)
+        0x60, 0x1a, // PUSH1 26 (offset = 32 - 6)
+        0x60, 0x00, // PUSH1 0  (value)
+        0xf5, // CREATE2
+        0x00, // STOP
+    ];
+
+    let mut caller = [0u8; 21];
+    caller[0] = 0x41;
+    caller[1..].fill(0xa3);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(caller),
+            &Account {
+                address: caller.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut factory = [0u8; 21];
+    factory[0] = 0x41;
+    factory[1..].fill(0xbb);
+    let factory_addr = Address::from_raw(factory);
+    stores
+        .accounts
+        .put(
+            &factory_addr,
+            &Account {
+                address: factory.to_vec(),
+                balance: 0,
+                code: factory_runtime.clone(),
+                code_hash: tron_crypto::hash::keccak256(&factory_runtime).to_vec(),
+                r#type: tron_proto::AccountType::Contract as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .code
+        .put(factory_addr.as_bytes(), &factory_runtime)
+        .unwrap();
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: factory.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    // Budget must cover the 40000 × 200 = 8M code-deposit plus the rest.
+    let tx_id = [0x7d; 32];
+    let (outcome, _traces, _pen) = execute_trigger_with_trace_tx_id(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 0,
+        },
+        &trigger,
+        15_000_000,
+        tx_id,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+
+    // The oversized child must exist (no size-limit rejection) with its full
+    // 40000-byte runtime code.
+    let child = tron_create2(&factory, [0u8; 32], &child_init);
+    let child_addr = Address::from_raw(child);
+    let child_acct = stores
+        .accounts
+        .get(&child_addr)
+        .unwrap()
+        .expect("oversized CREATE2 child account missing — size limit not lifted");
+    assert_eq!(child_acct.r#type, tron_proto::AccountType::Contract as i32);
+    let code = stores
+        .code
+        .get(child_addr.as_bytes())
+        .unwrap()
+        .expect("oversized CREATE2 child code missing");
+    assert_eq!(code.len(), RUNTIME_LEN, "deployed runtime code wrong size");
+}
+
 /// java-tron nested CREATE address: `0x41 || sha3omit12(rootTxId ++ nonce_be8)`.
 fn tron_create(root_tx_id: &[u8; 32], nonce: u64) -> [u8; 21] {
     let mut buf = Vec::new();

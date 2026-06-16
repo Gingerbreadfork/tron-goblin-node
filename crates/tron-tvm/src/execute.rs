@@ -416,6 +416,19 @@ fn execute_trigger_inner(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+            // TRON fork: java-tron enforces NO contract-code-size limit on
+            // deployment. `Program.createContractImpl` only checks there is
+            // enough energy to pay `saveCodeEnergy = code_len * getCreateData()`
+            // (200/byte) — there is no EIP-170 (24 KiB) byte cap. revm would
+            // otherwise reject any runtime code > 24576 bytes with
+            // `CreateContractSizeLimit`; and because TRON forwards ALL gas to a
+            // CREATE frame (no EIP-150 1/64 retention), that rejection burns the
+            // entire forwarded budget and OOGs the caller — e.g. a ~34 KiB
+            // SunSwap-V3 pool deployed via the factory's nested CREATE2 (block
+            // 83,349,051), which then cascades into thousands of downstream
+            // divergences. Lift the cap (and with it the EIP-3860 2× init-code
+            // cap) so deployment is bounded only by energy + tx size, as in java.
+            cfg.limit_contract_code_size = Some(usize::MAX);
         })
         .modify_block_chained(|b| {
             // VM block context = the block being executed (java's
@@ -690,6 +703,19 @@ fn execute_trigger_inner_with_tracer(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+            // TRON fork: java-tron enforces NO contract-code-size limit on
+            // deployment. `Program.createContractImpl` only checks there is
+            // enough energy to pay `saveCodeEnergy = code_len * getCreateData()`
+            // (200/byte) — there is no EIP-170 (24 KiB) byte cap. revm would
+            // otherwise reject any runtime code > 24576 bytes with
+            // `CreateContractSizeLimit`; and because TRON forwards ALL gas to a
+            // CREATE frame (no EIP-150 1/64 retention), that rejection burns the
+            // entire forwarded budget and OOGs the caller — e.g. a ~34 KiB
+            // SunSwap-V3 pool deployed via the factory's nested CREATE2 (block
+            // 83,349,051), which then cascades into thousands of downstream
+            // divergences. Lift the cap (and with it the EIP-3860 2× init-code
+            // cap) so deployment is bounded only by energy + tx size, as in java.
+            cfg.limit_contract_code_size = Some(usize::MAX);
         })
         .modify_block_chained(|b| {
             // VM block context = the block being executed (java's
@@ -1084,6 +1110,19 @@ pub fn execute_create_with_trace(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+            // TRON fork: java-tron enforces NO contract-code-size limit on
+            // deployment. `Program.createContractImpl` only checks there is
+            // enough energy to pay `saveCodeEnergy = code_len * getCreateData()`
+            // (200/byte) — there is no EIP-170 (24 KiB) byte cap. revm would
+            // otherwise reject any runtime code > 24576 bytes with
+            // `CreateContractSizeLimit`; and because TRON forwards ALL gas to a
+            // CREATE frame (no EIP-150 1/64 retention), that rejection burns the
+            // entire forwarded budget and OOGs the caller — e.g. a ~34 KiB
+            // SunSwap-V3 pool deployed via the factory's nested CREATE2 (block
+            // 83,349,051), which then cascades into thousands of downstream
+            // divergences. Lift the cap (and with it the EIP-3860 2× init-code
+            // cap) so deployment is bounded only by energy + tx size, as in java.
+            cfg.limit_contract_code_size = Some(usize::MAX);
         })
         .modify_block_chained(|b| {
             // VM block context = the block being executed (java's
