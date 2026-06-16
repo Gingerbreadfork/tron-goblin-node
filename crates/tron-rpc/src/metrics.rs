@@ -303,13 +303,32 @@ impl Metrics {
         self.rpc_requests_total.load(Ordering::Relaxed)
     }
 
+    /// Upper bound on distinct `method` labels in the per-method RPC counters.
+    /// The JSON-RPC `method` is attacker-controlled on a public port; inserting
+    /// it verbatim into an uncapped map grew the map (and the Prometheus series
+    /// count) without bound — the one genuine process-lifetime unbounded
+    /// structure in the node. Real method count is well under this.
+    const MAX_RPC_METHOD_LABELS: usize = 256;
+
+    /// Increment a per-method counter, capping distinct labels at
+    /// [`Self::MAX_RPC_METHOD_LABELS`]. Methods beyond the cap fold into a
+    /// single `"other"` bucket, so an attacker spraying random method names
+    /// can't grow the registry without bound.
+    fn bump_method_count(map: &mut HashMap<String, u64>, method: &str) {
+        if let Some(c) = map.get_mut(method) {
+            *c += 1;
+        } else if map.len() < Self::MAX_RPC_METHOD_LABELS {
+            map.insert(method.to_string(), 1);
+        } else {
+            *map.entry("other".to_string()).or_insert(0) += 1;
+        }
+    }
+
     pub fn record_rpc_request(&self, method: &str, success: bool) {
         self.rpc_requests_total.fetch_add(1, Ordering::Relaxed);
-        let mut by = self.rpc_requests_by_method.lock().unwrap();
-        *by.entry(method.to_string()).or_insert(0) += 1;
+        Self::bump_method_count(&mut self.rpc_requests_by_method.lock().unwrap(), method);
         if !success {
-            let mut err = self.rpc_errors_by_method.lock().unwrap();
-            *err.entry(method.to_string()).or_insert(0) += 1;
+            Self::bump_method_count(&mut self.rpc_errors_by_method.lock().unwrap(), method);
         }
     }
 
@@ -846,6 +865,26 @@ mod tests {
         assert!(text.contains("# TYPE tron_node_head_block_number gauge"));
         assert!(text.contains("tron_node_head_block_number 0"));
         assert!(text.contains("tron_node_sync_blocks_applied_total 0"));
+    }
+
+    #[test]
+    fn per_method_rpc_counter_cardinality_is_capped() {
+        // The JSON-RPC `method` is attacker-controlled on a public port. Spray
+        // more distinct method names than the cap and confirm the registry
+        // stays bounded (no unbounded map / Prometheus-series growth).
+        let m = Metrics::new();
+        let cap = Metrics::MAX_RPC_METHOD_LABELS;
+        for i in 0..(cap + 50) {
+            m.record_rpc_request(&format!("m{i}"), false); // both maps
+        }
+        let by = m.rpc_requests_by_method.lock().unwrap();
+        let err = m.rpc_errors_by_method.lock().unwrap();
+        // At most `cap` real labels + the single "other" overflow bucket.
+        assert!(by.len() <= cap + 1, "requests map unbounded: {}", by.len());
+        assert!(err.len() <= cap + 1, "errors map unbounded: {}", err.len());
+        assert!(by.contains_key("other"), "overflow must fold into 'other'");
+        assert!(*by.get("other").unwrap() >= 50, "other bucket holds overflow");
+        assert_eq!(*by.get("m0").unwrap(), 1, "early method keeps its own entry");
     }
 
     #[test]
