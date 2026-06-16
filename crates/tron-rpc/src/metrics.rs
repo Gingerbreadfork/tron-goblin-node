@@ -817,6 +817,26 @@ impl Metrics {
             self.firehose_gap_repaired_total.load(Ordering::Relaxed),
         );
 
+        // --- Consensus self-audit watchdog ---
+        // The executor cross-checks every tx's computed success/failure against
+        // the canonical block. A divergence means our state silently disagrees
+        // with consensus — operators should alert on `> 0`. Read straight from
+        // the executor's process-wide watchdog (no sampling needed).
+        emit_counter(
+            &mut out,
+            "tron_node_consensus_divergences_total",
+            "Consensus self-audit: txs whose computed success/failure disagreed with the canonical block (state diverged). Should stay 0; alert on > 0.",
+            tron_executor::watchdog::divergence_count(),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_consensus_last_divergence_block",
+            "Block number of the most recent consensus divergence (0 if none observed this run).",
+            tron_executor::watchdog::last_divergence()
+                .map(|d| d.block)
+                .unwrap_or(0),
+        );
+
         out
     }
 }
@@ -885,6 +905,30 @@ mod tests {
         assert!(by.contains_key("other"), "overflow must fold into 'other'");
         assert!(*by.get("other").unwrap() >= 50, "other bucket holds overflow");
         assert_eq!(*by.get("m0").unwrap(), 1, "early method keeps its own entry");
+    }
+
+    #[test]
+    fn consensus_watchdog_divergence_surfaces_as_metric() {
+        let m = Metrics::new();
+        let text0 = m.to_prometheus_text();
+        // Metric is always present (0 when no divergence observed).
+        assert!(text0.contains("tron_node_consensus_divergences_total"));
+        assert!(text0.contains("tron_node_consensus_last_divergence_block"));
+        // Recording a divergence in the executor watchdog reflects in the metric.
+        tron_executor::watchdog::record(tron_executor::watchdog::ConsensusDivergence {
+            block: 83_386_262,
+            tx_id: "6844b293".into(),
+            block_result: "OUT_OF_ENERGY".into(),
+            computed_result: "SUCCESS".into(),
+            reason: "watchdog metric test".into(),
+        });
+        let text1 = m.to_prometheus_text();
+        let line = text1
+            .lines()
+            .find(|l| l.starts_with("tron_node_consensus_divergences_total "))
+            .expect("divergences metric line present");
+        let n: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!(n >= 1, "divergence count should be >= 1 after record, got {n}");
     }
 
     #[test]

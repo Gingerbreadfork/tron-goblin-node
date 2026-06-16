@@ -36,6 +36,7 @@ pub mod energy;
 pub mod parallel;
 pub mod pipeline;
 pub mod resource;
+pub mod watchdog;
 
 pub use pipeline::ApplyPipeline;
 
@@ -2376,6 +2377,16 @@ fn execute_block_logic(
                      (success/failure disagreement — state may have diverged)",
                     raw.number, tx_hex, expected, computed, reason,
                 );
+                // Consensus self-audit watchdog: record the divergence so it is
+                // queryable / alertable (Prometheus) even when we don't
+                // hard-reject. See crate::watchdog.
+                crate::watchdog::record(crate::watchdog::ConsensusDivergence {
+                    block: raw.number,
+                    tx_id: tx_hex.clone(),
+                    block_result: expected.clone(),
+                    computed_result: computed.clone(),
+                    reason: reason.clone(),
+                });
                 if config.verify_contract_ret {
                     return Err(BlockExecError::ContractRetMismatch {
                         block_num: raw.number,
