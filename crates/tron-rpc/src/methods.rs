@@ -5103,6 +5103,9 @@ fn energy_breakdown_json(
 
     json!({
         "ops_executed": struct_logs.len(),
+        // `by_opcode` is capped at the 15 highest-energy opcodes; this reports
+        // how many distinct opcodes existed so callers can detect truncation.
+        "total_unique_opcodes": ops.len(),
         "by_opcode": by_opcode,
         "call_frames": frames_out,
         "halt": halt.map(|(op, reason)| json!({ "op": op, "reason": reason })),
@@ -7136,6 +7139,8 @@ mod eth_call_tests {
         ];
         let v = energy_breakdown_json(&logs, &[]);
         assert_eq!(v["ops_executed"], 4);
+        // 4 log entries but 3 distinct opcodes (SSTORE appears twice).
+        assert_eq!(v["total_unique_opcodes"], 3);
         // SSTORE (25000 across 2 ops) ranks first; PUSH1 is far down.
         assert_eq!(v["by_opcode"][0]["op"], "SSTORE");
         assert_eq!(v["by_opcode"][0]["energy"], 25000);
