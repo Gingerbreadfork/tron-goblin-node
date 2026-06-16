@@ -149,135 +149,121 @@ can actually profile, debug, and tune without fighting a JVM.
 
 ## Status
 
-What works today:
+The short version: `tron-goblin-node` imports, validates, and executes
+live mainnet blocks into **byte-exact** RocksDB state, syncs off public
+mainnet and holds the tip, produces blocks as an SR, and serves
+java-tron's full API surface — plus developer tooling java-tron doesn't
+have. What works today, by area:
 
-- ✅ Crypto vertical slice: secp256k1, SM2 (via pure-Rust
-  `sm2` crate), keccak256, ripemd160, sha256, base58check.
-- ✅ Proto / wire / types layer — produces hashes identical to
-  java-tron for blocks and transactions across the live chain.
-- ✅ Block import: decode + validate + execute live mainnet blocks
-  into per-store RocksDB state.
-- ✅ **Block-STM parallel execution** (optional, `vm.parallel_exec`).
-  Within a block, transactions execute optimistically across cores with
-  MVCC read/write-set tracking and re-execute only the ones that
-  conflict, producing a result **byte-identical to the serial loop** —
-  pinned by parallel-vs-serial equivalence tests, since TRON's absent
-  state root means a silent divergence would otherwise be invisible. On a
-  many-core machine, transaction-heavy mainnet blocks apply roughly 2×
-  faster (more on the densest, contract-heavy blocks); light blocks skip
-  the machinery and run serially.
-- ✅ **Consensus self-audit watchdog.** As each block applies, the
-  executor cross-checks every transaction's *computed* success/failure
-  against the block's canonical `contractRet` — TRON commits no state
-  root, so this tripwire is the node's only signal that its state has
-  silently diverged from consensus. The count and most-recent-divergence
-  block are surfaced as Prometheus metrics
-  (`tron_node_consensus_divergences_total`), so an operator can alert the
-  instant the node stops agreeing with the chain — independent of whether
-  `verify_contract_ret` is also set to hard-reject the block.
-- ✅ Actuator dispatch: full coverage of java-tron's contract types
-  (Transfer, AssetTransfer, Exchange*, FreezeBalance*, Witness*,
-  Proposal*, TriggerSmartContract, CreateSmartContract, …).
-- ✅ TVM: smart-contract execution on a revm-based interpreter with
-  TRON's energy schedule, the TRC-10 transfer fields + TRON-extended
-  opcodes (`0xd0..0xd4`), the per-contract dynamic-energy model, and
-  Sapling shielded-TRC-20 (Groth16) proving. Real mainnet contracts
-  execute against snapshot state; read-only (`triggerconstantcontract`)
-  return data for tested TRC-20s (USDT and others) matches java-tron
-  byte-for-byte. Energy-accounting parity is close, with known residual
-  gaps still being chased.
-- ✅ JSON-RPC + REST: the `eth_*` surface that java-tron exposes
-  plus the `/wallet/*` REST endpoints, backed by chainbase reads.
-- ✅ **Time-travel transaction tracer** — geth-style
-  `debug_traceTransaction` (and `debug_traceBlockByNumber` /
-  `ByHash`) re-execute a TVM transaction through a per-opcode
-  structured tracer **against the historical state as-of the tx's
-  block boundary** when the archive covers it (not "re-run against
-  latest"), reporting which state was used in a `tracedAtHeight`
-  field. java-tron has no `debug_trace*` surface at all.
-- ✅ **Explainable energy estimates** — `estimateEnergy` returns the
-  total *plus* an `energy_breakdown`: energy by opcode (top 15), the
-  CALL/CREATE frame tree with per-frame energy, and the exact halting
-  op + reason when a call would run out — "why it costs X / why it
-  would OOG", which java-tron's bare number omits.
-- ✅ gRPC server on the Wallet / WalletSolidity / Database / Monitor
-  / Network services — no `Status::unimplemented` stubs left.
-- ✅ Mempool with signer recovery + dedup + expiration eviction +
-  on-disk persistence (java-tron's pending queue is volatile;
-  `tron-goblin-node` reloads pending txs across restarts), plus
-  **state-aware admission validation** — the same precondition checks a
-  peer runs on receive (fee / permission / balance / ref-block, and
-  smart-contract `Trigger`/`Create` preconditions) so we don't relay
+### ⚙️ Consensus & execution
+
+- **Block execution** — decode + validate + execute live mainnet blocks
+  into per-store RocksDB state, with full actuator coverage of
+  java-tron's contract types (Transfer, AssetTransfer, Exchange\*,
+  FreezeBalance\*, Witness\*, Proposal\*, Trigger/CreateSmartContract, …).
+- **Block-STM parallel execution** (`vm.parallel_exec`) — transactions
+  execute optimistically across cores with MVCC conflict tracking,
+  re-running only those that conflict, for a result **byte-identical to
+  the serial loop** (pinned by equivalence tests — TRON has no state root,
+  so a silent divergence would otherwise be invisible). Transaction-heavy
+  blocks apply ~2× faster on many cores; light blocks stay serial.
+- **TVM** — revm-based interpreter with TRON's energy schedule, the TRC-10
+  transfer fields, the TRON opcodes (`0xd0..0xd4`), the per-contract
+  dynamic-energy model, and Sapling shielded-TRC-20 (Groth16) proving.
+  Read-only (`triggerconstantcontract`) results for tested TRC-20s (USDT
+  and others) match java-tron **byte-for-byte**; energy-accounting parity
+  is close, with residual gaps tracked under [Known gaps](#known-gaps).
+- **Consensus self-audit watchdog** — every transaction's computed
+  success/failure is cross-checked against the block's canonical
+  `contractRet` (the only divergence signal a stateless-root chain gives
+  you) and exported as a Prometheus counter, so an operator can alert the
+  instant the node stops agreeing with the chain.
+- **SR block production & PBFT** — with `[witness]` configured, runs
+  java-tron's `DposTask` loop (slot check → drain mempool →
+  produce/sign/apply/broadcast) plus the Prepare → Commit → solidify vote
+  runtime that advances the irreversible block.
+- **Reorg-driven rollback** — a sibling-fork overtake rolls the losing
+  branch's state back per-block, re-applies the winner, and re-pushes
+  reverted txs to the mempool, recovering atomically on failure and never
+  crossing the irreversible block. Two backends: undo-store (default) and
+  a snapshot overlay (`--snapshot-reorg`).
+
+### 🌐 Networking & mempool
+
+- **Public-mainnet sync** — java-tron-style block-locator + pipelined
+  fetch with rate-limit/keepalive parity. A single **active syncer** is
+  elected across a per-peer driver fleet (the rest stand by and fail over),
+  and fetch is **cooperative** — many peers fill a shared pool in parallel
+  while one driver applies in chain order. Live-validated catching a
+  multi-day backlog off public mainnet and holding the tip.
+- **Inbound serving** — binds the P2P port and completes the responder
+  handshake, serving `SyncBlockChain` → inventory and `FetchInvData` →
+  blocks, so other nodes (java-tron included) can sync *from* it.
+- **Validating mempool** — signer recovery + dedup + expiration eviction +
+  on-disk persistence (pending txs survive restarts, unlike java-tron's
+  volatile queue), with **state-aware admission** — the same
+  fee/permission/balance/ref-block and contract `Trigger`/`Create`
+  precondition checks a peer runs on receive, so we don't relay
   transactions a peer would reject.
-- ✅ Snapshot import / export (`import-snapshot`, `import-live`,
-  `export-snapshot`, `verify-snapshot`) for moving state to and
-  from a java-tron data directory.
-- ✅ Multi-peer sync from **public mainnet**: a java-tron-style
-  block-chain locator (`SyncBlockChain` → drain queue → re-request →
-  live-tip `BlockInventory` advertise at head), pipelined with
-  rate-limit + keepalive parity. A single **active syncer** is elected
-  across the per-peer driver fleet (the rest stay connected as standby
-  and fail over if it stalls), the node **listens for inbound peers**
-  (binds the P2P port, completes the responder handshake, and serves
-  `SyncBlockChain` → inventory and `FetchInvData` → blocks) so other
-  nodes — java-tron included — can sync *from* it, and the Hello
-  advertises a truthful solid/lowest block. Fetch is **cooperative
-  across the peer fleet** — many
-  peers download the backlog into a shared pool in parallel while one
-  driver applies in chain order. Live-validated catching up a multi-day
-  backlog off public mainnet and holding the tip, not just against a
-  local reference node.
-- ✅ SR block production: when `[witness]` is configured, the
-  daemon runs java-tron's `DposTask` loop — slot ownership check,
-  drain mempool, produce + sign + apply + broadcast.
-- ✅ PBFT vote runtime: Prepare → Commit → solidify state machine
-  driven off the SR runtime; signatures persist to
-  `PbftSignDataStore` and `LATEST_SOLIDIFIED_BLOCK_NUM` advances.
-- ✅ Reorg-driven state rollback in the sync path. On a sibling-fork
-  overtake the driver rolls the losing branch's state back (per-block
-  undo records restore every mutated store, incl. head pointers),
-  re-applies the winning branch, re-pushes reverted txs to the mempool,
-  and recovers atomically if a re-apply fails. Two backends:
-  `BlockUndoStore` (default) and a `SnapshotManager`-style overlay
-  stack (`--snapshot-reorg`). The solidified/irreversible block is
-  never crossed (forks diverging below it are rejected).
-- ✅ **Built-in address-history indexer** (`[index] enable = true`):
-  TronGrid-compatible
-  `/v1/accounts/{address}/transactions[/trc20|/trc721|/internal]` plus an
-  event-search endpoint `/v1/contracts/{address}/events`, served from the
-  node's own stores — no external indexer, no API keys. Backfill from a
-  snapshot is automatic (head-first by default: recent history is
-  queryable within seconds while the long tail fills in behind it),
-  reorg-reconciled, restart-resuming, and the on-disk index is
-  disposable — delete `data_dir/index/` and the node rebuilds it. Same
-  query params as TronGrid (`limit`, `fingerprint`, `only_from`/`only_to`,
-  `only_confirmed`, timestamps, `order_by`), so existing TronWeb history
-  code is a drop-in.
-- ✅ **Historical-state archive** (`[index] capture_state_deltas = true`):
-  every block's committed write-set recorded as per-key versions, enabling
-  `getaccount` / `getaccountresource` / `triggerconstantcontract` **at any
-  covered height** via `/v1/archive/...` — each historical read is one
-  seek, not a replay, and constant calls run against the full archived VM
-  state of that height (block number/timestamp included).
-- ✅ **Firehose** (`[index.firehose] enable = true`): a durable,
-  append-only log of applied blocks — decoded transfer facts, TRC20 logs,
-  internal txs — with explicit `UNWIND` entries covering both reorgs and
-  crash recovery, tailed by external consumers over gRPC
-  (`tronfirehose.Firehose/Tail`, resume by sequence number).
-  Reference consumers for **Postgres**, **NATS JetStream**, and
-  **ClickHouse** ship as standalone workspace binaries.
-- ✅ Prometheus `/metrics` endpoint (`--metrics-port`, default 9090)
-  exposes metrics across chain head, sync flow, reorg / fork-tree
-  outcomes, SR block production, PBFT message traffic, mempool
-  (size + accepted + evicted + rejected-by-reason labels), active
-  peers (incl. inbound peers syncing *from* us + requests served),
-  per-method RPC counters, the **consensus self-audit watchdog**
-  (`tron_node_consensus_divergences_total` +
-  `tron_node_consensus_last_divergence_block`), and the indexer
-  (cursor / lag / backfill edges, per-namespace row counters, archive
-  coverage, firehose head-seq and unwind counters).
 
-What doesn't work yet (real, currently-open gaps):
+### 💾 State, storage & snapshots
+
+- **Byte-exact RocksDB state** — per-store key/value layout identical to
+  java-tron; a java-tron data directory *is* a `tron-node` data directory
+  after `import-snapshot`.
+- **Snapshot tooling** — `import-snapshot`, `import-live`,
+  `export-snapshot`, and `verify-snapshot` move state to and from a
+  java-tron data directory.
+- **Historical-state archive** (`[index] capture_state_deltas`) — every
+  block's committed write-set recorded as per-key versions, so
+  `getaccount` / `getaccountresource` / `triggerconstantcontract` resolve
+  **at any covered height** in one seek (no replay), constant calls
+  included.
+
+### 🔌 APIs & compatibility
+
+- **Crypto & wire parity** — secp256k1, SM2 (pure-Rust), keccak256,
+  ripemd160, sha256, base58check; the proto/types layer produces block and
+  transaction hashes identical to java-tron across the live chain.
+- **JSON-RPC + REST + gRPC** — the `eth_*` JSON-RPC surface, the
+  `/wallet/*` REST endpoints, and the Wallet / WalletSolidity / Database /
+  Monitor / Network gRPC services (no `Status::unimplemented` stubs left).
+- **Built-in address-history indexer** (`[index] enable`) —
+  TronGrid-compatible
+  `/v1/accounts/{address}/transactions[/trc20|/trc721|/internal]` plus
+  `/v1/contracts/{address}/events`, served from the node's own stores (no
+  external indexer, no API keys). Auto-backfills head-first (recent history
+  queryable within seconds), reorg-reconciled, restart-resuming, and
+  disposable. Same query params as TronGrid — a drop-in for existing
+  TronWeb history code.
+
+### 🛠️ Developer & operator tooling
+
+- **Time-travel transaction tracer** — geth-style `debug_traceTransaction`
+  (and `debug_traceBlockByNumber` / `ByHash`) re-execute a transaction
+  through a per-opcode structured tracer **against the historical state
+  as-of the tx's block** when the archive covers it (not "re-run against
+  latest"), reporting which height was used. java-tron has no `debug_trace*`
+  surface at all.
+- **Explainable energy estimates** — `estimateEnergy` returns the total
+  *plus* a breakdown: energy by opcode, the CALL/CREATE frame tree with
+  per-frame energy, and the exact halting op + reason when a call would run
+  out — "why it costs X / why it would OOG", which java-tron's bare number
+  omits.
+- **Firehose** (`[index.firehose]`) — a durable, append-only stream of
+  applied blocks (decoded transfer facts, TRC20 logs, internal txs) with
+  explicit `UNWIND` entries for reorgs and crash recovery, tailed over gRPC
+  (`tronfirehose.Firehose/Tail`, resume by sequence). Postgres, NATS
+  JetStream, and ClickHouse reference consumers ship in-workspace.
+- **Prometheus `/metrics`** (`--metrics-port`, default 9090) — chain head,
+  sync flow, reorg/fork-tree outcomes, SR/PBFT traffic, mempool (with
+  reject-reason labels), peers (incl. inbound peers syncing *from* us),
+  per-method RPC counters, the consensus watchdog, and indexer / archive /
+  firehose health.
+
+### Known gaps
+
+Real, currently-open items:
 
 - ❌ **Long-running mainnet soak / endurance.** Short live sessions
   pass; multi-hour, multi-day stability under realistic peer churn
