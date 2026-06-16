@@ -283,7 +283,12 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
                 &Address::from_raw(target_addr),
                 &Account {
                     address: target_addr.to_vec(),
-                    code_hash: vec![0xff; 32], // any non-empty
+                    // ISCONTRACT mirrors java's Program.isContract (contract row /
+                    // AccountType::Contract), NOT code_hash — snapshot-imported
+                    // contracts carry an EMPTY code_hash (code is keyed by
+                    // address). Set the Contract type and leave code_hash empty
+                    // to exercise exactly that case.
+                    r#type: tron_proto::AccountType::Contract as i32,
                     ..Default::default()
                 },
             ).unwrap();
