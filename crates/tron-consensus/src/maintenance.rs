@@ -161,8 +161,15 @@ pub fn update_active_witnesses(
         ranked.push((*addr, witness.vote_count));
     }
 
-    // 3. Sort by vote_count desc; on tie, by address bytes (deterministic).
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
+    // 3. Sort by vote_count desc; on a tie, java `WitnessStore.sortWitness`
+    //    orders by `createReadableString` (hex of the address) DESCENDING when
+    //    `allowWitnessSortOptimization` (= `allowConsensusLogicOptimization`) is
+    //    active — which it has been on mainnet for years. Hex-string DESC is
+    //    identical to address-bytes DESCENDING. (The pre-proposal
+    //    `ByteString.hashCode` tie-break is unreachable for a node syncing from
+    //    a post-proposal snapshot.) We previously sorted bytes ASCENDING, which
+    //    would pick the wrong producer on an exact vote tie at the top-27 cutoff.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
     let new_active: Vec<Address> = ranked
         .iter()
         .take(MAX_ACTIVE_WITNESS_NUM)

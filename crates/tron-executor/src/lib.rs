@@ -4151,8 +4151,14 @@ const STANDBY_WITNESS_COUNT: usize = 127;
 /// thousands of entries) on every single block. Pinned equal to the naive
 /// sort in `standby_ranking_tests::top_standby_matches_full_sort`.
 fn top_standby_witnesses(mut ranked: Vec<(Address, i64)>) -> Vec<(Address, i64)> {
+    // vote_count desc; on a tie, address bytes DESCENDING — matching java
+    // `WitnessStore.sortWitnesses` whose `allowWitnessSortOptimization` (active
+    // on mainnet) tie-break is `createReadableString` (hex) reversed, which is
+    // identical to bytes DESC. (Pre-proposal ByteString.hashCode tie-break is
+    // unreachable for a post-proposal-snapshot node.) See the matching sort in
+    // tron-consensus `update_active_witnesses`.
     let cmp = |a: &(Address, i64), b: &(Address, i64)| {
-        b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes()))
     };
     if ranked.len() > STANDBY_WITNESS_COUNT {
         // Partition so the top-127 occupy [0, 127) (in arbitrary order),
@@ -4169,9 +4175,11 @@ mod standby_ranking_tests {
     use super::{top_standby_witnesses, STANDBY_WITNESS_COUNT};
     use tron_crypto::address::Address;
 
-    /// The pre-optimization ranking: full sort then truncate.
+    /// The pre-optimization ranking: full sort then truncate. Tie-break is
+    /// address bytes DESCENDING (java's active `allowWitnessSortOptimization`
+    /// hex-DESC tie-break), matching `top_standby_witnesses`.
     fn naive(mut v: Vec<(Address, i64)>) -> Vec<(Address, i64)> {
-        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
         v.truncate(STANDBY_WITNESS_COUNT);
         v
     }
@@ -4198,5 +4206,16 @@ mod standby_ranking_tests {
                 "partial selection diverged from the full sort at n={n}"
             );
         }
+    }
+
+    #[test]
+    fn tie_break_is_address_bytes_descending() {
+        // On an exact vote_count tie, java's active witness-sort tie-break is
+        // hex-string DESCENDING == address bytes DESCENDING, so the
+        // higher-bytes address ranks first.
+        let ranked = vec![(addr(1), 100i64), (addr(2), 100i64)];
+        let out = top_standby_witnesses(ranked);
+        assert_eq!(out[0].0, addr(2), "higher address bytes must rank first on a tie");
+        assert_eq!(out[1].0, addr(1));
     }
 }
