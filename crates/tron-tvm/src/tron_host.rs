@@ -50,10 +50,28 @@ impl TronDatabaseExt for TronDatabase {
 
     fn tron_is_contract(&self, address: Address) -> bool {
         let tron_addr = evm_to_tron_address(&address);
-        match self.accounts.get(&tron_addr) {
-            Ok(Some(account)) => !account.code_hash.is_empty(),
-            _ => false,
+        // java-tron's ISCONTRACT (0xd4 → `Program.isContract`) returns true iff
+        // the contract store holds a SmartContract row for the address
+        // (`getContract(addr) != null`). A contract's row and its
+        // Contract-typed account are written/deleted together on deploy/
+        // selfdestruct, so `AccountType::Contract` is the equivalent signal.
+        //
+        // Do NOT gate on `Account.code_hash`: snapshot-imported contracts
+        // routinely carry an EMPTY code_hash while their runtime code lives in
+        // the address-keyed code store (see `basic_ref`'s comment). Gating on
+        // code_hash made ISCONTRACT disagree with EXTCODESIZE and wrongly
+        // return false for a real contract — reverting valid txs, e.g. SunSwap
+        // TokenApprove's `isContract(token)` guard ("SafeERC20: call to
+        // non-contract", live at block 83,361,039).
+        if let Some(contracts) = &self.contracts {
+            if matches!(contracts.get(&tron_addr), Ok(Some(_))) {
+                return true;
+            }
         }
+        matches!(
+            self.accounts.get(&tron_addr),
+            Ok(Some(account)) if account.r#type == tron_proto::AccountType::Contract as i32
+        )
     }
 
     fn tron_account_exists(&self, address: Address) -> bool {
@@ -1404,12 +1422,20 @@ mod tests {
     }
 
     #[test]
-    fn is_contract_returns_true_for_account_with_code() {
+    fn is_contract_true_for_contract_typed_account_with_empty_code_hash() {
+        // Regression (block 83,361,039): java-tron's ISCONTRACT checks the
+        // contract row (getContract != null) — equivalently AccountType::
+        // Contract — NOT code_hash. Snapshot-imported contracts routinely have
+        // an EMPTY code_hash (their runtime code lives in the address-keyed
+        // code store), so gating on code_hash wrongly returned false and
+        // reverted SunSwap TokenApprove's `isContract` guard with
+        // "SafeERC20: call to non-contract".
         let db = make_db();
         let contract = tron_addr(0xcc);
         let acct = Account {
             address: contract.to_vec(),
-            code_hash: vec![0u8; 32], // any non-empty value
+            r#type: tron_proto::AccountType::Contract as i32,
+            code_hash: vec![], // EMPTY — the snapshot case
             ..Default::default()
         };
         db.accounts
@@ -1417,7 +1443,7 @@ mod tests {
             .unwrap();
         assert!(
             TronDatabaseExt::tron_is_contract(&db, evm_addr_from_tron(contract)),
-            "contract with non-empty code_hash must be is_contract == true"
+            "a Contract-typed account must be is_contract == true even with empty code_hash"
         );
     }
 
