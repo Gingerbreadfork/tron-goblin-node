@@ -128,6 +128,18 @@ pub fn pay_standby_witness(
 ///   1. brokerage = delegation.get_brokerage(cycle, witness) (% out of 100)
 ///   2. brokerage_amount = value * brokerage / 100 → into account.allowance
 ///   3. voter_share = value - brokerage_amount → into delegation.add_reward(cycle, witness)
+/// The witness's brokerage cut of a `value` reward, as a percentage.
+///
+/// java-tron `MortgageService.payReward` computes this in IEEE-754 double:
+/// `brokerageRate = (double) brokerage / 100; brokerageAmount = (long)
+/// (brokerageRate * value)`. Integer `value * brokerage / 100` differs by 1 for
+/// rates whose `/100` is not exactly representable in f64 (e.g. 29, 47, 70),
+/// which would drift every voter payout and the witness allowance. Mirror
+/// java's f64 path exactly.
+fn brokerage_cut(value: i64, brokerage_pct: i64) -> i64 {
+    ((brokerage_pct as f64 / 100.0) * value as f64) as i64
+}
+
 fn pay_reward_inner(
     accounts: &AccountStore,
     delegation: &DelegationStore,
@@ -142,7 +154,7 @@ fn pay_reward_inner(
     // Brokerage is a percentage (0..=100). Default value when no row
     // exists is 20 — matches java-tron's `DEFAULT_BROKERAGE`.
     let brokerage = delegation.get_brokerage(cycle, witness_address);
-    let brokerage_amount = (value as i128 * brokerage as i128 / 100) as i64;
+    let brokerage_amount = brokerage_cut(value, brokerage as i64);
     let voter_share = value.saturating_sub(brokerage_amount);
     // 1. Voter-share pool — adds to cycle's reward bucket.
     if voter_share > 0 {
@@ -274,6 +286,25 @@ mod encode_tests {
         assert_eq!(encode_signed_be(-128), vec![0x80]);
         // -129 → [0xFF, 0x7F]
         assert_eq!(encode_signed_be(-129), vec![0xff, 0x7f]);
+    }
+
+    #[test]
+    fn brokerage_cut_matches_java_f64_not_integer_division() {
+        // value=100, rate=29: java's f64 path = (long)(0.29 * 100). 0.29 is not
+        // exactly representable, so the product lands just below 29.0 and
+        // truncates to 28, while integer `100 * 29 / 100` yields 29. We must
+        // match java (28) — over-crediting the witness by 1 would drift every
+        // voter payout in that cycle.
+        assert_eq!(brokerage_cut(100, 29), 28);
+        assert_ne!(brokerage_cut(100, 29), 100 * 29 / 100);
+        // Another divergent case (rate=57).
+        assert_eq!(brokerage_cut(100, 57), 56);
+        // Exactly-representable rates agree with integer division.
+        assert_eq!(brokerage_cut(1_000_000, 20), 200_000);
+        assert_eq!(brokerage_cut(1_000_000, 50), 500_000);
+        // 0% and 100% boundaries.
+        assert_eq!(brokerage_cut(123_456, 0), 0);
+        assert_eq!(brokerage_cut(123_456, 100), 123_456);
     }
 }
 

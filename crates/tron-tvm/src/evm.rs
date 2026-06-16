@@ -426,7 +426,11 @@ pub fn install_tron_opcode_stubs<IT, H>(
         instructions.insert_instruction(
             opcode::CALLTOKEN,
             Instruction::new(contract::call_token::<IT, H>),
-            0,
+            // java-tron `EnergyCost.getCallTokenCost` starts at `CALL_ENERGY`
+            // (= 40), the same base as a standard CALL, before adding the
+            // dynamic call cost. A base of 0 here under-charged every CALLTOKEN
+            // by 40 energy (times any per-contract dynamic factor).
+            40,
         );
         instructions.insert_instruction(
             opcode::TOKENBALANCE,
