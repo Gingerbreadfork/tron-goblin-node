@@ -757,6 +757,13 @@ impl ArchiveApiState {
         let live = self.live(id)?;
         Some(Arc::new(ArchiveAtBackend::new(live, self.reader.clone(), id, height)))
     }
+
+    /// Whether the archive can serve at-height reads for block `h` (i.e. `h`
+    /// is within the captured coverage window). Used by `debug_traceTransaction`
+    /// to decide whether it can time-travel to the tx's historical state.
+    pub fn covers(&self, h: i64) -> bool {
+        matches!(self.reader.coverage(), Ok(Some((base, head))) if h >= base && h <= head)
+    }
 }
 
 /// Routes for the at-height read surface.
@@ -784,7 +791,7 @@ pub fn archive_router() -> Router<RpcState> {
 /// executor never writes it (TRC10 balances go inline to
 /// `Account.asset_v2`), so its live contents ARE its at-height
 /// contents.
-fn state_at_height(s: &RpcState, arch: &ArchiveApiState, h: i64) -> RpcState {
+pub(crate) fn state_at_height(s: &RpcState, arch: &ArchiveApiState, h: i64) -> RpcState {
     use tron_chainbase as cb;
     use UndoStoreId as Id;
     let mut at = s.clone();

@@ -1992,9 +1992,11 @@ pub fn debug_trace_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     };
     // Resolve the full Transaction: BlockRef ⇒ look the block up and
     // find the tx by id; Full ⇒ we already have it.
+    let mut tx_block_num: Option<i64> = None;
     let tx_obj: tron_proto::Transaction = match stored {
         tron_chainbase::StoredTransaction::Full(t) => t,
         tron_chainbase::StoredTransaction::BlockRef(block_num) => {
+            tx_block_num = Some(block_num);
             let block_id = s.block_index.get(block_num).map_err(|e| {
                 RpcError::internal(format!("block_index lookup failed: {e:?}"))
             })?;
@@ -2058,7 +2060,30 @@ pub fn debug_trace_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcErro
         gas: s.eth_call_gas_cap,
     };
     let options = parse_trace_options(p, 1);
-    build_trace_for_call(s, &req, options)
+    // Time-travel: re-execute against the historical state as-of the tx's block
+    // BOUNDARY (block_num - 1) via the archive when available — "what did this
+    // tx do when it ran", not "re-run it against latest state". Block-boundary
+    // granularity (ignores intra-block preceding-tx effects) is exact for the
+    // common single-VM-tx-per-target case and is the granularity the archive
+    // captures. Falls back to current state when the archive is absent or
+    // doesn't cover the height; `tracedAtHeight` reports which state was used
+    // (the height, or null = current).
+    let (at_state, traced_at): (Option<RpcState>, Option<i64>) =
+        match (tx_block_num, s.archive.as_ref()) {
+            (Some(n), Some(arch)) if n >= 1 && arch.covers(n - 1) => (
+                Some(crate::index_api::state_at_height(s, arch, n - 1)),
+                Some(n - 1),
+            ),
+            _ => (None, None),
+        };
+    let mut trace = build_trace_for_call(at_state.as_ref().unwrap_or(s), &req, options)?;
+    if let Value::Object(ref mut m) = trace {
+        m.insert(
+            "tracedAtHeight".to_string(),
+            traced_at.map(|h| json!(h)).unwrap_or(Value::Null),
+        );
+    }
+    Ok(trace)
 }
 
 fn parse_trace_block_param(p: &Value, s: &RpcState) -> Result<Vec<[u8; 32]>, RpcError> {
