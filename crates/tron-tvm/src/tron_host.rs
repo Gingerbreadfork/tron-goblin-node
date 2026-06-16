@@ -1148,8 +1148,16 @@ impl TronDatabaseExt for TronDatabase {
                     ),
                 };
                 let undelegate_max_usage = if total_weight > 0 {
-                    ((balance as f64 / TRX_PRECISION as f64)
-                        * (total_limit as f64 / total_weight as f64)) as i64
+                    // java UnDelegateResourceProcessor: `(long)((double)balance /
+                    // TRX_PRECISION * totalLimit / totalWeight)` — evaluated
+                    // LEFT-TO-RIGHT as `((balance/1e6) * totalLimit) / totalWeight`.
+                    // Our prior grouping `(balance/1e6) * (totalLimit/totalWeight)`
+                    // rounded the limit/weight ratio FIRST, differing from java by
+                    // up to 1 after the i64 truncation — a sub-unit energy_usage
+                    // drift on heavy delegate/undelegate accounts. Match java's
+                    // exact evaluation order.
+                    (balance as f64 / TRX_PRECISION as f64 * total_limit as f64
+                        / total_weight as f64) as i64
                 } else {
                     0
                 };
