@@ -4987,6 +4987,103 @@ pub fn get_memo_fee(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// Returns `{ result: { result: bool, code, message }, energy_required }`
 /// matching java-tron's `wallet.estimateEnergy`. Internally we just
 /// delegate to `eth_estimate_gas` and reshape.
+/// Run a constant call through the structured tracer and return the raw
+/// outputs (outcome + per-opcode logs + call-frame tree). Mirrors
+/// [`build_trace_for_call`]'s execution setup; shared by the energy breakdown.
+fn traced_call_outputs(
+    s: &RpcState,
+    req: &EthCallRequest,
+    options: tron_tvm::tracer::TracerOptions,
+) -> Result<
+    (
+        tron_tvm::execute::VmOutcome,
+        Vec<tron_tvm::tracer::StructLog>,
+        Vec<tron_tvm::tracer::CallFrame>,
+    ),
+    RpcError,
+> {
+    let Some(b) = &s.eth_call_backends else {
+        return Err(RpcError::internal(
+            "tracer not available: server built without EVM call backends",
+        ));
+    };
+    let vm_stores = build_call_vm_stores(b);
+    let block_env = tron_tvm::execute::VmBlockEnv {
+        block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+    };
+    let trigger = tron_proto::TriggerSmartContract {
+        owner_address: req.from.to_vec(),
+        contract_address: req.to.to_vec(),
+        call_value: req.value,
+        data: req.data.clone(),
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let tracer = tron_tvm::tracer::StructLogTracer::new(options);
+    let (outcome, _internal, tracer) = tron_tvm::execute::execute_trigger_with_tracer(
+        &vm_stores,
+        block_env,
+        &trigger,
+        req.gas,
+        s.eth_call_gas_cap,
+        tracer,
+    );
+    let (struct_logs, call_frames) = tracer.into_outputs();
+    Ok((outcome, struct_logs, call_frames))
+}
+
+/// Aggregate a structured trace into an energy breakdown: per-opcode energy
+/// (where the energy went, top 15), the call-frame tree with per-frame energy,
+/// and the halting op + reason if it failed. This "why it costs X / why it
+/// would OOG" surface is what java-tron's bare estimate omits.
+fn energy_breakdown_json(
+    struct_logs: &[tron_tvm::tracer::StructLog],
+    call_frames: &[tron_tvm::tracer::CallFrame],
+) -> Value {
+    use std::collections::HashMap;
+    let mut by_op: HashMap<&str, (u64, u64)> = HashMap::new(); // (count, energy)
+    let mut halt: Option<(&str, String)> = None;
+    for log in struct_logs {
+        let e = by_op.entry(log.op_name.as_str()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = e.1.saturating_add(log.gas_cost);
+        if let Some(err) = &log.error {
+            halt = Some((log.op_name.as_str(), err.clone()));
+        }
+    }
+    let mut ops: Vec<(&str, u64, u64)> = by_op.into_iter().map(|(op, (c, e))| (op, c, e)).collect();
+    // Highest energy first; ties broken by name for determinism.
+    ops.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+    let by_opcode: Vec<Value> = ops
+        .iter()
+        .take(15)
+        .map(|(op, count, energy)| json!({ "op": op, "count": count, "energy": energy }))
+        .collect();
+
+    fn flatten(frames: &[tron_tvm::tracer::CallFrame], depth: u32, out: &mut Vec<Value>) {
+        for f in frames {
+            out.push(json!({
+                "type": f.call_type,
+                "depth": depth,
+                "to": f.to.map(|a| format!("0x{}", hex::encode(a))),
+                "energy_used": f.gas_used,
+                "error": f.error,
+            }));
+            flatten(&f.calls, depth + 1, out);
+        }
+    }
+    let mut frames_out = Vec::new();
+    flatten(call_frames, 1, &mut frames_out);
+
+    json!({
+        "ops_executed": struct_logs.len(),
+        "by_opcode": by_opcode,
+        "call_frames": frames_out,
+        "halt": halt.map(|(op, reason)| json!({ "op": op, "reason": reason })),
+    })
+}
+
 pub fn estimate_energy(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let gas_value = eth_estimate_gas(p, s)?;
     // eth_estimateGas returns a hex string; decode back to i64.
@@ -4994,10 +5091,21 @@ pub fn estimate_energy(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .as_str()
         .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
         .unwrap_or(0) as i64;
-    Ok(json!({
+    let mut out = json!({
         "result": { "result": true },
         "energy_required": energy,
-    }))
+    });
+    // Energy breakdown — where the energy goes (per-opcode), the call-frame
+    // tree, and the halting op/reason if it would fail. Best-effort: a missing
+    // tracer backend or a parse error just omits the field, leaving the total.
+    if let Ok(req) = parse_eth_call_request(p, s.eth_call_gas_cap) {
+        if let Ok((_outcome, logs, frames)) =
+            traced_call_outputs(s, &req, tron_tvm::tracer::TracerOptions::default())
+        {
+            out["energy_breakdown"] = energy_breakdown_json(&logs, &frames);
+        }
+    }
+    Ok(out)
 }
 
 // =============================================================================
@@ -6980,5 +7088,35 @@ mod eth_call_tests {
         // Operator configured a 5M cap; caller's 10M gets clamped.
         let req = parse_eth_call_request(&o, 5_000_000).unwrap();
         assert_eq!(req.gas, 5_000_000);
+    }
+
+    #[test]
+    fn energy_breakdown_aggregates_by_opcode_and_flags_halt() {
+        use tron_tvm::tracer::StructLog;
+        let mk = |op: &str, cost: u64, err: Option<&str>| StructLog {
+            pc: 0,
+            op: 0,
+            op_name: op.to_string(),
+            gas: 0,
+            gas_cost: cost,
+            depth: 0,
+            stack: vec![],
+            error: err.map(|e| e.to_string()),
+        };
+        let logs = vec![
+            mk("SSTORE", 20000, None),
+            mk("SSTORE", 5000, None),
+            mk("PUSH1", 3, None),
+            mk("EXTCODESIZE", 0, Some("OutOfGas(Basic)")),
+        ];
+        let v = energy_breakdown_json(&logs, &[]);
+        assert_eq!(v["ops_executed"], 4);
+        // SSTORE (25000 across 2 ops) ranks first; PUSH1 is far down.
+        assert_eq!(v["by_opcode"][0]["op"], "SSTORE");
+        assert_eq!(v["by_opcode"][0]["energy"], 25000);
+        assert_eq!(v["by_opcode"][0]["count"], 2);
+        // The halting op + reason are surfaced (the "why it would OOG").
+        assert_eq!(v["halt"]["op"], "EXTCODESIZE");
+        assert_eq!(v["halt"]["reason"], "OutOfGas(Basic)");
     }
 }
