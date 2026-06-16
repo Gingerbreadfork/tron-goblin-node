@@ -222,8 +222,20 @@ impl PrecompileImpl {
                 let entries = (total_words - 5) / 6;
                 (entries as u64) * 1500
             }
-            // 1500 + 10000 baseline (per java-tron)
-            Self::ValidateMultiSign => 1500,
+            // java-tron `ValidateMultiSign.getEnergyForData` scales per signature:
+            // `cnt = (data.length / WORD_SIZE - 5) / 5; return cnt * ENGERYPERSIGN`
+            // (ENGERYPERSIGN = 1500). A flat 1500 over/under-charged depending on
+            // the signature count. (Guard `< 5` words → 0, since the Rust subtraction
+            // would underflow; java's negative-cnt case only arises on invalid input.)
+            Self::ValidateMultiSign => {
+                const WORD_SIZE: usize = 32;
+                let total_words = input.len() / WORD_SIZE;
+                if total_words < 5 {
+                    return 0;
+                }
+                let entries = (total_words - 5) / 5;
+                (entries as u64) * 1500
+            }
             // Shielded zk-SNARK verifiers — flat costs per java-tron's
             // `PrecompiledContracts.VerifyMintProof.getEnergyForData`
             // (and Burn/Transfer/MerkleHash siblings). NO per-spend or

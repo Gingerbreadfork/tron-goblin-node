@@ -368,7 +368,12 @@ fn energy_costs_match_pinned_values_from_java_tron() {
     // mainnet reference node + PrecompiledContracts.java.
     assert_eq!(PrecompileImpl::GetChainParameter.energy_cost(&[]), 50);
     assert_eq!(PrecompileImpl::AvailableUnfreezeV2Size.energy_cost(&[]), 50);
-    assert_eq!(PrecompileImpl::ValidateMultiSign.energy_cost(&[]), 1500);
+    // java-tron `ValidateMultiSign.getEnergyForData` scales per signature:
+    // `((data.length/32 - 5) / 5) * 1500`. Empty / <5-word input → 0; each
+    // 5-word signature group beyond the 5-word header adds 1500.
+    assert_eq!(PrecompileImpl::ValidateMultiSign.energy_cost(&[]), 0);
+    assert_eq!(PrecompileImpl::ValidateMultiSign.energy_cost(&vec![0u8; 10 * 32]), 1500);
+    assert_eq!(PrecompileImpl::ValidateMultiSign.energy_cost(&vec![0u8; 15 * 32]), 3000);
     // Shielded zk-SNARK verifiers. Constants pinned against java-tron's
     // `PrecompiledContracts.{VerifyMintProof,VerifyTransferProof,
     // VerifyBurnProof,MerkleHash}.getEnergyForData`. **Input-independent**:
