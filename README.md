@@ -166,6 +166,15 @@ What works today:
   many-core machine, transaction-heavy mainnet blocks apply roughly 2×
   faster (more on the densest, contract-heavy blocks); light blocks skip
   the machinery and run serially.
+- ✅ **Consensus self-audit watchdog.** As each block applies, the
+  executor cross-checks every transaction's *computed* success/failure
+  against the block's canonical `contractRet` — TRON commits no state
+  root, so this tripwire is the node's only signal that its state has
+  silently diverged from consensus. The count and most-recent-divergence
+  block are surfaced as Prometheus metrics
+  (`tron_node_consensus_divergences_total`), so an operator can alert the
+  instant the node stops agreeing with the chain — independent of whether
+  `verify_contract_ret` is also set to hard-reject the block.
 - ✅ Actuator dispatch: full coverage of java-tron's contract types
   (Transfer, AssetTransfer, Exchange*, FreezeBalance*, Witness*,
   Proposal*, TriggerSmartContract, CreateSmartContract, …).
@@ -179,6 +188,18 @@ What works today:
   gaps still being chased.
 - ✅ JSON-RPC + REST: the `eth_*` surface that java-tron exposes
   plus the `/wallet/*` REST endpoints, backed by chainbase reads.
+- ✅ **Time-travel transaction tracer** — geth-style
+  `debug_traceTransaction` (and `debug_traceBlockByNumber` /
+  `ByHash`) re-execute a TVM transaction through a per-opcode
+  structured tracer **against the historical state as-of the tx's
+  block boundary** when the archive covers it (not "re-run against
+  latest"), reporting which state was used in a `tracedAtHeight`
+  field. java-tron has no `debug_trace*` surface at all.
+- ✅ **Explainable energy estimates** — `estimateEnergy` returns the
+  total *plus* an `energy_breakdown`: energy by opcode (top 15), the
+  CALL/CREATE frame tree with per-frame energy, and the exact halting
+  op + reason when a call would run out — "why it costs X / why it
+  would OOG", which java-tron's bare number omits.
 - ✅ gRPC server on the Wallet / WalletSolidity / Database / Monitor
   / Network services — no `Status::unimplemented` stubs left.
 - ✅ Mempool with signer recovery + dedup + expiration eviction +
@@ -250,9 +271,11 @@ What works today:
   outcomes, SR block production, PBFT message traffic, mempool
   (size + accepted + evicted + rejected-by-reason labels), active
   peers (incl. inbound peers syncing *from* us + requests served),
-  per-method RPC counters, and the indexer (cursor / lag /
-  backfill edges, per-namespace row counters, archive coverage,
-  firehose head-seq and unwind counters).
+  per-method RPC counters, the **consensus self-audit watchdog**
+  (`tron_node_consensus_divergences_total` +
+  `tron_node_consensus_last_divergence_block`), and the indexer
+  (cursor / lag / backfill edges, per-namespace row counters, archive
+  coverage, firehose head-seq and unwind counters).
 
 What doesn't work yet (real, currently-open gaps):
 

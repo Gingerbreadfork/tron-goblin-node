@@ -14,6 +14,32 @@ Important config:
 - `[rpc] eth_call_gas_cap`: maximum gas for `eth_call` and estimation paths.
 - `[vm] support_constant`: required for read-only smart-contract calls.
 
+### Developer and debug methods
+
+Beyond the standard `eth_*` reads, the JSON-RPC surface exposes two
+developer tools java-tron does not provide. Both require
+`[vm] support_constant = true` (they re-execute through the TVM).
+
+- **`debug_traceTransaction`** (and `debug_traceBlockByNumber` /
+  `debug_traceBlockByHash`, which trace each contained transaction):
+  geth-style structured trace of a TVM transaction — per-opcode
+  `StructLog` plus the CALL/CREATE frame tree. Standard `tracer` /
+  `disableStack` / `disableMemory` / `disableStorage` options are
+  honored. When the historical-state archive
+  (`[index] capture_state_deltas = true`) covers the transaction's block
+  boundary, the trace re-executes against the state **as-of that height**
+  rather than current state, so it reflects what the transaction actually
+  did. A `tracedAtHeight` field reports the height used, or `null` when
+  current state was used (no archive, height not covered, or a
+  non-VM transaction). Granularity is the block boundary — it ignores the
+  effects of earlier transactions within the same block, which is exact
+  for the common single-VM-call-per-target case.
+- **`estimateEnergy`**: returns the estimated `energy_required` and, in
+  an `energy_breakdown` object, where that energy goes — energy by opcode
+  (top 15), the call-frame tree with per-frame energy, and, if the call
+  would fail, the halting opcode and reason. The breakdown is best-effort:
+  if the tracer cannot run, the total estimate is still returned.
+
 ## TRON REST Wallet API
 
 The HTTP REST surface provides java-tron-compatible `/wallet/*` endpoints used

@@ -161,6 +161,31 @@ RUST_LOG=tron_node=debug,info ./target/release/tron-node start --data-dir ./main
 
 At `info`, the node reports startup head, sync progress, and catch-up status.
 
+## Monitoring and Alerting
+
+The node exposes Prometheus metrics on `127.0.0.1:9090` by default (`[metrics]`
+section, or `--metrics-port`). Scrape `/metrics` for chain head, sync flow,
+reorg/fork outcomes, peer counts, per-method RPC counters, and indexer health.
+
+The single most important alert is the **consensus self-audit watchdog**. As
+each block applies, the executor cross-checks every transaction's computed
+success/failure outcome against the block's canonical `contractRet`. TRON block
+headers commit no state root, so this is the node's only runtime signal that its
+state has silently diverged from consensus.
+
+| Metric | Meaning |
+| --- | --- |
+| `tron_node_consensus_divergences_total` | Count of observed divergences since process start. **Alert on any increase** (`increase(...[5m]) > 0`). A healthy node holds this at `0`. |
+| `tron_node_consensus_last_divergence_block` | Block height of the most recent divergence (for triage). |
+
+A non-zero counter means this node disagrees with the chain on at least one
+transaction outcome — treat it as a correctness incident: capture the block from
+`tron_node_consensus_last_divergence_block`, and re-trace the offending
+transaction with `debug_traceTransaction` against the historical archive. This
+signal is emitted regardless of whether the executor's `verify_contract_ret`
+mode is also set to hard-reject the divergent block, so monitoring catches a
+divergence even when the node is configured to keep applying.
+
 ## Database Administration
 
 Run admin commands only while the node is stopped unless the command explicitly
