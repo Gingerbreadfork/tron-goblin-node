@@ -130,9 +130,10 @@ Set RUST_LOG to control log verbosity:
 
 At the default `info` level the node prints its startup head (height + UTC
 block time + how far behind real time) and a throttled sync-progress line,
-e.g. `syncing #83,344,101  2026-06-05 14:23:09Z  (3d 2h behind)  ·  142 blk/s
-·  via 8.217.215.241`, then `caught up to chain tip …` once it's following
-live blocks.
+e.g. `syncing #83,344,101 · 06-05 14:23:09 (3d 2h behind) · 142 blk/s · via
+8.217.215.241`, then `caught up to chain tip …` once it's following live
+blocks. On a terminal each line is prefixed with a compact `HH:MM:SS`; in a
+redirected/file capture the prefix keeps the full `YYYY-MM-DD HH:MM:SS.mmm`.
 ";
 
 fn main() -> ExitCode {
@@ -955,11 +956,19 @@ fn run_init(args: &[String]) -> ExitCode {
     }
 }
 
-/// Compact UTC log timestamp — `YYYY-MM-DD HH:MM:SS.mmm`, no `T`/`Z`/nanos —
-/// replacing tracing's verbose default (`2026-06-11T08:31:53.427701Z`).
-struct CompactUtcTime;
+/// Per-line log timestamp, replacing tracing's verbose default
+/// (`2026-06-11T08:31:53.427701Z`). Two modes:
+/// * `Full` — `YYYY-MM-DD HH:MM:SS.mmm` (no `T`/`Z`/nanos) for the file sink and
+///   non-TTY captures, which span multiple days and are kept for forensics.
+/// * `Clock` — `HH:MM:SS` for an interactive terminal, where the date is
+///   constant on screen and recorded in the daily log filename.
+#[derive(Clone, Copy)]
+enum LogTime {
+    Full,
+    Clock,
+}
 
-impl tracing_subscriber::fmt::time::FormatTime for CompactUtcTime {
+impl tracing_subscriber::fmt::time::FormatTime for LogTime {
     fn format_time(
         &self,
         w: &mut tracing_subscriber::fmt::format::Writer<'_>,
@@ -968,7 +977,10 @@ impl tracing_subscriber::fmt::time::FormatTime for CompactUtcTime {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        write!(w, "{}", tron_node::logfmt::log_timestamp(ms))
+        match self {
+            LogTime::Full => write!(w, "{}", tron_node::logfmt::log_timestamp(ms)),
+            LogTime::Clock => write!(w, "{}", tron_node::logfmt::clock(ms)),
+        }
     }
 }
 
@@ -1001,11 +1013,14 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let is_tty = std::io::stderr().is_terminal();
+    let ansi = is_tty && std::env::var_os("NO_COLOR").is_none();
+    // Interactive terminal → compact `HH:MM:SS` (the date is constant on screen).
+    // Redirected stderr (captures, `journald`) keeps the full dated timestamp.
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(ansi)
-        .with_timer(CompactUtcTime)
+        .with_timer(if is_tty { LogTime::Clock } else { LogTime::Full })
         .with_target(false);
 
     // Daily-rotated file sink (on by default, like java-tron). No ANSI in files.
@@ -1022,7 +1037,7 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         let layer = fmt::layer()
             .with_writer(non_blocking)
             .with_ansi(false)
-            .with_timer(CompactUtcTime)
+            .with_timer(LogTime::Full)
             .with_target(false);
         (Some(layer), Some(guard))
     };

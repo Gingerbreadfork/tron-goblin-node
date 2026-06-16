@@ -202,6 +202,37 @@ fn shared_env() -> Option<&'static Env> {
     .as_ref()
 }
 
+/// A read-only snapshot of the process-wide RocksDB tuning the node derived
+/// from the detected hardware at open time — for the startup summary log. Every
+/// field is the exact value the open paths actually applied; reading it neither
+/// opens a DB nor allocates.
+#[derive(Clone, Copy, Debug)]
+pub struct RocksdbTuning {
+    pub cores: usize,
+    pub mem_total_bytes: usize,
+    pub write_buffer_manager_bytes: usize,
+    pub block_cache_bytes: usize,
+    pub background_threads: i32,
+    pub flush_threads: i32,
+    pub max_write_buffer_number: i32,
+    pub bloom_bits_per_key: u32,
+}
+
+/// The resolved [`RocksdbTuning`]. Cheap: just returns the already-computed
+/// hardware-scaled values (and the configured block-cache size).
+pub fn rocksdb_tuning() -> RocksdbTuning {
+    RocksdbTuning {
+        cores: detected_cores(),
+        mem_total_bytes: detected_mem_total_bytes(),
+        write_buffer_manager_bytes: write_buffer_manager_bytes(),
+        block_cache_bytes: CONFIGURED_BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        background_threads: background_threads(),
+        flush_threads: flush_threads(),
+        max_write_buffer_number: DEFAULT_MAX_WRITE_BUFFER_NUMBER,
+        bloom_bits_per_key: 10,
+    }
+}
+
 /// Apply the runtime performance knobs the node's read-write open paths
 /// share: a shared LRU block cache + bloom filters (point-lookup stores
 /// like `account`/`code`/`storage-row` otherwise binary-search every

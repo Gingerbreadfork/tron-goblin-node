@@ -27,7 +27,9 @@ pub use checkpoint_v2::{
 };
 pub use pending_overlay::PendingOverlay;
 pub use permissions::{apply_default_account_permissions, default_account_permissions};
-pub use rocksdb_backend::{set_block_cache_bytes, RocksDbBackend, RocksDbError};
+pub use rocksdb_backend::{
+    rocksdb_tuning, set_block_cache_bytes, RocksDbBackend, RocksDbError, RocksdbTuning,
+};
 pub use session::SessionBackend;
 pub use snapshot::SnapshotKvBackend;
 pub use stores::{

@@ -182,7 +182,7 @@ pub async fn run_inbound_listener(
         }
     };
     info!(%listen_addr, max_inbound = server.max_inbound,
-        "p2p inbound listener up — peers can now sync from us");
+        "📡 p2p inbound listener up — peers can now sync from us");
     accept_loop(server, listener, shutdown).await;
 }
 

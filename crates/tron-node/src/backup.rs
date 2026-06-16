@@ -220,7 +220,7 @@ async fn run(
                         info!("backup: keepalive starved — SLAVER → INIT");
                     } else {
                         status.store(MASTER, Ordering::Relaxed);
-                        info!("backup: election won — INIT → MASTER (block production enabled)");
+                        info!("👑 backup: election won — INIT → MASTER (block production enabled)");
                     }
                 }
                 let st = status.load(Ordering::Relaxed);

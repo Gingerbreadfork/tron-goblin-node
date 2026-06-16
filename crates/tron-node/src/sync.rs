@@ -1462,13 +1462,13 @@ impl SyncDriver {
             .unwrap_or(0);
         let age_ms = (now_ms - block_ts).max(0);
         let height = logfmt::commas(block_num);
-        let when = logfmt::utc_millis(block_ts);
+        let when = logfmt::block_time(block_ts, now_ms);
         // One block produced every ~3s; an age under ~2 cadences is "live".
         if age_ms <= 6_000 {
-            info!("block #{height}  {when}  ({tx_count} txs)  ·  live tip  ·  via {peer}");
+            info!("block #{height} · {when} · {tx_count} txs · live tip · via {peer}");
         } else {
             info!(
-                "block #{height}  {when}  ({tx_count} txs)  ·  {} behind  ·  via {peer}",
+                "block #{height} · {when} · {tx_count} txs · {} behind · via {peer}",
                 logfmt::duration_ms(age_ms)
             );
         }
@@ -1502,7 +1502,7 @@ impl SyncDriver {
                 "🧌 tip reached at #{} ({}) — the goblin has done a little dance \
                  and stopped screaming at peers for now 🎉",
                 logfmt::commas(block_num),
-                logfmt::utc_millis(block_ts),
+                logfmt::block_time(block_ts, now_ms),
             );
             self.at_tip = true;
         } else if !is_tip && self.at_tip {
@@ -1541,7 +1541,7 @@ impl SyncDriver {
         };
 
         let height = logfmt::commas(block_num);
-        let when = logfmt::utc_millis(block_ts);
+        let when = logfmt::block_time(block_ts, now_ms);
         let behind = logfmt::duration_ms(behind_ms);
         let mut line = if is_tip {
             // A fully caught-up node still trails the newest block's TIMESTAMP by
@@ -1553,9 +1553,9 @@ impl SyncDriver {
             // growing lag at the tip) do we surface "(N behind)".
             const TIP_CURRENT_MS: i64 = 6_000;
             if behind_ms <= TIP_CURRENT_MS {
-                format!("at tip  #{height}  {when}  ·  via {peer}")
+                format!("at tip #{height} · {when} · via {peer}")
             } else {
-                format!("at tip  #{height}  {when}  ({behind} behind)  ·  via {peer}")
+                format!("at tip #{height} · {when} ({behind} behind) · via {peer}")
             }
         } else {
             // Full-sync ETA. TRON produces a block every ~3s, so each block we
@@ -1567,28 +1567,29 @@ impl SyncDriver {
             let eta = if rate >= 1.0 {
                 let closing = rate * TRON_BLOCK_SECS - 1.0;
                 let eta_ms = (behind_ms as f64 / closing) as i64;
-                format!("  ·  ETA {}", logfmt::duration_ms(eta_ms))
+                format!(" · ETA {}", logfmt::duration_ms(eta_ms))
             } else {
                 String::new()
             };
             format!(
-                "syncing #{height}  {when}  ({behind} behind)  ·  {rate:.0} blk/s{eta}  ·  via {peer}"
+                "syncing #{height} · {when} ({behind} behind) · {rate:.0} blk/s{eta} · via {peer}"
             )
         };
         let vr = self.stats.blocks_rejected_validation;
         let er = self.stats.blocks_rejected_execution;
         if vr > 0 || er > 0 {
-            line.push_str(&format!("  ·  {vr} val-rej  {er} exec-rej"));
+            line.push_str(&format!(" · {vr} val-rej {er} exec-rej"));
         }
-        // Multi-peer fetch fan-out. `fetchers` is the decisive number: if it
-        // stays at 1 while many peers are connected, the worker pool isn't
-        // claiming (fetch-bound on one peer); if it's high but blk/s is low,
-        // the pool is feeding the leader fine and we're apply-bound.
+        // Multi-peer fetch fan-out, logged as `pool want/inflight/ready f=fetchers`.
+        // `f` (fetchers) is the decisive number: if it stays at 1 while many peers
+        // are connected, the worker pool isn't claiming (fetch-bound on one peer);
+        // if it's high but blk/s is low, the pool is feeding the leader fine and
+        // we're apply-bound.
         if !is_tip {
             if let Some(pool) = &self.fetch_pool {
                 let (want, inflight, ready, fetchers) = pool.fanout_stats();
                 line.push_str(&format!(
-                    "  ·  pool w/i/r={want}/{inflight}/{ready} fetchers={fetchers}"
+                    " · pool {want}/{inflight}/{ready} f={fetchers}"
                 ));
             }
         }

@@ -228,11 +228,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
-    // Startup head summary — where we're resuming from, in human terms:
-    // height, the block's wall-clock time, and how far behind real time it
-    // is. Tells the operator at a glance whether this is a fresh genesis, a
-    // deep snapshot resume, or a node that's nearly at the tip.
+    // Startup system summary — a compact, at-a-glance boot readout for
+    // operators and the curious: build provenance, which chain/fork, where
+    // we're resuming from, the detected hardware + derived RocksDB tuning, the
+    // execution-engine switches, and the network/API surfaces. Everything here
+    // is a free config/const read or a cheap dyn-props point lookup — no scans.
     {
+        use tron_chainbase::rocksdb_tuning;
         let dp = tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone());
         let num = dp.latest_block_header_number().unwrap_or(0);
         let ts = dp.latest_block_header_timestamp().unwrap_or(0);
@@ -240,11 +242,96 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        let head_hash = dp.latest_block_header_hash().ok().flatten();
+        let solid = dp.latest_solidified_block_num().unwrap_or(0);
+        let cycle = dp.current_cycle_number();
+        let schema = dp.schema_version().unwrap_or(0);
+        let t = rocksdb_tuning();
+        let genesis = tron_types::genesis_block_id(&tron_types::mainnet_inputs()).0;
+
+        // Local formatting helpers (only the summary uses them).
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        let mib = |b: usize| b / (1usize << 20);
+        // Block ids are height-prefixed (8-byte height ++ 24-byte hash tail), so
+        // the meaningful fingerprint is the TAIL — render it as `0x…<last4>`.
+        let fp = |b: &[u8]| {
+            let mut s = String::from("0x…");
+            for x in &b[b.len().saturating_sub(4)..] {
+                s.push_str(&format!("{x:02x}"));
+            }
+            s
+        };
+        let on = |b: bool| if b { "ON" } else { "OFF" };
+        let api = |disabled: bool, port: u16| {
+            if disabled {
+                "off".to_string()
+            } else {
+                format!(":{port}")
+            }
+        };
+        let head_hex = head_hash
+            .as_ref()
+            .map(|h| fp(&h[..]))
+            .unwrap_or_else(|| "—".to_string());
+        let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+
         info!(
-            "head at startup: #{} ({}, {} behind)",
+            "🧌 build: tron-goblin/{} · {} · {} · {}-{} · mimalloc",
+            env!("CARGO_PKG_VERSION"),
+            env!("GOBLIN_GIT_SHA"),
+            profile,
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+        );
+        // Genesis tail (last 4 bytes) is the meaningful fingerprint — paired
+        // with the p2p net id it pins exactly which chain/fork this data-dir is.
+        info!(
+            "🧱 chain: TRON mainnet · p2p net {} · genesis {}",
+            tron_net::MAINNET_P2P_VERSION,
+            fp(&genesis[..]),
+        );
+        info!(
+            "🌱 head: #{} ({}) · {} behind · solidified #{} · cycle {}",
             crate::logfmt::commas(num),
-            crate::logfmt::utc_millis(ts),
+            head_hex,
             crate::logfmt::duration_ms((now_ms - ts).max(0)),
+            crate::logfmt::commas(solid),
+            cycle,
+        );
+        info!(
+            "⚙ runtime: {} cores · {:.1} GiB RAM · tokio {} workers",
+            t.cores,
+            gib(t.mem_total_bytes),
+            t.cores,
+        );
+        info!(
+            "💾 rocksdb: WBM {:.1} GiB · HyperClockCache {} MiB · {}c+{}f threads · bloom {}b/key · schema v{}",
+            gib(t.write_buffer_manager_bytes),
+            mib(t.block_cache_bytes),
+            t.background_threads,
+            t.flush_threads,
+            t.bloom_bits_per_key,
+            schema,
+        );
+        info!(
+            "🧠 vm: Block-STM {} · pipelined-apply {} · reorg={}",
+            on(config.vm.parallel_exec),
+            on(config.vm.pipelined_apply),
+            if config.storage.snapshot_reorg { "snapshot" } else { "undo-log" },
+        );
+        info!(
+            "📡 p2p :{} ({}) · discovery {} · max {} peers",
+            config.p2p.advertise_port,
+            if config.p2p.listen { "listening" } else { "outbound-only" },
+            if config.p2p.discover_enable { "DNS+Kad" } else { "off" },
+            config.p2p.max_peers,
+        );
+        info!(
+            "🔌 RPC {} · gRPC {} · 🌐 REST {} · 📊 metrics {}",
+            api(config.rpc.disabled, config.rpc.port),
+            api(config.grpc.disabled, config.grpc.port),
+            api(config.http.disabled, config.http.port),
+            api(config.metrics.disabled, config.metrics.port),
         );
 
         // Cross-store consistency guard: an imported snapshot whose stores
@@ -371,7 +458,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         let bound = listener
             .local_addr()
             .map_err(|e| RunError::Rpc(e.to_string()))?;
-        info!(%bound, "Prometheus metrics listening");
+        info!(%bound, "📊 Prometheus metrics listening");
         let app = tron_rpc::server::metrics_router(metrics.clone());
         let mut sd = shutdown.subscribe();
         handles.push(tokio::spawn(async move {
@@ -619,7 +706,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         let bound = listener
             .local_addr()
             .map_err(|e| RunError::Rpc(e.to_string()))?;
-        info!(%bound, "JSON-RPC listening");
+        info!(%bound, "🔌 JSON-RPC listening");
         let mut sd = shutdown.subscribe();
         // Rate limits: java's JsonRpcServlet sits behind the same
         // rate.limiter.http chain — the `jsonrpc` component (servlet
@@ -748,7 +835,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| RunError::Rpc(format!("bind {addr}: {e}")))?;
-        info!(bound = %listener.local_addr().unwrap_or(addr), "HTTP REST listening");
+        info!(bound = %listener.local_addr().unwrap_or(addr), "🌐 HTTP REST listening");
         let mut sd = shutdown.subscribe();
         // Build the HTTP rate-limit registry from config. Each entry
         // binds a path-tail component (lowercased) to a strategy
@@ -1769,7 +1856,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     if !shutdown.is_shutdown() {
         let _ = sd.recv().await;
     }
-    info!("shutdown observed; waiting up to 3s for subsystems to drain");
+    info!("👋 shutdown observed; waiting up to 3s for subsystems to drain");
 
     // Give subsystems a grace window to drain gracefully, then force-abort
     // any stragglers. Most tasks observe the shutdown broadcast and return
@@ -1794,7 +1881,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             ah.abort();
         }
     }
-    info!("bye");
+    info!("💀 bye");
     Ok(())
 }
 
@@ -2557,7 +2644,7 @@ fn seed_committee_initial_values(
         b"DYNAMIC_ENERGY_MAX_FACTOR",
         cfg.dynamic_energy_max_factor,
     );
-    info!("seeded committee.* governance flags into DynamicPropertiesStore");
+    info!("🏛 seeded committee.* governance flags into DynamicPropertiesStore");
 }
 
 fn hex_encode(b: &[u8]) -> String {

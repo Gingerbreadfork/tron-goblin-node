@@ -55,6 +55,37 @@ pub fn log_timestamp(ms: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{millis:03}")
 }
 
+/// Epoch-millis → `"HH:MM:SS"` (UTC time-of-day, no date or millis) — the
+/// compact per-line timestamp for an interactive terminal, where the date is
+/// constant on screen and recorded in the daily log filename. Negative input
+/// clamps to the epoch.
+pub fn clock(ms: i64) -> String {
+    let sod = (ms.max(0) / 1000).rem_euclid(86_400);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    format!("{hh:02}:{mm:02}:{ss:02}")
+}
+
+/// Block chain-time for status lines. Renders `"HH:MM:SS"` when the block is
+/// from the same UTC day as `now_ms`, else `"MM-DD HH:MM:SS"` — the year and
+/// the `Z` suffix are always dropped (the whole stream is UTC). `now_ms`
+/// supplies "today" so a block at the tip shows just a clock while a catch-up
+/// block keeps its date. Non-positive `ms` (unset) renders as `"—"`.
+pub fn block_time(ms: i64, now_ms: i64) -> String {
+    if ms <= 0 {
+        return "—".to_string();
+    }
+    let secs = ms / 1000;
+    let (y, mo, d) = civil_from_days(secs.div_euclid(86_400));
+    let sod = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    let now_date = civil_from_days((now_ms.max(0) / 1000).div_euclid(86_400));
+    if (y, mo, d) == now_date {
+        format!("{hh:02}:{mm:02}:{ss:02}")
+    } else {
+        format!("{mo:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+    }
+}
+
 /// Coarse human duration from millis, top two units: `"3d 2h"`, `"5m 12s"`,
 /// `"4s"`. Non-positive renders as `"0s"` (treats "block in the future" from
 /// minor clock skew as "at tip").
@@ -121,6 +152,26 @@ mod tests {
         assert_eq!(log_timestamp(1_700_000_000_123), "2023-11-14 22:13:20.123");
         assert_eq!(log_timestamp(0), "1970-01-01 00:00:00.000");
         assert_eq!(log_timestamp(-5), "1970-01-01 00:00:00.000");
+    }
+
+    #[test]
+    fn clock_renders_time_of_day_only() {
+        // 1700000000000 ms = 2023-11-14 22:13:20 UTC.
+        assert_eq!(clock(1_700_000_000_000), "22:13:20");
+        assert_eq!(clock(0), "00:00:00");
+        assert_eq!(clock(-5), "00:00:00");
+    }
+
+    #[test]
+    fn block_time_drops_date_when_same_day_else_keeps_month_day() {
+        // Block and "now" on the same UTC day → clock only.
+        let same_day_now = 1_700_000_000_000 + 3_600_000; // +1h, still 2023-11-14
+        assert_eq!(block_time(1_700_000_000_000, same_day_now), "22:13:20");
+        // Block from a different (earlier) day → MM-DD HH:MM:SS, no year/Z.
+        let later_now = 1_700_000_000_000 + 5 * 86_400_000; // ~2023-11-19
+        assert_eq!(block_time(1_700_000_000_000, later_now), "11-14 22:13:20");
+        // Unset.
+        assert_eq!(block_time(0, later_now), "—");
     }
 
     #[test]
