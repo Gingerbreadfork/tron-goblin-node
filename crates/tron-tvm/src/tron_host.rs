@@ -737,6 +737,24 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         }
         let owner = evm_to_tron_address(&caller);
+        // java `UnfreezeBalanceV2Processor.validate`: reject (no state change)
+        // when the count of still-unfreezing v2 entries (expire_time > now) is
+        // already at the UNFREEZE_MAX_TIMES cap (32). java validates before
+        // execute, so this precedes the reward settlement + sweep below.
+        {
+            const UNFREEZE_MAX_TIMES: usize = 32;
+            let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+            if let Ok(Some(acct)) = self.accounts.get(&owner) {
+                let unfreezing = acct
+                    .unfrozen_v2
+                    .iter()
+                    .filter(|u| u.unfreeze_expire_time > now)
+                    .count();
+                if unfreezing >= UNFREEZE_MAX_TIMES {
+                    return 0;
+                }
+            }
+        }
         // java's TVM `UnfreezeBalanceV2Processor.execute` settles pending
         // voter rewards first, mirroring the actuator.
         if let Some(delegation) = self.delegation.as_ref() {

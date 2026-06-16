@@ -353,3 +353,61 @@ fn allow_dynamic_energy_off_skips_penalty_even_with_stored_factor() {
          with_flag={with_flag}, without_flag={without_flag}"
     );
 }
+
+#[test]
+fn reverted_sub_call_does_not_persist_callee_energy_usage() {
+    // java attaches a nested frame's `energy_usage` write to its child deposit
+    // and discards it on revert (only a frame whose whole ancestor chain
+    // succeeds keeps it). A sub-CALL that reverts inside a SUCCESSFUL outer tx
+    // must therefore leave the callee's ContractState.energy_usage unchanged.
+    let stores = fresh_stores();
+
+    // Callee F: do a little work, then REVERT.
+    let mut f_code = make_workload(8);
+    f_code.pop(); // drop the trailing STOP
+    f_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // PUSH1 0 PUSH1 0 REVERT
+    let f = install(&stores, 0x02, &f_code);
+
+    // Seed F's stored energy_usage with a sentinel we expect to survive.
+    stores
+        .contract_state
+        .put(
+            &Address::from_raw(f),
+            &ContractState { energy_usage: 777, ..Default::default() },
+        )
+        .unwrap();
+
+    // Caller C: CALL F (which reverts), POP the failure flag, STOP (success).
+    // CALL stack (pushed bottom→top): retSize, retOffset, argsSize, argsOffset,
+    // value, addr, gas.
+    let mut c_code: Vec<u8> = vec![
+        0x60, 0x00, // PUSH1 0  retSize
+        0x60, 0x00, // PUSH1 0  retOffset
+        0x60, 0x00, // PUSH1 0  argsSize
+        0x60, 0x00, // PUSH1 0  argsOffset
+        0x60, 0x00, // PUSH1 0  value
+        0x73, // PUSH20 <F evm address>
+    ];
+    c_code.extend_from_slice(&f[1..21]); // F's 20-byte EVM address
+    c_code.extend_from_slice(&[0x62, 0x01, 0x86, 0xa0]); // PUSH3 100000 (forwarded gas)
+    c_code.push(0xf1); // CALL
+    c_code.push(0x50); // POP (discard the call's failure flag)
+    c_code.push(0x00); // STOP — C succeeds
+    let c = install(&stores, 0x01, &c_code);
+
+    let owner = fund_user(&stores, 0x09);
+    let _ = run(&stores, owner, c); // outer tx succeeds (panics otherwise)
+
+    // F reverted → its energy_usage must be untouched (sentinel preserved).
+    // Before the per-frame journal fix the reverted frame's base energy was
+    // added on top (777 + base), drifting the contract's dynamic-energy state.
+    let f_state = stores
+        .contract_state
+        .get(&Address::from_raw(f))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f_state.energy_usage, 777,
+        "a reverted sub-call's energy_usage must not persist"
+    );
+}

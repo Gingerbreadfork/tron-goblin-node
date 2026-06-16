@@ -26,6 +26,7 @@ use revm::primitives::{Address, U256};
 use std::sync::Arc;
 use std::time::Instant;
 use tron_chainbase::{AccountStore, ContractStateStore, DynamicPropertiesStore};
+use tron_proto::ContractState;
 
 use crate::database::evm_to_tron_address;
 use crate::internal_tx::InternalTxTrace;
@@ -74,6 +75,18 @@ pub struct Trc10Inspector {
     committed: Vec<PendingTransfer>,
     /// Per-frame marker into `committed` (parallels `frame_starts`).
     committed_starts: Vec<usize>,
+    /// Per-interpreter-frame snapshot of the frame target's `ContractState`
+    /// row, taken at `initialize_interp` BEFORE this frame's `catch_up_to_cycle`
+    /// + `add_energy_usage` writes. java attaches those writes to the nested
+    /// frame's child deposit and discards them on revert/halt (only a frame
+    /// whose whole ancestor chain succeeds keeps them). We restore the snapshot
+    /// (LIFO) when the frame's subtree reverts, so a reverted subtree leaves no
+    /// `energy_usage` / dynamic-factor drift. One snapshot per frame suffices —
+    /// both writes target the same address, so restoring the pre-frame row
+    /// undoes both; LIFO restore handles nested/recursive same-contract frames.
+    cs_journal: Vec<(tron_crypto::address::Address, ContractState)>,
+    /// Per-frame marker into `cs_journal` (parallels `committed_starts`).
+    cs_journal_starts: Vec<usize>,
     accounts: Option<Arc<AccountStore>>,
     /// Optional per-contract dynamic-energy lookup. When set, the
     /// inspector reads the callee's factor at `initialize_interp` and
@@ -164,6 +177,8 @@ impl Trc10Inspector {
             pending: Vec::new(),
             committed: Vec::new(),
             committed_starts: Vec::new(),
+            cs_journal: Vec::new(),
+            cs_journal_starts: Vec::new(),
             accounts: Some(accounts),
             contract_state: None,
             dyn_props: None,
@@ -328,6 +343,30 @@ impl Trc10Inspector {
         }
     }
 
+    /// Pop this frame's `cs_journal` marker. If the frame reverted/halted,
+    /// restore (LIFO) every ContractState row its subtree snapshotted at
+    /// `initialize_interp` — undoing the reverted subtree's `catch_up_to_cycle`
+    /// + `add_energy_usage` writes, exactly as java discards the uncommitted
+    /// child deposit. On success the entries stay (an ancestor frame may still
+    /// revert and restore them); the top-level frame's success drops them.
+    fn restore_cs_journal_if_reverted(&mut self, reverted: bool) {
+        let Some(jstart) = self.cs_journal_starts.pop() else {
+            return;
+        };
+        if !reverted {
+            return;
+        }
+        if let Some(cs) = self.contract_state.clone() {
+            while self.cs_journal.len() > jstart {
+                if let Some((addr, row)) = self.cs_journal.pop() {
+                    let _ = cs.put(&addr, &row);
+                }
+            }
+        } else {
+            self.cs_journal.truncate(jstart);
+        }
+    }
+
     /// Σ dynamic-energy penalties across all finished frames — java's
     /// `ProgramResult.getEnergyPenaltyTotal()`. Read after the run for
     /// `receipt.energy_penalty_total` / constant-call `energy_penalty`.
@@ -356,12 +395,22 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         // The catch-up writes the updated `ContractState` back to disk.
         // We also push a frame record so `*_end` can compute the
         // un-penalised base energy and call `add_energy_usage`.
-        let Some(cs) = &self.contract_state else {
+        let Some(cs) = self.contract_state.clone() else {
             return;
         };
         use revm::interpreter::interpreter_types::InputsTr;
         let target = interp.input.target_address();
         let tron_addr = evm_to_tron_address(&target);
+
+        // Snapshot the target's ContractState row BEFORE this frame's
+        // catch_up + add_energy_usage writes, so `*_end` can restore it if the
+        // frame's subtree reverts (java discards the reverted child deposit).
+        // One snapshot per frame covers both writes (same target); the marker
+        // for this frame was pushed in `call`/`create`.
+        if !self.cs_journal_starts.is_empty() {
+            let prior = cs.get(&tron_addr).ok().flatten().unwrap_or_default();
+            self.cs_journal.push((tron_addr, prior));
+        }
 
         let factor = if let Some(dp) = &self.dyn_props {
             let current_cycle = dp.current_cycle_number();
@@ -450,6 +499,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         let depth = self.frame_starts.len();
         self.frame_starts.push(self.internal_txs.len());
         self.committed_starts.push(self.committed.len());
+        self.cs_journal_starts.push(self.cs_journal.len());
         if depth > 0 {
             let trx_value = match inputs.value {
                 revm::interpreter::CallValue::Transfer(v) => v,
@@ -618,6 +668,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 }
             }
         }
+        self.restore_cs_journal_if_reverted(reverted);
     }
 
     fn create(
@@ -653,6 +704,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         self.interp_markers.push(false);
         self.frame_starts.push(self.internal_txs.len());
         self.committed_starts.push(self.committed.len());
+        self.cs_journal_starts.push(self.cs_journal.len());
         self.internal_txs.push(InternalTxTrace {
             caller_address: *caller.as_bytes(),
             transfer_to_address: *target.as_bytes(),
@@ -707,6 +759,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         if self.interp_markers.pop().unwrap_or(false) {
             self.record_frame_energy(&outcome.result.gas, outcome.result.result.is_halt());
         }
+        self.restore_cs_journal_if_reverted(!outcome.result.result.is_ok());
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
