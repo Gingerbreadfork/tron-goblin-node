@@ -1,6 +1,6 @@
 # <img src="goblin.svg" width="48" alt="" valign="middle"> Tron Goblin Node
 
-[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Tests](https://img.shields.io/badge/tests-2318%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
+[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Tests](https://img.shields.io/badge/tests-2328%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
 
 A Rust implementation of the [TRON](https://tron.network) full-node
 protocol — the same role java-tron plays, written from scratch in
@@ -292,25 +292,29 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **2251** |
-| Ignored (gated on Sapling proving, ~50 MB params + 1–2 s each) | 9 |
+| Workspace tests passing | **2328** |
+| Ignored — live-network (6), Sapling Groth16 proving (5), perf/diagnostic (7) | 18 |
 | Integration test files (`crates/*/tests/`) | 121 |
-| Source modules with `#[cfg(test)]` blocks | 117 |
+| Source modules with `#[cfg(test)]` blocks | 125 |
 
 Per-crate breakdown of the test surface (where coverage lives is
 where parity risk lives):
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `tron-node`      | 366 | `tron-types`     |  58 |
-| `tron-actuator`  | 321 | `tron-net`       |  57 |
-| `tron-rpc`       | 314 | `tron-index`     |  55 |
-| `tron-tvm`       | 297 | `tron-crypto`    |  34 |
-| `tron-chainbase` | 226 | `tron-mempool`   |  25 |
-| `tron-executor`  | 149 | `tron-wallet`    |  22 |
+| `tron-node`      | 373 | `tron-types`     |  60 |
+| `tron-actuator`  | 321 | `tron-net`       |  77 |
+| `tron-rpc`       | 317 | `tron-index`     |  55 |
+| `tron-tvm`       | 322 | `tron-crypto`    |  35 |
+| `tron-chainbase` | 228 | `tron-mempool`   |  25 |
+| `tron-executor`  | 162 | `tron-wallet`    |  22 |
 | `tron-consensus` |  88 | `tron-eventer`   |  16 |
 | `tron-grpc`      |  66 | `tron-firehose-*`|   8 |
-| `tron-proto`     |   8 | `tron-replay`    |   6 |
+| `tron-proto`     |   8 | `tron-replay`    |   8 |
+
+These principal crates account for 2,191 of the 2,328 passing tests; the
+remaining ~137 live in the four vendored `revm-*` forks and the
+`tron-state-diff` / `tron-eventer-kafka` tooling crates.
 
 Notable test categories:
 
@@ -323,8 +327,9 @@ Notable test categories:
   `crates/tron-node/tests/live_tip_observation.rs`).
 - **Shielded proving**: `#[ignore]`-gated Groth16 round-trips for
   mint / transfer / burn under
-  `crates/tron-grpc/tests/create_shielded_*.rs`. Run with
-  `cargo test --release -- --ignored`.
+  `crates/tron-grpc/tests/create_shielded_*.rs`. Run just these with
+  `cargo test -p tron-grpc --release -- --ignored` (workspace-wide
+  `--ignored` also pulls in the live-network tests).
 - **Deliberate java-tron deviations**: each of the ~handful of
   intentional behaviour gaps (e.g. `createtransaction`
   permissiveness, `getaccount` unknown-address shape) has a
@@ -341,12 +346,16 @@ What coverage **doesn't** include yet:
 - Long-running soak / load tests against mainnet snapshots. Manual
   for now; CI integration is on the observability backlog.
 
-The whole sweep (default + ignored) finishes in under 90 s on a
-modern laptop:
+The default suite finishes in under 90 s on a modern laptop:
 
 ```sh
-cargo test --workspace --release -- --include-ignored
+cargo test --workspace --release
 ```
+
+The 18 ignored tests are opt-in: 5 Sapling Groth16 round-trips (load the
+embedded ~50 MB params and run real proofs), 6 live-network tests (dial
+real mainnet peers / DNS / Kad — need outbound connectivity), and 7
+perf/diagnostic probes. Add `-- --include-ignored` to run them too.
 
 ## Layout
 
@@ -412,10 +421,10 @@ The full workspace compiles in ~3–5 minutes on a modern machine.
 Tests:
 
 ```sh
-cargo test --workspace            # 2250+ tests, all defaults
-cargo test --workspace --release -- --ignored
-                                  # adds 9 Sapling-proving tests
-                                  # (~50 MB Groth16 params + 1-2s each)
+cargo test --workspace            # 2328 tests, all defaults
+cargo test --workspace --release -- --include-ignored
+                                  # + 18 opt-in: Sapling proving (~50 MB
+                                  # Groth16 params), live-network, diagnostics
 ```
 
 ## Run
