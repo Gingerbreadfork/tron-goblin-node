@@ -2252,6 +2252,37 @@ fn execute_block_logic(
             )
             .map(|(from, to)| raw.number >= from && raw.number <= to)
             .unwrap_or(false);
+        // TEMP DIAGNOSTIC: per-block balance/frozen snapshot for ONE target
+        // account (TRON_BAL_TRACE_ADDR=<42-char 41-hex>). State is committed in
+        // tx order before this point, so `state.accounts` holds the post-block
+        // value. Lets a balance-drift root invisible to the fee/contractRet
+        // tripwires be diffed per-block against java's oracle acct dump.
+        if let Ok(hex) = std::env::var("TRON_BAL_TRACE_ADDR") {
+            let bytes: Vec<u8> = (0..hex.len() / 2)
+                .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                .collect();
+            if bytes.len() == 21 {
+                let mut b = [0u8; 21];
+                b.copy_from_slice(&bytes);
+                let acct_store = AccountStore::new(state.accounts.clone());
+                if let Ok(Some(a)) = acct_store.get(&Address::from_raw(b)) {
+                    let fz_bw: i64 = a.frozen_v2.iter().filter(|f| f.r#type == 0).map(|f| f.amount).sum();
+                    let fz_en: i64 = a.frozen_v2.iter().filter(|f| f.r#type == 1).map(|f| f.amount).sum();
+                    let ar = a.account_resource.as_ref();
+                    eprintln!(
+                        "BAL_TRACE blk={} balance={} frozenV2_bw={} frozenV2_energy={} energy_usage={} net_usage={} deleg_energy={} acq_deleg_energy={}",
+                        raw.number,
+                        a.balance,
+                        fz_bw,
+                        fz_en,
+                        ar.map(|r| r.energy_usage).unwrap_or(0),
+                        a.net_usage,
+                        ar.map(|r| r.delegated_frozen_v2_balance_for_energy).unwrap_or(0),
+                        ar.map(|r| r.acquired_delegated_frozen_v2_balance_for_energy).unwrap_or(0),
+                    );
+                }
+            }
+        }
         for (tx, res) in block.transactions.iter().zip(tx_results.iter()) {
             if fee_trace {
                 let id: String = res.tx_id.iter().map(|b| format!("{b:02x}")).collect();
