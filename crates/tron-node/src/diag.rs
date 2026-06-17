@@ -32,8 +32,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AccountStore, ContractStore, DelegatedResourceStore, DynamicPropertiesStore, KvBackend,
-    RocksDbBackend, StorageRowStore,
+    AccountStore, ContractStore, DelegatedResourceStore, DelegationStore, DynamicPropertiesStore,
+    KvBackend, RocksDbBackend, StorageRowStore,
 };
 use tron_crypto::address::{Address, ADDRESS_LENGTH};
 
@@ -102,6 +102,10 @@ pub fn run_diag(args: &[String]) -> ExitCode {
         "contractstate" => match pos.first().map(|s| parse_addr(s)) {
             Some(Ok(addr)) => diag_contractstate(&data_dir, &addr),
             _ => return arg_err("contractstate <hex-addr>"),
+        },
+        "reward" => match pos.first().map(|s| parse_addr(s)) {
+            Some(Ok(addr)) => diag_reward(&data_dir, &addr),
+            _ => return arg_err("reward <hex-addr>"),
         },
         "--help" | "-h" | "help" => {
             print!("{USAGE}");
@@ -255,6 +259,33 @@ fn diag_dynprop(data_dir: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Voter reward-cycle state: the `begin_cycle`/`end_cycle` (DelegationStore)
+/// against the chain's `current_cycle`, plus `allowance` and the live votes.
+/// `query_reward` returns 0 (empty window) once `begin_cycle >= current_cycle`,
+/// so diffing `begin_cycle` against the java reference node pins a reward query
+/// that wrongly settles to zero. java equivalents: `getReward` RPC + the
+/// delegation store's begin/end cycle.
+fn diag_reward(data_dir: &str, addr: &Address) -> Result<(), String> {
+    let deleg = DelegationStore::new(open_ro(data_dir, "delegation")?);
+    let dp = DynamicPropertiesStore::new(open_ro(data_dir, "properties")?);
+    let accounts = AccountStore::new(open_ro(data_dir, "account")?);
+    let current = dp.get_long(b"CURRENT_CYCLE_NUMBER").unwrap_or(0);
+    let (allowance, votes) = match accounts.get(addr).map_err(|e| format!("read account: {e}"))? {
+        Some(a) => (a.allowance, a.votes),
+        None => (0, Vec::new()),
+    };
+    println!("reward {}", hex_addr(addr));
+    println!("  begin_cycle    {}", deleg.get_begin_cycle(addr));
+    println!("  end_cycle      {}", deleg.get_end_cycle(addr));
+    println!("  current_cycle  {current}");
+    println!("  allowance      {allowance}");
+    println!("  votes ({})", votes.len());
+    for v in &votes {
+        println!("    {} -> {}", hex::encode(&v.vote_address), v.vote_count);
+    }
+    Ok(())
+}
+
 fn arg_err(usage: &str) -> ExitCode {
     eprintln!("diag: usage: tron-node diag {usage} [--data-dir DIR]");
     ExitCode::from(2)
@@ -303,6 +334,7 @@ USAGE:
   tron-node diag dynprop     <key-string>           [--data-dir DIR]
   tron-node diag storage     <hex-addr> <hex-slot>  [--data-dir DIR]
   tron-node diag contractstate <hex-addr>           [--data-dir DIR]
+  tron-node diag reward      <hex-addr>             [--data-dir DIR]
 
 Addresses are 21-byte mainnet hex (42 chars, '41…'), optional '0x' prefix.
 Default --data-dir is ./tron-data. Open is read-only; run with the node stopped.

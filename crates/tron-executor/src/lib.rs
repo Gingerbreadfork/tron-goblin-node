@@ -2283,6 +2283,42 @@ fn execute_block_logic(
                 }
             }
         }
+        // TEMP DIAGNOSTIC: per-block delegation reward-cycle snapshot for ONE
+        // voter (TRON_REWARD_TRACE_ADDR=<42-char 41-hex>). Tracks begin_cycle /
+        // end_cycle against the chain's current_cycle to catch a begin_cycle that
+        // advances out of step with java — an early/skipped reward settlement that
+        // empties later reward windows (invisible to the fee/contractRet tripwires).
+        if let Ok(hex) = std::env::var("TRON_REWARD_TRACE_ADDR") {
+            let bytes: Vec<u8> = (0..hex.len() / 2)
+                .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                .collect();
+            if bytes.len() == 21 {
+                let mut b = [0u8; 21];
+                b.copy_from_slice(&bytes);
+                let addr = Address::from_raw(b);
+                let deleg = DelegationStore::new(state.delegation.clone());
+                let dynp = DynamicPropertiesStore::new(state.dyn_props.clone());
+                let (votes_n, votes_sum, allowance) =
+                    match AccountStore::new(state.accounts.clone()).get(&addr) {
+                        Ok(Some(a)) => (
+                            a.votes.len(),
+                            a.votes.iter().map(|v| v.vote_count).sum::<i64>(),
+                            a.allowance,
+                        ),
+                        _ => (0, 0, 0),
+                    };
+                eprintln!(
+                    "REWARD_TRACE blk={} begin_cycle={} end_cycle={} current_cycle={} votes_n={} votes_sum={} allowance={}",
+                    raw.number,
+                    deleg.get_begin_cycle(&addr),
+                    deleg.get_end_cycle(&addr),
+                    dynp.get_long(b"CURRENT_CYCLE_NUMBER").unwrap_or(0),
+                    votes_n,
+                    votes_sum,
+                    allowance,
+                );
+            }
+        }
         for (tx, res) in block.transactions.iter().zip(tx_results.iter()) {
             if fee_trace {
                 let id: String = res.tx_id.iter().map(|b| format!("{b:02x}")).collect();
