@@ -255,14 +255,16 @@ impl TronDatabaseExt for TronDatabase {
         //      only on the transfer path -- both reach here) ----
         if allow_vote {
             if let Some(delegation) = self.delegation.clone() {
-                let _ = crate::reward::withdraw_reward(
+                // `VoteRewardUtil.withdrawReward` — gated on ALLOW_TVM_VOTE
+                // (the enclosing `allow_vote` already enforces it).
+                let _ = crate::reward::withdraw_reward_tvm(
                     &owner_t,
                     &self.accounts,
                     &delegation,
                     &dyn_props,
                     self.reward_vi.as_deref(),
                 );
-                // Re-read: withdraw_reward may have grown the allowance.
+                // Re-read: the settle may have grown the allowance.
                 if let Ok(Some(acc)) = self.accounts.get(&owner_t) {
                     owner_account = acc;
                 }
@@ -573,12 +575,13 @@ impl TronDatabaseExt for TronDatabase {
         };
         let owner = evm_to_tron_address(&caller);
         // java's `VoteWitnessProcessor.execute` settles pending voter
-        // rewards FIRST (`VoteRewardUtil.withdrawReward`) — the reward
-        // window must close against the votes as they stood.
+        // rewards FIRST (`VoteRewardUtil.withdrawReward`, gated on
+        // ALLOW_TVM_VOTE) — the reward window must close against the votes
+        // as they stood.
         if let (Some(delegation), Some(dyn_props)) =
             (self.delegation.as_ref(), self.dyn_props.as_ref())
         {
-            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
+            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_vote_witness settling rewards");
         }
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
@@ -624,13 +627,13 @@ impl TronDatabaseExt for TronDatabase {
         let owner = evm_to_tron_address(&caller);
         // java's TVM `WithdrawRewardProcessor.execute` settles pending
         // voter rewards into `allowance` first (`VoteRewardUtil
-        // .withdrawReward`), then drains the allowance. NOTE: unlike the
-        // `WithdrawBalanceContract` actuator, the TVM opcode has NO 24h
-        // cooldown — its validate only blocks genesis GRs. Our previous
-        // guard (`latest_withdraw_time + 24h`) failed withdrawals java
-        // accepts.
+        // .withdrawReward`, gated on ALLOW_TVM_VOTE), then drains the
+        // allowance. NOTE: unlike the `WithdrawBalanceContract` actuator,
+        // the TVM opcode has NO 24h cooldown — its validate only blocks
+        // genesis GRs. Our previous guard (`latest_withdraw_time + 24h`)
+        // failed withdrawals java accepts.
         if let Some(delegation) = self.delegation.as_ref() {
-            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
+            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
         }
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
@@ -756,9 +759,10 @@ impl TronDatabaseExt for TronDatabase {
             }
         }
         // java's TVM `UnfreezeBalanceV2Processor.execute` settles pending
-        // voter rewards first, mirroring the actuator.
+        // voter rewards first (`VoteRewardUtil.withdrawReward`, gated on
+        // ALLOW_TVM_VOTE), mirroring the actuator.
         if let Some(delegation) = self.delegation.as_ref() {
-            crate::reward::withdraw_reward(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
+            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
                 .expect(
                     "db error in TronDatabaseExt::tron_unfreeze_balance_v2 settling rewards",
                 );

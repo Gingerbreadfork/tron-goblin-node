@@ -8,9 +8,10 @@ use tron_chainbase::{
 use tron_crypto::address::Address;
 use tron_proto::{Account, Vote};
 use tron_tvm::reward::{
-    decode_signed_be_i128, query_reward, withdraw_reward, ALLOW_CHANGE_DELEGATION_KEY,
-    ALLOW_OLD_REWARD_OPT_KEY, CURRENT_CYCLE_NUMBER_KEY,
-    NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY, REWARD_VI_DECIMAL,
+    decode_signed_be_i128, query_reward, query_reward_actuator, query_reward_tvm, withdraw_reward,
+    withdraw_reward_actuator, withdraw_reward_tvm, ALLOW_CHANGE_DELEGATION_KEY, ALLOW_OLD_REWARD_OPT_KEY,
+    ALLOW_TVM_VOTE_KEY, CURRENT_CYCLE_NUMBER_KEY, NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY,
+    REWARD_VI_DECIMAL,
 };
 
 /// Arm the gates `query_reward`/`withdraw_reward` consult, mirroring a
@@ -291,8 +292,8 @@ fn query_reward_latest_cycle_catchup_uses_snapshot_votes() {
 
 #[test]
 fn query_reward_returns_zero_when_change_delegation_disabled() {
-    // java: `if (!allowChangeDelegation()) return 0` — even the cached
-    // allowance is not reported.
+    // java `MortgageService.queryReward`: `if (!allowChangeDelegation())
+    // return 0` — even the cached allowance is not reported.
     let accounts = AccountStore::new(mem());
     let delegation = DelegationStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
@@ -305,8 +306,72 @@ fn query_reward_returns_zero_when_change_delegation_disabled() {
             ..Default::default()
         },
     ).unwrap();
-    let reward = query_reward(&voter, &accounts, &delegation, &dp, None).unwrap();
+    let reward = query_reward_actuator(&voter, &accounts, &delegation, &dp, None).unwrap();
     assert_eq!(reward, 0);
+}
+
+/// Regression for the two-entry-point gate split: java gates
+/// `MortgageService` (actuator/RPC) on ALLOW_CHANGE_DELEGATION and
+/// `VoteRewardUtil` (TVM precompile/opcodes) on ALLOW_TVM_VOTE. When the
+/// flags differ, the two wrappers must diverge — each follows its own gate,
+/// not a single shared one.
+#[test]
+fn reward_gates_are_independent_per_entry_point() {
+    // A voter earning a 600-sun Vi-delta reward (no allowance), in a
+    // post-upgrade DB where the new algorithm has always been effective.
+    fn build() -> (AccountStore, DelegationStore, DynamicPropertiesStore, Address) {
+        let accounts = AccountStore::new(mem());
+        let delegation = DelegationStore::new(mem());
+        let dp = DynamicPropertiesStore::new(mem());
+        dp.put_long(NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY, 0);
+        dp.put_long(CURRENT_CYCLE_NUMBER_KEY, 20);
+        let voter = addr(0xe1);
+        let witness = addr(0xe2);
+        accounts.put(
+            &voter,
+            &Account {
+                address: voter.as_bytes().to_vec(),
+                votes: vec![Vote {
+                    vote_address: witness.as_bytes().to_vec(),
+                    vote_count: 100,
+                }],
+                ..Default::default()
+            },
+        ).unwrap();
+        delegation.set_begin_cycle(&voter, 10);
+        delegation.set_end_cycle(&voter, 20);
+        delegation.set_witness_vi_raw(19, &witness, &encode_vi(6 * REWARD_VI_DECIMAL));
+        (accounts, delegation, dp, voter)
+    }
+
+    // TVM_VOTE on, CHANGE_DELEGATION off: only the TVM wrappers pay out.
+    {
+        let (accounts, delegation, dp, voter) = build();
+        dp.put_long(ALLOW_TVM_VOTE_KEY, 1);
+        dp.put_long(ALLOW_CHANGE_DELEGATION_KEY, 0);
+        // query: TVM path sees 600, actuator path is gated to 0.
+        assert_eq!(query_reward_tvm(&voter, &accounts, &delegation, &dp, None).unwrap(), 600);
+        assert_eq!(query_reward_actuator(&voter, &accounts, &delegation, &dp, None).unwrap(), 0);
+        // withdraw: actuator path is a no-op (allowance stays 0)...
+        assert_eq!(withdraw_reward_actuator(&voter, &accounts, &delegation, &dp, None).unwrap(), 0);
+        assert_eq!(accounts.get(&voter).unwrap().unwrap().allowance, 0);
+        // ...while the TVM path settles the 600 into allowance.
+        assert_eq!(withdraw_reward_tvm(&voter, &accounts, &delegation, &dp, None).unwrap(), 600);
+        assert_eq!(accounts.get(&voter).unwrap().unwrap().allowance, 600);
+    }
+
+    // CHANGE_DELEGATION on, TVM_VOTE off: only the actuator wrappers pay out.
+    {
+        let (accounts, delegation, dp, voter) = build();
+        dp.put_long(ALLOW_TVM_VOTE_KEY, 0);
+        dp.put_long(ALLOW_CHANGE_DELEGATION_KEY, 1);
+        assert_eq!(query_reward_tvm(&voter, &accounts, &delegation, &dp, None).unwrap(), 0);
+        assert_eq!(query_reward_actuator(&voter, &accounts, &delegation, &dp, None).unwrap(), 600);
+        assert_eq!(withdraw_reward_tvm(&voter, &accounts, &delegation, &dp, None).unwrap(), 0);
+        assert_eq!(accounts.get(&voter).unwrap().unwrap().allowance, 0);
+        assert_eq!(withdraw_reward_actuator(&voter, &accounts, &delegation, &dp, None).unwrap(), 600);
+        assert_eq!(accounts.get(&voter).unwrap().unwrap().allowance, 600);
+    }
 }
 
 #[test]
@@ -465,8 +530,8 @@ fn withdraw_reward_noop_when_allow_change_delegation_disabled() {
             ..Default::default()
         },
     ).unwrap();
-    // ALLOW_CHANGE_DELEGATION not set ⇒ 0 ⇒ disabled.
-    let paid = withdraw_reward(&voter, &accounts, &delegation, &dp, None).unwrap();
+    // ALLOW_CHANGE_DELEGATION not set ⇒ 0 ⇒ disabled (the actuator gate).
+    let paid = withdraw_reward_actuator(&voter, &accounts, &delegation, &dp, None).unwrap();
     assert_eq!(paid, 0);
     // Allowance untouched.
     assert_eq!(accounts.get(&voter).unwrap().unwrap().allowance, 500);

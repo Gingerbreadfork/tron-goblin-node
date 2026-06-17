@@ -959,7 +959,7 @@ pub fn get_reward(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         return Ok(json!(0));
     };
     let reward =
-        tron_tvm::reward::query_reward(&addr, &s.accounts, d, &s.dyn_props, s.reward_vi.as_deref())
+        tron_tvm::reward::query_reward_actuator(&addr, &s.accounts, d, &s.dyn_props, s.reward_vi.as_deref())
         .map_err(|e| RpcError::internal(format!("reward read: {e}")))?;
     Ok(json!(reward))
 }

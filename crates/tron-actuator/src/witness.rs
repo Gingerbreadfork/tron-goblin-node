@@ -191,7 +191,8 @@ pub fn validate_withdraw_balance(
     // withdraw — execute settles them first. Gating on allowance alone
     // failed txs that mainnet accepts.
     if account.allowance <= 0
-        && tron_tvm::reward::query_reward(&owner, accounts, delegation, dyn_props, reward_vi)? <= 0
+        && tron_tvm::reward::query_reward_actuator(&owner, accounts, delegation, dyn_props, reward_vi)?
+            <= 0
     {
         return Err(ActuatorError::NoAllowance);
     }
@@ -213,7 +214,7 @@ pub fn execute_withdraw_balance(
     // this advances the voter's begin/end-cycle markers and writes the
     // `account_vote` snapshot in DelegationStore — state java mutates on
     // every withdrawal.
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
+    tron_tvm::reward::withdraw_reward_actuator(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut account = accounts
         .get(&owner)?

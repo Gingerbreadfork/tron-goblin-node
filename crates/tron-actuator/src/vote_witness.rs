@@ -127,7 +127,7 @@ pub fn execute_vote_witness(
     let owner =
         decode_address(&contract.owner_address).ok_or(ActuatorError::InvalidOwnerAddress)?;
 
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
+    tron_tvm::reward::withdraw_reward_actuator(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut owner_account = accounts
         .get(&owner)?

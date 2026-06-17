@@ -439,7 +439,7 @@ fn voter_withdraws_reward_after_full_cycle() {
     //                        = 1_076_800_000
     //   delta_vi = pool * 1e18 / vote_count = 1_076_800_000 * 1e15
     //   voter share = 100 * delta_vi / 1e18 = 107_680_000
-    let paid = tron_tvm::reward::withdraw_reward(
+    let paid = tron_tvm::reward::withdraw_reward_actuator(
         &Address::from_raw(voter),
         &accts,
         &dlg,

@@ -2035,7 +2035,7 @@ impl Wallet for WalletService {
         // (minimal test configurations).
         let address = Address::from_raw(addr);
         let num = match self.state.delegation.as_ref() {
-            Some(delegation) => tron_tvm::reward::query_reward(
+            Some(delegation) => tron_tvm::reward::query_reward_actuator(
                 &address,
                 &self.state.accounts,
                 delegation,

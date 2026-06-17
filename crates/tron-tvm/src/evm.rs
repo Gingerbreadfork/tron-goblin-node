@@ -154,7 +154,10 @@ impl EvmContext for TronEvmContext {
         Ok(self.contract_state.dynamic_energy_factor(contract)?)
     }
     fn query_reward(&self, voter: &TronAddress) -> Result<i64, EvmContextError> {
-        Ok(crate::reward::query_reward(
+        // `RewardBalance` precompile → `VoteRewardUtil.queryReward`, gated
+        // on ALLOW_TVM_VOTE (not ALLOW_CHANGE_DELEGATION like the actuator
+        // `getReward` RPC path).
+        Ok(crate::reward::query_reward_tvm(
             voter,
             &self.accounts,
             &self.delegation,

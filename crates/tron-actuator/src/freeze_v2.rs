@@ -223,7 +223,7 @@ pub fn execute_unfreeze_balance_v2(
     // (`mortgageService.withdrawReward` at the top of
     // `UnfreezeBalanceV2Actuator.execute`) — before the stake, and
     // therefore the vote list below, changes.
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
+    tron_tvm::reward::withdraw_reward_actuator(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut account = accounts
         .get(&owner)?

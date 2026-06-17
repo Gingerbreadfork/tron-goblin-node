@@ -254,7 +254,7 @@ pub fn execute_unfreeze_balance(
     // (`mortgageService.withdrawReward(ownerAddress)` at the top of
     // `UnfreezeBalanceActuator.execute`) — the reward window must close
     // against the votes/cycle markers as they stood.
-    tron_tvm::reward::withdraw_reward(&owner, accounts, delegation, dyn_props, reward_vi)?;
+    tron_tvm::reward::withdraw_reward_actuator(&owner, accounts, delegation, dyn_props, reward_vi)?;
 
     let mut account = accounts
         .get(&owner)?

@@ -29,7 +29,14 @@ pub const CURRENT_CYCLE_NUMBER_KEY: &[u8] = b"CURRENT_CYCLE_NUMBER";
 
 /// Change-delegation flag key. java's on-disk key is `CHANGE_DELEGATION`
 /// (no `ALLOW_` prefix — a java naming quirk; see the chainbase keys doc).
+/// Gates the actuator/consensus/RPC reward path (`MortgageService`).
 pub const ALLOW_CHANGE_DELEGATION_KEY: &[u8] = b"CHANGE_DELEGATION";
+
+/// TVM-vote flag key (`ALLOW_TVM_VOTE`, proposal #59). Gates the TVM
+/// reward path (`VoteRewardUtil`): the `RewardBalance` precompile, the
+/// `WITHDRAWREWARD` opcode, and the reward settlement inside the TVM
+/// vote / freeze-v2 / selfdestruct handlers.
+pub const ALLOW_TVM_VOTE_KEY: &[u8] = b"ALLOW_TVM_VOTE";
 
 /// First cycle the Vi-accumulator ("new reward") algorithm applies to.
 /// Set once when `ALLOW_NEW_REWARD` / `ALLOW_TVM_VOTE` activated;
@@ -308,10 +315,17 @@ mod encode_tests {
     }
 }
 
-/// Compute `MortgageService.queryReward(voter)` against the live stores —
-/// an exact port, including the legacy-algorithm branch:
+/// Compute the claimable reward for `voter` against the live stores — an
+/// exact port of java-tron's `queryReward`, including the legacy-algorithm
+/// branch. The body is shared by both java entry points
+/// (`MortgageService.queryReward` and `VoteRewardUtil.queryReward`); they
+/// differ ONLY in their chain-parameter gate, which java checks before the
+/// shared body and which is therefore the CALLER's responsibility here:
+/// the actuator/consensus/RPC path gates on `ALLOW_CHANGE_DELEGATION`, the
+/// TVM path on `ALLOW_TVM_VOTE` (see [`ALLOW_TVM_VOTE_KEY`]). Both java
+/// functions return `0` when their gate is off.
 ///
-/// 1. `0` when `ALLOW_CHANGE_DELEGATION` is off or the account is missing.
+/// 1. `0` when the account is missing.
 /// 2. `allowance` when `begin_cycle > current_cycle`.
 /// 3. Latest-cycle catch-up: when `begin_cycle + 1 == end_cycle` and the
 ///    cycle has finalised, the single-cycle reward is computed against
@@ -327,6 +341,10 @@ mod encode_tests {
 /// `reward_vi` is the `reward-vi` store used by the `ALLOW_OLD_REWARD_OPT`
 /// fast path; pass `None` only in contexts that never see pre-switch
 /// accounts (the production node always wires it).
+///
+/// This is the gate-free shared body. Use [`query_reward_actuator`] for the
+/// actuator/consensus/RPC path and [`query_reward_tvm`] for the TVM path —
+/// each applies the chain-parameter gate java checks before this body.
 pub fn query_reward(
     voter: &Address,
     accounts: &AccountStore,
@@ -334,9 +352,6 @@ pub fn query_reward(
     dyn_props: &DynamicPropertiesStore,
     reward_vi: Option<&RewardViStore>,
 ) -> Result<i64, StoreError> {
-    if dyn_props.get_long(ALLOW_CHANGE_DELEGATION_KEY).unwrap_or(0) == 0 {
-        return Ok(0);
-    }
     let Some(account) = accounts.get(voter)? else {
         return Ok(0);
     };
@@ -379,6 +394,38 @@ pub fn query_reward(
         ));
     }
     Ok(reward.saturating_add(allowance))
+}
+
+/// `MortgageService.queryReward` — the actuator/consensus/RPC entry point.
+/// Gated on `ALLOW_CHANGE_DELEGATION`; returns `0` when off (java's
+/// `if (!dynamicPropertiesStore.allowChangeDelegation()) return 0;`).
+pub fn query_reward_actuator(
+    voter: &Address,
+    accounts: &AccountStore,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> Result<i64, StoreError> {
+    if dyn_props.get_long(ALLOW_CHANGE_DELEGATION_KEY).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    query_reward(voter, accounts, delegation, dyn_props, reward_vi)
+}
+
+/// `VoteRewardUtil.queryReward` — the TVM entry point (the `RewardBalance`
+/// precompile). Gated on `ALLOW_TVM_VOTE`; returns `0` when off (java's
+/// `if (!VMConfig.allowTvmVote()) return 0;`).
+pub fn query_reward_tvm(
+    voter: &Address,
+    accounts: &AccountStore,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> Result<i64, StoreError> {
+    if dyn_props.get_long(ALLOW_TVM_VOTE_KEY).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    query_reward(voter, accounts, delegation, dyn_props, reward_vi)
 }
 
 /// `MortgageService.computeReward(beginCycle, endCycle, account)` — sum
@@ -518,11 +565,16 @@ fn old_reward_one_cycle(
 }
 
 /// Persist the reward claim — the write-side counterpart to
-/// [`query_reward`]. Mirrors java-tron's `MortgageService.withdrawReward`
-/// exactly:
+/// [`query_reward`]. An exact port of java-tron's `withdrawReward`. The
+/// body is shared by both java entry points (`MortgageService
+/// .withdrawReward` and `VoteRewardUtil.withdrawReward`); they differ ONLY
+/// in their chain-parameter gate, which java checks before the shared body
+/// and which is therefore the CALLER's responsibility here: the
+/// actuator/consensus/RPC path gates on `ALLOW_CHANGE_DELEGATION`, the TVM
+/// path on `ALLOW_TVM_VOTE` (see [`ALLOW_TVM_VOTE_KEY`]). Both java
+/// functions are a no-op (return without settling) when their gate is off.
 ///
-/// 1. No-op if `ALLOW_CHANGE_DELEGATION` is disabled or the account
-///    doesn't exist.
+/// 1. No-op if the account doesn't exist.
 /// 2. No-op if `begin_cycle > current_cycle` (nothing to settle).
 /// 3. No-op if `begin_cycle == current_cycle` AND the voter already has
 ///    an `account_vote(begin_cycle)` (they've already claimed this cycle).
@@ -540,6 +592,10 @@ fn old_reward_one_cycle(
 /// Returns the amount paid out (added to allowance). 0 if nothing was
 /// settled. The function is idempotent within a cycle — a second call
 /// hits the early-return in step 3.
+///
+/// This is the gate-free shared body. Use [`withdraw_reward_actuator`] for
+/// the actuator/consensus path and [`withdraw_reward_tvm`] for the TVM path
+/// — each applies the chain-parameter gate java checks before this body.
 pub fn withdraw_reward(
     address: &Address,
     accounts: &AccountStore,
@@ -549,9 +605,6 @@ pub fn withdraw_reward(
 ) -> Result<i64, StoreError> {
     use tron_proto::Account;
 
-    if dyn_props.get_long(ALLOW_CHANGE_DELEGATION_KEY).unwrap_or(0) == 0 {
-        return Ok(0);
-    }
     let Some(mut account) = accounts.get(address)? else {
         return Ok(0);
     };
@@ -640,6 +693,42 @@ pub fn withdraw_reward(
     delegation.set_account_vote(end_cycle, address, &snapshot)?;
 
     Ok(paid)
+}
+
+/// `MortgageService.withdrawReward` — the actuator/consensus entry point
+/// (WithdrawBalance / VoteWitness / UnfreezeBalance / UnfreezeBalanceV2
+/// actuators). Gated on `ALLOW_CHANGE_DELEGATION`; a no-op returning `0`
+/// when off (java's `if (!dynamicPropertiesStore.allowChangeDelegation())
+/// return;`).
+pub fn withdraw_reward_actuator(
+    address: &Address,
+    accounts: &AccountStore,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> Result<i64, StoreError> {
+    if dyn_props.get_long(ALLOW_CHANGE_DELEGATION_KEY).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    withdraw_reward(address, accounts, delegation, dyn_props, reward_vi)
+}
+
+/// `VoteRewardUtil.withdrawReward` — the TVM entry point (the
+/// `WITHDRAWREWARD` opcode and the reward settlement inside the TVM
+/// vote / freeze-v2 / selfdestruct handlers). Gated on `ALLOW_TVM_VOTE`; a
+/// no-op returning `0` when off (java's `if (!VMConfig.allowTvmVote())
+/// return;`).
+pub fn withdraw_reward_tvm(
+    address: &Address,
+    accounts: &AccountStore,
+    delegation: &DelegationStore,
+    dyn_props: &DynamicPropertiesStore,
+    reward_vi: Option<&RewardViStore>,
+) -> Result<i64, StoreError> {
+    if dyn_props.get_long(ALLOW_TVM_VOTE_KEY).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    withdraw_reward(address, accounts, delegation, dyn_props, reward_vi)
 }
 
 /// Read the Vi-accumulator value for `(cycle, witness)` and decode it
