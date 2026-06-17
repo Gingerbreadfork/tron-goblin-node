@@ -462,23 +462,133 @@ pub fn unfreeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     Ok(())
 }
 
-/// VOTEWITNESS (0xd8) — cast votes for SR candidates. Stack:
+/// VOTEWITNESS (0xd8) — cast votes for SR candidates. Stack (top first):
 /// `[amountArrayLength, amountArrayOffset, witnessArrayLength,
-/// witnessArrayOffset]`. The two arrays live in EVM memory; we don't
-/// decode them in the handler today (default Host returns 0 anyway).
-/// When a real Host override lands, populate the address/amount pairs
-/// from memory before passing.
+/// witnessArrayOffset]`.
+///
+/// Mirrors java-tron's `Program.voteWitness`
+/// (`actuator/.../vm/program/Program.java`):
+///
+/// * State-modifying, so it is rejected inside a static call.
+/// * Both arrays are ABI dynamic arrays: the word at `offset` is the
+///   element count and the elements start one word later (`offset + 32`).
+///   The length word must equal the length parameter for each array; a
+///   mismatch is a `BytecodeExecutionException` that halts and consumes
+///   all energy (`spendAllEnergy`), modelled here as `OutOfGas`.
+/// * `witnessArrayLength != amountArrayLength` returns false (push 0)
+///   without halting.
+/// * Each witness word becomes a TRON address (`toTronAddress` =
+///   `0x41 ++ last 20 bytes`); the 20-byte EVM address is built here and
+///   the host prepends the `0x41` prefix. Each amount word is the signed
+///   256-bit value (`sValue().longValueExact()`); a value outside the
+///   `i64` range is java's `ArithmeticException`, caught as a `false`
+///   return (no votes cast or cleared).
+///
+/// The witness/amount-count validation, SR-candidate existence check,
+/// duplicate merge, total-vs-TRON-power check and the actual vote cast
+/// live in the host's `tron_vote_witness` (java's
+/// `VoteWitnessProcessor.validate`/`execute`), so a validation failure
+/// returns 0 without mutating any votes.
 pub fn vote_witness<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    require_non_staticcall!(context.interpreter);
+
     popn!(
-        [_amount_array_len, _amount_array_off, _witness_array_len, _witness_array_off],
+        [amount_array_len, amount_array_off, witness_array_len, witness_array_off],
         context.interpreter
     );
+
+    // java reads every offset/length through `DataWord.intValueSafe()`,
+    // which saturates to `Integer.MAX_VALUE` when the word does not fit a
+    // non-negative `int`.
+    let witness_len = data_word_int_value_safe(&witness_array_len);
+    let witness_off = data_word_int_value_safe(&witness_array_off);
+    let amount_len = data_word_int_value_safe(&amount_array_len);
+    let amount_off = data_word_int_value_safe(&amount_array_off);
+
+    // Expand and charge memory for both arrays before reading, matching
+    // java-tron's `EnergyCost.getVoteWitnessCost2`: the metered span of
+    // each array is its length word plus its elements
+    // (`memNeeded(offset, length * 32 + 32)`). Charging both yields the
+    // same high-water mark — and therefore the same memory energy — as
+    // java's single max-of-the-two charge, because memory only grows.
+    let witness_span = witness_len.saturating_mul(32).saturating_add(32);
+    let amount_span = amount_len.saturating_mul(32).saturating_add(32);
+    context
+        .interpreter
+        .resize_memory(context.host.gas_params(), witness_off, witness_span)?;
+    context
+        .interpreter
+        .resize_memory(context.host.gas_params(), amount_off, amount_span)?;
+
+    // Length-word check: the element count stored at each array's offset
+    // must equal the supplied length parameter. java throws a
+    // `BytecodeExecutionException` on mismatch, which halts execution and
+    // spends all remaining energy.
+    let witness_len_word = read_memory_word(&context.interpreter.memory, witness_off);
+    let amount_len_word = read_memory_word(&context.interpreter.memory, amount_off);
+    if data_word_int_value_safe(&witness_len_word) != witness_len
+        || data_word_int_value_safe(&amount_len_word) != amount_len
+    {
+        return Err(InstructionResult::OutOfGas);
+    }
+
     let caller = context.interpreter.input.target_address();
-    // Empty slice — the real impl must read memory at the popped
-    // offsets to populate `(address, amount)` pairs.
-    let result = context.host.tron_vote_witness(caller, &[]);
+
+    // A length mismatch between the two arrays returns false without
+    // halting.
+    if witness_len != amount_len {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    }
+
+    // Decode the element pairs. The amount word is read as a signed
+    // 256-bit value that must fit in `i64`; an out-of-range amount is
+    // java's `ArithmeticException` (`longValueExact`) → return false with
+    // no votes cast or cleared.
+    let mut votes: std::vec::Vec<(primitives::Address, i64)> =
+        std::vec::Vec::with_capacity(witness_len);
+    for i in 0..witness_len {
+        let witness_word =
+            read_memory_word(&context.interpreter.memory, witness_off + 32 + i * 32);
+        let amount_word =
+            read_memory_word(&context.interpreter.memory, amount_off + 32 + i * 32);
+        let Some(amount) = u256_to_i64_exact(&amount_word) else {
+            push!(context.interpreter, U256::ZERO);
+            return Ok(());
+        };
+        votes.push((witness_word.into_address(), amount));
+    }
+
+    let result = context.host.tron_vote_witness(caller, &votes);
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
+}
+
+/// Reads a 32-byte word from interpreter memory at `offset`. Callers must
+/// have expanded memory to cover `[offset, offset + 32)` first (mirrors
+/// java's `Program.memoryLoad`, which only runs after the opcode's gas
+/// function has charged the matching expansion).
+#[inline]
+fn read_memory_word<M: MemoryTr>(memory: &M, offset: usize) -> U256 {
+    U256::try_from_be_slice(memory.slice_len(offset, 32).as_ref()).unwrap_or(U256::ZERO)
+}
+
+/// java `DataWord.intValueSafe()`: the word as a non-negative `int`, or
+/// `Integer.MAX_VALUE` when it occupies more than four bytes or its low
+/// 32 bits have the sign bit set. Returned as `usize` (always within
+/// `0..=i32::MAX`) for use as a memory offset / element count.
+#[inline]
+fn data_word_int_value_safe(v: &U256) -> usize {
+    let limbs = v.as_limbs();
+    let low = limbs[0];
+    let high_zero = limbs[1] == 0 && limbs[2] == 0 && limbs[3] == 0;
+    // `> 4 bytes` ⇔ any bit above the low 32 set; `intValue < 0` ⇔ bit 31
+    // set in the low 32 bits.
+    if high_zero && (low >> 32) == 0 && (low >> 31) == 0 {
+        low as usize
+    } else {
+        i32::MAX as usize
+    }
 }
 
 /// WITHDRAWREWARD (0xd9) — withdraw accumulated SR rewards. Stack

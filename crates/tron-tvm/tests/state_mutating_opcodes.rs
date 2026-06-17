@@ -518,8 +518,9 @@ fn freeze_v1_actually_locks_balance_with_expire_time() {
 }
 
 // =============================================================================
-// VOTEWITNESS (0xd8) — args are empty arrays today, but the bridge
-// still runs and writes the (empty) vote-set.
+// VOTEWITNESS (0xd8) — the handler reads the witness/amount arrays from
+// memory and the bridge validates + casts them (see the focused test
+// below and `vote_opcode.rs` for the full memory-layout cases).
 // =============================================================================
 
 // =============================================================================
@@ -922,10 +923,11 @@ fn undelegate_energy_sheds_receiver_usage_not_just_acquired() {
 
 #[test]
 fn vote_witness_writes_empty_vote_set_when_args_are_empty() {
-    // The interpreter handler currently passes `&[]` to the bridge —
-    // memory parsing is wired to a follow-up. So the test asserts the
-    // bridge accepts the no-vote case and records an empty new_votes
-    // list, leaving any prior votes ready to be cleared.
+    // Both arrays have length 0, and the length word at each offset (0) is
+    // zero, so the handler decodes an empty vote list and the bridge casts
+    // it — clearing any prior votes and recording an empty `new_votes`
+    // list. (java `VoteWitnessProcessor.execute` clears the account's votes
+    // before re-adding the empty `voteMap`.)
     let stores = fresh_stores();
     let caller_user = tron_addr(0xa7);
     let contract_addr = tron_addr(0xc7);

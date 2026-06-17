@@ -40,7 +40,7 @@ use revm::primitives::{Address as EvmAddress, AddressMap, StorageKey, StorageVal
 use revm::state::{Account, AccountInfo, Bytecode};
 use revm::{Database, DatabaseCommit, DatabaseRef};
 use tron_chainbase::{
-    AccountStore, BlockIndexStore, CodeStore, ContractStore, StorageRowStore,
+    AccountStore, BlockIndexStore, CodeStore, ContractStore, StorageRowStore, WitnessStore,
 };
 use tron_crypto::address::{Address as TronAddress, ADDRESS_LENGTH};
 use tron_crypto::hash::keccak256;
@@ -72,6 +72,12 @@ pub struct TronDatabase {
     // returning 0 (matches the upstream Host default).
     pub dyn_props: Option<Arc<tron_chainbase::DynamicPropertiesStore>>,
     pub votes: Option<Arc<tron_chainbase::VotesStore>>,
+    /// Witness registry, consulted by the VOTEWITNESS bridge to reject
+    /// votes for addresses that are not SR candidates (java-tron's
+    /// `VoteWitnessProcessor.execute` → `repo.getWitness(addr) == null`).
+    /// Optional like the other staking stores; when absent the bridge
+    /// returns 0 (matches the upstream Host default).
+    pub witnesses: Option<Arc<WitnessStore>>,
     pub delegated_resources: Option<Arc<tron_chainbase::DelegatedResourceStore>>,
     pub delegation: Option<Arc<tron_chainbase::DelegationStore>>,
     /// `reward-vi` store backing the `ALLOW_OLD_REWARD_OPT` legacy-reward
@@ -147,6 +153,7 @@ impl TronDatabase {
             contracts: None,
             dyn_props: None,
             votes: None,
+            witnesses: None,
             delegated_resources: None,
             delegation: None,
             reward_vi: None,
@@ -223,6 +230,14 @@ impl TronDatabase {
         self.votes = votes;
         self.delegated_resources = Some(delegated_resources);
         self.delegation = Some(delegation);
+        self
+    }
+
+    /// Attach the witness registry so the VOTEWITNESS bridge can reject
+    /// votes for non-SR-candidate addresses (java-tron's
+    /// `VoteWitnessProcessor.execute` witness-existence check).
+    pub fn with_witnesses(mut self, witnesses: Arc<WitnessStore>) -> Self {
+        self.witnesses = Some(witnesses);
         self
     }
 

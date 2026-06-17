@@ -393,6 +393,8 @@ fn execute_trigger_inner(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // Witness registry backs the VOTEWITNESS bridge's SR-candidate check.
+    tron_db = tron_db.with_witnesses(Arc::clone(&stores.witnesses));
     if let Some(rv) = stores.reward_vi.clone() {
         tron_db = tron_db.with_reward_vi(rv);
     }
@@ -680,6 +682,8 @@ fn execute_trigger_inner_with_tracer(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // Witness registry backs the VOTEWITNESS bridge's SR-candidate check.
+    tron_db = tron_db.with_witnesses(Arc::clone(&stores.witnesses));
     if let Some(rv) = stores.reward_vi.clone() {
         tron_db = tron_db.with_reward_vi(rv);
     }
@@ -1087,6 +1091,8 @@ pub fn execute_create_with_trace(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // Witness registry backs the VOTEWITNESS bridge's SR-candidate check.
+    tron_db = tron_db.with_witnesses(Arc::clone(&stores.witnesses));
     if let Some(rv) = stores.reward_vi.clone() {
         tron_db = tron_db.with_reward_vi(rv);
     }

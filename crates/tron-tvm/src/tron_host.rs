@@ -570,14 +570,93 @@ impl TronDatabaseExt for TronDatabase {
     fn tron_vote_witness(&mut self, caller: Address, witnesses: &[(Address, i64)]) -> i64 {
         // java `Program.voteWitness`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
-        let Some(votes_store) = self.votes.as_ref() else {
+        let Some(votes_store) = self.votes.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
-        // java's `VoteWitnessProcessor.execute` settles pending voter
-        // rewards FIRST (`VoteRewardUtil.withdrawReward`, gated on
-        // ALLOW_TVM_VOTE) — the reward window must close against the votes
-        // as they stood.
+
+        // ---- java `VoteWitnessProcessor.validate` + the pre-cast checks of
+        // `execute`, all read-only ----
+        //
+        // java runs these inside a child `Repository` that is committed only
+        // on success, so any failure leaves votes (and the reward settle that
+        // `execute` performs first) untouched. We mirror that by validating
+        // before mutating anything: the reward settle does not touch the
+        // frozen/staked fields that back TRON power, so computing the power
+        // here (pre-settle) yields the same value java reads post-settle.
+
+        // `validate`: at most MAX_VOTE_NUMBER witnesses.
+        if witnesses.len() > MAX_VOTE_NUMBER {
+            return 0;
+        }
+
+        let Ok(Some(owner_account)) = self.accounts.get(&owner) else {
+            return 0;
+        };
+
+        // Merge duplicate witnesses (java's `voteMap`) in first-seen order,
+        // dropping zero-count entries and rejecting negative counts; accumulate
+        // the total vote count with overflow checks (java `LongMath.checkedAdd`).
+        let mut merged: Vec<(TronAddress, i64)> = Vec::with_capacity(witnesses.len());
+        let mut sum: i64 = 0;
+        for (witness_addr, count) in witnesses {
+            let witness_tron = evm_to_tron_address(witness_addr);
+            // java removed the commented-out account-existence check; the SR
+            // candidate must still have a `Witness` row.
+            match self.witnesses.as_ref().map(|w| w.contains(&witness_tron)) {
+                Some(Ok(true)) => {}
+                _ => return 0,
+            }
+            if *count < 0 {
+                // java throws `ContractExeException` → caught → false.
+                return 0;
+            }
+            if *count == 0 {
+                // java `iterator.remove()` — silently dropped.
+                continue;
+            }
+            let Some(next_sum) = sum.checked_add(*count) else {
+                return 0;
+            };
+            sum = next_sum;
+            if let Some(existing) = merged.iter_mut().find(|(a, _)| *a == witness_tron) {
+                let Some(v) = existing.1.checked_add(*count) else {
+                    return 0;
+                };
+                existing.1 = v;
+            } else {
+                merged.push((witness_tron, *count));
+            }
+        }
+
+        // java selects `getAllTronPower()` only under the new resource model
+        // (`supportUnfreezeDelay() && supportAllowNewResourceModel()`); the
+        // mainnet path (`ALLOW_NEW_RESOURCE_MODEL = 0`) uses `getTronPower()`.
+        let tron_power = if let Some(dyn_props) = self.dyn_props.as_ref() {
+            let support_new_model =
+                dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1;
+            if dyn_props.support_unfreeze_delay() && support_new_model {
+                crate::votes::all_tron_power(&owner_account)
+            } else {
+                crate::votes::tron_power(&owner_account)
+            }
+        } else {
+            crate::votes::tron_power(&owner_account)
+        };
+        let Some(required) = sum.checked_mul(TRX_PRECISION) else {
+            // java `LongMath.checkedMultiply` overflow → ArithmeticException → false.
+            return 0;
+        };
+        if required > tron_power {
+            return 0;
+        }
+
+        // ---- All checks passed: settle rewards, then cast (java `execute`) ----
+        //
+        // `VoteRewardUtil.withdrawReward` closes the reward window against the
+        // votes as they stood, so it must run before the vote list changes. It
+        // mutates the owner's allowance / reward-cycle markers, so re-read the
+        // account afterwards before persisting the new votes.
         if let (Some(delegation), Some(dyn_props)) =
             (self.delegation.as_ref(), self.dyn_props.as_ref())
         {
@@ -597,16 +676,15 @@ impl TronDatabaseExt for TronDatabase {
         };
         owner_account.votes.clear();
         votes_capsule.new_votes.clear();
-        for (witness_addr, count) in witnesses {
-            let witness_tron = evm_to_tron_address(witness_addr);
+        // java iterates the merged `voteMap` (a `HashMap<ByteString, Long>`),
+        // so the persisted vote order is that map's deterministic iteration
+        // order, not the input order. Reproduce it byte-for-byte.
+        for (witness_tron, count) in java_vote_map_order(merged) {
             let entry = tron_proto::Vote {
                 vote_address: witness_tron.as_bytes().to_vec(),
-                vote_count: *count,
+                vote_count: count,
             };
-            owner_account.votes.push(tron_proto::Vote {
-                vote_address: witness_tron.as_bytes().to_vec(),
-                vote_count: *count,
-            });
+            owner_account.votes.push(entry.clone());
             votes_capsule.new_votes.push(entry);
         }
         self.accounts
@@ -1269,6 +1347,93 @@ impl TronDatabaseExt for TronDatabase {
 /// dep we can't cycle back through).
 const TRX_PRECISION: i64 = 1_000_000;
 
+/// `ChainConstant.MAX_VOTE_NUMBER` — most SR candidates one VOTEWITNESS may
+/// name (java `VoteWitnessProcessor.validate`).
+const MAX_VOTE_NUMBER: usize = 30;
+
+/// Reorder merged `(witness, count)` votes into java's
+/// `HashMap<ByteString, Long>` iteration order.
+///
+/// java-tron's `VoteWitnessProcessor.execute` accumulates votes in a
+/// `HashMap` keyed by the witness `ByteString`, then casts them by
+/// iterating that map. The persisted `Account.votes` list therefore
+/// carries the map's bucket order, not the caller's input order, and the
+/// account row's serialized bytes (hence the state root) depend on it.
+///
+/// `entries` must already be merged and in first-insertion order. This
+/// replays the exact `java.util.HashMap` mechanics for those insertions:
+///
+/// * key hash is `ByteString.hashCode()` spread by `h ^ (h >>> 16)`;
+/// * bucket index is `hash & (capacity - 1)`, capacity starting at 16;
+/// * a fresh key past the `0.75 * capacity` threshold doubles capacity,
+///   with the order-preserving lo/hi split java's `resize` performs;
+/// * iteration visits buckets `0..capacity`, each in chain (insertion)
+///   order.
+fn java_vote_map_order(entries: Vec<(TronAddress, i64)>) -> Vec<(TronAddress, i64)> {
+    /// `com.google.protobuf.ByteString.hashCode()` for a 21-byte address:
+    /// `h = size; for b in bytes { h = h * 31 + (b as i8) }`, mapped to `1`
+    /// when it lands on `0` (protobuf's non-zero-hash guard).
+    fn bytestring_hashcode(bytes: &[u8]) -> i32 {
+        let mut h: i32 = bytes.len() as i32;
+        for &b in bytes {
+            h = h.wrapping_mul(31).wrapping_add(b as i8 as i32);
+        }
+        if h == 0 {
+            1
+        } else {
+            h
+        }
+    }
+
+    /// `java.util.HashMap.hash(key)`: `(h = key.hashCode()) ^ (h >>> 16)`.
+    fn spread(hash: i32) -> i32 {
+        hash ^ ((hash as u32) >> 16) as i32
+    }
+
+    // Each bucket holds (spread_hash, original index) in chain order.
+    let mut capacity: usize = 16;
+    let mut threshold: usize = 12; // 0.75 * 16
+    let mut buckets: Vec<Vec<(i32, usize)>> = vec![Vec::new(); capacity];
+    let mut size: usize = 0;
+
+    for (idx, (addr, _)) in entries.iter().enumerate() {
+        let hash = spread(bytestring_hashcode(addr.as_bytes()));
+        let bucket = (hash as u32 as usize) & (capacity - 1);
+        buckets[bucket].push((hash, idx));
+        size += 1;
+        if size > threshold {
+            // java `resize`: double capacity, split each old bucket into a
+            // "lo" chain (stays at index j) and a "hi" chain (moves to
+            // j + oldCap), each preserving chain order.
+            let old_cap = capacity;
+            capacity <<= 1;
+            threshold <<= 1;
+            let mut next: Vec<Vec<(i32, usize)>> = vec![Vec::new(); capacity];
+            for (j, chain) in buckets.into_iter().enumerate() {
+                for (hash, eidx) in chain {
+                    if (hash as u32 as usize) & old_cap == 0 {
+                        next[j].push((hash, eidx));
+                    } else {
+                        next[j + old_cap].push((hash, eidx));
+                    }
+                }
+            }
+            buckets = next;
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(entries.len());
+    let mut taken = vec![false; entries.len()];
+    for chain in &buckets {
+        for &(_, eidx) in chain {
+            taken[eidx] = true;
+            ordered.push(entries[eidx].clone());
+        }
+    }
+    debug_assert!(taken.iter().all(|&t| t), "every vote placed in a bucket");
+    ordered
+}
+
 /// Mainnet burn account ("Blackhole",
 /// `TLsV52sRDL79HXGGm9yzwKibb6BeruhUzy`) -- the self-target suicide
 /// inheritor, java-tron `Repository.getBlackHoleAddress()`.
@@ -1685,5 +1850,69 @@ mod tests {
         );
         assert_eq!(rc, 0, "valid suicide returns ok");
         assert_eq!(db.create_nonce, 1, "one bump after canSuicide validation");
+    }
+
+    // Re-derive `ByteString.hashCode()` / HashMap spread independently of
+    // the implementation so the ordering test is a genuine cross-check.
+    fn ref_bytestring_hashcode(bytes: &[u8]) -> i32 {
+        let mut h: i32 = bytes.len() as i32;
+        for &b in bytes {
+            h = h.wrapping_mul(31).wrapping_add(b as i8 as i32);
+        }
+        if h == 0 {
+            1
+        } else {
+            h
+        }
+    }
+
+    fn ref_bucket16(addr: &TronAddress) -> usize {
+        let hc = ref_bytestring_hashcode(addr.as_bytes());
+        let spread = hc ^ ((hc as u32) >> 16) as i32;
+        (spread as u32 as usize) & 15
+    }
+
+    #[test]
+    fn vote_map_order_matches_java_hashmap_buckets() {
+        // Eight distinct witnesses (≤ 12 ⇒ HashMap stays at capacity 16, no
+        // resize), in an arbitrary insertion order.
+        let entries: Vec<(TronAddress, i64)> = (1u8..=8)
+            .map(|n| (TronAddress::from_raw(tron_addr(n)), n as i64))
+            .collect();
+
+        let ordered = java_vote_map_order(entries.clone());
+
+        // Same multiset of pairs.
+        assert_eq!(ordered.len(), entries.len());
+        for e in &entries {
+            assert!(ordered.contains(e), "every input vote must be present");
+        }
+
+        // For a 16-bucket map the iteration order is bucket index ascending,
+        // ties broken by insertion order — reproduce that independently.
+        let mut expected = entries.clone();
+        expected.sort_by_key({
+            let order: std::collections::HashMap<TronAddress, usize> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, (a, _))| (*a, i))
+                .collect();
+            move |(a, _): &(TronAddress, i64)| (ref_bucket16(a), order[a])
+        });
+        assert_eq!(ordered, expected, "vote order must follow HashMap buckets");
+    }
+
+    #[test]
+    fn vote_map_order_handles_resize_past_threshold() {
+        // 20 distinct keys forces a resize (threshold 12 → capacity 32). The
+        // result must still be a permutation carrying every entry exactly once.
+        let entries: Vec<(TronAddress, i64)> = (1u8..=20)
+            .map(|n| (TronAddress::from_raw(tron_addr(n)), n as i64))
+            .collect();
+        let ordered = java_vote_map_order(entries.clone());
+        assert_eq!(ordered.len(), entries.len());
+        for e in &entries {
+            assert!(ordered.contains(e));
+        }
     }
 }

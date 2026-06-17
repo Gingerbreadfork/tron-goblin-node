@@ -61,6 +61,38 @@ pub fn tron_power(account: &Account) -> i64 {
     tp
 }
 
+/// java-tron's `AccountCapsule.getAllTronPower` (in sun) — the
+/// NEW-resource-model power source. The `old_tron_power` field selects how
+/// legacy power folds in:
+///
+/// * `-1` → not yet initialized: V1 + V2 TRON_POWER-typed frozen only;
+/// * `0`  → legacy `getTronPower()` (every other frozen source) plus the
+///          two TRON_POWER components;
+/// * `>0` → stored old power plus the two TRON_POWER components.
+///
+/// Only reachable when `supportAllowNewResourceModel()` is active;
+/// mainnet runs with `ALLOW_NEW_RESOURCE_MODEL = 0`, where the vote path
+/// uses [`tron_power`] instead.
+pub fn all_tron_power(account: &Account) -> i64 {
+    let tron_power_v1 = account
+        .tron_power
+        .as_ref()
+        .map(|f| f.frozen_balance)
+        .unwrap_or(0);
+    let tron_power_v2: i64 = account
+        .frozen_v2
+        .iter()
+        .filter(|f| f.r#type == TRON_POWER_TYPE)
+        .map(|f| f.amount)
+        .sum();
+    let folded = tron_power_v1.saturating_add(tron_power_v2);
+    match account.old_tron_power {
+        -1 => folded,
+        0 => tron_power(account).saturating_add(folded),
+        old => old.saturating_add(folded),
+    }
+}
+
 /// Port of java-tron's `updateVote` (identical in
 /// `UnfreezeBalanceV2Actuator` and the TVM `UnfreezeBalanceV2Processor`;
 /// the mainnet path — `ALLOW_NEW_RESOURCE_MODEL = 0` — so the new-model
