@@ -480,3 +480,95 @@ async fn wallet_getcontractinfo_unknown_address_returns_null() {
     // null. Pin that as the expected shape.
     assert!(resp.is_null() || resp.get("Error").is_some(), "got: {resp}");
 }
+
+/// Spawn a server whose state has the head pointer (`number` + `hash`)
+/// and block bytes present, but the `block_index[number]` row missing.
+/// This reproduces the transient cross-store view a `getnowblock` read
+/// can observe mid-commit: the head pointer is written *after* the
+/// block bytes but the index row is committed in a separate per-store
+/// batch, so a reader can momentarily see the head hash without the
+/// matching `block_index` entry. The handler must still return the head
+/// block (resolved via the hash), never an empty `{}`.
+async fn spawn_server_head_hash_only() -> std::net::SocketAddr {
+    let blocks_be = mem();
+    let block_index_be = mem(); // intentionally left EMPTY
+    let dp_be = mem();
+
+    let block = Block {
+        block_header: Some(BlockHeader {
+            raw_data: Some(BlockHeaderRaw {
+                number: 99,
+                parent_hash: vec![0u8; 32],
+                timestamp: 1_700_000_009_000,
+                witness_address: ALICE_HEX.to_vec(),
+                tx_trie_root: tron_types::calc_tx_trie_root(&[])
+                    .map(|h| h.to_vec())
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            witness_signature: Vec::new(),
+        }),
+        transactions: Vec::new(),
+    };
+    let block_id = block_id_from_block(&block).unwrap();
+    BlockStore::new(blocks_be.clone()).put(&block_id, &block).unwrap();
+
+    let dp = DynamicPropertiesStore::new(dp_be.clone());
+    // Head pointer present; block_index row deliberately absent.
+    dp.save_latest_block_header_number(99);
+    dp.save_latest_block_header_hash(block_id.as_bytes());
+
+    let state = RpcState::new(
+        mem(),
+        blocks_be,
+        block_index_be,
+        mem(),
+        dp_be,
+        MAINNET_CHAIN_ID,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = tron_rpc::http_rest::router(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+    tokio::task::yield_now().await;
+    addr
+}
+
+/// Regression: `getnowblock` must resolve the head via the head *hash*
+/// so a missing `block_index` row (a transient mid-commit view) never
+/// degrades the response to an empty `{}`.
+#[tokio::test]
+async fn wallet_getnowblock_resolves_via_head_hash_when_index_row_absent() {
+    let addr = spawn_server_head_hash_only().await;
+    let resp = http_get(addr, "/wallet/getnowblock").await;
+    let num = resp["block_header"]["raw_data"]["number"].as_i64();
+    assert_eq!(
+        num,
+        Some(99),
+        "getnowblock should return the head block via the hash path, got: {resp}"
+    );
+}
+
+/// Under concurrent load, every `getnowblock` response stays a
+/// well-formed, non-empty block envelope. Runs on a multi-threaded
+/// runtime so the handler's `block_in_place` offload path is exercised
+/// (it is a no-op on the single-threaded default test runtime).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wallet_getnowblock_concurrent_load_returns_consistent_block() {
+    let (addr, ..) = spawn_http_server().await;
+    let mut handles = Vec::new();
+    for _ in 0..64 {
+        handles.push(tokio::spawn(async move {
+            let resp = http_get(addr, "/wallet/getnowblock").await;
+            // Body must be a populated block, never an empty object.
+            resp["block_header"]["raw_data"]["number"]
+                .as_i64()
+                .expect("well-formed block envelope")
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), 1);
+    }
+}

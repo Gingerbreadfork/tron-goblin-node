@@ -11,6 +11,7 @@
 //! * `eth_newFilter` family — server-side filter state machine.
 
 pub mod abi;
+pub mod blocking;
 pub mod builder;
 pub mod filters;
 pub mod http_rest;

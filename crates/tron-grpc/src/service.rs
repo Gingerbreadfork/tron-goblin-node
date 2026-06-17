@@ -518,22 +518,27 @@ impl Wallet for WalletService {
         &self,
         _: Request<EmptyMessage>,
     ) -> Result<Response<Block>, Status> {
-        let Some(id) = head_block_id(&self.state) else {
-            return Ok(Response::new(Block::default()));
-        };
-        let block = self.state.blocks.get(&id).unwrap_or_default();
-        Ok(Response::new(block))
+        // Synchronous store reads — keep them off the async worker so a
+        // disk-blocked read can't starve the server under heavy sync
+        // load (see `tron_rpc::blocking`).
+        let block = tron_rpc::blocking::run_blocking(|| {
+            head_block_id(&self.state)
+                .map(|id| self.state.blocks.get(&id).unwrap_or_default())
+        });
+        Ok(Response::new(block.unwrap_or_default()))
     }
 
     async fn get_now_block2(
         &self,
         _: Request<EmptyMessage>,
     ) -> Result<Response<BlockExtention>, Status> {
-        let Some(id) = head_block_id(&self.state) else {
-            return Ok(Response::new(BlockExtention::default()));
-        };
-        let block = self.state.blocks.get(&id).unwrap_or_default();
-        Ok(Response::new(block_to_extention(&block, &id)))
+        let ext = tron_rpc::blocking::run_blocking(|| {
+            head_block_id(&self.state).map(|id| {
+                let block = self.state.blocks.get(&id).unwrap_or_default();
+                block_to_extention(&block, &id)
+            })
+        });
+        Ok(Response::new(ext.unwrap_or_default()))
     }
 
     async fn get_block_by_num(
@@ -541,7 +546,8 @@ impl Wallet for WalletService {
         req: Request<NumberMessage>,
     ) -> Result<Response<Block>, Status> {
         let num = req.into_inner().num;
-        Ok(Response::new(block_by_num(&self.state, num).unwrap_or_default()))
+        let block = tron_rpc::blocking::run_blocking(|| block_by_num(&self.state, num));
+        Ok(Response::new(block.unwrap_or_default()))
     }
 
     async fn get_block_by_num2(
@@ -549,7 +555,7 @@ impl Wallet for WalletService {
         req: Request<NumberMessage>,
     ) -> Result<Response<BlockExtention>, Status> {
         let num = req.into_inner().num;
-        match block_by_num(&self.state, num) {
+        match tron_rpc::blocking::run_blocking(|| block_by_num(&self.state, num)) {
             Some(block) => {
                 let id = tron_types::block_id_from_block(&block)
                     .unwrap_or_else(|_| tron_types::BlockId::from_raw([0u8; 32]));
@@ -566,22 +572,22 @@ impl Wallet for WalletService {
         let r = req.into_inner();
         // BlockReq.id_or_num is a string holding either a number or a
         // hex-encoded 32-byte hash. java-tron accepts both; we mirror.
-        let opt: Option<Block> = if r.id_or_num.is_empty() {
-            let n = self.state.dyn_props.latest_block_header_number().unwrap_or(0);
-            block_by_num(&self.state, n)
-        } else if let Ok(num) = r.id_or_num.parse::<i64>() {
-            block_by_num(&self.state, num)
-        } else if let Ok(bytes) = hex::decode(&r.id_or_num) {
-            if bytes.len() == 32 {
-                let arr: [u8; 32] = bytes.try_into().expect("len 32");
+        // Synchronous store reads run off the async worker (see
+        // `tron_rpc::blocking`).
+        let opt: Option<Block> = tron_rpc::blocking::run_blocking(|| {
+            if r.id_or_num.is_empty() {
+                let n = self.state.dyn_props.latest_block_header_number().unwrap_or(0);
+                block_by_num(&self.state, n)
+            } else if let Ok(num) = r.id_or_num.parse::<i64>() {
+                block_by_num(&self.state, num)
+            } else if let Ok(bytes) = hex::decode(&r.id_or_num) {
+                let arr: [u8; 32] = bytes.try_into().ok()?;
                 let id = tron_types::BlockId::from_raw(arr);
                 self.state.blocks.get(&id).ok()
             } else {
                 None
             }
-        } else {
-            None
-        };
+        });
         match opt {
             Some(block) => {
                 let id = tron_types::block_id_from_block(&block)
@@ -605,23 +611,24 @@ impl Wallet for WalletService {
         }
         let mut addr = [0u8; 21];
         addr.copy_from_slice(&probe.address);
-        match self.state.accounts.get(&Address::from_raw(addr)).ok().flatten() {
-            Some(mut acct) => {
-                // Apply java-tron's Wallet.getAccount read-time transforms to the
-                // proto (asset merge, usage decay, slot→ms times, frozenV2 pad)
-                // so gRPC matches the HTTP surface (and java) for real clients.
-                let genesis_ms = self.state.dyn_props.genesis_block_timestamp().unwrap_or(0);
-                tron_rpc::methods::apply_get_account_transforms(
-                    &mut acct,
-                    &self.state.dyn_props,
-                    self.state.account_assets.as_deref(),
-                    genesis_ms,
-                );
-                Ok(Response::new(acct))
-            }
-            // java-tron returns the default (empty) Account for a missing one.
-            None => Ok(Response::new(Account::default())),
-        }
+        // Synchronous store reads + read-time transforms run off the
+        // async worker (see `tron_rpc::blocking`).
+        let acct = tron_rpc::blocking::run_blocking(|| {
+            let mut acct = self.state.accounts.get(&Address::from_raw(addr)).ok().flatten()?;
+            // Apply java-tron's Wallet.getAccount read-time transforms to the
+            // proto (asset merge, usage decay, slot→ms times, frozenV2 pad)
+            // so gRPC matches the HTTP surface (and java) for real clients.
+            let genesis_ms = self.state.dyn_props.genesis_block_timestamp().unwrap_or(0);
+            tron_rpc::methods::apply_get_account_transforms(
+                &mut acct,
+                &self.state.dyn_props,
+                self.state.account_assets.as_deref(),
+                genesis_ms,
+            );
+            Some(acct)
+        });
+        // java-tron returns the default (empty) Account for a missing one.
+        Ok(Response::new(acct.unwrap_or_default()))
     }
 
     async fn list_witnesses(

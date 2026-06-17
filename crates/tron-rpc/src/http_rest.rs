@@ -461,7 +461,10 @@ async fn forward_builder(
     // This is a no-op for already-prefixed values.
     translate_addresses_to_hex(&mut body);
     let params = Value::Array(vec![body]);
-    match method(&params, &state) {
+    // The method reads RocksDB-backed stores synchronously; keep it off
+    // the async worker so a disk-blocked read can't starve the server
+    // under heavy sync load (see `crate::blocking`).
+    match crate::blocking::run_blocking(|| method(&params, &state)) {
         Ok(mut v) => {
             rewrite_addresses(&mut v, visible);
             api_ok(v)
@@ -491,7 +494,7 @@ async fn forward_mapped(
                 .collect(),
         )
     };
-    match method(&params, &state) {
+    match crate::blocking::run_blocking(|| method(&params, &state)) {
         Ok(v) => api_ok(v),
         Err(e) => api_err(e),
     }
@@ -502,7 +505,7 @@ async fn forward_no_arg(
     State(state): State<RpcState>,
 ) -> (StatusCode, Json<Value>) {
     let params = Value::Array(vec![]);
-    match method(&params, &state) {
+    match crate::blocking::run_blocking(|| method(&params, &state)) {
         Ok(v) => api_ok(v),
         Err(e) => api_err(e),
     }
@@ -527,7 +530,10 @@ async fn http_get_contract_info(
         Err(e) => return api_err_str(e.to_string()),
     };
     let addr_hex = format!("0x{}", hex::encode(&addr.as_bytes()[1..]));
-    match methods::get_contract_info(&Value::Array(vec![Value::String(addr_hex)]), &state) {
+    let result = crate::blocking::run_blocking(|| {
+        methods::get_contract_info(&Value::Array(vec![Value::String(addr_hex)]), &state)
+    });
+    match result {
         Ok(mut v) => {
             rewrite_addresses(&mut v, visible);
             api_ok(v)
@@ -549,7 +555,10 @@ async fn http_get_block_by_latest_num(
         Some(n) => n,
         None => return api_err_str("missing 'num'".into()),
     };
-    match methods::get_block_by_latest_num(&Value::Array(vec![Value::Number(n.into())]), &state) {
+    let result = crate::blocking::run_blocking(|| {
+        methods::get_block_by_latest_num(&Value::Array(vec![Value::Number(n.into())]), &state)
+    });
+    match result {
         Ok(mut v) => {
             rewrite_addresses(&mut v, visible);
             api_ok(v)
@@ -582,10 +591,13 @@ async fn http_get_block_by_limit_next(
         Some(n) => n,
         None => return api_err_str("missing 'endNum'".into()),
     };
-    match methods::get_block_by_limit_next(
-        &Value::Array(vec![Value::Number(start.into()), Value::Number(end.into())]),
-        &state,
-    ) {
+    let result = crate::blocking::run_blocking(|| {
+        methods::get_block_by_limit_next(
+            &Value::Array(vec![Value::Number(start.into()), Value::Number(end.into())]),
+            &state,
+        )
+    });
+    match result {
         Ok(mut v) => {
             rewrite_addresses(&mut v, visible);
             api_ok(v)
@@ -631,9 +643,7 @@ async fn http_get_account_balance(
         Ok(a) => a,
         Err(e) => return api_err_str(e.to_string()),
     };
-    let balance = state
-        .accounts
-        .get(&addr)
+    let balance = crate::blocking::run_blocking(|| state.accounts.get(&addr))
         .ok()
         .flatten()
         .map(|a| a.balance)
@@ -856,16 +866,40 @@ async fn get_now_block(
 ) -> impl IntoResponse {
     let body_val = body.map(|j| j.0).unwrap_or_else(|| json!({}));
     let visible = visible_flag(&body_val, &query);
-    let head = state.dyn_props.latest_block_header_number().unwrap_or(0);
-    let Ok(id) = state.block_index.get(head) else {
-        return api_ok(json!({}));
-    };
-    let Ok(block) = state.blocks.get(&id) else {
+    // Synchronous store reads — run off the async worker so a
+    // disk-blocked read can't starve the server under heavy sync load
+    // (see `crate::blocking`).
+    let resolved = crate::blocking::run_blocking(|| resolve_head_block(&state));
+    let Some((id, block)) = resolved else {
+        // Genuinely no head yet (pre-genesis). java-tron's getNowBlock
+        // returns an empty block envelope in that case.
         return api_ok(json!({}));
     };
     let mut v = format_block_for_http(&id, &block);
     rewrite_addresses(&mut v, visible);
     api_ok(v)
+}
+
+/// Resolve the current head block (`getNowBlock` / java's
+/// `dbManager.getHead()`).
+///
+/// The head pointer (`latest_block_header_hash`) is written *after* the
+/// block bytes and the `block_index` row during apply, so a read that
+/// observes the hash always finds the block. Resolving via the hash is a
+/// single cross-store hop (dyn_props → blocks); the number→index→blocks
+/// path is kept only as a fallback for snapshots that pre-date the hash
+/// key. Returns `None` only when there is genuinely no head yet.
+fn resolve_head_block(state: &RpcState) -> Option<(tron_types::BlockId, tron_proto::Block)> {
+    if let Ok(Some(raw)) = state.dyn_props.latest_block_header_hash() {
+        let id = tron_types::BlockId::from_raw(raw);
+        if let Ok(block) = state.blocks.get(&id) {
+            return Some((id, block));
+        }
+    }
+    let head = state.dyn_props.latest_block_header_number().unwrap_or(0);
+    let id = state.block_index.get(head).ok()?;
+    let block = state.blocks.get(&id).ok()?;
+    Some((id, block))
 }
 
 /// `/monitor/getstatsinfo` handler — `methods::get_stats_info` is
@@ -1067,10 +1101,12 @@ async fn get_block_by_num(
         Some(n) => n,
         None => return api_err_str("missing 'num'".into()),
     };
-    let Ok(id) = state.block_index.get(num) else {
-        return api_ok(json!({}));
-    };
-    let Ok(block) = state.blocks.get(&id) else {
+    let resolved = crate::blocking::run_blocking(|| {
+        let id = state.block_index.get(num).ok()?;
+        let block = state.blocks.get(&id).ok()?;
+        Some((id, block))
+    });
+    let Some((id, block)) = resolved else {
         return api_ok(json!({}));
     };
     let mut v = format_block_for_http(&id, &block);
@@ -1096,7 +1132,7 @@ async fn get_block_by_id(
     let mut raw = [0u8; 32];
     raw.copy_from_slice(&bytes);
     let id = tron_types::BlockId::from_raw(raw);
-    let Ok(block) = state.blocks.get(&id) else {
+    let Ok(block) = crate::blocking::run_blocking(|| state.blocks.get(&id)) else {
         return api_ok(json!({}));
     };
     let mut v = format_block_for_http(&id, &block);

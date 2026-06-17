@@ -1386,41 +1386,52 @@ impl SyncDriver {
         prev_id: &mut Option<BlockId>,
         last_block_ts: &mut i64,
     ) -> usize {
-        // Open the pipelining window for this batch: blocks applied below
-        // overlap their commit + undo I/O with the next block's execution
-        // (`vm.pipelined_apply`). The window closes with a flush before
-        // returning, so everything outside this loop — watchdogs,
-        // leadership transfer, locator building, the at-tip apply path —
-        // observes fully committed base state.
-        self.open_pipeline();
-        let mut applied = 0usize;
-        while applied < Self::MAX_DRAIN_PER_CALL {
-            let Some(front) = expected.front().copied() else {
-                break;
-            };
-            let Some(raw) = pool.take_ready(&front) else {
-                break;
-            };
-            expected.pop_front();
-            let raw = Bytes::from(raw);
-            let block = match Block::decode(raw.clone()) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "decode pooled Block");
-                    continue;
-                }
-            };
-            let block_num = block
-                .block_header
-                .as_ref()
-                .and_then(|h| h.raw_data.as_ref())
-                .map(|r| r.number)
-                .unwrap_or(-1);
-            self.apply_block(&block, raw, block_num, peer, prev_id, last_block_ts);
-            applied += 1;
-        }
-        self.close_pipeline();
-        applied
+        // Block apply is synchronous CPU + RocksDB work that can run for
+        // tens of ms per block (a full drain batch is up to
+        // `MAX_DRAIN_PER_CALL`). Running it directly on the async worker
+        // would pin that worker for the whole batch and starve the
+        // co-located RPC servers' accept loop — clients then see empty
+        // bodies under a tight timeout. Offload the batch with
+        // `block_in_place` so the runtime hands this worker's other tasks
+        // to a sibling for the duration (no-op off the multi-threaded
+        // runtime; see `tron_rpc::blocking`).
+        tron_rpc::blocking::run_blocking(|| {
+            // Open the pipelining window for this batch: blocks applied below
+            // overlap their commit + undo I/O with the next block's execution
+            // (`vm.pipelined_apply`). The window closes with a flush before
+            // returning, so everything outside this loop — watchdogs,
+            // leadership transfer, locator building, the at-tip apply path —
+            // observes fully committed base state.
+            self.open_pipeline();
+            let mut applied = 0usize;
+            while applied < Self::MAX_DRAIN_PER_CALL {
+                let Some(front) = expected.front().copied() else {
+                    break;
+                };
+                let Some(raw) = pool.take_ready(&front) else {
+                    break;
+                };
+                expected.pop_front();
+                let raw = Bytes::from(raw);
+                let block = match Block::decode(raw.clone()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(error = %e, "decode pooled Block");
+                        continue;
+                    }
+                };
+                let block_num = block
+                    .block_header
+                    .as_ref()
+                    .and_then(|h| h.raw_data.as_ref())
+                    .map(|r| r.number)
+                    .unwrap_or(-1);
+                self.apply_block(&block, raw, block_num, peer, prev_id, last_block_ts);
+                applied += 1;
+            }
+            self.close_pipeline();
+            applied
+        })
     }
 
     /// Emit a human-readable sync-progress line for a freshly-applied block.
@@ -3921,14 +3932,21 @@ impl SyncDriver {
                         );
                         continue;
                     }
-                    self.apply_block(
-                        &block,
-                        raw_block_bytes,
-                        block_num,
-                        peer,
-                        &mut prev_id,
-                        &mut last_block_ts,
-                    );
+                    // Single-block apply (steady-state near-tip path).
+                    // Same offload rationale as `drain_pool`: keep the
+                    // synchronous apply off the async worker so it can't
+                    // starve the co-located RPC accept loop (no-op off the
+                    // multi-threaded runtime; see `tron_rpc::blocking`).
+                    tron_rpc::blocking::run_blocking(|| {
+                        self.apply_block(
+                            &block,
+                            raw_block_bytes,
+                            block_num,
+                            peer,
+                            &mut prev_id,
+                            &mut last_block_ts,
+                        );
+                    });
                     // Count *every* Block frame received (including
                     // rejected ones), not just accepted ones — a peer
                     // that sent us a bad block still consumed one of

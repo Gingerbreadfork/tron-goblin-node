@@ -126,7 +126,10 @@ async fn handle(
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
     let id = req.id.clone();
-    let result = dispatch(&req.method, &req.params, &state);
+    // `dispatch` is synchronous and reads RocksDB-backed stores; run it
+    // off the async worker so a disk-blocked read can't starve the
+    // server's accept loop under heavy sync load (see `crate::blocking`).
+    let result = crate::blocking::run_blocking(|| dispatch(&req.method, &req.params, &state));
     // Per-method counter — records both success and failure paths
     // so operators can spot a method that's erroring at a high rate.
     if let Some(m) = &state.metrics {
@@ -173,7 +176,9 @@ pub fn metrics_router(metrics: std::sync::Arc<crate::metrics::Metrics>) -> Route
 /// handler can forward non-subscription requests through the same
 /// method table. Keeps the WS surface identical to the HTTP one.
 pub fn ws_dispatch(method: &str, params: &Value, state: &RpcState) -> Result<Value, RpcError> {
-    dispatch(method, params, state)
+    // Mirror the HTTP path: the WS frame loop is async, so keep the
+    // synchronous store reads off its worker thread (see `crate::blocking`).
+    crate::blocking::run_blocking(|| dispatch(method, params, state))
 }
 
 fn dispatch(method: &str, params: &Value, state: &RpcState) -> Result<Value, RpcError> {
