@@ -402,14 +402,20 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // current state before accepting — same precondition checks a
     // peer would apply on receive, so we don't broadcast txs that
     // would be rejected.
-    let mempool_state = stores.to_state_backends();
-    let validator = crate::mempool_validator::build(&mempool_state);
-    let mempool = std::sync::Arc::new(
-        tron_mempool::TxMempool::new(tron_mempool::MempoolConfig::default())
-            .with_validator(validator)
-            .with_persistence(stores.mempool.clone())
-            .with_metrics(metrics.clone()),
-    );
+    //
+    // `--mempool` dashboard mode is decode-only: the head is spoofed to
+    // the live tip and the stores hold only genesis, so there is no real
+    // account state to validate against and the validator would reject
+    // every inbound tx. Skip it in that mode so the dashboard observes
+    // the raw pending stream; never skip it for a normal node.
+    let mut mempool = tron_mempool::TxMempool::new(tron_mempool::MempoolConfig::default())
+        .with_persistence(stores.mempool.clone())
+        .with_metrics(metrics.clone());
+    if !config.p2p.mempool {
+        let mempool_state = stores.to_state_backends();
+        mempool = mempool.with_validator(crate::mempool_validator::build(&mempool_state));
+    }
+    let mempool = std::sync::Arc::new(mempool);
     // Repopulate pending pool from disk. Stale entries (expired, sig
     // re-validation failures, etc.) are dropped from the backend in
     // the same pass so they don't keep re-attempting on every restart.
@@ -1255,42 +1261,72 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
-    // `--explore` live dashboard. Bootstrap tip: an explicit `--tip-test`
-    // checkpoint wins; otherwise discover it over p2p from the freshly
-    // DISCOVERED peer pool (not the hardcoded seeds — those bootstrap nodes are
-    // overloaded and ban new dials). We ask peers for their head, spoof ours to
-    // it, then `follow_tip` makes the drivers anchor there and stream the live
-    // tail. The renderer paints the dashboard to stdout (logs go to stderr).
-    let explore_state: Option<Arc<crate::explore::ExploreState>> = if config.p2p.explore {
+    // `--explore` / `--mempool` live dashboards. Both bootstrap from a real
+    // recent tip and follow the live tail decode-only; `--mempool` additionally
+    // watches the pending tx stream peers broadcast once we're at the tip.
+    //
+    // Bootstrap tip: an explicit `--tip-test` checkpoint wins; otherwise
+    // discover it over p2p from the freshly DISCOVERED peer pool (not the
+    // hardcoded seeds — those bootstrap nodes are overloaded and ban new
+    // dials). We ask peers for their head, spoof ours to it, then `follow_tip`
+    // makes the drivers anchor there and stream the live tail. Renderers paint
+    // to stdout (logs go to stderr). `--mempool` takes precedence when both
+    // flags are set.
+    let mut explore_state: Option<Arc<crate::explore::ExploreState>> = None;
+    if config.p2p.explore || config.p2p.mempool {
+        let mode = if config.p2p.mempool { "mempool" } else { "explore" };
         let tip_num = if let Some(cp) = &config.p2p.tip_test {
             cp.block_num
         } else {
-            info!("explore: discovering the live tip from the peer network…");
+            info!("{mode}: discovering the live tip from the peer network…");
             match discover_tip(&combined_peers).await {
                 Some((num, hash)) => {
                     use tron_chainbase::DynamicPropertiesStore;
                     let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
                     dp.save_latest_block_header_number(num);
                     dp.save_latest_block_header_hash(&hash);
-                    info!(tip = num, "explore: locked onto the live tip");
+                    info!(tip = num, "{mode}: locked onto the live tip");
                     num
                 }
                 None => {
                     error!(
-                        "explore: couldn't reach a peer to learn the tip — check your \
+                        "{mode}: couldn't reach a peer to learn the tip — check your \
                          connection, or pass --peer HOST:18888"
                     );
                     0
                 }
             }
         };
-        let st = Arc::new(crate::explore::ExploreState::new(tip_num));
-        st.set_discovered(combined_peers.len());
-        tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
-        Some(st)
-    } else {
-        None
-    };
+        if config.p2p.mempool {
+            // Pending txs flow into the shared mempool via the sync driver's
+            // inbound `Trx` / `Trxs` handlers once we reach the tip; the
+            // observer subscribes to that mempool and folds each into the
+            // dashboard state. No explore (block) dashboard in this mode.
+            let jsonl = config.p2p.mempool_json.as_deref().map(|p| {
+                Arc::new(if p == "-" {
+                    crate::mempool_explore::JsonlSink::Stdout
+                } else {
+                    crate::mempool_explore::JsonlSink::File(std::path::PathBuf::from(p))
+                })
+            });
+            let st = Arc::new(crate::mempool_explore::MempoolState::new(tip_num));
+            tokio::spawn(crate::mempool_explore::run_observer(
+                st.clone(),
+                mempool.clone(),
+                jsonl,
+                shutdown.subscribe(),
+            ));
+            tokio::spawn(crate::mempool_explore::run_renderer(
+                st,
+                shutdown.subscribe(),
+            ));
+        } else {
+            let st = Arc::new(crate::explore::ExploreState::new(tip_num));
+            st.set_discovered(combined_peers.len());
+            tokio::spawn(crate::explore::run_renderer(st.clone(), shutdown.subscribe()));
+            explore_state = Some(st);
+        }
+    }
 
     // Filter out peers we dialed recently — within the upstream's 60s
     // `bannedNodes` window (plus margin). Re-dialing immediately after

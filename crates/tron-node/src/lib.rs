@@ -17,6 +17,7 @@ pub mod firehose;
 pub mod inbound;
 pub mod index_hook;
 pub mod logfmt;
+pub mod mempool_explore;
 pub mod mempool_validator;
 pub mod node_persist;
 pub mod node_statistics;

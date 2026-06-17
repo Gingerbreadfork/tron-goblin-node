@@ -29,14 +29,14 @@ const ACTIVE_SRS: usize = 27;
 /// USDT (Tether) TRC-20 contract on TRON, 21-byte (0x41-prefixed) address.
 /// `TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t` — the single most-used contract on the
 /// network, so flagging calls to it makes the live feed instantly relatable.
-const USDT_ADDRESS_HEX: &str = "41a614f803b6fd780986a42c78ec9c7f77e6ded13c";
-const SUN_PER_TRX: u128 = 1_000_000;
+pub(crate) const USDT_ADDRESS_HEX: &str = "41a614f803b6fd780986a42c78ec9c7f77e6ded13c";
+pub(crate) const SUN_PER_TRX: u128 = 1_000_000;
 /// USDT has 6 decimals, so 1 USDT == 1_000_000 base units.
-const USDT_UNITS_PER_DOLLAR: u128 = 1_000_000;
+pub(crate) const USDT_UNITS_PER_DOLLAR: u128 = 1_000_000;
 /// ERC-20/TRC-20 selectors we recognise to pull a transfer amount out of the
 /// `TriggerSmartContract` calldata.
-const SEL_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
-const SEL_TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd]; // transferFrom(address,address,uint256)
+pub(crate) const SEL_TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+pub(crate) const SEL_TRANSFER_FROM: [u8; 4] = [0x23, 0xb8, 0x72, 0xdd]; // transferFrom(address,address,uint256)
 /// Flash a whale milestone once a single USDT transfer crosses this ($).
 const WHALE_USD: u128 = 100_000;
 /// Cap the unique-wallet set so a viewer left running for days can't grow it
@@ -44,16 +44,18 @@ const WHALE_USD: u128 = 100_000;
 const MAX_WALLETS: usize = 2_000_000;
 
 // ----- ANSI ---------------------------------------------------------------
-const RST: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RED: &str = "\x1b[38;5;203m";
-const GRN: &str = "\x1b[38;5;47m";
-const YEL: &str = "\x1b[38;5;221m";
-const CYN: &str = "\x1b[38;5;87m";
-const MAG: &str = "\x1b[38;5;213m";
-const GRY: &str = "\x1b[38;5;245m";
-const ORG: &str = "\x1b[38;5;215m";
+// Shared with `mempool_explore` so both dashboards speak the same visual
+// language; kept crate-private (presentation detail, not a public API).
+pub(crate) const RST: &str = "\x1b[0m";
+pub(crate) const BOLD: &str = "\x1b[1m";
+pub(crate) const DIM: &str = "\x1b[2m";
+pub(crate) const RED: &str = "\x1b[38;5;203m";
+pub(crate) const GRN: &str = "\x1b[38;5;47m";
+pub(crate) const YEL: &str = "\x1b[38;5;221m";
+pub(crate) const CYN: &str = "\x1b[38;5;87m";
+pub(crate) const MAG: &str = "\x1b[38;5;213m";
+pub(crate) const GRY: &str = "\x1b[38;5;245m";
+pub(crate) const ORG: &str = "\x1b[38;5;215m";
 
 /// One streamed block, summarised for the live feed.
 #[derive(Clone)]
@@ -687,7 +689,7 @@ fn note_wallet(set: &mut HashSet<Vec<u8>>, addr: &[u8]) {
 
 /// Pull the transfer amount (6-decimal base units) out of a TRC-20 call's
 /// calldata for `transfer(address,uint256)` / `transferFrom(...,uint256)`.
-fn usdt_amount(data: &[u8]) -> Option<u128> {
+pub(crate) fn usdt_amount(data: &[u8]) -> Option<u128> {
     if data.len() < 4 {
         return None;
     }
@@ -707,7 +709,7 @@ fn usdt_amount(data: &[u8]) -> Option<u128> {
 }
 
 /// A TRON base58check address (`T…`), shortened for display: `TXXXXX…YYYY`.
-fn short_addr(addr: &[u8]) -> String {
+pub(crate) fn short_addr(addr: &[u8]) -> String {
     if addr.len() != 21 {
         return "—".into();
     }
@@ -723,7 +725,7 @@ fn short_addr(addr: &[u8]) -> String {
 
 /// Map a 4-byte TRC-20 / router selector to a human method name, falling back
 /// to the hex selector for unknown ones.
-fn method_name(sel: &[u8; 4]) -> String {
+pub(crate) fn method_name(sel: &[u8; 4]) -> String {
     match *sel {
         [0xa9, 0x05, 0x9c, 0xbb] => "transfer".into(),
         [0x23, 0xb8, 0x72, 0xdd] => "transferFrom".into(),
@@ -741,21 +743,23 @@ fn method_name(sel: &[u8; 4]) -> String {
 }
 
 // ----- rendering helpers --------------------------------------------------
+// Shared with `mempool_explore` (crate-private): both dashboards build frames
+// out of the same primitives so they stay visually consistent.
 
-fn line(content: &str) -> String {
+pub(crate) fn line(content: &str) -> String {
     format!("{content}\x1b[K\r\n")
 }
-fn blank() -> String {
+pub(crate) fn blank() -> String {
     "\x1b[K\r\n".to_string()
 }
-fn rule(w: usize) -> String {
+pub(crate) fn rule(w: usize) -> String {
     line(&format!("{GRY}{}{RST}", "━".repeat(w)))
 }
-fn section(title: &str, w: usize) -> String {
+pub(crate) fn section(title: &str, w: usize) -> String {
     let dashes = w.saturating_sub(title.len() + 6);
     line(&format!("  {BOLD}{GRY}── {title} {}{RST}", "─".repeat(dashes)))
 }
-fn row2(colw: usize, i1: &str, l1: &str, v1: &str, i2: &str, l2: &str, v2: &str) -> String {
+pub(crate) fn row2(colw: usize, i1: &str, l1: &str, v1: &str, i2: &str, l2: &str, v2: &str) -> String {
     let left = format!("{i1} {GRY}{l1}{RST} {BOLD}{v1}{RST}");
     let right = format!("{i2} {GRY}{l2}{RST} {BOLD}{v2}{RST}");
     // Pad the left column so the right one starts at the column split point;
@@ -766,7 +770,7 @@ fn row2(colw: usize, i1: &str, l1: &str, v1: &str, i2: &str, l2: &str, v2: &str)
 
 /// Width of the controlling terminal in columns, via `TIOCGWINSZ` on stdout.
 /// Falls back to 80 when the size is unavailable (output piped / not a tty).
-fn term_cols() -> usize {
+pub(crate) fn term_cols() -> usize {
     #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -785,7 +789,7 @@ fn term_cols() -> usize {
 /// A stacked, colored proportion bar: each `(count, color)` gets a slice of
 /// `width` cells sized by its share of the total. The last slice absorbs any
 /// rounding remainder so the bar is always exactly `width` cells wide.
-fn mix_bar(parts: &[(u64, &str)], width: usize) -> String {
+pub(crate) fn mix_bar(parts: &[(u64, &str)], width: usize) -> String {
     let total: u64 = parts.iter().map(|(c, _)| *c).sum();
     if total == 0 {
         return format!("{DIM}{}{RST}", "░".repeat(width));
@@ -811,7 +815,7 @@ fn mix_bar(parts: &[(u64, &str)], width: usize) -> String {
 }
 
 /// 8-level unicode sparkline from a series of counts.
-fn sparkline(vals: &VecDeque<u64>) -> String {
+pub(crate) fn sparkline(vals: &VecDeque<u64>) -> String {
     const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let max = vals.iter().copied().max().unwrap_or(0);
     let min = vals.iter().copied().min().unwrap_or(0);
@@ -825,7 +829,7 @@ fn sparkline(vals: &VecDeque<u64>) -> String {
 }
 
 /// Length of a string ignoring ANSI escapes (best-effort, for column padding).
-fn visible_len(s: &str) -> usize {
+pub(crate) fn visible_len(s: &str) -> usize {
     let mut n = 0;
     let mut in_esc = false;
     for c in s.chars() {
@@ -846,7 +850,7 @@ fn visible_len(s: &str) -> usize {
     n
 }
 
-fn commas(n: i64) -> String {
+pub(crate) fn commas(n: i64) -> String {
     let neg = n < 0;
     let mut x = n.unsigned_abs();
     if x == 0 {
@@ -871,7 +875,7 @@ fn commas(n: i64) -> String {
 }
 
 /// Compact human count: 8,412 / 12.4K / 1.9M.
-fn compact(n: u128) -> String {
+pub(crate) fn compact(n: u128) -> String {
     if n >= 1_000_000_000 {
         format!("{:.2}B", n as f64 / 1e9)
     } else if n >= 1_000_000 {
@@ -884,17 +888,17 @@ fn compact(n: u128) -> String {
 }
 
 /// TRX amount (from sun) as a compact human string: 12.4M, 1.92B, 8,421.
-fn human_trx(sun: u128) -> String {
+pub(crate) fn human_trx(sun: u128) -> String {
     compact(sun / SUN_PER_TRX)
 }
 
 /// USDT (6-decimal base units) as a dollar string: $1.24M, $850K, $1,234.
-fn usd(units: u128) -> String {
+pub(crate) fn usd(units: u128) -> String {
     let dollars = units / USDT_UNITS_PER_DOLLAR;
     format!("${}", compact(dollars))
 }
 
-fn dur(ms: i64) -> String {
+pub(crate) fn dur(ms: i64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
         format!("{}h {}m", s / 3600, (s % 3600) / 60)
@@ -905,7 +909,7 @@ fn dur(ms: i64) -> String {
     }
 }
 
-fn trunc(s: &str, max: usize) -> String {
+pub(crate) fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -916,7 +920,7 @@ fn trunc(s: &str, max: usize) -> String {
 
 /// Format a millisecond unix timestamp as `YYYY-MM-DD HH:MM:SS UTC` without
 /// pulling in chrono (Howard Hinnant's civil-from-days algorithm).
-fn utc(ms: i64) -> String {
+pub(crate) fn utc(ms: i64) -> String {
     if ms <= 0 {
         return "—".into();
     }
@@ -966,7 +970,7 @@ pub async fn run_renderer(
     let _ = out.flush();
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

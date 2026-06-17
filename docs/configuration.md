@@ -52,6 +52,30 @@ Controls discovery, outbound sync, inbound serving, and peer persistence.
 - `progress_log_interval`: sync progress heartbeat interval.
 - `disabled`: run without the P2P sync loop.
 
+#### Live dashboard modes (decode-only)
+
+These run a self-bootstrapping node that discovers the live tip, follows it, and
+decodes traffic for a terminal dashboard — without executing, persisting, or
+snapshotting. Usually set via the matching CLI flag rather than the config file.
+
+- `explore` (CLI `--explore`): live dashboard of **confirmed** blocks — each
+  block's transactions decoded as they arrive.
+- `mempool` (CLI `--mempool`): live dashboard of the **pending** transaction
+  stream — the txs peers are broadcasting before any SR mines them. Each is
+  decoded on arrival (TRX / USDT transfers, contract calls with method names)
+  and folded into running stats: arrival rate, pending USDT/TRX volume, hottest
+  contracts and methods, pending DEX swaps, time-in-mempool, and whale alerts —
+  MEV / ops visibility java-tron does not expose. In this mode the state-aware
+  mempool validator is skipped (the node carries no real account state), so the
+  raw pending stream is surfaced as-is.
+- `mempool_json` (CLI `--mempool-json PATH`): with `mempool`, also write one
+  JSON object per pending tx to `PATH` (`-` for stdout) for downstream tooling.
+  Each line: `{txid, ts, signer, type, to, amount_sun, usdt_units, contract,
+  method, expiration}`.
+
+In a dashboard mode, node logs are routed to the file sink only so they don't
+clobber the terminal UI (check `logs/tron-node.log` for errors).
+
 ### `[rpc]`, `[http]`, `[grpc]`, `[metrics]`
 
 Configure bind hosts, ports, and disable flags for served interfaces.

@@ -78,6 +78,25 @@ directory and an isolated RPC port, and cleans up after itself. No API keys, no
 external services — just a release build (`cargo build --release`, or drop a
 `tron-node` binary next to the script).
 
+### See the mempool too: pending txs before they're mined
+
+`--explore` shows *confirmed* blocks. Swap in `--mempool` and the same
+self-bootstrapping node instead watches the **pending** transaction stream —
+the txs peers are broadcasting right now, before any SR has mined them:
+
+```sh
+tron-node start --mempool
+```
+
+Each pending tx is decoded the instant it arrives (TRX / USDT transfers,
+contract calls with method names) and folded into a live dashboard: arrival
+rate, pending USDT/TRX volume, the hottest contracts and methods, pending DEX
+swaps, time-in-mempool, and whale alerts. That's MEV / ops visibility (front-run
+candidates, large transfers landing, contract hotspots) that java-tron does not
+expose. Add `--mempool-json <path>` (or `-` for stdout) to also stream one JSON
+object per pending tx for tooling. Decode-only, like `--explore` — no execution,
+no state, no snapshot.
+
 ## What this is
 
 `tron-goblin-node` is a workspace of small, focused crates that

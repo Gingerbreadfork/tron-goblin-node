@@ -117,6 +117,15 @@ DHT. Peer dial order is randomized per-session.
                            block tail, and paints a self-updating terminal
                            dashboard of real mainnet activity (decode-only --
                            no execution, no state, no snapshot). Try ./try.sh.
+--mempool                  live mempool dashboard. Same self-bootstrapping
+                           tip-follow as --explore, but watches PENDING (not-
+                           yet-mined) txs streaming in from peers: decodes each
+                           (TRX/USDT/contract calls with method names) and shows
+                           arrival rate, pending volume, hot contracts, DEX
+                           swaps, and whale alerts. MEV/ops visibility java-tron
+                           does not expose. Decode-only.
+--mempool-json PATH        with --mempool, also write one JSON object per
+                           pending tx to PATH (append) or stdout when PATH is -.
 --metrics-port N           Prometheus /metrics listen port (default 9090).
 --metrics-host HOST        Prometheus /metrics bind host (default 127.0.0.1).
 --no-metrics               disable the Prometheus metrics endpoint.
@@ -1013,6 +1022,11 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Full-screen dashboard modes paint an ANSI UI on stderr's tty; node logs
+    // written there would interleave and clobber it, so keep them off stderr
+    // (they still reach the daily file sink). Detected from argv because this
+    // runs before CLI parsing.
+    let dashboard_mode = std::env::args().any(|a| a == "--explore" || a == "--mempool");
     let is_tty = std::io::stderr().is_terminal();
     let ansi = is_tty && std::env::var_os("NO_COLOR").is_none();
     // Interactive terminal → compact `HH:MM:SS` (the date is constant on screen).
@@ -1044,7 +1058,9 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer)
+        // `Option<Layer>` is a no-op when `None`, dropping stderr output in
+        // dashboard mode while leaving the file sink intact.
+        .with(if dashboard_mode { None } else { Some(stderr_layer) })
         .with(file_layer)
         .try_init();
     guard
@@ -1165,6 +1181,24 @@ fn parse_args(args: &[String]) -> Result<NodeConfig, String> {
                 config.p2p.explore = true;
                 config.p2p.follow_tip = true;
                 config.p2p.multi_peer_fetch = false;
+            }
+            "--mempool" => {
+                // Live mempool dashboard. Same self-bootstrapping tip-follow as
+                // `--explore` (so the node reaches the live tip and peers start
+                // broadcasting pending txs to it), but the dashboard watches the
+                // pending tx stream instead of confirmed blocks. Decode-only —
+                // no execution, no state. An explicit `--tip-test NUM:HASH` may
+                // still pin the starting tip.
+                config.p2p.mempool = true;
+                config.p2p.follow_tip = true;
+                config.p2p.multi_peer_fetch = false;
+            }
+            "--mempool-json" => {
+                // Optional JSONL feed of decoded pending txs. `-` writes to
+                // stdout; any other value is a file path (append mode).
+                i += 1;
+                config.p2p.mempool_json =
+                    Some(args.get(i).ok_or("--mempool-json needs PATH or -")?.clone());
             }
             "--metrics-port" => {
                 i += 1;

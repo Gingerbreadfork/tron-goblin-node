@@ -1051,6 +1051,23 @@ pub struct P2pConfig {
     /// normal syncing node.
     #[serde(default, alias = "explore")]
     pub explore: bool,
+    /// `--mempool` live-dashboard mode. Reuses the same tip bootstrap as
+    /// [`Self::explore`] (so the node reaches the live tip and peers start
+    /// broadcasting pending txs to it), but instead of confirmed blocks it
+    /// watches the *pending* tx stream: every accepted mempool tx is decoded
+    /// (TRX / USDT / contract call), classified, and painted in a live
+    /// dashboard with arrival rate, pending volume, hot contracts/methods, and
+    /// whale alerts. Decode-only — never executes or applies. When both this
+    /// and [`Self::explore`] are set, the mempool dashboard wins. Off by
+    /// default; never affects a normal syncing node.
+    #[serde(default, alias = "mempool")]
+    pub mempool: bool,
+    /// Optional JSONL sink for [`Self::mempool`] mode: one JSON object per
+    /// pending tx (txid, ts, signer, type, to, amount_sun, usdt_units,
+    /// contract, method, expiration). `"-"` writes to stdout; any other value
+    /// is a file path opened in append mode. `None` disables the feed.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "mempoolJson")]
+    pub mempool_json: Option<String>,
 }
 
 fn default_multi_peer_fetch() -> bool {
@@ -1137,6 +1154,8 @@ impl Default for P2pConfig {
             multi_peer_fetch: default_multi_peer_fetch(),
             follow_tip: false,
             explore: false,
+            mempool: false,
+            mempool_json: None,
         }
     }
 }
