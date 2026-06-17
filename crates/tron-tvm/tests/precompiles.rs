@@ -636,44 +636,74 @@ fn standard_evm_precompiles_say_handled_by_interpreter() {
 }
 
 // =============================================================================
-// TotalVoteCount (real implementation, post-Phase 2a)
+// TotalVoteCount (0x0100000a) — despite the name, returns the queried
+// account's TRON Power in TRX (java `getTronPower()/TRX_PRECISION` on mainnet).
 // =============================================================================
 
-#[test]
-fn total_vote_count_sums_across_all_witnesses() {
-    let mut ctx = MockContext::default();
-    let a = alice();
-    let b = bob();
-    ctx.witnesses.insert(
-        a,
-        Witness {
-            address: a.as_bytes().to_vec(),
-            vote_count: 1_000,
-            ..Default::default()
-        },
-    );
-    ctx.witnesses.insert(
-        b,
-        Witness {
-            address: b.as_bytes().to_vec(),
-            vote_count: 250,
-            ..Default::default()
-        },
-    );
-    let out = PrecompileImpl::TotalVoteCount.execute(&[], &ctx).unwrap();
+fn total_vote_count_i64(ctx: &MockContext, input: &[u8]) -> i64 {
+    let out = PrecompileImpl::TotalVoteCount.execute(input, ctx).unwrap();
     assert_eq!(out.len(), 32);
     let mut be = [0u8; 8];
     be.copy_from_slice(&out[24..32]);
-    assert_eq!(i64::from_be_bytes(be), 1250);
+    i64::from_be_bytes(be)
 }
 
 #[test]
-fn total_vote_count_returns_zero_with_no_witnesses() {
+fn total_vote_count_returns_account_tron_power_in_trx() {
+    // Mainnet gating: ALLOW_NEW_RESOURCE_MODEL = 0 → the getTronPower() path.
+    let mut ctx = MockContext::default();
+    ctx.chain_params.insert(b"UNFREEZE_DELAY_DAYS".to_vec(), 14);
+    let a = alice();
+    // 4_000 TRX bandwidth + 3_000 TRX energy frozen-v2, plus 1_000 TRX
+    // delegated out for energy (delegating out keeps the voting power).
+    let mut acct = account_with_freeze_v2(
+        &a,
+        4_000_000_000, // bw_frozen
+        0,             // bw_delegated_out
+        0,             // bw_acquired
+        0,             // bw_usage
+        3_000_000_000, // energy_frozen
+        1_000_000_000, // energy_delegated_out
+        0,             // energy_acquired
+        0,             // energy_usage
+    );
+    // getTronPower sums every frozen source except TRON_POWER-typed v2.
+    acct.old_tron_power = 0;
+    ctx.accounts.insert(a, acct);
+
+    // TRON Power = (4_000 + 3_000 + 1_000) TRX in sun, / TRX_PRECISION = 8_000.
+    assert_eq!(total_vote_count_i64(&ctx, &addr_word(&a)), 8_000);
+}
+
+#[test]
+fn total_vote_count_uses_all_tron_power_when_new_model_active() {
+    // When BOTH UNFREEZE_DELAY_DAYS > 0 and ALLOW_NEW_RESOURCE_MODEL == 1,
+    // java switches to getAllTronPower(), which folds in TRON_POWER-typed v2.
+    use tron_proto::account::FreezeV2;
+    let mut ctx = MockContext::default();
+    ctx.chain_params.insert(b"UNFREEZE_DELAY_DAYS".to_vec(), 14);
+    ctx.chain_params.insert(b"ALLOW_NEW_RESOURCE_MODEL".to_vec(), 1);
+    let a = alice();
+    let mut acct = account_with_freeze_v2(&a, 4_000_000_000, 0, 0, 0, 0, 0, 0, 0);
+    acct.old_tron_power = 0;
+    // 2_000 TRX of TRON_POWER-typed v2 freeze — only counted by getAllTronPower.
+    acct.frozen_v2.push(FreezeV2 {
+        r#type: 2,
+        amount: 2_000_000_000,
+    });
+    ctx.accounts.insert(a, acct);
+
+    // getAllTronPower = getTronPower (4_000) + TRON_POWER v2 (2_000) = 6_000 TRX.
+    assert_eq!(total_vote_count_i64(&ctx, &addr_word(&a)), 6_000);
+}
+
+#[test]
+fn total_vote_count_returns_zero_for_absent_account_or_bad_input() {
     let ctx = MockContext::default();
-    let out = PrecompileImpl::TotalVoteCount.execute(&[], &ctx).unwrap();
-    let mut be = [0u8; 8];
-    be.copy_from_slice(&out[24..32]);
-    assert_eq!(i64::from_be_bytes(be), 0);
+    // Absent account.
+    assert_eq!(total_vote_count_i64(&ctx, &addr_word(&alice())), 0);
+    // Wrong-length input.
+    assert_eq!(total_vote_count_i64(&ctx, &[]), 0);
 }
 
 // =============================================================================

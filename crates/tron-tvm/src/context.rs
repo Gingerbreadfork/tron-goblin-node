@@ -56,8 +56,8 @@ pub trait EvmContext {
         self.block_timestamp_ms()
     }
 
-    /// Snapshot every registered witness. Used by `TotalVoteCount` and
-    /// any consensus path that needs to sum across the entire SR set.
+    /// Snapshot every registered witness. Used by consensus paths that
+    /// need to scan or sum across the entire SR set.
     ///
     /// Returns owned values so the implementer can wrap a session
     /// without lifetime entanglement.

@@ -59,7 +59,7 @@
 //! The interface between the (future) EVM interpreter and everything
 //! it needs to read: accounts, witnesses, chain parameters, delegated
 //! resources, dynamic-energy factors, `all_witnesses` (for
-//! `TotalVoteCount` and consensus paths).
+//! consensus paths that scan the SR set).
 //!
 //! ## Deliberately deferred (each its own follow-up session)
 //!

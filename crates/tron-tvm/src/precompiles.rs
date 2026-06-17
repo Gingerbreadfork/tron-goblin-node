@@ -602,18 +602,40 @@ fn received_vote_count(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
 }
 
 // =============================================================================
-// TotalVoteCount (0x0100000a): sum of all witness vote counts
+// TotalVoteCount (0x0100000a): the queried account's TRON Power (in TRX)
 // =============================================================================
 
-fn total_vote_count(_input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
-    // java-tron sums `witness.vote_count` across the entire WitnessStore.
-    // Now backed by `EvmContext::all_witnesses` which the chainbase
-    // `WitnessStore::all` powers.
-    let mut total = 0i64;
-    for w in ctx.all_witnesses()? {
-        total = total.saturating_add(w.vote_count);
-    }
-    Ok(long_to_32_bytes(total))
+/// Despite the name, java-tron's `PrecompiledContracts.TotalVoteCount` returns
+/// the **TRON Power of the account named in the input**, divided by
+/// `TRX_PRECISION` — i.e. the total voting weight that account may cast, not a
+/// sum of witness vote counts. The input is a single 32-byte word holding the
+/// address; a missing/wrong-length input or an absent account yields 0.
+///
+/// The power source matches java's `getAllTronPower()`/`getTronPower()` switch:
+/// when `supportUnfreezeDelay()` (`UNFREEZE_DELAY_DAYS > 0`) **and**
+/// `supportAllowNewResourceModel()` (`ALLOW_NEW_RESOURCE_MODEL == 1`) are both
+/// active it uses `getAllTronPower()`, otherwise `getTronPower()`. Mainnet runs
+/// with `ALLOW_NEW_RESOURCE_MODEL = 0`, so the legacy `getTronPower()` path is
+/// the live one — the same source the VOTEWITNESS validation caps against.
+fn total_vote_count(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
+    let addr = match parse_address_only(input) {
+        Some(a) => a,
+        None => return Ok(long_to_32_bytes(0)),
+    };
+    let account = match ctx.get_account(&addr)? {
+        Some(a) => a,
+        None => return Ok(long_to_32_bytes(0)),
+    };
+    let support_unfreeze_delay =
+        ctx.chain_parameter_long(b"UNFREEZE_DELAY_DAYS")?.unwrap_or(0) > 0;
+    let support_new_resource_model =
+        ctx.chain_parameter_long(b"ALLOW_NEW_RESOURCE_MODEL")?.unwrap_or(0) == 1;
+    let tron_power = if support_unfreeze_delay && support_new_resource_model {
+        crate::votes::all_tron_power(&account)
+    } else {
+        crate::votes::tron_power(&account)
+    };
+    Ok(long_to_32_bytes(tron_power / crate::votes::TRX_PRECISION))
 }
 
 // =============================================================================

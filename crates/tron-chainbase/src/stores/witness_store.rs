@@ -50,9 +50,8 @@ impl WitnessStore {
 
     /// Snapshot every registered witness in the store.
     ///
-    /// Used by:
-    /// * Maintenance round (every 6 hours) to pick the active 27 SRs.
-    /// * `TotalVoteCount` precompile (sum of all witness vote counts).
+    /// Used by the maintenance round (every 6 hours) to pick the active
+    /// 27 SRs, and by any consensus path that scans the full SR set.
     ///
     /// Keys are 21 bytes (an [`Address`]). Anything shorter is a
     /// malformed write from a buggy upstream — skip it so a single bad

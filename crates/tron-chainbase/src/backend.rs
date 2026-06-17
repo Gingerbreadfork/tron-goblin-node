@@ -138,7 +138,7 @@ pub trait KvBackend: Send + Sync {
     ///
     /// This is the minimum primitive needed by consensus-critical paths
     /// that must walk the full table — e.g. `WitnessStore::all` for the
-    /// maintenance round, or the `TotalVoteCount` precompile.
+    /// maintenance round.
     ///
     /// The default implementation returns an error; backends MUST
     /// override. It's a default only so trait objects taken before

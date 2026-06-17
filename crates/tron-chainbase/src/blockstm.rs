@@ -729,10 +729,10 @@ impl KvBackend for VersionedBackend {
         //
         // Without this override `VersionedBackend` inherited the erroring default
         // `scan_all`, so every full-table scan failed *only under parallel
-        // execution*: the `TotalVoteCount` precompile (`WitnessStore::all`) then
-        // returned failure and any contract that checked the call reverted — a
-        // parallel-vs-serial divergence, since serial runs on a snapshot/session
-        // backend that implements `scan_all`.
+        // execution*: a full-table scan (e.g. the maintenance round's
+        // `WitnessStore::all`) then returned failure — a parallel-vs-serial
+        // divergence, since serial runs on a snapshot/session backend that
+        // implements `scan_all`.
         //
         // A key *created* by a lower-index tx this block that is neither in base
         // nor written by this tx is not enumerated, but the stores reachable by a
@@ -970,10 +970,9 @@ mod tests {
     #[test]
     fn versioned_scan_all_merges_base_overlay_mvcc_and_records_reads() {
         // Regression: `VersionedBackend` used to inherit the erroring default
-        // `scan_all`, so full-table scans (the `TotalVoteCount` precompile's
-        // `WitnessStore::all`) failed *only under parallel execution* — the
-        // precompile returned failure and any contract checking the call
-        // reverted, diverging from serial (which uses a backend that implements
+        // `scan_all`, so full-table scans (e.g. the maintenance round's
+        // `WitnessStore::all`) failed *only under parallel execution*,
+        // diverging from serial (which uses a backend that implements
         // `scan_all`).
         let base = Arc::new(MemBackend::new());
         base.put(b"a", b"1").unwrap();
