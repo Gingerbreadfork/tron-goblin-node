@@ -386,7 +386,8 @@ impl TronDatabaseExt for TronDatabase {
 
             // Merge usage windows into the inheritor (java
             // updateUsageForDelegated + unDelegateIncrease).
-            res::update_usage(&mut owner_account, ResourceKind::Bandwidth, now_slot, gates);
+            let harden = dyn_props.allow_harden_resource_calculation();
+            res::update_usage(&mut owner_account, ResourceKind::Bandwidth, now_slot, gates, harden);
             res::set_latest_time(&mut owner_account, ResourceKind::Bandwidth, now_slot);
             if res::usage(&owner_account, ResourceKind::Bandwidth) > 0 {
                 let usage = res::usage(&owner_account, ResourceKind::Bandwidth);
@@ -397,9 +398,10 @@ impl TronDatabaseExt for TronDatabase {
                     ResourceKind::Bandwidth,
                     now_slot,
                     gates,
+                    harden,
                 );
             }
-            res::update_usage(&mut owner_account, ResourceKind::Energy, now_slot, gates);
+            res::update_usage(&mut owner_account, ResourceKind::Energy, now_slot, gates, harden);
             res::set_latest_time(&mut owner_account, ResourceKind::Energy, now_slot);
             if res::usage(&owner_account, ResourceKind::Energy) > 0 {
                 let usage = res::usage(&owner_account, ResourceKind::Energy);
@@ -410,6 +412,7 @@ impl TronDatabaseExt for TronDatabase {
                     ResourceKind::Energy,
                     now_slot,
                     gates,
+                    harden,
                 );
             }
 
@@ -1199,6 +1202,7 @@ impl TronDatabaseExt for TronDatabase {
             support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
             support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
         };
+        let harden = dyn_props.allow_harden_resource_calculation();
 
         // Per-resource acquired-delegated read/write helpers (kind-aware).
         let acquired_v2 = |a: &tron_proto::Account| -> i64 {
@@ -1232,7 +1236,7 @@ impl TronDatabaseExt for TronDatabase {
         let mut transfer_usage = 0i64;
         let mut receiver_account = self.accounts.get(&receiver).ok().flatten();
         if let Some(recv) = receiver_account.as_mut() {
-            res::update_usage(recv, kind, now_slot, gates);
+            res::update_usage(recv, kind, now_slot, gates, harden);
             let acquired = acquired_v2(recv);
             if acquired < balance {
                 // TVM suicide + re-create can leave acquired < balance.
@@ -1322,6 +1326,7 @@ impl TronDatabaseExt for TronDatabase {
                         kind,
                         now_slot,
                         gates,
+                        harden,
                     );
                 }
             }

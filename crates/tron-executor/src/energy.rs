@@ -148,7 +148,13 @@ fn apply_energy_pre_consume(
         })
         .unwrap_or((0, 0, 0, false));
     // c. updateUsage: decay the stored usage to `now`, rewrite the window.
-    update_usage(account, ResourceKind::Energy, now_slot, gates);
+    update_usage(
+        account,
+        ResourceKind::Energy,
+        now_slot,
+        gates,
+        dyn_props.allow_harden_resource_calculation(),
+    );
     // d. setLatestConsumeTimeForEnergy(now) — AFTER the decay.
     set_latest_time(account, ResourceKind::Energy, now_slot);
     // e. capture the post-decay state (what resetAccountUsage restores to).
@@ -158,8 +164,16 @@ fn apply_energy_pre_consume(
     // f. pre-consume `reserve`: increase(usage, reserve, now, now). lastTime==now
     //    so the decay branch is skipped — a pure window-merge add. `increase_account`
     //    returns the new usage AND rewrites the per-account window in place.
-    let merged_usage =
-        increase_account(account, ResourceKind::Energy, usage, reserve, now_slot, now_slot, gates);
+    let merged_usage = increase_account(
+        account,
+        ResourceKind::Energy,
+        usage,
+        reserve,
+        now_slot,
+        now_slot,
+        gates,
+        dyn_props.allow_harden_resource_calculation(),
+    );
     set_usage(account, ResourceKind::Energy, merged_usage);
     // g. capture the post-merge state.
     let merged_size = window_size(account, ResourceKind::Energy);
@@ -236,7 +250,13 @@ pub fn caller_energy_quota_left(
             support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
         };
         let mut q = account.clone();
-        update_usage(&mut q, ResourceKind::Energy, now_slot, gates);
+        update_usage(
+            &mut q,
+            ResourceKind::Energy,
+            now_slot,
+            gates,
+            dyn_props.allow_harden_resource_calculation(),
+        );
         let decayed_d = resource_usage(&q, ResourceKind::Energy);
         recovery_account(
             &q,
@@ -342,7 +362,13 @@ pub fn consume_energy(
             support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
         };
         let mut q = account.clone();
-        update_usage(&mut q, ResourceKind::Energy, now_slot, gates);
+        update_usage(
+            &mut q,
+            ResourceKind::Energy,
+            now_slot,
+            gates,
+            dyn_props.allow_harden_resource_calculation(),
+        );
         let decayed_d = resource_usage(&q, ResourceKind::Energy);
         recovery_account(
             &q,
@@ -424,6 +450,7 @@ pub fn consume_energy(
             res.latest_consume_time_for_energy,
             now_slot,
             gates,
+            dyn_props.allow_harden_resource_calculation(),
         );
         let r = account.account_resource.get_or_insert_with(Default::default);
         r.energy_usage = new;
@@ -480,6 +507,7 @@ pub fn consume_energy(
                 latest_consume,
                 now_slot,
                 gates_dbg,
+                dyn_props.allow_harden_resource_calculation(),
             );
             eprintln!(
                 "EDECAY addr={addr} cusage={current_usage} decayed_recovery={decayed_usage} decayed_via_increase={decayed_via_increase} delta={}",

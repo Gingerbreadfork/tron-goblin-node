@@ -424,6 +424,7 @@ fn try_use_asset_account_net(
             issuer_last_consume,
             now_slot,
             gates,
+            stores.dyn_props.allow_harden_resource_calculation(),
         )
     } else {
         increase_default(new_issuer_net_usage, bytes, now_slot, now_slot)
@@ -533,7 +534,16 @@ fn try_use_account_net(
             support_unfreeze_delay: true,
             support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
         };
-        increase_account(account, ResourceKind::Bandwidth, cur_usage, bytes, last_consume, now_slot, gates)
+        increase_account(
+            account,
+            ResourceKind::Bandwidth,
+            cur_usage,
+            bytes,
+            last_consume,
+            now_slot,
+            gates,
+            dyn_props.allow_harden_resource_calculation(),
+        )
     } else {
         increase_default(decayed, bytes, now_slot, now_slot)
     };
@@ -674,6 +684,7 @@ fn try_use_net_for_create_new_account(
             last_consume,
             now_slot,
             gates,
+            dyn_props.allow_harden_resource_calculation(),
         )
     } else {
         increase_default(decayed, net_cost, now_slot, now_slot)

@@ -274,6 +274,49 @@ fn get_new_window_size_i128(
     (last_usage * last_window + usage * window) / new_usage
 }
 
+// -- Legacy (`long`) growth helpers ------------------------------------------
+//
+// java-tron's `ResourceProcessor` performs the growth/window math entirely in
+// 64-bit `long` (there is NO BigInteger branch in the deployed 4.8.1.1 code).
+// The intermediate products silently overflow and wrap on the JVM, and that
+// wrapped result is what mainnet commits. These helpers reproduce that exact
+// `long` wrap (`wrapping_*`) so the persisted growth path stays byte-identical
+// to java when an operand product exceeds `i64::MAX` — the same way
+// [`increase_legacy`] already mirrors the decay/quota-check path. For in-range
+// operands they are bit-for-bit equal to the i128 helpers above.
+
+/// `long` form of [`get_usage_i128`] — `usage * windowSize / precision`.
+fn get_usage_i64(usage: i64, window: i64) -> i64 {
+    usage.wrapping_mul(window) / PRECISION
+}
+
+/// `long` form of [`get_usage2_i128`] —
+/// `(oldUsage*oldWindowSize + newUsage*newWindowSize) / precision`.
+fn get_usage2_i64(old_usage: i64, old_window: i64, new_usage: i64, new_window: i64) -> i64 {
+    old_usage
+        .wrapping_mul(old_window)
+        .wrapping_add(new_usage.wrapping_mul(new_window))
+        / PRECISION
+}
+
+/// `long` form of [`get_new_window_size_i128`] —
+/// `(lastUsage*lastWindowSize + usage*windowSize) / newUsage`.
+fn get_new_window_size_i64(
+    last_usage: i64,
+    last_window: i64,
+    usage: i64,
+    window: i64,
+    new_usage: i64,
+) -> i64 {
+    if new_usage == 0 {
+        return 0;
+    }
+    last_usage
+        .wrapping_mul(last_window)
+        .wrapping_add(usage.wrapping_mul(window))
+        / new_usage
+}
+
 // =============================================================================
 // Per-account window helpers (java-tron AccountCapsule)
 // =============================================================================
@@ -579,6 +622,17 @@ pub fn recovery_account(
 /// also recomputes and writes the per-account window size. Returns the new
 /// usage. Mutates `account`'s window fields (and, via the V2 path, the
 /// window-optimized flag).
+///
+/// `harden` is `ALLOW_HARDEN_RESOURCE_CALCULATION` (proposal #97, **off on
+/// mainnet**). The deployed java-tron does the entire growth/window
+/// computation in 64-bit `long`, whose intermediate products silently wrap;
+/// when `harden == false` we reproduce that wrap exactly (the byte-exact
+/// mainnet path), mirroring how the decay/quota-check path
+/// ([`recovery_account`] → [`increase_legacy`]) already wraps. When
+/// `harden == true` the same math is done in exact i128 (no wrap), kept
+/// symmetric with the other harden-gated helpers in this module
+/// ([`usage_to_balance`], [`calculate_global_net_limit_v2`]). For in-range
+/// operands the two branches return identical values.
 pub fn increase_account(
     account: &mut Account,
     kind: ResourceKind,
@@ -587,11 +641,17 @@ pub fn increase_account(
     last_time: i64,
     now: i64,
     gates: ResourceGates,
+    harden: bool,
 ) -> i64 {
     if gates.support_allow_cancel_all_unfreeze_v2 {
-        return increase_v2_account(account, kind, last_usage, usage_amt, last_time, now);
+        return increase_v2_account(account, kind, last_usage, usage_amt, last_time, now, harden);
     }
     let old_window = window_size(account, kind);
+    if !harden {
+        return increase_account_legacy(
+            account, kind, last_usage, usage_amt, last_time, now, gates, old_window,
+        );
+    }
     let precision = PRECISION as i128;
     let mut average_last = div_ceil_i128((last_usage as i128) * precision, old_window as i128);
     let average_usage = div_ceil_i128((usage_amt as i128) * precision, WINDOW_SIZE_BLOCKS as i128);
@@ -628,8 +688,58 @@ pub fn increase_account(
     new_usage as i64
 }
 
+/// Legacy (`long`, mainnet) form of [`increase_account`]'s V1 (non-cancel-all)
+/// path. Mirrors java `ResourceProcessor.increase` term-for-term in wrapping
+/// i64 — same operand order, same grouping, same truncating-divide points as
+/// `divideCeil` / `getUsage` / `getNewWindowSize`.
+fn increase_account_legacy(
+    account: &mut Account,
+    kind: ResourceKind,
+    last_usage: i64,
+    usage_amt: i64,
+    last_time: i64,
+    now: i64,
+    gates: ResourceGates,
+    old_window: i64,
+) -> i64 {
+    let mut average_last = div_ceil_i64(last_usage.wrapping_mul(PRECISION), old_window);
+    let average_usage = div_ceil_i64(usage_amt.wrapping_mul(PRECISION), WINDOW_SIZE_BLOCKS);
+
+    if last_time != now {
+        if last_time + old_window > now {
+            let delta = now - last_time;
+            let decay = (old_window - delta) as f64 / old_window as f64;
+            average_last = strict_round(average_last as f64 * decay);
+        } else {
+            average_last = 0;
+        }
+    }
+
+    let new_usage = get_usage2_i64(average_last, old_window, average_usage, WINDOW_SIZE_BLOCKS);
+    if gates.support_unfreeze_delay {
+        let remain_usage = get_usage_i64(average_last, old_window);
+        if remain_usage == 0 {
+            set_new_window_size(account, kind, WINDOW_SIZE_BLOCKS);
+            return new_usage;
+        }
+        let remain_window = old_window.wrapping_sub(now - last_time);
+        let new_window = get_new_window_size_i64(
+            remain_usage,
+            remain_window,
+            usage_amt,
+            WINDOW_SIZE_BLOCKS,
+            new_usage,
+        );
+        set_new_window_size(account, kind, new_window);
+    }
+    new_usage
+}
+
 /// java-tron `ResourceProcessor.increaseV2(...)` — the
 /// `supportAllowCancelAllUnfreezeV2` window path (precision-scaled window).
+///
+/// `harden` gates the same wrapping-`long` (mainnet) vs exact-i128 split as
+/// [`increase_account`].
 fn increase_v2_account(
     account: &mut Account,
     kind: ResourceKind,
@@ -637,7 +747,11 @@ fn increase_v2_account(
     usage_amt: i64,
     last_time: i64,
     now: i64,
+    harden: bool,
 ) -> i64 {
+    if !harden {
+        return increase_v2_account_legacy(account, kind, last_usage, usage_amt, last_time, now);
+    }
     let old_window_v2 = window_size_v2(account, kind);
     let old_window = window_size(account, kind);
     let precision = PRECISION as i128;
@@ -676,13 +790,71 @@ fn increase_v2_account(
     new_usage as i64
 }
 
+/// Legacy (`long`, mainnet) form of [`increase_v2_account`]. Mirrors java
+/// `ResourceProcessor.increaseV2` term-for-term in wrapping i64.
+fn increase_v2_account_legacy(
+    account: &mut Account,
+    kind: ResourceKind,
+    last_usage: i64,
+    usage_amt: i64,
+    last_time: i64,
+    now: i64,
+) -> i64 {
+    let old_window_v2 = window_size_v2(account, kind);
+    let old_window = window_size(account, kind);
+    let mut average_last = div_ceil_i64(last_usage.wrapping_mul(PRECISION), old_window);
+    let average_usage = div_ceil_i64(usage_amt.wrapping_mul(PRECISION), WINDOW_SIZE_BLOCKS);
+
+    if last_time != now {
+        if last_time + old_window > now {
+            let delta = now - last_time;
+            let decay = (old_window - delta) as f64 / old_window as f64;
+            average_last = strict_round(average_last as f64 * decay);
+        } else {
+            average_last = 0;
+        }
+    }
+
+    let new_usage = get_usage2_i64(average_last, old_window, average_usage, WINDOW_SIZE_BLOCKS);
+    let remain_usage = get_usage_i64(average_last, old_window);
+    if remain_usage == 0 {
+        set_new_window_size_v2(account, kind, WINDOW_SIZE_BLOCKS * WINDOW_SIZE_PRECISION);
+        return new_usage;
+    }
+
+    // java: `remainWindowSize = oldWindowSizeV2 - (now - lastTime) * WINDOW_SIZE_PRECISION`.
+    let remain_window =
+        old_window_v2.wrapping_sub((now - last_time).wrapping_mul(WINDOW_SIZE_PRECISION));
+    // java: `divideCeil(remainUsage * remainWindowSize
+    //                    + usage * windowSize * WINDOW_SIZE_PRECISION, newUsage)`
+    // — `usage * windowSize * WINDOW_SIZE_PRECISION` evaluates left-to-right.
+    let numerator = remain_usage.wrapping_mul(remain_window).wrapping_add(
+        usage_amt
+            .wrapping_mul(WINDOW_SIZE_BLOCKS)
+            .wrapping_mul(WINDOW_SIZE_PRECISION),
+    );
+    let mut new_window = div_ceil_i64(numerator, new_usage);
+    let cap = WINDOW_SIZE_BLOCKS.wrapping_mul(WINDOW_SIZE_PRECISION);
+    if new_window > cap {
+        new_window = cap;
+    }
+    set_new_window_size_v2(account, kind, new_window);
+    new_usage
+}
+
 /// java-tron `BandwidthProcessor.updateUsageForDelegated` /
 /// `EnergyProcessor.updateUsage` — decay the account's usage to `now`
 /// (writing the window back) **without** touching `latest_consume_time`.
-pub fn update_usage(account: &mut Account, kind: ResourceKind, now: i64, gates: ResourceGates) {
+pub fn update_usage(
+    account: &mut Account,
+    kind: ResourceKind,
+    now: i64,
+    gates: ResourceGates,
+    harden: bool,
+) {
     let old = usage(account, kind);
     let last = last_consume_time(account, kind);
-    let new = increase_account(account, kind, old, 0, last, now, gates);
+    let new = increase_account(account, kind, old, 0, last, now, gates, harden);
     set_usage(account, kind, new);
 }
 
@@ -697,15 +869,17 @@ pub fn undelegate_increase(
     kind: ResourceKind,
     now: i64,
     gates: ResourceGates,
+    harden: bool,
 ) {
     if gates.support_allow_cancel_all_unfreeze_v2 {
-        undelegate_increase_v2(owner, receiver, transfer_usage, kind, now, gates);
+        undelegate_increase_v2(owner, receiver, transfer_usage, kind, now, gates, harden);
         return;
     }
     let last_owner_time = last_consume_time(owner, kind);
     let owner_usage0 = usage(owner, kind);
     // Update itself first (decays owner usage + writes its window).
-    let owner_usage = increase_account(owner, kind, owner_usage0, 0, last_owner_time, now, gates);
+    let owner_usage =
+        increase_account(owner, kind, owner_usage0, 0, last_owner_time, now, gates, harden);
 
     let mut remain_owner_window = window_size(owner, kind);
     let mut remain_receiver_window = window_size(receiver, kind);
@@ -723,13 +897,24 @@ pub fn undelegate_increase(
         set_latest_time(owner, kind, now);
         return;
     }
-    let new_owner_window = get_new_window_size_i128(
-        owner_usage as i128,
-        remain_owner_window as i128,
-        transfer_usage as i128,
-        remain_receiver_window as i128,
-        new_owner_usage as i128,
-    ) as i64;
+    // java `getNewWindowSize` is plain `long`; harden=false reproduces the wrap.
+    let new_owner_window = if harden {
+        get_new_window_size_i128(
+            owner_usage as i128,
+            remain_owner_window as i128,
+            transfer_usage as i128,
+            remain_receiver_window as i128,
+            new_owner_usage as i128,
+        ) as i64
+    } else {
+        get_new_window_size_i64(
+            owner_usage,
+            remain_owner_window,
+            transfer_usage,
+            remain_receiver_window,
+            new_owner_usage,
+        )
+    };
     set_new_window_size(owner, kind, new_owner_window);
     set_usage(owner, kind, new_owner_usage);
     set_latest_time(owner, kind, now);
@@ -743,10 +928,12 @@ fn undelegate_increase_v2(
     kind: ResourceKind,
     now: i64,
     gates: ResourceGates,
+    harden: bool,
 ) {
     let last_owner_time = last_consume_time(owner, kind);
     let owner_usage0 = usage(owner, kind);
-    let owner_usage = increase_account(owner, kind, owner_usage0, 0, last_owner_time, now, gates);
+    let owner_usage =
+        increase_account(owner, kind, owner_usage0, 0, last_owner_time, now, gates, harden);
     let new_owner_usage = owner_usage + transfer_usage;
     if new_owner_usage == 0 {
         set_new_window_size_v2(owner, kind, WINDOW_SIZE_BLOCKS * WINDOW_SIZE_PRECISION);
@@ -764,10 +951,20 @@ fn undelegate_increase_v2(
         remain_receiver_window_v2 = 0;
     }
 
-    let bi = (owner_usage as i128) * (remain_owner_window_v2 as i128)
-        + (transfer_usage as i128) * (remain_receiver_window_v2 as i128);
-    let mut new_owner_window = div_ceil_i128(bi, new_owner_usage as i128);
+    // java: `divideCeil(ownerUsage * remainOwnerWindowSizeV2
+    //                    + transferUsage * remainReceiverWindowSizeV2, newOwnerUsage)`
+    // — plain `long`; harden=false reproduces the wrap.
     let cap = (WINDOW_SIZE_BLOCKS as i128) * (WINDOW_SIZE_PRECISION as i128);
+    let mut new_owner_window = if harden {
+        let bi = (owner_usage as i128) * (remain_owner_window_v2 as i128)
+            + (transfer_usage as i128) * (remain_receiver_window_v2 as i128);
+        div_ceil_i128(bi, new_owner_usage as i128)
+    } else {
+        let numerator = owner_usage.wrapping_mul(remain_owner_window_v2).wrapping_add(
+            transfer_usage.wrapping_mul(remain_receiver_window_v2),
+        );
+        div_ceil_i64(numerator, new_owner_usage) as i128
+    };
     if new_owner_window > cap {
         new_owner_window = cap;
     }
@@ -914,7 +1111,9 @@ mod tests {
         let mut a = Account::default(); // window unset → default 28800
         let now = 1_000;
         let pure = increase(0, 500_000, 0, now, WINDOW_SIZE_BLOCKS);
-        let acct = increase_account(&mut a, ResourceKind::Bandwidth, 0, 500_000, 0, now, GATES_V1);
+        // `increase` is the exact (i128) path, so compare against harden=true.
+        let acct =
+            increase_account(&mut a, ResourceKind::Bandwidth, 0, 500_000, 0, now, GATES_V1, true);
         assert_eq!(pure, acct);
         // A window was written back (growth path, supportUnfreezeDelay on).
         assert!(a.net_window_size > 0);
@@ -933,6 +1132,7 @@ mod tests {
             0,
             WINDOW_SIZE_BLOCKS * 10,
             GATES_V1,
+            false,
         );
         assert_eq!(a.net_window_size, WINDOW_SIZE_BLOCKS);
     }
@@ -943,7 +1143,7 @@ mod tests {
     fn undelegate_increase_zero_resets_owner() {
         let mut owner = Account::default();
         let receiver = Account::default();
-        undelegate_increase(&mut owner, &receiver, 0, ResourceKind::Bandwidth, 777, GATES_V1);
+        undelegate_increase(&mut owner, &receiver, 0, ResourceKind::Bandwidth, 777, GATES_V1, false);
         assert_eq!(owner.net_usage, 0);
         assert_eq!(owner.latest_consume_time, 777);
         assert_eq!(owner.net_window_size, WINDOW_SIZE_BLOCKS);
@@ -957,7 +1157,15 @@ mod tests {
         let mut receiver = Account::default();
         receiver.net_usage = 200_000;
         // now == last so owner usage doesn't decay; transfer adds straight.
-        undelegate_increase(&mut owner, &receiver, 50_000, ResourceKind::Bandwidth, 1_000, GATES_V1);
+        undelegate_increase(
+            &mut owner,
+            &receiver,
+            50_000,
+            ResourceKind::Bandwidth,
+            1_000,
+            GATES_V1,
+            false,
+        );
         assert_eq!(owner.net_usage, 50_000);
         assert_eq!(owner.latest_consume_time, 1_000);
         assert!(owner.net_window_size > 0);
@@ -970,11 +1178,93 @@ mod tests {
         let mut receiver = Account::default();
         receiver.account_resource =
             Some(AccountResource { energy_usage: 100_000, ..Default::default() });
-        undelegate_increase(&mut owner, &receiver, 40_000, ResourceKind::Energy, 2_000, GATES_V2);
+        undelegate_increase(&mut owner, &receiver, 40_000, ResourceKind::Energy, 2_000, GATES_V2, false);
         let r = owner.account_resource.as_ref().unwrap();
         assert_eq!(r.energy_usage, 40_000);
         assert_eq!(r.latest_consume_time_for_energy, 2_000);
         assert!(r.energy_window_optimized);
+    }
+
+    /// The harden gate on the persisted growth path must be a NO-OP for
+    /// in-range operands and engage exactly at the i64-overflow boundary,
+    /// mirroring java-tron's plain-`long` (wrapping) growth math vs the exact
+    /// (i128) hardened mode.
+    #[test]
+    fn increase_account_harden_gate_engages_at_i64_overflow_boundary() {
+        // (a) In-range operands: both branches are byte-identical. `now ==
+        // last_time` so there is no `double` decay step — the result is pure
+        // integer windowed-average growth, identical under both modes.
+        let mut a_legacy = Account::default();
+        let mut a_harden = Account::default();
+        let legacy = increase_account(
+            &mut a_legacy,
+            ResourceKind::Bandwidth,
+            1_234_567,
+            89_000,
+            500,
+            500,
+            GATES_V1,
+            false,
+        );
+        let harden = increase_account(
+            &mut a_harden,
+            ResourceKind::Bandwidth,
+            1_234_567,
+            89_000,
+            500,
+            500,
+            GATES_V1,
+            true,
+        );
+        assert_eq!(legacy, harden, "in-range growth must match across modes");
+        assert_eq!(
+            a_legacy.net_window_size, a_harden.net_window_size,
+            "in-range window must match across modes"
+        );
+
+        // (b) Boundary: `last_usage * PRECISION` exceeds i64::MAX
+        // (1e13 * 1e6 = 1e19 > 9.22e18), the first product java forms in
+        // `divideCeil(lastUsage * precision, oldWindowSize)`. The deployed
+        // mainnet java does this in `long` and the product wraps; harden=false
+        // must reproduce that wrap, and it must DIFFER from the exact i128
+        // (harden=true) value — proving the fix engages precisely here.
+        let overflow_usage = 10_000_000_000_000i64; // 1e13
+        let mut b_legacy = Account::default();
+        let mut b_harden = Account::default();
+        let legacy_of = increase_account(
+            &mut b_legacy,
+            ResourceKind::Bandwidth,
+            overflow_usage,
+            0,
+            500,
+            500,
+            GATES_V1,
+            false,
+        );
+        let harden_of = increase_account(
+            &mut b_harden,
+            ResourceKind::Bandwidth,
+            overflow_usage,
+            0,
+            500,
+            500,
+            GATES_V1,
+            true,
+        );
+        assert_ne!(
+            legacy_of, harden_of,
+            "at the i64-overflow boundary the wrapping `long` path must diverge from exact i128"
+        );
+        // The exact (i128) value is the lossless windowed-average round-trip
+        // (no wrap): div_ceil(1e13*1e6, 28800) * 28800 / 1e6.
+        let exact_avg =
+            div_ceil_i128((overflow_usage as i128) * (PRECISION as i128), WINDOW_SIZE_BLOCKS as i128);
+        let exact = get_usage2_i128(exact_avg, WINDOW_SIZE_BLOCKS as i128, 0, WINDOW_SIZE_BLOCKS as i128);
+        assert_eq!(harden_of as i128, exact);
+        // The legacy value is the wrapped-`long` result, matching java mainnet:
+        // the `1e13 * 1e6` product overflows i64 and wraps before the divide.
+        let wrapped_avg = div_ceil_i64(overflow_usage.wrapping_mul(PRECISION), WINDOW_SIZE_BLOCKS);
+        assert_eq!(legacy_of, get_usage2_i64(wrapped_avg, WINDOW_SIZE_BLOCKS, 0, WINDOW_SIZE_BLOCKS));
     }
 
     #[test]
@@ -983,7 +1273,7 @@ mod tests {
         a.net_usage = 1_000_000;
         a.latest_consume_time = 0;
         let half = WINDOW_SIZE_BLOCKS / 2;
-        update_usage(&mut a, ResourceKind::Bandwidth, half, GATES_V1);
+        update_usage(&mut a, ResourceKind::Bandwidth, half, GATES_V1, false);
         assert!((499_000..=501_000).contains(&a.net_usage), "got {}", a.net_usage);
         // updateUsage must NOT advance latest_consume_time.
         assert_eq!(a.latest_consume_time, 0);

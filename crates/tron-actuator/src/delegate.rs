@@ -412,7 +412,13 @@ pub fn execute_undelegate_resource(
     let mut receiver_account = accounts.get(&to)?;
     if let Some(receiver) = receiver_account.as_mut() {
         // Decay the receiver's usage to `now_slot` (writes its window back).
-        update_usage(receiver, kind, now_slot, gates);
+        update_usage(
+            receiver,
+            kind,
+            now_slot,
+            gates,
+            dyn_props.allow_harden_resource_calculation(),
+        );
         let acquired = acquired_delegated_v2(receiver, kind);
         if acquired < balance {
             // A TVM contract suicide + re-create can leave acquired < balance.
@@ -520,7 +526,15 @@ pub fn execute_undelegate_resource(
     }
     if let Some(receiver) = receiver_account.as_ref() {
         if transfer_usage > 0 {
-            undelegate_increase(&mut owner_account, receiver, transfer_usage, kind, now_slot, gates);
+            undelegate_increase(
+                &mut owner_account,
+                receiver,
+                transfer_usage,
+                kind,
+                now_slot,
+                gates,
+                dyn_props.allow_harden_resource_calculation(),
+            );
         }
     }
     accounts.put(&owner, &owner_account)?;
