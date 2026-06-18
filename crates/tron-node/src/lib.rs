@@ -29,6 +29,7 @@ pub mod runtime;
 pub mod pbft_runtime;
 pub mod peer_state;
 pub mod ref_block;
+pub mod replay;
 pub mod snapshot_export;
 pub mod snapshot_import;
 pub mod sr_runtime;
@@ -61,6 +62,7 @@ pub use resilience::{
 };
 pub use sr_runtime::{ProducedBlockNotice, SrIdentity, SrRuntime, SrRuntimeError};
 pub use dump_state::{snapshot, snapshot_to_json, StateSnapshot};
+pub use replay::{bench_decode, run_replay, BenchDecodeReport, ReplayError, ReplayReport};
 pub use runtime::{run, RunError, ShutdownSignal};
 pub use snapshot_export::{
     export_to_tarball, export_via_checkpoint, Compression, ExportError, ExportReport,

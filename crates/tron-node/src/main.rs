@@ -53,6 +53,9 @@ usage:
   tron-node export-snapshot  --to PATH [--data-dir DIR]
                              [--compression gzip|none]
   tron-node verify-snapshot  [--data-dir DIR]
+  tron-node replay-blocks    --blocks FILE [--data-dir DIR] [--to N]
+                             [--config FILE]
+  tron-node bench-decode     --blocks FILE [--count N]
 
 start:            open the storage tree, bootstrap genesis if needed, then run
                   the JSON-RPC server + one sync coordinator per configured peer
@@ -102,6 +105,29 @@ export-snapshot:  bundle data_dir/db/* into a tarball at --to. --compression
 verify-snapshot:  open an existing data_dir/db/ and print the same report as
                   import-snapshot — head pointer, witness count, store list.
                   Use after a manual copy to confirm everything is readable.
+
+replay-blocks:    network-free block apply, for a fair throughput benchmark
+                  against java-tron's offline OracleReplay. Reads blocks from
+                  a local --blocks FILE (length-prefixed protobuf: repeated
+                  [int32 big-endian length][Block bytes], ascending order) and
+                  applies each through the SAME production apply path as live
+                  sync (validate + execute + commit), with NO p2p — so the
+                  timed window is pure apply, not fetch. Blocks at or below the
+                  data-dir head are skipped; replay stops after --to (default:
+                  EOF). Honors [vm] parallel_exec / pipelined_apply from
+                  --config (or ./config.toml). The data-dir must already hold an
+                  imported snapshot. Prints `replay-blocks: applied=N head=M`.
+
+bench-decode:     pure DECODE-throughput microbenchmark — no state, no RocksDB,
+                  no execution. Loads the first --count blocks of the same
+                  length-prefixed --blocks FILE into memory (untimed), then in a
+                  tight loop deserializes each Block protobuf, iterates its
+                  transactions, and decodes each contract's parameters (the same
+                  protobuf-unpack + 4-byte-selector + USDT-ABI decode the
+                  --mempool / --explore dashboards use). I/O is excluded from the
+                  timed window so the number is parse/decode CPU only. Prints
+                  `bench-decode: blocks=N txs=M elapsed_s=S blocks_per_sec=..
+                  txs_per_sec=..`. Used by bench/decode/ours.sh.
 
 Each --peer flag accepts a HOST:PORT and may be repeated to add more
 peers. --no-rpc / --no-sync disable the respective subsystem.
@@ -163,6 +189,8 @@ fn main() -> ExitCode {
         "import-live" => run_import_live(&args[2..]),
         "export-snapshot" => run_export_snapshot(&args[2..]),
         "verify-snapshot" => run_verify_snapshot(&args[2..]),
+        "replay-blocks" => run_replay_blocks(&args[2..]),
+        "bench-decode" => run_bench_decode(&args[2..]),
         "admin" => run_admin(&args[2..]),
         "diag" => tron_node::diag::run_diag(&args[2..]),
         "--help" | "-h" | "help" => {
@@ -337,6 +365,154 @@ fn run_verify_snapshot(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("tron-node: verify failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `tron-node replay-blocks --blocks FILE [--data-dir DIR] [--to N] [--config FILE]`
+///
+/// Pulls out the replay-only flags (`--blocks`, `--to`), then hands the
+/// rest (`--config`, `--data-dir`) to the shared `parse_args` so the
+/// `[vm]` config — and thus `parallel_exec` / `pipelined_apply` — is
+/// resolved exactly as the daemon resolves it.
+fn run_replay_blocks(args: &[String]) -> ExitCode {
+    const USAGE_LINE: &str =
+        "usage: tron-node replay-blocks --blocks FILE [--data-dir DIR] [--to N] [--config FILE]";
+    let mut blocks: Option<PathBuf> = None;
+    let mut to: i64 = i64::MAX;
+    // Everything not consumed here is forwarded to parse_args.
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--blocks" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--blocks needs FILE");
+                    return ExitCode::from(2);
+                };
+                blocks = Some(PathBuf::from(s));
+            }
+            "--to" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--to needs N");
+                    return ExitCode::from(2);
+                };
+                to = match s.parse() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("--to parse: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+            }
+            other => passthrough.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let Some(blocks) = blocks else {
+        eprintln!("--blocks is required");
+        eprintln!("{USAGE_LINE}");
+        return ExitCode::from(2);
+    };
+    let config = match parse_args(&passthrough) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match tron_node::run_replay(&config, &blocks, to) {
+        Ok(report) => {
+            // Machine-parseable final line for the bench script.
+            println!(
+                "replay-blocks: applied={} head={} (skipped={})",
+                report.applied, report.head, report.skipped
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("tron-node: replay-blocks failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `tron-node bench-decode --blocks FILE [--count N]`
+///
+/// Decode-only microbenchmark: loads `--count` blocks (default 10,000) of the
+/// length-prefixed corpus into memory, then times deserialize + per-tx contract
+/// decode with no state, no RocksDB, no execution. Prints a single
+/// machine-parseable line for `bench/decode/ours.sh` to scrape.
+fn run_bench_decode(args: &[String]) -> ExitCode {
+    const USAGE_LINE: &str = "usage: tron-node bench-decode --blocks FILE [--count N]";
+    let mut blocks: Option<PathBuf> = None;
+    let mut count: u64 = 10_000;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--blocks" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--blocks needs FILE");
+                    return ExitCode::from(2);
+                };
+                blocks = Some(PathBuf::from(s));
+            }
+            "--count" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--count needs N");
+                    return ExitCode::from(2);
+                };
+                count = match s.parse() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("--count parse: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+            }
+            "-h" | "--help" => {
+                println!("{USAGE_LINE}");
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("bench-decode: unexpected argument: {other}");
+                eprintln!("{USAGE_LINE}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(blocks) = blocks else {
+        eprintln!("--blocks is required");
+        eprintln!("{USAGE_LINE}");
+        return ExitCode::from(2);
+    };
+    match tron_node::bench_decode(&blocks, count) {
+        Ok(report) => {
+            let bps = if report.elapsed_s > 0.0 {
+                report.blocks as f64 / report.elapsed_s
+            } else {
+                0.0
+            };
+            let tps = if report.elapsed_s > 0.0 {
+                report.txs as f64 / report.elapsed_s
+            } else {
+                0.0
+            };
+            // Machine-parseable final line for bench/decode/ours.sh.
+            println!(
+                "bench-decode: blocks={} txs={} elapsed_s={:.3} blocks_per_sec={:.1} txs_per_sec={:.1}",
+                report.blocks, report.txs, report.elapsed_s, bps, tps
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("tron-node: bench-decode failed: {e}");
             ExitCode::FAILURE
         }
     }

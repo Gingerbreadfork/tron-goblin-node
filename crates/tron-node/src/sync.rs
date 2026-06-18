@@ -1364,6 +1364,30 @@ impl SyncDriver {
         }
     }
 
+    /// Apply one block from an offline source (no p2p), driving the exact
+    /// same `apply_block` path the live single-peer loop uses: txTrieRoot
+    /// validate against the original wire bytes, fork-tree push, execute,
+    /// commit, head advance, and full `AcceptOutcome` handling/logging.
+    ///
+    /// `raw` is the block's canonical protobuf wire bytes (the same
+    /// `Block.toByteArray()` java's `getBlockByNum` returns), so the
+    /// raw-bytes txTrieRoot check is exact. `prev_id` / `last_block_ts`
+    /// are the offline caller's per-stream cursors, updated in place on a
+    /// clean extension. Returns the driver's `blocks_applied` counter so
+    /// the caller can tell whether this block extended the head. Used by
+    /// the `replay-blocks` subcommand; not on the live path.
+    pub fn replay_apply_block(
+        &mut self,
+        block: &Block,
+        raw: Bytes,
+        block_num: i64,
+        prev_id: &mut Option<BlockId>,
+        last_block_ts: &mut i64,
+    ) -> usize {
+        self.apply_block(block, raw, block_num, "offline-replay", prev_id, last_block_ts);
+        self.stats.blocks_applied
+    }
+
     /// Drain the multi-peer fetch pool: while the next block the leader needs
     /// (`expected` front) has been delivered by some worker, apply it in chain
     /// order. Stops at the first gap (not yet fetched). Returns how many it
