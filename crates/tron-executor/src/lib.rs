@@ -831,12 +831,15 @@ impl SessionStoreOwners {
 /// vote / delegate effects that revm's journal said should be undone
 /// — a hard consensus break against every other node.
 ///
-/// Backends the VM only READS (`dyn_props`, `witnesses`, `delegation`,
-/// `block_index`, `contracts`) pass through unwrapped — nothing to
-/// revert. The per-tx session's bandwidth + energy charge writes go
-/// to the outer `TxSession` directly and survive regardless of
-/// VM-side commit/revert (matches java-tron's "energy is paid even on
-/// revert" rule).
+/// Backends the VM only READS (`witnesses`, `delegation`, `block_index`,
+/// `contracts`) pass through unwrapped — nothing to revert. `dyn_props` IS
+/// wrapped here because the staking opcodes write the chain-global
+/// TOTAL_*_WEIGHT accumulators through it, and those must roll back on a frame
+/// revert (java scopes them to the frame's child repository). The per-tx
+/// session's bandwidth + energy charge writes use the OUTER `TxSession`
+/// dyn_props handle (a different, unwrapped handle) and so survive regardless
+/// of VM-side commit/revert — matching java-tron's "energy is paid even on
+/// revert" rule.
 struct VmSession {
     accounts: Arc<SessionBackend>,
     code: Arc<SessionBackend>,
@@ -844,6 +847,12 @@ struct VmSession {
     contract_state: Arc<SessionBackend>,
     votes: Arc<SessionBackend>,
     delegated_resources: Arc<SessionBackend>,
+    // Staking opcodes (FREEZEBALANCEV2 / UNFREEZEBALANCEV2 / CANCELALLUNFREEZEV2
+    // / suicide) write the chain-global TOTAL_*_WEIGHT accumulators through this
+    // handle. java-tron runs those in the contract frame's child repository,
+    // committed only when the frame succeeds — so they must be discarded on a
+    // frame revert exactly like the account writes.
+    dyn_props: Arc<SessionBackend>,
 }
 
 impl VmSession {
@@ -863,6 +872,7 @@ impl VmSession {
         contract_state: Arc<dyn KvBackend>,
         votes: Arc<dyn KvBackend>,
         delegated_resources: Arc<dyn KvBackend>,
+        dyn_props: Arc<dyn KvBackend>,
     ) -> Self {
         Self {
             accounts: Arc::new(SessionBackend::new(accounts)),
@@ -871,6 +881,7 @@ impl VmSession {
             contract_state: Arc::new(SessionBackend::new(contract_state)),
             votes: Arc::new(SessionBackend::new(votes)),
             delegated_resources: Arc::new(SessionBackend::new(delegated_resources)),
+            dyn_props: Arc::new(SessionBackend::new(dyn_props)),
         }
     }
 
@@ -883,6 +894,7 @@ impl VmSession {
         self.contract_state.commit()?;
         self.votes.commit()?;
         self.delegated_resources.commit()?;
+        self.dyn_props.commit()?;
         Ok(())
     }
 
@@ -897,6 +909,7 @@ impl VmSession {
         self.contract_state.revert();
         self.votes.revert();
         self.delegated_resources.revert();
+        self.dyn_props.revert();
     }
 }
 
@@ -2270,7 +2283,7 @@ fn execute_block_logic(
                     let fz_en: i64 = a.frozen_v2.iter().filter(|f| f.r#type == 1).map(|f| f.amount).sum();
                     let ar = a.account_resource.as_ref();
                     eprintln!(
-                        "BAL_TRACE blk={} balance={} frozenV2_bw={} frozenV2_energy={} energy_usage={} net_usage={} deleg_energy={} acq_deleg_energy={}",
+                        "BAL_TRACE blk={} balance={} frozenV2_bw={} frozenV2_energy={} energy_usage={} net_usage={} deleg_energy={} acq_deleg_energy={} net_window_size={} latest_consume_time={} net_window_optimized={}",
                         raw.number,
                         a.balance,
                         fz_bw,
@@ -2279,9 +2292,25 @@ fn execute_block_logic(
                         a.net_usage,
                         ar.map(|r| r.delegated_frozen_v2_balance_for_energy).unwrap_or(0),
                         ar.map(|r| r.acquired_delegated_frozen_v2_balance_for_energy).unwrap_or(0),
+                        a.net_window_size,
+                        a.latest_consume_time,
+                        a.net_window_optimized,
                     );
                 }
             }
+        }
+        // TEMP DIAGNOSTIC: per-block chain-wide resource-weight totals
+        // (TRON_TNW_TRACE=1). Diffs the TOTAL_*_WEIGHT accumulators against
+        // java's per-block totals to localize a weight-accounting drift.
+        if std::env::var("TRON_TNW_TRACE").is_ok() {
+            let dp = tron_chainbase::DynamicPropertiesStore::new(state.dyn_props.clone());
+            eprintln!(
+                "TNW blk={} tnw={} tew={} ttpw={}",
+                raw.number,
+                dp.total_net_weight(),
+                dp.total_energy_weight(),
+                dp.total_tron_power_weight(),
+            );
         }
         // TEMP DIAGNOSTIC: per-block delegation reward-cycle snapshot for ONE
         // voter (TRON_REWARD_TRACE_ADDR=<42-char 41-hex>). Tracks begin_cycle /
@@ -3498,6 +3527,7 @@ fn execute_vm_tx(
         contract_state.clone(),
         view.votes.clone(),
         view.delegated_resources.clone(),
+        view.dyn_props.clone(),
     );
 
     let vm_stores = tron_tvm::execute::VmStores {
@@ -3506,7 +3536,7 @@ fn execute_vm_tx(
         storage: Arc::new(SRS::new(vm_session.storage_row.clone() as _)),
         witnesses: Arc::new(WS::new(view.witnesses.clone() as _)),
         contract_state: Arc::new(CtS::new(vm_session.contract_state.clone() as _)),
-        dynamic_properties: Arc::new(DPS::new(view.dyn_props.clone() as _)),
+        dynamic_properties: Arc::new(DPS::new(vm_session.dyn_props.clone() as _)),
         delegated_resources: Arc::new(DRS::new(vm_session.delegated_resources.clone() as _)),
         delegation: Arc::new(DelS::new(view.delegation.clone() as _)),
         // Attach BlockIndexStore so BLOCKHASH(n) returns real hashes
