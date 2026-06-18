@@ -1,0 +1,104 @@
+{
+  "_comment": [
+    "Shared query plan for the RPC / query-performance benchmark dimension.",
+    "Used IDENTICALLY against both engines (tron-goblin-node and clean java-tron)",
+    "over the java-tron-compatible HTTP /wallet/* JSON API on port 8090.",
+    "",
+    "Every query is read-only and deterministic over the pristine LiteFullNode",
+    "snapshot at head 83,316,752 (block-index, account, tx-info, and VM read",
+    "paths). Values were picked to fall inside that snapshot's range so both",
+    "engines resolve the same data.",
+    "",
+    "Schema per query:",
+    "  type        - stable id, surfaced in the result JSON",
+    "  path        - HTTP path, identical on both engines",
+    "  method      - GET or POST",
+    "  body        - JSON request body (POST only); omitted for GET",
+    "  concurrency - list of concurrency levels to sweep",
+    "  duration_s  - seconds to drive load at each concurrency level",
+    "  resolve     - optional: a field the runner fills in at startup from a",
+    "                live query (so a real, in-snapshot value is always used)",
+    "",
+    "The `gettransactionbyid` value is a PLACEHOLDER. The load generator",
+    "resolves a real tx id from `getblockbynum` (block_for_num) at startup and",
+    "substitutes it; the literal below is the documented fallback if that block",
+    "carries no transactions (it does -- mainnet blocks here hold hundreds --",
+    "but the resolve step keeps the plan robust across snapshots).",
+    "",
+    "Block / tx choice for THIS snapshot: the source is a LiteFullNode snapshot",
+    "(head 83,316,752) that PRUNES historical blocks and DROPS the transaction-",
+    "info / receipt stores entirely (transactionRetStore / transactionHistory-",
+    "Store are empty). So:",
+    "  * block_for_num is 83,300,000 -- comfortably inside the retained tail",
+    "    (blocks below ~83,260,000 are pruned; 83,000,000 is NOT present);",
+    "  * the tx-lookup query is `gettransactionbyid` (reads the populated `trans`",
+    "    store -- real data) rather than `gettransactioninfobyid` (which returns",
+    "    null for every tx on this snapshot because receipts are pruned). Both",
+    "    are read-only /wallet/* endpoints both engines expose identically;",
+    "    gettransactionbyid is the one that returns real data here. On a full-",
+    "    archive snapshot, swap to gettransactioninfobyid for the receipt path."
+  ],
+
+  "snapshot_head": 83316752,
+  "block_for_num": 83300000,
+
+  "queries": [
+    {
+      "type": "getnowblock",
+      "path": "/wallet/getnowblock",
+      "method": "POST",
+      "body": {},
+      "concurrency": [1, 16, 64],
+      "duration_s": 4
+    },
+    {
+      "type": "getblockbynum",
+      "path": "/wallet/getblockbynum",
+      "method": "POST",
+      "body": { "num": 83300000 },
+      "concurrency": [1, 16, 64],
+      "duration_s": 4
+    },
+    {
+      "type": "getaccount",
+      "path": "/wallet/getaccount",
+      "method": "POST",
+      "body": {
+        "address": "414294074251d793793cc8bced15123135a8ad5a80",
+        "visible": false
+      },
+      "concurrency": [1, 16, 64],
+      "duration_s": 4
+    },
+    {
+      "type": "gettransactionbyid",
+      "path": "/wallet/gettransactionbyid",
+      "method": "POST",
+      "body": {
+        "value": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "resolve": {
+        "field": "value",
+        "from": "getblockbynum",
+        "num": 83300000,
+        "pick": "first_txid"
+      },
+      "concurrency": [1, 16, 64],
+      "duration_s": 4
+    },
+    {
+      "type": "triggerconstantcontract",
+      "path": "/wallet/triggerconstantcontract",
+      "method": "POST",
+      "body": {
+        "owner_address": "414294074251d793793cc8bced15123135a8ad5a80",
+        "contract_address": "41a614f803b6fd780986a42c78ec9c7f77e6ded13c",
+        "function_selector": "balanceOf(address)",
+        "parameter": "0000000000000000000000004294074251d793793cc8bced15123135a8ad5a80",
+        "visible": false
+      },
+      "concurrency": [1, 16, 64],
+      "duration_s": 4
+    }
+  ]
+}

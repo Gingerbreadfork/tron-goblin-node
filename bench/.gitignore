@@ -1,0 +1,18 @@
+# Isolated working dir the suite fully owns (default BENCH_WORK): built jars,
+# cloned java-tron source, per-engine snapshot copies, the decode corpus, logs,
+# samples. All reproducible; never committed.
+/.work/
+
+# Generated benchmark results (per-engine JSON, REPORT.md, per-run logs/samples)
+# and the load-generator output. Reproduce by re-running the suite.
+/results/*
+!/results/.gitkeep
+
+# Leftover machine-built artifacts from earlier suite versions. The portable
+# suite builds the java-tron jar into BENCH_WORK and compiles DecodeBench on
+# demand; a committed jar is large and machine-specific.
+/.java/
+
+# Python bytecode cache.
+__pycache__/
+*.pyc
