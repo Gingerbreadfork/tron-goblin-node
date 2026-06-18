@@ -464,6 +464,20 @@ impl TronDatabaseExt for TronDatabase {
         resource_type: u32,
         receiver_address: Option<Address>,
     ) -> i64 {
+        // java `OperationActions.freezeAction`: once Stake-2.0 freeze-v2 is active
+        // (`allowTvmFreezeV2` is wired straight to `supportUnfreezeDelay`), the
+        // deprecated V1 FREEZE opcode pushes ZERO and performs no freeze, no
+        // weight change, and — because java never reaches `Program.freeze` — no
+        // nonce bump. Gate above the nonce bump to match. Without this gate the
+        // opcode kept crediting TOTAL_NET_WEIGHT, inflating the chain-wide weight
+        // and shrinking every account's net limit.
+        if self
+            .dyn_props
+            .as_ref()
+            .map_or(false, |dp| dp.support_unfreeze_delay())
+        {
+            return 0;
+        }
         // java `Program.freeze` bumps the nonce at the top of the handler,
         // before its validate (`increaseNonce` precedes `processor.validate`).
         self.note_internal_tx_nonce();

@@ -419,10 +419,12 @@ pub fn freeze_expire_time<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -
 /// FREEZE (0xd5) — Stake 1.0 freeze. Stack (top first): `[resourceType,
 /// frozenBalance, receiverAddress]`. Pushes `1`/`0` for success.
 ///
-/// Post-`ALLOW_TVM_FREEZE_V2`, java-tron skips the freeze and pushes 0
-/// (the opcode is deprecated). The default Host impl already returns
-/// 0, so we get the same observable behavior without needing the
-/// proposal-gating logic in the handler.
+/// Post-`ALLOW_TVM_FREEZE_V2` (wired to `supportUnfreezeDelay`, active on
+/// mainnet since Stake 2.0), java-tron's `freezeAction` skips the freeze and
+/// pushes 0 (the opcode is deprecated) with no weight change and no nonce
+/// bump. That gate lives in the TronDatabase Host override (`tron-tvm`'s
+/// `tron_freeze`), which returns 0 before any state change; the default Host
+/// impl returns 0 unconditionally.
 pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn!(
         [resource_type, frozen_balance, receiver_address],

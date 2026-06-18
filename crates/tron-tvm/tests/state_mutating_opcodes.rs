@@ -460,7 +460,7 @@ fn withdraw_reward_returns_allowance_and_zeroes_it() {
 // =============================================================================
 
 #[test]
-fn freeze_v1_actually_locks_balance_with_expire_time() {
+fn freeze_v1_is_noop_when_freezev2_active() {
     let stores = fresh_stores();
     let caller_user = tron_addr(0xa6);
     let contract_addr = tron_addr(0xc6);
@@ -505,16 +505,21 @@ fn freeze_v1_actually_locks_balance_with_expire_time() {
     );
     assert!(matches!(outcome, VmOutcome::Success { .. }));
 
+    // Stake-2.0 freeze-v2 is active in `fresh_stores` (UNFREEZE_DELAY_DAYS=14),
+    // so the deprecated V1 FREEZE opcode is a no-op that pushes 0 — matching
+    // java `OperationActions.freezeAction` under `allowTvmFreezeV2`. Nothing is
+    // frozen, the balance is untouched, and no net weight is credited.
     let acct = stores
         .accounts
         .get(&Address::from_raw(contract_addr))
         .unwrap()
         .unwrap();
-    let frozen_entry = acct.frozen.first().expect("frozen entry");
-    assert_eq!(frozen_entry.frozen_balance, frozen as i64);
-    assert!(frozen_entry.expire_time > 1_700_000_000_000);
-    // Balance reconciliation through the journal.
-    assert_eq!(acct.balance, 50_000_000 - frozen as i64);
+    assert!(
+        acct.frozen.is_empty(),
+        "V1 FREEZE must not lock balance when freeze-v2 is active"
+    );
+    assert_eq!(acct.balance, 50_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
 }
 
 // =============================================================================
