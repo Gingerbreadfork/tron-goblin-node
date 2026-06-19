@@ -266,3 +266,55 @@ fn outstanding_delegation_reverts_the_suicide() {
     );
     assert_eq!(balance_of(&stores, heir), 0);
 }
+
+/// SELFDESTRUCT's `NEW_ACCT_CALL` (25000) top-up keys on java-tron's
+/// `isDeadAccount` — store non-existence (`getAccount == null`), NOT EIP-161
+/// emptiness. A beneficiary that EXISTS in the account store but is empty
+/// (zero balance/nonce/no code) is alive in TRON (accounts are never pruned),
+/// so it must NOT incur the 25000 top-up. Pins the energy at the bare
+/// `PUSH20 (3) + SUICIDE_V2 (5000)` = 5003 for an existing-but-empty heir.
+#[test]
+fn restriction_suicide_existing_empty_heir_no_new_acct_topup() {
+    let stores = fresh_stores(true);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xaa);
+    let heir = tron_addr(0xbb);
+    install_caller(&stores, caller, 1_000_000);
+    // Heir EXISTS in the store but is empty (balance 0).
+    install_caller(&stores, heir, 0);
+    install_contract(&stores, contract, suicide_bytecode(heir), 0);
+
+    let out = run(&stores, caller, contract);
+    let VmOutcome::Success { energy_used, .. } = out else {
+        panic!("expected success, got {out:?}");
+    };
+    assert_eq!(
+        energy_used, 5003,
+        "PUSH20 (3) + SUICIDE_V2 (5000); the 25000 NEW_ACCT_CALL top-up must \
+         NOT apply to an existing-but-empty beneficiary (java isDeadAccount = \
+         getAccount == null)"
+    );
+}
+
+/// Counterpart: a beneficiary with NO store row IS a dead account, so the
+/// 25000 top-up DOES apply — `PUSH20 (3) + SUICIDE_V2 (5000) + NEW_ACCT_CALL
+/// (25000)` = 30003.
+#[test]
+fn restriction_suicide_absent_heir_charges_new_acct_topup() {
+    let stores = fresh_stores(true);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xac);
+    let heir = tron_addr(0xad); // never installed → no store row
+    install_caller(&stores, caller, 1_000_000);
+    install_contract(&stores, contract, suicide_bytecode(heir), 0);
+
+    let out = run(&stores, caller, contract);
+    let VmOutcome::Success { energy_used, .. } = out else {
+        panic!("expected success, got {out:?}");
+    };
+    assert_eq!(
+        energy_used, 30003,
+        "PUSH20 (3) + SUICIDE_V2 (5000) + NEW_ACCT_CALL (25000) for a \
+         store-absent (dead) beneficiary"
+    );
+}

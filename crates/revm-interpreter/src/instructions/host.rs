@@ -411,12 +411,41 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     let target = target.into_address();
     let owner = context.interpreter.input.target_address();
 
-    // java `EnergyCost.getSuicideCost3`: SUICIDE_V2 = 5000 base under
-    // the restriction proposal (pre-#94 SUICIDE = 0).
+    // java charges ALL of SELFDESTRUCT's energy in `op.getEnergyCost`
+    // (`VM.play` line 56) BEFORE `op.execute` runs the suicide. The
+    // `NEW_ACCT_CALL` (25000) top-up in `EnergyCost.getSuicideCost3` keys on
+    // `isDeadAccount(inheritor)` — store NON-EXISTENCE
+    // (`getContractState().getAccount(target) == null`), with NO value gating
+    // — evaluated on the PRE-suicide state (the stack is peeked, nothing has
+    // executed yet). We therefore snapshot existence here, before
+    // `tron_suicide` runs `createAccountIfNotExist` for the inheritor (which
+    // would otherwise make every beneficiary "exist" by the time we check).
+    //
+    // Keying on the chainbase store (java's model) rather than `res.target_
+    // exists` is also required: the journal computes `target_exists` via
+    // EIP-161 emptiness under the modern *opcode* spec (CANCUN under the
+    // restriction proposal → `is_empty()`), which over-charges 25000 for a
+    // SELFDESTRUCT whose beneficiary is an existing-but-empty account — TRON
+    // never prunes accounts, so a zero-balance row is alive. Mirrors the
+    // CALL-site fix in `call_helpers.rs`. The default `tron_account_exists`
+    // returns `false` (no TRON store), preserving upstream EVM behaviour.
+    let target_is_dead = !context.host.tron_account_exists(target);
+
+    // java `EnergyCost.getSuicideCost3`: SUICIDE_V2 = 5000 base under the
+    // restriction proposal (pre-#94 SUICIDE = 0), plus the dead-account
+    // top-up. The whole charge lands before any state mutation.
     let restriction = context.host.tron_selfdestruct_restriction();
     if restriction {
         gas!(context.interpreter, 5000);
     }
+    let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
+    gas!(
+        context.interpreter,
+        context
+            .host
+            .gas_params()
+            .selfdestruct_cost(target_is_dead, false)
+    );
 
     let created_locally = context.host.tron_account_created_locally(owner);
     let will_destroy = created_locally || !restriction;
@@ -429,24 +458,8 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
 
     // Standard journal selfdestruct -- destroy/no-op/transfer per the
     // (overridden) 6780 rule, burn-account redirect for self-target.
-    let spec = context.host.gas_params().spec();
-    let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
     let skip_cold_load = context.interpreter.gas.remaining() < cold_load_gas;
     let res = context.host.selfdestruct(owner, target, skip_cold_load)?;
-
-    let should_charge_topup = if spec.is_enabled_in(SpecId::SPURIOUS_DRAGON) {
-        res.had_value && !res.target_exists
-    } else {
-        !res.target_exists
-    };
-
-    gas!(
-        context.interpreter,
-        context
-            .host
-            .gas_params()
-            .selfdestruct_cost(should_charge_topup, res.is_cold)
-    );
 
     if !res.previously_destroyed {
         context
