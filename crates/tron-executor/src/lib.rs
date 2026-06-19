@@ -3248,9 +3248,24 @@ fn execute_one_tx_isolated(
         ty,
         ContractType::TriggerSmartContract | ContractType::CreateSmartContract
     ) {
+        // Block-recorded `OUT_OF_TIME` deferral (replay/validation only).
+        //
+        // java-tron terminates a VM tx that exceeds `maxCpuTimeOfOneTx` on
+        // the producing SR with `OutOfTimeException`, reverting all its VM
+        // contract-state changes and charging the full energy budget
+        // (`spendAllEnergy`). That outcome is a wall-clock artifact of the
+        // JVM — a non-JVM node can't reproduce it by timing — so when the
+        // canonical block records a VM tx as `OUT_OF_TIME` we force that
+        // outcome regardless of local execution. Without this, our node runs
+        // the tx to SUCCESS/REVERT, COMMITTING (or rejecting) state java
+        // never applied, silently diverging downstream. Only a block-recorded
+        // result drives this (`tx.ret[0]`), so it never fires during block
+        // production (no stored ret yet). See `execute_vm_tx`.
+        let recorded_out_of_time = tx.ret.first().map(|r| r.contract_ret)
+            == Some(tron_proto::transaction::result::ContractResult::OutOfTime as i32);
         return execute_vm_tx(
             view, iso, tx_id, ty, parameter, config, raw.fee_limit, block_number,
-            block_timestamp_ms, receipt,
+            block_timestamp_ms, recorded_out_of_time, receipt,
         );
     }
 
@@ -3480,6 +3495,13 @@ fn execute_vm_tx(
     // resource model still reads the head (N-1) via the dyn-props store.
     block_number: i64,
     block_timestamp_ms: i64,
+    // When the canonical block records this VM tx's contractRet as
+    // `OUT_OF_TIME`, force that outcome: skip VM execution, discard all VM
+    // contract-state changes, and charge the full energy budget
+    // (`spendAllEnergy`). A wall-clock artifact of java-tron's JVM that a
+    // non-JVM node can't reproduce by timing, so on replay/validation we
+    // defer to the recorded result. Always `false` during block production.
+    recorded_out_of_time: bool,
     mut receipt: TxReceipt,
 ) -> TxResult {
     use tron_chainbase::{
@@ -3604,6 +3626,13 @@ fn execute_vm_tx(
     // energy_fee`. Until that flow lands we keep the 10M cap.
     let now_slot = head_slot(&dp);
 
+    // For a block-recorded `OUT_OF_TIME` tx we still run the energy BUDGET
+    // (it persists the caller/origin frozen pre-consume that the energy
+    // charge bills against, exactly as java's `VMActuator.validate -> call/
+    // create` does before `execute()`), but skip `VM.play()` and instead
+    // `spendAllEnergy()` — `energy_used = energy_limit`. The whole VM frame
+    // is discarded. `Some(limit)` here is the signal to take that path below.
+    let mut out_of_time_energy: Option<u64> = None;
     let (caller_addr, trigger_contract_addr, outcome, vm_traces, energy_penalty) = match ty {
         ContractType::TriggerSmartContract => {
             let trigger: tron_proto::TriggerSmartContract =
@@ -3642,15 +3671,26 @@ fn execute_vm_tx(
             } else {
                 energy_limit
             };
-            let (outcome, traces, energy_penalty) =
-                tron_tvm::execute::execute_trigger_with_trace_tx_id(
-                    &vm_stores,
-                    block_env,
-                    &trigger,
-                    energy_limit,
-                    tx_id,
-                );
-            (caller, contract_addr, outcome, traces, energy_penalty)
+            if recorded_out_of_time {
+                // java `VMActuator.execute`: the producer-replay path
+                // (`generatedByMyself && hasWitnessSignature && contractRet ==
+                // OUT_OF_TIME`) calls `program.spendAllEnergy()` and throws
+                // `OutOfTimeException` BEFORE `VM.play()` — the VM never runs,
+                // so `energyUsed == energyLimit`. We mirror that here: no VM
+                // call, full budget charged below.
+                out_of_time_energy = Some(energy_limit);
+                (caller, contract_addr, None, Vec::new(), 0)
+            } else {
+                let (outcome, traces, energy_penalty) =
+                    tron_tvm::execute::execute_trigger_with_trace_tx_id(
+                        &vm_stores,
+                        block_env,
+                        &trigger,
+                        energy_limit,
+                        tx_id,
+                    );
+                (caller, contract_addr, Some(outcome), traces, energy_penalty)
+            }
         }
         ContractType::CreateSmartContract => {
             let create: tron_proto::CreateSmartContract =
@@ -3687,17 +3727,25 @@ fn execute_vm_tx(
             } else {
                 energy_limit
             };
-            let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_create_with_trace(
-                &vm_stores,
-                block_env,
-                &create,
-                &tx_id,
-                energy_limit,
-            );
-            // CreateSmartContract: caller IS the origin, so no origin
-            // split applies. Pass `None` for the contract address so
-            // the energy-charge path takes the caller-pays-all branch.
-            (caller, None, outcome, traces, energy_penalty)
+            if recorded_out_of_time {
+                // See the TriggerSmartContract arm: skip `VM.play()`, charge
+                // the full budget (`spendAllEnergy`). caller IS the origin for
+                // a create, so no origin split.
+                out_of_time_energy = Some(energy_limit);
+                (caller, None, None, Vec::new(), 0)
+            } else {
+                let (outcome, traces, energy_penalty) = tron_tvm::execute::execute_create_with_trace(
+                    &vm_stores,
+                    block_env,
+                    &create,
+                    &tx_id,
+                    energy_limit,
+                );
+                // CreateSmartContract: caller IS the origin, so no origin
+                // split applies. Pass `None` for the contract address so
+                // the energy-charge path takes the caller-pays-all branch.
+                (caller, None, Some(outcome), traces, energy_penalty)
+            }
         }
         _ => unreachable!("execute_vm_tx invoked for non-VM contract type"),
     };
@@ -3716,8 +3764,12 @@ fn execute_vm_tx(
     //
     // The per-tx outer session is untouched here — its bandwidth +
     // about-to-apply energy charge survive whichever branch fires.
+    //
+    // OUT_OF_TIME (`outcome == None`) takes the revert branch: java's
+    // `OutOfTimeException` path never reaches `rootRepository.commit()`, so
+    // the child deposit — every VM contract-state write — is discarded.
     match &outcome {
-        tron_tvm::execute::VmOutcome::Success { .. } => vm_session
+        Some(tron_tvm::execute::VmOutcome::Success { .. }) => vm_session
             .commit()
             .expect("db error in execute_vm_tx: VmSession::commit flush failed"),
         _ => vm_session.revert(),
@@ -3754,7 +3806,13 @@ fn execute_vm_tx(
                 }
                 None => None,
             };
-            if matches!(&outcome, tron_tvm::execute::VmOutcome::Success { .. }) {
+            // OUT_OF_TIME (`outcome == None`) takes the revert branch: java's
+            // `TransactionTrace.pay` only runs `resetAccountUsage` when
+            // `getException() == null && !isRevert()`, and the OutOfTimeException
+            // leaves an exception set — so the pre-consume is NOT reset (it was
+            // never committed in java's discarded rootRepository), and the energy
+            // charge below decays from the original row.
+            if matches!(&outcome, Some(tron_tvm::execute::VmOutcome::Success { .. })) {
                 let _ =
                     energy::reset_energy_pre_consume(&accounts, &dp_store, &caller, origin.as_ref());
             } else {
@@ -3775,10 +3833,21 @@ fn execute_vm_tx(
     // If the caller isn't recoverable from the proto (malformed
     // address) we skip the charge — the tx would have hit a preflight
     // error inside the VM and the outcome arm below will reject it.
-    let (energy_used, vm_succeeded) = match &outcome {
-        tron_tvm::execute::VmOutcome::Success { energy_used, .. } => (*energy_used, true),
-        tron_tvm::execute::VmOutcome::Revert { energy_used, .. } => (*energy_used, false),
-        tron_tvm::execute::VmOutcome::Halt { energy_used, .. } => (*energy_used, false),
+    // OUT_OF_TIME charges the FULL energy budget (java
+    // `Program.spendAllEnergy` → `energyUsed = energyLimit`); the synthetic
+    // `out_of_time_energy` carries that budget, overriding the per-outcome
+    // read (which would be 0 for the `None` outcome).
+    let (energy_used, vm_succeeded) = match (out_of_time_energy, &outcome) {
+        (Some(limit), _) => (limit, false),
+        (None, Some(tron_tvm::execute::VmOutcome::Success { energy_used, .. })) => {
+            (*energy_used, true)
+        }
+        (None, Some(tron_tvm::execute::VmOutcome::Revert { energy_used, .. })) => {
+            (*energy_used, false)
+        }
+        (None, Some(tron_tvm::execute::VmOutcome::Halt { energy_used, .. })) => {
+            (*energy_used, false)
+        }
         _ => (0, false),
     };
     receipt.energy_usage_total = energy_used as i64;
@@ -3887,6 +3956,41 @@ fn execute_vm_tx(
     } else {
         Vec::new()
     };
+
+    // OUT_OF_TIME outcome (block-recorded; VM was skipped). Mirrors java's
+    // Revert-style settlement: the VM frame was already discarded by
+    // `vm_session.revert()`, the bandwidth (pre-VM) and the full
+    // `spendAllEnergy` charge (applied above) stay, so `iso.commit()` flushes
+    // exactly those into the per-tx parent. `result = OUT_OF_TIME`, no logs,
+    // no internal txs (java `rejectInternalTransactions`).
+    if out_of_time_energy.is_some() {
+        let _ = vm_succeeded;
+        iso.commit()
+            .expect("db error in execute_vm_tx: commit flush failed on OUT_OF_TIME");
+        receipt.result =
+            tron_proto::transaction::result::ContractResult::OutOfTime as i32;
+        return TxResult {
+            tx_id,
+            contract_type: Some(ty),
+            // OUT_OF_TIME is a failed VM outcome (state reverted); surface it
+            // as an execution failure so callers that gate on `Success`
+            // (e.g. the contractRet tripwire's success/failure axis) treat it
+            // correctly. The receipt carries the precise OUT_OF_TIME code.
+            outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(
+                "VM out of time (block-recorded)".to_string(),
+            )),
+            internal_transactions: Vec::new(),
+            vm_logs: Vec::new(),
+            receipt,
+            vm_return_data: Vec::new(),
+            actuator_fee: 0,
+        };
+    }
+
+    // For every non-OUT_OF_TIME path the VM ran and produced a concrete
+    // outcome (`Some`). The `None` case is OUT_OF_TIME, handled above, so the
+    // `unreachable!` only fires on a logic error.
+    let outcome = outcome.expect("VM outcome must be Some when not OUT_OF_TIME");
 
     match outcome {
         tron_tvm::execute::VmOutcome::Success { logs, return_data, .. } => {

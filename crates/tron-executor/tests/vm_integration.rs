@@ -217,6 +217,141 @@ fn executor_runs_trigger_smart_contract_end_to_end() {
     assert_eq!(stored, expected.to_vec());
 }
 
+/// Block-recorded `OUT_OF_TIME` deferral (java-tron parity).
+///
+/// java-tron terminates a VM tx that exceeds `maxCpuTimeOfOneTx` on the
+/// producing SR with `OutOfTimeException`: it `spendAllEnergy()` and never
+/// reaches `rootRepository.commit()`, so EVERY VM contract-state change is
+/// discarded (the wallet debits never land) while the full energy budget is
+/// charged. That outcome is a wall-clock artifact of the JVM — a non-JVM node
+/// can't reproduce it by timing — so on replay/validation we DEFER to the
+/// block's recorded `contractRet`: when it says `OUT_OF_TIME` we force the
+/// outcome regardless of local execution.
+///
+/// This drives the EXACT same tx as
+/// [`executor_runs_trigger_smart_contract_end_to_end`] (an SSTORE that our VM
+/// would happily SUCCEED on), but stamps the block-recorded `contractRet =
+/// OUT_OF_TIME`. The SSTORE must NOT land, the receipt must read OUT_OF_TIME,
+/// and energy must still be charged.
+#[test]
+fn block_recorded_out_of_time_discards_vm_state_but_charges_energy() {
+    let state = build_state();
+    let (caller_priv, caller_bytes) = caller_keypair(0xa9);
+    let contract_bytes = addr_with_byte(0xc9);
+
+    // Same bytecode as the success test: PUSH1 0x42 PUSH1 0x00 SSTORE STOP.
+    let bytecode: Vec<u8> = vec![0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
+
+    let accounts = AccountStore::new(state.accounts.clone());
+    // Comfortably larger than the lenient-mode energy budget (10M energy *
+    // 100 sun = 1e9 sun) so the full `spendAllEnergy` charge is always
+    // coverable and the test never trips the insufficient-balance preflight.
+    let caller_start_balance: i64 = 100_000_000_000;
+    accounts
+        .put(
+            &Address::from_raw(caller_bytes),
+            &Account {
+                address: caller_bytes.to_vec(),
+                balance: caller_start_balance,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let code = CodeStore::new(state.code.as_ref().unwrap().clone());
+    let hash = tron_crypto::hash::keccak256(&bytecode);
+    code.put(&hash, &bytecode).unwrap();
+    accounts
+        .put(
+            &Address::from_raw(contract_bytes),
+            &Account {
+                address: contract_bytes.to_vec(),
+                balance: 0,
+                code: bytecode.clone(),
+                code_hash: hash.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_bytes.to_vec(),
+        contract_address: contract_bytes.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let any = Any {
+        type_url: "type.googleapis.com/protocol.TriggerSmartContract".into(),
+        value: trigger.encode_to_vec(),
+    };
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TriggerSmartContract as i32,
+                parameter: Some(any),
+                ..Default::default()
+            }],
+            timestamp: 1_700_000_000_000,
+            // A non-zero fee_limit so the (lenient-mode) energy budget — hence
+            // the `spendAllEnergy` charge — is non-zero and observable.
+            fee_limit: 1_000_000_000,
+            ..Default::default()
+        }),
+        signature: Vec::new(),
+        // The canonical block recorded this tx as OUT_OF_TIME. This is the
+        // signal that forces the deferral.
+        ret: vec![tron_proto::transaction::Result {
+            contract_ret:
+                tron_proto::transaction::result::ContractResult::OutOfTime as i32,
+            ..Default::default()
+        }],
+        unparsed_field10: None,
+    };
+    tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
+
+    let block = make_block(1, [0u8; 32], vec![tx]);
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
+    let tx_result = &report.tx_results[0];
+
+    // 1) The receipt result must be OUT_OF_TIME.
+    assert_eq!(
+        tx_result.receipt.result,
+        tron_proto::transaction::result::ContractResult::OutOfTime as i32,
+        "receipt result must be OUT_OF_TIME (deferred to block), got {:?}",
+        tx_result.outcome
+    );
+
+    // 2) The VM state change (SSTORE) must have been DISCARDED — java's
+    //    OutOfTimeException path never commits the child deposit. The storage
+    //    slot the success-path test asserts present must be ABSENT here.
+    let storage = StorageRowStore::new(state.storage_row.as_ref().unwrap().clone());
+    let composite =
+        StorageRowStore::compose_key(&Address::from_raw(contract_bytes), &[0u8; 32]);
+    assert!(
+        storage.get(&composite).unwrap().is_none(),
+        "OUT_OF_TIME must discard VM state; the SSTORE slot should be absent"
+    );
+
+    // 3) Energy must still be charged (`spendAllEnergy` → full budget). In
+    //    lenient mode the energy is billed entirely as a TRX fee (the test
+    //    caller has no staked energy), so the caller's balance drops.
+    assert!(
+        tx_result.receipt.energy_usage_total > 0,
+        "OUT_OF_TIME must charge the full energy budget; energy_usage_total was 0"
+    );
+    let after_caller = accounts
+        .get(&Address::from_raw(caller_bytes))
+        .unwrap()
+        .unwrap();
+    assert!(
+        after_caller.balance < caller_start_balance,
+        "OUT_OF_TIME must charge energy (caller balance {} should be < {})",
+        after_caller.balance,
+        caller_start_balance
+    );
+}
+
 #[test]
 fn executor_top_level_calltoken_trigger_runs_with_trc10_transfer() {
     let state = build_state();
