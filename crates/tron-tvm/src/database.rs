@@ -601,7 +601,7 @@ impl DatabaseCommit for TronDatabase {
             }
 
             // Apply storage diffs.
-            // TEMP DIAGNOSTIC (TRON_SSTORE_TRACE=<evm-addr-hex>): log every committed
+            // Env-gated diagnostic (TRON_SSTORE_TRACE=<evm-addr-hex>): log every committed
             // storage write to a target contract (slot, old→new, root tx) so a silent
             // storage-VALUE divergence vs java can be pinned to the exact tx + op.
             let sstore_trace: Option<[u8; 20]> =

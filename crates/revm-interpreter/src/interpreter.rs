@@ -30,11 +30,11 @@ std::thread_local! {
     static OP_TRACE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
-/// TEMP DIAGNOSTIC: toggle per-opcode `OPTRACE pc=.. op=0x.. cost=..` stderr
-/// output for the current thread. The executor sets this around a single
-/// target tx so a re-sync emits a reliable per-op gas trace (the core charge
-/// path, unlike the inspector trace which mis-attributes memory gas). Off by
-/// default — no effect on consensus.
+/// Env-gated diagnostic: toggle per-opcode `OPTRACE pc=.. op=0x.. cost=..`
+/// stderr output for the current thread. The executor sets this around a single
+/// target tx to emit a reliable per-op gas trace (the core charge path, unlike
+/// the inspector trace which mis-attributes memory gas). Off by default — no
+/// effect on consensus.
 #[cfg(feature = "std")]
 pub fn set_op_trace(on: bool) {
     OP_TRACE.with(|c| c.set(on));
@@ -336,7 +336,7 @@ impl<IW: InterpreterTypes> Interpreter<IW> {
         // Get current opcode.
         let opcode = self.bytecode.opcode();
 
-        // TEMP DIAGNOSTIC: capture pc + gas + top stack operands before, to emit
+        // Env-gated diagnostic: capture pc + gas + top stack operands before, to emit
         // a per-op record below. The operands (top-7, hex, top-first) let the
         // analysis recompute java's memory/copy/log/sstore cost; the gas-before
         // lets it reconstruct call depth (a gas jump = child returned).

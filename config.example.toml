@@ -86,7 +86,7 @@ init_optimization = false
 [p2p]
 # Explicit peers to sync from, each "HOST:PORT". Empty = rely on discovery
 # (and the built-in mainnet seeds). Add your own full node for a fast, stable
-# sync source, e.g. peers = ["192.168.0.36:18888"]. Also settable via --peer.
+# sync source, e.g. peers = ["10.0.0.2:18888"]. Also settable via --peer.
 peers = []
 
 # Also mix the built-in MAINNET_SEEDS into the pool. When `peers` is empty the

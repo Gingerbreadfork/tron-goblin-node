@@ -530,7 +530,7 @@ fn execute_trigger_inner(
         Err(e) => return (VmOutcome::PreflightError(format!("TxEnv build: {e:?}")), Vec::new(), 0),
     };
 
-    // TEMP DIAGNOSTIC: per-opcode gas trace for target tx(s) (env
+    // Env-gated diagnostic: per-opcode gas trace for target tx(s) (env
     // TRON_OP_TRACE_TX = one or more hex tx ids, comma/space-separated). Emits
     // `OPTRACE …` lines on stderr from the core interpreter (reliable, unlike
     // the inspector trace). Off by default.

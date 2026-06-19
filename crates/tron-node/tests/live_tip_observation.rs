@@ -28,8 +28,8 @@
 //! the doomed sync.
 //!
 //! Marked `#[ignore]` because it requires:
-//!   - A reachable mainnet peer (default `192.168.0.36:18888`, override
-//!     via `TRON_PEER` env var).
+//!   - A reachable mainnet peer, set via the `TRON_PEER` env var
+//!     (`host:port`).
 //!   - The peer must accept us — being trust-listed in `node.passive`
 //!     bypasses `TIME_BANNED` / `DUPLICATE_PEER` and makes iteration
 //!     reliable. Without trust-peer status, the test may flake on
@@ -83,8 +83,8 @@ fn unique_node_id() -> Vec<u8> {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live mainnet peer; run with: cargo test --test live_tip_observation --ignored -- --nocapture"]
 async fn observe_tip_block_announcements_from_live_peer() {
-    let peer_addr =
-        std::env::var("TRON_PEER").unwrap_or_else(|_| "192.168.0.36:18888".into());
+    let peer_addr = std::env::var("TRON_PEER")
+        .expect("set TRON_PEER=host:port to a reachable mainnet peer for this #[ignore]d live test");
     let observation_timeout = Duration::from_secs(45);
 
     let genesis = genesis_block_id(&mainnet_inputs());

@@ -46,7 +46,7 @@ const USAGE: &str = "\
 tron-state-diff — diff RPC state between this node (A) and a reference java-tron node (B)
 
 REQUIRED:
-  --b <url>                 reference node base URL (e.g. http://192.168.0.36:8090)
+  --b <url>                 reference node base URL (e.g. http://127.0.0.1:8090)
 
 OPTIONS:
   --a <url>                 node-under-test base URL          [default http://127.0.0.1:8090]

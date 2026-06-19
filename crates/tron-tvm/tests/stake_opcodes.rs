@@ -145,7 +145,7 @@ fn freezebalancev2_pops_two_args_and_pushes() {
     let mut bc = Vec::new();
     bc.extend(push1(0x01));      // frozenBalance (top after both pushes? — PUSHes go onto top)
     bc.extend(push1(0x01));      // resourceType (this becomes top of stack)
-    // Wait — in EVM, pushes are last-in-first-out: PUSH a then PUSH b makes b the top.
+    // In EVM, pushes are last-in-first-out: PUSH a then PUSH b makes b the top.
     // freeze_balance_v2 handler pops `[resource_type, frozen_balance]` (resource_type top).
     // So I need push frozenBalance first, then resourceType — that's what's above.
     bc.push(0xda);               // FREEZEBALANCEV2

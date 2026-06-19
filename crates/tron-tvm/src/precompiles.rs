@@ -1419,10 +1419,9 @@ fn check_un_delegate_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
         (clean, amount - clean)
     };
 
-    // TEMP DIAGNOSTIC (TRON_PCDUMP): dump CheckUnDelegateResource internals for
-    // the energy-market divergence hunt — gated on the queried address so the
-    // volume stays tiny. Lets the af6f4896 word2 (+6/+7) be inverted to the
-    // exact diverging field (resource_limit vs usage_balance vs energy_usage).
+    // Env-gated diagnostic (TRON_PCDUMP): dump the CheckUnDelegateResource
+    // precompile internals (resource_limit / usage_balance / energy_usage),
+    // gated on the queried address so the volume stays tiny. Off by default.
     if std::env::var("TRON_PCDUMP").is_ok() {
         let th: String = target.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         if th.contains("ed396169118f826b1001231180b3609d6f120a48")

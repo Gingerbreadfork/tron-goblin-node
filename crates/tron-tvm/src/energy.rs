@@ -189,16 +189,8 @@ pub fn energy_fee_in_sun(energy_used: u64, fee_per_unit_sun: i64) -> Result<i64,
 /// [`DYNAMIC_ENERGY_FACTOR_DECIMAL`] (so `factor = 10_000` doubles the
 /// cost; `factor = 5_000` adds 50%). Pass `0` for no penalty.
 ///
-/// Source: `actuator/src/main/java/org/tron/core/vm/VM.java` line ~74:
-///
-/// ```text
-/// penalty = energy * factor / DYNAMIC_ENERGY_FACTOR_DECIMAL - energy
-/// effective = energy + penalty = energy + (energy * factor / DECIMAL - energy)
-///           = energy * factor / DECIMAL
-/// ```
-///
-/// Wait — that simplification looks wrong; let me re-read the source.
-/// java-tron's exact formula is:
+/// Source: `actuator/src/main/java/org/tron/core/vm/VM.java` (~line 74) —
+/// the factor scales the base energy linearly:
 ///
 /// ```text
 /// effective_energy = energy * (DYNAMIC_ENERGY_FACTOR_DECIMAL + factor)

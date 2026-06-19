@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn parse_host_port_variants() {
         assert_eq!(parse_host_port("http://127.0.0.1:8090").unwrap(), ("127.0.0.1".into(), 8090));
-        assert_eq!(parse_host_port("192.168.0.36:8090").unwrap(), ("192.168.0.36".into(), 8090));
+        assert_eq!(parse_host_port("192.0.2.10:8090").unwrap(), ("192.0.2.10".into(), 8090));
         assert_eq!(parse_host_port("http://example.test").unwrap(), ("example.test".into(), 80));
         assert_eq!(
             parse_host_port("http://127.0.0.1:8090/").unwrap(),

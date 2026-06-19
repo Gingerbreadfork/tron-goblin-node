@@ -2250,7 +2250,7 @@ fn execute_block_logic(
         };
         use tron_proto::transaction::result::Code;
         const RET_SUCCESS: i32 = Code::Sucess as i32;
-        // TEMP DIAGNOSTIC: per-tx fee/energy/net trace over a block window, so
+        // Env-gated diagnostic: per-tx fee/energy/net trace over a block window, so
         // SILENT charge divergences (fees/energy our node computes differently
         // from java — which the success/failure contractRet tripwire can't see)
         // can be diffed against java's `gettransactioninfobyblocknum`. Gated by
@@ -2265,7 +2265,7 @@ fn execute_block_logic(
             )
             .map(|(from, to)| raw.number >= from && raw.number <= to)
             .unwrap_or(false);
-        // TEMP DIAGNOSTIC: per-block balance/frozen snapshot for ONE target
+        // Env-gated diagnostic: per-block balance/frozen snapshot for ONE target
         // account (TRON_BAL_TRACE_ADDR=<42-char 41-hex>). State is committed in
         // tx order before this point, so `state.accounts` holds the post-block
         // value. Lets a balance-drift root invisible to the fee/contractRet
@@ -2299,7 +2299,7 @@ fn execute_block_logic(
                 }
             }
         }
-        // TEMP DIAGNOSTIC: per-block chain-wide resource-weight totals
+        // Env-gated diagnostic: per-block chain-wide resource-weight totals
         // (TRON_TNW_TRACE=1). Diffs the TOTAL_*_WEIGHT accumulators against
         // java's per-block totals to localize a weight-accounting drift.
         if std::env::var("TRON_TNW_TRACE").is_ok() {
@@ -2312,7 +2312,7 @@ fn execute_block_logic(
                 dp.total_tron_power_weight(),
             );
         }
-        // TEMP DIAGNOSTIC: per-block delegation reward-cycle snapshot for ONE
+        // Env-gated diagnostic: per-block delegation reward-cycle snapshot for ONE
         // voter (TRON_REWARD_TRACE_ADDR=<42-char 41-hex>). Tracks begin_cycle /
         // end_cycle against the chain's current_cycle to catch a begin_cycle that
         // advances out of step with java — an early/skipped reward settlement that
