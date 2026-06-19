@@ -35,7 +35,7 @@ pub mod rows;
 
 pub use archive::{
     ArchiveAtBackend, ArchiveCounters, ArchiveReader, ArchiveWriter, AtHeight, DeltaRef,
-    ARCHIVE_FORMAT_VERSION,
+    PruneStats, ARCHIVE_FORMAT_VERSION,
 };
 pub use db::{IndexDb, IndexError, InitOutcome, FORMAT_VERSION};
 pub use engine::{EngineOptions, IndexCounters, IndexEngine, IndexStatus, Tick};

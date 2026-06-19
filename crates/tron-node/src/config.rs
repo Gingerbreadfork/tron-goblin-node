@@ -1756,6 +1756,12 @@ pub struct IndexConfig {
     #[serde(default, alias = "captureStateDeltas")]
     pub capture_state_deltas: bool,
 
+    /// `[index.archive]` — the user-facing historical-state archive switch
+    /// (enable + rolling/full retention + retain window). `archive.enabled`
+    /// implies `capture_state_deltas`. See [`ArchiveConfig`].
+    #[serde(default)]
+    pub archive: ArchiveConfig,
+
     /// Which stream the index follows: the canonical head
     /// (reorg-reconciled, freshest) or the PBFT-solidified mark
     /// (never unwinds, lags ~19 blocks).
@@ -1788,11 +1794,64 @@ impl Default for IndexConfig {
             capture_logs: None,
             capture_callee_contract: false,
             capture_state_deltas: false,
+            archive: ArchiveConfig::default(),
             stream: IndexStream::default(),
             backfill: IndexBackfillConfig::default(),
             firehose: IndexFirehoseConfig::default(),
         }
     }
+}
+
+/// `[index.archive]` — the historical-state archive's user-facing config.
+/// Off by default. When `enabled`, the node records every block's committed
+/// write-set so `/v1/archive/...` can serve account / storage / resource
+/// reads — and `triggerconstantcontract` — at any covered height.
+/// `mode = "rolling"` keeps a bounded `retain_blocks` window (older versions
+/// are pruned on a timer); `mode = "full"` keeps all captured history
+/// (terabyte-scale on mainnet). Enabling implies `capture_state_deltas` and
+/// requires the BlockSession commit path (`storage.snapshot_reorg = false`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    /// Master switch (default false). Implies `capture_state_deltas`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Retention strategy: `"rolling"` (bounded window) or `"full"`.
+    #[serde(default)]
+    pub mode: ArchiveMode,
+    /// Rolling-mode window: keep `[head - retain_blocks, head]`. Default
+    /// 2_592_000 ≈ 90 days at 3s blocks. Ignored in full mode.
+    #[serde(default = "default_archive_retain_blocks", alias = "retainBlocks")]
+    pub retain_blocks: u64,
+}
+
+/// Retention strategy for [`ArchiveConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveMode {
+    /// Keep only the bounded `retain_blocks` window; prune older versions.
+    Rolling,
+    /// Keep the entire captured history (never prune).
+    Full,
+}
+
+impl Default for ArchiveMode {
+    fn default() -> Self {
+        ArchiveMode::Rolling
+    }
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: ArchiveMode::Rolling,
+            retain_blocks: default_archive_retain_blocks(),
+        }
+    }
+}
+
+fn default_archive_retain_blocks() -> u64 {
+    2_592_000
 }
 
 impl IndexConfig {

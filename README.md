@@ -233,11 +233,12 @@ have. What works today, by area:
 - **Snapshot tooling** — `import-snapshot`, `import-live`,
   `export-snapshot`, and `verify-snapshot` move state to and from a
   java-tron data directory.
-- **Historical-state archive** (`[index] capture_state_deltas`) — every
-  block's committed write-set recorded as per-key versions, so
-  `getaccount` / `getaccountresource` / `triggerconstantcontract` resolve
-  **at any covered height** in one seek (no replay), constant calls
-  included.
+- **Historical-state archive** (`[index.archive]`) — every block's
+  committed write-set recorded as per-key versions, so `getaccount` /
+  `getaccountresource` / `triggerconstantcontract` resolve **at any
+  covered height** in one seek (no replay), constant calls included.
+  Rolling-window or full retention; see
+  [docs/historical-state-archive.md](docs/historical-state-archive.md).
 
 ### 🔌 APIs & compatibility
 
@@ -524,7 +525,10 @@ stack. Enable it in the config:
 [index]
 enable = true            # address-history index + /v1 API
 scope  = "trc20"         # native | trc20 (default) | all (adds event search)
-# capture_state_deltas = true     # + historical-state archive (/v1/archive)
+
+[index.archive]
+enabled = true           # + historical-state archive (/v1/archive); off by default
+mode    = "rolling"      # bounded window (default) | "full"
 
 [index.firehose]
 enable = true            # + the external-sink stream (gRPC Tail)
@@ -559,10 +563,13 @@ Three properties worth knowing:
 - **The index is disposable.** `data_dir/index/` can be deleted at any
   time; the node re-derives it from its own stores. Scope changes and
   format-version bumps rebuild automatically (and loudly).
-- **The archive is not.** `capture_state_deltas` records each block's
+- **The archive is not.** `[index.archive]` records each block's
   committed write-set as per-key versions (one seek per historical
   read, no replay) — coverage starts when first enabled and cannot be
-  back-filled, since deleted history isn't re-derivable.
+  back-filled, since deleted history isn't re-derivable. It is
+  storage-heavy (rolling-window or full); sizing, curl examples, and
+  caveats are in
+  [docs/historical-state-archive.md](docs/historical-state-archive.md).
 - **TRC20/internal backfill needs transaction-info.** Snapshots without
   `transactionRetStore` index native kinds only for pre-enable history
   (the gap is counted in metrics); once enabled, the node persists

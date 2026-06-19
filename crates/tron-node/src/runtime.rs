@@ -633,6 +633,53 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             shutdown.clone(),
         );
         let engine = parts.engine.clone();
+
+        // Rolling-window retention for the historical-state archive: prune
+        // archived versions older than the configured window on a timer.
+        // `prune_for_window` clamps the floor to the live head, and
+        // ArchiveWriter serializes its writes (RocksDB backend + inner
+        // Mutex), so this runs safely alongside per-block capture. Full mode
+        // (and the raw capture_state_deltas flag) never prune.
+        if config.index.archive.enabled
+            && config.index.archive.mode == crate::config::ArchiveMode::Rolling
+        {
+            if let Some(archive) = parts.archive.as_ref() {
+                let prune_writer = archive.writer.clone();
+                let retain = config.index.archive.retain_blocks;
+                let mut sd_prune = shutdown.subscribe();
+                handles.push(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(600));
+                    ticker.tick().await; // skip the immediate tick
+                    loop {
+                        tokio::select! {
+                            _ = sd_prune.recv() => return,
+                            _ = ticker.tick() => {
+                                let head = match prune_writer.coverage() {
+                                    Ok(Some((_, head))) => head,
+                                    _ => continue,
+                                };
+                                match prune_writer.prune_for_window(head, retain) {
+                                    Ok(Some(stats)) if !stats.noop => info!(
+                                        rows_deleted = stats.rows_deleted,
+                                        rows_repinned = stats.rows_repinned,
+                                        base = stats.base_after,
+                                        head,
+                                        retain_blocks = retain,
+                                        "archive: rolling-window prune"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        "archive: rolling-window prune failed; will retry"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+
         let archive_sampler = parts
             .archive
             .as_ref()
@@ -2261,6 +2308,9 @@ struct ArchiveParts {
     reader: tron_index::ArchiveReader,
     counters: Arc<tron_index::ArchiveCounters>,
     backends: Vec<(tron_chainbase::UndoStoreId, Arc<dyn tron_chainbase::KvBackend>)>,
+    /// Write-side handle, cloned out so `run` can spawn the rolling-window
+    /// retention timer (the writer is otherwise consumed by the index hook).
+    writer: Arc<tron_index::ArchiveWriter>,
 }
 
 /// Every state store the executor's write-set can touch, paired with
@@ -2367,10 +2417,11 @@ fn open_index_subsystem(
     let mut archive_parts: Option<ArchiveParts> = None;
     let mut hook = crate::index_hook::IndexHook::new(stores.transaction_ret.clone())
         .with_tx_refs(stores.transactions.clone());
-    if config.index.capture_state_deltas {
+    if config.index.archive.enabled || config.index.capture_state_deltas {
         if config.storage.snapshot_reorg {
             error!(
-                "index: capture_state_deltas requires the BlockSession commit path \
+                "index: the historical-state archive (index.archive.enabled / \
+                 index.capture_state_deltas) requires the BlockSession commit path \
                  (storage.snapshot_reorg = false) — the snapshot-stack path does not \
                  materialize per-block write-sets. Archive DISABLED."
             );
@@ -2401,6 +2452,7 @@ fn open_index_subsystem(
                 reader: writer.reader(),
                 counters: writer.counters(),
                 backends,
+                writer: writer.clone(),
             });
             hook = hook.with_archive(writer);
         }

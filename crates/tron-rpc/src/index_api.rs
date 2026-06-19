@@ -770,11 +770,13 @@ impl ArchiveApiState {
 pub fn archive_router() -> Router<RpcState> {
     use axum::routing::post;
     Router::new()
+        .route("/v1/archive/coverage", get(archive_coverage))
         .route("/v1/archive/account", get(archive_account).post(archive_account))
         .route(
             "/v1/archive/accountresource",
             get(archive_account_resource).post(archive_account_resource),
         )
+        .route("/v1/archive/storage", get(archive_storage).post(archive_storage))
         .route(
             "/v1/archive/triggerconstantcontract",
             post(archive_trigger_constant),
@@ -892,12 +894,30 @@ fn parse_block_param(
     Ok(h)
 }
 
-fn archive_method(
+/// Map an inner `RpcError` to a REST status: client mistakes
+/// (bad/missing params, gated method) become 400, everything else 500.
+/// The clean `message` is surfaced — never the `{:?}` struct dump.
+fn rpc_error_response(e: crate::methods::RpcError) -> (StatusCode, Json<Value>) {
+    // -32602 invalid params / -32600 invalid request → caller error.
+    let code = if e.code == -32602 || e.code == -32600 {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    err_response(code, e.message)
+}
+
+/// Resolve the queried height (validating coverage), build the
+/// at-height `RpcState`, and run `method` with caller-built `params`.
+/// All `/v1/archive` read handlers funnel through here so the gating,
+/// coverage check, response envelope, and `visible` rewrite stay
+/// identical across the surface.
+fn run_archive_method(
     method: fn(&Value, &RpcState) -> Result<Value, crate::methods::RpcError>,
     state: &RpcState,
-    address: Option<&str>,
     q: &HashMap<String, String>,
     body: Option<&Value>,
+    build_params: impl FnOnce(&ArchiveApiState) -> Result<Value, (StatusCode, Json<Value>)>,
 ) -> (StatusCode, Json<Value>) {
     let Some(arch) = state.archive.as_ref() else {
         return err_response(
@@ -909,21 +929,9 @@ fn archive_method(
         Ok(h) => h,
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
     };
-    let params = match address {
-        Some(a) => {
-            let addr = match parse_tron_address(a) {
-                Ok(a) => a,
-                Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
-            };
-            Value::Array(vec![Value::String(format!("0x{}", hex::encode(&addr[1..])))])
-        }
-        None => {
-            // Pass the JSON body through as params[0] (the builder
-            // convention), addresses normalized to hex.
-            let mut b = body.cloned().unwrap_or_else(|| json!({}));
-            crate::http_rest::translate_addresses_to_hex(&mut b);
-            Value::Array(vec![b])
-        }
+    let params = match build_params(arch) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
     let at_state = state_at_height(state, arch, h);
     match method(&params, &at_state) {
@@ -935,8 +943,33 @@ fn archive_method(
             }
             (StatusCode::OK, Json(out))
         }
-        Err(e) => err_response(StatusCode::BAD_REQUEST, format!("{e:?}")),
+        Err(e) => rpc_error_response(e),
     }
+}
+
+/// Build the at-height `params` for an address-keyed method:
+/// `params[0]` = the contract/account address as hex.
+fn archive_method(
+    method: fn(&Value, &RpcState) -> Result<Value, crate::methods::RpcError>,
+    state: &RpcState,
+    address: Option<&str>,
+    q: &HashMap<String, String>,
+    body: Option<&Value>,
+) -> (StatusCode, Json<Value>) {
+    run_archive_method(method, state, q, body, |_arch| match address {
+        Some(a) => {
+            let addr =
+                parse_tron_address(a).map_err(|e| err_response(StatusCode::BAD_REQUEST, e))?;
+            Ok(Value::Array(vec![Value::String(format!("0x{}", hex::encode(&addr[1..])))]))
+        }
+        None => {
+            // Pass the JSON body through as params[0] (the builder
+            // convention), addresses normalized to hex.
+            let mut b = body.cloned().unwrap_or_else(|| json!({}));
+            crate::http_rest::translate_addresses_to_hex(&mut b);
+            Ok(Value::Array(vec![b]))
+        }
+    })
 }
 
 /// GET takes `address`/`block` as query params; POST also accepts
@@ -978,6 +1011,56 @@ fn archive_address_method(
     archive_method(method, &state, Some(&address), &q, body.as_ref())
 }
 
+/// `GET|POST /v1/archive/storage` — one contract storage slot as of a
+/// height. `address` (the contract), `slot` (a `0x` QUANTITY or full
+/// 32-byte hex word), and `block` come from query params or the JSON
+/// body (body wins, mirroring the other archive handlers). Reuses the
+/// live `eth_getStorageAt` handler over the at-height `StorageRowStore`,
+/// so the slot-key composition and zero-fill stay byte-identical to the
+/// live path. Returns `data` = the 32-byte slot value as `0x…64-hex`.
+async fn archive_storage(
+    State(state): State<RpcState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let body = body.map(|Json(b)| b);
+    let field = |name: &str| -> Option<String> {
+        body.as_ref()
+            .and_then(|b| b.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| q.get(name).cloned())
+    };
+    let Some(address) = field("address") else {
+        return err_response(StatusCode::BAD_REQUEST, "missing 'address' parameter");
+    };
+    let Some(slot) = field("slot") else {
+        return err_response(StatusCode::BAD_REQUEST, "missing 'slot' parameter");
+    };
+    run_archive_method(
+        crate::methods::eth_get_storage_at,
+        &state,
+        &q,
+        body.as_ref(),
+        |_arch| {
+            let addr = parse_tron_address(&address)
+                .map_err(|e| err_response(StatusCode::BAD_REQUEST, e))?;
+            // `eth_getStorageAt` expects a `0x`-prefixed slot (QUANTITY
+            // or full word); normalize a bare-hex slot so either form
+            // works from the REST surface.
+            let slot_hex = if slot.starts_with("0x") || slot.starts_with("0X") {
+                slot.clone()
+            } else {
+                format!("0x{slot}")
+            };
+            Ok(Value::Array(vec![
+                Value::String(format!("0x{}", hex::encode(&addr[1..]))),
+                Value::String(slot_hex),
+            ]))
+        },
+    )
+}
+
 /// `POST /v1/archive/triggerconstantcontract` — the standard
 /// `/wallet/triggerconstantcontract` body plus a `block` field. The
 /// whole VM environment comes out of the archived dyn-props at H, so
@@ -994,4 +1077,213 @@ async fn archive_trigger_constant(
         &q,
         Some(&body),
     )
+}
+
+/// `GET /v1/archive/coverage` — the served at-height window. Lets a
+/// client discover the valid `block` range before issuing reads (every
+/// other archive route rejects out-of-range heights with this same
+/// window in the error). Returns `404`-shaped `success:false` when the
+/// archive is off, `{base, head, ...}` otherwise.
+async fn archive_coverage(State(state): State<RpcState>) -> (StatusCode, Json<Value>) {
+    let Some(arch) = state.archive.as_ref() else {
+        return err_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "historical-state archive not enabled on this node (set [index] capture_state_deltas = true)",
+        );
+    };
+    match arch.reader.coverage() {
+        Ok(Some((base, head))) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "data": { "base": base, "head": head, "blocks": head - base + 1 },
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "data": Value::Null,
+                "note": "archive enabled but no blocks captured yet",
+            })),
+        ),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use tron_chainbase::MemBackend;
+    use tron_index::ArchiveWriter;
+
+    fn mem() -> Arc<dyn KvBackend> {
+        Arc::new(MemBackend::new())
+    }
+
+    /// A fresh `RpcState` with no archive attached.
+    fn fresh_state() -> RpcState {
+        RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111)
+    }
+
+    /// A `RpcState` whose archive covers `[base, base + 1]`. The
+    /// writer's first captured block sets `base = head = height - 1`,
+    /// then advances `head` to `height`; capturing block `base + 1`
+    /// over empty deltas therefore yields coverage `[base, base + 1]`.
+    /// Live backends are empty `MemBackend`s, so every at-height read
+    /// falls through to "absent".
+    fn state_with_archive(base: i64) -> RpcState {
+        let archive_backend = mem();
+        let writer = ArchiveWriter::new(archive_backend.clone(), None, Vec::new());
+        writer.check_or_init().expect("init archive");
+        writer.on_block_applied(base + 1, Some(&[])).expect("capture");
+        let reader = ArchiveReader::new(archive_backend);
+        assert_eq!(reader.coverage().unwrap(), Some((base, base + 1)));
+        // One live backend per store the at-height views might touch;
+        // empty MemBackends are enough to exercise routing + coverage.
+        let backends: Vec<(UndoStoreId, Arc<dyn KvBackend>)> = [
+            UndoStoreId::Accounts,
+            UndoStoreId::DynProps,
+            UndoStoreId::StorageRow,
+            UndoStoreId::Code,
+            UndoStoreId::Contracts,
+        ]
+        .iter()
+        .map(|id| (*id, mem()))
+        .collect();
+        fresh_state().with_archive(ArchiveApiState::new(reader, backends))
+    }
+
+    async fn get(state: RpcState, uri: &str) -> (StatusCode, Value) {
+        let app = crate::http_rest::router(state);
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[test]
+    fn rpc_error_status_mapping() {
+        use crate::methods::RpcError;
+        assert_eq!(
+            rpc_error_response(RpcError::invalid_params("x")).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            rpc_error_response(RpcError::invalid_request("x")).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            rpc_error_response(RpcError::internal("x")).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // The clean message is surfaced, not the `{:?}` struct dump.
+        let (_, body) = rpc_error_response(RpcError::invalid_params("bad slot"));
+        assert_eq!(body.0["error"], "bad slot");
+    }
+
+    #[tokio::test]
+    async fn archive_disabled_returns_501_on_every_route() {
+        for uri in [
+            "/v1/archive/coverage",
+            "/v1/archive/account?address=410000000000000000000000000000000000000000&block=5",
+            "/v1/archive/accountresource?address=410000000000000000000000000000000000000000&block=5",
+            "/v1/archive/storage?address=410000000000000000000000000000000000000000&slot=0x0&block=5",
+        ] {
+            let (status, body) = get(fresh_state(), uri).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "uri={uri}");
+            assert_eq!(body["success"], Value::Bool(false), "uri={uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn coverage_endpoint_reports_the_window() {
+        let (status, body) = get(state_with_archive(100), "/v1/archive/coverage").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], Value::Bool(true));
+        assert_eq!(body["data"]["base"], 100);
+        assert_eq!(body["data"]["head"], 101);
+        assert_eq!(body["data"]["blocks"], 2);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_block_is_rejected_with_the_window() {
+        let addr = "410000000000000000000000000000000000000000";
+        // Above head.
+        let (status, body) =
+            get(state_with_archive(100), &format!("/v1/archive/account?address={addr}&block=999")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["success"], Value::Bool(false));
+        assert!(
+            body["error"].as_str().unwrap().contains("[100, 101]"),
+            "error names the window: {body:?}"
+        );
+        // Below base.
+        let (status, _) =
+            get(state_with_archive(100), &format!("/v1/archive/account?address={addr}&block=1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_required_params_are_400() {
+        let st = state_with_archive(100);
+        // Missing block.
+        let (status, _) = get(
+            st.clone(),
+            "/v1/archive/account?address=410000000000000000000000000000000000000000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Missing address.
+        let (status, _) = get(st.clone(), "/v1/archive/account?block=100").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Storage missing slot.
+        let (status, _) = get(
+            st,
+            "/v1/archive/storage?address=410000000000000000000000000000000000000000&block=100",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn in_range_account_read_succeeds_and_is_null_for_absent() {
+        // Live backends are empty, so an in-range account read resolves
+        // to an absent account — `get_account` returns JSON null. The
+        // point is the route runs end-to-end at a historical height.
+        let addr = "410000000000000000000000000000000000000000";
+        let (status, body) =
+            get(state_with_archive(100), &format!("/v1/archive/account?address={addr}&block=100")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], Value::Bool(true));
+        assert_eq!(body["block"], 100);
+        assert_eq!(body["data"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn in_range_storage_read_returns_zero_word_for_absent_slot() {
+        let addr = "410000000000000000000000000000000000000000";
+        // Slot accepted both as a `0x` QUANTITY and as bare hex.
+        for slot in ["0x0", "0", "0x00000000000000000000000000000000000000000000000000000000000000ff"]
+        {
+            let uri = format!("/v1/archive/storage?address={addr}&slot={slot}&block=100");
+            let (status, body) = get(state_with_archive(100), &uri).await;
+            assert_eq!(status, StatusCode::OK, "slot={slot}");
+            assert_eq!(body["success"], Value::Bool(true), "slot={slot}");
+            // Absent slot → 32 zero bytes.
+            assert_eq!(
+                body["data"].as_str().unwrap(),
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "slot={slot}"
+            );
+        }
+    }
 }

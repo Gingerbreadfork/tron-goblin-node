@@ -21,6 +21,7 @@ path.
 | Choose safe runtime settings | [Configuration](configuration.md) |
 | Prepare a public or production-like deployment | [Security and Production Readiness](security-production.md) |
 | Use RPC, history APIs, archive reads, or firehose | [APIs, Indexing, and Firehose](apis-indexing-firehose.md) |
+| Read account/contract state (or run calls) at a past block | [Historical-State Archive](historical-state-archive.md) |
 | Change code or validate parity | [Development](development.md) |
 | Diagnose common failures | [Troubleshooting](troubleshooting.md) |
 

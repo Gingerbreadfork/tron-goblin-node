@@ -95,25 +95,28 @@ index directory is deleted, the node rebuilds it.
 
 ## Historical Archive
 
-Enable:
+Answer "what was account/contract X at block N?" and run read-only contract
+calls against state as of block N. Enable:
 
 ```toml
-[index]
-enable = true
-capture_state_deltas = true
+[index.archive]
+enabled = true              # implies [index] capture_state_deltas
+mode    = "rolling"         # bounded window (default) | "full"
 ```
 
-Archive endpoints:
+Archive endpoints (served on the HTTP REST port):
 
 ```text
 GET  /v1/archive/account?address=...&block=H
 GET  /v1/archive/accountresource?address=...&block=H
-POST /v1/archive/triggerconstantcontract
+POST /v1/archive/triggerconstantcontract     (standard body + "block": H)
 ```
 
-Archive reads use recorded per-key versions rather than replay. Coverage starts
-when state-delta capture is enabled; it cannot reconstruct earlier deleted
-state.
+Archive reads use recorded per-key versions rather than replay (one seek per
+read). Coverage starts at the current head when capture is first enabled; it
+cannot reconstruct earlier state. The feature is storage-heavy and off by
+default. Full configuration, disk-cost sizing, curl examples, and caveats:
+[Historical-State Archive](historical-state-archive.md).
 
 ## Firehose
 

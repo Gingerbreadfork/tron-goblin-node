@@ -324,6 +324,10 @@ scope = "trc20"
 # toggling this off and on) restarts coverage at the then-current head.
 # Small crash gaps self-repair exactly from the block-undo log. Requires
 # storage.snapshot_reorg = false (the default).
+#
+# Most operators should NOT set this directly — use the [index.archive]
+# section below, whose `enabled = true` implies this flag and adds rolling-
+# window retention. Leave this commented to let [index.archive] own it.
 # capture_state_deltas = false
 
 # Which stream the index follows.
@@ -348,6 +352,43 @@ fsync_barrier_windows = 16
 # Optional capacity clamp: index only from this height up (0 = the snapshot
 # base). Changing it later triggers an automatic full index rebuild.
 start_height = 0
+
+# -----------------------------------------------------------------------------
+# [index.archive] — HISTORICAL-STATE ARCHIVE (operator-facing wrapper)
+# -----------------------------------------------------------------------------
+# The at-height read surface: "what was account/contract X at block N?" and
+# "run a read-only contract call against state as of block N". Capabilities a
+# normal TRON node can't provide — there is no enforced state root and no
+# public at-height archive. Backed by a versioned-KV store of every block's
+# committed write-set (see capture_state_deltas above); each historical point
+# read is ONE seek. Served on the HTTP REST port:
+#   GET  /v1/archive/account?address=...&block=H
+#   GET  /v1/archive/accountresource?address=...&block=H
+#   POST /v1/archive/triggerconstantcontract   (standard body + "block": H)
+#
+# OFF by default — the whole section. STORAGE-HEAVY: size scales with state
+# WRITES (changed keys x blocks), roughly ~8-15 GB/day on mainnet, so a 90-day
+# rolling window is ~0.8-1.3 TB and full-from-enable reaches tens of TB.
+# Coverage starts at the CURRENT HEAD when first enabled (not genesis) and is
+# NOT cheaply rebuildable. Full guide: docs/historical-state-archive.md.
+[index.archive]
+# Master switch. false (default) = no archive. When true, it implies
+# [index] capture_state_deltas above (the per-key version capture) and starts
+# the indexer if it isn't already running.
+enabled = false
+
+# Retention policy.
+#   "rolling" — keep a bounded window [head - retain_blocks, head] and prune
+#               older versions as the head advances (default; recommended).
+#   "full"    — keep every version from the moment capture began; disk grows
+#               without bound (only with explicit capacity planning).
+mode = "rolling"
+
+# Rolling-mode window depth, in blocks (ignored when mode = "full").
+# 2_592_000 ~= 90 days at 3-second blocks. Pruning is IRREVERSIBLE: a height
+# that drops below the window base can't be read again. Size for the deepest
+# history you intend to query (7d ~ 201_600, 30d ~ 864_000, 1y ~ 10_512_000).
+retain_blocks = 2592000
 
 # The FIREHOSE external-sink log (P3): a durable, append-only log of applied
 # blocks — decoded transfer facts, TRC20/VM logs, internal txs — with
