@@ -22,6 +22,7 @@ path.
 | Prepare a public or production-like deployment | [Security and Production Readiness](security-production.md) |
 | Use RPC, history APIs, archive reads, or firehose | [APIs, Indexing, and Firehose](apis-indexing-firehose.md) |
 | Read account/contract state (or run calls) at a past block | [Historical-State Archive](historical-state-archive.md) |
+| Get a verifiable state root + offline proofs, or self-check a node is byte-exact | [Verifiable State Commitment](verifiable-state-commitment.md) |
 | Change code or validate parity | [Development](development.md) |
 | Diagnose common failures | [Troubleshooting](troubleshooting.md) |
 

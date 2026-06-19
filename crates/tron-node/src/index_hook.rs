@@ -59,6 +59,16 @@ pub struct IndexHook {
     /// Optional firehose writer (P3). When attached, every applied
     /// block appends a durable log entry for external sinks.
     firehose: Option<Arc<crate::firehose::FirehoseWriter>>,
+    /// Optional state-commitment channel. When attached, every applied
+    /// block's write-set is handed to the background commitment builder
+    /// via a non-blocking `try_send` — the commitment is computed OFF the
+    /// apply path (folding one block can recompute hundreds of node
+    /// hashes), so this hook must never block on it. A full channel drops
+    /// the message and flags a resync; the dropped height is re-derivable.
+    commitment_tx: Option<tokio::sync::mpsc::Sender<tron_index::CommitmentMsg>>,
+    /// Counters shared with the commitment builder, bumped here only to
+    /// record backpressure (a dropped write-set) without blocking apply.
+    commitment_counters: Option<Arc<tron_index::CommitmentCounters>>,
 }
 
 impl IndexHook {
@@ -71,6 +81,8 @@ impl IndexHook {
             notify: Arc::new(tokio::sync::Notify::new()),
             archive: None,
             firehose: None,
+            commitment_tx: None,
+            commitment_counters: None,
         }
     }
 
@@ -90,6 +102,18 @@ impl IndexHook {
     /// Attach the firehose writer (the durable external-sink log).
     pub fn with_firehose(mut self, writer: Arc<crate::firehose::FirehoseWriter>) -> Self {
         self.firehose = Some(writer);
+        self
+    }
+
+    /// Attach the state-commitment channel and its shared counters. The
+    /// sender is non-blocking (`try_send`); the background builder drains it.
+    pub fn with_commitment(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<tron_index::CommitmentMsg>,
+        counters: Arc<tron_index::CommitmentCounters>,
+    ) -> Self {
+        self.commitment_tx = Some(tx);
+        self.commitment_counters = Some(counters);
         self
     }
 
@@ -180,6 +204,40 @@ impl IndexHook {
                     block = block_id.num(),
                     error = %e,
                     "index hook: archive capture failed; block stands, archive coverage may reset"
+                );
+            }
+        }
+        if let Some(tx) = &self.commitment_tx {
+            // Hand the block's write-set to the off-path commitment builder.
+            // Every height is sent (an empty write-set still advances the
+            // committed watermark, keeping the fold contiguous). The message
+            // owns its bytes — the hook holds only borrows into the report.
+            let height = block_id.num() as i64;
+            let deltas: Vec<tron_index::CommitmentDeltaRef> = report
+                .state_deltas
+                .as_ref()
+                .map(|ds| {
+                    ds.iter()
+                        .map(|d| tron_index::CommitmentDeltaRef {
+                            store: d.store,
+                            key: d.key.clone(),
+                            after: d.after.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if tx.try_send(tron_index::CommitmentMsg::Block { height, deltas }).is_err() {
+                // Drop-and-flag: never block apply on the builder. The dropped
+                // height becomes a gap the builder repairs (resume source, else
+                // re-bootstrap); record the backpressure for metrics.
+                if let Some(counters) = &self.commitment_counters {
+                    use std::sync::atomic::Ordering;
+                    counters.lagged.fetch_add(1, Ordering::Relaxed);
+                    counters.resync_needed.store(true, Ordering::Relaxed);
+                }
+                tracing::debug!(
+                    block = height,
+                    "index hook: commitment channel full; dropped write-set (builder will resync)"
                 );
             }
         }

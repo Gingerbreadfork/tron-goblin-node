@@ -239,6 +239,13 @@ have. What works today, by area:
   covered height** in one seek (no replay), constant calls included.
   Rolling-window or full retention; see
   [docs/historical-state-archive.md](docs/historical-state-archive.md).
+- **Verifiable state commitment** (`[index.commitment]`) — an opt-in
+  Sparse Merkle Tree (keccak256) over committed state, giving the node a
+  **cryptographic state root** TRON headers don't provide, offline
+  inclusion/exclusion proofs (`/v1/commitment/*`), and a history-independent
+  root so two independently-bootstrapped nodes prove they hold byte-identical
+  state by comparing one hash. Off by default, off the hot path; see
+  [docs/verifiable-state-commitment.md](docs/verifiable-state-commitment.md).
 
 ### 🔌 APIs & compatibility
 
@@ -532,6 +539,9 @@ mode    = "rolling"      # bounded window (default) | "full"
 
 [index.firehose]
 enable = true            # + the external-sink stream (gRPC Tail)
+
+[index.commitment]
+enabled = true           # + verifiable state root + proofs (/v1/commitment); off by default
 ```
 
 With a populated block store (e.g. right after `import-snapshot`) the
@@ -549,6 +559,9 @@ GET /v1/contracts/{address}/events                  — event search (scope = "a
 GET /v1/archive/account?address=…&block=H           — state at height H
 GET /v1/archive/accountresource?address=…&block=H
 POST /v1/archive/triggerconstantcontract            — constant call at height H
+GET /v1/commitment/root                             — current state root + height
+GET /v1/commitment/status                           — committed/head heights, lag
+GET|POST /v1/commitment/proof                       — inclusion/exclusion proof
 ```
 
 Query params mirror TronGrid (`limit`, `fingerprint` pagination,
@@ -574,6 +587,17 @@ Three properties worth knowing:
   `transactionRetStore` index native kinds only for pre-enable history
   (the gap is counted in metrics); once enabled, the node persists
   transaction-info for every newly-applied block.
+- **The commitment layer is verifiable, not consensus-critical.**
+  `[index.commitment]` maintains a keccak256 Sparse Merkle Tree over
+  committed state and serves a root plus offline-verifiable
+  inclusion/exclusion proofs (`/v1/commitment/*`). The root is
+  history-independent, so two independently-bootstrapped nodes at the same
+  committed height compute the same root — an integrity self-check that the
+  node is byte-exact with the canonical chain. It runs off the hot path, so
+  the committed root trails head past finality; it is independent of the
+  archive and stores only the latest tree. Guide and the offline
+  proof-verification recipe:
+  [docs/verifiable-state-commitment.md](docs/verifiable-state-commitment.md).
 
 The **firehose** is the push-side complement: a durable append-only log
 of applied blocks (decoded transfer facts, TRC20 logs, internal txs)

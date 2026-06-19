@@ -94,6 +94,12 @@ pub struct Metrics {
     archive_reorg_unwinds: AtomicU64,
     archive_gap_repaired_blocks: AtomicU64,
     archive_coverage_resets: AtomicU64,
+    commitment_committed_height: AtomicI64,
+    commitment_head_height: AtomicI64,
+    commitment_blocks_folded: AtomicU64,
+    commitment_lagged: AtomicU64,
+    commitment_pending_depth: AtomicU64,
+    commitment_bootstrapping: AtomicU64,
     // --- Firehose external-sink log ------------------------------------------
     firehose_head_seq: AtomicU64,
     firehose_entries_total: AtomicU64,
@@ -162,6 +168,12 @@ impl Metrics {
             archive_reorg_unwinds: AtomicU64::new(0),
             archive_gap_repaired_blocks: AtomicU64::new(0),
             archive_coverage_resets: AtomicU64::new(0),
+            commitment_committed_height: AtomicI64::new(0),
+            commitment_head_height: AtomicI64::new(0),
+            commitment_blocks_folded: AtomicU64::new(0),
+            commitment_lagged: AtomicU64::new(0),
+            commitment_pending_depth: AtomicU64::new(0),
+            commitment_bootstrapping: AtomicU64::new(0),
             firehose_head_seq: AtomicU64::new(0),
             firehose_entries_total: AtomicU64::new(0),
             firehose_unwinds_total: AtomicU64::new(0),
@@ -397,6 +409,26 @@ impl Metrics {
             .store(gap_repaired_blocks, Ordering::Relaxed);
         self.archive_coverage_resets
             .store(coverage_resets, Ordering::Relaxed);
+    }
+
+    /// Mirror of the state-commitment builder's counters (stored, not added).
+    pub fn set_commitment_stats(
+        &self,
+        committed_height: i64,
+        head_height: i64,
+        blocks_folded: u64,
+        lagged: u64,
+        pending_depth: u64,
+        bootstrapping: bool,
+    ) {
+        self.commitment_committed_height
+            .store(committed_height, Ordering::Relaxed);
+        self.commitment_head_height.store(head_height, Ordering::Relaxed);
+        self.commitment_blocks_folded.store(blocks_folded, Ordering::Relaxed);
+        self.commitment_lagged.store(lagged, Ordering::Relaxed);
+        self.commitment_pending_depth.store(pending_depth, Ordering::Relaxed);
+        self.commitment_bootstrapping
+            .store(bootstrapping as u64, Ordering::Relaxed);
     }
 
     /// Mirror of the firehose writer's counters (stored, not added).
@@ -789,6 +821,44 @@ impl Metrics {
             "tron_node_archive_coverage_resets_total",
             "Archive coverage resets (history lost, capture restarted) — should stay 0.",
             self.archive_coverage_resets.load(Ordering::Relaxed),
+        );
+
+        // --- Verifiable state commitment ---
+        emit_gauge(
+            &mut out,
+            "tron_node_commitment_committed_height",
+            "Height the committed state-commitment root reflects (trails head by the confirmation lag).",
+            self.commitment_committed_height.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_commitment_head_height",
+            "Highest block height the commitment builder has observed.",
+            self.commitment_head_height.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_commitment_blocks_folded_total",
+            "Blocks folded into the state-commitment tree.",
+            self.commitment_blocks_folded.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_commitment_lagged_total",
+            "Write-sets dropped at the commitment channel under backpressure (later resynced).",
+            self.commitment_lagged.load(Ordering::Relaxed),
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_commitment_pending_depth",
+            "Confirmed-but-not-yet-folded write-sets buffered by the commitment builder.",
+            self.commitment_pending_depth.load(Ordering::Relaxed) as i64,
+        );
+        emit_gauge(
+            &mut out,
+            "tron_node_commitment_bootstrapping",
+            "1 while the commitment full-state Merkleize is running, else 0.",
+            self.commitment_bootstrapping.load(Ordering::Relaxed) as i64,
         );
 
         // --- Firehose ---

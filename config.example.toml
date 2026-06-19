@@ -406,6 +406,51 @@ enable = false
 retain_mb = 32768
 
 # -----------------------------------------------------------------------------
+# [index.commitment] — VERIFIABLE STATE-COMMITMENT LAYER
+# -----------------------------------------------------------------------------
+# A cryptographic commitment over the node's committed state — something TRON
+# headers do NOT provide (no enforced state root). When enabled, the node
+# maintains a Sparse Merkle Tree (keccak256) over the executor-written state
+# surface (the same surface [index.archive] versions; account_asset excluded)
+# and exposes, on the HTTP REST port:
+#   GET      /v1/commitment/root     — the current state root + committed height
+#   GET      /v1/commitment/status   — committed/head heights, lag, bootstrap
+#   GET|POST /v1/commitment/proof    — inclusion/exclusion proof for a key
+# The root is HISTORY-INDEPENDENT (a pure function of the current key/value
+# set), so two independently-bootstrapped nodes at the same committed height
+# compute the byte-identical root — an operator can prove the node is
+# byte-exact with the canonical chain by comparing roots. Clients can verify
+# inclusion/exclusion proofs offline against the root, no trust in the node.
+#
+# OFF by default — the whole section. NOT consensus-critical: it runs off the
+# block-apply hot path, so committed_height trails head by ~confirmation_lag_
+# blocks (past finality; committed roots are final, never reorg-able).
+# Independent of [index.archive] (neither requires the other). Stores only the
+# LATEST tree (~a few % of state size; far smaller than a full archive) under
+# <data_dir>/commitment/db. enabled = true implies [index] capture_state_deltas
+# above and requires storage.snapshot_reorg = false (the default). NOT cheaply
+# rebuildable — toggling off and on re-Merkleizes full state at the then-current
+# head. Full guide: docs/verifiable-state-commitment.md.
+[index.commitment]
+# Master switch. false (default) = no commitment layer. When true, it implies
+# [index] capture_state_deltas above (the per-block write-set capture).
+enabled = false
+
+# Confirmation depth: the builder folds a block's root into the tree only once
+# it is at least this many blocks behind the head it has seen, so committed
+# roots are past TRON's ~19-block PBFT finality and never commit reorg-able tip
+# state. committed_height therefore trails head by ~this many blocks. Reorgs
+# shallower than this are absorbed before the height is ever committed (no tree
+# mutation). Lowering it below ~19 risks committing a root a tip reorg later
+# orphans; raising it widens the lag. camelCase alias: confirmationLagBlocks.
+confirmation_lag_blocks = 20
+
+# Warn threshold: how far the async builder may trail head before logging a
+# warning. Tunes the warning only (the work channel is bounded regardless).
+# camelCase alias: maxLagBlocks.
+max_lag_blocks = 256
+
+# -----------------------------------------------------------------------------
 # [rate_limiter] — rate.limiter.* enforcement (java-tron parity).
 # Per-component rows gate HTTP servlets (component = path tail OR java's
 # servlet class name, e.g. "GetAccountServlet"), the JSON-RPC endpoint

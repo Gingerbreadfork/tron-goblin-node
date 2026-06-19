@@ -118,6 +118,34 @@ cannot reconstruct earlier state. The feature is storage-heavy and off by
 default. Full configuration, disk-cost sizing, curl examples, and caveats:
 [Historical-State Archive](historical-state-archive.md).
 
+## Verifiable State Commitment
+
+Give the node a cryptographic state root (which TRON headers do not provide),
+serve offline-verifiable inclusion/exclusion proofs, and self-check that the
+node is byte-exact with the canonical chain. Enable:
+
+```toml
+[index.commitment]
+enabled = true              # implies [index] capture_state_deltas; off by default
+```
+
+Commitment endpoints (served on the HTTP REST port):
+
+```text
+GET      /v1/commitment/root      — current state root + committed height
+GET      /v1/commitment/status    — committed/head heights, confirmation lag, bootstrap
+GET|POST /v1/commitment/proof     — inclusion/exclusion proof for a store + key
+```
+
+The root is history-independent, so two independently-bootstrapped nodes at
+the same committed height compute the byte-identical root. It is not
+consensus-critical and runs off the apply hot path, so `committed_height`
+trails head past finality. Independent of `[index.archive]`. Full
+configuration, the offline proof-verification recipe, the integrity
+self-check workflow, and the phase-2 roadmap (historical at-height proofs,
+on-chain anchoring — not yet shipped):
+[Verifiable State Commitment](verifiable-state-commitment.md).
+
 ## Firehose
 
 Enable:

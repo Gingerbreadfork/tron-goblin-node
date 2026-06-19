@@ -1111,6 +1111,302 @@ async fn archive_coverage(State(state): State<RpcState>) -> (StatusCode, Json<Va
     }
 }
 
+// ---------------------------------------------------------------------------
+// /v1/commitment — verifiable state-commitment layer ([index.commitment])
+// ---------------------------------------------------------------------------
+
+use tron_chainbase::StorageRowStore;
+use tron_crypto::address::Address;
+use tron_index::{leaf_path_for, CommitmentReader, EMPTY_ROOT};
+
+/// `0x`-prefixed lowercase hex of a byte slice, matching the archive routes.
+fn hex0x(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+/// Routes for the verifiable state-commitment surface. Mounted
+/// unconditionally; the handlers answer `501` when no reader is attached.
+pub fn commitment_router() -> Router<RpcState> {
+    Router::new()
+        .route("/v1/commitment/root", get(commitment_root))
+        .route("/v1/commitment/status", get(commitment_status))
+        .route("/v1/commitment/proof", get(commitment_proof).post(commitment_proof))
+}
+
+/// 501 body returned when `[index.commitment]` is off — the same shape the
+/// archive uses for its disabled surface.
+fn commitment_disabled() -> (StatusCode, Json<Value>) {
+    err_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "state-commitment layer not enabled on this node (set [index.commitment] enabled = true)",
+    )
+}
+
+/// Resolve the commitment reader or short-circuit with the 501 body.
+macro_rules! get_commitment {
+    ($state:expr) => {
+        match $state.commitment.as_ref() {
+            Some(r) => r,
+            None => return commitment_disabled(),
+        }
+    };
+}
+
+/// Map an `UndoStoreId` to its lowercase variant name for the response. The
+/// inverse of [`store_from_name`].
+fn store_name(store: UndoStoreId) -> &'static str {
+    use UndoStoreId as Id;
+    match store {
+        Id::Accounts => "accounts",
+        Id::Witnesses => "witnesses",
+        Id::Votes => "votes",
+        Id::Delegation => "delegation",
+        Id::DelegatedResources => "delegatedresources",
+        Id::DynProps => "dynprops",
+        Id::Proposals => "proposals",
+        Id::NameIndex => "nameindex",
+        Id::IdIndex => "idindex",
+        Id::AssetV1 => "assetv1",
+        Id::AssetV2 => "assetv2",
+        Id::Contracts => "contracts",
+        Id::Abi => "abi",
+        Id::ExchangeV1 => "exchangev1",
+        Id::ExchangeV2 => "exchangev2",
+        Id::MarketOrders => "marketorders",
+        Id::Nullifiers => "nullifiers",
+        Id::MerkleTrees => "merkletrees",
+        Id::Code => "code",
+        Id::StorageRow => "storagerow",
+        Id::ContractState => "contractstate",
+        Id::BlockIndex => "blockindex",
+        Id::WitnessSchedule => "witnessschedule",
+        Id::DelegatedResourceAccountIndex => "delegatedresourceaccountindex",
+    }
+}
+
+/// Parse a `store` param into an `UndoStoreId`: either a variant NAME
+/// (case-insensitive, e.g. `accounts`, `storagerow`, `code`) or its numeric
+/// discriminant (`0..23`). The numeric form goes through `UndoStoreId::from_u8`
+/// so the accepted range stays in lockstep with the enum.
+fn store_from_name(s: &str) -> Result<UndoStoreId, String> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<u8>() {
+        return UndoStoreId::from_u8(n)
+            .ok_or_else(|| format!("unknown store discriminant: {n} (valid range 0..=23)"));
+    }
+    use UndoStoreId as Id;
+    let id = match t.to_ascii_lowercase().as_str() {
+        "accounts" => Id::Accounts,
+        "witnesses" => Id::Witnesses,
+        "votes" => Id::Votes,
+        "delegation" => Id::Delegation,
+        "delegatedresources" => Id::DelegatedResources,
+        "dynprops" => Id::DynProps,
+        "proposals" => Id::Proposals,
+        "nameindex" => Id::NameIndex,
+        "idindex" => Id::IdIndex,
+        "assetv1" => Id::AssetV1,
+        "assetv2" => Id::AssetV2,
+        "contracts" => Id::Contracts,
+        "abi" => Id::Abi,
+        "exchangev1" => Id::ExchangeV1,
+        "exchangev2" => Id::ExchangeV2,
+        "marketorders" => Id::MarketOrders,
+        "nullifiers" => Id::Nullifiers,
+        "merkletrees" => Id::MerkleTrees,
+        "code" => Id::Code,
+        "storagerow" => Id::StorageRow,
+        "contractstate" => Id::ContractState,
+        "blockindex" => Id::BlockIndex,
+        "witnessschedule" => Id::WitnessSchedule,
+        "delegatedresourceaccountindex" => Id::DelegatedResourceAccountIndex,
+        other => return Err(format!("unknown store name: {other}")),
+    };
+    Ok(id)
+}
+
+/// Decode a `0x`-optional hex string into raw bytes.
+fn parse_hex_key(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    let stripped = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    hex::decode(stripped).map_err(|e| format!("bad hex key: {e}"))
+}
+
+/// Compose the raw `StorageRow` key for `(address, slot)` byte-for-byte the
+/// way `/v1/archive/storage` does (via `eth_getStorageAt` →
+/// [`StorageRowStore::compose_key`], v2 layout, plain `sha3(address)` prefix),
+/// so a proof key matches the live read key exactly. `slot` is `0x`-optional,
+/// a QUANTITY or a full 32-byte word, left-padded to 32 bytes.
+fn storage_row_key(address: &str, slot: &str) -> Result<Vec<u8>, String> {
+    let addr = parse_tron_address(address)?;
+    let stripped = slot
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| slot.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| slot.trim());
+    if stripped.len() > 64 {
+        return Err("slot exceeds 32 bytes".into());
+    }
+    let padded = format!("{stripped:0>64}");
+    let bytes = hex::decode(&padded).map_err(|e| format!("bad slot hex: {e}"))?;
+    let mut slot_word = [0u8; 32];
+    slot_word.copy_from_slice(&bytes);
+    let key = StorageRowStore::compose_key(&Address::from_raw(addr), &slot_word);
+    Ok(key.to_vec())
+}
+
+/// Resolve the `(store, raw_key)` pair a `/proof` request names, applying the
+/// `account=` and `address`+`slot` sugar. `field` reads a param from the body
+/// (when present) else the query string (body wins, mirroring the archive
+/// handlers).
+fn resolve_proof_target(
+    field: impl Fn(&str) -> Option<String>,
+) -> Result<(UndoStoreId, Vec<u8>), String> {
+    // Sugar 1: `account=<T-addr|41-hex>` ⇒ Accounts store, 21-byte raw key.
+    if let Some(account) = field("account") {
+        let addr = parse_tron_address(&account)?;
+        return Ok((UndoStoreId::Accounts, addr.to_vec()));
+    }
+    // Sugar 2: `address`+`slot` ⇒ StorageRow store, composite raw key.
+    match (field("address"), field("slot")) {
+        (Some(address), Some(slot)) => {
+            let key = storage_row_key(&address, &slot)?;
+            return Ok((UndoStoreId::StorageRow, key));
+        }
+        (Some(_), None) => return Err("'address' requires 'slot' (contract storage sugar)".into()),
+        (None, Some(_)) => return Err("'slot' requires 'address' (contract storage sugar)".into()),
+        (None, None) => {}
+    }
+    // Explicit form: `store` (name or discriminant) + `key` (raw hex).
+    let store = field("store").ok_or("missing 'store' parameter")?;
+    let store = store_from_name(&store)?;
+    let key = field("key").ok_or("missing 'key' parameter")?;
+    let key = parse_hex_key(&key)?;
+    Ok((store, key))
+}
+
+/// `GET /v1/commitment/root` — the current committed root and the height it
+/// commits to. By design the height trails the live head by
+/// ~`confirmation_lag_blocks` (the builder folds only past-finality blocks),
+/// so the root is never a reorg-able tip; `height` is `null` and a
+/// `bootstrapping` note is returned before the first committed height.
+async fn commitment_root(State(state): State<RpcState>) -> (StatusCode, Json<Value>) {
+    let reader = get_commitment!(state);
+    match reader.root() {
+        Ok((height, root)) => {
+            // The reader returns `-1` before the first commit (still
+            // bootstrapping / no folded height yet) — report `height: null`.
+            if height < 0 {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "success": true,
+                        "data": {
+                            "height": Value::Null,
+                            "root": hex0x(&root),
+                            "note": "commitment bootstrapping",
+                        },
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "success": true,
+                        "data": { "height": height, "root": hex0x(&root) },
+                    })),
+                )
+            }
+        }
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `GET /v1/commitment/status` — the committed height/root, the live head the
+/// builder has seen, the configured confirmation lag, and bootstrap progress.
+/// `committed_height` trails `head_height` by ~`confirmation_lag_blocks`.
+async fn commitment_status(State(state): State<RpcState>) -> (StatusCode, Json<Value>) {
+    let reader = get_commitment!(state);
+    match reader.status() {
+        Ok(s) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "data": {
+                    "committed_height": s.committed_height,
+                    "head_height": s.head_height,
+                    "confirmation_lag_blocks": s.confirmation_lag_blocks,
+                    "root": hex0x(&s.root),
+                    "bootstrapping": s.bootstrapping,
+                    "bootstrap_keys_done": s.bootstrap_keys_done,
+                    "empty_root": hex0x(&EMPTY_ROOT),
+                },
+            })),
+        ),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `GET|POST /v1/commitment/proof` — an inclusion/exclusion proof for a state
+/// key against the current committed root. Params come from query (GET) or the
+/// JSON body (POST, body wins): `store` (variant name or discriminant) + `key`
+/// (raw store key, `0x`-optional hex), or the `account=` / `address`+`slot`
+/// sugar. The response carries the served root + height; a zero-trust client
+/// recomputes `leaf_path = keccak256(store_byte ‖ key)`, walks the proof to a
+/// root, and checks it equals `root` (and, for inclusion, that
+/// `keccak256(value) == value_hash`).
+async fn commitment_proof(
+    State(state): State<RpcState>,
+    Query(q): Query<HashMap<String, String>>,
+    body: Option<Json<Value>>,
+) -> (StatusCode, Json<Value>) {
+    let reader: &CommitmentReader = get_commitment!(state);
+    let body = body.map(|Json(b)| b);
+    let field = |name: &str| -> Option<String> {
+        body.as_ref()
+            .and_then(|b| b.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| q.get(name).cloned())
+    };
+    let (store, raw_key) = match resolve_proof_target(field) {
+        Ok(t) => t,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
+    };
+
+    let (height, root) = match reader.root() {
+        Ok(r) => r,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let proof = match reader.prove(store, &raw_key) {
+        Ok(p) => p,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let leaf_path = leaf_path_for(store, &raw_key);
+    let included = proof.leaf_value_hash.is_some();
+    let mut data = json!({
+        "height": if height < 0 { Value::Null } else { json!(height) },
+        "root": hex0x(&root),
+        "included": included,
+        "store": store_name(store),
+        "key": hex0x(&raw_key),
+        "leaf_path": hex0x(&leaf_path),
+        "proof": {
+            "sibling_mask": hex0x(&proof.sibling_mask),
+            "siblings": proof.siblings.iter().map(|s| hex0x(s)).collect::<Vec<_>>(),
+        },
+    });
+    // Inclusion proofs carry the value hash. The raw value is not held by the
+    // commitment reader (the leaf stores only `keccak256(value)`), so `value`
+    // is omitted; a client fetches it independently (e.g. via `/v1/archive`)
+    // and checks `keccak256(value) == value_hash`.
+    if let Some(vh) = proof.leaf_value_hash {
+        data["value_hash"] = json!(hex0x(&vh));
+    }
+    (StatusCode::OK, Json(json!({ "success": true, "data": data })))
+}
+
 #[cfg(test)]
 mod archive_tests {
     use super::*;
@@ -1284,6 +1580,443 @@ mod archive_tests {
                 "0x0000000000000000000000000000000000000000000000000000000000000000",
                 "slot={slot}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod commitment_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use tron_chainbase::MemBackend;
+    use tron_index::{
+        verify_proof, CommitmentBuilder, CommitmentCounters, CommitmentDeltaRef, CommitmentReader,
+        CommitmentStore, NodeHash, Proof, ProofOutcome,
+    };
+
+    /// Confirmation lag used across these tests. Small so a short fold stream
+    /// commits a few heights while leaving a tip buffer.
+    const K: u64 = 2;
+
+    fn mem() -> Arc<dyn KvBackend> {
+        Arc::new(MemBackend::new())
+    }
+
+    /// A fresh `RpcState` with no commitment reader attached.
+    fn fresh_state() -> RpcState {
+        RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111)
+    }
+
+    fn delta(store: UndoStoreId, key: &[u8], val: &[u8]) -> CommitmentDeltaRef {
+        CommitmentDeltaRef {
+            store,
+            key: key.to_vec(),
+            after: Some(val.to_vec()),
+        }
+    }
+
+    /// Build a `CommitmentReader` over an in-memory commitment store, folding a
+    /// supplied set of blocks (the engine's own builder path). Returns the
+    /// reader plus the raw key/value pairs that ended up COMMITTED (folded
+    /// below the confirmation ceiling), so callers can prove against them.
+    ///
+    /// `anchor` is the bootstrap anchor (empty live surface ⇒ empty tree at
+    /// `anchor`); blocks are ingested as heights `anchor+1..`.
+    fn reader_with_blocks(
+        anchor: i64,
+        blocks: &[(i64, Vec<CommitmentDeltaRef>)],
+    ) -> CommitmentReader {
+        let store = CommitmentStore::new(mem());
+        store.check_or_init().expect("init commitment store");
+        let counters = Arc::new(CommitmentCounters::new());
+        let mut builder =
+            CommitmentBuilder::new(store, Vec::new(), K, counters).expect("build commitment");
+        builder.bootstrap_or_resume(anchor).expect("bootstrap");
+        for (h, deltas) in blocks {
+            builder.ingest(*h, deltas.clone()).expect("ingest");
+        }
+        builder.reader()
+    }
+
+    fn state_with_commitment(reader: CommitmentReader) -> RpcState {
+        fresh_state().with_commitment(reader)
+    }
+
+    async fn get(state: RpcState, uri: &str) -> (StatusCode, Value) {
+        let app = crate::http_rest::router(state);
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    async fn post(state: RpcState, uri: &str, body: Value) -> (StatusCode, Value) {
+        let app = crate::http_rest::router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    /// Decode a `0x…64hex` field into a `NodeHash`.
+    fn node_hash(v: &Value) -> NodeHash {
+        let s = v.as_str().expect("hex string");
+        let raw = hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("hex");
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&raw);
+        h
+    }
+
+    /// Reconstruct a `Proof` from a `/proof` response body's `data`, so the
+    /// served proof can be fed back into `verify_proof`.
+    fn proof_from_data(data: &Value) -> Proof {
+        let path = node_hash(&data["leaf_path"]);
+        let leaf_value_hash = data
+            .get("value_hash")
+            .filter(|v| !v.is_null())
+            .map(node_hash);
+        let mut sibling_mask = [0u8; 32];
+        let mask = hex::decode(
+            data["proof"]["sibling_mask"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
+        sibling_mask.copy_from_slice(&mask);
+        let siblings: Vec<NodeHash> = data["proof"]["siblings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(node_hash)
+            .collect();
+        Proof {
+            path,
+            leaf_value_hash,
+            sibling_mask,
+            siblings,
+        }
+    }
+
+    #[test]
+    fn store_name_parsing_round_trips_names_and_discriminants() {
+        for n in 0u8..=23 {
+            let id = UndoStoreId::from_u8(n).unwrap();
+            // Name round-trips through the parser.
+            assert_eq!(store_from_name(store_name(id)).unwrap(), id);
+            // Numeric discriminant parses to the same variant.
+            assert_eq!(store_from_name(&n.to_string()).unwrap(), id);
+        }
+        // Case-insensitive names.
+        assert_eq!(store_from_name("ACCOUNTS").unwrap(), UndoStoreId::Accounts);
+        assert_eq!(store_from_name("StorageRow").unwrap(), UndoStoreId::StorageRow);
+        // Out-of-range discriminant and unknown name are errors.
+        assert!(store_from_name("24").is_err());
+        assert!(store_from_name("nope").is_err());
+    }
+
+    #[test]
+    fn storage_row_sugar_matches_eth_get_storage_at_key() {
+        // The sugar must compose the exact key the live `eth_getStorageAt`
+        // path uses, so a proof key matches the live read key byte-for-byte.
+        let addr = "410000000000000000000000000000000000000001";
+        let from_sugar = storage_row_key(addr, "0x5").unwrap();
+        let parsed = parse_tron_address(addr).unwrap();
+        let mut slot = [0u8; 32];
+        slot[31] = 0x5;
+        let expected =
+            tron_chainbase::StorageRowStore::compose_key(&Address::from_raw(parsed), &slot);
+        assert_eq!(from_sugar, expected.to_vec());
+        // Bare-hex and `0x` QUANTITY forms agree.
+        assert_eq!(storage_row_key(addr, "5").unwrap(), from_sugar);
+    }
+
+    #[tokio::test]
+    async fn disabled_returns_501_on_every_route() {
+        for uri in [
+            "/v1/commitment/root",
+            "/v1/commitment/status",
+            "/v1/commitment/proof?store=accounts&key=0x00",
+        ] {
+            let (status, body) = get(fresh_state(), uri).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "uri={uri}");
+            assert_eq!(body["success"], Value::Bool(false), "uri={uri}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("[index.commitment] enabled = true"),
+                "uri={uri}: {body:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_is_bootstrapping_before_first_commit() {
+        // A fresh store with no committed height: the reader reports height -1
+        // ⇒ the route returns null height + a bootstrapping note + EMPTY_ROOT.
+        let store = CommitmentStore::new(mem());
+        store.check_or_init().unwrap();
+        let reader = CommitmentReader::new(store, Arc::new(CommitmentCounters::new()), K);
+        let (status, body) =
+            get(state_with_commitment(reader), "/v1/commitment/root").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["success"], Value::Bool(true));
+        assert_eq!(body["data"]["height"], Value::Null);
+        assert_eq!(body["data"]["note"], "commitment bootstrapping");
+        assert_eq!(body["data"]["root"].as_str().unwrap(), hex0x(&EMPTY_ROOT));
+    }
+
+    #[tokio::test]
+    async fn root_and_status_report_committed_height_and_lag() {
+        // Fold heights 1..=5 over K=2: committed_height = 5 - 2 = 3, head = 5.
+        let blocks: Vec<(i64, Vec<CommitmentDeltaRef>)> = (1..=5i64)
+            .map(|h| {
+                (
+                    h,
+                    vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+                )
+            })
+            .collect();
+        let reader = reader_with_blocks(0, &blocks);
+
+        let (status, body) =
+            get(state_with_commitment(reader.clone()), "/v1/commitment/root").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["height"], 3);
+        let root_hex = body["data"]["root"].as_str().unwrap().to_owned();
+        assert!(root_hex.starts_with("0x") && root_hex.len() == 66);
+        assert_ne!(root_hex, hex0x(&EMPTY_ROOT));
+
+        let (status, body) =
+            get(state_with_commitment(reader), "/v1/commitment/status").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["committed_height"], 3);
+        assert_eq!(body["data"]["head_height"], 5);
+        assert_eq!(body["data"]["confirmation_lag_blocks"], K);
+        assert_eq!(body["data"]["bootstrapping"], Value::Bool(false));
+        assert_eq!(body["data"]["root"].as_str().unwrap(), root_hex);
+        assert_eq!(body["data"]["empty_root"].as_str().unwrap(), hex0x(&EMPTY_ROOT));
+    }
+
+    #[tokio::test]
+    async fn proof_inclusion_round_trips_through_verify_proof() {
+        // Commit a known Accounts key (height 1, well below the K=2 ceiling
+        // once head reaches 5). The served proof + value must verify against
+        // the served root.
+        let key = 1i64.to_be_bytes().to_vec();
+        let value = b"committed-account-value".to_vec();
+        let mut blocks: Vec<(i64, Vec<CommitmentDeltaRef>)> = vec![(
+            1,
+            vec![CommitmentDeltaRef {
+                store: UndoStoreId::Accounts,
+                key: key.clone(),
+                after: Some(value.clone()),
+            }],
+        )];
+        for h in 2..=5i64 {
+            blocks.push((
+                h,
+                vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+            ));
+        }
+        let reader = reader_with_blocks(0, &blocks);
+
+        let uri = format!("/v1/commitment/proof?store=accounts&key=0x{}", hex::encode(&key));
+        let (status, body) = get(state_with_commitment(reader), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+        assert_eq!(data["included"], Value::Bool(true));
+        assert_eq!(data["store"], "accounts");
+        assert_eq!(data["key"].as_str().unwrap(), hex0x(&key));
+        assert!(data.get("value_hash").is_some());
+        // The served proof verifies against the served root with the value.
+        let root = node_hash(&data["root"]);
+        let proof = proof_from_data(data);
+        assert_eq!(verify_proof(&root, &proof, Some(&value)), ProofOutcome::Included);
+        // Wrong value → Invalid.
+        assert_eq!(
+            verify_proof(&root, &proof, Some(b"wrong")),
+            ProofOutcome::Invalid
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_exclusion_round_trips_through_verify_proof() {
+        let blocks: Vec<(i64, Vec<CommitmentDeltaRef>)> = (1..=5i64)
+            .map(|h| {
+                (
+                    h,
+                    vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+                )
+            })
+            .collect();
+        let reader = reader_with_blocks(0, &blocks);
+
+        // A key that was never folded ⇒ exclusion proof.
+        let absent = hex::encode(b"never-committed-key");
+        let uri = format!("/v1/commitment/proof?store=accounts&key=0x{absent}");
+        let (status, body) = get(state_with_commitment(reader), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+        assert_eq!(data["included"], Value::Bool(false));
+        // Exclusion omits value_hash (and value).
+        assert!(data.get("value_hash").is_none());
+        assert!(data.get("value").is_none());
+        let root = node_hash(&data["root"]);
+        let proof = proof_from_data(data);
+        assert_eq!(verify_proof(&root, &proof, None), ProofOutcome::Excluded);
+    }
+
+    #[tokio::test]
+    async fn account_sugar_proves_the_accounts_key() {
+        // Fold an Accounts row keyed by a 21-byte address; the `account=`
+        // sugar must resolve to that exact leaf.
+        let addr_hex = "41a614f803b6fd780986a42c78ec9c7f77e6ded13c";
+        let raw_addr = parse_tron_address(addr_hex).unwrap().to_vec();
+        let value = b"acct".to_vec();
+        let mut blocks: Vec<(i64, Vec<CommitmentDeltaRef>)> = vec![(
+            1,
+            vec![CommitmentDeltaRef {
+                store: UndoStoreId::Accounts,
+                key: raw_addr.clone(),
+                after: Some(value.clone()),
+            }],
+        )];
+        for h in 2..=5i64 {
+            blocks.push((
+                h,
+                vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+            ));
+        }
+        let reader = reader_with_blocks(0, &blocks);
+
+        // Base58 / 41-hex both go through parse_tron_address; use the 41-hex.
+        let uri = format!("/v1/commitment/proof?account={addr_hex}");
+        let (status, body) = get(state_with_commitment(reader), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+        assert_eq!(data["store"], "accounts");
+        assert_eq!(data["key"].as_str().unwrap(), hex0x(&raw_addr));
+        assert_eq!(data["included"], Value::Bool(true));
+        let root = node_hash(&data["root"]);
+        let proof = proof_from_data(data);
+        assert_eq!(verify_proof(&root, &proof, Some(&value)), ProofOutcome::Included);
+    }
+
+    #[tokio::test]
+    async fn address_slot_sugar_proves_the_storage_row_key() {
+        // Fold a StorageRow row at the exact composed key, then prove it via
+        // the address+slot sugar.
+        let addr_hex = "41a614f803b6fd780986a42c78ec9c7f77e6ded13c";
+        let storage_key = storage_row_key(addr_hex, "0x7").unwrap();
+        let value = vec![0x42u8; 32];
+        let mut blocks: Vec<(i64, Vec<CommitmentDeltaRef>)> = vec![(
+            1,
+            vec![CommitmentDeltaRef {
+                store: UndoStoreId::StorageRow,
+                key: storage_key.clone(),
+                after: Some(value.clone()),
+            }],
+        )];
+        for h in 2..=5i64 {
+            blocks.push((
+                h,
+                vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+            ));
+        }
+        let reader = reader_with_blocks(0, &blocks);
+
+        // POST with body params (body wins) exercises the JSON path too.
+        let (status, body) = post(
+            state_with_commitment(reader),
+            "/v1/commitment/proof",
+            json!({ "address": addr_hex, "slot": "0x7" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &body["data"];
+        assert_eq!(data["store"], "storagerow");
+        assert_eq!(data["key"].as_str().unwrap(), hex0x(&storage_key));
+        assert_eq!(data["included"], Value::Bool(true));
+        let root = node_hash(&data["root"]);
+        let proof = proof_from_data(data);
+        assert_eq!(verify_proof(&root, &proof, Some(&value)), ProofOutcome::Included);
+    }
+
+    #[tokio::test]
+    async fn numeric_store_discriminant_is_accepted() {
+        let key = 1i64.to_be_bytes().to_vec();
+        let value = b"v".to_vec();
+        let mut blocks: Vec<(i64, Vec<CommitmentDeltaRef>)> = vec![(
+            1,
+            vec![CommitmentDeltaRef {
+                store: UndoStoreId::Accounts,
+                key: key.clone(),
+                after: Some(value.clone()),
+            }],
+        )];
+        for h in 2..=5i64 {
+            blocks.push((
+                h,
+                vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+            ));
+        }
+        let reader = reader_with_blocks(0, &blocks);
+        // Accounts = discriminant 0.
+        let uri = format!("/v1/commitment/proof?store=0&key=0x{}", hex::encode(&key));
+        let (status, body) = get(state_with_commitment(reader), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["store"], "accounts");
+        assert_eq!(body["data"]["included"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn bad_proof_inputs_are_400() {
+        let reader = reader_with_blocks(
+            0,
+            &(1..=5i64)
+                .map(|h| {
+                    (
+                        h,
+                        vec![delta(UndoStoreId::Accounts, &h.to_be_bytes(), &[h as u8])],
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let st = state_with_commitment(reader);
+        for (uri, why) in [
+            ("/v1/commitment/proof", "missing store and key"),
+            ("/v1/commitment/proof?store=accounts", "missing key"),
+            ("/v1/commitment/proof?key=0x00", "missing store"),
+            ("/v1/commitment/proof?store=bogus&key=0x00", "unknown store name"),
+            ("/v1/commitment/proof?store=99&key=0x00", "out-of-range discriminant"),
+            ("/v1/commitment/proof?store=accounts&key=0xzz", "malformed hex key"),
+            ("/v1/commitment/proof?account=not-an-address", "bad address"),
+            ("/v1/commitment/proof?address=410000000000000000000000000000000000000001", "address without slot"),
+        ] {
+            let (status, body) = get(st.clone(), uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {uri}");
+            assert_eq!(body["success"], Value::Bool(false), "{why}: {uri}");
         }
     }
 }

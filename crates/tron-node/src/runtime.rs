@@ -590,7 +590,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // engine/reader pair that the follower task and the HTTP /v1
     // surface use below. A failure here logs and disables the index —
     // it never blocks consensus.
-    let index_parts = if config.index.enable {
+    let mut index_parts = if config.index.enable {
         match open_index_subsystem(&config, &stores) {
             Ok(parts) => {
                 // Internal-tx capture requires the executor to record
@@ -602,10 +602,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     info!("index: capture_internal is on — enabling vm.save_internal_tx for trace capture");
                     exec_config.save_internal_tx = true;
                 }
-                if parts.archive.is_some() {
-                    // The archive consumes the per-block write-set; tell
-                    // the executor to capture it (pure observation — no
-                    // consensus-path behavior change).
+                if parts.archive.is_some() || parts.commitment.is_some() {
+                    // The archive and the commitment builder both consume the
+                    // per-block write-set; tell the executor to capture it
+                    // (pure observation — no consensus-path behavior change).
                     exec_config.capture_state_deltas = true;
                 }
                 Some(parts)
@@ -619,6 +619,27 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         None
     };
     let index_hook = index_parts.as_ref().map(|p| p.hook.clone());
+
+    // Spawn the dedicated state-commitment builder task. It takes ownership of
+    // the builder + receiver (the tree's single writer), runs the one-time
+    // bootstrap anchored at the recovered head, then folds confirmed blocks
+    // entirely off the apply path. The reader/counters stay in `index_parts`
+    // for the HTTP and metrics surfaces.
+    if let Some(commitment) = index_parts.as_mut().and_then(|p| p.commitment.as_mut()) {
+        if let (Some(builder), Some(rx)) = (commitment.builder.take(), commitment.rx.take()) {
+            let anchor_head = tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone())
+                .latest_block_header_number()
+                .unwrap_or(0);
+            let max_lag = config.index.commitment.max_lag_blocks;
+            handles.push(tokio::spawn(run_commitment_builder(
+                builder,
+                rx,
+                anchor_head,
+                max_lag,
+                shutdown.clone(),
+            )));
+        }
+    }
 
     // Index follower + metrics sampler tasks. The follower is the
     // unified gap-closing loop: backfill from the local stores while
@@ -689,6 +710,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .as_ref()
             .zip(parts.firehose_counters.as_ref())
             .map(|(t, c)| (t.clone(), c.clone()));
+        let commitment_sampler = parts.commitment.as_ref().map(|c| c.counters.clone());
         let m = metrics.clone();
         let mut sd = shutdown.subscribe();
         handles.push(tokio::spawn(async move {
@@ -718,6 +740,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                         counters.reorg_unwinds.load(Relaxed),
                         counters.gap_repaired_blocks.load(Relaxed),
                         counters.coverage_resets.load(Relaxed),
+                    );
+                }
+                if let Some(counters) = &commitment_sampler {
+                    m.set_commitment_stats(
+                        counters.committed_height.load(Relaxed),
+                        counters.head_height.load(Relaxed),
+                        counters.blocks_folded.load(Relaxed),
+                        counters.lagged.load(Relaxed),
+                        counters.pending_depth.load(Relaxed),
+                        counters.bootstrapping.load(Relaxed),
                     );
                 }
                 m.set_index_stats(
@@ -880,6 +912,9 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     arch.reader.clone(),
                     arch.backends.clone(),
                 ));
+            }
+            if let Some(commitment) = &parts.commitment {
+                http_state = http_state.with_commitment(commitment.reader.clone());
             }
         }
         let addr: std::net::SocketAddr = format!("{}:{}", config.http.host, config.http.port)
@@ -2298,6 +2333,10 @@ struct IndexParts {
     /// + per-store live backends for at-height views, plus the
     /// writer's counters for the metrics sampler.
     archive: Option<ArchiveParts>,
+    /// Verifiable state-commitment layer (`[index.commitment]`) — the
+    /// read handle + counters for the HTTP/metrics surfaces; the builder
+    /// and its receiver are taken out in `run` for the background task.
+    commitment: Option<CommitmentParts>,
     /// Firehose tail handle (P3, `[index.firehose]`) — handed to the
     /// gRPC server so external consumers can tail the durable log.
     firehose_tail: Option<tron_index::FirehoseTailHandle>,
@@ -2312,6 +2351,23 @@ struct ArchiveParts {
     /// retention timer (the writer is otherwise consumed by the index hook).
     writer: Arc<tron_index::ArchiveWriter>,
 }
+
+struct CommitmentParts {
+    /// Cheap-clone read handle for the HTTP `/v1/commitment` surface.
+    reader: tron_index::CommitmentReader,
+    /// Shared with the builder; mirrored into the metrics sampler.
+    counters: Arc<tron_index::CommitmentCounters>,
+    /// The builder and its receiver are taken (`Option::take`) in `run` and
+    /// moved into the dedicated background task — the only writer of the tree.
+    builder: Option<tron_index::CommitmentBuilder>,
+    rx: Option<tokio::sync::mpsc::Receiver<tron_index::CommitmentMsg>>,
+}
+
+/// Bounded depth of the commitment write-set channel (blocks). A full channel
+/// drops the message rather than blocking apply; the dropped height is
+/// re-derivable, so this only bounds how far a lagging builder may fall behind
+/// before it must repair a gap.
+const COMMITMENT_CHANNEL_CAP: usize = 4096;
 
 /// Every state store the executor's write-set can touch, paired with
 /// its `StoreId` — the archive's gap-repair source and the raw
@@ -2457,6 +2513,66 @@ fn open_index_subsystem(
             hook = hook.with_archive(writer);
         }
     }
+    // Verifiable state-commitment layer (`[index.commitment]`) — its own
+    // RocksDB instance under <data_dir>/commitment/db. Independent of the
+    // archive; like it, it needs the per-block write-set, so it shares the
+    // same BlockSession-commit requirement. The builder is handed a bounded
+    // channel sender via the hook (non-blocking try_send) and runs entirely
+    // off the apply path in `run`.
+    let mut commitment_parts: Option<CommitmentParts> = None;
+    if config.index.commitment.enabled {
+        if config.storage.snapshot_reorg {
+            error!(
+                "index: the state-commitment layer (index.commitment.enabled) requires the \
+                 BlockSession commit path (storage.snapshot_reorg = false) — the snapshot-stack \
+                 path does not materialize per-block write-sets. Commitment DISABLED."
+            );
+        } else {
+            let commit_dir = config.data_dir.join("commitment").join("db");
+            if let Some(parent) = commit_dir.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+            }
+            let commit_backend: Arc<dyn tron_chainbase::KvBackend> = Arc::new(
+                RocksDbBackend::open_tuned(
+                    &commit_dir,
+                    config.storage.write_buffer_size_mb,
+                    config.storage.max_open_files,
+                )
+                .map_err(|e| format!("open commitment db {commit_dir:?}: {e:?}"))?,
+            );
+            let store = tron_index::CommitmentStore::new(commit_backend);
+            let fresh = store.check_or_init().map_err(|e| e.to_string())?;
+            let counters = Arc::new(tron_index::CommitmentCounters::new());
+            let k = config.index.commitment.confirmation_lag_blocks;
+            let builder = tron_index::CommitmentBuilder::new(
+                store,
+                store_id_backends(stores),
+                k,
+                counters.clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            let reader = builder.reader();
+            let committed = builder.committed_height();
+            // Bounded so a lagging builder never blocks the apply path: a full
+            // channel drops the write-set (the hook flags a resync; the gap is
+            // re-derivable). Sized to absorb ordinary catch-up bursts.
+            let (tx, rx) = tokio::sync::mpsc::channel(COMMITMENT_CHANNEL_CAP);
+            info!(
+                fresh,
+                ?committed,
+                confirmation_lag_blocks = k,
+                dir = ?commit_dir,
+                "index: state-commitment layer enabled"
+            );
+            hook = hook.with_commitment(tx, counters.clone());
+            commitment_parts = Some(CommitmentParts {
+                reader,
+                counters,
+                builder: Some(builder),
+                rx: Some(rx),
+            });
+        }
+    }
     // Firehose external-sink log (P3) — its own durable artifact under
     // <data_dir>/firehose/, reconciled against consensus at open (a
     // log ahead of the recovered chain emits an UNWIND; a log behind
@@ -2504,7 +2620,112 @@ fn open_index_subsystem(
         dir = ?dir,
         "index: subsystem ready"
     );
-    Ok(IndexParts { hook, engine, reader, archive: archive_parts, firehose_tail, firehose_counters })
+    Ok(IndexParts {
+        hook,
+        engine,
+        reader,
+        archive: archive_parts,
+        commitment: commitment_parts,
+        firehose_tail,
+        firehose_counters,
+    })
+}
+
+/// The state-commitment builder's background task: a one-time bootstrap (or
+/// crash-resume) anchored at the recovered head, then an off-apply-path fold
+/// loop. All CPU/IO — the full-state Merkleize (minutes on a fresh enable) and
+/// every per-block fold (up to hundreds of node hashes) — runs on a blocking
+/// thread so it never occupies a tokio worker. `committed_height` deliberately
+/// trails the head by the configured confirmation lag, so committed roots are
+/// final. A fold/store error stops the builder (the node is unaffected; the
+/// commitment simply stops advancing and `/v1/commitment/status` shows it).
+async fn run_commitment_builder(
+    builder: tron_index::CommitmentBuilder,
+    mut rx: tokio::sync::mpsc::Receiver<tron_index::CommitmentMsg>,
+    anchor_head: i64,
+    max_lag_blocks: u64,
+    shutdown: ShutdownSignal,
+) {
+    let mut sd = shutdown.subscribe();
+    // Bootstrap / resume off-thread, moving the builder through and back.
+    let mut builder = match tokio::task::spawn_blocking(move || {
+        let mut builder = builder;
+        let r = builder.bootstrap_or_resume(anchor_head);
+        (builder, r)
+    })
+    .await
+    {
+        Ok((b, Ok(()))) => {
+            info!(committed = ?b.committed_height(), "commitment: bootstrap/resume complete");
+            b
+        }
+        Ok((_, Err(e))) => {
+            error!(error = %e, "commitment: bootstrap/resume failed; builder stopping");
+            return;
+        }
+        Err(_) => {
+            error!("commitment: bootstrap task panicked; builder stopping");
+            return;
+        }
+    };
+
+    let mut warned = false;
+    loop {
+        let (height, deltas) = tokio::select! {
+            _ = sd.recv() => break,
+            msg = rx.recv() => match msg {
+                Some(tron_index::CommitmentMsg::Block { height, deltas }) => (height, deltas),
+                None => break, // all senders dropped (shutdown)
+            },
+        };
+        // Fold off-thread (a block recomputes hundreds of node hashes; a rare
+        // deep-reorg fallback re-Merkleizes from live state).
+        let (b, result) = match tokio::task::spawn_blocking(move || {
+            let mut builder = builder;
+            let r = builder.ingest(height, deltas);
+            (builder, r)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(_) => {
+                error!(block = height, "commitment: fold task panicked; builder stopping");
+                return;
+            }
+        };
+        builder = b;
+        match result {
+            Ok(c) => {
+                if c.rebootstrapped {
+                    warn!(
+                        committed = ?c.committed_height,
+                        "commitment: re-bootstrapped after a deep reorg or unrepairable gap"
+                    );
+                }
+                // The builder trails head by ~K by design; warn (once per
+                // lag episode) only when it exceeds the operator threshold.
+                let lag = height - c.committed_height.unwrap_or(height);
+                if lag as u64 > max_lag_blocks {
+                    if !warned {
+                        warn!(
+                            lag,
+                            max_lag_blocks,
+                            head = height,
+                            "commitment: builder lagging head beyond threshold"
+                        );
+                        warned = true;
+                    }
+                } else {
+                    warned = false;
+                }
+            }
+            Err(e) => {
+                error!(block = height, error = %e, "commitment: fold failed; builder stopping");
+                return;
+            }
+        }
+    }
+    info!("commitment: builder task stopped");
 }
 
 /// Spawn the follower loop: tick the engine on a blocking thread,

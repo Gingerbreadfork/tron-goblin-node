@@ -25,6 +25,7 @@
 //! * [`query`] — fingerprint-paginated, filterable page reads.
 
 pub mod archive;
+pub mod commitment;
 pub mod db;
 pub mod engine;
 pub mod extract;
@@ -36,6 +37,13 @@ pub mod rows;
 pub use archive::{
     ArchiveAtBackend, ArchiveCounters, ArchiveReader, ArchiveWriter, AtHeight, DeltaRef,
     PruneStats, ARCHIVE_FORMAT_VERSION,
+};
+pub use commitment::{
+    default_hashes, leaf_path_for, verify_proof, BootstrapCursor, BuildState, Committed,
+    CommitmentBuilder, CommitmentCounters, CommitmentDeltaRef, CommitmentError, CommitmentMeta,
+    CommitmentMsg, CommitmentReader, CommitmentStatus, CommitmentStore, LeafPath, NodeBackend,
+    NodeHash, NodeOp, Proof, ProofOutcome, ProofStep, ResumeSource, Smt, COMMITMENT_FORMAT_VERSION,
+    EMPTY_ROOT,
 };
 pub use db::{IndexDb, IndexError, InitOutcome, FORMAT_VERSION};
 pub use engine::{EngineOptions, IndexCounters, IndexEngine, IndexStatus, Tick};

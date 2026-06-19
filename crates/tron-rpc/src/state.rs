@@ -109,6 +109,11 @@ pub struct RpcState {
     /// Optional historical-state archive (the `/v1/archive/...`
     /// surface). Attached when `[index] capture_state_deltas` is on.
     pub archive: Option<crate::index_api::ArchiveApiState>,
+    /// Optional verifiable state-commitment reader (the
+    /// `/v1/commitment/...` surface). Attached when
+    /// `[index.commitment] enabled` is on; absent ⇒ those routes answer
+    /// `501 NOT_IMPLEMENTED`.
+    pub commitment: Option<tron_index::CommitmentReader>,
     /// Optional firehose tail handle (the gRPC `tronfirehose.Firehose`
     /// service). Attached when `[index.firehose]` is enabled.
     pub firehose: Option<tron_index::FirehoseTailHandle>,
@@ -192,6 +197,7 @@ impl RpcState {
             eth_call_backends: None,
             index: None,
             archive: None,
+            commitment: None,
             firehose: None,
             tx_history: None,
             transaction_ret: None,
@@ -250,6 +256,13 @@ impl RpcState {
     /// `/v1/archive/...` at-height read surface.
     pub fn with_archive(mut self, archive: crate::index_api::ArchiveApiState) -> Self {
         self.archive = Some(archive);
+        self
+    }
+
+    /// Attach the verifiable state-commitment reader, enabling the
+    /// `/v1/commitment/...` root/status/proof surface.
+    pub fn with_commitment(mut self, reader: tron_index::CommitmentReader) -> Self {
+        self.commitment = Some(reader);
         self
     }
 

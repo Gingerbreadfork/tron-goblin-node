@@ -1762,6 +1762,13 @@ pub struct IndexConfig {
     #[serde(default)]
     pub archive: ArchiveConfig,
 
+    /// `[index.commitment]` — opt-in verifiable state-commitment layer.
+    /// `commitment.enabled` implies `capture_state_deltas`. Independent of
+    /// `[index.archive]` — neither requires the other. See
+    /// [`CommitmentConfig`].
+    #[serde(default)]
+    pub commitment: CommitmentConfig,
+
     /// Which stream the index follows: the canonical head
     /// (reorg-reconciled, freshest) or the PBFT-solidified mark
     /// (never unwinds, lags ~19 blocks).
@@ -1795,6 +1802,7 @@ impl Default for IndexConfig {
             capture_callee_contract: false,
             capture_state_deltas: false,
             archive: ArchiveConfig::default(),
+            commitment: CommitmentConfig::default(),
             stream: IndexStream::default(),
             backfill: IndexBackfillConfig::default(),
             firehose: IndexFirehoseConfig::default(),
@@ -1852,6 +1860,57 @@ impl Default for ArchiveConfig {
 
 fn default_archive_retain_blocks() -> u64 {
     2_592_000
+}
+
+/// `[index.commitment]` — the verifiable state-commitment layer.
+/// Off by default. When `enabled`, the node maintains a Sparse Merkle Tree
+/// (keccak256) over committed state, exposes the current root plus
+/// inclusion/exclusion proofs via `/v1/commitment/...`, and lets an operator
+/// cross-check the node is byte-exact with the canonical chain by comparing
+/// roots with another independently-bootstrapped node at the same committed
+/// height. The root commits to the executor-written state surface — the same
+/// surface the archive versions. It is computed off the block-apply path and
+/// trails the head by `confirmation_lag_blocks`, so committed roots are final
+/// rather than reorg-able. Enabling implies `capture_state_deltas` and
+/// requires the BlockSession commit path (`storage.snapshot_reorg = false`).
+/// Storage (the latest tree) lives under `<data_dir>/commitment/db`; it is not
+/// cheaply re-derivable — disabling and re-enabling triggers a full
+/// re-Merkleization at the then-current head. Independent of `[index.archive]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitmentConfig {
+    /// Master switch (default false). Implies `capture_state_deltas`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Blocks behind head at which a root is committed. The builder defers
+    /// folding a block until the head is this many blocks beyond it, so a
+    /// committed root is past PBFT finality and a tip reorg cannot orphan it.
+    /// Default 20 (just past the ~19-block solidification gap); lowering it
+    /// below finality risks committing a root a later reorg orphans.
+    #[serde(default = "default_commitment_confirmation_lag", alias = "confirmationLagBlocks")]
+    pub confirmation_lag_blocks: u64,
+    /// Warn threshold: how far the async builder may trail the head before a
+    /// lag warning is logged. The channel is bounded independently; this only
+    /// tunes when the operator is told the builder is falling behind.
+    #[serde(default = "default_commitment_max_lag", alias = "maxLagBlocks")]
+    pub max_lag_blocks: u64,
+}
+
+impl Default for CommitmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            confirmation_lag_blocks: default_commitment_confirmation_lag(),
+            max_lag_blocks: default_commitment_max_lag(),
+        }
+    }
+}
+
+fn default_commitment_confirmation_lag() -> u64 {
+    20
+}
+
+fn default_commitment_max_lag() -> u64 {
+    256
 }
 
 impl IndexConfig {
@@ -2020,6 +2079,10 @@ mod tests {
         assert!(cfg.p2p.listen);
         assert_eq!(cfg.p2p.listen_host, "0.0.0.0");
         assert!(cfg.p2p.discover_enable);
+        // The opt-in state surfaces ship off with their documented defaults.
+        assert!(!cfg.index.commitment.enabled);
+        assert_eq!(cfg.index.commitment.confirmation_lag_blocks, 20);
+        assert_eq!(cfg.index.commitment.max_lag_blocks, 256);
         // No [witness] table → sync-only.
         assert!(cfg.witness.is_none());
     }
@@ -2089,6 +2152,29 @@ mod tests {
         assert!(on.index.capture_state_deltas);
         // Toggling the archive must NOT change the tx-history index's
         // scope fingerprint (it would force a pointless index rebuild).
+        assert_eq!(
+            cfg.index.capture_set().fingerprint(0),
+            on.index.capture_set().fingerprint(0)
+        );
+    }
+
+    #[test]
+    fn index_commitment_is_off_by_default_and_outside_the_fingerprint() {
+        let cfg: NodeConfig = toml::from_str("").unwrap();
+        assert!(!cfg.index.commitment.enabled);
+        assert_eq!(cfg.index.commitment.confirmation_lag_blocks, 20);
+        assert_eq!(cfg.index.commitment.max_lag_blocks, 256);
+        // camelCase aliases parse (java-tron-style config.conf portability).
+        let on: NodeConfig = toml::from_str(
+            "[index.commitment]\nenabled = true\nconfirmationLagBlocks = 32\nmaxLagBlocks = 512",
+        )
+        .unwrap();
+        assert!(on.index.commitment.enabled);
+        assert_eq!(on.index.commitment.confirmation_lag_blocks, 32);
+        assert_eq!(on.index.commitment.max_lag_blocks, 512);
+        // Like the archive, enabling the commitment must NOT change the
+        // tx-history index's scope fingerprint (it would force a needless
+        // index rebuild).
         assert_eq!(
             cfg.index.capture_set().fingerprint(0),
             on.index.capture_set().fingerprint(0)
