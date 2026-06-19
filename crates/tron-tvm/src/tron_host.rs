@@ -27,6 +27,157 @@ use tron_chainbase::DelegatedResourceStore;
 use tron_crypto::address::Address as TronAddress;
 
 use crate::database::{evm_to_tron_address, tron_to_evm_address, TronDatabase};
+use crate::staking_journal::StakingEntry;
+
+// ---- Per-frame rollback journaling for the staking / SELFDESTRUCT bridges ----
+//
+// Every state-mutating staking / suicide write below goes through one of these
+// helpers, which records a reversing entry on the shared `staking_journal`
+// (snapshot of the prior row, or the signed weight delta) BEFORE applying the
+// mutation. The `Trc10Inspector` unwinds a frame's entries on revert. When no
+// journal is attached (read-only / unit-test setups) the helpers fall straight
+// through to the underlying store, preserving the historical behaviour.
+//
+// Snapshotting the CURRENT stored value immediately before each write means a
+// LIFO unwind restores the exact pre-frame state even when one frame mutates
+// the same row several times (the earliest snapshot wins on restore) — the same
+// guarantee `Trc10Inspector::cs_journal` relies on.
+impl TronDatabase {
+    /// Record a reversing snapshot of `addr`'s current `Account` row WITHOUT
+    /// writing anything. Used before an out-of-line account mutation the bridge
+    /// doesn't perform via `put_account_journaled` — chiefly the reward settle
+    /// (`withdraw_reward_tvm` writes `allowance` straight to the store). On a
+    /// LIFO unwind the later post-settle snapshot restores first and this
+    /// pre-settle snapshot restores the true pre-frame row last, so both the
+    /// settle's and the bridge's account writes are reversed.
+    fn snapshot_account(&self, addr: &TronAddress) {
+        if let Some(journal) = &self.staking_journal {
+            let prior = self.accounts.get(addr).ok().flatten();
+            journal.lock().expect("staking journal mutex poisoned").push(
+                StakingEntry::Account { addr: *addr, prior },
+            );
+        }
+    }
+
+    /// Record a reversing snapshot of `addr`'s current `Votes` row WITHOUT
+    /// writing — used before an out-of-line votes mutation (e.g.
+    /// `update_vote_after_unstake`, which writes the votes store itself).
+    fn snapshot_votes(&self, addr: &TronAddress) {
+        if let Some(journal) = &self.staking_journal {
+            if let Some(votes_store) = &self.votes {
+                let prior = votes_store.get(addr).ok().flatten();
+                journal.lock().expect("staking journal mutex poisoned").push(
+                    StakingEntry::Votes { addr: *addr, prior },
+                );
+            }
+        }
+    }
+
+    /// Snapshot `addr`'s current `Account` row (if the journal is attached),
+    /// then write `account` to the store.
+    fn put_account_journaled(&self, addr: &TronAddress, account: &tron_proto::Account) {
+        if let Some(journal) = &self.staking_journal {
+            let prior = self.accounts.get(addr).ok().flatten();
+            journal.lock().expect("staking journal mutex poisoned").push(
+                StakingEntry::Account { addr: *addr, prior },
+            );
+        }
+        self.accounts
+            .put(addr, account)
+            .expect("db error writing account in staking bridge");
+    }
+
+    /// Snapshot `addr`'s current `Votes` row, then write `votes`.
+    fn put_votes_journaled(
+        &self,
+        votes_store: &tron_chainbase::VotesStore,
+        addr: &TronAddress,
+        votes: &tron_proto::Votes,
+    ) {
+        if let Some(journal) = &self.staking_journal {
+            let prior = votes_store.get(addr).ok().flatten();
+            journal.lock().expect("staking journal mutex poisoned").push(
+                StakingEntry::Votes { addr: *addr, prior },
+            );
+        }
+        votes_store
+            .put(addr, votes)
+            .expect("db error writing votes in staking bridge");
+    }
+
+    /// Snapshot the current `DelegatedResource` row at `key`, then write
+    /// `record` via the raw key.
+    fn put_delegated_journaled(
+        &self,
+        resources: &DelegatedResourceStore,
+        key: &[u8],
+        record: &tron_proto::DelegatedResource,
+    ) {
+        if let Some(journal) = &self.staking_journal {
+            let prior = resources.get_raw(key).ok().flatten();
+            journal.lock().expect("staking journal mutex poisoned").push(
+                StakingEntry::DelegatedResource { key: key.to_vec(), prior },
+            );
+        }
+        resources
+            .put_raw(key, record)
+            .expect("db error writing delegated resource in staking bridge");
+    }
+
+    /// Apply a `TOTAL_NET_WEIGHT` delta, recording it for reversal.
+    fn add_net_weight_journaled(
+        &self,
+        dyn_props: &tron_chainbase::DynamicPropertiesStore,
+        delta: i64,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(journal) = &self.staking_journal {
+            journal
+                .lock()
+                .expect("staking journal mutex poisoned")
+                .push(StakingEntry::NetWeight { delta });
+        }
+        dyn_props.add_total_net_weight(delta);
+    }
+
+    /// Apply a `TOTAL_ENERGY_WEIGHT` delta, recording it for reversal.
+    fn add_energy_weight_journaled(
+        &self,
+        dyn_props: &tron_chainbase::DynamicPropertiesStore,
+        delta: i64,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(journal) = &self.staking_journal {
+            journal
+                .lock()
+                .expect("staking journal mutex poisoned")
+                .push(StakingEntry::EnergyWeight { delta });
+        }
+        dyn_props.add_total_energy_weight(delta);
+    }
+
+    /// Apply a `TOTAL_TRON_POWER_WEIGHT` delta, recording it for reversal.
+    fn add_tron_power_weight_journaled(
+        &self,
+        dyn_props: &tron_chainbase::DynamicPropertiesStore,
+        delta: i64,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(journal) = &self.staking_journal {
+            journal
+                .lock()
+                .expect("staking journal mutex poisoned")
+                .push(StakingEntry::TronPowerWeight { delta });
+        }
+        dyn_props.add_total_tron_power_weight(delta);
+    }
+}
 
 impl TronDatabaseExt for TronDatabase {
     fn tron_token_balance(&self, address: Address, token_id: i64) -> i64 {
@@ -255,6 +406,8 @@ impl TronDatabaseExt for TronDatabase {
         //      only on the transfer path -- both reach here) ----
         if allow_vote {
             if let Some(delegation) = self.delegation.clone() {
+                // Snapshot before the settle writes `allowance` to the store.
+                self.snapshot_account(&owner_t);
                 // `VoteRewardUtil.withdrawReward` — gated on ALLOW_TVM_VOTE
                 // (the enclosing `allow_vote` already enforces it).
                 let _ = crate::reward::withdraw_reward_tvm(
@@ -270,7 +423,7 @@ impl TronDatabaseExt for TronDatabase {
                 }
             }
             if !owner_account.votes.is_empty() {
-                if let Some(votes_store) = self.votes.as_ref() {
+                if let Some(votes_store) = self.votes.clone() {
                     let mut votes_row = match votes_store.get(&owner_t) {
                         Ok(Some(v)) => {
                             let mut v = v;
@@ -284,9 +437,7 @@ impl TronDatabaseExt for TronDatabase {
                         },
                     };
                     votes_row.address = owner_t.as_bytes().to_vec();
-                    votes_store
-                        .put(&owner_t, &votes_row)
-                        .expect("db error in tron_suicide writing votes row");
+                    self.put_votes_journaled(&votes_store, &owner_t, &votes_row);
                 }
                 owner_account.votes.clear();
                 owner_account.old_tron_power = 0;
@@ -343,8 +494,8 @@ impl TronDatabaseExt for TronDatabase {
                 .and_then(|r| r.frozen_balance_for_energy.as_ref())
                 .map(|f| f.frozen_balance)
                 .unwrap_or(0);
-            dyn_props.add_total_net_weight(-frozen_bw / TRX_PRECISION);
-            dyn_props.add_total_energy_weight(-frozen_energy / TRX_PRECISION);
+            self.add_net_weight_journaled(&dyn_props, -frozen_bw / TRX_PRECISION);
+            self.add_energy_weight_journaled(&dyn_props, -frozen_energy / TRX_PRECISION);
             let total = frozen_bw.saturating_add(frozen_energy);
             if total != 0 {
                 self.pending_balance_deltas
@@ -445,13 +596,9 @@ impl TronDatabaseExt for TronDatabase {
             res::set_new_window_size(&mut owner_account, ResourceKind::Energy, 0);
         }
 
-        self.accounts
-            .put(&owner_t, &owner_account)
-            .expect("db error in tron_suicide writing owner account");
+        self.put_account_journaled(&owner_t, &owner_account);
         if inheritor_t != owner_t {
-            self.accounts
-                .put(&inheritor_t, &inheritor_account)
-                .expect("db error in tron_suicide writing inheritor account");
+            self.put_account_journaled(&inheritor_t, &inheritor_account);
         }
         0
     }
@@ -482,7 +629,7 @@ impl TronDatabaseExt for TronDatabase {
         // before its validate (`increaseNonce` precedes `processor.validate`).
         self.note_internal_tx_nonce();
         let _ = receiver_address; // v1 didn't really use it on chain
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
@@ -516,13 +663,11 @@ impl TronDatabaseExt for TronDatabase {
                 expire_time: expire,
             });
         }
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_freeze writing owner account");
+        self.put_account_journaled(&owner, &account);
         let weight = frozen_balance / TRX_PRECISION;
         match resource_type {
-            0 => dyn_props.add_total_net_weight(weight),
-            1 => dyn_props.add_total_energy_weight(weight),
+            0 => self.add_net_weight_journaled(&dyn_props, weight),
+            1 => self.add_energy_weight_journaled(&dyn_props, weight),
             _ => {}
         }
         // Tell the Host to debit the caller's journaled balance so
@@ -540,7 +685,7 @@ impl TronDatabaseExt for TronDatabase {
         // java `Program.unfreeze`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
         let _ = receiver_address;
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
@@ -567,13 +712,11 @@ impl TronDatabaseExt for TronDatabase {
             Some(v) => v,
             None => return 0,
         };
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_unfreeze writing owner account");
+        self.put_account_journaled(&owner, &account);
         let weight = unlocked / TRX_PRECISION;
         match resource_type {
-            0 => dyn_props.add_total_net_weight(-weight),
-            1 => dyn_props.add_total_energy_weight(-weight),
+            0 => self.add_net_weight_journaled(&dyn_props, -weight),
+            1 => self.add_energy_weight_journaled(&dyn_props, -weight),
             _ => {}
         }
         // Credit the unlocked amount back to the caller's journaled
@@ -675,9 +818,12 @@ impl TronDatabaseExt for TronDatabase {
         // mutates the owner's allowance / reward-cycle markers, so re-read the
         // account afterwards before persisting the new votes.
         if let (Some(delegation), Some(dyn_props)) =
-            (self.delegation.as_ref(), self.dyn_props.as_ref())
+            (self.delegation.clone(), self.dyn_props.clone())
         {
-            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
+            // Snapshot before the settle mutates `allowance` straight to the
+            // store, so a frame revert reverses the settle write too.
+            self.snapshot_account(&owner);
+            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_vote_witness settling rewards");
         }
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
@@ -704,19 +850,15 @@ impl TronDatabaseExt for TronDatabase {
             owner_account.votes.push(entry.clone());
             votes_capsule.new_votes.push(entry);
         }
-        self.accounts
-            .put(&owner, &owner_account)
-            .expect("db error in TronDatabaseExt::tron_vote_witness writing owner account");
-        votes_store
-            .put(&owner, &votes_capsule)
-            .expect("db error in TronDatabaseExt::tron_vote_witness writing votes");
+        self.put_account_journaled(&owner, &owner_account);
+        self.put_votes_journaled(&votes_store, &owner, &votes_capsule);
         1
     }
 
     fn tron_withdraw_reward(&mut self, caller: Address) -> i64 {
         // java `Program.withdrawReward`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
@@ -727,8 +869,10 @@ impl TronDatabaseExt for TronDatabase {
         // the TVM opcode has NO 24h cooldown — its validate only blocks
         // genesis GRs. Our previous guard (`latest_withdraw_time + 24h`)
         // failed withdrawals java accepts.
-        if let Some(delegation) = self.delegation.as_ref() {
-            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
+        if let Some(delegation) = self.delegation.clone() {
+            // Snapshot before the settle writes `allowance` to the store.
+            self.snapshot_account(&owner);
+            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
         }
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
@@ -747,9 +891,7 @@ impl TronDatabaseExt for TronDatabase {
         };
         account.allowance = 0;
         account.latest_withdraw_time = now;
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_withdraw_reward writing owner account");
+        self.put_account_journaled(&owner, &account);
         // Credit the withdrawn allowance to the caller's journaled
         // balance.
         self.last_balance_delta = Some((caller, allowance));
@@ -764,7 +906,7 @@ impl TronDatabaseExt for TronDatabase {
     ) -> i64 {
         // java `Program.freezeBalanceV2`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
@@ -799,16 +941,14 @@ impl TronDatabaseExt for TronDatabase {
                 });
             }
         }
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_freeze_balance_v2 writing owner account");
+        self.put_account_journaled(&owner, &account);
         let new_basis = old_basis.saturating_add(frozen_balance);
         let weight_delta = new_basis / TRX_PRECISION - old_basis / TRX_PRECISION;
         if weight_delta != 0 {
             match resource {
-                0 => dyn_props.add_total_net_weight(weight_delta),
-                1 => dyn_props.add_total_energy_weight(weight_delta),
-                2 => dyn_props.add_total_tron_power_weight(weight_delta),
+                0 => self.add_net_weight_journaled(&dyn_props, weight_delta),
+                1 => self.add_energy_weight_journaled(&dyn_props, weight_delta),
+                2 => self.add_tron_power_weight_journaled(&dyn_props, weight_delta),
                 _ => {}
             }
         }
@@ -828,7 +968,7 @@ impl TronDatabaseExt for TronDatabase {
         // validate. A second bump happens below iff it auto-withdraws an
         // expired unfreeze (`unfreezeExpireBalance > 0`).
         self.note_internal_tx_nonce();
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         if unfreeze_balance <= 0 || resource_type > 2 {
@@ -856,8 +996,10 @@ impl TronDatabaseExt for TronDatabase {
         // java's TVM `UnfreezeBalanceV2Processor.execute` settles pending
         // voter rewards first (`VoteRewardUtil.withdrawReward`, gated on
         // ALLOW_TVM_VOTE), mirroring the actuator.
-        if let Some(delegation) = self.delegation.as_ref() {
-            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, delegation, dyn_props, self.reward_vi.as_deref())
+        if let Some(delegation) = self.delegation.clone() {
+            // Snapshot before the settle writes `allowance` to the store.
+            self.snapshot_account(&owner);
+            crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect(
                     "db error in TronDatabaseExt::tron_unfreeze_balance_v2 settling rewards",
                 );
@@ -910,23 +1052,23 @@ impl TronDatabaseExt for TronDatabase {
         });
         // Trim votes the unstake no longer backs (java's `updateVote`,
         // shared with the actuator — see `crate::votes`).
-        if let Some(votes_store) = self.votes.as_ref() {
-            crate::votes::update_vote_after_unstake(votes_store, &owner, &mut account).expect(
+        if let Some(votes_store) = self.votes.clone() {
+            // Snapshot the votes row before `update_vote_after_unstake` writes it.
+            self.snapshot_votes(&owner);
+            crate::votes::update_vote_after_unstake(&votes_store, &owner, &mut account).expect(
                 "db error in TronDatabaseExt::tron_unfreeze_balance_v2 trimming votes",
             );
         }
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_unfreeze_balance_v2 writing owner account");
+        self.put_account_journaled(&owner, &account);
         // Shrink chain-wide weight by the floored basis change (delegated-out
         // unchanged, so `new_basis == old_basis - unfreeze_balance`).
         let weight_delta =
             (old_basis - unfreeze_balance) / TRX_PRECISION - old_basis / TRX_PRECISION;
         if weight_delta != 0 {
             match resource {
-                0 => dyn_props.add_total_net_weight(weight_delta),
-                1 => dyn_props.add_total_energy_weight(weight_delta),
-                2 => dyn_props.add_total_tron_power_weight(weight_delta),
+                0 => self.add_net_weight_journaled(&dyn_props, weight_delta),
+                1 => self.add_energy_weight_journaled(&dyn_props, weight_delta),
+                2 => self.add_tron_power_weight_journaled(&dyn_props, weight_delta),
                 _ => {}
             }
         }
@@ -945,7 +1087,7 @@ impl TronDatabaseExt for TronDatabase {
         // before validate. A second bump happens below iff it auto-withdraws an
         // expired unfreeze (`WITHDRAW_EXPIRE_BALANCE > 0`).
         self.note_internal_tx_nonce();
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
@@ -992,9 +1134,7 @@ impl TronDatabaseExt for TronDatabase {
         if withdraw > 0 {
             account.balance = account.balance.saturating_add(withdraw);
         }
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_cancel_all_unfreeze_v2 writing owner account");
+        self.put_account_journaled(&owner, &account);
         // Restore the chain-wide weight for the re-staked (not-expired) entries
         // (`floor(old + restored) - floor(old)`, byte-identical to java's
         // per-entry fold by telescoping).
@@ -1002,15 +1142,9 @@ impl TronDatabaseExt for TronDatabase {
         let energy_delta =
             (old_energy + restored_energy) / TRX_PRECISION - old_energy / TRX_PRECISION;
         let tp_delta = (old_tp + restored_tp) / TRX_PRECISION - old_tp / TRX_PRECISION;
-        if net_delta != 0 {
-            dyn_props.add_total_net_weight(net_delta);
-        }
-        if energy_delta != 0 {
-            dyn_props.add_total_energy_weight(energy_delta);
-        }
-        if tp_delta != 0 {
-            dyn_props.add_total_tron_power_weight(tp_delta);
-        }
+        self.add_net_weight_journaled(&dyn_props, net_delta);
+        self.add_energy_weight_journaled(&dyn_props, energy_delta);
+        self.add_tron_power_weight_journaled(&dyn_props, tp_delta);
         // Journal the expired-sweep balance to the caller (matches the on-chain
         // `setBalance(balance + withdrawExpireBalance)`).
         if withdraw > 0 {
@@ -1025,7 +1159,7 @@ impl TronDatabaseExt for TronDatabase {
     fn tron_withdraw_expire_unfreeze(&mut self, caller: Address) -> i64 {
         // java `Program.withdrawExpireUnfreeze`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
-        let Some(dyn_props) = self.dyn_props.as_ref() else {
+        let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
@@ -1049,9 +1183,7 @@ impl TronDatabaseExt for TronDatabase {
             Some(v) => v,
             None => return 0,
         };
-        self.accounts
-            .put(&owner, &account)
-            .expect("db error in TronDatabaseExt::tron_withdraw_expire_unfreeze writing owner account");
+        self.put_account_journaled(&owner, &account);
         // Credit the swept matured-unfreeze amount to the caller's
         // journaled balance.
         if withdrawn > 0 {
@@ -1071,7 +1203,7 @@ impl TronDatabaseExt for TronDatabase {
     ) -> i64 {
         // java `Program.delegateResource`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
-        let Some(resources) = self.delegated_resources.as_ref() else {
+        let Some(resources) = self.delegated_resources.clone() else {
             return 0;
         };
         if balance <= 0 || resource_type > 1 {
@@ -1130,12 +1262,8 @@ impl TronDatabaseExt for TronDatabase {
             }
             _ => {}
         }
-        self.accounts
-            .put(&owner, &owner_account)
-            .expect("db error in TronDatabaseExt::tron_delegate_resource writing owner account");
-        self.accounts
-            .put(&receiver, &receiver_account)
-            .expect("db error in TronDatabaseExt::tron_delegate_resource writing receiver account");
+        self.put_account_journaled(&owner, &owner_account);
+        self.put_account_journaled(&receiver, &receiver_account);
         // Write the DelegatedResource record so receiver-side reads see
         // the delegation. v2-unlocked key = (from, to).
         let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(&owner, &receiver);
@@ -1163,9 +1291,7 @@ impl TronDatabaseExt for TronDatabase {
             }
             _ => {}
         }
-        resources
-            .put_raw(&key, &record)
-            .expect("db error in TronDatabaseExt::tron_delegate_resource writing delegated resource record");
+        self.put_delegated_journaled(&resources, &key, &record);
         1
     }
 
@@ -1178,7 +1304,7 @@ impl TronDatabaseExt for TronDatabase {
     ) -> i64 {
         // java `Program.unDelegateResource`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
-        let Some(resources) = self.delegated_resources.as_ref() else {
+        let Some(resources) = self.delegated_resources.clone() else {
             return 0;
         };
         if balance <= 0 || resource_type > 1 {
@@ -1303,9 +1429,7 @@ impl TronDatabaseExt for TronDatabase {
             1 => record.frozen_balance_for_energy -= balance,
             _ => {}
         }
-        resources
-            .put_raw(&key, &record)
-            .expect("db error in TronDatabaseExt::tron_undelegate_resource writing delegated resource record");
+        self.put_delegated_journaled(&resources, &key, &record);
 
         // 3. Owner: credit FreezeV2 back, debit delegated_*, then fold the
         //    transferred usage in via `unDelegateIncrease`.
@@ -1344,17 +1468,13 @@ impl TronDatabaseExt for TronDatabase {
                     );
                 }
             }
-            self.accounts
-                .put(&owner, &owner_account)
-                .expect("db error in TronDatabaseExt::tron_undelegate_resource writing owner account");
+            self.put_account_journaled(&owner, &owner_account);
         }
 
         // 4. Persist the receiver last (mutated in step 1; java puts it earlier but
         //    it isn't modified after, so the end state matches).
         if let Some(recv) = receiver_account.as_ref() {
-            self.accounts
-                .put(&receiver, recv)
-                .expect("db error in TronDatabaseExt::tron_undelegate_resource writing receiver account");
+            self.put_account_journaled(&receiver, recv);
         }
         1
     }

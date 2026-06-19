@@ -78,6 +78,7 @@ pub mod precompiles;
 pub mod proposals;
 pub mod reward;
 pub mod shielded;
+pub mod staking_journal;
 pub mod tracer;
 pub mod trc10;
 pub mod tron_host;

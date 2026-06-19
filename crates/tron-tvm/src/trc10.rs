@@ -25,11 +25,14 @@ use revm::interpreter::{
 use revm::primitives::{Address, U256};
 use std::sync::Arc;
 use std::time::Instant;
-use tron_chainbase::{AccountStore, ContractStateStore, DynamicPropertiesStore};
+use tron_chainbase::{
+    AccountStore, ContractStateStore, DelegatedResourceStore, DynamicPropertiesStore, VotesStore,
+};
 use tron_proto::ContractState;
 
 use crate::database::evm_to_tron_address;
 use crate::internal_tx::InternalTxTrace;
+use crate::staking_journal::SharedStakingJournal;
 
 /// One per active *interpreter* VM frame, pushed at `initialize_interp`
 /// and popped at `call_end` / `create_end` (guarded by `interp_markers`
@@ -87,6 +90,24 @@ pub struct Trc10Inspector {
     cs_journal: Vec<(tron_crypto::address::Address, ContractState)>,
     /// Per-frame marker into `cs_journal` (parallels `committed_starts`).
     cs_journal_starts: Vec<usize>,
+    /// Shared per-frame rollback log for the staking / SELFDESTRUCT opcode
+    /// bridges (see [`crate::staking_journal`]). The host pushes a reversing
+    /// entry before every staking/suicide write; the inspector records
+    /// `len()` here at each frame entry (`staking_starts`) and, when a frame's
+    /// subtree reverts, unwinds (LIFO) every entry pushed within it — so even
+    /// an ANCESTOR revert undoes a succeeded descendant's writes, exactly as
+    /// java discards the uncommitted child deposit. Mirrors the `cs_journal`
+    /// mechanism. `None` (with the stores below also `None`) on read-only
+    /// setups that never attach the staking bridge.
+    staking_journal: Option<SharedStakingJournal>,
+    /// Per-frame marker into the shared staking journal (parallels
+    /// `cs_journal_starts`).
+    staking_starts: Vec<usize>,
+    /// Stores the staking-journal unwind writes back into (the same
+    /// session-wrapped handles the host bridges use). `votes` is optional
+    /// because VOTEWITNESS quietly no-ops without it.
+    staking_votes: Option<Arc<VotesStore>>,
+    staking_delegated_resources: Option<Arc<DelegatedResourceStore>>,
     accounts: Option<Arc<AccountStore>>,
     /// Optional per-contract dynamic-energy lookup. When set, the
     /// inspector reads the callee's factor at `initialize_interp` and
@@ -179,6 +200,10 @@ impl Trc10Inspector {
             committed_starts: Vec::new(),
             cs_journal: Vec::new(),
             cs_journal_starts: Vec::new(),
+            staking_journal: None,
+            staking_starts: Vec::new(),
+            staking_votes: None,
+            staking_delegated_resources: None,
             accounts: Some(accounts),
             contract_state: None,
             dyn_props: None,
@@ -294,6 +319,32 @@ impl Trc10Inspector {
         self
     }
 
+    /// Attach the shared per-frame staking/suicide rollback journal (the same
+    /// handle [`crate::database::TronDatabase`] holds) plus the stores it
+    /// unwinds into. With this set, a reverted VM frame discards the staking
+    /// writes its subtree made — the per-frame analogue of the per-tx
+    /// `VmSession` rollback in `tron-executor`. The unwind needs `dyn_props`
+    /// (the weight accumulators), which `with_dynamic_energy` already supplies;
+    /// when dynamic-energy is off, the dyn_props handle is passed here too.
+    pub fn with_staking_journal(
+        mut self,
+        journal: SharedStakingJournal,
+        dyn_props: Arc<DynamicPropertiesStore>,
+        votes: Option<Arc<VotesStore>>,
+        delegated_resources: Arc<DelegatedResourceStore>,
+    ) -> Self {
+        self.staking_journal = Some(journal);
+        // The unwind reverses TOTAL_*_WEIGHT deltas through `dyn_props`. Reuse
+        // the one `with_dynamic_energy` set if present; otherwise install it so
+        // the journal can reverse weight even with dynamic-energy disabled.
+        if self.dyn_props.is_none() {
+            self.dyn_props = Some(dyn_props);
+        }
+        self.staking_votes = votes;
+        self.staking_delegated_resources = Some(delegated_resources);
+        self
+    }
+
     /// Carry a top-level transaction's `(token_id, token_value)` into
     /// the first interpreter frame. The TRC-10 debit/credit on
     /// asset_v2 must happen separately *before* calling the EVM — this
@@ -365,6 +416,54 @@ impl Trc10Inspector {
         } else {
             self.cs_journal.truncate(jstart);
         }
+    }
+
+    /// Record the staking journal's current length as this frame's start
+    /// marker. Always pushes a marker (even when no journal is attached) so the
+    /// pop in `*_end` stays balanced with `call`/`create`.
+    fn push_staking_start(&mut self) {
+        let len = self
+            .staking_journal
+            .as_ref()
+            .map(|j| j.lock().expect("staking journal mutex poisoned").len())
+            .unwrap_or(0);
+        self.staking_starts.push(len);
+    }
+
+    /// Pop this frame's staking-journal marker. If the frame reverted/halted,
+    /// unwind (LIFO) every staking/suicide write its subtree recorded — exactly
+    /// as java discards the uncommitted child deposit. On success the entries
+    /// stay (an ancestor frame may still revert and unwind them); the top-level
+    /// frame's revert unwinds the lot (the per-tx `VmSession` also discards
+    /// them, so the unwind lands in an overlay that's about to be dropped —
+    /// harmless and idempotent).
+    fn unwind_staking_journal_if_reverted(&mut self, reverted: bool) {
+        let Some(start) = self.staking_starts.pop() else {
+            return;
+        };
+        let Some(journal) = self.staking_journal.clone() else {
+            return;
+        };
+        if !reverted {
+            return;
+        }
+        let (Some(accounts), Some(dyn_props), Some(delegated)) = (
+            self.accounts.as_ref(),
+            self.dyn_props.as_ref(),
+            self.staking_delegated_resources.as_ref(),
+        ) else {
+            return;
+        };
+        journal
+            .lock()
+            .expect("staking journal mutex poisoned")
+            .unwind_to(
+                start,
+                accounts,
+                self.staking_votes.as_deref(),
+                delegated,
+                dyn_props,
+            );
     }
 
     /// Σ dynamic-energy penalties across all finished frames — java's
@@ -500,6 +599,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         self.frame_starts.push(self.internal_txs.len());
         self.committed_starts.push(self.committed.len());
         self.cs_journal_starts.push(self.cs_journal.len());
+        self.push_staking_start();
         if depth > 0 {
             let trx_value = match inputs.value {
                 revm::interpreter::CallValue::Transfer(v) => v,
@@ -669,6 +769,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
             }
         }
         self.restore_cs_journal_if_reverted(reverted);
+        self.unwind_staking_journal_if_reverted(reverted);
     }
 
     fn create(
@@ -705,6 +806,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         self.frame_starts.push(self.internal_txs.len());
         self.committed_starts.push(self.committed.len());
         self.cs_journal_starts.push(self.cs_journal.len());
+        self.push_staking_start();
         self.internal_txs.push(InternalTxTrace {
             caller_address: *caller.as_bytes(),
             transfer_to_address: *target.as_bytes(),
@@ -760,6 +862,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
             self.record_frame_energy(&outcome.result.gas, outcome.result.result.is_halt());
         }
         self.restore_cs_journal_if_reverted(!outcome.result.result.is_ok());
+        self.unwind_staking_journal_if_reverted(!outcome.result.result.is_ok());
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {

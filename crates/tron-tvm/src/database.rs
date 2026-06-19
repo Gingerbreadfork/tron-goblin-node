@@ -129,6 +129,14 @@ pub struct TronDatabase {
     /// uses the value BEFORE its own bump. One `TronDatabase` per tx ⇒ one
     /// counter per tx.
     pub(crate) create_nonce: u64,
+    /// Per-VM-frame rollback log for the staking / SELFDESTRUCT opcode bridges,
+    /// shared with the [`crate::trc10::Trc10Inspector`]. Each staking/suicide
+    /// write records a reversing entry here BEFORE mutating its store; the
+    /// inspector unwinds a frame's subtree on revert. `None` on read-only setups
+    /// (eth_call / unit tests) — those have no frame boundaries to unwind, and
+    /// the bridges then write through with no journal (matching the historical
+    /// store-direct behaviour). See [`crate::staking_journal`].
+    pub(crate) staking_journal: Option<crate::staking_journal::SharedStakingJournal>,
     /// Nested CREATE/CREATE2 deploys recorded by the frame layer, keyed by the
     /// EVM contract address → (creator EVM address, is_create2). `commit`
     /// drains this to write each survivor's `SmartContract` row +
@@ -163,8 +171,21 @@ impl TronDatabase {
             version_cache: RefCell::new(HashMap::new()),
             root_tx_id: [0u8; 32],
             create_nonce: 0,
+            staking_journal: None,
             pending_created_contracts: HashMap::new(),
         }
+    }
+
+    /// Attach the shared per-frame staking/suicide rollback journal (the same
+    /// handle the [`crate::trc10::Trc10Inspector`] holds). When set, the
+    /// staking/suicide bridges snapshot each affected row / weight delta into
+    /// it before writing, so a reverted VM frame can discard them.
+    pub fn with_staking_journal(
+        mut self,
+        journal: crate::staking_journal::SharedStakingJournal,
+    ) -> Self {
+        self.staking_journal = Some(journal);
+        self
     }
 
     /// Set the root transaction id used for nested-CREATE address derivation.

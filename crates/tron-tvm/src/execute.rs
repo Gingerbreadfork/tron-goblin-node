@@ -393,6 +393,13 @@ fn execute_trigger_inner(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // Per-frame staking/suicide rollback journal, shared between the host
+    // (records reversing entries as it writes) and the inspector (unwinds a
+    // reverted frame's subtree). Mirrors java's per-frame child Repository: a
+    // staking op in an inner frame that reverts leaves no trace even when the
+    // top-level tx succeeds.
+    let staking_journal = crate::staking_journal::StakingJournal::new_shared();
+    tron_db = tron_db.with_staking_journal(Arc::clone(&staking_journal));
     // Witness registry backs the VOTEWITNESS bridge's SR-candidate check.
     tron_db = tron_db.with_witnesses(Arc::clone(&stores.witnesses));
     if let Some(rv) = stores.reward_vi.clone() {
@@ -474,6 +481,15 @@ fn execute_trigger_inner(
             Arc::clone(&stores.dynamic_properties),
         );
     }
+    // Same shared journal the host writes into — lets the inspector unwind a
+    // reverted frame's staking/suicide writes (per-frame analogue of the
+    // executor's per-tx VmSession).
+    trc10_inspector = trc10_inspector.with_staking_journal(
+        Arc::clone(&staking_journal),
+        Arc::clone(&stores.dynamic_properties),
+        stores.votes.as_ref().map(Arc::clone),
+        Arc::clone(&stores.delegated_resources),
+    );
     if let Some((id, val)) = top_level_token {
         trc10_inspector = trc10_inspector.with_top_level_token(id, val);
     }
@@ -682,6 +698,13 @@ fn execute_trigger_inner_with_tracer(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // Per-frame staking/suicide rollback journal, shared between the host
+    // (records reversing entries as it writes) and the inspector (unwinds a
+    // reverted frame's subtree). Mirrors java's per-frame child Repository: a
+    // staking op in an inner frame that reverts leaves no trace even when the
+    // top-level tx succeeds.
+    let staking_journal = crate::staking_journal::StakingJournal::new_shared();
+    tron_db = tron_db.with_staking_journal(Arc::clone(&staking_journal));
     // Witness registry backs the VOTEWITNESS bridge's SR-candidate check.
     tron_db = tron_db.with_witnesses(Arc::clone(&stores.witnesses));
     if let Some(rv) = stores.reward_vi.clone() {
@@ -764,6 +787,14 @@ fn execute_trigger_inner_with_tracer(
             Arc::clone(&stores.dynamic_properties),
         );
     }
+    // Same shared journal the host writes into — lets the inspector unwind a
+    // reverted frame's staking/suicide writes.
+    trc10_inspector = trc10_inspector.with_staking_journal(
+        Arc::clone(&staking_journal),
+        Arc::clone(&stores.dynamic_properties),
+        stores.votes.as_ref().map(Arc::clone),
+        Arc::clone(&stores.delegated_resources),
+    );
     if let Some((id, val)) = top_level_token {
         trc10_inspector = trc10_inspector.with_top_level_token(id, val);
     }
@@ -1091,6 +1122,13 @@ pub fn execute_create_with_trace(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // Per-frame staking/suicide rollback journal, shared between the host
+    // (records reversing entries as it writes) and the inspector (unwinds a
+    // reverted frame's subtree). Mirrors java's per-frame child Repository: a
+    // staking op in an inner frame that reverts leaves no trace even when the
+    // top-level tx succeeds.
+    let staking_journal = crate::staking_journal::StakingJournal::new_shared();
+    tron_db = tron_db.with_staking_journal(Arc::clone(&staking_journal));
     // Witness registry backs the VOTEWITNESS bridge's SR-candidate check.
     tron_db = tron_db.with_witnesses(Arc::clone(&stores.witnesses));
     if let Some(rv) = stores.reward_vi.clone() {
@@ -1167,6 +1205,14 @@ pub fn execute_create_with_trace(
             Arc::clone(&stores.dynamic_properties),
         );
     }
+    // Same shared journal the host writes into — lets the inspector unwind a
+    // reverted frame's staking/suicide writes.
+    trc10 = trc10.with_staking_journal(
+        Arc::clone(&staking_journal),
+        Arc::clone(&stores.dynamic_properties),
+        stores.votes.as_ref().map(Arc::clone),
+        Arc::clone(&stores.delegated_resources),
+    );
     // TRON SELFDESTRUCT semantics: the journal's destroy rule follows
     // proposal #94 (not the Cancun opcode spec), and a self-target
     // destroy credits the burn account when TRC-10 transfers are live.

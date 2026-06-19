@@ -118,6 +118,396 @@ fn push_u64(v: u64) -> Vec<u8> {
 }
 
 // =============================================================================
+// Inner-frame-revert staking leak (mirrors e0e37f2 for the per-frame case)
+// =============================================================================
+//
+// java-tron scopes every VM frame's staking-opcode side effects (the callee's
+// frozen / frozen_v2 / votes / delegated_* fields AND the chain-global
+// TOTAL_*_WEIGHT accumulators) to that frame's child Repository, committed to
+// the parent ONLY on frame success and discarded on frame revert. So a staking
+// op run inside an inner CALL frame that REVERTS leaves NO trace — even when
+// the outer/top-level tx frame SUCCEEDS.
+//
+// Our staking bridges (`crates/tron-tvm/src/tron_host.rs`) write directly to
+// the chainbase stores, BYPASSING revm's journal, so revm's per-frame
+// `checkpoint_revert` never undoes them. e0e37f2 added a per-TRANSACTION
+// VmSession (in tron-executor) that rolls these back on a WHOLE-TX revert, but
+// it has NO per-frame checkpoint: an inner frame that reverts while the
+// top-level frame succeeds still leaks. These tests reproduce that leak at the
+// VM level (no executor session) and assert the callee fields + global weight
+// accumulators are UNCHANGED after the tx.
+
+/// Build the OUTER contract (the trigger target): it CALLs `inner_evm` with
+/// gas=`gas`, value 0, no calldata, no return buffer, then POPs the (0/1)
+/// success flag and STOPs. Because it discards the CALL result, the outer
+/// frame SUCCEEDS even when the inner frame REVERTs.
+fn outer_calls_then_succeeds(inner_evm: [u8; 20], gas: u64) -> Vec<u8> {
+    let mut bc = Vec::new();
+    // CALL stack (top first): gas, to, value, inOffset, inLen, outOffset, outLen.
+    // Push in reverse so `gas` ends up on top.
+    bc.extend(push1(0)); // outLen
+    bc.extend(push1(0)); // outOffset
+    bc.extend(push1(0)); // inLen
+    bc.extend(push1(0)); // inOffset
+    bc.extend(push1(0)); // value
+    bc.push(0x73); // PUSH20 to
+    bc.extend_from_slice(&inner_evm);
+    bc.extend(push_u64(gas)); // gas (top of stack)
+    bc.push(0xf1); // CALL
+    bc.push(0x50); // POP the success flag — ignore inner revert
+    bc.push(0x00); // STOP → outer SUCCEEDS
+    bc
+}
+
+/// Regression: FREEZEBALANCEV2 inside an inner CALL frame that REVERTS must
+/// NOT leak — neither the inner contract's `frozen_v2` / balance debit nor the
+/// chain-global TOTAL_NET_WEIGHT. Before the fix the bridge's direct store
+/// writes survive the inner revert (revm's journal + the per-tx VmSession both
+/// miss it), so the freeze persisted and TOTAL_NET_WEIGHT drifted.
+#[test]
+fn inner_frame_revert_does_not_leak_freeze_v2() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa1);
+    let outer_addr = tron_addr(0xc1);
+    let inner_addr = tron_addr(0xb1);
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    // INNER: FREEZEBALANCEV2(amount, resource=0) then REVERT(0,0).
+    let frozen = 10_000_000u64;
+    let mut inner = Vec::new();
+    inner.extend(push_u64(frozen));
+    inner.extend(push1(0)); // resource = BANDWIDTH
+    inner.push(0xda); // FREEZEBALANCEV2
+    inner.push(0x50); // POP the success flag
+    inner.extend(push1(0)); // REVERT len
+    inner.extend(push1(0)); // REVERT offset
+    inner.push(0xfd); // REVERT → inner frame fails
+    install_contract(&stores, inner_addr, inner, 100_000_000);
+
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(inner_evm, 400_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        2_000_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "outer frame must SUCCEED (it ignores the inner revert), got: {outcome:?}"
+    );
+
+    // The inner contract (the freeze caller) must be byte-identical to its
+    // pre-state: no frozen_v2 slot, balance untouched.
+    let inner_acct = stores
+        .accounts
+        .get(&Address::from_raw(inner_addr))
+        .unwrap()
+        .unwrap();
+    assert!(
+        inner_acct.frozen_v2.iter().all(|f| f.amount == 0),
+        "inner-frame FREEZEBALANCEV2 leaked frozen_v2: {:?}",
+        inner_acct.frozen_v2
+    );
+    assert_eq!(
+        inner_acct.balance, 100_000_000,
+        "inner-frame FREEZEBALANCEV2 leaked the balance debit"
+    );
+    // The chain-global accumulator must not have drifted.
+    assert_eq!(
+        stores.dynamic_properties.total_net_weight(),
+        0,
+        "inner-frame FREEZEBALANCEV2 leaked TOTAL_NET_WEIGHT"
+    );
+}
+
+/// Regression: UNFREEZEBALANCEV2 inside an inner CALL frame that REVERTS must
+/// leave the callee's `frozen_v2` / `unfrozen_v2` and TOTAL_NET_WEIGHT exactly
+/// as they were. Exercises the unstake path (which decrements the weight and
+/// queues an unfreeze entry) under inner-frame revert.
+#[test]
+fn inner_frame_revert_does_not_leak_unfreeze_v2() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa2);
+    let outer_addr = tron_addr(0xc2);
+    let inner_addr = tron_addr(0xb2);
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    // INNER: UNFREEZEBALANCEV2(amount, resource=0) then REVERT.
+    let unfreeze = 5_000_000u64;
+    let mut inner = Vec::new();
+    inner.extend(push_u64(unfreeze));
+    inner.extend(push1(0));
+    inner.push(0xdb); // UNFREEZEBALANCEV2
+    inner.push(0x50);
+    inner.extend(push1(0));
+    inner.extend(push1(0));
+    inner.push(0xfd); // REVERT
+    let hash = code_hash(&inner);
+    stores.code.put(hash.as_slice(), &inner).unwrap();
+    // Seed the inner contract with held FreezeV2 and the matching weight, as if
+    // a prior (committed) freeze had recorded it.
+    stores.dynamic_properties.put_long(b"TOTAL_NET_WEIGHT", 20);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(inner_addr),
+            &Account {
+                address: inner_addr.to_vec(),
+                balance: 0,
+                code: inner.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 20_000_000 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(inner_evm, 400_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        2_000_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "outer must succeed: {outcome:?}");
+
+    let inner_acct = stores
+        .accounts
+        .get(&Address::from_raw(inner_addr))
+        .unwrap()
+        .unwrap();
+    let held: i64 = inner_acct.frozen_v2.iter().filter(|f| f.r#type == 0).map(|f| f.amount).sum();
+    assert_eq!(held, 20_000_000, "inner-frame UNFREEZEBALANCEV2 leaked the FreezeV2 debit");
+    assert!(
+        inner_acct.unfrozen_v2.is_empty(),
+        "inner-frame UNFREEZEBALANCEV2 leaked an unfrozen_v2 entry: {:?}",
+        inner_acct.unfrozen_v2
+    );
+    assert_eq!(
+        stores.dynamic_properties.total_net_weight(),
+        20,
+        "inner-frame UNFREEZEBALANCEV2 leaked TOTAL_NET_WEIGHT"
+    );
+}
+
+/// Regression: DELEGATERESOURCE inside an inner CALL frame that REVERTS must
+/// not leak the owner/receiver account moves OR the DelegatedResource row.
+#[test]
+fn inner_frame_revert_does_not_leak_delegate_resource() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa3);
+    let outer_addr = tron_addr(0xc3);
+    let inner_addr = tron_addr(0xb3);
+    let receiver = tron_addr(0xd3);
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    let amount = 3_000_000u64;
+    // INNER: DELEGATERESOURCE(receiver, amount, resource=0) then REVERT.
+    // Stack: [resource_type, delegate_balance, receiver_address] (resource top).
+    let mut inner = Vec::new();
+    inner.push(0x73); // PUSH20 receiver
+    inner.extend_from_slice(&receiver[1..]);
+    inner.extend(push_u64(amount));
+    inner.extend(push1(0)); // resource = BANDWIDTH
+    inner.push(0xde); // DELEGATERESOURCE
+    inner.push(0x50);
+    inner.extend(push1(0));
+    inner.extend(push1(0));
+    inner.push(0xfd); // REVERT
+    let hash = code_hash(&inner);
+    stores.code.put(hash.as_slice(), &inner).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(inner_addr),
+            &Account {
+                address: inner_addr.to_vec(),
+                balance: 0,
+                code: inner.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 10_000_000 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(receiver),
+            &Account { address: receiver.to_vec(), balance: 0, ..Default::default() },
+        )
+        .unwrap();
+
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(inner_evm, 400_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        2_000_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "outer must succeed: {outcome:?}");
+
+    let owner_acct = stores
+        .accounts
+        .get(&Address::from_raw(inner_addr))
+        .unwrap()
+        .unwrap();
+    let held: i64 = owner_acct.frozen_v2.iter().filter(|f| f.r#type == 0).map(|f| f.amount).sum();
+    assert_eq!(held, 10_000_000, "inner-frame DELEGATERESOURCE leaked the owner FreezeV2 debit");
+    assert_eq!(
+        owner_acct.delegated_frozen_v2_balance_for_bandwidth, 0,
+        "inner-frame DELEGATERESOURCE leaked the owner delegated counter"
+    );
+    let receiver_acct = stores
+        .accounts
+        .get(&Address::from_raw(receiver))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        receiver_acct.acquired_delegated_frozen_v2_balance_for_bandwidth, 0,
+        "inner-frame DELEGATERESOURCE leaked the receiver acquired counter"
+    );
+    let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(
+        &Address::from_raw(inner_addr),
+        &Address::from_raw(receiver),
+    );
+    let record = stores.delegated_resources.get_raw(&key).unwrap();
+    assert!(
+        record.map_or(true, |r| r.frozen_balance_for_bandwidth == 0),
+        "inner-frame DELEGATERESOURCE leaked a DelegatedResource row"
+    );
+}
+
+/// Regression (ANCESTOR revert): a staking op in a frame that itself SUCCEEDS
+/// must still be discarded when an ANCESTOR frame later reverts — java rolls
+/// back the whole child deposit. Three-level chain: outer CALLs `middle`
+/// (ignoring its result, so outer succeeds); `middle` CALLs `inner` then
+/// REVERTs; `inner` does FREEZEBALANCEV2 then STOPs (succeeds). The freeze must
+/// NOT persist, because `middle`'s revert discards `inner`'s committed subtree.
+#[test]
+fn ancestor_frame_revert_discards_succeeded_descendant_freeze() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa5);
+    let outer_addr = tron_addr(0xc5);
+    let middle_addr = tron_addr(0xb5);
+    let inner_addr = tron_addr(0xe5);
+    let middle_evm: [u8; 20] = middle_addr[1..].try_into().unwrap();
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    // INNER: FREEZEBALANCEV2(amount, 0) then STOP (this frame SUCCEEDS).
+    let frozen = 10_000_000u64;
+    let mut inner = Vec::new();
+    inner.extend(push_u64(frozen));
+    inner.extend(push1(0));
+    inner.push(0xda); // FREEZEBALANCEV2
+    inner.push(0x50);
+    inner.push(0x00); // STOP
+    install_contract(&stores, inner_addr, inner, 100_000_000);
+
+    // MIDDLE: CALL inner (succeeds), then REVERT (discards inner's subtree).
+    let mut middle = Vec::new();
+    middle.extend(push1(0)); // outLen
+    middle.extend(push1(0)); // outOffset
+    middle.extend(push1(0)); // inLen
+    middle.extend(push1(0)); // inOffset
+    middle.extend(push1(0)); // value
+    middle.push(0x73); // PUSH20 inner
+    middle.extend_from_slice(&inner_evm);
+    middle.extend(push_u64(300_000)); // gas
+    middle.push(0xf1); // CALL inner
+    middle.push(0x50); // POP success
+    middle.extend(push1(0)); // REVERT len
+    middle.extend(push1(0)); // REVERT offset
+    middle.push(0xfd); // REVERT → discards the whole subtree
+    install_contract(&stores, middle_addr, middle, 0);
+
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(middle_evm, 500_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        3_000_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "outer must succeed: {outcome:?}");
+
+    let inner_acct = stores
+        .accounts
+        .get(&Address::from_raw(inner_addr))
+        .unwrap()
+        .unwrap();
+    assert!(
+        inner_acct.frozen_v2.iter().all(|f| f.amount == 0),
+        "ancestor revert must discard the descendant's committed freeze: {:?}",
+        inner_acct.frozen_v2
+    );
+    assert_eq!(inner_acct.balance, 100_000_000, "ancestor revert must restore the balance");
+    assert_eq!(
+        stores.dynamic_properties.total_net_weight(),
+        0,
+        "ancestor revert must restore TOTAL_NET_WEIGHT"
+    );
+}
+
+/// Control: the SAME inner staking op, but the inner frame SUCCEEDS (STOP
+/// instead of REVERT). The freeze MUST persist and the global weight MUST move
+/// — proving the fix only suppresses the REVERTED-frame writes, not legitimate
+/// committed ones.
+#[test]
+fn inner_frame_success_still_commits_freeze_v2() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa4);
+    let outer_addr = tron_addr(0xc4);
+    let inner_addr = tron_addr(0xb4);
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    let frozen = 10_000_000u64;
+    let mut inner = Vec::new();
+    inner.extend(push_u64(frozen));
+    inner.extend(push1(0));
+    inner.push(0xda); // FREEZEBALANCEV2
+    inner.push(0x50);
+    inner.push(0x00); // STOP → inner SUCCEEDS
+    install_contract(&stores, inner_addr, inner, 100_000_000);
+
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(inner_evm, 400_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        2_000_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "outer must succeed: {outcome:?}");
+
+    let inner_acct = stores
+        .accounts
+        .get(&Address::from_raw(inner_addr))
+        .unwrap()
+        .unwrap();
+    let held: i64 = inner_acct.frozen_v2.iter().filter(|f| f.r#type == 0).map(|f| f.amount).sum();
+    assert_eq!(held, frozen as i64, "committed inner-frame freeze must persist");
+    assert_eq!(
+        inner_acct.balance,
+        100_000_000 - frozen as i64,
+        "committed inner-frame freeze must debit balance"
+    );
+    assert_eq!(
+        stores.dynamic_properties.total_net_weight(),
+        frozen as i64 / 1_000_000,
+        "committed inner-frame freeze must move TOTAL_NET_WEIGHT"
+    );
+}
+
+// =============================================================================
 // FREEZEBALANCEV2 (0xda)
 // =============================================================================
 
