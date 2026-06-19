@@ -117,6 +117,7 @@ fn make_driver(state: StateBackends, blocks_be: Arc<dyn KvBackend>) -> SyncDrive
         tip_test: false,
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
+        fetch_inflight_per_peer: 64,
         peer_is_fast_forward: false,
         follow_tip: false,
     };

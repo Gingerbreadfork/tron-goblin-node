@@ -1872,6 +1872,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 fetch_block_timeout: std::time::Duration::from_millis(
                     config.p2p.fetch_block_timeout_ms.clamp(100, 1000),
                 ),
+                fetch_inflight_per_peer: config
+                    .p2p
+                    .sync_fetch_inflight_per_peer
+                    .clamp(16, 100),
                 peer_is_fast_forward,
                 follow_tip: config.p2p.follow_tip,
             };

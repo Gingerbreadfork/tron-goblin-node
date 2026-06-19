@@ -191,6 +191,7 @@ pub fn run_replay(
         tip_test: false,
         p2p_rate_limits: config.rate_limiter.p2p.clone(),
         fetch_block_timeout: std::time::Duration::from_millis(200),
+        fetch_inflight_per_peer: 64,
         peer_is_fast_forward: false,
         follow_tip: false,
     };

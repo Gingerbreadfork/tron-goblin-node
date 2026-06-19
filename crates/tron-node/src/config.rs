@@ -1007,6 +1007,22 @@ pub struct P2pConfig {
     /// Default 200.
     #[serde(default = "default_fetch_block_timeout_ms")]
     pub fetch_block_timeout_ms: u64,
+    /// Cooperative-fetch per-peer in-flight block cap (only consulted when
+    /// [`Self::multi_peer_fetch`] is on). The most blocks this node will have
+    /// outstanding to ANY single peer at once — the per-peer back-pressure that
+    /// keeps the fetch fan-out spread across many peers instead of letting one
+    /// fast peer vacuum the whole window. Lower = more peers share the load
+    /// (better citizenship, no single host overloaded); higher = deeper
+    /// per-peer pipeline. java-tron's own pull cap is `MAX_BLOCK_FETCH_PER_PEER`
+    /// (100); we stay at or below that so we never out-pressure what a peer
+    /// expects from one connection. Default 64 keeps a healthy per-peer pipe
+    /// while leaving headroom under the 100 cap and spreading the rest across
+    /// the fleet. Clamped to `[16, 100]` at the use site.
+    #[serde(
+        default = "default_sync_fetch_inflight_per_peer",
+        alias = "syncFetchInflightPerPeer"
+    )]
+    pub sync_fetch_inflight_per_peer: usize,
     /// Operator-supplied `fastForwardNodes` set. Each entry is a peer
     /// `HOST:PORT` string. When a SR produces a block, peers in this
     /// list receive the full `Block` frame directly (lowest-latency
@@ -1149,6 +1165,7 @@ impl Default for P2pConfig {
             node_discovery_persist: default_node_discovery_persist(),
             node_discovery_persist_interval_ms: default_node_discovery_persist_interval_ms(),
             fetch_block_timeout_ms: default_fetch_block_timeout_ms(),
+            sync_fetch_inflight_per_peer: default_sync_fetch_inflight_per_peer(),
             fast_forward_nodes: Vec::new(),
             tip_test: None,
             multi_peer_fetch: default_multi_peer_fetch(),
@@ -1207,6 +1224,14 @@ fn default_fetch_block_timeout_ms() -> u64 {
     // java-tron clamps to [100, 1000]; the config.conf default is
     // typically 200.
     200
+}
+
+fn default_sync_fetch_inflight_per_peer() -> usize {
+    // At or below java-tron's `MAX_BLOCK_FETCH_PER_PEER` (100) so a single
+    // connection never carries more in-flight than the peer expects; 64 keeps
+    // a deep-enough per-peer pipe while leaving the rest of the backlog for
+    // OTHER peers to fetch in parallel (spreads load, no single host hammered).
+    64
 }
 
 fn default_progress_log_interval() -> usize {
@@ -2079,6 +2104,7 @@ mod tests {
         assert!(cfg.p2p.listen);
         assert_eq!(cfg.p2p.listen_host, "0.0.0.0");
         assert!(cfg.p2p.discover_enable);
+        assert_eq!(cfg.p2p.sync_fetch_inflight_per_peer, 64);
         // The opt-in state surfaces ship off with their documented defaults.
         assert!(!cfg.index.commitment.enabled);
         assert_eq!(cfg.index.commitment.confirmation_lag_blocks, 20);

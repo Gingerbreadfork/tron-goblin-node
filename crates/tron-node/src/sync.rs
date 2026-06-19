@@ -111,6 +111,15 @@ pub struct SyncConfig {
     /// scheduler treats the slot as releasable after `timeout *
     /// BLOCK_FETCH_LEFT_TIME_PERCENT` (50%).
     pub fetch_block_timeout: Duration,
+    /// Cooperative-fetch per-peer in-flight block cap (multi-peer fetch only):
+    /// the most blocks this driver keeps outstanding to its peer at once. Caps
+    /// per-connection request pressure (≤ java-tron's `MAX_BLOCK_FETCH_PER_PEER`
+    /// of 100) so a single fast peer can't vacuum the whole window — the rest
+    /// of the backlog stays available for OTHER peers to fetch in parallel,
+    /// spreading load across the fleet. Sourced from
+    /// `p2p.sync_fetch_inflight_per_peer`, clamped to `[16, 100]` by the
+    /// runtime.
+    pub fetch_inflight_per_peer: usize,
     /// `true` when THIS peer is one of the operator's
     /// `fastForwardNodes`. Drives the produced-block relay decision:
     /// fast-forward peers receive the full `Block` frame as a direct
@@ -647,6 +656,33 @@ mod fetch_pool_tests {
             p.claim(T2, HI, 10, 100, Duration::from_secs(5), fresh),
             vec![id(3)]
         );
+    }
+
+    #[test]
+    fn bounded_chunks_spread_the_backlog_across_peers() {
+        // Per-peer in-flight cap in action: with each worker claiming only a
+        // bounded chunk per request (its headroom under the cap), two peers
+        // SPLIT the want set instead of the first vacuuming all of it. This is
+        // the fan-out that keeps `f` > 1 and no single peer overloaded.
+        let p = SyncFetchPool::new();
+        p.push_wants([w(1), w(2), w(3), w(4), w(5), w(6)]);
+        // Worker A claims its first 2-block chunk (its cap headroom).
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_secs(5), fresh),
+            vec![id(1), id(2)]
+        );
+        // Worker B, waking in the same tick, takes the NEXT two — the lowest
+        // still-unclaimed — rather than re-contending for A's blocks.
+        assert_eq!(
+            p.claim(T2, HI, 2, 100, Duration::from_secs(5), fresh),
+            vec![id(3), id(4)]
+        );
+        // The tail is still available for either peer's next chunk.
+        assert_eq!(
+            p.claim(T1, HI, 2, 100, Duration::from_secs(5), fresh),
+            vec![id(5), id(6)]
+        );
+        assert_eq!(p.outstanding(), 6, "all six in flight across two peers");
     }
 
     #[test]
@@ -2611,7 +2647,7 @@ impl SyncDriver {
         // (a FetchInvData went out or a Block frame came in). Backs the
         // `blocks_in_flight` stall reset below: a peer that silently drops
         // part of a batch (or answers ItemNotFound we failed to account)
-        // would otherwise leak the counter up to PIPELINE_LOW_WATER and
+        // would otherwise leak the counter up to the per-peer in-flight cap and
         // permanently mute this connection's fetching — a zombie worker.
         let mut last_block_pipeline_at: Instant = Instant::now();
         // On ANY exit from this peer pass, return this connection's in-flight
@@ -2655,14 +2691,24 @@ impl SyncDriver {
         // keep the connection "alive" every ~10s, so the 60s read-idle valve
         // never fires on a healthy-looking socket.
         let mut awaiting_inventory: Option<Instant> = None;
-        // Pipelining threshold: when in-flight blocks drop below this,
-        // try to queue the next FetchInvData chunk so the peer is
-        // continuously processing while we're draining the current
-        // batch's blocks. Half a batch (50) is a sweet spot: leaves
-        // enough processing headroom that we don't race the rate
-        // limiter, but starts the next request well before the
-        // current batch finishes.
-        const PIPELINE_LOW_WATER: usize = 50;
+        // Per-peer in-flight cap (`p2p.sync_fetch_inflight_per_peer`, clamped
+        // to [16,100] by the runtime). The most blocks this connection keeps
+        // outstanding to its peer at once — the per-peer back-pressure that
+        // spreads the backlog across many peers instead of letting one fast
+        // peer claim the whole window. Stays ≤ java-tron's
+        // `MAX_BLOCK_FETCH_PER_PEER` (100), so we never out-pressure a single
+        // connection beyond what the peer expects.
+        let inflight_cap: usize = self.config.fetch_inflight_per_peer.clamp(16, 100);
+        // Pipelining threshold: when in-flight blocks drop below this, queue
+        // the next FetchInvData chunk so the peer is continuously processing
+        // while we're draining the current batch. Half the per-peer cap leaves
+        // processing headroom that doesn't race the rate limiter but starts the
+        // next request well before the current batch finishes.
+        let pipeline_low_water: usize = (inflight_cap / 2).max(1);
+        // Per FetchInvData chunk: never claim more than the remaining headroom
+        // under the per-peer cap, so each request leaves room for OTHER peers
+        // to claim the rest of the want set in parallel. Bounded by
+        // FETCH_CHUNK_SIZE (the wire-batch cap) as a ceiling.
         const FETCH_CHUNK_SIZE: usize = 100;
 
         // === Multi-peer fetch pool state (only used when a pool is attached) ===
@@ -2728,12 +2774,17 @@ impl SyncDriver {
         const POOL_READY_CAP: usize = 400;
         // Re-offer a still-in-flight id to a different peer after this long. A
         // dead peer's claims are reclaimed immediately on disconnect (the
-        // `FetchClaimGuard`), so this only covers a *slow-but-alive* peer; with
-        // apply now running at ~20 blk/s the pipeline drains fast, so a long
-        // window would idle the leader. The per-connection fetched-history
-        // guard makes a re-offer harmless (the slow peer's late delivery is
-        // still accepted).
-        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(8);
+        // `FetchClaimGuard`), so this only covers a *slow-but-alive* peer that
+        // hasn't yet answered a FetchInvData. A healthy peer answers a
+        // 100-block batch in well under a second, and the per-request pacing is
+        // `REQ_MIN_INTERVAL` (0.4s) — so 5s is many round-trips of slack, far
+        // above any legitimate delivery latency, yet fails over off a genuinely
+        // stuck head-of-line block in ~half the previous window (at ~20 blk/s a
+        // stalled head-of-line block costs the leader ~100 blocks of idle). The
+        // re-offer is harmless either way: the per-connection fetched-history
+        // guard never re-hands the id to the slow peer, and that peer's late
+        // delivery is still accepted by `deliver`, so no fetch is wasted.
+        const POOL_RECLAIM_AFTER: Duration = Duration::from_secs(5);
         // How long an outstanding `SyncBlockChain` may go unanswered before
         // the single-flight gate re-opens. The peer either answers within an
         // RTT or never will (rate-limiter drop / undecodable reply); a leader
@@ -3161,7 +3212,13 @@ impl SyncDriver {
                 // Pool path: claim+fetch ids inside our offered window; when
                 // there's nothing left to claim there, refresh the window
                 // (advance to the current shared head / re-establish context).
-                let can_fetch = blocks_in_flight < PIPELINE_LOW_WATER
+                // Gate on BOTH the per-peer in-flight cap (so this connection
+                // never carries more outstanding than the peer expects, leaving
+                // the rest of the backlog for other peers) AND the pipeline
+                // low-water (so we only top up once the pipe has drained a
+                // little, not on every byte received).
+                let can_fetch = blocks_in_flight < inflight_cap
+                    && blocks_in_flight < pipeline_low_water
                     && offered_max > 0
                     && self
                         .fetch_pool
@@ -3174,20 +3231,35 @@ impl SyncDriver {
                         .unwrap_or(false);
                 if can_fetch {
                     Some(PendingAction::FetchChunk)
-                } else if blocks_in_flight == 0
-                    && prev_id.is_some()
+                } else if prev_id.is_some()
                     && awaiting_inventory.is_none()
-                    // Refresh our window only once (a) the leader's apply queue
-                    // is fully drained (so an overlapping re-offer can't push
-                    // duplicate ids into `expected` and stall the drain;
-                    // workers have no `expected` so this is always true), AND
-                    // (b) our applied head has reached the highest block this
-                    // peer already offered us (`offered_max`). Refreshing while
-                    // still below `offered_max` would send a locator lower than
-                    // the peer's recorded `lastSyncBlockId` — a regression it
-                    // rejects with BAD_PROTOCOL. Waiting until head ≥ offered_max
-                    // keeps every refresh monotonic.
-                    && expected.is_empty()
+                    // Refresh our offered window once our applied head has
+                    // reached the highest block this peer already offered us
+                    // (`offered_max`). The peer serves blocks strictly AFTER the
+                    // highest id in our locator (our head), so with head ≥
+                    // offered_max the next window is entirely above offered_max —
+                    // disjoint from everything currently tracked (want ∪ inflight
+                    // ∪ ready ∪ expected all sit at ≤ offered_max) and from every
+                    // already-applied block (≤ head). `push_wants` dedups against
+                    // the live set, so the leader's `expected` can never gain a
+                    // duplicate from the refresh. Refreshing while head <
+                    // offered_max would send a locator below the peer's recorded
+                    // `lastSyncBlockId` (a regression it rejects with
+                    // BAD_PROTOCOL), so the head ≥ offered_max guard is what keeps
+                    // every refresh monotonic.
+                    //
+                    // Critically we DON'T wait for `expected` to drain or for
+                    // in-flight fetches to settle: a 2000-id window drains in
+                    // seconds across the worker fleet but takes far longer to
+                    // apply, so the old "refresh only when fully idle" gate let
+                    // the want set empty (every worker goes idle, f→0) and only
+                    // refilled in a burst once the leader finished applying the
+                    // whole window. Priming the NEXT window the moment the head
+                    // clears the current one keeps the want set — and the worker
+                    // fan-out — continuously fed. The single-flight
+                    // `awaiting_inventory` gate still prevents a duplicate
+                    // outstanding locator; aggregate locator volume over a sync
+                    // is unchanged (one per window), just issued earlier.
                     && self.head_number() >= offered_max
                 {
                     Some(PendingAction::AskInventory)
@@ -3195,7 +3267,7 @@ impl SyncDriver {
                     None
                 }
             } else if !pending_fetch_queue.is_empty()
-                && blocks_in_flight < PIPELINE_LOW_WATER
+                && blocks_in_flight < pipeline_low_water
             {
                 Some(PendingAction::FetchChunk)
             } else if pending_fetch_queue.is_empty()
@@ -3240,14 +3312,28 @@ impl SyncDriver {
                                 // Claim ids inside OUR peer's offered window
                                 // (num ≤ offered_max), deduped across the fleet
                                 // — so this FetchInvData is always in-context.
+                                // Bound the claim by the remaining headroom under
+                                // the per-peer in-flight cap (and the wire-batch
+                                // ceiling): a worker only ever pulls up to its own
+                                // cap, so a single fast peer can't vacuum the whole
+                                // want set in one request — the rest stays
+                                // claimable by OTHER peers in the same tick, which
+                                // is what spreads the fan-out (`f`) across the
+                                // fleet instead of collapsing onto one fetcher.
+                                let chunk = fetch_chunk_size(
+                                    blocks_in_flight,
+                                    inflight_cap,
+                                    FETCH_CHUNK_SIZE,
+                                );
                                 let claimed = self
                                     .fetch_pool
                                     .as_ref()
+                                    .filter(|_| chunk > 0)
                                     .map(|p| {
                                         p.claim(
                                             conn_token,
                                             offered_max,
-                                            FETCH_CHUNK_SIZE,
+                                            chunk,
                                             POOL_READY_CAP,
                                             POOL_RECLAIM_AFTER,
                                             |id| fetched_ids.contains_key(id),
@@ -4128,8 +4214,8 @@ impl SyncDriver {
                     // miss quietly degrades this connection:
                     //   * decrement `blocks_in_flight` by the missing count —
                     //     it only counts down on received Block frames, so an
-                    //     unaccounted miss leaks it toward PIPELINE_LOW_WATER,
-                    //     where this connection stops fetching (and a leader
+                    //     unaccounted miss leaks it toward the per-peer in-flight
+                    //     cap, where this connection stops fetching (and a leader
                     //     stops refreshing) for good;
                     //   * hand the ids straight back to the pool so a
                     //     DIFFERENT connection fetches them now, instead of
@@ -6601,6 +6687,20 @@ mod node_id_tests {
     }
 }
 
+/// Block-ids to claim in one cooperative-fetch `FetchInvData` chunk for a peer
+/// that already has `in_flight` blocks outstanding.
+///
+/// The size is the remaining headroom under the per-peer in-flight cap
+/// (`per_peer_cap`), clamped to the wire-batch ceiling (`wire_cap`). Capping at
+/// the per-peer headroom is what keeps the fetch fan-out spread across the
+/// fleet: a worker never pulls more than its own cap in one request, so a fast
+/// peer can't vacuum the whole want set — the rest stays claimable by OTHER
+/// peers in the same tick. Returns `0` when the peer is already at its cap (the
+/// caller then issues no request, leaving the slot for another peer).
+fn fetch_chunk_size(in_flight: usize, per_peer_cap: usize, wire_cap: usize) -> usize {
+    per_peer_cap.saturating_sub(in_flight).min(wire_cap)
+}
+
 /// Pick the next rotation cursor after leaving a peer: a random candidate
 /// different from `cursor` whose peer isn't archive-demoted, falling back to
 /// a linear scan. Returns `cursor` unchanged only when no other eligible
@@ -6687,6 +6787,36 @@ impl XorShift64 {
             let j = self.next_usize_below(i + 1);
             slice.swap(i, j);
         }
+    }
+}
+
+#[cfg(test)]
+mod fetch_chunk_size_tests {
+    use super::fetch_chunk_size;
+
+    #[test]
+    fn full_headroom_when_idle_capped_at_wire_batch() {
+        // Idle peer (0 in-flight) under a 64 cap: claim up to the wire-batch
+        // ceiling (100), so a fresh worker fills its pipe in one request.
+        assert_eq!(fetch_chunk_size(0, 64, 100), 64);
+        // A larger cap is still bounded by the wire-batch ceiling.
+        assert_eq!(fetch_chunk_size(0, 200, 100), 100);
+    }
+
+    #[test]
+    fn shrinks_to_remaining_headroom_under_the_cap() {
+        // 40 already outstanding, cap 64 → only 24 more may be claimed, so the
+        // rest of the want set stays claimable by OTHER peers in the same tick.
+        assert_eq!(fetch_chunk_size(40, 64, 100), 24);
+    }
+
+    #[test]
+    fn zero_at_or_over_the_cap_so_the_slot_goes_to_another_peer() {
+        // At the cap: no request — back-pressure holds, the slot is left for a
+        // different peer to fetch the remaining backlog (spreads the fan-out).
+        assert_eq!(fetch_chunk_size(64, 64, 100), 0);
+        // Over the cap (a transient overshoot) is also zero, never negative.
+        assert_eq!(fetch_chunk_size(70, 64, 100), 0);
     }
 }
 
@@ -7538,6 +7668,7 @@ mod solidify_tests {
             tip_test: false,
             p2p_rate_limits: Default::default(),
             fetch_block_timeout: Duration::from_millis(200),
+            fetch_inflight_per_peer: 64,
             peer_is_fast_forward: false,
             follow_tip: false,
         };
@@ -7585,6 +7716,7 @@ mod solidify_tests {
             tip_test: false,
             p2p_rate_limits: Default::default(),
             fetch_block_timeout: Duration::from_millis(200),
+            fetch_inflight_per_peer: 64,
             peer_is_fast_forward: false,
             follow_tip: true,
         };
@@ -8182,6 +8314,7 @@ mod pipelined_apply_tests {
             tip_test: false,
             p2p_rate_limits: Default::default(),
             fetch_block_timeout: Duration::from_millis(200),
+            fetch_inflight_per_peer: 64,
             peer_is_fast_forward: false,
             follow_tip: false,
         };

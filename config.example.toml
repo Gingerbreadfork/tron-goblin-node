@@ -144,6 +144,14 @@ progress_log_interval = 100
 # Per-block live-tip fetch timeout, ms (clamped to [100, 1000]).
 fetch_block_timeout_ms = 200
 
+# Cooperative-fetch per-peer in-flight block cap (multi-peer fetch only). The
+# most blocks this node keeps outstanding to ANY single peer at once. Lower
+# spreads the catch-up backlog across more peers (better citizenship, no single
+# host overloaded); higher gives each peer a deeper pipeline. Stays at or below
+# java-tron's per-connection pull cap (100) so we never out-pressure what a peer
+# expects from one connection. Clamped to [16, 100]. Default 64.
+sync_fetch_inflight_per_peer = 64
+
 # fastForwardNodes: peers that receive full Block frames directly on production
 # (lowest latency) instead of an inventory advertisement. SR/relay operators only.
 fast_forward_nodes = []

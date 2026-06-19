@@ -229,6 +229,7 @@ fn applied_block_flows_through_hook_engine_and_reader() {
         tip_test: false,
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
+        fetch_inflight_per_peer: 64,
         peer_is_fast_forward: false,
         follow_tip: false,
     };
@@ -389,6 +390,7 @@ fn rpc_by_id_fallbacks_resolve_through_hook_written_stores() {
         tip_test: false,
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
+        fetch_inflight_per_peer: 64,
         peer_is_fast_forward: false,
         follow_tip: false,
     };
@@ -504,6 +506,7 @@ fn applied_blocks_archive_historical_state_exactly() {
         tip_test: false,
         p2p_rate_limits: Default::default(),
         fetch_block_timeout: Duration::from_millis(200),
+        fetch_inflight_per_peer: 64,
         peer_is_fast_forward: false,
         follow_tip: false,
     };
