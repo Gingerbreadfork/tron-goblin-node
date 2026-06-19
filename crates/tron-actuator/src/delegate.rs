@@ -13,8 +13,9 @@ use tron_proto::{
     Account, DelegateResourceContract, DelegatedResource, UnDelegateResourceContract,
 };
 use tron_types::resource::{
-    all_frozen_balance_for_bandwidth, all_frozen_balance_for_energy, set_latest_time, set_usage,
-    undelegate_increase, update_usage, usage, ResourceGates, ResourceKind,
+    all_frozen_balance_for_bandwidth, all_frozen_balance_for_energy, delegatable_frozen_v2,
+    set_latest_time, set_usage, undelegate_increase, update_usage, usage, ResourceGates,
+    ResourceKind,
 };
 
 use crate::freeze::TRX_PRECISION;
@@ -143,15 +144,34 @@ pub fn validate_delegate_resource(
     let owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    let frozen = owner_account
-        .frozen_v2
-        .iter()
-        .find(|f| f.r#type == contract.resource)
-        .map(|f| f.amount)
-        .unwrap_or(0);
-    if frozen < contract.balance {
+    // java `DelegateResourceActuator.validate`: the delegatable amount is the
+    // owner's frozen-V2 pool MINUS the usage that pool currently backs
+    // (`getFrozenV2BalanceFor{Bandwidth,Energy}() - getV2{Net,Energy}Usage`),
+    // not the raw frozen-V2 pool. Mirrors the TVM `DELEGATERESOURCE` opcode
+    // path (`DelegateResourceProcessor.validate`).
+    let kind = resource_kind(contract.resource);
+    let (total_limit, total_weight) = match kind {
+        ResourceKind::Bandwidth => (dyn_props.total_net_limit(), dyn_props.total_net_weight()),
+        ResourceKind::Energy => (
+            dyn_props.total_energy_current_limit(),
+            dyn_props.total_energy_weight(),
+        ),
+    };
+    let available = delegatable_frozen_v2(
+        &owner_account,
+        kind,
+        dyn_props.head_slot(),
+        total_weight,
+        total_limit,
+        ResourceGates {
+            support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        },
+        dyn_props.allow_harden_resource_calculation(),
+    );
+    if available < contract.balance {
         return Err(ActuatorError::InsufficientBalance {
-            balance: frozen,
+            balance: available,
             needed: contract.balance,
         });
     }

@@ -479,6 +479,120 @@ pub fn all_frozen_balance_for_energy(account: &Account) -> i64 {
         .saturating_add(res.acquired_delegated_frozen_v2_balance_for_energy)
 }
 
+/// java-tron `AccountCapsule.getFrozenV2BalanceForBandwidth` — the v2
+/// frozen-for-bandwidth pool this account holds.
+pub fn frozen_v2_balance_for_bandwidth(account: &Account) -> i64 {
+    account
+        .frozen_v2
+        .iter()
+        .filter(|fb| fb.r#type == 0) // BANDWIDTH
+        .map(|fb| fb.amount)
+        .sum()
+}
+
+/// java-tron `AccountCapsule.getFrozenV2BalanceForEnergy` — the v2
+/// frozen-for-energy pool this account holds.
+pub fn frozen_v2_balance_for_energy(account: &Account) -> i64 {
+    account
+        .frozen_v2
+        .iter()
+        .filter(|fb| fb.r#type == 1) // ENERGY
+        .map(|fb| fb.amount)
+        .sum()
+}
+
+/// java-tron `FreezeV2Util.getV2NetUsage(ownerCapsule, netUsage,
+/// disableJavaLangMath)` — the portion of the account's net usage that is
+/// backed by its *own* frozen-V2 bandwidth (after removing the usage
+/// attributable to V1 self-frozen and acquired-delegated weight):
+/// `max(0, netUsage - getFrozenBalance() (V1)
+///         - getAcquiredDelegatedFrozenBalanceForBandwidth() (V1)
+///         - getAcquiredDelegatedFrozenV2BalanceForBandwidth())`.
+fn v2_net_usage(account: &Account, net_usage: i64) -> i64 {
+    let v1_frozen: i64 = account.frozen.iter().map(|f| f.frozen_balance).sum();
+    let v2 = net_usage
+        .saturating_sub(v1_frozen)
+        .saturating_sub(account.acquired_delegated_frozen_balance_for_bandwidth)
+        .saturating_sub(account.acquired_delegated_frozen_v2_balance_for_bandwidth);
+    v2.max(0)
+}
+
+/// java-tron `FreezeV2Util.getV2EnergyUsage(ownerCapsule, energyUsage,
+/// disableJavaLangMath)` — the portion of the account's energy usage that
+/// is backed by its *own* frozen-V2 energy:
+/// `max(0, energyUsage - getEnergyFrozenBalance() (V1)
+///         - getAcquiredDelegatedFrozenBalanceForEnergy() (V1)
+///         - getAcquiredDelegatedFrozenV2BalanceForEnergy())`.
+fn v2_energy_usage(account: &Account, energy_usage: i64) -> i64 {
+    let res = account.account_resource.as_ref();
+    let v1_frozen = res
+        .and_then(|r| r.frozen_balance_for_energy.as_ref())
+        .map(|f| f.frozen_balance)
+        .unwrap_or(0);
+    let acquired_v1 = res.map(|r| r.acquired_delegated_frozen_balance_for_energy).unwrap_or(0);
+    let acquired_v2 = res
+        .map(|r| r.acquired_delegated_frozen_v2_balance_for_energy)
+        .unwrap_or(0);
+    let v2 = energy_usage
+        .saturating_sub(v1_frozen)
+        .saturating_sub(acquired_v1)
+        .saturating_sub(acquired_v2);
+    v2.max(0)
+}
+
+/// The frozen-V2 balance an owner may still delegate out for `kind`, matching
+/// java-tron's `DelegateResourceProcessor.validate` (the TVM `DELEGATERESOURCE`
+/// opcode path) and `DelegateResourceActuator.validate`:
+///
+/// 1. decay the owner's usage to `now_slot`
+///    (`EnergyProcessor.updateUsage` / `BandwidthProcessor.updateUsageForDelegated`),
+/// 2. convert that decayed usage to a sun-denominated weight
+///    `usage * TRX_PRECISION * ((double) totalWeight / totalLimit)` (IEEE-754
+///    `double`, java truncates to `long`),
+/// 3. strip the part of that weight attributable to V1 self-frozen and
+///    acquired-delegated balances (`getV2{Net,Energy}Usage`), leaving the
+///    usage charged against the owner's own frozen-V2 pool,
+/// 4. the delegatable balance is `getFrozenV2BalanceFor{Bandwidth,Energy}()`
+///    MINUS that frozen-V2-charged usage.
+///
+/// The caller compares this against `delegateBalance`: java rejects (and the
+/// opcode therefore reverts) when `delegatable < delegateBalance`. `harden` /
+/// `gates` select the windowed-decay arithmetic (mainnet: legacy `double`).
+///
+/// Decays a *clone* of the usage window — java's `updateUsage` mutates only the
+/// in-memory capsule used for the check and is never persisted (the delegate
+/// `execute` re-reads the account), so this leaves `account` untouched.
+pub fn delegatable_frozen_v2(
+    account: &Account,
+    kind: ResourceKind,
+    now_slot: i64,
+    total_weight: i64,
+    total_limit: i64,
+    gates: ResourceGates,
+    harden: bool,
+) -> i64 {
+    let mut decayed = account.clone();
+    update_usage(&mut decayed, kind, now_slot, gates, harden);
+    let decayed_usage = usage(&decayed, kind);
+    // java: `(long)(usage * TRX_PRECISION * ((double) totalWeight / totalLimit))`.
+    let usage_weight = if total_limit > 0 {
+        ((decayed_usage as f64) * (TRX_PRECISION as f64) * (total_weight as f64 / total_limit as f64))
+            as i64
+    } else {
+        0
+    };
+    match kind {
+        ResourceKind::Bandwidth => {
+            let frozen_v2 = frozen_v2_balance_for_bandwidth(&decayed);
+            frozen_v2.saturating_sub(v2_net_usage(&decayed, usage_weight))
+        }
+        ResourceKind::Energy => {
+            let frozen_v2 = frozen_v2_balance_for_energy(&decayed);
+            frozen_v2.saturating_sub(v2_energy_usage(&decayed, usage_weight))
+        }
+    }
+}
+
 /// java-tron `RepositoryImpl.usageToBalance(usage, totalWeight, totalLimit)` —
 /// convert a recovered usage figure back into the sun-denominated balance it
 /// represents.
@@ -1265,6 +1379,65 @@ mod tests {
         // the `1e13 * 1e6` product overflows i64 and wraps before the divide.
         let wrapped_avg = div_ceil_i64(overflow_usage.wrapping_mul(PRECISION), WINDOW_SIZE_BLOCKS);
         assert_eq!(legacy_of, get_usage2_i64(wrapped_avg, WINDOW_SIZE_BLOCKS, 0, WINDOW_SIZE_BLOCKS));
+    }
+
+    /// java-tron `DelegateResourceProcessor.validate` (ENERGY) caps the
+    /// delegatable amount at `getFrozenV2BalanceForEnergy() - v2EnergyUsage`,
+    /// NOT the raw frozen-V2 pool: an account that has consumed energy has part
+    /// of its frozen-V2 locked behind that usage. With `totalWeight ==
+    /// totalLimit` the usage-weight is `energyUsage * TRX_PRECISION`, so an
+    /// `energy_usage` of 5 reserves 5 TRX of a 10-TRX pool, leaving 5 TRX
+    /// delegatable. `latest == now_slot` keeps the usage un-decayed for a
+    /// deterministic figure; this helper decays a clone and never mutates the
+    /// input account.
+    #[test]
+    fn delegatable_frozen_v2_energy_subtracts_v2_usage() {
+        let now_slot = 1_000;
+        let account = Account {
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 1, amount: 10_000_000 }],
+            account_resource: Some(AccountResource {
+                energy_usage: 5,
+                latest_consume_time_for_energy: now_slot,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // totalWeight == totalLimit → usage-weight == energy_usage * TRX_PRECISION.
+        let delegatable = delegatable_frozen_v2(
+            &account,
+            ResourceKind::Energy,
+            now_slot,
+            1_000_000_000,
+            1_000_000_000,
+            GATES_V2,
+            false,
+        );
+        assert_eq!(
+            delegatable, 5_000_000,
+            "frozenV2(10 TRX) - v2EnergyUsage(5 TRX) = 5 TRX delegatable"
+        );
+        // The input account must be untouched (the decay is on a clone).
+        assert_eq!(account.account_resource.as_ref().unwrap().energy_usage, 5);
+    }
+
+    /// An account with no energy usage can delegate its entire frozen-V2 pool.
+    #[test]
+    fn delegatable_frozen_v2_energy_full_pool_when_no_usage() {
+        let now_slot = 1_000;
+        let account = Account {
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 1, amount: 10_000_000 }],
+            ..Default::default()
+        };
+        let delegatable = delegatable_frozen_v2(
+            &account,
+            ResourceKind::Energy,
+            now_slot,
+            1_000_000_000,
+            1_000_000_000,
+            GATES_V2,
+            false,
+        );
+        assert_eq!(delegatable, 10_000_000, "no usage → full pool delegatable");
     }
 
     #[test]

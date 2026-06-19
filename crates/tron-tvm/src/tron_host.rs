@@ -1215,18 +1215,58 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         }
         let resource = resource_type as i32;
+        let Some(dyn_props) = self.dyn_props.clone() else {
+            return 0;
+        };
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
             return 0;
         };
+        // java `DelegateResourceProcessor.validate`: the owner can only
+        // delegate out the frozen-V2 balance NOT already covering its own
+        // decayed resource usage — `getFrozenV2BalanceFor{Bandwidth,Energy}()
+        // - getV2{Net,Energy}Usage(...)`. Checking only the raw frozen-V2 pool
+        // (`have < balance`) over-accepts: an account that has consumed
+        // resource has part of its frozen-V2 locked behind that usage, so java
+        // rejects a delegation that the raw pool would cover and the opcode
+        // reverts. Match java's available-balance computation exactly.
+        use tron_types::resource::{
+            delegatable_frozen_v2, ResourceGates, ResourceKind,
+        };
+        let kind = if resource == 0 {
+            ResourceKind::Bandwidth
+        } else {
+            ResourceKind::Energy
+        };
+        let (total_limit, total_weight) = match kind {
+            ResourceKind::Bandwidth => {
+                (dyn_props.total_net_limit(), dyn_props.total_net_weight())
+            }
+            ResourceKind::Energy => (
+                dyn_props.total_energy_current_limit(),
+                dyn_props.total_energy_weight(),
+            ),
+        };
+        let gates = ResourceGates {
+            support_unfreeze_delay: dyn_props.support_unfreeze_delay(),
+            support_allow_cancel_all_unfreeze_v2: dyn_props.support_allow_cancel_all_unfreeze_v2(),
+        };
+        let available = delegatable_frozen_v2(
+            &owner_account,
+            kind,
+            dyn_props.head_slot(),
+            total_weight,
+            total_limit,
+            gates,
+            dyn_props.allow_harden_resource_calculation(),
+        );
+        if available < balance {
+            return 0;
+        }
         // Debit owner's FreezeV2 by `balance` for this resource type.
         let slot = owner_account
             .frozen_v2
             .iter_mut()
             .find(|f| f.r#type == resource);
-        let have = slot.as_ref().map(|f| f.amount).unwrap_or(0);
-        if have < balance {
-            return 0;
-        }
         if let Some(f) = slot {
             f.amount -= balance;
         }
@@ -1862,6 +1902,80 @@ mod tests {
             dyn_props.total_energy_weight(),
             2,
             "energy weight must use with-delegated basis: floor(2.2)-floor(0.7)=2 (old held-only bug gave 1)"
+        );
+    }
+
+    /// java `DelegateResourceProcessor.validate` (the TVM `DELEGATERESOURCE`
+    /// opcode path) caps the delegatable ENERGY at `getFrozenV2BalanceForEnergy()
+    /// - v2EnergyUsage`, NOT the raw frozen-V2 pool. An owner that has consumed
+    /// energy has part of its frozen-V2 reserved behind that usage, so java
+    /// REJECTS (and the opcode reverts → the EnergyManager `require` fails) a
+    /// delegation the raw pool would cover. Regression for the 83,555,614
+    /// REVERT-vs-SUCCESS divergence (contract 41037b3e2f… delegateEnergy):
+    /// before the fix `tron_delegate_resource` checked only the raw pool and
+    /// returned success (push 1), so the contract did not revert.
+    ///
+    /// Setup: `totalEnergyWeight == totalEnergyCurrentLimit` makes the
+    /// usage-weight `energy_usage * TRX_PRECISION`; `head_slot == 0 ==
+    /// latest_consume_time_for_energy` keeps the usage un-decayed. With a 10-TRX
+    /// frozen-V2 pool and an energy_usage of 5 (→ 5 TRX reserved), 6 TRX must be
+    /// rejected and 4 TRX must succeed.
+    #[test]
+    fn tvm_delegate_energy_rejects_over_v2_energy_usage() {
+        let (db, dyn_props) = make_staking_db();
+        // head_slot = (ts - genesis) / 3000 = 0; latest_consume_time = 0 → no decay.
+        dyn_props.save_latest_block_header_timestamp(0);
+        dyn_props.save_total_energy_weight(1_000_000_000);
+        dyn_props.save_total_energy_current_limit(1_000_000_000);
+        let owner = tron_addr(0x60);
+        let receiver = tron_addr(0x61);
+        let owner_account = Account {
+            address: owner.to_vec(),
+            frozen_v2: vec![FreezeV2 { r#type: 1, amount: 10_000_000 }],
+            account_resource: Some(AccountResource {
+                energy_usage: 5,
+                latest_consume_time_for_energy: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        db.accounts.put(&TronAddress::from_raw(owner), &owner_account).unwrap();
+        db.accounts
+            .put(
+                &TronAddress::from_raw(receiver),
+                &Account { address: receiver.to_vec(), ..Default::default() },
+            )
+            .unwrap();
+
+        let mut db = db;
+        let caller = evm_addr_from_tron(owner);
+        let to = evm_addr_from_tron(receiver);
+
+        // 6 TRX > (10 - 5) delegatable → java rejects → opcode pushes 0.
+        assert_eq!(
+            db.tron_delegate_resource(caller, 6_000_000, to, 1, false, 0),
+            0,
+            "delegation above frozenV2 - v2EnergyUsage must fail (REVERT in the EnergyManager require)"
+        );
+        // Owner state untouched on the rejected delegation.
+        let owner_after = db.accounts.get(&TronAddress::from_raw(owner)).unwrap().unwrap();
+        assert_eq!(
+            owner_after.frozen_v2.iter().find(|f| f.r#type == 1).unwrap().amount,
+            10_000_000,
+            "rejected delegation must not debit the frozen-V2 pool"
+        );
+
+        // 4 TRX <= (10 - 5) delegatable → succeeds (push 1), debits the pool.
+        assert_eq!(
+            db.tron_delegate_resource(caller, 4_000_000, to, 1, false, 0),
+            1,
+            "delegation within the available frozenV2 - v2EnergyUsage must succeed"
+        );
+        let owner_after = db.accounts.get(&TronAddress::from_raw(owner)).unwrap().unwrap();
+        assert_eq!(
+            owner_after.frozen_v2.iter().find(|f| f.r#type == 1).unwrap().amount,
+            6_000_000,
+            "successful 4-TRX delegation debits the frozen-V2 pool"
         );
     }
 
