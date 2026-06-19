@@ -53,7 +53,9 @@ usage:
   tron-node export-snapshot  --to PATH [--data-dir DIR]
                              [--compression gzip|none]
   tron-node verify-snapshot  [--data-dir DIR]
-  tron-node replay-blocks    --blocks FILE [--data-dir DIR] [--to N]
+  tron-node replay-blocks    --blocks FILE [--data-dir DIR] [--to N] [--verify]
+                             [--config FILE]
+  tron-node dump-blocks      --out FILE --from N --to M [--data-dir DIR]
                              [--config FILE]
   tron-node bench-decode     --blocks FILE [--count N]
 
@@ -117,6 +119,16 @@ replay-blocks:    network-free block apply, for a fair throughput benchmark
                   EOF). Honors [vm] parallel_exec / pipelined_apply from
                   --config (or ./config.toml). The data-dir must already hold an
                   imported snapshot. Prints `replay-blocks: applied=N head=M`.
+                  --verify also runs the contractRet success/failure tripwire
+                  (logs CONTRACTRET DIVERGENCE), for narrow fix-verification
+                  from a checkpoint near a divergence block.
+
+dump-blocks:      read blocks --from N --to M out of an already-synced data-dir's
+                  BlockStore and write them to --out FILE in the length-prefixed
+                  format replay-blocks consumes — NO network. Run once after a
+                  sync to capture a range, then drive repeated offline replays /
+                  narrow fix-verifications from disk at CPU speed (deterministic,
+                  no peer fetch). Prints `dump-blocks: written=N first=A last=B`.
 
 bench-decode:     pure DECODE-throughput microbenchmark — no state, no RocksDB,
                   no execution. Loads the first --count blocks of the same
@@ -190,6 +202,7 @@ fn main() -> ExitCode {
         "export-snapshot" => run_export_snapshot(&args[2..]),
         "verify-snapshot" => run_verify_snapshot(&args[2..]),
         "replay-blocks" => run_replay_blocks(&args[2..]),
+        "dump-blocks" => run_dump_blocks(&args[2..]),
         "bench-decode" => run_bench_decode(&args[2..]),
         "admin" => run_admin(&args[2..]),
         "diag" => tron_node::diag::run_diag(&args[2..]),
@@ -378,14 +391,19 @@ fn run_verify_snapshot(args: &[String]) -> ExitCode {
 /// resolved exactly as the daemon resolves it.
 fn run_replay_blocks(args: &[String]) -> ExitCode {
     const USAGE_LINE: &str =
-        "usage: tron-node replay-blocks --blocks FILE [--data-dir DIR] [--to N] [--config FILE]";
+        "usage: tron-node replay-blocks --blocks FILE [--data-dir DIR] [--to N] [--verify] [--config FILE]";
     let mut blocks: Option<PathBuf> = None;
     let mut to: i64 = i64::MAX;
+    // Run the success/failure (contractRet) tripwire during the offline
+    // apply, so a narrow fix-verification reports a divergence the same way
+    // the live sync does. Off by default (a pure throughput benchmark).
+    let mut verify = false;
     // Everything not consumed here is forwarded to parse_args.
     let mut passthrough: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--verify" => verify = true,
             "--blocks" => {
                 i += 1;
                 let Some(s) = args.get(i) else {
@@ -424,7 +442,7 @@ fn run_replay_blocks(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match tron_node::run_replay(&config, &blocks, to) {
+    match tron_node::run_replay(&config, &blocks, to, verify) {
         Ok(report) => {
             // Machine-parseable final line for the bench script.
             println!(
@@ -435,6 +453,93 @@ fn run_replay_blocks(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("tron-node: replay-blocks failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `tron-node dump-blocks --out FILE --from N --to M [--data-dir DIR] [--config FILE]`
+///
+/// Read blocks `from..=to` out of an already-synced data-dir's `BlockStore`
+/// and write them as the length-prefixed `Block` archive `replay-blocks`
+/// consumes — a network-free way to capture a block range once and then drive
+/// repeated offline replays / narrow fix-verifications from disk at CPU speed.
+fn run_dump_blocks(args: &[String]) -> ExitCode {
+    const USAGE_LINE: &str =
+        "usage: tron-node dump-blocks --out FILE --from N --to M [--data-dir DIR] [--config FILE]";
+    let mut out: Option<PathBuf> = None;
+    let mut from: Option<i64> = None;
+    let mut to: Option<i64> = None;
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--out needs FILE");
+                    return ExitCode::from(2);
+                };
+                out = Some(PathBuf::from(s));
+            }
+            "--from" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--from needs N");
+                    return ExitCode::from(2);
+                };
+                from = Some(match s.parse() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("--from parse: {e}");
+                        return ExitCode::from(2);
+                    }
+                });
+            }
+            "--to" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    eprintln!("--to needs N");
+                    return ExitCode::from(2);
+                };
+                to = Some(match s.parse() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("--to parse: {e}");
+                        return ExitCode::from(2);
+                    }
+                });
+            }
+            other => passthrough.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let (Some(out), Some(from), Some(to)) = (out, from, to) else {
+        eprintln!("--out, --from and --to are all required");
+        eprintln!("{USAGE_LINE}");
+        return ExitCode::from(2);
+    };
+    if to < from {
+        eprintln!("--to ({to}) must be >= --from ({from})");
+        return ExitCode::from(2);
+    }
+    let config = match parse_args(&passthrough) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match tron_node::dump_blocks(&config, from, to, &out) {
+        Ok(report) => {
+            println!(
+                "dump-blocks: written={} first={} last={}",
+                report.written, report.first, report.last
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("tron-node: dump-blocks failed: {e}");
             ExitCode::FAILURE
         }
     }

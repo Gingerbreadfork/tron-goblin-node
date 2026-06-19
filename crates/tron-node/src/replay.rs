@@ -36,7 +36,7 @@
 //!   `replay-blocks: applied=N head=M`.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use bytes::Bytes;
@@ -131,6 +131,7 @@ pub fn run_replay(
     config: &NodeConfig,
     blocks_path: &Path,
     to: i64,
+    verify_contract_ret: bool,
 ) -> Result<ReplayReport, ReplayError> {
     // === Open the snapshot and replay any orphan checkpoint manifests ===
     // The daemon's startup runs this same BlockSession-checkpoint
@@ -165,7 +166,10 @@ pub fn run_replay(
         defer_store_fsync: false,
         parallel_exec: vm.parallel_exec,
         capture_state_deltas: false,
-        verify_contract_ret: false,
+        // Off for a pure throughput benchmark; ON for divergence hunting /
+        // narrow fix-verification (the `--verify` flag), so the offline
+        // apply runs the same success/failure tripwire the live sync does.
+        verify_contract_ret,
     };
 
     // === Build the apply driver ===
@@ -303,6 +307,106 @@ pub fn run_replay(
         skipped,
         head,
     })
+}
+
+/// Result of a `dump-blocks` archive run.
+pub struct DumpReport {
+    /// Number of blocks written to the archive.
+    pub written: u64,
+    /// Lowest block number written (`-1` if none).
+    pub first: i64,
+    /// Highest block number written (`-1` if none).
+    pub last: i64,
+}
+
+/// Produce a length-prefixed block archive — the same
+/// `[int32 big-endian length][Block bytes]` stream [`run_replay`] consumes —
+/// by reading blocks `from..=to` straight out of an already-synced data-dir's
+/// `BlockStore`. No network, no peers: run this once after a normal sync to
+/// capture the block range, then drive any number of offline replays and
+/// narrow fix-verifications from the file at CPU speed (deterministic,
+/// repeatable, immune to peer rotation).
+///
+/// The bytes written are the store's persisted `Block` encoding, which is the
+/// canonical wire form the replay's raw-bytes `txTrieRoot`/block-id checks
+/// validate against — a non-canonical row would be *rejected* on replay
+/// (block-not-applied), not silently mis-applied, so the archive is
+/// self-checking the first time it's replayed.
+pub fn dump_blocks(
+    config: &NodeConfig,
+    from: i64,
+    to: i64,
+    out_path: &Path,
+) -> Result<DumpReport, ReplayError> {
+    let stores = OpenedStores::open(&config.data_dir)?;
+    let block_store = tron_chainbase::BlockStore::new(stores.blocks.clone());
+
+    let file = File::create(out_path)?;
+    let mut w = BufWriter::with_capacity(1 << 20, file);
+
+    // Forward num-ordered scan in chunks, the same primitive the chain uses
+    // for paginated range walks.
+    const CHUNK: usize = 256;
+    let mut next = from;
+    let mut written = 0u64;
+    let mut first = -1i64;
+    let mut last = -1i64;
+    let t0 = std::time::Instant::now();
+    info!(from, to, out = %out_path.display(), "dump-blocks starting");
+    'outer: while next <= to {
+        let want = (((to - next + 1) as usize).min(CHUNK)).max(1);
+        let blocks = block_store.get_limit_number(next, want).map_err(|e| {
+            ReplayError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("block store read at {next}: {e}"),
+            ))
+        })?;
+        if blocks.is_empty() {
+            break; // gap or end of store
+        }
+        let mut advanced = false;
+        for b in &blocks {
+            let n = b
+                .block_header
+                .as_ref()
+                .and_then(|h| h.raw_data.as_ref())
+                .map(|r| r.number)
+                .unwrap_or(-1);
+            // Dedup any fork-height duplicate and stop at the ceiling.
+            if n < next {
+                continue;
+            }
+            if n > to {
+                break 'outer;
+            }
+            let bytes = b.encode_to_vec();
+            w.write_all(&(bytes.len() as i32).to_be_bytes())?;
+            w.write_all(&bytes)?;
+            written += 1;
+            if first < 0 {
+                first = n;
+            }
+            last = n;
+            next = n + 1;
+            advanced = true;
+            if written % 50_000 == 0 {
+                info!(written, at = last, "dump-blocks progress");
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    w.flush()?;
+    let secs = t0.elapsed().as_secs_f64().max(1e-9);
+    info!(
+        written,
+        first,
+        last,
+        rate = format!("{:.0} blk/s", written as f64 / secs),
+        "dump-blocks done"
+    );
+    Ok(DumpReport { written, first, last })
 }
 
 /// Result of a decode-only microbenchmark run.
