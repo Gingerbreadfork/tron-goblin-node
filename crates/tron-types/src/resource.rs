@@ -211,26 +211,26 @@ pub fn calculate_global_limit_v2(
 /// its free quota until that saturates, so the 1-byte floor cascades into a
 /// chain of contractRet divergences.
 ///
-/// * harden: `(frozeBalance * totalLimit) / (TRX_PRECISION * totalWeight)`
-///   (BigInteger / i128, a single end truncation).
-/// * legacy: `(long)((double) frozeBalance / TRX_PRECISION
-///   * ((double) totalLimit / totalWeight))`.
+/// java-tron 4.8.1.1's `calculateGlobalNetLimitV2` is UNCONDITIONALLY this
+/// `double` scaling: `(long)((double) frozeBalance / TRX_PRECISION
+/// * ((double) totalNetLimit / totalNetWeight))`. The deployed release has
+/// **no** `hardenCalculation()`/integer branch for NET V2 (verified against
+/// `BandwidthProcessor.calculateGlobalNetLimitV2` source), so the `harden`
+/// flag is ignored here — exactly as the energy V2 path
+/// ([`calculate_global_limit_v2`]) ignores it. A BigInteger/i64 integer path
+/// would truncate up to 1 byte differently from java's double and wrongly
+/// reject a frozen-net tx java covers.
 pub fn calculate_global_net_limit_v2(
     froze_balance: i64,
     total_limit: i64,
     total_weight: i64,
-    harden: bool,
+    _harden: bool,
 ) -> i64 {
     if total_weight <= 0 {
         return 0;
     }
-    if harden {
-        ((froze_balance as i128) * (total_limit as i128)
-            / ((TRX_PRECISION as i128) * (total_weight as i128))) as i64
-    } else {
-        ((froze_balance as f64 / TRX_PRECISION as f64)
-            * (total_limit as f64 / total_weight as f64)) as i64
-    }
+    ((froze_balance as f64 / TRX_PRECISION as f64)
+        * (total_limit as f64 / total_weight as f64)) as i64
 }
 
 /// `divideCeil(a, b)` over i128 — `ceil(a / b)` for `a, b >= 0`.
