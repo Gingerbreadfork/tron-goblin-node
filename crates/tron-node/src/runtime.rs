@@ -1192,13 +1192,18 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                                         let mut added = 0usize;
                                         for addr in discovered {
                                             let s = addr.to_string();
+                                            if g.contains(&s) {
+                                                continue;
+                                            }
+                                            // FIFO-evict the oldest at the cap so a
+                                            // long run keeps cycling in freshly-
+                                            // discovered peers instead of freezing
+                                            // on the first cap-full snapshot.
                                             if g.len() >= DYNAMIC_POOL_CAP {
-                                                break;
+                                                g.remove(0);
                                             }
-                                            if !g.contains(&s) {
-                                                g.push(s);
-                                                added += 1;
-                                            }
+                                            g.push(s);
+                                            added += 1;
                                         }
                                         if added > 0 {
                                             debug!(
@@ -1259,6 +1264,78 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 "dns: discovery complete"
             );
         }
+    }
+
+    // Periodic DNS-tree refresh. The walk above is a one-shot startup
+    // snapshot; on a long run those endpoints go stale (good servers drop
+    // off, dial targets die), and without `discover_enable` there is no Kad
+    // feeder replenishing the rotation pool — so a sync-only node's
+    // throughput decays until a manual restart re-walks the tree. Re-walk on
+    // a timer and fold fresh endpoints into the shared `dynamic_pool` the
+    // rotation drivers consume, independent of `discover_enable`. The drivers
+    // already demote dead peers via per-peer backoff; this keeps a fresh
+    // supply flowing in to replace them.
+    if !config.p2p.disabled && !config.p2p.discover_tree_urls.is_empty() {
+        let urls = config.p2p.discover_tree_urls.clone();
+        let query_timeout = Duration::from_millis(config.p2p.discover_tree_query_timeout_ms);
+        let refresh_pool = dynamic_pool.clone();
+        let mut sd_dns = shutdown.subscribe();
+        // Gentle on the tree's DNS, frequent enough to cycle in fresh peers
+        // well within a single multi-hour sync.
+        const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+        handles.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DNS_REFRESH_INTERVAL);
+            ticker.tick().await; // skip the immediate tick — startup already walked
+            loop {
+                tokio::select! {
+                    _ = sd_dns.recv() => return,
+                    _ = ticker.tick() => {
+                        let mut fresh: Vec<String> = Vec::new();
+                        for url in &urls {
+                            match tron_net::resolve_dns_tree(url, query_timeout).await {
+                                Ok(eps) => {
+                                    fresh.extend(eps.into_iter().map(|a| a.to_string()))
+                                }
+                                Err(e) => warn!(
+                                    url = url.as_str(), error = %e,
+                                    "dns: periodic tree re-walk failed; continuing"
+                                ),
+                            }
+                        }
+                        if fresh.is_empty() {
+                            continue;
+                        }
+                        if let Ok(mut g) = refresh_pool.lock() {
+                            let present: std::collections::HashSet<String> =
+                                g.iter().cloned().collect();
+                            let mut added = 0usize;
+                            for s in fresh {
+                                if present.contains(&s) {
+                                    continue;
+                                }
+                                // FIFO-evict the oldest entry at the cap so fresh
+                                // peers always get a slot — otherwise a long run
+                                // freezes on the first cap-full snapshot. The
+                                // rotation drivers keep already-dialed peers in
+                                // their own working set, so an eviction here only
+                                // stops the pool from blocking new discoveries.
+                                if g.len() >= DYNAMIC_POOL_CAP {
+                                    g.remove(0);
+                                }
+                                g.push(s);
+                                added += 1;
+                            }
+                            if added > 0 {
+                                info!(
+                                    added, pool = g.len(),
+                                    "dns: periodic re-walk folded fresh peers into rotation pool"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }));
     }
 
     // `--explore` / `--mempool` live dashboards. Both bootstrap from a real
