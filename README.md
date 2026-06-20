@@ -179,7 +179,7 @@ have. What works today, by area:
 - **Block execution** — decode + validate + execute live mainnet blocks
   into per-store RocksDB state, with full actuator coverage of
   java-tron's contract types (Transfer, AssetTransfer, Exchange\*,
-  FreezeBalance\*, Witness\*, Proposal\*, Trigger/CreateSmartContract, …).
+  FreezeBalance\*, DelegateResource\*, Witness\*, Proposal\*, Trigger/CreateSmartContract, …).
 - **Block-STM parallel execution** (`vm.parallel_exec`) — transactions
   execute optimistically across cores with MVCC conflict tracking,
   re-running only those that conflict, for a result **byte-identical to
@@ -295,14 +295,6 @@ Real, currently-open items:
 - ❌ **Long-running mainnet soak / endurance.** Short live sessions
   pass; multi-hour, multi-day stability under realistic peer churn
   hasn't been characterized.
-- ❌ **A V1 (Stake 1.0) delegate-freeze edge.** The Stake 2.0
-  delegated-resource lifecycle is ported — delegate/undelegate with the
-  receiver bandwidth/energy *usage-transfer* fold on undelegate, and
-  on-write maintenance of the `DelegatedResourceAccountIndex` lookup
-  (wired into both actuators). The deprecated V1 `FreezeBalanceContract`
-  with a `receiver_address` (resource delegation via the old freeze path)
-  is still unhandled — it moves account state + `DelegatedResource` rows,
-  not just weight. Rare on mainnet (superseded by Stake 2.0).
 - ❌ **Probably a number of other things.** java-tron is large
   and old; some quirks will only surface when a specific client or
   workload hits them. This list will be updated as new items are
