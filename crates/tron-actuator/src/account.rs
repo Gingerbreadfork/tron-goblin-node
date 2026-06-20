@@ -207,7 +207,8 @@ pub fn execute_set_account_id(
 const MAX_ACTIVE_PERMISSIONS: usize = 8;
 /// Default `TOTAL_SIGN_NUM` from java-tron when unset.
 const DEFAULT_TOTAL_SIGN_NUM: i64 = 5;
-/// Maximum permission name length (java-tron `Permission.MAX_NAME_LENGTH`).
+/// Maximum permission name length in UTF-16 code units, matching java's
+/// `name.length() > 32` check in `AccountPermissionUpdateActuator`.
 const MAX_PERMISSION_NAME_LEN: usize = 32;
 /// `operations` bitmap is 32 bytes (256 bits, one per ContractType).
 const OPERATIONS_BYTES: usize = 32;
@@ -311,7 +312,16 @@ fn check_permission(
             "permission's threshold should be greater than 0",
         ));
     }
-    if permission.permission_name.len() > MAX_PERMISSION_NAME_LEN {
+    // java's `name.length()` is a UTF-16 code-unit count (and the empty
+    // name is allowed via `StringUtils.isEmpty`), not a UTF-8 byte count;
+    // `String::len` here is bytes, so measure UTF-16 units to match.
+    if permission
+        .permission_name
+        .chars()
+        .map(char::len_utf16)
+        .sum::<usize>()
+        > MAX_PERMISSION_NAME_LEN
+    {
         return Err(ActuatorError::Validate("permission's name is too long"));
     }
     if permission.parent_id != 0 {

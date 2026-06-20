@@ -445,7 +445,9 @@ fn check_operation_allowed(
     let bit_index = contract_type as usize;
     let byte_idx = bit_index / 8;
     let bit = 1u8 << (bit_index % 8);
-    if byte_idx >= permission.operations.len() {
+    // java's `WalletUtil.checkPermissionOperations` throws (failing the tx)
+    // unless the bitmap is exactly 32 bytes, before testing the bit.
+    if permission.operations.len() != 32 {
         return Err(PermissionError::OperationsDisallowedContract);
     }
     if permission.operations[byte_idx] & bit == 0 {
