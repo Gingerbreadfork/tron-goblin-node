@@ -706,6 +706,25 @@ Thanks in particular to:
 If you maintain a crate we depend on and you're not listed here,
 that's an oversight — please open an issue and we'll fix it.
 
+## Support
+
+This node is independent and unfunded, built from scratch to give TRON
+something it has never had: a real second client. It's free, open-source, and
+already does things the reference node can't.
+
+If it saved you time, taught you something, or you simply want an independent
+TRON client to keep existing, a donation puts that work directly back into more
+parity, more features, and keeping all of it free. Even a few TRX makes a
+difference, and there's no obligation at all.
+
+Send TRX or any TRC-20 token, on TRON mainnet, to:
+
+```
+TKbx8NEyu41T69zgmQGbjAt1dF6o49QuNA
+```
+
+Every contribution keeps the goblin fed and the commits coming. Thank you. 🧌
+
 ## License
 
 LGPL-3.0-or-later. See [`LICENSE`](LICENSE).
