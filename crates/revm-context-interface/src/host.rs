@@ -276,6 +276,19 @@ pub trait Host {
         false
     }
 
+    /// **TRON fork** — `true` when running under the TRON VM (the real
+    /// chainbase-backed Context). Used by the shared CALL opcode path to
+    /// gate TRON-only semantics that diverge from upstream EVM — e.g.
+    /// java-tron forbids a value/token transfer to oneself
+    /// (`VMUtils.validateForSmartContract` throws "Cannot transfer … to
+    /// yourself"), whereas upstream EVM treats a `from == to` self-transfer
+    /// as a legal no-op. Default `false` keeps DummyHost / Ethereum-only
+    /// setups on the upstream behaviour.
+    #[inline]
+    fn tron_enabled(&self) -> bool {
+        false
+    }
+
     /// **TRON fork** — per-contract dynamic-energy factor. Read once
     /// at frame setup; the interpreter's `Gas` tracker multiplies every
     /// charge by `(10_000 + factor) / 10_000`. Default `0` = no penalty.

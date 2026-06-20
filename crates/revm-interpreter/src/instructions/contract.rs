@@ -177,6 +177,32 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     let (gas_limit, bytecode, bytecode_hash, charged_new_account_state_gas) =
         load_acc_and_calc_gas(&mut context, to, has_transfer, is_call, local_gas_limit)?;
 
+    // TRON fork: a CALL with non-zero TRX value to the executing contract's
+    // OWN address is forbidden. java-tron's `Program.callToAddress` enters the
+    // transfer block (its `senderAddress != contextAddress` guard is a
+    // ByteString *reference* compare, always true for distinct objects) and
+    // `VMUtils.validateForSmartContract` throws a `ContractValidateException`
+    // ("Cannot transfer TRX to yourself"), which `callToAddress` rethrows as a
+    // `TransferException` after `refundEnergy(msg.getEnergy())`. A
+    // `TransferException` is exempt from `spendAllEnergy` (VM.java) and ends the
+    // executing frame with a failure (`TRANSFER_FAILED`), the forwarded energy
+    // refunded. We mirror that here: refund the forwarded `gas_limit` (java's
+    // `msg.getEnergy()`, which includes the value-transfer stipend) and halt the
+    // executing frame with `Revert` — which, like a `TransferException`, ends
+    // the frame as a failure WITHOUT spending all energy (the top-level
+    // `last_frame_result` erases the remaining gas for `is_ok_or_revert`,
+    // matching java's consumed-only charge). Only fires under the TRON VM
+    // (`tron_enabled`); upstream EVM keeps the legal `from == to` self-transfer.
+    // CALLCODE/DELEGATECALL/STATICCALL never reach here: CALLCODE/DELEGATECALL
+    // keep the caller's own context (java sets `contextAddress = senderAddress`,
+    // so its self-guard is false) and STATICCALL carries no value.
+    if KIND == CALL && has_transfer && to == context.interpreter.input.target_address()
+        && context.host.tron_enabled()
+    {
+        context.interpreter.gas.erase_cost(gas_limit);
+        return Err(InstructionResult::Revert);
+    }
+
     let target_address = if matches!(KIND, CALLCODE | DELEGATECALL) {
         context.interpreter.input.target_address()
     } else {
@@ -283,6 +309,24 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // transfer surcharge if non-zero TRX, new-account gas if applicable.
     let (gas_limit, bytecode, bytecode_hash, charged_new_account_state_gas) =
         load_acc_and_calc_gas(&mut context, to, has_transfer, /* is_call */ true, local_gas_limit)?;
+
+    // TRON fork: a CALLTOKEN with non-zero TRC-10 value to the executing
+    // contract's OWN address is forbidden — the token analogue of the native
+    // value self-CALL above. java-tron's `Program.callToAddress` enters the
+    // transfer block and `VMUtils.validateForSmartContract(... tokenId ...)`
+    // throws "Cannot transfer asset to yourself", rethrown as a
+    // `TransferException` after `refundEnergy(msg.getEnergy())`. Mirror it:
+    // refund the forwarded `gas_limit` and halt this frame with `Revert`
+    // (failure, no spend-all). Doing this in the opcode handler — BEFORE the
+    // child frame is created — also means `Trc10Inspector::call` never runs for
+    // a self-CALLTOKEN, so the asset_v2 debit/credit (which would otherwise
+    // net-mint `value` to the caller, since the caller and target rows are the
+    // same account) never happens. CALLTOKEN is a TRON-only opcode, so no
+    // `tron_enabled` gate is needed.
+    if has_transfer && to == context.interpreter.input.target_address() {
+        context.interpreter.gas.erase_cost(gas_limit);
+        return Err(InstructionResult::Revert);
+    }
 
     // Saturate the i128 stack words to i64. java-tron rejects out-of-i64
     // token id / value at the contract layer; the EVM keeps the truncated

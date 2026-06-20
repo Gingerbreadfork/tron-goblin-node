@@ -322,6 +322,63 @@ fn calltoken_insufficient_token_balance_skips_callee() {
     );
 }
 
+/// CALL-F8: a CALLTOKEN to the executing contract's OWN address is rejected
+/// (java throws TransferException, halting the frame) and must NOT net-mint
+/// tokens to the caller. Before the fix the inspector wrote caller-then-target
+/// as two clones of the same account, minting `value` to the caller.
+#[test]
+fn calltoken_self_transfer_rejected_and_does_not_mint() {
+    let stores = fresh_stores();
+    let token_id = 1_000_001i64;
+    let value = 250i64;
+    let initial = 10_000i64;
+
+    let caller_user = tron_addr(0xa0);
+    let self_contract = tron_addr(0xc0);
+    let acct = Account {
+        address: caller_user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    stores.accounts.put(&Address::from_raw(caller_user), &acct).unwrap();
+
+    // The contract CALLTOKENs ITS OWN address (target == self_contract).
+    install_contract_with_balance(
+        &stores,
+        self_contract,
+        &build_calltoken_caller(self_contract, token_id, value),
+        token_id,
+        initial,
+    );
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: self_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger,
+        500_000,
+    );
+    // The self-CALLTOKEN halts the (top-level) frame → the tx fails.
+    assert!(
+        !matches!(outcome, VmOutcome::Success { .. }),
+        "self-CALLTOKEN must fail, got {outcome:?}"
+    );
+    // No mint: the contract's TRC-10 balance is exactly its pre-tx balance.
+    let acct = stores.accounts.get(&Address::from_raw(self_contract)).unwrap().unwrap();
+    assert_eq!(
+        acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(initial),
+        "self-CALLTOKEN must not mint; balance must be unchanged"
+    );
+}
+
 /// Regression: a CALLTOKEN callee must see native CALLVALUE (`msg.value`) == 0.
 /// The old code popped a phantom `callValue` operand and passed the TRC-10
 /// token amount as the native call-value, so a callee guarded by

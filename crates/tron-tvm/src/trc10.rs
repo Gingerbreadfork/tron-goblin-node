@@ -648,6 +648,20 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         let token_id_key = inputs.tron_token_id.to_string();
         let transferred = inputs.tron_token_value;
 
+        // A self CALLTOKEN (caller == target) is rejected by the CALLTOKEN
+        // opcode handler (revm-interpreter) BEFORE the child frame is created,
+        // so this hook normally never sees one. Guard defensively anyway: if a
+        // self-transfer ever reaches here, perform NO transfer — the caller and
+        // target rows are the same account, so debiting one copy and crediting
+        // the other and writing both (caller-then-target) would net-MINT
+        // `transferred` tokens to the account (a value-creation bug). Treat it
+        // as a no-op (net zero) and push `None` so `call_end`'s unconditional
+        // `pending.pop()` stays balanced.
+        if caller_addr == target_addr {
+            self.pending.push(None);
+            return None;
+        }
+
         // Read pre-state from the AccountStore.
         let mut caller_account = accounts
             .get(&caller_addr)

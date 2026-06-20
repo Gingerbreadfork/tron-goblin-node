@@ -661,6 +661,12 @@ impl<
         self.journaled_state.db().tron_account_exists(address)
     }
 
+    // This impl IS the TRON VM Context (the `DB: TronDatabaseExt` bound),
+    // so the shared CALL opcode path's TRON-only gating is always on here.
+    fn tron_enabled(&self) -> bool {
+        true
+    }
+
     fn tron_root_tx_id(&self) -> B256 {
         self.journaled_state.db().tron_root_tx_id()
     }
