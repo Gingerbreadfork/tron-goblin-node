@@ -338,15 +338,28 @@ pub fn execute_exchange_transaction(
             )
         };
 
-    // x*y=k: output = other_balance - (my_balance * other_balance) / (my_balance + quant).
-    let new_my = (my_balance_before as i128) + (contract.quant as i128);
-    let new_other =
-        (my_balance_before as i128) * (other_balance_before as i128) / new_my;
-    let output = (other_balance_before as i128) - new_other;
-    if output <= 0 || output > i64::MAX as i128 {
-        return Err(ActuatorError::Overflow);
-    }
-    let output = output as i64;
+    // java `ExchangeCapsule.transaction` / `ExchangeProcessor.exchange`: a
+    // two-step Bancor power curve over a fixed virtual supply, NOT constant
+    // product. `supply` is a long (so the `+= relay; -= relay` round-trip is
+    // exact and the step-2 denominator is exactly the original supply), and
+    // both `pow` results truncate toward zero via the `(long)` cast (`as i64`).
+    // The `+ quant` and supply steps use wrapping i64 arithmetic to mirror
+    // java's `long` overflow. java picks Math.pow / StrictMath.pow on
+    // `allowStrictMath` (proposal 87); `f64::powf` matches Math.pow (the pre-87
+    // path) exactly — last-ULP exactness under strict math would need an fdlibm
+    // `pow` (a repo-wide follow-up shared with the dynamic-energy decay).
+    let mut supply: i64 = 1_000_000_000_000_000_000;
+    // exchangeToSupply(sell_balance, sell_quant)
+    let new_balance = my_balance_before.wrapping_add(contract.quant) as f64;
+    let issued =
+        -(supply as f64) * (1.0 - (1.0 + contract.quant as f64 / new_balance).powf(0.0005));
+    let relay = issued as i64;
+    supply = supply.wrapping_add(relay);
+    // exchangeFromSupply(buy_balance, relay)
+    supply = supply.wrapping_sub(relay);
+    let exchange_balance =
+        other_balance_before as f64 * ((1.0 + relay as f64 / supply as f64).powf(2000.0) - 1.0);
+    let output = exchange_balance as i64;
     if output < contract.expected {
         return Err(ActuatorError::ExchangeOutputBelowExpected);
     }

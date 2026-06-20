@@ -493,12 +493,13 @@ fn transaction_rejects_zero_quant_or_expected() {
 }
 
 #[test]
-fn transaction_applies_constant_product_pricing() {
+fn transaction_applies_bancor_pricing() {
     let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
     // Pool: 1_000_000_000 TRX : 1_000_000_000 of asset. Symmetric.
     seed_trx_asset_exchange(&ctx, 1, ALICE, 1_000_000_000, 1_000_000_000);
-    // Swap 100_000_000 TRX → expect ~ 90_909_090 of asset (round-down floor
-    // of 1e9 - 1e9*1e9/(1e9+1e8) = 1e9 - 909_090_909 = 90_909_091).
+    // Swap 100_000_000 TRX. java's Bancor two-step power curve (supply=1e18)
+    // yields exactly 90_909_090 (constant-product x*y=k would give 90_909_091
+    // — the 1-sun difference this fix closes).
     let c = ExchangeTransactionContract {
         owner_address: ALICE.to_vec(),
         exchange_id: 1,
@@ -509,26 +510,13 @@ fn transaction_applies_constant_product_pricing() {
     exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
     exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
-    // First side grew by 100_000_000.
+    // First side grew by the swapped 100_000_000; second shrank by the exact
+    // Bancor output.
     assert_eq!(ex.first_token_balance, 1_100_000_000);
-    // x*y=k invariant — verify k is preserved within floor-rounding
-    // tolerance. With integer division the new k can drop by up to
-    // ~`my_balance_before` due to the floor of `my * other / new_my`.
-    // We assert the drop is bounded (essentially within one "tick").
-    let original_k = 1_000_000_000i128 * 1_000_000_000i128;
-    let new_k = ex.first_token_balance as i128 * ex.second_token_balance as i128;
-    let drop = original_k - new_k;
-    assert!(
-        drop.abs() <= 2_000_000_000i128,
-        "x*y=k drift larger than rounding tolerance: drop={drop}"
-    );
-    // Alice received tokens.
+    assert_eq!(ex.second_token_balance, 1_000_000_000 - 90_909_090);
+    // Alice received exactly the Bancor output.
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
-    let alice_asset = *alice.asset_v2.get("1000001").unwrap();
-    assert!(
-        alice_asset > 1_000_000_000,
-        "Alice's asset should have grown; got {alice_asset}"
-    );
+    assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 1_000_000_000 + 90_909_090);
 }
 
 #[test]
