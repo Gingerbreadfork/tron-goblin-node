@@ -287,13 +287,13 @@ pub fn build_transaction_ret(
                 block_number,
                 block_time_stamp,
                 contract_address: vm_contract_address(tx, &res.tx_id),
-                // The VM's return value / revert payload; java-tron
-                // stores it as a single-element list.
-                contract_result: if res.vm_return_data.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![res.vm_return_data.clone()]
-                },
+                // The VM's return value / revert payload. java-tron's
+                // `TransactionUtil.buildTransactionInfoInstance`
+                // unconditionally `addContractResult(hReturn)`, so the
+                // list length is always exactly 1 — a zero-length
+                // `bytes` entry when there is no return data (halts /
+                // OOG / non-VM txs), never an empty list.
+                contract_result: vec![res.vm_return_data.clone()],
                 receipt: has_receipt.then(|| tron_proto::ResourceReceipt {
                     energy_usage: r.energy_usage,
                     energy_fee: r.energy_fee,
@@ -316,10 +316,18 @@ pub fn build_transaction_ret(
                     })
                     .collect(),
                 result,
-                // Our outcome description, not java-tron's literal
-                // message strings — informative rather than byte-equal.
+                // java-tron stamps `runtimeError` here. For a VM REVERT
+                // it is exactly the literal `"REVERT opcode executed"`
+                // (`VMActuator.java:247`); we reproduce that string
+                // byte-for-byte. Other failures keep our own outcome
+                // description (java's halt-exception text needs
+                // structured halt detail not yet plumbed here).
                 res_message: if res.outcome.is_success() {
                     Vec::new()
+                } else if r.result
+                    == tron_proto::transaction::result::ContractResult::Revert as i32
+                {
+                    b"REVERT opcode executed".to_vec()
                 } else {
                     format!("{:?}", res.outcome).into_bytes()
                 },
@@ -433,6 +441,18 @@ mod tests {
         }
     }
 
+    /// Single-tx report with an explicit `TxResult`, for the
+    /// `TransactionInfo` data-fidelity assertions (contractResult shape,
+    /// res_message text).
+    fn report_with(id: &BlockId, res: TxResult) -> tron_executor::BlockExecutionReport {
+        tron_executor::BlockExecutionReport {
+            block_id: *id,
+            tx_results: vec![res],
+            maintenance: None,
+            state_deltas: None,
+        }
+    }
+
     #[test]
     fn builds_block_keyed_ret_with_logs_and_result() {
         let (block, id, tx_id) = block_with_transfer();
@@ -451,7 +471,9 @@ mod tests {
         assert_eq!(receipt.energy_usage_total, 13_000);
         assert_eq!(receipt.energy_fee, 1_000);
         assert_eq!(info.fee, 1_000, "fee = net_fee + energy_fee");
+        // java-tron always stores contractResult as a one-element list.
         assert_eq!(info.contract_result, vec![vec![0xAB]]);
+        assert_eq!(info.contract_result.len(), 1);
         assert!(info.res_message.is_empty(), "success carries no res_message");
 
         let failed = build_transaction_ret(&block, &id, &report_for(&id, tx_id, false));
@@ -459,6 +481,64 @@ mod tests {
             failed.transactioninfo[0].result,
             tron_proto::transaction_info::Code::Failed as i32
         );
+    }
+
+    /// A halted / OOG tx carries no VM return data — java-tron still
+    /// stores a length-1 `contractResult` list whose single entry is
+    /// zero-length bytes, never an empty list.
+    #[test]
+    fn halt_yields_length_one_empty_contract_result() {
+        let (block, id, tx_id) = block_with_transfer();
+        let mut receipt = tron_executor::TxReceipt::default();
+        receipt.result = tron_proto::transaction::result::ContractResult::OutOfEnergy as i32;
+        let res = TxResult {
+            tx_id,
+            contract_type: None,
+            outcome: TxOutcome::ExecutionFailed(tron_actuator::ActuatorError::Store(
+                "VM halt: OutOfGas".to_string(),
+            )),
+            internal_transactions: vec![],
+            vm_logs: vec![],
+            receipt,
+            vm_return_data: vec![],
+            actuator_fee: 0,
+        };
+        let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
+        let info = &ret.transactioninfo[0];
+        assert_eq!(info.contract_result.len(), 1, "always a one-element list");
+        assert!(info.contract_result[0].is_empty(), "single zero-length entry");
+        // Non-revert failure keeps our outcome description, not the
+        // java REVERT literal.
+        assert_ne!(info.res_message, b"REVERT opcode executed".to_vec());
+        assert!(!info.res_message.is_empty());
+    }
+
+    /// A reverted tx: java-tron's `runtimeError` for a REVERT opcode is
+    /// exactly `"REVERT opcode executed"` (VMActuator.java:247), and the
+    /// revert payload rides through as the single `contractResult` entry.
+    #[test]
+    fn revert_yields_java_message_and_carries_payload() {
+        let (block, id, tx_id) = block_with_transfer();
+        let mut receipt = tron_executor::TxReceipt::default();
+        receipt.result = tron_proto::transaction::result::ContractResult::Revert as i32;
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let res = TxResult {
+            tx_id,
+            contract_type: None,
+            outcome: TxOutcome::ExecutionFailed(tron_actuator::ActuatorError::Store(
+                "VM revert".to_string(),
+            )),
+            internal_transactions: vec![],
+            vm_logs: vec![],
+            receipt,
+            vm_return_data: payload.clone(),
+            actuator_fee: 0,
+        };
+        let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
+        let info = &ret.transactioninfo[0];
+        assert_eq!(info.res_message, b"REVERT opcode executed".to_vec());
+        assert_eq!(info.contract_result.len(), 1, "always a one-element list");
+        assert_eq!(info.contract_result[0], payload, "revert payload rides through");
     }
 
     #[test]
