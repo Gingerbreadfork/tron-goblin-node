@@ -397,3 +397,44 @@ fn storage_uses_v1_layout_when_contract_version_is_1() {
         "v1 contract reading a slot only written via v2 must miss"
     );
 }
+
+#[test]
+fn commit_skips_touched_empty_new_account() {
+    // EIP-161 / java parity: a CALL that merely touches a previously
+    // non-existent address with no value, code, or storage must NOT create an
+    // account (java gates createAccountIfNotExist on endowment > 0).
+    let mut db = fresh_db();
+    let evm_addr = EvmAddress::from([0xab; 20]);
+    let tron_addr = evm_to_tron_address(&evm_addr);
+
+    let account = make_touched_account(0); // balance 0, no code, no storage
+    let mut changes = revm::primitives::AddressMap::default();
+    changes.insert(evm_addr, account);
+    db.commit(changes);
+
+    assert!(
+        db.accounts.get(&tron_addr).unwrap().is_none(),
+        "a touched-but-empty new account must not be persisted"
+    );
+}
+
+#[test]
+fn commit_persists_value_funded_new_account() {
+    // The flip side: a CALL that transfers value to a new address DOES create
+    // it — the empty-account skip must not drop a value-funded account.
+    let mut db = fresh_db();
+    let evm_addr = EvmAddress::from([0xac; 20]);
+    let tron_addr = evm_to_tron_address(&evm_addr);
+
+    let account = make_touched_account(500); // balance > 0
+    let mut changes = revm::primitives::AddressMap::default();
+    changes.insert(evm_addr, account);
+    db.commit(changes);
+
+    let acct = db
+        .accounts
+        .get(&tron_addr)
+        .unwrap()
+        .expect("a value-funded new account must be persisted");
+    assert_eq!(acct.balance, 500);
+}

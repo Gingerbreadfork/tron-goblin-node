@@ -581,6 +581,31 @@ impl DatabaseCommit for TronDatabase {
                 }
             }
 
+            // EIP-161 / java parity: a CALL that merely TOUCHES a previously
+            // non-existent address WITHOUT transferring value must not create an
+            // account — java gates `createAccountIfNotExist` on endowment > 0
+            // (Program.callToAddress), and EIP-161 deletes touched-empty
+            // accounts. revm touches the target regardless, so a zero-value CALL
+            // to a fresh address would otherwise persist a phantom empty account
+            // here — both a snapshot-diff drift AND a cross-tx energy divergence
+            // (a later value-CALL would skip the 25000 NEW_ACCT_CALL charge java
+            // still applies, since the account would already exist). Skip a
+            // freshly-touched account that ended up empty (no balance, no code)
+            // and is not a deployed contract. Value-funded accounts (balance > 0)
+            // and created contracts are persisted as before; existing accounts
+            // are never affected (is_new_account is false for them).
+            if is_new_account
+                && created_contract.is_none()
+                && tron_account.balance == 0
+                && tron_account.code.is_empty()
+                && !account
+                    .storage
+                    .values()
+                    .any(|s| s.present_value != s.original_value)
+            {
+                continue;
+            }
+
             // java's `RepositoryImpl.createNormalAccount` attaches the default
             // owner+active[id=2] permission (when ALLOW_MULTI_SIGN is on) to a
             // freshly-created *normal* account — i.e. a plain EOA the VM
