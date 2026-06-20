@@ -21,12 +21,18 @@ use interpreter::{
     InterpreterResult, InterpreterTypes, SharedMemory,
 };
 use primitives::{
-    constants::CALL_STACK_LIMIT,
     hardfork::SpecId::{self, HOMESTEAD, LONDON, SPURIOUS_DRAGON},
     Address, Bytes, U256,
 };
 use state::Bytecode;
 use std::{borrow::ToOwned, boxed::Box, vec::Vec};
+
+/// TRON caps call/create nesting at java-tron's `Program.MAX_DEPTH` (64), not
+/// the EVM's `CALL_STACK_LIMIT` of 1024. A frame deeper than this fails with
+/// CallTooDeep (the caller pushes 0 and continues), matching java's
+/// `getCallDeep() == MAX_DEPTH` refusal. The entry frame is depth 0, so the
+/// deepest executing frame is depth 64.
+const TRON_MAX_CALL_DEPTH: usize = 64;
 
 /// Frame implementation for Ethereum.
 #[derive_where(Clone, Debug; IW,
@@ -173,7 +179,7 @@ impl EthFrame<EthInterpreter> {
         };
 
         // Check depth
-        if depth > CALL_STACK_LIMIT as usize {
+        if depth > TRON_MAX_CALL_DEPTH {
             return return_result(InstructionResult::CallTooDeep);
         }
 
@@ -304,7 +310,7 @@ impl EthFrame<EthInterpreter> {
         };
 
         // Check depth
-        if depth > CALL_STACK_LIMIT as usize {
+        if depth > TRON_MAX_CALL_DEPTH {
             return return_error(InstructionResult::CallTooDeep);
         }
 
