@@ -70,6 +70,15 @@ pub struct VmStores {
     pub contract_state: Arc<ContractStateStore>,
     pub dynamic_properties: Arc<DynamicPropertiesStore>,
     pub delegated_resources: Arc<DelegatedResourceStore>,
+    /// `DelegatedResourceAccountIndex` — the bidirectional `(from, to)`
+    /// delegation index that the DELEGATERESOURCE / UNDELEGATERESOURCE opcode
+    /// bridges keep in sync with java-tron. RPC-only (never read into any
+    /// balance/usage/energy/consensus computation), so it is `Option`: the
+    /// production node attaches the session-wrapped store, read-only callers
+    /// (`eth_call`) and unit tests leave it `None` and the bridges then skip
+    /// the index write.
+    pub delegated_resource_account_index:
+        Option<Arc<tron_chainbase::DelegatedResourceAccountIndexStore>>,
     pub delegation: Arc<DelegationStore>,
     /// Optional — when present, `BLOCKHASH(n)` returns the canonical
     /// block hash for the last 256 blocks (EVM spec window); when
@@ -393,6 +402,11 @@ fn execute_trigger_inner(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // RPC-only DelegatedResourceAccountIndex: the DELEGATERESOURCE /
+    // UNDELEGATERESOURCE bridges keep it in sync with java-tron when attached.
+    if let Some(idx) = &stores.delegated_resource_account_index {
+        tron_db = tron_db.with_delegated_resource_index(Arc::clone(idx));
+    }
     // Per-frame staking/suicide rollback journal, shared between the host
     // (records reversing entries as it writes) and the inspector (unwinds a
     // reverted frame's subtree). Mirrors java's per-frame child Repository: a
@@ -698,6 +712,11 @@ fn execute_trigger_inner_with_tracer(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // RPC-only DelegatedResourceAccountIndex: the DELEGATERESOURCE /
+    // UNDELEGATERESOURCE bridges keep it in sync with java-tron when attached.
+    if let Some(idx) = &stores.delegated_resource_account_index {
+        tron_db = tron_db.with_delegated_resource_index(Arc::clone(idx));
+    }
     // Per-frame staking/suicide rollback journal, shared between the host
     // (records reversing entries as it writes) and the inspector (unwinds a
     // reverted frame's subtree). Mirrors java's per-frame child Repository: a
@@ -1122,6 +1141,11 @@ pub fn execute_create_with_trace(
         Arc::clone(&stores.delegated_resources),
         Arc::clone(&stores.delegation),
     );
+    // RPC-only DelegatedResourceAccountIndex: the DELEGATERESOURCE /
+    // UNDELEGATERESOURCE bridges keep it in sync with java-tron when attached.
+    if let Some(idx) = &stores.delegated_resource_account_index {
+        tron_db = tron_db.with_delegated_resource_index(Arc::clone(idx));
+    }
     // Per-frame staking/suicide rollback journal, shared between the host
     // (records reversing entries as it writes) and the inspector (unwinds a
     // reverted frame's subtree). Mirrors java's per-frame child Repository: a

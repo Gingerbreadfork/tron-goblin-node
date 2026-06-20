@@ -21,8 +21,9 @@
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AccountStore, CodeStore, ContractStateStore, DelegatedResourceStore, DelegationStore,
-    DynamicPropertiesStore, KvBackend, MemBackend, StorageRowStore, VotesStore, WitnessStore,
+    AccountStore, CodeStore, ContractStateStore, DelegatedResourceAccountIndexStore,
+    DelegatedResourceStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend,
+    StorageRowStore, VotesStore, WitnessStore,
 };
 use tron_crypto::address::Address;
 use tron_proto::Account;
@@ -51,6 +52,7 @@ fn fresh_stores() -> VmStores {
         contract_state: Arc::new(ContractStateStore::new(mem())),
         dynamic_properties,
         delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
+        delegated_resource_account_index: None,
         delegation: Arc::new(DelegationStore::new(mem())),
         block_index: None,
         contracts: None,
@@ -58,6 +60,17 @@ fn fresh_stores() -> VmStores {
         reward_vi: None,
     abi: None,
     }
+}
+
+/// `fresh_stores()` plus a real `DelegatedResourceAccountIndex` store attached,
+/// for the DELEGATERESOURCE / UNDELEGATERESOURCE index-maintenance tests. The
+/// returned store handle is shared with the `VmStores`, so tests can read the
+/// index rows the opcode bridges write.
+fn fresh_stores_with_index() -> (VmStores, Arc<DelegatedResourceAccountIndexStore>) {
+    let mut stores = fresh_stores();
+    let index = Arc::new(DelegatedResourceAccountIndexStore::new(mem()));
+    stores.delegated_resource_account_index = Some(Arc::clone(&index));
+    (stores, index)
 }
 
 fn tron_addr(byte: u8) -> [u8; 21] {
@@ -1314,6 +1327,321 @@ fn undelegate_energy_sheds_receiver_usage_not_just_acquired() {
         "expected ~500 (1000 - transferUsage 500); got {}",
         r.energy_usage
     );
+}
+
+// =============================================================================
+// DelegatedResourceAccountIndex maintenance (RPC-only, java parity)
+// =============================================================================
+//
+// The DELEGATERESOURCE / UNDELEGATERESOURCE opcode bridges keep the
+// bidirectional `DelegatedResourceAccountIndex` rows in sync with java-tron's
+// `DelegateResourceProcessor` / `UnDelegateResourceProcessor`. The index is
+// RPC-only — never read into any balance/usage/energy/consensus computation —
+// so it is wired through the executor's session-wrapped store, NOT the staking
+// journal. These tests prove the bridge writes/clears both V2 rows and that a
+// setup WITHOUT the index store attached is a silent no-op (no panic).
+
+/// An in-VM DELEGATERESOURCE writes BOTH V2 index rows, each stamped with the
+/// latest block-header timestamp and pointing at the counterparty — matching
+/// java `DelegateResourceProcessor.delegateResource`'s `delegateV2(...)`.
+#[test]
+fn delegate_resource_writes_both_index_rows() {
+    let (stores, index) = fresh_stores_with_index();
+    let caller_user = tron_addr(0xa9);
+    let contract_addr = tron_addr(0xc9);
+    let receiver = tron_addr(0xd9);
+
+    let amount = 3_000_000u64;
+    // DELEGATERESOURCE pops [resource_type, delegate_balance, receiver_address].
+    let mut bc = Vec::new();
+    bc.push(0x73);
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(push_u64(amount));
+    bc.extend(push1(0)); // resource = BANDWIDTH
+    bc.push(0xde);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    let hash = code_hash(&bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(contract_addr),
+            &Account {
+                address: contract_addr.to_vec(),
+                code: bc.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 10_000_000 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(receiver),
+            &Account { address: receiver.to_vec(), ..Default::default() },
+        )
+        .unwrap();
+    install_caller(&stores, caller_user, 1_000_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, contract_addr),
+        500_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "expected Success, got: {outcome:?}");
+
+    let owner = Address::from_raw(contract_addr);
+    let recv = Address::from_raw(receiver);
+    // From-side row (0x03 ‖ owner ‖ receiver) holds the counterparty `receiver`,
+    // stamped with the fixture's latest-block-header timestamp.
+    let from_row = index
+        .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&owner, &recv))
+        .unwrap()
+        .expect("from-side index row written");
+    assert_eq!(from_row.account, recv.as_bytes().to_vec());
+    assert_eq!(from_row.timestamp, 1_700_000_000_000);
+    // To-side row (0x04 ‖ receiver ‖ owner) holds `owner`.
+    let to_row = index
+        .get_raw(&DelegatedResourceAccountIndexStore::v2_to_key(&owner, &recv))
+        .unwrap()
+        .expect("to-side index row written");
+    assert_eq!(to_row.account, owner.as_bytes().to_vec());
+    assert_eq!(to_row.timestamp, 1_700_000_000_000);
+}
+
+/// An in-VM UNDELEGATERESOURCE that ZEROES the delegation record clears BOTH V2
+/// index rows — matching java `UnDelegateResourceProcessor.execute`, which
+/// overwrites both rows with an empty capsule (committed as a delete) once
+/// `frozenBalanceForBandwidth == 0 && frozenBalanceForEnergy == 0`.
+#[test]
+fn undelegate_resource_clears_both_index_rows_when_record_zeroed() {
+    let (stores, index) = fresh_stores_with_index();
+    let caller_user = tron_addr(0xaa);
+    let contract_addr = tron_addr(0xca);
+    let receiver = tron_addr(0xda);
+
+    let amount = 2_000_000u64;
+    let mut bc = Vec::new();
+    bc.push(0x73);
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(push_u64(amount));
+    bc.extend(push1(0)); // resource = BANDWIDTH
+    bc.push(0xdf);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    let hash = code_hash(&bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(contract_addr),
+            &Account {
+                address: contract_addr.to_vec(),
+                code: bc.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                delegated_frozen_v2_balance_for_bandwidth: amount as i64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(receiver),
+            &Account {
+                address: receiver.to_vec(),
+                acquired_delegated_frozen_v2_balance_for_bandwidth: amount as i64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    stores
+        .delegated_resources
+        .put_raw(
+            &key,
+            &tron_proto::DelegatedResource {
+                from: contract_addr.to_vec(),
+                to: receiver.to_vec(),
+                frozen_balance_for_bandwidth: amount as i64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let owner = Address::from_raw(contract_addr);
+    let recv = Address::from_raw(receiver);
+    // Pre-seed the index rows as a prior delegate would have.
+    index.delegate_v2(&owner, &recv, 1).unwrap();
+    install_caller(&stores, caller_user, 1_000_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, contract_addr),
+        500_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "expected Success, got: {outcome:?}");
+
+    // The record is now fully zero, so both index rows are gone.
+    assert!(
+        index
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&owner, &recv))
+            .unwrap()
+            .is_none(),
+        "from-side index row must be cleared"
+    );
+    assert!(
+        index
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_to_key(&owner, &recv))
+            .unwrap()
+            .is_none(),
+        "to-side index row must be cleared"
+    );
+}
+
+/// CRUCIAL frame-revert-safety: the index writes must NOT reach the underlying
+/// store when the VM frame they belong to reverts. The executor routes the
+/// index store through the per-tx `VmSession` — a `SessionBackend` overlay that
+/// is COMMITTED on `VmOutcome::Success` and DISCARDED (never committed) on a
+/// revert/halt. This test exercises that exact mechanism directly: a delegate
+/// written through a session-wrapped index store is invisible in the parent
+/// store until commit, and stays invisible if the session is reverted instead
+/// — proving the discard-on-revert path the executor depends on.
+///
+/// (The `execute_trigger` unit harness has no `VmSession`, so it cannot drive a
+/// real VM-frame revert against a session-wrapped index — this asserts the
+/// mechanism instead, as the test plan allows.)
+#[test]
+fn session_wrapped_index_discards_writes_on_revert_and_commits_on_success() {
+    use tron_chainbase::SessionBackend;
+
+    let from = Address::from_raw(tron_addr(0xaa));
+    let to = Address::from_raw(tron_addr(0xbb));
+
+    // ----- Frame REVERT: write through the session, never commit. -----
+    let parent: Arc<dyn KvBackend> = mem();
+    let session = Arc::new(SessionBackend::new(Arc::clone(&parent)));
+    let index = DelegatedResourceAccountIndexStore::new(Arc::clone(&session) as _);
+    index.delegate_v2(&from, &to, 1_234).unwrap();
+    // The write is visible THROUGH the session overlay ...
+    assert!(
+        index
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&from, &to))
+            .unwrap()
+            .is_some(),
+        "delegate must be visible through the session overlay before revert"
+    );
+    // ... but NOT in the parent store, and discarding (revert = no commit)
+    // leaves the parent untouched — exactly what a reverted VM frame does.
+    session.revert();
+    let parent_index = DelegatedResourceAccountIndexStore::new(Arc::clone(&parent));
+    assert!(
+        parent_index
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&from, &to))
+            .unwrap()
+            .is_none(),
+        "reverted VM frame must leave NO index row in the parent store"
+    );
+    assert!(
+        parent_index
+            .get_raw(&DelegatedResourceAccountIndexStore::v2_to_key(&from, &to))
+            .unwrap()
+            .is_none(),
+        "reverted VM frame must leave NO index row in the parent store (to-side)"
+    );
+
+    // ----- Frame SUCCESS: write through a fresh session, then commit. -----
+    let parent2: Arc<dyn KvBackend> = mem();
+    let session2 = Arc::new(SessionBackend::new(Arc::clone(&parent2)));
+    let index2 = DelegatedResourceAccountIndexStore::new(Arc::clone(&session2) as _);
+    index2.delegate_v2(&from, &to, 1_234).unwrap();
+    session2.commit().unwrap();
+    let parent2_index = DelegatedResourceAccountIndexStore::new(Arc::clone(&parent2));
+    let from_row = parent2_index
+        .get_raw(&DelegatedResourceAccountIndexStore::v2_from_key(&from, &to))
+        .unwrap()
+        .expect("committed VM frame must persist the from-side index row");
+    assert_eq!(from_row.account, to.as_bytes().to_vec());
+    let to_row = parent2_index
+        .get_raw(&DelegatedResourceAccountIndexStore::v2_to_key(&from, &to))
+        .unwrap()
+        .expect("committed VM frame must persist the to-side index row");
+    assert_eq!(to_row.account, from.as_bytes().to_vec());
+}
+
+/// When NO index store is attached (read-only / unit-test setups, `None`), an
+/// in-VM DELEGATERESOURCE is a silent no-op for the index: the opcode still
+/// succeeds and mutates the staking state, it simply skips the index write.
+#[test]
+fn delegate_resource_without_index_store_is_a_noop() {
+    // Default `fresh_stores()` leaves `delegated_resource_account_index = None`.
+    let stores = fresh_stores();
+    assert!(stores.delegated_resource_account_index.is_none());
+    let caller_user = tron_addr(0xa9);
+    let contract_addr = tron_addr(0xc9);
+    let receiver = tron_addr(0xd9);
+
+    let amount = 3_000_000u64;
+    let mut bc = Vec::new();
+    bc.push(0x73);
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(push_u64(amount));
+    bc.extend(push1(0)); // resource = BANDWIDTH
+    bc.push(0xde);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    let hash = code_hash(&bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(contract_addr),
+            &Account {
+                address: contract_addr.to_vec(),
+                code: bc.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 10_000_000 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(receiver),
+            &Account { address: receiver.to_vec(), ..Default::default() },
+        )
+        .unwrap();
+    install_caller(&stores, caller_user, 1_000_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, contract_addr),
+        500_000,
+    );
+    // The opcode still succeeds and the delegation record/balances still move;
+    // only the index write is skipped (no panic, no store handle to write to).
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "expected Success, got: {outcome:?}");
+    let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    let record = stores
+        .delegated_resources
+        .get_raw(&key)
+        .unwrap()
+        .expect("DelegatedResource record still written without an index store");
+    assert_eq!(record.frozen_balance_for_bandwidth, amount as i64);
 }
 
 #[test]

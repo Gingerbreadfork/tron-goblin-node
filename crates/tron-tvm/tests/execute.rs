@@ -24,6 +24,7 @@ fn fresh_stores() -> VmStores {
         contract_state: Arc::new(ContractStateStore::new(mem())),
         dynamic_properties: Arc::new(DynamicPropertiesStore::new(mem())),
         delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
+        delegated_resource_account_index: None,
         delegation: Arc::new(DelegationStore::new(mem())),
         block_index: None,
         contracts: None,

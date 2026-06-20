@@ -53,6 +53,7 @@ fn fresh_stores() -> VmStores {
         votes: None,
         reward_vi: None,
     abi: None,
+    delegated_resource_account_index: None,
     }
 }
 

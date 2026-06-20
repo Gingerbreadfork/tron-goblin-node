@@ -847,6 +847,14 @@ struct VmSession {
     contract_state: Arc<SessionBackend>,
     votes: Arc<SessionBackend>,
     delegated_resources: Arc<SessionBackend>,
+    // DELEGATERESOURCE / UNDELEGATERESOURCE opcode bridges write the
+    // bidirectional `DelegatedResourceAccountIndex` rows through this handle
+    // (java `DelegateResourceProcessor`/`UnDelegateResourceProcessor`). The
+    // store is RPC-only (never read into consensus), but it must roll back
+    // with the VM frame exactly like the delegation record, so it is wrapped
+    // here and committed only on frame success. `None` in setups that don't
+    // attach the index (read-only callers / unit tests).
+    delegated_resource_account_index: Option<Arc<SessionBackend>>,
     // Staking opcodes (FREEZEBALANCEV2 / UNFREEZEBALANCEV2 / CANCELALLUNFREEZEV2
     // / suicide) write the chain-global TOTAL_*_WEIGHT accumulators through this
     // handle. java-tron runs those in the contract frame's child repository,
@@ -872,6 +880,7 @@ impl VmSession {
         contract_state: Arc<dyn KvBackend>,
         votes: Arc<dyn KvBackend>,
         delegated_resources: Arc<dyn KvBackend>,
+        delegated_resource_account_index: Option<Arc<dyn KvBackend>>,
         dyn_props: Arc<dyn KvBackend>,
     ) -> Self {
         Self {
@@ -881,6 +890,8 @@ impl VmSession {
             contract_state: Arc::new(SessionBackend::new(contract_state)),
             votes: Arc::new(SessionBackend::new(votes)),
             delegated_resources: Arc::new(SessionBackend::new(delegated_resources)),
+            delegated_resource_account_index: delegated_resource_account_index
+                .map(|b| Arc::new(SessionBackend::new(b))),
             dyn_props: Arc::new(SessionBackend::new(dyn_props)),
         }
     }
@@ -894,6 +905,9 @@ impl VmSession {
         self.contract_state.commit()?;
         self.votes.commit()?;
         self.delegated_resources.commit()?;
+        if let Some(s) = &self.delegated_resource_account_index {
+            s.commit()?;
+        }
         self.dyn_props.commit()?;
         Ok(())
     }
@@ -909,6 +923,9 @@ impl VmSession {
         self.contract_state.revert();
         self.votes.revert();
         self.delegated_resources.revert();
+        if let Some(s) = &self.delegated_resource_account_index {
+            s.revert();
+        }
         self.dyn_props.revert();
     }
 }
@@ -3598,6 +3615,7 @@ fn execute_vm_tx(
         contract_state.clone(),
         view.votes.clone(),
         view.delegated_resources.clone(),
+        view.delegated_resource_account_index.clone(),
         view.dyn_props.clone(),
     );
 
@@ -3609,6 +3627,18 @@ fn execute_vm_tx(
         contract_state: Arc::new(CtS::new(vm_session.contract_state.clone() as _)),
         dynamic_properties: Arc::new(DPS::new(vm_session.dyn_props.clone() as _)),
         delegated_resources: Arc::new(DRS::new(vm_session.delegated_resources.clone() as _)),
+        // DelegatedResourceAccountIndex — RPC-only bidirectional index the
+        // DELEGATERESOURCE / UNDELEGATERESOURCE opcode bridges keep in sync
+        // with java-tron. Routed through the inner `vm_session` so a reverted
+        // VM frame discards the index writes for free (no journal needed).
+        delegated_resource_account_index: vm_session
+            .delegated_resource_account_index
+            .as_ref()
+            .map(|b| {
+                Arc::new(tron_chainbase::DelegatedResourceAccountIndexStore::new(
+                    b.clone() as _,
+                ))
+            }),
         delegation: Arc::new(DelS::new(view.delegation.clone() as _)),
         // Attach BlockIndexStore so BLOCKHASH(n) returns real hashes
         // for the last 256 blocks (when the backend is configured).

@@ -79,6 +79,15 @@ pub struct TronDatabase {
     /// returns 0 (matches the upstream Host default).
     pub witnesses: Option<Arc<WitnessStore>>,
     pub delegated_resources: Option<Arc<tron_chainbase::DelegatedResourceStore>>,
+    /// `DelegatedResourceAccountIndex` — the bidirectional `(from, to)`
+    /// delegation index that the DELEGATERESOURCE / UNDELEGATERESOURCE bridges
+    /// write (java `DelegateResourceProcessor`/`UnDelegateResourceProcessor`).
+    /// RPC-only: never read into any balance/usage/energy/consensus path. When
+    /// attached at the executor it is session-wrapped, so the index writes roll
+    /// back with a reverted VM frame for free. Optional like the other staking
+    /// stores; when `None` the bridges skip the index write entirely.
+    pub delegated_resource_account_index:
+        Option<Arc<tron_chainbase::DelegatedResourceAccountIndexStore>>,
     pub delegation: Option<Arc<tron_chainbase::DelegationStore>>,
     /// `reward-vi` store backing the `ALLOW_OLD_REWARD_OPT` legacy-reward
     /// fast path inside `withdraw_reward` (VOTEWITNESS / WITHDRAWREWARD /
@@ -163,6 +172,7 @@ impl TronDatabase {
             votes: None,
             witnesses: None,
             delegated_resources: None,
+            delegated_resource_account_index: None,
             delegation: None,
             reward_vi: None,
             abi: None,
@@ -251,6 +261,18 @@ impl TronDatabase {
         self.votes = votes;
         self.delegated_resources = Some(delegated_resources);
         self.delegation = Some(delegation);
+        self
+    }
+
+    /// Attach the `DelegatedResourceAccountIndex` store so the
+    /// DELEGATERESOURCE / UNDELEGATERESOURCE opcode bridges keep the
+    /// bidirectional RPC index in sync with java-tron. When absent, the
+    /// bridges skip the index write (matching read-only / unit-test setups).
+    pub fn with_delegated_resource_index(
+        mut self,
+        index: Arc<tron_chainbase::DelegatedResourceAccountIndexStore>,
+    ) -> Self {
+        self.delegated_resource_account_index = Some(index);
         self
     }
 

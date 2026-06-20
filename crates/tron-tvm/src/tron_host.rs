@@ -1343,6 +1343,23 @@ impl TronDatabaseExt for TronDatabase {
             _ => {}
         }
         self.put_delegated_journaled(&resources, &key, &record);
+        // Maintain the bidirectional DelegatedResourceAccountIndex, matching
+        // java `DelegateResourceProcessor.delegateResource`: write the two V2
+        // index rows stamped with the latest block-header timestamp (java
+        // `repo.getDynamicPropertiesStore().getLatestBlockHeaderTimestamp()`).
+        // The store is RPC-only — never read into any balance/usage/energy/
+        // consensus computation. It is routed through the per-frame VmSession
+        // at the executor (committed only when the frame succeeds), so a
+        // reverted VM frame discards these writes for free — the same per-frame
+        // rollback the consensus-bearing DelegatedResource row above gets from
+        // the staking journal, achieved here via the session instead, so the
+        // index needs no journal entry.
+        if let Some(index) = &self.delegated_resource_account_index {
+            let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+            index
+                .delegate_v2(&owner, &receiver, now)
+                .expect("db error writing delegated resource account index in delegate bridge");
+        }
         1
     }
 
@@ -1535,6 +1552,23 @@ impl TronDatabaseExt for TronDatabase {
         //    it isn't modified after, so the end state matches).
         if let Some(recv) = receiver_account.as_ref() {
             self.put_account_journaled(&receiver, recv);
+        }
+
+        // 5. Clear the bidirectional DelegatedResourceAccountIndex once the
+        //    delegation record is fully gone, matching java
+        //    `UnDelegateResourceProcessor.execute`: it overwrites both V2 rows
+        //    with an EMPTY index capsule when `frozenBalanceForBandwidth == 0
+        //    && frozenBalanceForEnergy == 0`, which `RepositoryImpl` commits as
+        //    a DELETE (`ByteUtil.isNullOrZeroArray` → `store.delete`). The TVM
+        //    path has only the single unlocked record, so this is the exact
+        //    clear condition. RPC-only and session-wrapped, so a reverted VM
+        //    frame discards this for free.
+        if record.frozen_balance_for_bandwidth == 0 && record.frozen_balance_for_energy == 0 {
+            if let Some(index) = &self.delegated_resource_account_index {
+                index
+                    .undelegate_v2(&owner, &receiver)
+                    .expect("db error clearing delegated resource account index in undelegate bridge");
+            }
         }
         1
     }

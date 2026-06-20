@@ -1580,6 +1580,10 @@ pub fn build_call_vm_stores(b: &crate::state::EthCallBackends) -> tron_tvm::exec
         contract_state: Arc::new(ContractStateStore::new(session(&b.contract_state))),
         dynamic_properties: Arc::new(DynamicPropertiesStore::new(session(&b.dyn_props))),
         delegated_resources: Arc::new(DelegatedResourceStore::new(session(&b.delegated_resources))),
+        // Read-only call path: the RPC-only DelegatedResourceAccountIndex is
+        // never consulted and the session is discarded, so leave it unset and
+        // the DELEGATE/UNDELEGATE bridges skip the index write.
+        delegated_resource_account_index: None,
         delegation: Arc::new(DelegationStore::new(session(&b.delegation))),
         block_index: b
             .block_index
