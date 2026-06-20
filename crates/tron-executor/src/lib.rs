@@ -2655,9 +2655,16 @@ fn execute_block_logic(
         let accts = AccountStore::new(state.accounts.clone());
         let dlg = DelegationStore::new(state.delegation.clone());
 
+        // java `Manager.payReward` branches on allowChangeDelegation: the
+        // post-fork brokerage / cycle-pool / standby split (5c-i..iii) runs
+        // only when it is on; the pre-fork path (5c-pre below) sends the block
+        // + tx-fee reward straight to the producer's allowance. Mainnet has
+        // CHANGE_DELEGATION on, so 5c-pre is dead for a snapshot node — it
+        // matters only for a from-genesis replay of the pre-fork window.
+        let change_delegation = dp.allow_change_delegation();
         // 5c-i. Block-production reward to the producer.
         let block_pay = dp.witness_pay_per_block();
-        if block_pay > 0 {
+        if change_delegation && block_pay > 0 {
             let _ = tron_tvm::reward::pay_block_reward(
                 &accts, &dlg, &dp, &producer, block_pay,
             );
@@ -2668,7 +2675,7 @@ fn execute_block_logic(
         // is independent of the active witness rotation (which is
         // capped at 27).
         let standby_pay = dp.witness_127_pay_per_block();
-        if standby_pay > 0 {
+        if change_delegation && standby_pay > 0 {
             let ws = WitnessStore::new(state.witnesses.clone());
             if let Ok(by_vote) = ws.all() {
                 let ranked = top_standby_witnesses(
@@ -2690,7 +2697,7 @@ fn execute_block_logic(
         // / cycle-pool split as the block reward. Without this, fees
         // charged into the pool (bandwidth/energy) accumulated forever
         // and witnesses never received their tx-fee share.
-        if dp.support_transaction_fee_pool() {
+        if change_delegation && dp.support_transaction_fee_pool() {
             const TRANSACTION_FEE_POOL_PERIOD: i64 = 1;
             let pool = dp.transaction_fee_pool();
             let tx_fee_reward = pool / TRANSACTION_FEE_POOL_PERIOD;
@@ -2698,6 +2705,21 @@ fn execute_block_logic(
                 &accts, &dlg, &dp, &producer, tx_fee_reward,
             );
             dp.save_transaction_fee_pool(pool - tx_fee_reward);
+        }
+        // 5c-pre. java payReward else-branch (pre-CHANGE_DELEGATION): the block
+        // reward + tx-fee reward go straight to the producer's allowance (no
+        // brokerage split, no cycle pool) and standby is NOT paid per-block
+        // (legacy standby is paid at maintenance via IncentiveManager.reward).
+        if !change_delegation {
+            if let Ok(Some(mut acct)) = accts.get(&producer) {
+                acct.allowance = acct.allowance.saturating_add(block_pay);
+                if dp.support_transaction_fee_pool() {
+                    let pool = dp.transaction_fee_pool();
+                    acct.allowance = acct.allowance.saturating_add(pool);
+                    dp.save_transaction_fee_pool(0);
+                }
+                let _ = accts.put(&producer, &acct);
+            }
         }
     }
 

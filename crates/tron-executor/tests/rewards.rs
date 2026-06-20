@@ -105,6 +105,9 @@ fn empty_block(num: i64, parent_hash: [u8; 32], witness: [u8; 21], timestamp_ms:
 #[test]
 fn producer_gets_brokerage_into_allowance_and_remainder_into_cycle_pool() {
     let state = fresh_state();
+    // Reward distribution is gated on allowChangeDelegation (java payReward);
+    // active on mainnet — set it so the post-fork brokerage/standby path runs.
+    DynamicPropertiesStore::new(state.dyn_props.clone()).save_allow_change_delegation(1);
     let producer = addr(0xa1);
 
     // Seed witness + account; witness has 100 votes (any positive
@@ -162,6 +165,9 @@ fn standby_pool_distributes_proportionally_across_top_127() {
     // Plus the producer (B in this test) also gets WITNESS_PAY_PER_BLOCK = 32M.
     // Brokerage 20% each.
     let state = fresh_state();
+    // Reward distribution is gated on allowChangeDelegation (java payReward);
+    // active on mainnet — set it so the post-fork standby split runs.
+    DynamicPropertiesStore::new(state.dyn_props.clone()).save_allow_change_delegation(1);
     let a = addr(0xa1);
     let b = addr(0xb2);
     let c = addr(0xc3);
