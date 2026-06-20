@@ -18,7 +18,8 @@ use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
     AssetIssueV2Store, ContractStore, DelegatedResourceStore, DelegationStore,
     DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, IncrementalMerkleTreeStore,
-    KvBackend, MarketOrderStore, NullifierStore, ProposalStore, VotesStore, WitnessStore,
+    KvBackend, MarketAccountStore, MarketOrderStore, NullifierStore, ProposalStore, VotesStore,
+    WitnessStore,
 };
 use tron_executor::StateBackends;
 use tron_mempool::TxValidatorFn;
@@ -48,6 +49,7 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
     let exchange_v1_be = state.exchange_v1.clone();
     let exchange_v2_be = state.exchange_v2.clone();
     let market_orders_be = state.market_orders.clone();
+    let market_account_be = state.market_account.clone();
     let nullifiers_be = state.nullifiers.clone();
     let merkle_trees_be: Option<Arc<dyn KvBackend>> = state.merkle_trees.clone();
     // The ref_block / chain-id replay gate also runs at mempool
@@ -94,6 +96,7 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
         let exchange_v1 = ExchangeStore::new(exchange_v1_be.clone());
         let exchange_v2 = ExchangeV2Store::new(exchange_v2_be.clone());
         let market_orders = MarketOrderStore::new(market_orders_be.clone());
+        let market_account = MarketAccountStore::new(market_account_be.clone());
         let nullifiers = NullifierStore::new(nullifiers_be.clone());
         let merkle_trees =
             merkle_trees_be.as_ref().map(|be| IncrementalMerkleTreeStore::new(be.clone()));
@@ -119,6 +122,7 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
             exchange_v1: &exchange_v1,
             exchange_v2: &exchange_v2,
             market_orders: &market_orders,
+            market_account: &market_account,
             nullifiers: &nullifiers,
             merkle_trees: merkle_trees.as_ref(),
             // Admission checks never reach legacy-reward settlement depth.

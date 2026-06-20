@@ -1173,6 +1173,7 @@ fn store_name(store: UndoStoreId) -> &'static str {
         Id::ExchangeV1 => "exchangev1",
         Id::ExchangeV2 => "exchangev2",
         Id::MarketOrders => "marketorders",
+        Id::MarketAccount => "marketaccount",
         Id::Nullifiers => "nullifiers",
         Id::MerkleTrees => "merkletrees",
         Id::Code => "code",
@@ -1186,13 +1187,13 @@ fn store_name(store: UndoStoreId) -> &'static str {
 
 /// Parse a `store` param into an `UndoStoreId`: either a variant NAME
 /// (case-insensitive, e.g. `accounts`, `storagerow`, `code`) or its numeric
-/// discriminant (`0..23`). The numeric form goes through `UndoStoreId::from_u8`
+/// discriminant (`0..24`). The numeric form goes through `UndoStoreId::from_u8`
 /// so the accepted range stays in lockstep with the enum.
 fn store_from_name(s: &str) -> Result<UndoStoreId, String> {
     let t = s.trim();
     if let Ok(n) = t.parse::<u8>() {
         return UndoStoreId::from_u8(n)
-            .ok_or_else(|| format!("unknown store discriminant: {n} (valid range 0..=23)"));
+            .ok_or_else(|| format!("unknown store discriminant: {n} (valid range 0..=24)"));
     }
     use UndoStoreId as Id;
     let id = match t.to_ascii_lowercase().as_str() {
@@ -1212,6 +1213,7 @@ fn store_from_name(s: &str) -> Result<UndoStoreId, String> {
         "exchangev1" => Id::ExchangeV1,
         "exchangev2" => Id::ExchangeV2,
         "marketorders" => Id::MarketOrders,
+        "marketaccount" => Id::MarketAccount,
         "nullifiers" => Id::Nullifiers,
         "merkletrees" => Id::MerkleTrees,
         "code" => Id::Code,
@@ -1719,7 +1721,7 @@ mod commitment_tests {
 
     #[test]
     fn store_name_parsing_round_trips_names_and_discriminants() {
-        for n in 0u8..=23 {
+        for n in 0u8..=24 {
             let id = UndoStoreId::from_u8(n).unwrap();
             // Name round-trips through the parser.
             assert_eq!(store_from_name(store_name(id)).unwrap(), id);
@@ -1730,7 +1732,7 @@ mod commitment_tests {
         assert_eq!(store_from_name("ACCOUNTS").unwrap(), UndoStoreId::Accounts);
         assert_eq!(store_from_name("StorageRow").unwrap(), UndoStoreId::StorageRow);
         // Out-of-range discriminant and unknown name are errors.
-        assert!(store_from_name("24").is_err());
+        assert!(store_from_name("25").is_err());
         assert!(store_from_name("nope").is_err());
     }
 

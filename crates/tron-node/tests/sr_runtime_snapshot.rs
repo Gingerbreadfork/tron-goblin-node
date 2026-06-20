@@ -59,6 +59,7 @@ fn fresh_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, Arc<dyn KvBacke
         exchange_v1: snapshot_wrap(&mut backends),
         exchange_v2: snapshot_wrap(&mut backends),
         market_orders: snapshot_wrap(&mut backends),
+        market_account: snapshot_wrap(&mut backends),
         nullifiers: snapshot_wrap(&mut backends),
         merkle_trees: None,
         code: Some(snapshot_wrap(&mut backends)),

@@ -616,6 +616,28 @@ fn div_round_half_up_scale4(numer: i128, denom: i128) -> f64 {
     (q * 10_000 + frac) as f64 / 10_000.0
 }
 
+/// Public re-export of [`is_number`] for use by [`crate::market`]. Mirrors
+/// java `TransactionUtil.isNumber`.
+pub fn is_number_impl(id: &[u8]) -> bool {
+    is_number(id)
+}
+
+/// Public re-export of [`asset_balance_enough_v2`] for use by [`crate::market`].
+/// Mirrors java `AccountCapsule.assetBalanceEnoughV2` on the
+/// `allowSameTokenName == 1` path.
+pub fn asset_balance_enough_v2_impl(
+    account: &tron_proto::Account,
+    token_id: &[u8],
+    amount: i64,
+) -> bool {
+    asset_balance_enough_v2(account, token_id, amount)
+}
+
+/// Public re-export of [`asset_v2_balance`] for use by [`crate::market`].
+pub fn asset_v2_balance_impl(account: &tron_proto::Account, token_id: &[u8]) -> i64 {
+    asset_v2_balance(account, token_id)
+}
+
 /// Public re-export of [`debit_token`] for use by [`crate::market`].
 pub fn debit_token_impl(
     account: &mut tron_proto::Account,

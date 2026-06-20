@@ -18,8 +18,9 @@ use std::sync::Arc;
 use hex_literal::hex;
 use tron_actuator::{account, asset, market, witness, ActuatorError};
 use tron_chainbase::{
-    AccountIdIndexStore, AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend,
-    MarketOrderStore, MemBackend, WitnessStore,
+    AccountIdIndexStore, AccountStore, AssetIssueStore, AssetIssueV2Store, DelegationStore,
+    DynamicPropertiesStore, KvBackend, MarketAccountStore, MarketOrderStore, MemBackend,
+    WitnessStore,
 };
 use tron_crypto::address::Address;
 use tron_proto::account::Frozen;
@@ -61,6 +62,29 @@ fn put_account(accounts: &AccountStore, who: [u8; 21], balance: i64) {
     ).unwrap();
 }
 
+/// The three extra stores `validate_market_sell_asset` reads beyond the
+/// account + dyn-props pair. `asset_v1` is pre-loaded with token `1000001`
+/// (the buy token used by these cases) so the asset-existence checks pass;
+/// `allowSameTokenName` defaults to 0, so the legacy AssetIssue store is the
+/// one consulted, keyed by the token-id bytes.
+fn market_sell_stores() -> (MarketAccountStore, AssetIssueStore, AssetIssueV2Store) {
+    let asset_v1 = AssetIssueStore::new(mem());
+    asset_v1
+        .put(
+            b"1000001",
+            &tron_proto::AssetIssueContract {
+                id: "1000001".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    (
+        MarketAccountStore::new(mem()),
+        asset_v1,
+        AssetIssueV2Store::new(mem()),
+    )
+}
+
 // ============================================================
 // MarketSellAsset
 // ============================================================
@@ -69,6 +93,7 @@ fn put_account(accounts: &AccountStore, who: [u8; 21], balance: i64) {
 fn market_sell_rejects_when_proposal_disabled() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
+    let (market_account, asset_v1, asset_v2) = market_sell_stores();
     put_account(&accounts, ALICE, 1_000_000_000);
     let c = MarketSellAssetContract {
         owner_address: ALICE.to_vec(),
@@ -77,7 +102,9 @@ fn market_sell_rejects_when_proposal_disabled() {
         buy_token_id: b"1000001".to_vec(),
         buy_token_quantity: 50,
     };
-    let err = market::validate_market_sell_asset(&accounts, &dp, &c).unwrap_err();
+    let err =
+        market::validate_market_sell_asset(&accounts, &market_account, &asset_v1, &asset_v2, &dp, &c)
+            .unwrap_err();
     assert!(matches!(err, ActuatorError::MarketDisabled));
 }
 
@@ -86,6 +113,7 @@ fn market_sell_rejects_same_token_on_both_sides() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     dp.put_long(b"ALLOW_MARKET_TRANSACTION", 1);
+    let (market_account, asset_v1, asset_v2) = market_sell_stores();
     put_account(&accounts, ALICE, 1_000_000_000);
     let c = MarketSellAssetContract {
         owner_address: ALICE.to_vec(),
@@ -94,7 +122,9 @@ fn market_sell_rejects_same_token_on_both_sides() {
         buy_token_id: b"_".to_vec(),
         buy_token_quantity: 50,
     };
-    let err = market::validate_market_sell_asset(&accounts, &dp, &c).unwrap_err();
+    let err =
+        market::validate_market_sell_asset(&accounts, &market_account, &asset_v1, &asset_v2, &dp, &c)
+            .unwrap_err();
     assert!(matches!(err, ActuatorError::MarketSameTokens));
 }
 
@@ -103,6 +133,7 @@ fn market_sell_rejects_non_positive_quantities() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     dp.put_long(b"ALLOW_MARKET_TRANSACTION", 1);
+    let (market_account, asset_v1, asset_v2) = market_sell_stores();
     put_account(&accounts, ALICE, 1_000_000_000);
     for (s, b) in [(0, 50), (100, 0), (-1, 50), (100, -1)] {
         let c = MarketSellAssetContract {
@@ -112,7 +143,15 @@ fn market_sell_rejects_non_positive_quantities() {
             buy_token_id: b"1000001".to_vec(),
             buy_token_quantity: b,
         };
-        let err = market::validate_market_sell_asset(&accounts, &dp, &c).unwrap_err();
+        let err = market::validate_market_sell_asset(
+            &accounts,
+            &market_account,
+            &asset_v1,
+            &asset_v2,
+            &dp,
+            &c,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveTokenQuant),
             "({s},{b}) got: {err:?}"
@@ -126,6 +165,7 @@ fn market_sell_rejects_insufficient_balance_for_fee() {
     let dp = DynamicPropertiesStore::new(mem());
     dp.put_long(b"ALLOW_MARKET_TRANSACTION", 1);
     dp.put_long(b"MARKET_SELL_FEE", 1_000_000);
+    let (market_account, asset_v1, asset_v2) = market_sell_stores();
     put_account(&accounts, ALICE, 100); // < fee
     let c = MarketSellAssetContract {
         owner_address: ALICE.to_vec(),
@@ -134,7 +174,9 @@ fn market_sell_rejects_insufficient_balance_for_fee() {
         buy_token_id: b"1000001".to_vec(),
         buy_token_quantity: 50,
     };
-    let err = market::validate_market_sell_asset(&accounts, &dp, &c).unwrap_err();
+    let err =
+        market::validate_market_sell_asset(&accounts, &market_account, &asset_v1, &asset_v2, &dp, &c)
+            .unwrap_err();
     assert!(matches!(err, ActuatorError::InsufficientBalance { .. }));
 }
 
@@ -210,6 +252,7 @@ fn market_cancel_rejects_already_canceled_order() {
 fn market_sell_then_cancel_returns_unfilled_quantity() {
     let accounts = AccountStore::new(mem());
     let orders = MarketOrderStore::new(mem());
+    let market_account = MarketAccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     dp.put_long(b"ALLOW_MARKET_TRANSACTION", 1);
     accounts.put(
@@ -229,27 +272,34 @@ fn market_sell_then_cancel_returns_unfilled_quantity() {
         buy_token_id: b"_".to_vec(),
         buy_token_quantity: 50,
     };
-    market::execute_market_sell_asset(&accounts, &orders, &dp, &sell).unwrap();
+    market::execute_market_sell_asset(&accounts, &orders, &market_account, &dp, &sell).unwrap();
     let alice_after = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(*alice_after.asset_v2.get("1000001").unwrap(), 100);
-    // Locate the order id (sha256(owner || timestamp); timestamp=0 here).
-    use tron_crypto::hash::sha256;
-    let mut buf = Vec::with_capacity(29);
-    buf.extend_from_slice(addr(ALICE).as_bytes());
-    buf.extend_from_slice(&0i64.to_be_bytes());
-    let order_id = sha256(&buf).to_vec();
+    // The order id is recorded on the owner's MarketAccountOrder; read it
+    // back rather than recomputing the keccak layout.
+    let account_order = market_account.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(account_order.count, 1);
+    assert_eq!(account_order.total_count, 1);
+    let order_id = account_order.orders[0].clone();
     assert!(orders.get(&order_id).unwrap().is_some());
     let cancel = MarketCancelOrderContract {
         owner_address: ALICE.to_vec(),
         order_id: order_id.clone(),
     };
-    market::execute_market_cancel_order(&accounts, &orders, &dp, &cancel).unwrap();
+    market::execute_market_cancel_order(&accounts, &orders, &market_account, &dp, &cancel).unwrap();
     let alice_back = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(*alice_back.asset_v2.get("1000001").unwrap(), 200);
     let o = orders.get(&order_id).unwrap().unwrap();
     assert_eq!(o.state, OrderState::Canceled as i32);
-    assert_eq!(o.sell_token_quantity_return, 100);
+    // java cancel does not set sell_token_quantity_return (only matching-time
+    // dust returns set it); an unmatched canceled order keeps it at 0.
+    assert_eq!(o.sell_token_quantity_return, 0);
     assert_eq!(o.sell_token_quantity_remain, 0);
+    // count decremented, total_count untouched, list emptied.
+    let account_order = market_account.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(account_order.count, 0);
+    assert_eq!(account_order.total_count, 1);
+    assert!(account_order.orders.is_empty());
 }
 
 // ============================================================

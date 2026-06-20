@@ -202,6 +202,16 @@ pub enum ActuatorError {
     MarketOrderMissing,
     #[error("market order already canceled or filled")]
     MarketOrderNotActive,
+    #[error("market token id is not a valid number")]
+    MarketInvalidTokenId,
+    #[error("market token quantity exceeds the per-order limit")]
+    MarketQuantityLimitExceeded,
+    #[error("maximum number of active market orders exceeded")]
+    MarketTooManyOrders,
+    #[error("market sell-token does not exist")]
+    MarketSellTokenMissing,
+    #[error("market buy-token does not exist")]
+    MarketBuyTokenMissing,
 
     // --- Smart contract admin -------------------------------------------
     #[error("smart contract does not exist")]

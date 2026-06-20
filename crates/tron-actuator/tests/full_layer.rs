@@ -15,7 +15,7 @@ use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
     AssetIssueV2Store, ContractStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
     DelegationStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, KvBackend,
-    MarketOrderStore, MemBackend, ProposalStore, VotesStore, WitnessStore,
+    MarketAccountStore, MarketOrderStore, MemBackend, ProposalStore, VotesStore, WitnessStore,
 };
 use tron_crypto::address::Address;
 use tron_proto::account::Frozen;
@@ -578,8 +578,23 @@ fn exchange_create_round_trip() {
 fn market_sell_then_cancel() {
     let accounts = AccountStore::new(mem());
     let orders = MarketOrderStore::new(mem());
+    let market_account = MarketAccountStore::new(mem());
+    let asset_v1 = AssetIssueStore::new(mem());
+    let asset_v2 = AssetIssueV2Store::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     dp.put_long(b"ALLOW_MARKET_TRANSACTION", 1);
+    // The buy token must exist (java: "No buyTokenId !"). allowSameTokenName
+    // defaults to 0 here, so the legacy AssetIssue store is keyed by the
+    // token-id bytes.
+    asset_v1
+        .put(
+            b"1000001",
+            &tron_proto::AssetIssueContract {
+                id: "1000001".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     accounts.put(
         &addr(ALICE),
         &Account {
@@ -597,35 +612,45 @@ fn market_sell_then_cancel() {
         buy_token_id: b"1000001".to_vec(),
         buy_token_quantity: 50_000_000,
     };
-    market::validate_market_sell_asset(&accounts, &dp, &sell).unwrap();
-    market::execute_market_sell_asset(&accounts, &orders, &dp, &sell).unwrap();
+    market::validate_market_sell_asset(
+        &accounts,
+        &market_account,
+        &asset_v1,
+        &asset_v2,
+        &dp,
+        &sell,
+    )
+    .unwrap();
+    market::execute_market_sell_asset(&accounts, &orders, &market_account, &dp, &sell).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 900_000_000);
 
-    // We need the order id to cancel; iterate the backend instead.
-    let order_id = {
-        let mut found: Option<Vec<u8>> = None;
-        let _ = orders.get(&[]); // ensure store is touched (no-op)
-        // Walk MemBackend directly via known invariant: we just wrote one order.
-        // Simulate by computing the same hash the actuator uses.
-        use tron_crypto::hash::sha256;
-        let mut buf = Vec::with_capacity(29);
-        buf.extend_from_slice(addr(ALICE).as_bytes());
-        buf.extend_from_slice(&dp.latest_block_header_timestamp().unwrap_or(0).to_be_bytes());
-        let id = sha256(&buf).to_vec();
-        if orders.get(&id).unwrap().is_some() {
-            found = Some(id);
-        }
-        found.expect("order was written")
-    };
+    // The owner's MarketAccountOrder now holds one active order; its id is
+    // exactly what java MarketUtils.calculateOrderId derives from the
+    // PRE-increment total_count (0 for the first order). Read the id back
+    // from the account-order record rather than recomputing the layout.
+    let account_order = market_account.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(account_order.count, 1);
+    assert_eq!(account_order.total_count, 1);
+    assert_eq!(account_order.orders.len(), 1);
+    let order_id = account_order.orders[0].clone();
+    assert!(orders.get(&order_id).unwrap().is_some());
+
     let cancel = tron_proto::MarketCancelOrderContract {
         owner_address: ALICE.to_vec(),
         order_id,
     };
     market::validate_market_cancel_order(&accounts, &orders, &dp, &cancel).unwrap();
-    market::execute_market_cancel_order(&accounts, &orders, &dp, &cancel).unwrap();
+    market::execute_market_cancel_order(&accounts, &orders, &market_account, &dp, &cancel).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 1_000_000_000); // refunded
+
+    // Cancel removed the order from the owner's list and decremented count;
+    // total_count is left untouched (java removeOrder).
+    let account_order = market_account.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(account_order.count, 0);
+    assert_eq!(account_order.total_count, 1);
+    assert!(account_order.orders.is_empty());
 }
 
 // =============================================================================

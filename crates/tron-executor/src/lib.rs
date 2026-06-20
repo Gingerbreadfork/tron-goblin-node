@@ -52,8 +52,8 @@ use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
     AssetIssueV2Store, ContractStore, DelegatedResourceStore, DelegationStore,
     DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, IncrementalMerkleTreeStore,
-    KvBackend, MarketOrderStore, NullifierStore, ProposalStore, SessionBackend, VotesStore,
-    WitnessStore,
+    KvBackend, MarketAccountStore, MarketOrderStore, NullifierStore, ProposalStore, SessionBackend,
+    VotesStore, WitnessStore,
 };
 use tron_crypto::hash::sha256;
 use tron_proto::transaction::contract::ContractType;
@@ -437,6 +437,7 @@ pub struct StateBackends {
     pub exchange_v1: Arc<dyn KvBackend>,
     pub exchange_v2: Arc<dyn KvBackend>,
     pub market_orders: Arc<dyn KvBackend>,
+    pub market_account: Arc<dyn KvBackend>,
     pub nullifiers: Arc<dyn KvBackend>,
     /// Optional shielded-transfer incremental Merkle tree store.
     /// When `None`, anchor checks and commitment appends are skipped.
@@ -488,6 +489,7 @@ struct TxSession {
     exchange_v1: Arc<SessionBackend>,
     exchange_v2: Arc<SessionBackend>,
     market_orders: Arc<SessionBackend>,
+    market_account: Arc<SessionBackend>,
     nullifiers: Arc<SessionBackend>,
     merkle_trees: Option<Arc<SessionBackend>>,
     /// EVM-side session-wrapped backends. `None` when the executor was
@@ -524,6 +526,7 @@ impl TxSession {
             exchange_v1: Arc::new(SessionBackend::new(base.exchange_v1.clone())),
             exchange_v2: Arc::new(SessionBackend::new(base.exchange_v2.clone())),
             market_orders: Arc::new(SessionBackend::new(base.market_orders.clone())),
+            market_account: Arc::new(SessionBackend::new(base.market_account.clone())),
             nullifiers: Arc::new(SessionBackend::new(base.nullifiers.clone())),
             merkle_trees: base
                 .merkle_trees
@@ -566,6 +569,7 @@ impl TxSession {
         self.exchange_v1.commit()?;
         self.exchange_v2.commit()?;
         self.market_orders.commit()?;
+        self.market_account.commit()?;
         self.nullifiers.commit()?;
         if let Some(s) = &self.delegated_resource_account_index {
             s.commit()?;
@@ -605,6 +609,7 @@ impl TxSession {
         self.exchange_v1.revert();
         self.exchange_v2.revert();
         self.market_orders.revert();
+        self.market_account.revert();
         self.nullifiers.revert();
         if let Some(s) = &self.delegated_resource_account_index {
             s.revert();
@@ -656,6 +661,7 @@ impl TxSession {
             exchange_v1: up(&self.exchange_v1),
             exchange_v2: up(&self.exchange_v2),
             market_orders: up(&self.market_orders),
+            market_account: up(&self.market_account),
             nullifiers: up(&self.nullifiers),
             merkle_trees: upo(&self.merkle_trees),
             code: upo(&self.code),
@@ -743,6 +749,7 @@ struct SessionStoreOwners {
     exchange_v1: ExchangeStore,
     exchange_v2: ExchangeV2Store,
     market_orders: MarketOrderStore,
+    market_account: MarketAccountStore,
     nullifiers: NullifierStore,
     merkle_trees: Option<IncrementalMerkleTreeStore>,
     reward_vi: Option<tron_chainbase::RewardViStore>,
@@ -774,6 +781,7 @@ impl SessionStoreOwners {
             exchange_v1: ExchangeStore::new(state.exchange_v1.clone()),
             exchange_v2: ExchangeV2Store::new(state.exchange_v2.clone()),
             market_orders: MarketOrderStore::new(state.market_orders.clone()),
+            market_account: MarketAccountStore::new(state.market_account.clone()),
             nullifiers: NullifierStore::new(state.nullifiers.clone()),
             merkle_trees: state
                 .merkle_trees
@@ -805,6 +813,7 @@ impl SessionStoreOwners {
             exchange_v1: &self.exchange_v1,
             exchange_v2: &self.exchange_v2,
             market_orders: &self.market_orders,
+            market_account: &self.market_account,
             nullifiers: &self.nullifiers,
             merkle_trees: self.merkle_trees.as_ref(),
             reward_vi: self.reward_vi.as_ref(),
@@ -1399,6 +1408,7 @@ struct BlockSession {
     exchange_v1: Arc<SessionBackend>,
     exchange_v2: Arc<SessionBackend>,
     market_orders: Arc<SessionBackend>,
+    market_account: Arc<SessionBackend>,
     nullifiers: Arc<SessionBackend>,
     merkle_trees: Option<Arc<SessionBackend>>,
     code: Option<Arc<SessionBackend>>,
@@ -1433,6 +1443,7 @@ impl BlockSession {
             exchange_v1: Arc::new(SessionBackend::new(state.exchange_v1.clone())),
             exchange_v2: Arc::new(SessionBackend::new(state.exchange_v2.clone())),
             market_orders: Arc::new(SessionBackend::new(state.market_orders.clone())),
+            market_account: Arc::new(SessionBackend::new(state.market_account.clone())),
             nullifiers: Arc::new(SessionBackend::new(state.nullifiers.clone())),
             merkle_trees: state
                 .merkle_trees
@@ -1484,6 +1495,7 @@ impl BlockSession {
             exchange_v1: self.exchange_v1.clone(),
             exchange_v2: self.exchange_v2.clone(),
             market_orders: self.market_orders.clone(),
+            market_account: self.market_account.clone(),
             nullifiers: self.nullifiers.clone(),
             merkle_trees: self.merkle_trees.clone().map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
             code: self.code.clone().map(|s| s as Arc<dyn tron_chainbase::KvBackend>),
@@ -1549,6 +1561,7 @@ impl BlockSession {
         push(Id::ExchangeV1, self.exchange_v1.commit_with_undo_and_ops()?);
         push(Id::ExchangeV2, self.exchange_v2.commit_with_undo_and_ops()?);
         push(Id::MarketOrders, self.market_orders.commit_with_undo_and_ops()?);
+        push(Id::MarketAccount, self.market_account.commit_with_undo_and_ops()?);
         push(Id::Nullifiers, self.nullifiers.commit_with_undo_and_ops()?);
         if let Some(s) = self.delegated_resource_account_index {
             push(Id::DelegatedResourceAccountIndex, s.commit_with_undo_and_ops()?);
@@ -1677,6 +1690,7 @@ pub(crate) fn drain_block_session(
     take(Id::ExchangeV1, session.exchange_v1, targets.exchange_v1.clone())?;
     take(Id::ExchangeV2, session.exchange_v2, targets.exchange_v2.clone())?;
     take(Id::MarketOrders, session.market_orders, targets.market_orders.clone())?;
+    take(Id::MarketAccount, session.market_account, targets.market_account.clone())?;
     take(Id::Nullifiers, session.nullifiers, targets.nullifiers.clone())?;
     if let (Some(s), Some(b)) = (
         session.delegated_resource_account_index,
@@ -1865,6 +1879,7 @@ fn sync_all_state_wals(state: &StateBackends) -> Result<(), tron_chainbase::KvEr
     sync(&state.exchange_v1)?;
     sync(&state.exchange_v2)?;
     sync(&state.market_orders)?;
+    sync(&state.market_account)?;
     sync(&state.nullifiers)?;
     if let Some(b) = &state.delegated_resource_account_index {
         sync(b)?;
@@ -1930,6 +1945,7 @@ pub fn replay_pending_checkpoints(
     by_name.insert(Id::ExchangeV1.db_name(), state.exchange_v1.clone());
     by_name.insert(Id::ExchangeV2.db_name(), state.exchange_v2.clone());
     by_name.insert(Id::MarketOrders.db_name(), state.market_orders.clone());
+    by_name.insert(Id::MarketAccount.db_name(), state.market_account.clone());
     by_name.insert(Id::Nullifiers.db_name(), state.nullifiers.clone());
     if let Some(b) = state.delegated_resource_account_index.clone() {
         by_name.insert(Id::DelegatedResourceAccountIndex.db_name(), b);
@@ -2020,6 +2036,7 @@ pub fn rollback_block(
             Id::ExchangeV1 => &state.exchange_v1,
             Id::ExchangeV2 => &state.exchange_v2,
             Id::MarketOrders => &state.market_orders,
+            Id::MarketAccount => &state.market_account,
             Id::Nullifiers => &state.nullifiers,
             Id::MerkleTrees => state
                 .merkle_trees

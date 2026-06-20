@@ -65,6 +65,7 @@ const SID_STORAGE_ROW: StoreId = 20;
 const SID_CONTRACT_STATE: StoreId = 21;
 const SID_BLOCK_INDEX: StoreId = 22;
 const SID_WITNESS_SCHEDULE: StoreId = 23;
+const SID_MARKET_ACCOUNT: StoreId = 24;
 
 /// Commutative-accumulator keys in the dyn_props store: pure additive (`+=`)
 /// counters RMW'd by (nearly) every tx on a single shared key. As ordinary
@@ -191,6 +192,7 @@ fn versioned_state(
         exchange_v1: w(SID_EXCHANGE_V1, &base.exchange_v1),
         exchange_v2: w(SID_EXCHANGE_V2, &base.exchange_v2),
         market_orders: w(SID_MARKET_ORDERS, &base.market_orders),
+        market_account: w(SID_MARKET_ACCOUNT, &base.market_account),
         nullifiers: w(SID_NULLIFIERS, &base.nullifiers),
         merkle_trees: wo(SID_MERKLE_TREES, &base.merkle_trees),
         code: wo(SID_CODE, &base.code),
@@ -225,6 +227,7 @@ fn base_field(state: &StateBackends, sid: StoreId) -> Option<Arc<dyn KvBackend>>
         SID_EXCHANGE_V1 => state.exchange_v1.clone(),
         SID_EXCHANGE_V2 => state.exchange_v2.clone(),
         SID_MARKET_ORDERS => state.market_orders.clone(),
+        SID_MARKET_ACCOUNT => state.market_account.clone(),
         SID_NULLIFIERS => state.nullifiers.clone(),
         SID_MERKLE_TREES => return state.merkle_trees.clone(),
         SID_CODE => return state.code.clone(),

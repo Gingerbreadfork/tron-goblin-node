@@ -14,8 +14,8 @@ use tron_chainbase::{
     AbiStore, AccountIdIndexStore, AccountIndexStore, AccountStore, AssetIssueStore,
     AssetIssueV2Store, ContractStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
     DelegationStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
-    IncrementalMerkleTreeStore, MarketOrderStore, NullifierStore, ProposalStore, VotesStore,
-    WitnessStore,
+    IncrementalMerkleTreeStore, MarketAccountStore, MarketOrderStore, NullifierStore,
+    ProposalStore, VotesStore, WitnessStore,
 };
 use tron_proto::transaction::contract::ContractType;
 
@@ -48,6 +48,11 @@ pub struct ActuatorStores<'a> {
     pub exchange_v1: &'a ExchangeStore,
     pub exchange_v2: &'a ExchangeV2Store,
     pub market_orders: &'a MarketOrderStore,
+    /// Per-owner aggregate market order accounting (order-id list +
+    /// active `count` + monotonic `total_count`). Mirrors
+    /// [`market_orders`](Self::market_orders); written by the market
+    /// sell/cancel actuators.
+    pub market_account: &'a MarketAccountStore,
     pub nullifiers: &'a NullifierStore,
     /// Optional: the shielded-transfer incremental Merkle tree store.
     /// When `None`, the actuator skips the anchor-existence check and
@@ -289,7 +294,14 @@ pub fn dispatch_validate(
         }
         ContractType::MarketSellAssetContract => {
             let c = unpack::<tron_proto::MarketSellAssetContract>(parameter)?;
-            crate::market::validate_market_sell_asset(stores.accounts, stores.dyn_props, &c)
+            crate::market::validate_market_sell_asset(
+                stores.accounts,
+                stores.market_account,
+                stores.asset_v1,
+                stores.asset_v2,
+                stores.dyn_props,
+                &c,
+            )
         }
         ContractType::MarketCancelOrderContract => {
             let c = unpack::<tron_proto::MarketCancelOrderContract>(parameter)?;
@@ -592,6 +604,7 @@ pub fn dispatch_execute(
             crate::market::execute_market_sell_asset(
                 stores.accounts,
                 stores.market_orders,
+                stores.market_account,
                 stores.dyn_props,
                 &c,
             )
@@ -601,6 +614,7 @@ pub fn dispatch_execute(
             crate::market::execute_market_cancel_order(
                 stores.accounts,
                 stores.market_orders,
+                stores.market_account,
                 stores.dyn_props,
                 &c,
             )

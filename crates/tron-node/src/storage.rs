@@ -733,6 +733,7 @@ impl OpenedStores {
             exchange_v1: self.exchange_v1.clone(),
             exchange_v2: self.exchange_v2.clone(),
             market_orders: self.market_orders.clone(),
+            market_account: self.market_account.clone(),
             nullifiers: self.nullifiers.clone(),
             merkle_trees: Some(self.merkle_trees.clone()),
             code: Some(self.code.clone()),

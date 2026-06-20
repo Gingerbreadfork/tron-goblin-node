@@ -167,6 +167,7 @@ fn engine_backfills_and_resumes_over_rocksdb() {
             exchange_v1: mem(),
             exchange_v2: mem(),
             market_orders: mem(),
+            market_account: mem(),
             nullifiers: mem(),
             merkle_trees: None,
             code: Some(mem()),

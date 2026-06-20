@@ -65,6 +65,7 @@ struct StateBundle {
     exchange_v1_be: Arc<dyn KvBackend>,
     exchange_v2_be: Arc<dyn KvBackend>,
     market_orders_be: Arc<dyn KvBackend>,
+    market_account_be: Arc<dyn KvBackend>,
     // Typed views for setup/assertions.
     accounts: AccountStore,
     #[allow(dead_code)]
@@ -108,6 +109,7 @@ impl StateBundle {
         let (abi_be, exchange_v1_be, exchange_v2_be, market_orders_be) =
             (mem(), mem(), mem(), mem());
         let nullifiers_be = mem();
+        let market_account_be = mem();
         Self {
             accounts: AccountStore::new(accounts_be.clone()),
             witnesses: WitnessStore::new(witnesses_be.clone()),
@@ -142,6 +144,7 @@ impl StateBundle {
             exchange_v1_be,
             exchange_v2_be,
             market_orders_be,
+            market_account_be,
         }
     }
 
@@ -165,6 +168,7 @@ impl StateBundle {
             exchange_v1: self.exchange_v1_be.clone(),
             exchange_v2: self.exchange_v2_be.clone(),
             market_orders: self.market_orders_be.clone(),
+            market_account: self.market_account_be.clone(),
             nullifiers: self.nullifiers_be.clone(),
             merkle_trees: None,
             // VM stores not attached for non-VM contract tests.

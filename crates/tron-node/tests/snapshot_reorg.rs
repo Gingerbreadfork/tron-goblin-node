@@ -54,6 +54,7 @@ fn build_snapshot_state() -> (StateBackends, Arc<dyn KvBackend>, SnapshotStack) 
         exchange_v1: snapshot_state(&mut stores),
         exchange_v2: snapshot_state(&mut stores),
         market_orders: snapshot_state(&mut stores),
+        market_account: snapshot_state(&mut stores),
         nullifiers: snapshot_state(&mut stores),
         merkle_trees: None,
         code: Some(snapshot_state(&mut stores)),

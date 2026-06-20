@@ -207,6 +207,7 @@ impl ApplyPipeline {
             exchange_v1: wrap(Id::ExchangeV1, &base.exchange_v1),
             exchange_v2: wrap(Id::ExchangeV2, &base.exchange_v2),
             market_orders: wrap(Id::MarketOrders, &base.market_orders),
+            market_account: wrap(Id::MarketAccount, &base.market_account),
             nullifiers: wrap(Id::Nullifiers, &base.nullifiers),
             delegated_resource_account_index: opt(
                 &mut overlays,

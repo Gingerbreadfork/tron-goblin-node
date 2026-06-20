@@ -347,6 +347,7 @@ fn cmd_execute(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         exchange_v1: m(),
         exchange_v2: m(),
         market_orders: m(),
+        market_account: m(),
         nullifiers: m(),
         merkle_trees: None,
         code: Some(m()),
