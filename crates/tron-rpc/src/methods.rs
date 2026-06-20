@@ -4044,8 +4044,15 @@ pub fn get_contract_info(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
                 .get_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR")
                 .unwrap_or(0);
             let max_factor = s.dyn_props.get_long(b"DYNAMIC_ENERGY_MAX_FACTOR").unwrap_or(0);
-            cs.caught_up_view(&addr, current_cycle, threshold, increase, max_factor)
-                .map_err(|e| RpcError::internal(format!("contract state read: {e}")))?
+            cs.caught_up_view(
+                &addr,
+                current_cycle,
+                threshold,
+                increase,
+                max_factor,
+                s.dyn_props.allow_strict_math(),
+            )
+            .map_err(|e| RpcError::internal(format!("contract state read: {e}")))?
         }
         None => tron_proto::ContractState {
             update_cycle: current_cycle,

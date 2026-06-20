@@ -13,6 +13,7 @@ use std::sync::Arc;
 use prost::Message;
 use tron_crypto::address::Address;
 use tron_proto::ContractState;
+use tron_types::strict_math::pow;
 
 use crate::backend::KvBackend;
 use crate::stores::StoreError;
@@ -66,10 +67,10 @@ impl ContractStateStore {
     /// 3. Reset `energy_usage` to 0 and stamp `update_cycle = new_cycle`.
     ///
     /// Idempotent within a single cycle. Initialises a fresh record when
-    /// the contract has none yet. Strict-math / `Math.pow` flag handling
-    /// is deferred — we always use `f64::powf`; differences vs java-tron
-    /// surface only at the LSBs of the resulting factor for very long
-    /// idle gaps.
+    /// the contract has none yet. `use_strict_math` is java-tron's
+    /// `DynamicPropertiesStore.allowStrictMath()` (proposal #87): when `true`
+    /// the decay `pow` uses the bit-exact fdlibm `StrictMath.pow` port,
+    /// otherwise `f64::powf` (== pre-#87 `Math.pow`).
     pub fn catch_up_to_cycle(
         &self,
         address: &Address,
@@ -77,9 +78,16 @@ impl ContractStateStore {
         threshold: i64,
         increase_factor: i64,
         max_factor: i64,
+        use_strict_math: bool,
     ) -> Result<i64, StoreError> {
-        let (state, changed) =
-            Self::caught_up(self.get(address)?, new_cycle, threshold, increase_factor, max_factor);
+        let (state, changed) = Self::caught_up(
+            self.get(address)?,
+            new_cycle,
+            threshold,
+            increase_factor,
+            max_factor,
+            use_strict_math,
+        );
         if changed {
             self.put(address, &state)?;
         }
@@ -98,8 +106,17 @@ impl ContractStateStore {
         threshold: i64,
         increase_factor: i64,
         max_factor: i64,
+        use_strict_math: bool,
     ) -> Result<ContractState, StoreError> {
-        Ok(Self::caught_up(self.get(address)?, new_cycle, threshold, increase_factor, max_factor).0)
+        Ok(Self::caught_up(
+            self.get(address)?,
+            new_cycle,
+            threshold,
+            increase_factor,
+            max_factor,
+            use_strict_math,
+        )
+        .0)
     }
 
     /// Pure catch-up transform shared by the consensus write path
@@ -112,6 +129,7 @@ impl ContractStateStore {
         threshold: i64,
         increase_factor: i64,
         max_factor: i64,
+        use_strict_math: bool,
     ) -> (ContractState, bool) {
         const DECIMAL: i64 = 10_000;
         const DECREASE_DIVISION: i64 = 4;
@@ -154,7 +172,7 @@ impl ContractStateStore {
         if cycle_count > 0 {
             let base = 1.0
                 - (increase_factor as f64) / (DECREASE_DIVISION as f64) / (DECIMAL as f64);
-            let decrease_percent = base.powf(cycle_count as f64);
+            let decrease_percent = pow(base, cycle_count as f64, use_strict_math);
             current_factor =
                 ((current_factor + DECIMAL) as f64 * decrease_percent) as i64 - DECIMAL;
             if current_factor < 0 {
@@ -206,7 +224,7 @@ mod tests {
     fn catch_up_initialises_fresh_record() {
         let s = store();
         let a = addr(0x11);
-        let factor = s.catch_up_to_cycle(&a, 100, 1_000_000, 50, 100_000).unwrap();
+        let factor = s.catch_up_to_cycle(&a, 100, 1_000_000, 50, 100_000, false).unwrap();
         assert_eq!(factor, 0);
         let stored = s.get(&a).unwrap().unwrap();
         assert_eq!(stored.update_cycle, 100);
@@ -226,7 +244,7 @@ mod tests {
                 energy_usage: 42,
             },
         ).unwrap();
-        let factor = s.catch_up_to_cycle(&a, 50, 1_000_000, 50, 100_000).unwrap();
+        let factor = s.catch_up_to_cycle(&a, 50, 1_000_000, 50, 100_000, false).unwrap();
         assert_eq!(factor, 3_000);
         let stored = s.get(&a).unwrap().unwrap();
         assert_eq!(stored.energy_usage, 42, "usage must not be cleared on no-op");
@@ -248,7 +266,7 @@ mod tests {
         // newCycle = 100 (one cycle gap). Increase by 50 / 10_000 = 0.5%.
         // (0 + 10000) * 1.005 = 10049.999... (IEEE 754), truncates to
         // 10049; minus 10000 → 49. Java-tron does the same `(long)` cast.
-        let factor = s.catch_up_to_cycle(&a, 100, 1_000_000, 50, 100_000).unwrap();
+        let factor = s.catch_up_to_cycle(&a, 100, 1_000_000, 50, 100_000, false).unwrap();
         assert_eq!(factor, 49);
         let stored = s.get(&a).unwrap().unwrap();
         assert_eq!(stored.update_cycle, 100);
@@ -269,7 +287,7 @@ mod tests {
             },
         ).unwrap();
         // Jump to cycle 60: 10 idle cycles, no growth, only decay.
-        let factor = s.catch_up_to_cycle(&a, 60, 1_000_000, 50, 100_000).unwrap();
+        let factor = s.catch_up_to_cycle(&a, 60, 1_000_000, 50, 100_000, false).unwrap();
         // base = 1 - 50/4/10000 = 0.99875; 0.99875^10 ≈ 0.98758
         // (10000 + 10000) * 0.98758 ≈ 19751.6; - 10000 = 9751.
         assert!(

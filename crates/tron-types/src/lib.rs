@@ -15,6 +15,7 @@ pub mod block_id;
 pub mod block_validate;
 pub mod genesis;
 pub mod resource;
+pub mod strict_math;
 pub mod tx_id;
 pub mod tx_sign;
 
@@ -27,6 +28,7 @@ pub use block_validate::{
     block_raw_hash, sign_block, verify_parent_link, verify_tx_trie_root, verify_tx_trie_root_raw,
     verify_witness_signature, BlockValidateError,
 };
+pub use strict_math::strict_pow;
 pub use genesis::{
     build_genesis_block, genesis_block_id, mainnet_inputs, mainnet_witnesses, GenesisAsset,
     GenesisInputs, GenesisWitness, GENESIS_OWNER_ADDRESS, MAINNET_ASSETS, MAINNET_PARENT_HASH,

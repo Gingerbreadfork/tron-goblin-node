@@ -509,7 +509,7 @@ fn transaction_applies_bancor_pricing() {
         expected: 90_000_000, // accept slippage
     };
     exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
-    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
+    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // First side grew by the swapped 100_000_000; second shrank by the exact
     // Bancor output.
@@ -533,7 +533,7 @@ fn transaction_rejects_output_below_expected_slippage() {
         expected: 99_999_999_999, // wildly optimistic
     };
     let err =
-        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap_err();
+        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::ExchangeOutputBelowExpected),
         "got: {err:?}"
@@ -553,7 +553,7 @@ fn transaction_rejects_when_owner_lacks_input_balance() {
     };
     exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
     let err =
-        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap_err();
+        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     // We're short on TRX; debit returns InsufficientBalance via check_sub.
     assert!(
         matches!(
@@ -579,7 +579,7 @@ fn transaction_with_swap_in_opposite_direction_also_works() {
         expected: 1,
     };
     exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
-    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
+    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // Asset side grew, TRX side shrank.
     assert_eq!(ex.second_token_balance, 1_100_000_000);

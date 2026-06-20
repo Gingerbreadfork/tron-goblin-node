@@ -91,6 +91,9 @@ pub mod keys {
     pub const ALLOW_HARDEN_RESOURCE_CALCULATION: &[u8] = b"ALLOW_HARDEN_RESOURCE_CALCULATION";
     pub const ALLOW_TVM_FREEZE: &[u8] = b"ALLOW_TVM_FREEZE";
     pub const ALLOW_BLACKHOLE_OPTIMIZATION: &[u8] = b"ALLOW_BLACKHOLE_OPTIMIZATION";
+    /// Proposal #87. When `1`, `Maths.pow` selects `StrictMath.pow` (fdlibm)
+    /// over `Math.pow` for the Bancor exchange curve and dynamic-energy decay.
+    pub const ALLOW_STRICT_MATH: &[u8] = b"ALLOW_STRICT_MATH";
     /// `getUnfreezeDelayDays() > 0` ⇒ `supportUnfreezeDelay()`.
     pub const UNFREEZE_DELAY_DAYS: &[u8] = b"UNFREEZE_DELAY_DAYS";
     /// `getAllowCancelAllUnfreezeV2() == 1 && supportUnfreezeDelay()` ⇒
@@ -714,6 +717,13 @@ impl DynamicPropertiesStore {
 
     pub fn allow_blackhole_optimization(&self) -> i64 {
         self.get_long(keys::ALLOW_BLACKHOLE_OPTIMIZATION).unwrap_or(0)
+    }
+
+    /// java-tron `allowStrictMath()` = `getAllowStrictMath() == 1` (proposal
+    /// #87). Selects the fdlibm `StrictMath.pow` port over `f64::powf` in the
+    /// Bancor exchange curve and the dynamic-energy decay.
+    pub fn allow_strict_math(&self) -> bool {
+        self.get_long(keys::ALLOW_STRICT_MATH).unwrap_or(0) == 1
     }
 
     pub fn support_blackhole_optimization(&self) -> bool {

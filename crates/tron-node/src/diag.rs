@@ -238,7 +238,7 @@ fn diag_contractstate(data_dir: &str, addr: &Address) -> Result<(), String> {
         ),
     }
     let caught = cs
-        .caught_up_view(addr, cur_cycle, threshold, increase, max_factor)
+        .caught_up_view(addr, cur_cycle, threshold, increase, max_factor, dp.allow_strict_math())
         .map_err(|e| format!("catch-up: {e}"))?;
     println!(
         "  caught-up @cycle {cur_cycle} (allow_dynamic={allow} threshold={threshold} \

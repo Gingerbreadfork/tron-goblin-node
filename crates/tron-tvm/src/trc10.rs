@@ -516,8 +516,16 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
             let threshold = dp.get_long(b"DYNAMIC_ENERGY_THRESHOLD").unwrap_or(0);
             let increase = dp.get_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR").unwrap_or(0);
             let max_factor = dp.get_long(b"DYNAMIC_ENERGY_MAX_FACTOR").unwrap_or(0);
-            cs.catch_up_to_cycle(&tron_addr, current_cycle, threshold, increase, max_factor)
-                .unwrap_or(0)
+            let use_strict_math = dp.allow_strict_math();
+            cs.catch_up_to_cycle(
+                &tron_addr,
+                current_cycle,
+                threshold,
+                increase,
+                max_factor,
+                use_strict_math,
+            )
+            .unwrap_or(0)
         } else {
             cs.dynamic_energy_factor(&tron_addr).unwrap_or(0)
         };

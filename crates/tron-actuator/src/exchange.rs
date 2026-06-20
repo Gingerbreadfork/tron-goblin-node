@@ -6,10 +6,11 @@
 //!
 //! **Pricing**: ExchangeTransaction uses java's two-step Bancor power curve
 //! over a fixed virtual supply (1e18), reproduced in
-//! [`execute_exchange_transaction`]. `f64::powf` matches `Math.pow` (the
-//! pre-`ALLOW_STRICT_MATH` path); last-ULP exactness under `StrictMath.pow`
-//! is a repo-wide follow-up. Inject/withdraw use exact integer (i128) ratio
-//! math.
+//! [`execute_exchange_transaction`]. The `pow` calls go through
+//! [`tron_types::strict_math::pow`], which selects the bit-exact fdlibm
+//! `StrictMath.pow` port when `ALLOW_STRICT_MATH` (proposal #87) is active and
+//! `f64::powf` (== pre-#87 `Math.pow`) otherwise. Inject/withdraw use exact
+//! integer (i128) ratio math.
 
 use tron_chainbase::{
     AccountStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
@@ -18,6 +19,8 @@ use tron_proto::{
     Exchange, ExchangeCreateContract, ExchangeInjectContract, ExchangeTransactionContract,
     ExchangeWithdrawContract,
 };
+
+use tron_types::strict_math::pow;
 
 use crate::helpers::{check_add, check_sub, require_owner};
 use crate::transfer::ExecutionResult;
@@ -487,8 +490,10 @@ pub fn execute_exchange_transaction(
     accounts: &AccountStore,
     v1: &ExchangeStore,
     v2: &ExchangeV2Store,
+    dyn_props: &DynamicPropertiesStore,
     contract: &ExchangeTransactionContract,
 ) -> Result<ExecutionResult, ActuatorError> {
+    let use_strict_math = dyn_props.allow_strict_math();
     let owner = require_owner(&contract.owner_address)?;
     let mut exchange = v2
         .get(contract.exchange_id)?
@@ -517,21 +522,21 @@ pub fn execute_exchange_transaction(
     // exact and the step-2 denominator is exactly the original supply), and
     // both `pow` results truncate toward zero via the `(long)` cast (`as i64`).
     // The `+ quant` and supply steps use wrapping i64 arithmetic to mirror
-    // java's `long` overflow. java picks Math.pow / StrictMath.pow on
-    // `allowStrictMath` (proposal 87); `f64::powf` matches Math.pow (the pre-87
-    // path) exactly — last-ULP exactness under strict math would need an fdlibm
-    // `pow` (a repo-wide follow-up shared with the dynamic-energy decay).
+    // java's `long` overflow. java's `Maths.pow` selects `StrictMath.pow`
+    // (fdlibm) over `Math.pow` on `allowStrictMath` (proposal 87); the `pow`
+    // helper mirrors that — `strict_pow` (bit-exact fdlibm) when the flag is on,
+    // `f64::powf` (== pre-87 `Math.pow`) when off.
     let mut supply: i64 = 1_000_000_000_000_000_000;
     // exchangeToSupply(sell_balance, sell_quant)
     let new_balance = my_balance_before.wrapping_add(contract.quant) as f64;
-    let issued =
-        -(supply as f64) * (1.0 - (1.0 + contract.quant as f64 / new_balance).powf(0.0005));
+    let issued = -(supply as f64)
+        * (1.0 - pow(1.0 + contract.quant as f64 / new_balance, 0.0005, use_strict_math));
     let relay = issued as i64;
     supply = supply.wrapping_add(relay);
     // exchangeFromSupply(buy_balance, relay)
     supply = supply.wrapping_sub(relay);
-    let exchange_balance =
-        other_balance_before as f64 * ((1.0 + relay as f64 / supply as f64).powf(2000.0) - 1.0);
+    let exchange_balance = other_balance_before as f64
+        * (pow(1.0 + relay as f64 / supply as f64, 2000.0, use_strict_math) - 1.0);
     let output = exchange_balance as i64;
     if output < contract.expected {
         return Err(ActuatorError::ExchangeOutputBelowExpected);
