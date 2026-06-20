@@ -1451,4 +1451,91 @@ mod tests {
         // updateUsage must NOT advance latest_consume_time.
         assert_eq!(a.latest_consume_time, 0);
     }
+
+    /// `delegatable_frozen_v2` with a usage window that has PARTIALLY decayed
+    /// (`latest_consume_time_for_energy` well BEFORE `now_slot`), exercising the
+    /// `EnergyProcessor.updateUsage` decay that the `latest == now_slot` cases
+    /// above never reach. The decayed usage — not the raw stored usage — is what
+    /// java charges against the frozen-V2 pool, so the delegatable amount must be
+    /// computed from the decayed figure.
+    ///
+    /// Hand-computed against java-tron's `ResourceProcessor.increaseV2`
+    /// (`supportAllowCancelAllUnfreezeV2` path, the mainnet gate): for a
+    /// window-optimized account with raw `energy_window_size = 28_800_000`
+    /// (→ `getWindowSize` V1 = 28_800), `energy_usage = 1_000_000`,
+    /// `latest_consume_time_for_energy = 0`, decayed to `now_slot = 14_400`
+    /// (half the V1 window):
+    ///   averageLastUsage = divideCeil(1_000_000 * 1e6, 28_800) = 34_722_223
+    ///   decay            = (28_800 - 14_400) / 28_800 = 0.5
+    ///   averageLastUsage = round(34_722_223 * 0.5) = 17_361_112  (×2 to undo ceil)
+    ///   newUsage         = 17_361_112 * 28_800 / 1e6 = 500_000
+    /// With `totalWeight / totalLimit = 1 / 1000`, the usage-weight is
+    /// `500_000 * TRX_PRECISION / 1000 = 500_000_000` sun, so a 800_000_000-sun
+    /// (800-TRX) frozen-V2 pool leaves `800_000_000 - 500_000_000 = 300_000_000`
+    /// delegatable. The raw (un-decayed) usage would over-reserve the whole pool
+    /// (`1_000_000 * 1e6 / 1000 = 1_000_000_000 > 800_000_000` → 0 delegatable),
+    /// which is exactly the over-rejection a missing/incorrect decay would cause.
+    #[test]
+    fn delegatable_frozen_v2_energy_partial_decay_window() {
+        let now_slot = 14_400; // half the 28_800-block V1 window
+        let account = Account {
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 1, amount: 800_000_000 }],
+            account_resource: Some(AccountResource {
+                energy_usage: 1_000_000,
+                latest_consume_time_for_energy: 0,
+                energy_window_size: 28_800_000, // optimized raw → getWindowSize V1 = 28_800
+                energy_window_optimized: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // totalWeight / totalLimit = 1 / 1000 → usage-weight = decayed_usage * 1e6 / 1000.
+        let delegatable = delegatable_frozen_v2(
+            &account,
+            ResourceKind::Energy,
+            now_slot,
+            1_000_000,         // totalWeight
+            1_000_000_000,     // totalLimit
+            GATES_V2,
+            false,
+        );
+        assert_eq!(
+            delegatable, 300_000_000,
+            "frozenV2(800 TRX) - decayed-usage-weight(500_000_000) = 300_000_000 delegatable"
+        );
+        // The input account must be untouched (the decay is on a clone).
+        assert_eq!(account.account_resource.as_ref().unwrap().energy_usage, 1_000_000);
+        assert_eq!(account.account_resource.as_ref().unwrap().latest_consume_time_for_energy, 0);
+    }
+
+    /// Once the usage window has fully elapsed (`latest_consume_time_for_energy +
+    /// windowSize <= now_slot`), java's `ResourceProcessor.increaseV2` zeroes the
+    /// averaged usage, so the entire frozen-V2 pool becomes delegatable. Same
+    /// window-optimized account as the partial-decay case, decayed past its full
+    /// 28_800-block window.
+    #[test]
+    fn delegatable_frozen_v2_energy_decays_to_full_pool_after_window() {
+        let account = Account {
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 1, amount: 800_000_000 }],
+            account_resource: Some(AccountResource {
+                energy_usage: 1_000_000,
+                latest_consume_time_for_energy: 0,
+                energy_window_size: 28_800_000,
+                energy_window_optimized: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // now_slot == latest + windowSize → averageLastUsage = 0 → full pool free.
+        let delegatable = delegatable_frozen_v2(
+            &account,
+            ResourceKind::Energy,
+            WINDOW_SIZE_BLOCKS, // 28_800 == 0 + getWindowSize
+            1_000_000,
+            1_000_000_000,
+            GATES_V2,
+            false,
+        );
+        assert_eq!(delegatable, 800_000_000, "fully decayed usage → whole frozen-V2 pool delegatable");
+    }
 }

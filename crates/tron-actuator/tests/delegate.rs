@@ -182,6 +182,59 @@ fn delegate_rejects_insufficient_frozen_balance() {
     assert!(matches!(err, ActuatorError::InsufficientBalance { .. }));
 }
 
+/// java `DelegateResourceActuator.validate` (ENERGY) caps the delegatable
+/// amount at `getFrozenV2BalanceForEnergy() - v2EnergyUsage`, NOT the raw
+/// frozen-V2 pool — consistent with the TVM `DELEGATERESOURCE` opcode path.
+/// An owner with 10 TRX frozen-V2 energy that has consumed energy (here 5,
+/// with `totalEnergyWeight == totalEnergyCurrentLimit` so the usage-weight is
+/// `energy_usage * TRX_PRECISION` and `head_slot == latest_consume_time` so it
+/// is un-decayed) reserves 5 TRX behind that usage: 6 TRX is rejected, 4 TRX
+/// is accepted.
+#[test]
+fn delegate_energy_rejects_above_frozen_minus_v2_usage() {
+    let ctx = ctx_enabled();
+    // head_slot = (ts - genesis) / 3000 = 0; latest_consume_time = 0 → no decay.
+    ctx.dp.save_latest_block_header_timestamp(0);
+    ctx.dp.save_total_energy_weight(1_000_000_000);
+    ctx.dp.save_total_energy_current_limit(1_000_000_000);
+    ctx.accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                r#type: AccountType::Normal as i32,
+                frozen_v2: vec![FreezeV2Entry { r#type: 1, amount: 10 * PRECISION }],
+                account_resource: Some(AccountResource {
+                    energy_usage: 5,
+                    latest_consume_time_for_energy: 0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    put_basic_account(&ctx, BOB);
+
+    // 6 TRX > (10 - 5) delegatable → rejected.
+    let reject = DelegateResourceContract {
+        owner_address: ALICE.to_vec(),
+        receiver_address: BOB.to_vec(),
+        resource: 1,
+        balance: 6 * PRECISION,
+        lock: false,
+        lock_period: 0,
+    };
+    let err = delegate::validate_delegate_resource(&ctx.accounts, &ctx.dp, &reject).unwrap_err();
+    assert!(matches!(err, ActuatorError::InsufficientBalance { .. }));
+
+    // 4 TRX <= (10 - 5) delegatable → accepted.
+    let accept = DelegateResourceContract {
+        balance: 4 * PRECISION,
+        ..reject
+    };
+    delegate::validate_delegate_resource(&ctx.accounts, &ctx.dp, &accept).unwrap();
+}
+
 #[test]
 fn delegate_rejects_to_contract_account() {
     let ctx = ctx_enabled();
