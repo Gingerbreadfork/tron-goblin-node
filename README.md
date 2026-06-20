@@ -295,15 +295,14 @@ Real, currently-open items:
 - ❌ **Long-running mainnet soak / endurance.** Short live sessions
   pass; multi-hour, multi-day stability under realistic peer churn
   hasn't been characterized.
-- ❌ **A couple of delegated-resource (Stake 2.0) refinements.** The
-  locked-delegation lifecycle is correct (delegate-with-lock, lock
-  expiry, undelegate-after-expiry), but two java-tron behaviours aren't
-  ported yet: the receiver bandwidth/energy *usage-transfer* on
-  undelegate (a transient gap — the usage counters self-heal over the
-  ~1-day decay window), and on-write maintenance of the
-  `DelegatedResourceAccountIndex` lookup that backs
-  `getdelegatedresourceaccountindex` (the store methods exist but aren't
-  wired into the actuators).
+- ❌ **A V1 (Stake 1.0) delegate-freeze edge.** The Stake 2.0
+  delegated-resource lifecycle is ported — delegate/undelegate with the
+  receiver bandwidth/energy *usage-transfer* fold on undelegate, and
+  on-write maintenance of the `DelegatedResourceAccountIndex` lookup
+  (wired into both actuators). The deprecated V1 `FreezeBalanceContract`
+  with a `receiver_address` (resource delegation via the old freeze path)
+  is still unhandled — it moves account state + `DelegatedResource` rows,
+  not just weight. Rare on mainnet (superseded by Stake 2.0).
 - ❌ **Probably a number of other things.** java-tron is large
   and old; some quirks will only surface when a specific client or
   workload hits them. This list will be updated as new items are
