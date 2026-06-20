@@ -4,10 +4,26 @@ use std::sync::Arc;
 
 use tron_chainbase::{DynamicPropertiesStore, KvBackend, MemBackend, ProposalStore};
 use tron_consensus::{activate_expired_proposals, parameter_id_to_key};
+use tron_crypto::address::Address;
 use tron_proto::{proposal::State as ProposalState, Proposal};
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
+}
+
+/// Active SR set whose addresses match `make_proposal`'s generated approvers
+/// (`0x41 ‖ (i+0xa0)×20`), so every approver counts toward the threshold.
+fn active_set(n: usize) -> Vec<Address> {
+    (0..n)
+        .map(|i| {
+            let mut a = [0u8; 21];
+            a[0] = 0x41;
+            for b in &mut a[1..] {
+                *b = (i as u8) + 0xa0;
+            }
+            Address::from_raw(a)
+        })
+        .collect()
 }
 
 fn make_proposal(id: i64, params: Vec<(i64, i64)>, expiration: i64, approvals: usize) -> Proposal {
@@ -34,19 +50,19 @@ fn proposal_approved_when_meets_threshold_and_expired() {
     let proposals = ProposalStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
 
-    // Active witnesses = 27, threshold = ⌈27 × 0.7⌉ = 19
+    // Active witnesses = 27, threshold = floor(27 × 7/10) = 18
     proposals.put(
         1,
         &make_proposal(
             1,
             vec![(3, 50_000)], // TRANSACTION_FEE = 50_000
             1_700_000_000_000,
-            20, // > 19 threshold
+            20, // > 18 threshold
         ),
     ).unwrap();
 
     let now = 1_700_000_010_000; // past expiration
-    let report = activate_expired_proposals(&proposals, &dp, now, 27).unwrap();
+    let report = activate_expired_proposals(&proposals, &dp, now, &active_set(27)).unwrap();
     assert_eq!(report.approved, vec![1]);
     assert!(report.disapproved.is_empty());
     assert_eq!(report.parameter_updates, vec![(1, 3, 50_000)]);
@@ -71,7 +87,7 @@ fn proposal_disapproved_when_under_threshold_and_expired() {
     ).unwrap();
 
     let now = 1_700_000_010_000;
-    let report = activate_expired_proposals(&proposals, &dp, now, 27).unwrap();
+    let report = activate_expired_proposals(&proposals, &dp, now, &active_set(27)).unwrap();
     assert!(report.approved.is_empty());
     assert_eq!(report.disapproved, vec![2]);
     assert!(report.parameter_updates.is_empty());
@@ -94,7 +110,7 @@ fn proposal_not_yet_expired_stays_pending() {
     ).unwrap();
 
     let now = 1_700_000_000_000; // before expiration
-    let report = activate_expired_proposals(&proposals, &dp, now, 27).unwrap();
+    let report = activate_expired_proposals(&proposals, &dp, now, &active_set(27)).unwrap();
     assert!(report.approved.is_empty());
     assert!(report.disapproved.is_empty());
 
@@ -111,7 +127,7 @@ fn already_terminal_proposals_are_left_alone() {
     already_approved.state = ProposalState::Approved as i32;
     proposals.put(4, &already_approved).unwrap();
 
-    let report = activate_expired_proposals(&proposals, &dp, 1_000, 27).unwrap();
+    let report = activate_expired_proposals(&proposals, &dp, 1_000, &active_set(27)).unwrap();
     assert!(report.approved.is_empty());
     assert!(report.disapproved.is_empty());
     // Parameter must NOT have been re-applied.
@@ -135,7 +151,7 @@ fn multiple_proposals_processed_in_id_order() {
         &make_proposal(2, vec![(3, 20)], 1_700_000_000_000, 20),
     ).unwrap();
 
-    let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, 27).unwrap();
+    let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
     assert_eq!(report.approved, vec![1, 2]);
     assert_eq!(dp.get_long(b"TRANSACTION_FEE").unwrap(), 20);
 }
@@ -155,12 +171,52 @@ fn unknown_parameter_id_is_silently_dropped() {
         ),
     ).unwrap();
 
-    let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, 27).unwrap();
+    let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
     assert_eq!(report.approved, vec![5]); // still approved
     assert!(
         report.parameter_updates.is_empty(),
         "unknown parameter id should not produce an update"
     );
+}
+
+#[test]
+fn approvals_from_inactive_witnesses_are_not_counted() {
+    // java hasMostApprovals counts only approvals from witnesses CURRENTLY in
+    // the active set. A proposal with 20 approvers none of whom are active
+    // sees 0 approvals → disapproved (the old approvals.len() path would have
+    // counted 20 ≥ threshold and approved it).
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    proposals
+        .put(6, &make_proposal(6, vec![(3, 7)], 1_700_000_000_000, 20))
+        .unwrap();
+    // Active set in a disjoint 0xc0.. range — none match the 0xa0.. approvers.
+    let active: Vec<Address> = (0..27)
+        .map(|i| {
+            let mut a = [0u8; 21];
+            a[0] = 0x41;
+            a[1..].fill(0xc0u8.wrapping_add(i as u8));
+            Address::from_raw(a)
+        })
+        .collect();
+    let report =
+        activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active).unwrap();
+    assert_eq!(report.disapproved, vec![6]);
+    assert!(report.approved.is_empty());
+}
+
+#[test]
+fn threshold_is_floor_of_seventy_percent() {
+    // floor(27 * 7 / 10) == 18, NOT the ceiling 19: exactly 18 active
+    // approvals must APPROVE (the old ⌈n·0.7⌉ rejected 18).
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    proposals
+        .put(7, &make_proposal(7, vec![(3, 9)], 1_700_000_000_000, 18))
+        .unwrap();
+    let report =
+        activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
+    assert_eq!(report.approved, vec![7], "18 of 27 meets floor(0.7n)=18");
 }
 
 #[test]

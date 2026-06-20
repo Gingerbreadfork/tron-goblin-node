@@ -225,6 +225,10 @@ fn maintenance_pass_advances_cycle_and_writes_vi() {
     let state = fresh_state();
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     dp.save_allow_change_delegation(1);
+    // Vi accumulation is gated on useNewRewardAlgorithm() (the new-reward
+    // algorithm being effective), not allowChangeDelegation — both are active
+    // on mainnet. Set the effective cycle so this matches real-mainnet state.
+    dp.put_long(b"NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE", 0);
     dp.save_maintenance_time_interval(6 * 3600 * 1000);
     dp.save_next_maintenance_time(1_700_000_000_000); // boundary at t=baseline
 

@@ -17,6 +17,7 @@
 //! + `Manager.updateActiveWitnesses`.
 
 use tron_chainbase::{DynamicPropertiesStore, ProposalStore, StoreError};
+use tron_crypto::address::Address;
 use tron_proto::proposal::State as ProposalState;
 
 /// Summary of a proposal-activation pass.
@@ -36,17 +37,24 @@ pub struct ProposalActivationReport {
 /// Walk the proposal store and resolve any expired Pending proposals
 /// against `now_ms`. Returns a report of state changes.
 ///
-/// `active_witness_count` is the **current** active set size (typically
-/// 27 on mainnet). Threshold is `⌈active * 0.7⌉` distinct signers per
-/// java-tron's `ChainConstant.SOLIDIFIED_THRESHOLD`. (TRON uses 70% for
-/// proposal acceptance, distinct from the 2/3 used for block solidity.)
+/// `active_witnesses` is the **current** active SR set. java
+/// `ProposalCapsule.hasMostApprovals` counts only approvals from witnesses
+/// presently in that set (an approver that has since dropped out of the
+/// active list no longer counts) and accepts at
+/// `floor(activeWitnesses.size() * 7 / 10)` — 18 for the 27-SR mainnet, NOT
+/// the ceiling. (TRON's 70% proposal threshold is distinct from the 2/3 used
+/// for block solidity.)
 pub fn activate_expired_proposals(
     proposals: &ProposalStore,
     dyn_props: &DynamicPropertiesStore,
     now_ms: i64,
-    active_witness_count: usize,
+    active_witnesses: &[Address],
 ) -> Result<ProposalActivationReport, StoreError> {
-    let threshold = ((active_witness_count * 7) + 9) / 10; // ⌈n * 0.7⌉
+    let threshold = active_witnesses.len() * 7 / 10; // java: size * 7 / 10 (floor)
+    let active_set: std::collections::HashSet<&[u8]> = active_witnesses
+        .iter()
+        .map(|w| w.as_bytes().as_slice())
+        .collect();
     let mut report = ProposalActivationReport::default();
 
     let mut all = proposals.all()?;
@@ -60,11 +68,16 @@ pub fn activate_expired_proposals(
             continue;
         }
 
-        // Count distinct approving witnesses. java-tron uses the
-        // `approvals` list directly — every entry is a distinct
-        // 21-byte witness address by construction (the actuator
-        // dedupes on add).
-        let approvals = proposal.approvals.len();
+        // Count approvals from witnesses CURRENTLY in the active set, per
+        // java `hasMostApprovals` (`approvals.stream().filter(activeWitnesses
+        // ::contains).count()`). Each approval entry is a distinct 21-byte
+        // address (the actuator dedupes on add); an approver no longer in the
+        // active SR list does not count toward the threshold.
+        let approvals = proposal
+            .approvals
+            .iter()
+            .filter(|a| active_set.contains(a.as_slice()))
+            .count();
         let approved = approvals >= threshold;
 
         if approved {

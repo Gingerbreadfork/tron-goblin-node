@@ -2711,12 +2711,28 @@ fn execute_block_logic(
     // java-tron has a "block 1 special case" where the genesis block
     // skips doMaintenance but DOES advance next_maintenance_time; we
     // mirror that.
-    let maintenance_interval = dp
-        .maintenance_time_interval()
-        .unwrap_or(tron_consensus::DEFAULT_MAINTENANCE_INTERVAL_MS);
     let next_maintenance = dp.next_maintenance_time().unwrap_or(0);
     let mut maintenance_rotation: Option<MaintenanceRotation> = None;
     if tron_consensus::is_maintenance_boundary(raw.timestamp, next_maintenance) {
+        // java `Manager.processBlock`: at every maintenance boundary, run the
+        // proposal-activation pass BEFORE doMaintenance and before advancing
+        // next_maintenance_time — an expiring proposal can change a parameter
+        // (CHANGE_DELEGATION, MAINTENANCE_TIME_INTERVAL, fees, …) that this same
+        // cycle's maintenance and the interval advance below then read. `now_ms`
+        // is the PRE-bump `next_maintenance` (java tests
+        // `hasExpired(getNextMaintenanceTime())` before updateNextMaintenanceTime).
+        if let Some(sched_be) = state.witness_schedule.clone() {
+            let schedule = tron_chainbase::WitnessScheduleStore::new(sched_be);
+            if let Ok(Some(active)) = schedule.load_active() {
+                let proposal_store = ProposalStore::new(state.proposals.clone());
+                let _ = tron_consensus::activate_expired_proposals(
+                    &proposal_store,
+                    &dp,
+                    next_maintenance,
+                    &active,
+                );
+            }
+        }
         // Run doMaintenance for every block EXCEPT genesis. Java-tron's
         // check is `blockNum != 1`.
         if raw.number != 1 {
@@ -2751,6 +2767,11 @@ fn execute_block_logic(
         // Substituting the block time (e.g. when the boundary slot was skipped
         // and `raw.timestamp > next_maintenance`) shifts the anchor off-grid
         // permanently, so subsequent boundaries fire at the wrong heights.
+        // Read the interval AFTER the proposal pass — a proposal applied above
+        // may have changed MAINTENANCE_TIME_INTERVAL, which java reads here.
+        let maintenance_interval = dp
+            .maintenance_time_interval()
+            .unwrap_or(tron_consensus::DEFAULT_MAINTENANCE_INTERVAL_MS);
         let new_next = tron_consensus::compute_next_maintenance_time(
             raw.timestamp,
             next_maintenance,
