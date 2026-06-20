@@ -192,6 +192,80 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
 }
 
 #[test]
+fn execute_create_stamps_create_time_from_head_block_timestamp() {
+    // java stamps a created contract's create_time with the head-block
+    // timestamp (getLatestBlockHeaderTimestamp), not 0 and not the executing
+    // block's env timestamp.
+    let stores = fresh_stores();
+    let head_ts = 1_700_000_222_000i64;
+    stores.dynamic_properties.save_latest_block_header_timestamp(head_ts);
+
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xb0);
+    let owner = Address::from_raw(owner_bytes);
+    stores
+        .accounts
+        .put(
+            &owner,
+            &Account {
+                address: owner.as_bytes().to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Init code returning a trivial 1-byte runtime [0x00] (STOP).
+    let mut padded = [0u8; 32];
+    padded[31] = 0x00;
+    let mut init_code = vec![0x7fu8]; // PUSH32
+    init_code.extend_from_slice(&padded);
+    init_code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x01, 0x60, 0x1f, 0xf3]);
+
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            contract_address: vec![],
+            abi: Some(Abi::default()),
+            bytecode: init_code,
+            call_value: 0,
+            consume_user_resource_percent: 100,
+            name: "T".into(),
+            origin_energy_limit: 1_000_000,
+            code_hash: vec![],
+            trx_hash: vec![],
+            version: 1,
+        }),
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let tx_id = [0xee; 32];
+    // The env timestamp (9_999_999) differs from the head-block ts to prove
+    // create_time reads dyn_props, not VmBlockEnv.
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv { block_number: 2, block_timestamp_ms: 9_999_999 },
+        &create,
+        &tx_id,
+        500_000,
+    );
+    let addr = match outcome {
+        VmOutcome::Success { return_data, .. } => return_data,
+        other => panic!("expected Success, got {other:?}"),
+    };
+    let mut a = [0u8; 21];
+    a.copy_from_slice(&addr);
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(a))
+        .unwrap()
+        .expect("contract account");
+    assert_eq!(acct.create_time, head_ts, "create_time must be the head-block timestamp");
+}
+
+#[test]
 fn execute_create_rejects_eip3541_ef_runtime_when_london_active() {
     // EIP-3541 (allowTvmLondon): a top-level deploy whose returned runtime code
     // begins with 0xEF must FAIL (java throws InvalidCodeException), not deploy.

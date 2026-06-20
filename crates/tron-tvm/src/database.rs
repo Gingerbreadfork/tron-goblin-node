@@ -526,6 +526,18 @@ impl DatabaseCommit for TronDatabase {
                 address: tron_addr.as_bytes().to_vec(),
                 ..Default::default()
             });
+            // java createNormalAccount/createAccount stamps a freshly-created
+            // account with the head-block timestamp (= N-1 during block apply,
+            // as getLatestBlockHeaderTimestamp returns until the head advances
+            // after the tx loop), matching the standalone TransferActuator.
+            // Only on creation — never overwrite an existing account's value.
+            if is_new_account {
+                tron_account.create_time = self
+                    .dyn_props
+                    .as_ref()
+                    .and_then(|d| d.latest_block_header_timestamp())
+                    .unwrap_or(0);
+            }
 
             // TRON fork: if a nested CREATE/CREATE2 deployed this address (and
             // it survived to commit), mark the account `CreatedByContract` /

@@ -1119,6 +1119,13 @@ pub fn execute_create_with_trace(
             balance: smart_contract.call_value.max(0),
             code: init_code.clone(),
             code_hash: init_hash.to_vec(),
+            // java stamps create_time on contract creation (= head-block
+            // timestamp). The commit path sees this pre-installed account as
+            // existing, so create_time must be set here or it stays 0.
+            create_time: stores
+                .dynamic_properties
+                .latest_block_header_timestamp()
+                .unwrap_or(0),
             ..Default::default()
         },
     ) {

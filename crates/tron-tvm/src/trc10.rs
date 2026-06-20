@@ -657,14 +657,22 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 address: caller_addr.as_bytes().to_vec(),
                 ..Default::default()
             });
-        let mut target_account = accounts
-            .get(&target_addr)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| tron_proto::Account {
-                address: target_addr.as_bytes().to_vec(),
-                ..Default::default()
-            });
+        let target_existing = accounts.get(&target_addr).ok().flatten();
+        let target_was_new = target_existing.is_none();
+        let mut target_account = target_existing.unwrap_or_else(|| tron_proto::Account {
+            address: target_addr.as_bytes().to_vec(),
+            ..Default::default()
+        });
+        if target_was_new {
+            // java createAccountIfNotExist stamps a freshly-created account's
+            // create_time with the head-block timestamp (matching the commit
+            // path + TransferActuator). Only on creation.
+            target_account.create_time = self
+                .dyn_props
+                .as_ref()
+                .and_then(|d| d.latest_block_header_timestamp())
+                .unwrap_or(0);
+        }
 
         // An asset-optimized account holds its TRC-10 balances in the separate
         // account-asset store, not inline; merge them before reading/mutating
