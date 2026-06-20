@@ -320,11 +320,16 @@ fn try_use_asset_account_net(
             .ok_or(BandwidthError::UnknownAsset(asset_name))?
     };
 
-    // If sender IS the issuer, defer to useAccountNet.
-    if asset.owner_address == owner.as_bytes() {
-        return Ok(None);
-    }
-
+    // java `useAssetAccountNet` guards sender==issuer with `==` on two distinct
+    // ByteString instances — that reference comparison is ALWAYS false, so the
+    // branch is dead and the full body runs even when an asset issuer sends
+    // their own token. We must NOT short-circuit with a value comparison: doing
+    // so wrongly defers to useAccountNet and leaves the asset row's
+    // `public_free_asset_net_usage` stale. The body reproduces java's effect
+    // for sender==issuer naturally — the issuer account is reloaded fresh below
+    // and persisted LAST (after the sender), so its write clobbers the sender's
+    // free-asset-map updates: net effect on the account is only net_usage /
+    // latest_consume_time, while the asset row's public-free usage IS bumped.
     let token_id_str: String = asset.id.clone();
     let token_id_num: i64 = token_id_str.parse().unwrap_or(0);
     let token_name_str: String = String::from_utf8_lossy(&asset.name).into_owned();
