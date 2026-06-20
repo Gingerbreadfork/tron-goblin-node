@@ -2477,13 +2477,21 @@ fn execute_block_logic(
                     computed_ok,
                 )
             };
-            // Only a success-vs-failure disagreement is real divergence.
-            if expected_ok != computed_ok {
+            // A success/failure disagreement is a real STATE divergence. For VM
+            // txs a same-outcome contractRet *code* mismatch (both failed, with
+            // a different code — e.g. BAD_JUMP_DESTINATION vs UNKNOWN) is a
+            // recorded-result fidelity gap with no state or fee effect. Reaching
+            // here for a VM tx already implies expected != computed (exact
+            // matches and OUT_OF_TIME `continue` above), so any non-state
+            // mismatch is exactly a code mismatch.
+            let state_diverged = expected_ok != computed_ok;
+            let code_mismatch = is_vm && !state_diverged;
+            if state_diverged || code_mismatch {
                 let tx_hex: String =
                     res.tx_id.iter().map(|b| format!("{b:02x}")).collect();
-                // Decode the VM revert payload so the divergence line carries
-                // *why* it reverted (Error(string) / Panic(code)), plus the
-                // outcome variant for DEFAULTs that never reached the VM.
+                // Decode the VM revert payload so the line carries *why* it
+                // reverted (Error(string) / Panic(code)), plus the outcome
+                // variant for DEFAULTs that never reached the VM.
                 let reason = {
                     let d = &res.vm_return_data;
                     if d.len() >= 4 && d[..4] == [0x08, 0xc3, 0x79, 0xa0] && d.len() >= 68 {
@@ -2499,32 +2507,47 @@ fn execute_block_logic(
                         format!("raw:0x{}", d.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>())
                     }
                 };
-                // A success/failure disagreement with the canonical block is a
-                // real consensus divergence — log at ERROR so it lands in the
-                // log file and stands out (the message text is preserved for
-                // existing `CONTRACTRET DIVERGENCE` grep workflows).
-                tracing::error!(
-                    "CONTRACTRET DIVERGENCE block {} tx {}: block={} computed={} reason={} \
-                     (success/failure disagreement — state may have diverged)",
-                    raw.number, tx_hex, expected, computed, reason,
-                );
-                // Consensus self-audit watchdog: record the divergence so it is
-                // queryable / alertable (Prometheus) even when we don't
-                // hard-reject. See crate::watchdog.
-                crate::watchdog::record(crate::watchdog::ConsensusDivergence {
-                    block: raw.number,
-                    tx_id: tx_hex.clone(),
-                    block_result: expected.clone(),
-                    computed_result: computed.clone(),
-                    reason: reason.clone(),
-                });
-                if config.verify_contract_ret {
-                    return Err(BlockExecError::ContractRetMismatch {
-                        block_num: raw.number,
-                        tx_id: tx_hex,
-                        expected,
-                        computed,
+                if state_diverged {
+                    // A success/failure disagreement with the canonical block is
+                    // a real consensus divergence — log at ERROR so it lands in
+                    // the log file and stands out (the message text is preserved
+                    // for existing `CONTRACTRET DIVERGENCE` grep workflows).
+                    tracing::error!(
+                        "CONTRACTRET DIVERGENCE block {} tx {}: block={} computed={} reason={} \
+                         (success/failure disagreement — state may have diverged)",
+                        raw.number, tx_hex, expected, computed, reason,
+                    );
+                    // Consensus self-audit watchdog: STATE divergence only, so
+                    // the `tron_node_consensus_divergences_total` alarm stays
+                    // clean (the code-only mismatch below is intentionally not
+                    // recorded). Surfaced even when we don't hard-reject.
+                    crate::watchdog::record(crate::watchdog::ConsensusDivergence {
+                        block: raw.number,
+                        tx_id: tx_hex.clone(),
+                        block_result: expected.clone(),
+                        computed_result: computed.clone(),
+                        reason: reason.clone(),
                     });
+                    if config.verify_contract_ret {
+                        return Err(BlockExecError::ContractRetMismatch {
+                            block_num: raw.number,
+                            tx_id: tx_hex,
+                            expected,
+                            computed,
+                        });
+                    }
+                } else {
+                    // Same success/failure, different contractRet code: state and
+                    // fee are identical, so this is a recorded-code fidelity gap,
+                    // not a consensus divergence. Log at WARN (distinct
+                    // `CONTRACTRET CODE MISMATCH` text) so a regression in the
+                    // HaltReason -> contractResult mapping is caught, without
+                    // alarming the watchdog or hard-rejecting the block.
+                    tracing::warn!(
+                        "CONTRACTRET CODE MISMATCH block {} tx {}: block={} computed={} reason={} \
+                         (same success/failure; recorded code differs)",
+                        raw.number, tx_hex, expected, computed, reason,
+                    );
                 }
             }
         }
