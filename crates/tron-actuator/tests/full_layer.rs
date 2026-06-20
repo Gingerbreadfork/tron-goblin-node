@@ -314,8 +314,9 @@ fn freeze_balance_v1_round_trip() {
         resource: 0,
         receiver_address: Vec::new(),
     };
-    freeze::validate_freeze_balance(&accounts, &c).unwrap();
-    freeze::execute_freeze_balance(&accounts, &dp, &c).unwrap();
+    let resources = tron_chainbase::DelegatedResourceStore::new(mem());
+    freeze::validate_freeze_balance(&accounts, &dp, &c).unwrap();
+    freeze::execute_freeze_balance(&accounts, &dp, &resources, None, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 5_000_000);
     assert_eq!(alice.frozen[0].frozen_balance, 5_000_000);

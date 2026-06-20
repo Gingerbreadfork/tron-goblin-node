@@ -13,7 +13,9 @@ use tron_chainbase::{
 };
 use tron_crypto::address::{Address, ADDRESS_LENGTH, ADDRESS_PREFIX_MAINNET};
 use tron_proto::account::Frozen;
-use tron_proto::{AccountType, FreezeBalanceContract, UnfreezeBalanceContract, Votes};
+use tron_proto::{
+    AccountType, DelegatedResource, FreezeBalanceContract, UnfreezeBalanceContract, Votes,
+};
 
 use crate::helpers::{check_add, check_sub, require_owner};
 use crate::transfer::ExecutionResult;
@@ -30,6 +32,7 @@ pub const FROZEN_PERIOD_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
 pub fn validate_freeze_balance(
     accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &FreezeBalanceContract,
 ) -> Result<(), ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -46,94 +49,283 @@ pub fn validate_freeze_balance(
         });
     }
     // Resource code 0=BANDWIDTH, 1=ENERGY, 2=TRON_POWER (per ResourceCode enum).
+    // java `FreezeBalanceActuator.validate`: TRON_POWER is only valid under the
+    // new resource model (mainnet off → InvalidResourceCode), and even then
+    // cannot be delegated to a receiver. BANDWIDTH/ENERGY are always valid.
     if contract.resource < 0 || contract.resource > 2 {
         return Err(ActuatorError::InvalidResourceCode);
+    }
+    if contract.resource == 2 {
+        // ALLOW_NEW_RESOURCE_MODEL is off on mainnet; java then rejects
+        // TRON_POWER v1 freeze outright. With it on, only delegation is
+        // forbidden (the receiver-set case below would carry TRON_POWER).
+        if dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) != 1 {
+            return Err(ActuatorError::InvalidResourceCode);
+        }
+        if !contract.receiver_address.is_empty() {
+            return Err(ActuatorError::InvalidDelegationReceiver);
+        }
+    }
+
+    // java `FreezeBalanceActuator.validate` receiver branch: when a receiver is
+    // set and ALLOW_DELEGATE_RESOURCE is on, the freeze delegates the resource.
+    // The receiver must be a valid, existing, non-self account; once
+    // ALLOW_TVM_CONSTANTINOPLE is live a contract receiver is rejected.
+    let receiver = decode_receiver(&contract.receiver_address)?;
+    let support_dr = dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) == 1;
+    if let (Some(receiver), true) = (receiver, support_dr) {
+        if receiver == owner {
+            return Err(ActuatorError::ReceiverSameAsOwner);
+        }
+        let receiver_account = accounts
+            .get(&receiver)?
+            .ok_or(ActuatorError::TargetAccountMissing)?;
+        if dyn_props.get_long(b"ALLOW_TVM_CONSTANTINOPLE").unwrap_or(0) == 1
+            && receiver_account.r#type == AccountType::Contract as i32
+        {
+            return Err(ActuatorError::DelegationToContract);
+        }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_freeze_balance(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    delegated_resources: &DelegatedResourceStore,
+    index: Option<&DelegatedResourceAccountIndexStore>,
     contract: &FreezeBalanceContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    account.balance = check_sub(account.balance, contract.frozen_balance)?;
+    // java computes `newBalance` up front from the value read before any
+    // delegate-side mutation, then assigns it last; the owner debit is
+    // independent of the delegate bookkeeping, so the order matches.
+    let new_balance = check_sub(account.balance, contract.frozen_balance)?;
 
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let expire = now + contract.frozen_duration * FROZEN_PERIOD_MS / 3; // duration is in days; we treat 1 = 3-day base
 
+    let receiver = decode_receiver(&contract.receiver_address)?;
+    let support_dr = dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) == 1;
+
     // Chain-wide weight delta. java-tron's `FreezeBalanceActuator.addTotalWeight`:
     //   weight = allowNewReward() ? increment : freezeBalance / TRX_PRECISION
-    // where `increment = floor(newFrozen / TRX_PRECISION) - floor(oldFrozen /
-    // TRX_PRECISION)` over the resource's coalesced V1 frozen balance
-    // (`getFrozenBalance()` for BANDWIDTH, `getEnergyFrozenBalance()` for
-    // ENERGY). Mainnet runs with ALLOW_NEW_REWARD = 1, so the floored
-    // *difference* is the byte-exact value — the prior `freezeBalance /
-    // TRX_PRECISION` form drifted by up to 1 per freeze whenever the account
-    // already held a fractional-TRX V1 frozen balance (the same flooring-
-    // boundary class as the V2 fix), leaking into TOTAL_*_WEIGHT.
+    // For a SELF freeze `increment = floor(newFrozen / TRX_PRECISION) -
+    // floor(oldFrozen / TRX_PRECISION)` over the resource's coalesced V1 frozen
+    // balance (`getFrozenBalance()` for BANDWIDTH, `getEnergyFrozenBalance()`
+    // for ENERGY); for a DELEGATE freeze `increment` is the receiver-side
+    // acquired-balance floored difference returned by `delegateResource`.
+    // Mainnet runs with ALLOW_NEW_REWARD = 1, so the floored *difference* is the
+    // byte-exact value — the prior `freezeBalance / TRX_PRECISION` form drifted
+    // by up to 1 per freeze whenever the existing frozen/acquired balance held a
+    // fractional TRX (the same flooring-boundary class as the V2 fix), leaking
+    // into TOTAL_*_WEIGHT.
     let allow_new_reward = dyn_props.get_long(b"ALLOW_NEW_REWARD").unwrap_or(0) == 1;
+    let weight_of = |increment: i64| -> i64 {
+        if allow_new_reward {
+            increment
+        } else {
+            contract.frozen_balance / TRX_PRECISION
+        }
+    };
+
     match contract.resource {
-        // BANDWIDTH: coalesce into the single legacy `frozen` entry (java keeps
-        // at most 1 there — `getFrozenBalance()`).
+        // BANDWIDTH.
         0 => {
-            let old_balance = account.frozen.first().map(|f| f.frozen_balance).unwrap_or(0);
-            let new_balance = check_add(old_balance, contract.frozen_balance)?;
-            if let Some(existing) = account.frozen.first_mut() {
-                existing.frozen_balance = new_balance;
-                existing.expire_time = expire;
+            let increment = if let (Some(receiver), true) = (receiver, support_dr) {
+                // === Delegate (receiver) branch — java `delegateResource(...,
+                // isBandwidth=true, ...)` + `addDelegatedFrozenBalanceForBandwidth`. ===
+                let inc = delegate_resource_v1(
+                    accounts,
+                    dyn_props,
+                    delegated_resources,
+                    index,
+                    &owner,
+                    &receiver,
+                    true,
+                    contract.frozen_balance,
+                    expire,
+                )?;
+                account.delegated_frozen_balance_for_bandwidth = check_add(
+                    account.delegated_frozen_balance_for_bandwidth,
+                    contract.frozen_balance,
+                )?;
+                inc
             } else {
-                account.frozen.push(Frozen {
-                    frozen_balance: new_balance,
-                    expire_time: expire,
-                });
-            }
-            let weight = if allow_new_reward {
-                new_balance / TRX_PRECISION - old_balance / TRX_PRECISION
-            } else {
-                contract.frozen_balance / TRX_PRECISION
+                // === Self branch — coalesce into the single legacy `frozen`
+                // entry (java keeps at most 1 there — `getFrozenBalance()`). ===
+                let old_balance = account.frozen.first().map(|f| f.frozen_balance).unwrap_or(0);
+                let new_frozen = check_add(old_balance, contract.frozen_balance)?;
+                if let Some(existing) = account.frozen.first_mut() {
+                    existing.frozen_balance = new_frozen;
+                    existing.expire_time = expire;
+                } else {
+                    account.frozen.push(Frozen {
+                        frozen_balance: new_frozen,
+                        expire_time: expire,
+                    });
+                }
+                new_frozen / TRX_PRECISION - old_balance / TRX_PRECISION
             };
-            accounts.put(&owner, &account)?;
-            dyn_props.add_total_net_weight(weight);
+            dyn_props.add_total_net_weight(weight_of(increment));
         }
         // ENERGY: coalesce into `AccountResource.frozen_balance_for_energy`
-        // (java `getEnergyFrozenBalance()` / `setFrozenForEnergy`). The prior
-        // code wrote energy freezes into the BANDWIDTH `frozen` list — a wrong
-        // bucket that the V1 unfreeze (which reads `frozen_balance_for_energy`)
-        // would never see.
+        // (java `getEnergyFrozenBalance()` / `setFrozenForEnergy`) on the self
+        // path; on the delegate path bump `delegated_frozen_balance_for_energy`.
         1 => {
-            let res = account.account_resource.get_or_insert_with(Default::default);
-            let old_balance = res
-                .frozen_balance_for_energy
-                .as_ref()
-                .map(|f| f.frozen_balance)
-                .unwrap_or(0);
-            let new_balance = check_add(old_balance, contract.frozen_balance)?;
-            res.frozen_balance_for_energy = Some(Frozen {
-                frozen_balance: new_balance,
-                expire_time: expire,
-            });
-            let weight = if allow_new_reward {
-                new_balance / TRX_PRECISION - old_balance / TRX_PRECISION
+            let increment = if let (Some(receiver), true) = (receiver, support_dr) {
+                // === Delegate (receiver) branch — java `delegateResource(...,
+                // isBandwidth=false, ...)` + `addDelegatedFrozenBalanceForEnergy`. ===
+                let inc = delegate_resource_v1(
+                    accounts,
+                    dyn_props,
+                    delegated_resources,
+                    index,
+                    &owner,
+                    &receiver,
+                    false,
+                    contract.frozen_balance,
+                    expire,
+                )?;
+                let res = account.account_resource.get_or_insert_with(Default::default);
+                res.delegated_frozen_balance_for_energy = check_add(
+                    res.delegated_frozen_balance_for_energy,
+                    contract.frozen_balance,
+                )?;
+                inc
             } else {
-                contract.frozen_balance / TRX_PRECISION
+                // === Self branch. The prior code wrote energy freezes into the
+                // BANDWIDTH `frozen` list — a wrong bucket that the V1 unfreeze
+                // (which reads `frozen_balance_for_energy`) would never see. ===
+                let res = account.account_resource.get_or_insert_with(Default::default);
+                let old_balance = res
+                    .frozen_balance_for_energy
+                    .as_ref()
+                    .map(|f| f.frozen_balance)
+                    .unwrap_or(0);
+                let new_frozen = check_add(old_balance, contract.frozen_balance)?;
+                res.frozen_balance_for_energy = Some(Frozen {
+                    frozen_balance: new_frozen,
+                    expire_time: expire,
+                });
+                new_frozen / TRX_PRECISION - old_balance / TRX_PRECISION
             };
-            accounts.put(&owner, &account)?;
-            dyn_props.add_total_energy_weight(weight);
+            dyn_props.add_total_energy_weight(weight_of(increment));
         }
         // TRON_POWER (new-resource-model only; not exercised on mainnet, where
         // TRON Power is frozen via the V2 path). Persist the balance move
         // without a weight change, matching the prior behaviour for this arm.
-        _ => {
-            accounts.put(&owner, &account)?;
+        _ => {}
+    }
+
+    account.balance = new_balance;
+    accounts.put(&owner, &account)?;
+    Ok(ExecutionResult::default())
+}
+
+/// java-tron `FreezeBalanceActuator.delegateResource` — record a V1
+/// `from → to` delegation of `balance` sun of BANDWIDTH (`is_bandwidth`)
+/// or ENERGY, expiring at `expire`. Coalesces into the per-(from,to)
+/// `DelegatedResource` V1 row, updates the bidirectional account index,
+/// credits the receiver's `acquired_delegated_frozen_balance_for_*`, and
+/// returns the receiver-side floored weight increment
+/// (`floor(newAcquired/1e6) - floor(oldAcquired/1e6)`).
+#[allow(clippy::too_many_arguments)]
+fn delegate_resource_v1(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    delegated_resources: &DelegatedResourceStore,
+    index: Option<&DelegatedResourceAccountIndexStore>,
+    owner: &Address,
+    receiver: &Address,
+    is_bandwidth: bool,
+    balance: i64,
+    expire: i64,
+) -> Result<i64, ActuatorError> {
+    // 1. Coalesce into the per-(from,to) V1 row. java's `addFrozenBalanceFor*`
+    //    (existing row) adds the balance and overwrites the expiry;
+    //    `setFrozenBalanceFor*` (new row) sets both — identical end state.
+    let key = DelegatedResourceStore::v1_key(owner, receiver);
+    let mut row = delegated_resources
+        .get_raw(&key)?
+        .unwrap_or_else(|| DelegatedResource {
+            from: owner.as_bytes().to_vec(),
+            to: receiver.as_bytes().to_vec(),
+            ..Default::default()
+        });
+    if is_bandwidth {
+        row.frozen_balance_for_bandwidth =
+            check_add(row.frozen_balance_for_bandwidth, balance)?;
+        row.expire_time_for_bandwidth = expire;
+    } else {
+        row.frozen_balance_for_energy = check_add(row.frozen_balance_for_energy, balance)?;
+        row.expire_time_for_energy = expire;
+    }
+    delegated_resources.put_raw(&key, &row)?;
+
+    // 2. Bidirectional account index. java writes the per-pair rows directly
+    //    once ALLOW_DELEGATE_OPTIMIZATION is on (lazily converting any legacy
+    //    aggregate row first); the pre-optimization branch appends the
+    //    counterparty to each side's aggregate list (dead on mainnet, kept for
+    //    parity).
+    if let Some(index) = index {
+        if dyn_props.get_long(b"ALLOW_DELEGATE_OPTIMIZATION").unwrap_or(0) == 1 {
+            index.convert(owner)?;
+            index.convert(receiver)?;
+            index.delegate_v1(owner, receiver, now_ts(dyn_props))?;
+        } else {
+            let okey = DelegatedResourceAccountIndexStore::legacy_key(owner);
+            let mut o = index.get_raw(&okey)?.unwrap_or_default();
+            if !o.to_accounts.iter().any(|a| a == receiver.as_bytes()) {
+                o.to_accounts.push(receiver.as_bytes().to_vec());
+            }
+            index.put_raw(&okey, &o)?;
+
+            let rkey = DelegatedResourceAccountIndexStore::legacy_key(receiver);
+            let mut r = index.get_raw(&rkey)?.unwrap_or_default();
+            if !r.from_accounts.iter().any(|a| a == owner.as_bytes()) {
+                r.from_accounts.push(owner.as_bytes().to_vec());
+            }
+            index.put_raw(&rkey, &r)?;
         }
     }
 
-    Ok(ExecutionResult::default())
+    // 3. Credit the receiver's acquired balance and return its floored weight
+    //    increment. java uses the plain `addAcquiredDelegatedFrozenBalanceFor*`
+    //    (no max(0) clamp on the delegate path).
+    let mut receiver_account = accounts
+        .get(receiver)?
+        .ok_or(ActuatorError::TargetAccountMissing)?;
+    let increment = if is_bandwidth {
+        let old_w = receiver_account.acquired_delegated_frozen_balance_for_bandwidth / TRX_PRECISION;
+        receiver_account.acquired_delegated_frozen_balance_for_bandwidth = check_add(
+            receiver_account.acquired_delegated_frozen_balance_for_bandwidth,
+            balance,
+        )?;
+        receiver_account.acquired_delegated_frozen_balance_for_bandwidth / TRX_PRECISION - old_w
+    } else {
+        let res = receiver_account
+            .account_resource
+            .get_or_insert_with(Default::default);
+        let old_w = res.acquired_delegated_frozen_balance_for_energy / TRX_PRECISION;
+        res.acquired_delegated_frozen_balance_for_energy = check_add(
+            res.acquired_delegated_frozen_balance_for_energy,
+            balance,
+        )?;
+        res.acquired_delegated_frozen_balance_for_energy / TRX_PRECISION - old_w
+    };
+    accounts.put(receiver, &receiver_account)?;
+    Ok(increment)
+}
+
+/// `DynamicPropertiesStore.getLatestBlockHeaderTimestamp` — the index
+/// `delegate_v1` timestamp source on the optimized path.
+fn now_ts(dyn_props: &DynamicPropertiesStore) -> i64 {
+    dyn_props.latest_block_header_timestamp().unwrap_or(0)
 }
 
 // =============================================================================

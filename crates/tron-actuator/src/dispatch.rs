@@ -206,7 +206,7 @@ pub fn dispatch_validate(
         }
         ContractType::FreezeBalanceContract => {
             let c = unpack::<tron_proto::FreezeBalanceContract>(parameter)?;
-            crate::freeze::validate_freeze_balance(stores.accounts, &c)
+            crate::freeze::validate_freeze_balance(stores.accounts, stores.dyn_props, &c)
         }
         ContractType::UnfreezeBalanceContract => {
             let c = unpack::<tron_proto::UnfreezeBalanceContract>(parameter)?;
@@ -454,7 +454,13 @@ pub fn dispatch_execute(
         }
         ContractType::FreezeBalanceContract => {
             let c = unpack::<tron_proto::FreezeBalanceContract>(parameter)?;
-            crate::freeze::execute_freeze_balance(stores.accounts, stores.dyn_props, &c)
+            crate::freeze::execute_freeze_balance(
+                stores.accounts,
+                stores.dyn_props,
+                stores.delegated_resources,
+                stores.delegated_resource_account_index,
+                &c,
+            )
         }
         ContractType::UnfreezeBalanceContract => {
             let c = unpack::<tron_proto::UnfreezeBalanceContract>(parameter)?;
