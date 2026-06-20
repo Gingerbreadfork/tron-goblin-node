@@ -65,32 +65,72 @@ pub fn execute_freeze_balance(
 
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let expire = now + contract.frozen_duration * FROZEN_PERIOD_MS / 3; // duration is in days; we treat 1 = 3-day base
-    let new_frozen = Frozen {
-        frozen_balance: contract.frozen_balance,
-        expire_time: expire,
-    };
-    // Coalesce into the single legacy `frozen` entry (java-tron keeps at
-    // most 1 there).
-    if let Some(existing) = account.frozen.first_mut() {
-        existing.frozen_balance = check_add(existing.frozen_balance, contract.frozen_balance)?;
-        existing.expire_time = expire;
-    } else {
-        account.frozen.push(new_frozen);
-    }
-    accounts.put(&owner, &account)?;
 
-    // Bump chain-wide weight. java-tron's `FreezeBalanceActuator.execute`:
-    //   weight = freezeBalance / TRX_PRECISION
-    //   addTotalNetWeight(weight) for BANDWIDTH (resource=0)
-    //   addTotalEnergyWeight(weight) for ENERGY (resource=1)
-    // (Unlike v2, v1 doesn't compute oldWeight — it just adds the full
-    // newly-frozen weight since v1 freezes are append-style with a
-    // single rolling timer.)
-    let weight = contract.frozen_balance / TRX_PRECISION;
+    // Chain-wide weight delta. java-tron's `FreezeBalanceActuator.addTotalWeight`:
+    //   weight = allowNewReward() ? increment : freezeBalance / TRX_PRECISION
+    // where `increment = floor(newFrozen / TRX_PRECISION) - floor(oldFrozen /
+    // TRX_PRECISION)` over the resource's coalesced V1 frozen balance
+    // (`getFrozenBalance()` for BANDWIDTH, `getEnergyFrozenBalance()` for
+    // ENERGY). Mainnet runs with ALLOW_NEW_REWARD = 1, so the floored
+    // *difference* is the byte-exact value — the prior `freezeBalance /
+    // TRX_PRECISION` form drifted by up to 1 per freeze whenever the account
+    // already held a fractional-TRX V1 frozen balance (the same flooring-
+    // boundary class as the V2 fix), leaking into TOTAL_*_WEIGHT.
+    let allow_new_reward = dyn_props.get_long(b"ALLOW_NEW_REWARD").unwrap_or(0) == 1;
     match contract.resource {
-        0 => dyn_props.add_total_net_weight(weight),
-        1 => dyn_props.add_total_energy_weight(weight),
-        _ => {}
+        // BANDWIDTH: coalesce into the single legacy `frozen` entry (java keeps
+        // at most 1 there — `getFrozenBalance()`).
+        0 => {
+            let old_balance = account.frozen.first().map(|f| f.frozen_balance).unwrap_or(0);
+            let new_balance = check_add(old_balance, contract.frozen_balance)?;
+            if let Some(existing) = account.frozen.first_mut() {
+                existing.frozen_balance = new_balance;
+                existing.expire_time = expire;
+            } else {
+                account.frozen.push(Frozen {
+                    frozen_balance: new_balance,
+                    expire_time: expire,
+                });
+            }
+            let weight = if allow_new_reward {
+                new_balance / TRX_PRECISION - old_balance / TRX_PRECISION
+            } else {
+                contract.frozen_balance / TRX_PRECISION
+            };
+            accounts.put(&owner, &account)?;
+            dyn_props.add_total_net_weight(weight);
+        }
+        // ENERGY: coalesce into `AccountResource.frozen_balance_for_energy`
+        // (java `getEnergyFrozenBalance()` / `setFrozenForEnergy`). The prior
+        // code wrote energy freezes into the BANDWIDTH `frozen` list — a wrong
+        // bucket that the V1 unfreeze (which reads `frozen_balance_for_energy`)
+        // would never see.
+        1 => {
+            let res = account.account_resource.get_or_insert_with(Default::default);
+            let old_balance = res
+                .frozen_balance_for_energy
+                .as_ref()
+                .map(|f| f.frozen_balance)
+                .unwrap_or(0);
+            let new_balance = check_add(old_balance, contract.frozen_balance)?;
+            res.frozen_balance_for_energy = Some(Frozen {
+                frozen_balance: new_balance,
+                expire_time: expire,
+            });
+            let weight = if allow_new_reward {
+                new_balance / TRX_PRECISION - old_balance / TRX_PRECISION
+            } else {
+                contract.frozen_balance / TRX_PRECISION
+            };
+            accounts.put(&owner, &account)?;
+            dyn_props.add_total_energy_weight(weight);
+        }
+        // TRON_POWER (new-resource-model only; not exercised on mainnet, where
+        // TRON Power is frozen via the V2 path). Persist the balance move
+        // without a weight change, matching the prior behaviour for this arm.
+        _ => {
+            accounts.put(&owner, &account)?;
+        }
     }
 
     Ok(ExecutionResult::default())

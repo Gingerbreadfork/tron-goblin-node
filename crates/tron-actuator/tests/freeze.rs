@@ -205,6 +205,128 @@ fn freeze_v1_tron_power_does_not_update_global_weights() {
     assert_eq!(dp.get_long(b"TOTAL_ENERGY_WEIGHT").unwrap_or(0), 0);
 }
 
+/// V1 energy freeze must coalesce into `AccountResource.frozen_balance_for_energy`
+/// (java `getEnergyFrozenBalance()` / `setFrozenForEnergy`), NOT the BANDWIDTH
+/// `frozen` list. The V1 unfreeze reads `frozen_balance_for_energy`, so a freeze
+/// written to the wrong bucket was invisible to it.
+#[test]
+fn freeze_v1_energy_lands_in_energy_frozen_field() {
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    put_account(&accounts, ALICE, 1000 * PRECISION);
+    let c = FreezeBalanceContract {
+        owner_address: ALICE.to_vec(),
+        frozen_balance: 50 * PRECISION,
+        frozen_duration: 3,
+        resource: 1, // ENERGY
+        receiver_address: Vec::new(),
+    };
+    freeze::execute_freeze_balance(&accounts, &dp, &c).unwrap();
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert!(alice.frozen.is_empty(), "energy freeze must not touch the bandwidth `frozen` list");
+    assert_eq!(
+        alice
+            .account_resource
+            .as_ref()
+            .and_then(|r| r.frozen_balance_for_energy.as_ref())
+            .map(|f| f.frozen_balance)
+            .unwrap_or(0),
+        50 * PRECISION,
+        "energy freeze coalesces into AccountResource.frozen_balance_for_energy"
+    );
+}
+
+/// With ALLOW_NEW_REWARD = 1 (mainnet), java's `FreezeBalanceActuator
+/// .addTotalWeight` adds `floor(newFrozen/1e6) - floor(oldFrozen/1e6)` over the
+/// resource's coalesced V1 frozen balance — NOT `floor(freezeBalance/1e6)`.
+/// When the account already holds a fractional-TRX V1 frozen balance the two
+/// differ by 1 at a flooring boundary, and the legacy form leaked into
+/// TOTAL_*_WEIGHT (same class as the V2 fix). Here a 0.5-TRX existing energy
+/// freeze plus a 0.6-TRX freeze gives java floor(1.1)-floor(0.5)=1; the legacy
+/// floor(0.6)=0 form was wrong.
+#[test]
+fn freeze_v1_weight_is_floor_difference_under_new_reward() {
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.put_long(b"ALLOW_NEW_REWARD", 1);
+    // Seed a fractional (0.5 TRX) pre-existing V1 energy frozen balance.
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 1000 * PRECISION,
+                r#type: AccountType::Normal as i32,
+                account_resource: Some(tron_proto::account::AccountResource {
+                    frozen_balance_for_energy: Some(Frozen {
+                        frozen_balance: 500_000, // 0.5 TRX
+                        expire_time: 0,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = FreezeBalanceContract {
+        owner_address: ALICE.to_vec(),
+        frozen_balance: 600_000, // 0.6 TRX
+        frozen_duration: 3,
+        resource: 1, // ENERGY
+        receiver_address: Vec::new(),
+    };
+    freeze::execute_freeze_balance(&accounts, &dp, &c).unwrap();
+    // floor((0.5+0.6) TRX / 1) - floor(0.5) = 1 - 0 = 1.
+    assert_eq!(
+        dp.get_long(b"TOTAL_ENERGY_WEIGHT").unwrap_or(0),
+        1,
+        "new-reward weight is the floored basis difference, not floor(freezeBalance)"
+    );
+    // The new frozen balance is the coalesced 1.1 TRX.
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(
+        alice
+            .account_resource
+            .unwrap()
+            .frozen_balance_for_energy
+            .unwrap()
+            .frozen_balance,
+        1_100_000
+    );
+}
+
+/// The same flooring fix for BANDWIDTH: 0.5-TRX existing + 0.6-TRX freeze →
+/// floor(1.1)-floor(0.5) = 1 (legacy floor(0.6) = 0).
+#[test]
+fn freeze_v1_bandwidth_weight_is_floor_difference_under_new_reward() {
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.put_long(b"ALLOW_NEW_REWARD", 1);
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 1000 * PRECISION,
+                r#type: AccountType::Normal as i32,
+                frozen: vec![Frozen { frozen_balance: 500_000, expire_time: 0 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = FreezeBalanceContract {
+        owner_address: ALICE.to_vec(),
+        frozen_balance: 600_000,
+        frozen_duration: 3,
+        resource: 0, // BANDWIDTH
+        receiver_address: Vec::new(),
+    };
+    freeze::execute_freeze_balance(&accounts, &dp, &c).unwrap();
+    assert_eq!(dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0), 1);
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(alice.frozen[0].frozen_balance, 1_100_000);
+}
+
 // ============================================================
 // UnfreezeBalance v1
 // ============================================================
