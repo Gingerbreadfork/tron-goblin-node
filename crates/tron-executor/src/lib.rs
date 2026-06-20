@@ -4395,6 +4395,11 @@ fn top_standby_witnesses(mut ranked: Vec<(Address, i64)>) -> Vec<(Address, i64)>
         ranked.truncate(STANDBY_WITNESS_COUNT);
     }
     ranked.sort_by(cmp);
+    // java `getWitnessStandby` trims `voteCount < 1` AFTER taking the top
+    // WITNESS_STANDBY_LENGTH — a zero/negative-vote witness that made the
+    // top-127 earns no standby reward and must not dilute the per-vote split.
+    // Benign on mainnet (vote counts are non-negative) but exact parity.
+    ranked.retain(|(_, vote_count)| *vote_count >= 1);
     ranked
 }
 
@@ -4403,12 +4408,14 @@ mod standby_ranking_tests {
     use super::{top_standby_witnesses, STANDBY_WITNESS_COUNT};
     use tron_crypto::address::Address;
 
-    /// The pre-optimization ranking: full sort then truncate. Tie-break is
-    /// address bytes DESCENDING (java's active `allowWitnessSortOptimization`
-    /// hex-DESC tie-break), matching `top_standby_witnesses`.
+    /// The pre-optimization ranking: full sort, truncate, then trim
+    /// vote_count < 1 (java `getWitnessStandby`). Tie-break is address bytes
+    /// DESCENDING (java's active `allowWitnessSortOptimization` hex-DESC
+    /// tie-break), matching `top_standby_witnesses`.
     fn naive(mut v: Vec<(Address, i64)>) -> Vec<(Address, i64)> {
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
         v.truncate(STANDBY_WITNESS_COUNT);
+        v.retain(|(_, vc)| *vc >= 1);
         v
     }
 

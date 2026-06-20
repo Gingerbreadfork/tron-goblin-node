@@ -526,16 +526,22 @@ fn old_reward(
         // legacy loop. Same values up to double-vs-BigInteger rounding;
         // production always wires the store so this branch is test-only.
     }
+    // java `MortgageService.getOldReward`: each cycle is computed from a FRESH
+    // `long reward = 0` (`computeReward(cycle, votes)`) and the per-cycle
+    // results are INTEGER-added. Threading the running total into the per-vote
+    // `(long)(reward + voteRate*totalReward)` narrowing (as the old code did)
+    // loses mantissa precision once the accumulated reward exceeds ~2^53 sun.
     let mut reward: i64 = 0;
     for cycle in begin_cycle..end_cycle {
-        reward = old_reward_one_cycle(cycle, votes, delegation, reward);
+        reward = reward.saturating_add(old_reward_one_cycle(cycle, votes, delegation, 0));
     }
     reward
 }
 
-/// One legacy cycle: java's `computeReward(cycle, votes)` folded into the
-/// running total with `long += double` semantics (`reward = (long)(reward
-/// + voteRate * totalReward)` — the addition happens in `double`).
+/// One legacy cycle, java's `computeReward(cycle, votes)`: a FRESH per-cycle
+/// accumulator (callers pass 0) summed across the voter's votes with
+/// `reward = (long)(reward + voteRate * totalReward)` double-narrowing.
+/// `getOldReward` integer-adds each cycle's result (see [`old_reward`]).
 fn old_reward_one_cycle(
     cycle: i64,
     votes: &[tron_proto::Vote],
