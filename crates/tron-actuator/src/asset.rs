@@ -176,6 +176,11 @@ pub fn execute_asset_issue(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let fee = dyn_props.get_long(b"ASSET_ISSUE_FEE").unwrap_or(1_024_000_000);
     owner_account.balance = check_sub(owner_account.balance, fee)?;
+    // java AssetIssueActuator: after debiting the owner, burn the fee
+    // (supportBlackHoleOptimization → burnTrx) so the chain-wide BURN_TRX_AMOUNT
+    // accounting matches. Balances already match without this; only the burn
+    // statistic would drift.
+    dyn_props.burn_trx(fee);
 
     let next_token_id = dyn_props.get_long(b"TOKEN_ID_NUM").unwrap_or(1_000_000) + 1;
     dyn_props.put_long(b"TOKEN_ID_NUM", next_token_id);

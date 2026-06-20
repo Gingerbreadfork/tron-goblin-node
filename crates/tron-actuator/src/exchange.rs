@@ -71,6 +71,9 @@ pub fn execute_exchange_create(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let fee = dyn_props.get_long(b"EXCHANGE_CREATE_FEE").unwrap_or(1_024_000_000);
     account.balance = check_sub(account.balance, fee)?;
+    // java ExchangeCreateActuator: burn the fee after debiting the owner
+    // (supportBlackHoleOptimization → burnTrx) to keep BURN_TRX_AMOUNT in sync.
+    dyn_props.burn_trx(fee);
 
     // Debit owner's TRX or asset balance for each side.
     debit_token(
