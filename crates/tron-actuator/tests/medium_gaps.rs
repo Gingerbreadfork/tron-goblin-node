@@ -41,6 +41,14 @@ fn addr(b: [u8; 21]) -> Address {
     Address::from_raw(b)
 }
 
+/// A DynamicPropertiesStore with CHANGE_DELEGATION activated (mainnet state),
+/// which validate_update_brokerage gates on.
+fn dp_cd() -> DynamicPropertiesStore {
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_change_delegation(1);
+    dp
+}
+
 fn put_account(accounts: &AccountStore, who: [u8; 21], balance: i64) {
     accounts.put(
         &addr(who),
@@ -421,7 +429,7 @@ fn update_brokerage_rejects_out_of_range() {
             owner_address: ALICE.to_vec(),
             brokerage: b,
         };
-        let err = witness::validate_update_brokerage(&accounts, &witnesses, &c).unwrap_err();
+        let err = witness::validate_update_brokerage(&accounts, &witnesses, &dp_cd(), &c).unwrap_err();
         assert!(
             matches!(err, ActuatorError::BrokerageOutOfRange),
             "b={b} got: {err:?}"
@@ -437,7 +445,7 @@ fn update_brokerage_rejects_missing_owner() {
         owner_address: ALICE.to_vec(),
         brokerage: 30,
     };
-    let err = witness::validate_update_brokerage(&accounts, &witnesses, &c).unwrap_err();
+    let err = witness::validate_update_brokerage(&accounts, &witnesses, &dp_cd(), &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing));
 }
 
@@ -450,7 +458,7 @@ fn update_brokerage_rejects_non_witness() {
         owner_address: ALICE.to_vec(),
         brokerage: 30,
     };
-    let err = witness::validate_update_brokerage(&accounts, &witnesses, &c).unwrap_err();
+    let err = witness::validate_update_brokerage(&accounts, &witnesses, &dp_cd(), &c).unwrap_err();
     assert!(matches!(err, ActuatorError::WitnessMissing));
 }
 
@@ -466,9 +474,24 @@ fn update_brokerage_accepts_boundary_values() {
             owner_address: ALICE.to_vec(),
             brokerage: b,
         };
-        witness::validate_update_brokerage(&accounts, &witnesses, &c).unwrap();
+        witness::validate_update_brokerage(&accounts, &witnesses, &dp_cd(), &c).unwrap();
         witness::execute_update_brokerage(&delegation, &c).unwrap();
     }
+}
+
+#[test]
+fn update_brokerage_rejects_when_change_delegation_off() {
+    // java UpdateBrokerageActuator.validate throws when CHANGE_DELEGATION is
+    // not activated, ahead of the brokerage/witness checks. A valid witness +
+    // in-range brokerage would otherwise pass, so this isolates the gate.
+    let accounts = AccountStore::new(mem());
+    let witnesses = WitnessStore::new(mem());
+    put_account(&accounts, ALICE, 0);
+    witnesses.put(&addr(ALICE), &Witness::default()).unwrap();
+    let dp = DynamicPropertiesStore::new(mem()); // CHANGE_DELEGATION off (default)
+    let c = UpdateBrokerageContract { owner_address: ALICE.to_vec(), brokerage: 30 };
+    let err = witness::validate_update_brokerage(&accounts, &witnesses, &dp, &c).unwrap_err();
+    assert!(matches!(err, ActuatorError::ChangeDelegationNotActivated));
 }
 
 // ============================================================

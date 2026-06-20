@@ -33,6 +33,14 @@ fn addr(b: [u8; 21]) -> Address {
     Address::from_raw(b)
 }
 
+/// A DynamicPropertiesStore with CHANGE_DELEGATION activated (mainnet state),
+/// which validate_update_brokerage gates on.
+fn dp_cd() -> DynamicPropertiesStore {
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_change_delegation(1);
+    dp
+}
+
 fn put_account(store: &AccountStore, address: [u8; 21], balance: i64) {
     store.put(
         &addr(address),
@@ -110,7 +118,7 @@ fn update_brokerage_round_trip() {
         owner_address: ALICE.to_vec(),
         brokerage: 30,
     };
-    witness::validate_update_brokerage(&accounts, &witnesses, &c).unwrap();
+    witness::validate_update_brokerage(&accounts, &witnesses, &dp_cd(), &c).unwrap();
     witness::execute_update_brokerage(&delegation, &c).unwrap();
     assert_eq!(delegation.get_brokerage_global(&addr(ALICE)), 30);
 }
@@ -125,7 +133,7 @@ fn update_brokerage_rejects_out_of_range() {
         brokerage: 101,
     };
     assert_eq!(
-        witness::validate_update_brokerage(&accounts, &witnesses, &c),
+        witness::validate_update_brokerage(&accounts, &witnesses, &dp_cd(), &c),
         Err(ActuatorError::BrokerageOutOfRange)
     );
 }

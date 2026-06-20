@@ -94,6 +94,8 @@ pub enum ActuatorError {
     InvalidUrl,
     #[error("brokerage out of range (must be 0..=100)")]
     BrokerageOutOfRange,
+    #[error("AllowChangeDelegation is not activated")]
+    ChangeDelegationNotActivated,
     #[error("withdrawal allowance is zero")]
     NoAllowance,
     #[error("withdrawal too soon: must wait until {ready_at} (now {now})")]

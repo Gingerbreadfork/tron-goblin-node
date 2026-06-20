@@ -139,8 +139,16 @@ pub fn execute_witness_update(
 pub fn validate_update_brokerage(
     accounts: &AccountStore,
     witnesses: &WitnessStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &UpdateBrokerageContract,
 ) -> Result<(), ActuatorError> {
+    // java UpdateBrokerageActuator.validate rejects when CHANGE_DELEGATION is
+    // not activated, ahead of the address/brokerage/witness checks. Inert at
+    // mainnet (the flag is on); without it a pre-fork UpdateBrokerage that java
+    // FAILs would SUCCEED here.
+    if !dyn_props.allow_change_delegation() {
+        return Err(ActuatorError::ChangeDelegationNotActivated);
+    }
     let owner = require_owner(&contract.owner_address)?;
     if contract.brokerage < 0 || contract.brokerage > 100 {
         return Err(ActuatorError::BrokerageOutOfRange);

@@ -118,7 +118,7 @@ pub fn dispatch_validate(
         }
         ContractType::UpdateBrokerageContract => {
             let c = unpack::<tron_proto::UpdateBrokerageContract>(parameter)?;
-            crate::witness::validate_update_brokerage(stores.accounts, stores.witnesses, &c)
+            crate::witness::validate_update_brokerage(stores.accounts, stores.witnesses, stores.dyn_props, &c)
         }
         ContractType::WithdrawBalanceContract => {
             let c = unpack::<tron_proto::WithdrawBalanceContract>(parameter)?;
