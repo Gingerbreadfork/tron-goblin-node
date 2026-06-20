@@ -18,6 +18,7 @@ ripemd.workspace = true
 k256.workspace = true
 thiserror.workspace = true
 revm.workspace = true
+aurora-engine-modexp = "1.2"
 sapling-crypto.workspace = true
 bls12_381.workspace = true
 jubjub.workspace = true

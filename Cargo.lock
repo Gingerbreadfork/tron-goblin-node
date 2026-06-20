@@ -6184,6 +6184,7 @@ dependencies = [
 name = "tron-tvm"
 version = "0.0.1"
 dependencies = [
+ "aurora-engine-modexp",
  "bellman",
  "bls12_381",
  "ff",

@@ -620,12 +620,14 @@ fn shielded_snark_verifier_precompiles_return_32_byte_zero_on_empty_input() {
 #[test]
 fn standard_evm_precompiles_say_handled_by_interpreter() {
     let ctx = MockContext::default();
+    // Ripemd160 (0x03) and ModExp (0x05) are NOT in this list: TRON's
+    // behavior at those addresses diverges from the standard EVM
+    // precompiles, so they're implemented locally (see the dedicated
+    // tests below).
     for p in [
         PrecompileImpl::EcRecover,
         PrecompileImpl::Sha256,
-        PrecompileImpl::Ripemd160,
         PrecompileImpl::Identity,
-        PrecompileImpl::ModExp,
         PrecompileImpl::Bn128Add,
         PrecompileImpl::Bn128Mul,
         PrecompileImpl::Bn128Pairing,
@@ -633,6 +635,69 @@ fn standard_evm_precompiles_say_handled_by_interpreter() {
         let err = p.execute(&[], &ctx).unwrap_err();
         assert!(matches!(err, tron_tvm::PrecompileError::HandledByInterpreter));
     }
+}
+
+#[test]
+fn ripemd160_returns_double_sha256_not_real_ripemd160() {
+    let ctx = MockContext::default();
+    // java-tron's 0x03 returns SHA256(SHA256(input)[0..20]) — a 32-byte
+    // digest, NOT real ripemd160.
+    for input in [b"".as_slice(), b"abc".as_slice(), &[0xffu8; 64]] {
+        let first = tron_crypto::hash::sha256(input);
+        let expected = tron_crypto::hash::sha256(&first[..20]).to_vec();
+        let out = PrecompileImpl::Ripemd160.execute(input, &ctx).unwrap();
+        assert_eq!(out.len(), 32, "0x03 output is a 32-byte sha256 digest");
+        assert_eq!(out, expected);
+    }
+    // Energy: 600 + 120 per 32-byte word (java `Ripempd160.getEnergyForData`).
+    assert_eq!(PrecompileImpl::Ripemd160.energy_cost(b""), 600);
+    assert_eq!(PrecompileImpl::Ripemd160.energy_cost(&[0u8; 1]), 600 + 120);
+    assert_eq!(PrecompileImpl::Ripemd160.energy_cost(&[0u8; 32]), 600 + 120);
+    assert_eq!(PrecompileImpl::Ripemd160.energy_cost(&[0u8; 33]), 600 + 240);
+}
+
+#[test]
+fn modexp_matches_eip198_energy_and_output() {
+    let ctx = MockContext::default();
+    // 3^2 mod 5 = 4. Each length = 1 byte. base=3, exp=2, mod=5.
+    let mut input = vec![0u8; 96];
+    input[31] = 1; // base_len
+    input[63] = 1; // exp_len
+    input[95] = 1; // mod_len
+    input.push(3);
+    input.push(2);
+    input.push(5);
+    let out = PrecompileImpl::ModExp.execute(&input, &ctx).unwrap();
+    assert_eq!(out, vec![4u8], "3^2 mod 5 = 4, left-padded to mod_len=1");
+
+    // EIP-198 energy: multComplexity(max(1,1)) = 1; adjExpLen for exp=2
+    // (highest set bit index 1) = 1; energy = 1 * max(1,1) / 20 = 0.
+    assert_eq!(PrecompileImpl::ModExp.energy_cost(&input), 0);
+
+    // A bigger exponent to exercise non-zero EIP-198 energy: base=mod=32
+    // bytes, exp=32 bytes all-0xff. multComplexity(32) = 32^2 = 1024;
+    // adjExpLen = highest set bit of 0xff..ff (255) = 255; energy =
+    // 1024 * 255 / 20 = 13056 — ~8x revm's EIP-2565 cost for the same.
+    let mut big = vec![0u8; 96];
+    big[31] = 32;
+    big[63] = 32;
+    big[95] = 32;
+    big.extend_from_slice(&[1u8; 32]); // base
+    big.extend_from_slice(&[0xffu8; 32]); // exp
+    big.extend_from_slice(&[0x07u8; 32]); // mod (odd, non-zero)
+    assert_eq!(PrecompileImpl::ModExp.energy_cost(&big), 1024 * 255 / 20);
+
+    // Zero modulus → empty output (java returns EMPTY_BYTE_ARRAY, not
+    // mod_len zeros).
+    let mut zero_mod = vec![0u8; 96];
+    zero_mod[31] = 1; // base_len
+    zero_mod[63] = 1; // exp_len
+    zero_mod[95] = 1; // mod_len
+    zero_mod.push(3); // base
+    zero_mod.push(2); // exp
+    zero_mod.push(0); // mod = 0
+    let out = PrecompileImpl::ModExp.execute(&zero_mod, &ctx).unwrap();
+    assert!(out.is_empty(), "zero modulus → empty output");
 }
 
 // =============================================================================
@@ -710,12 +775,52 @@ fn total_vote_count_returns_zero_for_absent_account_or_bad_input() {
 // ValidateMultiSign — uses on-chain Permission, weighted threshold check
 // =============================================================================
 
-/// Encode a 65-byte sig into the 3-word layout the TRON precompiles
-/// expect: bytes [0..65] hold the signature, [65..96] is zero padding.
-fn encode_sig(sig: &[u8; 65]) -> [u8; 96] {
-    let mut out = [0u8; 96];
-    out[..65].copy_from_slice(sig);
+fn word_with_low(byte_val: usize) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..32].copy_from_slice(&(byte_val as u64).to_be_bytes());
+    w
+}
+
+/// Solidity `bytes[]` of 65-byte signatures laid out as java-tron's
+/// `extractSigArray` parses it (the active `allowTvmSelfdestructRestriction`
+/// path): length word, `N` relative-offset pointers, then each 65-byte
+/// signature padded to 3 words. java reads element `i` from word
+/// `ptr_i/32 + head + 2`, so for contiguous data `ptr_i = (N-1 + i*3) * 32`.
+fn encode_sig_array(sigs: &[[u8; 65]]) -> Vec<u8> {
+    let n = sigs.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&word_with_low(n));
+    for i in 0..n {
+        out.extend_from_slice(&word_with_low((n - 1 + i * 3) * 32));
+    }
+    for sig in sigs {
+        let mut block = [0u8; 96];
+        block[..65].copy_from_slice(sig);
+        out.extend_from_slice(&block);
+    }
     out
+}
+
+/// ValidateMultiSign recovery prehash: `SHA256(addr(21) ||
+/// int32_BE(perm_id) || payload(32))`.
+fn multi_sign_prehash(addr: &Address, perm_id: i32, payload: &[u8; 32]) -> [u8; 32] {
+    let mut combine = Vec::new();
+    combine.extend_from_slice(addr.as_bytes());
+    combine.extend_from_slice(&perm_id.to_be_bytes());
+    combine.extend_from_slice(payload);
+    tron_crypto::hash::sha256(&combine)
+}
+
+/// Full ValidateMultiSign calldata: 4 head words (addr, perm_id, payload,
+/// sig-array byte offset = 0x80) + the `bytes[]` signature array.
+fn multi_sign_input(addr: &Address, perm_id: i32, payload: &[u8; 32], sigs: &[[u8; 65]]) -> Vec<u8> {
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word(addr));
+    input.extend_from_slice(&word_with_low(perm_id as usize));
+    input.extend_from_slice(payload);
+    input.extend_from_slice(&word_with_low(0x80));
+    input.extend_from_slice(&encode_sig_array(sigs));
+    input
 }
 
 /// Deterministic keypair from a fixed 32-byte seed. Avoids pulling in
@@ -782,26 +887,11 @@ fn validate_multi_sign_meets_threshold_when_weights_sum_to_target() {
         },
     );
 
-    let hash = [7u8; 32];
+    let payload = [7u8; 32];
+    let hash = multi_sign_prehash(&target_addr, 0, &payload);
     let sig1 = sign_prehash(&sk1, &hash);
     let sig2 = sign_prehash(&sk2, &hash);
-
-    // Build input: addr || permission_id (0) || hash || offset (0x80) ||
-    //              sigs_array_len (2) || sig1_words || sig2_words
-    let mut input = Vec::new();
-    input.extend_from_slice(&addr_word(&target_addr));
-    let mut perm_id = [0u8; 32];
-    perm_id[31] = 0;
-    input.extend_from_slice(&perm_id);
-    input.extend_from_slice(&hash);
-    let mut offset = [0u8; 32];
-    offset[31] = 0x80;
-    input.extend_from_slice(&offset);
-    let mut sig_count = [0u8; 32];
-    sig_count[31] = 2;
-    input.extend_from_slice(&sig_count);
-    input.extend_from_slice(&encode_sig(&sig1));
-    input.extend_from_slice(&encode_sig(&sig2));
+    let input = multi_sign_input(&target_addr, 0, &payload, &[sig1, sig2]);
 
     let out = PrecompileImpl::ValidateMultiSign.execute(&input, &ctx).unwrap();
     assert_eq!(out.last(), Some(&1u8), "should be true with both sigs");
@@ -846,22 +936,12 @@ fn validate_multi_sign_fails_below_threshold() {
         },
     );
 
-    let hash = [0xaau8; 32];
+    let payload = [0xaau8; 32];
+    let hash = multi_sign_prehash(&target_addr, 0, &payload);
     let sig1 = sign_prehash(&sk1, &hash);
-
-    let mut input = Vec::new();
-    input.extend_from_slice(&addr_word(&target_addr));
-    let mut perm_id = [0u8; 32];
-    perm_id[31] = 0;
-    input.extend_from_slice(&perm_id);
-    input.extend_from_slice(&hash);
-    let mut offset = [0u8; 32];
-    offset[31] = 0x80;
-    input.extend_from_slice(&offset);
-    let mut sig_count = [0u8; 32];
-    sig_count[31] = 1;
-    input.extend_from_slice(&sig_count);
-    input.extend_from_slice(&encode_sig(&sig1));
+    // Only k1 (weight 1) signs; k1 is a permission key so its weight is
+    // non-zero, but 1 < threshold 2 → false.
+    let input = multi_sign_input(&target_addr, 0, &payload, &[sig1]);
 
     let out = PrecompileImpl::ValidateMultiSign.execute(&input, &ctx).unwrap();
     assert_eq!(out.last(), Some(&0u8), "should be false: only weight 1 of 2");
@@ -906,22 +986,10 @@ fn validate_multi_sign_resolves_active_permission_by_id() {
         },
     );
 
-    let hash = [0x42u8; 32];
+    let payload = [0x42u8; 32];
+    let hash = multi_sign_prehash(&target_addr, 3, &payload);
     let sig = sign_prehash(&sk, &hash);
-
-    let mut input = Vec::new();
-    input.extend_from_slice(&addr_word(&target_addr));
-    let mut perm_id = [0u8; 32];
-    perm_id[31] = 3;
-    input.extend_from_slice(&perm_id);
-    input.extend_from_slice(&hash);
-    let mut offset = [0u8; 32];
-    offset[31] = 0x80;
-    input.extend_from_slice(&offset);
-    let mut sig_count = [0u8; 32];
-    sig_count[31] = 1;
-    input.extend_from_slice(&sig_count);
-    input.extend_from_slice(&encode_sig(&sig));
+    let input = multi_sign_input(&target_addr, 3, &payload, &[sig]);
 
     let out = PrecompileImpl::ValidateMultiSign.execute(&input, &ctx).unwrap();
     assert_eq!(out.last(), Some(&1u8));

@@ -301,13 +301,16 @@ impl TronPrecompiles {
 
         // Standard EVM precompiles report `HandledByInterpreter` from
         // our registry — defer to the `eth` fallback for those.
+        //
+        // `Ripemd160` (0x03) and `ModExp` (0x05) are deliberately NOT in
+        // this list: TRON's 0x03 returns a double-SHA256 (not real
+        // ripemd160) and TRON's 0x05 charges the permanent EIP-198 energy
+        // (not revm's EIP-2565), so both are dispatched to our registry.
         if matches!(
             pre,
             PrecompileImpl::EcRecover
                 | PrecompileImpl::Sha256
-                | PrecompileImpl::Ripemd160
                 | PrecompileImpl::Identity
-                | PrecompileImpl::ModExp
                 | PrecompileImpl::Bn128Add
                 | PrecompileImpl::Bn128Mul
                 | PrecompileImpl::Bn128Pairing

@@ -18,7 +18,7 @@
 use crate::address::*;
 use crate::context::{EvmContext, EvmContextError};
 use tron_crypto::address::{Address, ADDRESS_LENGTH};
-use tron_crypto::hash::keccak256;
+use tron_crypto::hash::{keccak256, sha256};
 use tron_types::resource::{
     account_usage_balance_and_restore_seconds, all_frozen_balance_for_bandwidth,
     all_frozen_balance_for_energy, ResourceKind, BLOCK_PRODUCED_INTERVAL_MS,
@@ -250,11 +250,22 @@ impl PrecompileImpl {
             // EVM-compat extras with java-tron's pinned costs.
             Self::Blake2F => blake2f_energy_cost(input),
             Self::P256Verify => 6_900,
-            // Standard EVM precompiles (EcRecover, Sha256, Ripemd160,
-            // Identity, ModExp, Bn128Add, Bn128Mul, Bn128Pairing,
-            // EthRipemd160) are handled by the interpreter — their
-            // execute() returns HandledByInterpreter and the cost
-            // calculation lives in revm.
+            // java-tron `Ripempd160.getEnergyForData`: `600 + 120 per
+            // 32-byte word (rounded up)`. Identical to revm's RIPEMD160
+            // cost, but charged here because TRON's 0x03 output differs
+            // from real ripemd160 (see `ripemd160_precompile`).
+            Self::Ripemd160 => {
+                600u64.saturating_add((input.len() as u64).div_ceil(32).saturating_mul(120))
+            }
+            // java-tron `ModExp.getEnergyForData` is permanently the
+            // EIP-198 (Byzantium) formula — it never adopted EIP-2565,
+            // so the energy is ~10x higher than revm's resolved
+            // (≥ Berlin) cost. Computed locally to match java.
+            Self::ModExp => modexp_energy_cost(input),
+            // Standard EVM precompiles (EcRecover, Sha256, Identity,
+            // Bn128Add, Bn128Mul, Bn128Pairing, EthRipemd160) are
+            // handled by the interpreter — their execute() returns
+            // HandledByInterpreter and the cost calculation lives in revm.
             _ => 0,
         }
     }
@@ -299,12 +310,16 @@ impl PrecompileImpl {
             Self::TotalDelegatedResource => total_delegated_resource(input, ctx),
             Self::TotalAcquiredResource => total_acquired_resource(input, ctx),
 
+            // TRON's 0x03 / 0x05 diverge from the standard EVM
+            // precompiles, so they're implemented here rather than
+            // deferred to the interpreter.
+            Self::Ripemd160 => Ok(ripemd160_precompile(input)),
+            Self::ModExp => Ok(modexp_precompile(input)),
+
             // === Standard EVM (handled upstream) ===
             Self::EcRecover
             | Self::Sha256
-            | Self::Ripemd160
             | Self::Identity
-            | Self::ModExp
             | Self::Bn128Add
             | Self::Bn128Mul
             | Self::Bn128Pairing
@@ -390,6 +405,163 @@ fn blake2f_precompile(input: &[u8]) -> PrecompileResult {
         out[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
     }
     Ok(out)
+}
+
+/// `0x03` — TRON's RIPEMD160 quirk. Despite the address, java-tron's
+/// `PrecompiledContracts.Ripempd160.execute` does NOT compute ripemd160:
+/// it takes the first 20 bytes of `SHA256(input)` and returns
+/// `SHA256(those 20 bytes)` — a 32-byte digest, left-aligned, no padding.
+/// (The real ripemd160 lives at `0x00020003` / `EthRipemd160`.)
+fn ripemd160_precompile(input: &[u8]) -> Vec<u8> {
+    let first = sha256(input);
+    sha256(&first[..20]).to_vec()
+}
+
+/// java-tron `ModExp.parseLen` — the `idx`-th 32-byte big-endian length
+/// word, run through `DataWord.intValueSafe` (saturates to
+/// `Integer.MAX_VALUE` when more than 4 bytes are occupied or the value
+/// would be negative as an `int`). Words past the end of `data` read as
+/// zero (java's `parseBytes` right-pads).
+fn modexp_parse_len(data: &[u8], idx: usize) -> usize {
+    let off = idx * WORD_SIZE;
+    let mut word = [0u8; WORD_SIZE];
+    if off < data.len() {
+        let n = (data.len() - off).min(WORD_SIZE);
+        word[..n].copy_from_slice(&data[off..off + n]);
+    }
+    // intValueSafe: occupying more than 4 bytes, or a high bit in the
+    // low 4 bytes (negative int), saturates to Integer.MAX_VALUE.
+    if word[..28].iter().any(|&b| b != 0) || word[28] & 0x80 != 0 {
+        return i32::MAX as usize;
+    }
+    u32::from_be_bytes(word[28..32].try_into().unwrap()) as usize
+}
+
+/// java-tron `BIUtil.addSafely` for the `int` offsets used in ModExp:
+/// the sum saturates to `Integer.MAX_VALUE`.
+fn modexp_add_safely(a: usize, b: usize) -> usize {
+    a.saturating_add(b).min(i32::MAX as usize)
+}
+
+/// java-tron `ByteUtil.parseBytes(data, offset, len)` — `len` bytes from
+/// `offset`, right-padded with zeros when `data` is too short; empty when
+/// `offset >= data.len()` or `len == 0`.
+fn modexp_parse_bytes(data: &[u8], offset: usize, len: usize) -> Vec<u8> {
+    if offset >= data.len() || len == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; len];
+    let avail = (data.len() - offset).min(len);
+    out[..avail].copy_from_slice(&data[offset..offset + avail]);
+    out
+}
+
+const MODEXP_ARGS_OFFSET: usize = 32 * 3;
+
+/// java-tron `ModExp.getEnergyForData` — the permanent EIP-198 (Byzantium)
+/// energy formula. java never adopted EIP-2565, so this is ~10x the gas
+/// revm charges at the resolved (≥ Berlin) spec. The result is computed in
+/// `i128` to avoid overflow and clamped to `i64` (`Long.MAX_VALUE` when it
+/// would not fit), matching java's `BigInteger` math.
+fn modexp_energy_cost(input: &[u8]) -> u64 {
+    let base_len = modexp_parse_len(input, 0);
+    let exp_len = modexp_parse_len(input, 1);
+    let mod_len = modexp_parse_len(input, 2);
+
+    // expHighBytes = parseBytes(data, ARGS_OFFSET + baseLen, min(expLen, 32)).
+    let exp_high = modexp_parse_bytes(
+        input,
+        modexp_add_safely(MODEXP_ARGS_OFFSET, base_len),
+        exp_len.min(32),
+    );
+
+    let mult_complexity = modexp_mult_complexity(base_len.max(mod_len));
+    let adj_exp_len = modexp_adjusted_exp_length(&exp_high, exp_len);
+
+    // energy = multComplexity * max(adjExpLen, 1) / GQUAD_DIVISOR(=20).
+    let energy = (mult_complexity as i128)
+        .saturating_mul(adj_exp_len.max(1) as i128)
+        / 20;
+    if energy >= i64::MAX as i128 {
+        i64::MAX as u64
+    } else {
+        energy as u64
+    }
+}
+
+/// java-tron `ModExp.getMultComplexity(x)` where `x = max(baseLen, modLen)`.
+fn modexp_mult_complexity(x: usize) -> i128 {
+    let x = x as i128;
+    let x2 = x * x;
+    if x <= 64 {
+        x2
+    } else if x <= 1024 {
+        x2 / 4 + 96 * x - 3072
+    } else {
+        x2 / 16 + 480 * x - 199680
+    }
+}
+
+/// java-tron `ModExp.getAdjustedExponentLength(expHighBytes, expLen)`.
+/// `highestBit` is the index of the highest set bit across `expHighBytes`
+/// (0 when none are set); for `expLen > 32` the high 8*(expLen-32) bits
+/// are added.
+fn modexp_adjusted_exp_length(exp_high: &[u8], exp_len: usize) -> i128 {
+    // numberOfLeadingZeros over the big-endian byte array.
+    let leading_zeros = exp_high
+        .iter()
+        .position(|&b| b != 0)
+        .map(|i| i * 8 + (exp_high[i].leading_zeros() as usize))
+        .unwrap_or(exp_high.len() * 8);
+    let mut highest_bit = (8 * exp_high.len()).saturating_sub(leading_zeros);
+    if highest_bit > 0 {
+        highest_bit -= 1;
+    }
+    if exp_len <= 32 {
+        highest_bit as i128
+    } else {
+        8 * (exp_len as i128 - 32) + highest_bit as i128
+    }
+}
+
+/// `0x05` — modular exponentiation. The energy is java's EIP-198 cost
+/// (see `modexp_energy_cost`); the OUTPUT bytes mirror java-tron's
+/// `ModExp.execute` exactly: parse `base`/`exp`/`mod` as unsigned
+/// big-endian, return empty bytes when the modulus is zero, otherwise
+/// `base^exp mod m` left-padded to `modLen` bytes.
+fn modexp_precompile(input: &[u8]) -> Vec<u8> {
+    let base_len = modexp_parse_len(input, 0);
+    let exp_len = modexp_parse_len(input, 1);
+    let mod_len = modexp_parse_len(input, 2);
+
+    let base = modexp_parse_bytes(input, MODEXP_ARGS_OFFSET, base_len);
+    let exp = modexp_parse_bytes(
+        input,
+        modexp_add_safely(MODEXP_ARGS_OFFSET, base_len),
+        exp_len,
+    );
+    let modulus = modexp_parse_bytes(
+        input,
+        modexp_add_safely(modexp_add_safely(MODEXP_ARGS_OFFSET, base_len), exp_len),
+        mod_len,
+    );
+
+    // java `isZero(mod)` → empty output (NOT modLen zeros).
+    if modulus.iter().all(|&b| b == 0) {
+        return Vec::new();
+    }
+
+    // `aurora_engine_modexp::modexp` returns the stripped big-endian
+    // result (the same primitive revm uses). Left-pad to `modLen`,
+    // matching java's `adjRes` length adjustment.
+    let res = aurora_engine_modexp::modexp(&base, &exp, &modulus);
+    if res.len() >= mod_len {
+        res
+    } else {
+        let mut adj = vec![0u8; mod_len];
+        adj[mod_len - res.len()..].copy_from_slice(&res);
+        adj
+    }
 }
 
 /// `0x0000_0100` — EIP-7951 P256Verify (ECDSA over secp256r1 = NIST P-256).
@@ -691,21 +863,108 @@ fn get_chain_parameter(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
 }
 
 // =============================================================================
+// Signature-array (Solidity `bytes[]`) parsing + recovery
+// =============================================================================
+
+const SIG_LENGTH: usize = 65;
+
+/// java-tron `DataWord.intValueSafe()` — the low 32 bits as a non-negative
+/// `int`, saturated to `Integer.MAX_VALUE` when the word occupies more than
+/// 4 bytes or the low word would read as a negative `int`.
+fn word_int_value_safe(word: &[u8; WORD_SIZE]) -> usize {
+    if word[..28].iter().any(|&b| b != 0) || word[28] & 0x80 != 0 {
+        return i32::MAX as usize;
+    }
+    u32::from_be_bytes(word[28..32].try_into().unwrap()) as usize
+}
+
+/// java-tron `ByteUtil.extractBytes(data, offset, len)` =
+/// `Arrays.copyOfRange(data, offset, offset + len)`: `len` bytes from
+/// `offset`, zero-padded when the slice runs past the end of `data`.
+/// Returns `None` when `offset > data.len()` (java throws
+/// `ArrayIndexOutOfBoundsException`, which fails the whole call).
+fn extract_bytes(data: &[u8], offset: usize, len: usize) -> Option<Vec<u8>> {
+    if offset > data.len() {
+        return None;
+    }
+    let mut out = vec![0u8; len];
+    let avail = (data.len() - offset).min(len);
+    out[..avail].copy_from_slice(&data[offset..offset + avail]);
+    Some(out)
+}
+
+/// java-tron `PrecompiledContracts.extractSigArray` — the
+/// `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet) path
+/// for parsing the signature `bytes[]`. `offset` is the array-head word
+/// index (`words[i].intValueSafe() / WORD_SIZE`). The `len` word is at
+/// `offset`; the `N` words after it are per-element relative byte offsets,
+/// and each 65-byte signature is read from
+/// `(bytesOffset + offset + 2) * WORD_SIZE` in the raw input.
+///
+/// Returns `None` if any element would read out of bounds (java throws and
+/// the call result becomes false).
+fn extract_sig_array(words: &[[u8; WORD_SIZE]], offset: usize, data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if words.is_empty() || offset > words.len() - 1 {
+        return Some(Vec::new());
+    }
+    let len = word_int_value_safe(&words[offset]);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let ptr_word = words.get(offset + i + 1)?;
+        let bytes_offset = word_int_value_safe(ptr_word) / WORD_SIZE;
+        let read_at = bytes_offset
+            .saturating_add(offset)
+            .saturating_add(2)
+            .saturating_mul(WORD_SIZE);
+        out.push(extract_bytes(data, read_at, SIG_LENGTH)?);
+    }
+    Some(out)
+}
+
+/// java-tron `recoverAddrBySign` — recover the signer's 20-byte (EVM-style,
+/// low 20 of the keccak of the pubkey) address from a 65-byte `[r|s|v]`
+/// signature over `hash`. Returns `None` on any failure (empty/short sig,
+/// invalid components, recovery error) so the caller skips it (java returns
+/// an empty address, which matches no permission key / address).
+fn recover_addr_by_sign(sign: &[u8], hash: &[u8; WORD_SIZE]) -> Option<[u8; 20]> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    if sign.len() < SIG_LENGTH {
+        return None;
+    }
+    let mut rs = [0u8; 64];
+    rs.copy_from_slice(&sign[0..64]);
+    let v = sign[64];
+    let recid = if v >= 27 { v - 27 } else { v };
+    let rec_id = RecoveryId::try_from(recid).ok()?;
+    let sig = Signature::from_slice(&rs).ok()?;
+    let vk = VerifyingKey::recover_from_prehash(hash, &sig, rec_id).ok()?;
+    let enc = vk.to_encoded_point(false);
+    let pub_bytes = enc.as_bytes();
+    if pub_bytes.len() != 65 {
+        return None;
+    }
+    let pub_hash = keccak256(&pub_bytes[1..]);
+    let mut low20 = [0u8; 20];
+    low20.copy_from_slice(&pub_hash[12..32]);
+    Some(low20)
+}
+
+// =============================================================================
 // BatchValidateSign (0x09)
 // =============================================================================
 //
-// ABI: hash(32) || offset(sigs) || offset(addrs) || padding || sigs_array || addrs_array
+// ABI (java-tron `BatchValidateSign.doExecute`):
+//   word[0]    = hash to verify
+//   word[1]    = byte offset to the signature `bytes[]` array
+//   word[2]    = byte offset to the address `bytes32[]` array
+//   ...        = the two arrays, encoded per Solidity ABI (offset indirection
+//                for `bytes[]`, contiguous words for `bytes32[]`)
 //
-// where sigs_array = len || sig_0 || sig_1 || ... (each sig is up to 65 bytes,
-// padded to multiples of 32) and addrs_array = len || addr_0 || addr_1 || ...
-// (each addr in a 32-byte word).
-//
-// Returns a 32-byte word where byte `i` is 1 if signature `i` recovered to
-// addresses[i], 0 otherwise.
+// Returns a 32-byte word where byte `i` is 1 iff signature `i` recovers to
+// addresses[i], 0 otherwise. On any malformed input it returns the all-zero
+// word (java's `execute` catches every Throwable and returns `new byte[32]`).
 
 fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
-    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-
     const MAX_SIZE: usize = 16;
 
     let words = parse_words(input);
@@ -714,87 +973,47 @@ fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
     }
 
     let hash = words[0];
-    // Offsets are in *bytes*; divide by 32 to get word index.
-    let sig_array_word_idx = i64::from_be_bytes(words[1][24..32].try_into().unwrap()) as usize / WORD_SIZE;
-    let addr_array_word_idx = i64::from_be_bytes(words[2][24..32].try_into().unwrap()) as usize / WORD_SIZE;
+    // Array heads: java reads `words[wordIdx].intValueSafe()` where
+    // `wordIdx = words[1|2].intValueSafe() / WORD_SIZE`.
+    let sig_head_idx = word_int_value_safe(&words[1]) / WORD_SIZE;
+    let addr_head_idx = word_int_value_safe(&words[2]) / WORD_SIZE;
 
-    let sig_count = if let Some(w) = words.get(sig_array_word_idx) {
-        i64::from_be_bytes(w[24..32].try_into().unwrap()) as usize
-    } else {
+    // `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet):
+    // java reads the declared array sizes and rejects oversized ones up
+    // front, then parses the signatures with offset indirection.
+    let (Some(sig_head), Some(addr_head)) = (words.get(sig_head_idx), words.get(addr_head_idx))
+    else {
         return Ok(data_boolean(false));
     };
-    let addr_count = if let Some(w) = words.get(addr_array_word_idx) {
-        i64::from_be_bytes(w[24..32].try_into().unwrap()) as usize
-    } else {
+    let sig_array_size = word_int_value_safe(sig_head);
+    let addr_array_size = word_int_value_safe(addr_head);
+    if sig_array_size > MAX_SIZE || addr_array_size > MAX_SIZE {
         return Ok(data_boolean(false));
-    };
+    }
 
-    if sig_count == 0
-        || sig_count > MAX_SIZE
-        || sig_count != addr_count
-    {
+    let signatures = match extract_sig_array(&words, sig_head_idx, input) {
+        Some(s) => s,
+        None => return Ok(data_boolean(false)),
+    };
+    // addresses := contiguous 32-byte words after the array-length word
+    // (java `extractBytes32Array`).
+    let addr_count = addr_array_size;
+
+    let cnt = signatures.len();
+    if cnt == 0 || cnt > MAX_SIZE || cnt != addr_count {
         return Ok(data_boolean(false));
     }
 
     let mut result = vec![0u8; WORD_SIZE];
-
-    // For each sig, decode + recover + compare to expected address.
-    // In java-tron the signatures are length-prefixed; for the common
-    // case (each sig is exactly 65 bytes), they occupy 3 words (65 bytes
-    // padded). We support that common case; the more exotic layouts are
-    // Phase 2.
-    for i in 0..sig_count {
-        let sig_words_offset = sig_array_word_idx + 1 + i * 3;
-        let addr_word_offset = addr_array_word_idx + 1 + i;
-
-        let (Some(sig0), Some(sig1), Some(sig2), Some(addr_word)) = (
-            words.get(sig_words_offset),
-            words.get(sig_words_offset + 1),
-            words.get(sig_words_offset + 2),
-            words.get(addr_word_offset),
-        ) else {
+    for (i, sig) in signatures.iter().enumerate() {
+        let Some(addr_word) = words.get(addr_head_idx + i + 1) else {
             continue;
         };
-
-        // Concatenate the three words to 96 bytes; the signature is
-        // left-aligned at bytes [0..65] with [65..96] zero padding.
-        // This matches java-tron's `BatchValidateSign` encoding where
-        // each signature in the input array is a `bytes32[3]` slot
-        // (no per-sig length prefix; the outer array length is the
-        // single header word that's already been consumed).
-        let mut sig_buf = [0u8; 96];
-        sig_buf[0..32].copy_from_slice(sig0);
-        sig_buf[32..64].copy_from_slice(sig1);
-        sig_buf[64..96].copy_from_slice(sig2);
-        let sig_bytes = &sig_buf[0..65];
-        // Recoverable ECDSA: [r||s||v] with v ∈ 0..=3.
-        if sig_bytes.len() != 65 {
-            continue;
-        }
-        let mut rs = [0u8; 64];
-        rs.copy_from_slice(&sig_bytes[0..64]);
-        let v = sig_bytes[64];
-        let recid = if v >= 27 { v - 27 } else { v };
-        let Ok(rec_id) = RecoveryId::try_from(recid) else {
+        let Some(recovered) = recover_addr_by_sign(sig, &hash) else {
             continue;
         };
-        let Ok(sig) = Signature::from_slice(&rs) else {
-            continue;
-        };
-        let Ok(vk) = VerifyingKey::recover_from_prehash(&hash, &sig, rec_id) else {
-            continue;
-        };
-        // Derive a 21-byte TRON address from the recovered pubkey.
-        let enc = vk.to_encoded_point(false);
-        let pub_bytes = enc.as_bytes();
-        if pub_bytes.len() != 65 {
-            continue;
-        }
-        let pub_hash = keccak256(&pub_bytes[1..]);
-        // The expected address in the input is given as a *20-byte*
-        // EVM-style address in the low 20 bytes of `addr_word`.
-        // We compare against the last 20 bytes of our derived hash.
-        if pub_hash[12..32] == addr_word[12..32] {
+        // java `DataWord.equalAddressByteArray` compares the low 20 bytes.
+        if recovered == addr_word[12..32] {
             result[i] = 1;
         }
     }
@@ -806,22 +1025,21 @@ fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
 // ValidateMultiSign (0x0a)
 // =============================================================================
 //
-// ABI (per java-tron `ValidateMultiSign.execute`):
+// ABI (java-tron `ValidateMultiSign.execute`):
 //   word[0]     = address (target account)
 //   word[1]     = permission_id (int32 in low bytes)
-//   word[2]     = hash to verify
-//   word[3]     = offset to sigs array (in bytes; almost always 0x80 = 4*32)
-//   words[4..]  = sigs_array := len || sig_0_words || sig_1_words || ...
+//   word[2]     = 32-byte payload (mixed into the recovery prehash)
+//   word[3]     = byte offset to the signature `bytes[]` array
+//   ...         = the `bytes[]` array (offset indirection, 65-byte elements)
 //
-// For each signature: recover the public key; derive its 20-byte EVM-style
-// address; look that up in the named Permission's `keys` and accumulate
-// the matching key's `weight`. Each key may contribute at most once.
-// Return true iff total weight ≥ permission.threshold.
+// The recovery prehash is `SHA256(address(21) || int32_BE(permissionId) ||
+// words[2])`. For each signature: recover the signer's address; look up its
+// weight in the named permission. A recovered signer whose weight is 0
+// fails the whole call (`DATA_FALSE`). Each unique signer counts once.
+// Returns true iff the total weight reaches the permission threshold.
 
 fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
-    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-
-    const MAX_SIGS: usize = 5;
+    const MAX_SIZE: usize = 5;
 
     let words = parse_words(input);
     if words.len() < 5 {
@@ -829,13 +1047,32 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     }
 
     let addr = word_to_tron_address(&words[0]);
-    let permission_id = i64::from_be_bytes(words[1][24..32].try_into().unwrap()) as i32;
-    let hash = words[2];
+    let permission_id = word_int_value_safe(&words[1]) as i32;
 
-    // words[3] is offset; with the typical layout (one head word per arg
-    // = 4 head words), sigs_array length lives at words[4].
-    let sig_count = i64::from_be_bytes(words[4][24..32].try_into().unwrap()) as usize;
-    if sig_count == 0 || sig_count > MAX_SIGS {
+    // Recovery prehash: SHA256(address(21) || ByteArray.fromInt(permissionId)
+    // || words[2].getData()). `ByteArray.fromInt` is a 4-byte big-endian int.
+    let mut combine = Vec::with_capacity(ADDRESS_LENGTH + 4 + WORD_SIZE);
+    combine.extend_from_slice(addr.as_bytes());
+    combine.extend_from_slice(&permission_id.to_be_bytes());
+    combine.extend_from_slice(&words[2]);
+    let hash: [u8; WORD_SIZE] = sha256(&combine);
+
+    // `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet):
+    // reject oversized arrays up front, then parse the `bytes[]` with offset
+    // indirection.
+    let sig_head_idx = word_int_value_safe(&words[3]) / WORD_SIZE;
+    let Some(sig_head) = words.get(sig_head_idx) else {
+        return Ok(data_boolean(false));
+    };
+    if word_int_value_safe(sig_head) > MAX_SIZE {
+        return Ok(data_boolean(false));
+    }
+
+    let signatures = match extract_sig_array(&words, sig_head_idx, input) {
+        Some(s) => s,
+        None => return Ok(data_boolean(false)),
+    };
+    if signatures.is_empty() || signatures.len() > MAX_SIZE {
         return Ok(data_boolean(false));
     }
 
@@ -848,70 +1085,46 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
         Some(p) => p,
         None => return Ok(data_boolean(false)),
     };
-    if permission.threshold <= 0 {
-        return Ok(data_boolean(false));
-    }
 
-    // Build a lookup of permission key low-20-bytes → weight.
-    let mut key_table: Vec<([u8; 20], i64)> = Vec::with_capacity(permission.keys.len());
-    for k in &permission.keys {
-        if k.address.len() == ADDRESS_LENGTH {
-            // Strip the 0x41 prefix; the EVM compares the low 20 bytes.
-            let mut buf = [0u8; 20];
-            buf.copy_from_slice(&k.address[1..]);
-            key_table.push((buf, k.weight));
-        }
-    }
-
-    // Walk signatures, recover, sum weights — but each key only counts once.
-    let mut used = vec![false; key_table.len()];
-    let mut total_weight: i64 = 0;
-    for i in 0..sig_count {
-        // Each signature is encoded as a 65-byte byte-array padded to 3 words.
-        let off = 5 + i * 3;
-        let (Some(s0), Some(s1), Some(s2)) =
-            (words.get(off), words.get(off + 1), words.get(off + 2))
-        else {
-            break;
-        };
-
-        let mut sig_buf = [0u8; 96];
-        sig_buf[0..32].copy_from_slice(s0);
-        sig_buf[32..64].copy_from_slice(s1);
-        sig_buf[64..96].copy_from_slice(s2);
-        // Same convention as BatchValidateSign: sig left-aligned in
-        // bytes [0..65] of the three-word block.
-        let sig_bytes = &sig_buf[0..65];
-
-        let mut rs = [0u8; 64];
-        rs.copy_from_slice(&sig_bytes[0..64]);
-        let v = sig_bytes[64];
-        let recid = if v >= 27 { v - 27 } else { v };
-        let Ok(rec_id) = RecoveryId::try_from(recid) else {
-            continue;
-        };
-        let Ok(sig) = Signature::from_slice(&rs) else {
-            continue;
-        };
-        let Ok(vk) = VerifyingKey::recover_from_prehash(&hash, &sig, rec_id) else {
-            continue;
-        };
-        let enc = vk.to_encoded_point(false);
-        let pub_bytes = enc.as_bytes();
-        if pub_bytes.len() != 65 {
-            continue;
-        }
-        let pub_hash = keccak256(&pub_bytes[1..]);
-        let mut low20 = [0u8; 20];
-        low20.copy_from_slice(&pub_hash[12..32]);
-
-        for (idx, (k_low, weight)) in key_table.iter().enumerate() {
-            if !used[idx] && k_low == &low20 {
-                used[idx] = true;
-                total_weight = total_weight.saturating_add(*weight);
-                break;
+    // java `TransactionCapsule.getWeight` matches the recovered signer
+    // against each key's full 21-byte address; the 0x41 prefix is constant,
+    // so comparing the low 20 bytes is equivalent.
+    let weight_of = |signer: &[u8; 20]| -> i64 {
+        for k in &permission.keys {
+            if k.address.len() == ADDRESS_LENGTH && &k.address[1..] == signer {
+                return k.weight;
             }
         }
+        0
+    };
+
+    // java walks the recovered signers, summing weights. A recovered signer
+    // whose weight is 0 (foreign / not in the permission) fails the whole
+    // call. The same `(addr, sig)` pair is skipped on a repeat; a repeated
+    // signer with a *different* sig still passes through (its weight is added
+    // again — but java de-dups exact `(recoveredAddr, sign)` pairs, so a
+    // byte-identical signature counts once).
+    let mut executed: Vec<(Vec<u8>, [u8; 20])> = Vec::new();
+    let mut total_weight: i64 = 0;
+    for sign in &signatures {
+        let Some(recovered) = recover_addr_by_sign(sign, &hash) else {
+            // recoverAddrBySign returns an empty address → getWeight == 0.
+            return Ok(data_boolean(false));
+        };
+        let merged: Vec<u8> = recovered.iter().chain(sign.iter()).copied().collect();
+        let seen_addr = executed.iter().any(|(_, a)| a == &recovered);
+        if seen_addr {
+            let seen_pair = executed.iter().any(|(m, _)| m == &merged);
+            if seen_pair {
+                continue;
+            }
+        }
+        let weight = weight_of(&recovered);
+        if weight == 0 {
+            return Ok(data_boolean(false));
+        }
+        total_weight += weight;
+        executed.push((merged, recovered));
     }
 
     Ok(data_boolean(total_weight >= permission.threshold))
