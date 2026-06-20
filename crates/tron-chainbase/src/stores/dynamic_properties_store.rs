@@ -670,9 +670,6 @@ impl DynamicPropertiesStore {
     /// [`Self::add_total_net_weight_unclamped`]).
     pub fn add_total_energy_weight_unclamped(&self, delta: i64) {
         let cur = self.total_energy_weight();
-        if delta != 0 && std::env::var("TRON_WTRACE").is_ok() {
-            eprintln!("WTRACE_STORE add_total_energy_weight delta={} old={} new={}", delta, cur, cur.wrapping_add(delta));
-        }
         self.save_total_energy_weight(cur.wrapping_add(delta));
     }
 

@@ -528,9 +528,10 @@ fn old_reward(
     }
     // java `MortgageService.getOldReward`: each cycle is computed from a FRESH
     // `long reward = 0` (`computeReward(cycle, votes)`) and the per-cycle
-    // results are INTEGER-added. Threading the running total into the per-vote
-    // `(long)(reward + voteRate*totalReward)` narrowing (as the old code did)
-    // loses mantissa precision once the accumulated reward exceeds ~2^53 sun.
+    // results are INTEGER-added. Each cycle therefore starts its per-vote
+    // `(long)(reward + voteRate*totalReward)` narrowing from 0, not from the
+    // running total — folding the running total into that narrowing would lose
+    // mantissa precision once the accumulated reward exceeds ~2^53 sun.
     let mut reward: i64 = 0;
     for cycle in begin_cycle..end_cycle {
         reward = reward.saturating_add(old_reward_one_cycle(cycle, votes, delegation, 0));
