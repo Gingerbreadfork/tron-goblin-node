@@ -512,13 +512,31 @@ impl DynamicPropertiesStore {
     }
     /// Bump (or shrink) the chain-wide net weight by `delta`. Called
     /// from the freeze/unfreeze actuators. Mirrors java-tron's
-    /// `DynamicPropertiesStore.addTotalNetWeight(long amount)`. Adds with
-    /// `wrapping_add` to match java-tron's plain `long +=`, which wraps on
-    /// i64 overflow rather than throwing — exact parity at the (in-practice
-    /// impossible) overflow boundary, where saturating would have diverged
-    /// to `i64::MAX` while java wraps negative (M-9). The other
-    /// `add_total_*` accumulators below do the same.
+    /// `DynamicPropertiesStore.addTotalNetWeight(long amount)`: a zero delta
+    /// is a no-op, the sum uses `wrapping_add` to match java's plain `long +=`
+    /// (which wraps on i64 overflow rather than throwing — exact parity at the
+    /// in-practice-impossible overflow boundary, where saturating would have
+    /// diverged to `i64::MAX` while java wraps negative, M-9), and under
+    /// `allowNewReward` the result is floored at 0. The other clamped
+    /// `add_total_*` accumulators below do the same. The VM staking path uses
+    /// the `*_unclamped` variants, which omit the floor (see those methods).
     pub fn add_total_net_weight(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut next = self.total_net_weight().wrapping_add(delta);
+        if self.allow_new_reward() {
+            next = next.max(0);
+        }
+        self.save_total_net_weight(next);
+    }
+
+    /// Unclamped net-weight bump for the in-VM staking opcodes and their
+    /// revert-unwind. java's VM `RepositoryImpl.addTotalNetWeight` does NOT
+    /// apply the actuator-side `allowNewReward` `max(0, ..)` floor, so the
+    /// opcode write and the journal entry that undoes it must use this plain
+    /// wrapping form to net to exactly zero on revert.
+    pub fn add_total_net_weight_unclamped(&self, delta: i64) {
         let cur = self.total_net_weight();
         self.save_total_net_weight(cur.wrapping_add(delta));
     }
@@ -534,6 +552,19 @@ impl DynamicPropertiesStore {
         self.put_long(keys::TOTAL_TRON_POWER_WEIGHT, v);
     }
     pub fn add_total_tron_power_weight(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut next = self.total_tron_power_weight().wrapping_add(delta);
+        if self.allow_new_reward() {
+            next = next.max(0);
+        }
+        self.save_total_tron_power_weight(next);
+    }
+
+    /// Unclamped TRON_POWER-weight bump for the in-VM staking path (see
+    /// [`Self::add_total_net_weight_unclamped`]).
+    pub fn add_total_tron_power_weight_unclamped(&self, delta: i64) {
         let cur = self.total_tron_power_weight();
         self.save_total_tron_power_weight(cur.wrapping_add(delta));
     }
@@ -618,8 +649,26 @@ impl DynamicPropertiesStore {
         self.put_long(keys::TOTAL_ENERGY_WEIGHT, v);
     }
     /// Bump (or shrink) the chain-wide energy weight by `delta`.
-    /// Mirrors `DynamicPropertiesStore.addTotalEnergyWeight`.
+    /// Mirrors `DynamicPropertiesStore.addTotalEnergyWeight`: zero-delta no-op,
+    /// `wrapping_add`, and an `allowNewReward` floor at 0.
     pub fn add_total_energy_weight(&self, delta: i64) {
+        let cur = self.total_energy_weight();
+        if delta != 0 && std::env::var("TRON_WTRACE").is_ok() {
+            eprintln!("WTRACE_STORE add_total_energy_weight delta={} old={} new={}", delta, cur, cur.wrapping_add(delta));
+        }
+        if delta == 0 {
+            return;
+        }
+        let mut next = cur.wrapping_add(delta);
+        if self.allow_new_reward() {
+            next = next.max(0);
+        }
+        self.save_total_energy_weight(next);
+    }
+
+    /// Unclamped energy-weight bump for the in-VM staking path (see
+    /// [`Self::add_total_net_weight_unclamped`]).
+    pub fn add_total_energy_weight_unclamped(&self, delta: i64) {
         let cur = self.total_energy_weight();
         if delta != 0 && std::env::var("TRON_WTRACE").is_ok() {
             eprintln!("WTRACE_STORE add_total_energy_weight delta={} old={} new={}", delta, cur, cur.wrapping_add(delta));
@@ -890,5 +939,135 @@ mod schema_version_tests {
             dp.check_or_stamp_schema_version(),
             Err(DynamicPropertiesStore::CURRENT_SCHEMA_VERSION + 1)
         );
+    }
+}
+
+#[cfg(test)]
+mod head_slot_tests {
+    use super::*;
+    use crate::MemBackend;
+    use std::sync::Arc;
+
+    fn dp() -> DynamicPropertiesStore {
+        DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>)
+    }
+
+    /// `head_slot()` is the slot unit fed to every windowed-average resource
+    /// decay (`latest_consume_time(_for_energy)` is stored in it). It must equal
+    /// java-tron's `ChainBaseManager.getHeadSlot()` /
+    /// `EnergyProcessor.getHeadSlot()`:
+    /// `(latestBlockHeaderTimestamp - genesisTimestamp) / BLOCK_PRODUCED_INTERVAL`
+    /// with `BLOCK_PRODUCED_INTERVAL == 3000` ms.
+    #[test]
+    fn head_slot_matches_java_formula() {
+        let d = dp();
+        // Mainnet genesis timestamp is "0" (config.conf `genesis.block.timestamp
+        // = "0"`), so the slot counts from the unix epoch.
+        d.save_latest_block_header_timestamp(1_700_000_001_999);
+        // (1_700_000_001_999 - 0) / 3000, truncating integer division.
+        assert_eq!(d.head_slot(), 1_700_000_001_999 / 3_000);
+        assert_eq!(d.head_slot(), 566_666_667);
+    }
+
+    /// A java mainnet RocksDB snapshot carries NO `GENESIS_BLOCK_TIMESTAMP` key
+    /// (that key is tron-goblin-node-internal; java derives genesis from config).
+    /// On the snapshot-import path `initialize_genesis` is skipped (the head
+    /// pointer already exists), so the key stays absent. `head_slot()` must then
+    /// default the genesis to 0 — matching java's mainnet config "0" — NOT to the
+    /// head timestamp. A non-zero default here would shrink `(now - lct)` and
+    /// under-decay energy usage (drift HIGH) on every account.
+    #[test]
+    fn head_slot_defaults_genesis_to_zero_when_absent() {
+        let d = dp();
+        d.save_latest_block_header_timestamp(1_700_000_000_000);
+        assert!(d.genesis_block_timestamp().is_none());
+        assert_eq!(d.head_slot(), 1_700_000_000_000 / 3_000);
+    }
+
+    /// When `GENESIS_BLOCK_TIMESTAMP` IS pinned (fresh genesis init), it is
+    /// subtracted before the slot division, exactly like java's
+    /// `getGenesisBlock().getTimeStamp()`. Mainnet pins it to 0 (no-op), but the
+    /// subtraction itself must be exact for non-zero test genesis chains.
+    #[test]
+    fn head_slot_subtracts_pinned_genesis() {
+        let d = dp();
+        d.save_genesis_block_timestamp(3_000);
+        d.save_latest_block_header_timestamp(3_000 + 9_000);
+        // (12_000 - 3_000) / 3_000 == 3.
+        assert_eq!(d.head_slot(), 3);
+    }
+
+    /// Truncation must floor toward zero (java `long` division), so the slot does
+    /// NOT advance until a full 3000 ms interval has elapsed — a sub-interval
+    /// head-time bump leaves the slot (and thus the decay) unchanged.
+    #[test]
+    fn head_slot_truncates_sub_interval() {
+        let d = dp();
+        d.save_latest_block_header_timestamp(9_000);
+        assert_eq!(d.head_slot(), 3);
+        d.save_latest_block_header_timestamp(9_000 + 2_999);
+        assert_eq!(d.head_slot(), 3, "sub-interval bump must not advance the slot");
+        d.save_latest_block_header_timestamp(9_000 + 3_000);
+        assert_eq!(d.head_slot(), 4);
+    }
+}
+
+#[cfg(test)]
+mod weight_accumulator_tests {
+    use super::*;
+    use crate::MemBackend;
+    use std::sync::Arc;
+
+    fn dp() -> DynamicPropertiesStore {
+        DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>)
+    }
+
+    /// The actuator-side `add_total_energy_weight` mirrors java's
+    /// `DynamicPropertiesStore.addTotalEnergyWeight`: a zero delta is a no-op,
+    /// and under `allowNewReward` the running total is floored at 0 so an
+    /// over-large unfreeze can never drive the chain-wide weight negative.
+    #[test]
+    fn actuator_weight_add_floors_at_zero_under_new_reward() {
+        let d = dp();
+        d.put_long(keys::ALLOW_NEW_REWARD, 1);
+        d.save_total_energy_weight(100);
+        // A debit larger than the stored weight clamps to 0, not negative.
+        d.add_total_energy_weight(-250);
+        assert_eq!(d.total_energy_weight(), 0);
+        // A zero delta is a no-op.
+        d.save_total_energy_weight(42);
+        d.add_total_energy_weight(0);
+        assert_eq!(d.total_energy_weight(), 42);
+        // A normal credit accumulates.
+        d.add_total_energy_weight(8);
+        assert_eq!(d.total_energy_weight(), 50);
+    }
+
+    /// With `allowNewReward` off the floor is not applied — java added the
+    /// `max(0, ..)` clamp alongside the new-reward algorithm, not before it.
+    #[test]
+    fn actuator_weight_add_unclamped_before_new_reward() {
+        let d = dp();
+        // ALLOW_NEW_REWARD unset (0).
+        d.save_total_net_weight(100);
+        d.add_total_net_weight(-250);
+        assert_eq!(d.total_net_weight(), -150);
+    }
+
+    /// The VM-path `*_unclamped` variants mirror java's
+    /// `RepositoryImpl.addTotal*Weight`: a plain wrapping add with no
+    /// `allowNewReward` floor, so an in-frame opcode write and the journal
+    /// entry that reverses it net to exactly zero even when the floor is on.
+    #[test]
+    fn vm_weight_add_unclamped_even_under_new_reward() {
+        let d = dp();
+        d.put_long(keys::ALLOW_NEW_REWARD, 1);
+        d.save_total_energy_weight(100);
+        // Unclamped path goes negative (no floor) ...
+        d.add_total_energy_weight_unclamped(-250);
+        assert_eq!(d.total_energy_weight(), -150);
+        // ... and a reverting +250 restores the exact original value.
+        d.add_total_energy_weight_unclamped(250);
+        assert_eq!(d.total_energy_weight(), 100);
     }
 }

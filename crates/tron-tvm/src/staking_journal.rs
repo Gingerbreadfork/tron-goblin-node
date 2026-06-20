@@ -169,10 +169,14 @@ impl StakingJournal {
                     .put_raw(&key, &DelegatedResource::default())
                     .expect("db error reversing staking-journal delegated-resource create"),
             },
-            StakingEntry::NetWeight { delta } => dyn_props.add_total_net_weight(-delta),
-            StakingEntry::EnergyWeight { delta } => dyn_props.add_total_energy_weight(-delta),
+            StakingEntry::NetWeight { delta } => {
+                dyn_props.add_total_net_weight_unclamped(-delta)
+            }
+            StakingEntry::EnergyWeight { delta } => {
+                dyn_props.add_total_energy_weight_unclamped(-delta)
+            }
             StakingEntry::TronPowerWeight { delta } => {
-                dyn_props.add_total_tron_power_weight(-delta)
+                dyn_props.add_total_tron_power_weight_unclamped(-delta)
             }
         }
     }

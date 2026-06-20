@@ -139,7 +139,7 @@ impl TronDatabase {
                 .expect("staking journal mutex poisoned")
                 .push(StakingEntry::NetWeight { delta });
         }
-        dyn_props.add_total_net_weight(delta);
+        dyn_props.add_total_net_weight_unclamped(delta);
     }
 
     /// Apply a `TOTAL_ENERGY_WEIGHT` delta, recording it for reversal.
@@ -157,7 +157,7 @@ impl TronDatabase {
                 .expect("staking journal mutex poisoned")
                 .push(StakingEntry::EnergyWeight { delta });
         }
-        dyn_props.add_total_energy_weight(delta);
+        dyn_props.add_total_energy_weight_unclamped(delta);
     }
 
     /// Apply a `TOTAL_TRON_POWER_WEIGHT` delta, recording it for reversal.
@@ -175,7 +175,7 @@ impl TronDatabase {
                 .expect("staking journal mutex poisoned")
                 .push(StakingEntry::TronPowerWeight { delta });
         }
-        dyn_props.add_total_tron_power_weight(delta);
+        dyn_props.add_total_tron_power_weight_unclamped(delta);
     }
 }
 
@@ -1352,6 +1352,15 @@ impl TronDatabaseExt for TronDatabase {
         }
         let owner = evm_to_tron_address(&caller);
         let receiver = evm_to_tron_address(&receiver_address);
+        // java `UnDelegateResourceProcessor.validate`: reject when the receiver
+        // address equals the owner address ("receiverAddress must not be the
+        // same as ownerAddress"). The delegate opcode rejects this too; without
+        // the symmetric check here a self-undelegate would execute (and the two
+        // account writes would clobber, last-writer-wins on the stale snapshot)
+        // where java reverts the frame.
+        if owner.as_bytes() == receiver.as_bytes() {
+            return 0;
+        }
         let resource = resource_type as i32;
         use tron_types::resource::{self as res, ResourceGates, ResourceKind};
         let kind = if resource == 0 {
@@ -1976,6 +1985,78 @@ mod tests {
             owner_after.frozen_v2.iter().find(|f| f.r#type == 1).unwrap().amount,
             6_000_000,
             "successful 4-TRX delegation debits the frozen-V2 pool"
+        );
+    }
+
+    /// java `UnDelegateResourceProcessor.validate` rejects an undelegate whose
+    /// receiver equals the owner ("receiverAddress must not be the same as
+    /// ownerAddress"), exactly as the delegate opcode does. The guard fires
+    /// before any state read, so even a forged self-delegation row is left
+    /// untouched and the owner's usage is never decayed. Without the guard the
+    /// opcode would process the record and the two account writes would clobber
+    /// (last-writer-wins on the stale receiver snapshot) where java reverts.
+    #[test]
+    fn tvm_self_undelegate_rejected_before_processing() {
+        let (db, dyn_props) = make_staking_db();
+        // head_slot = 12000/3000 = 4 > latest_consume_time = 0, so step 1's
+        // `update_usage` WOULD stamp latest_consume_time = 4; an unchanged 0
+        // proves the guard returned before any processing.
+        dyn_props.save_latest_block_header_timestamp(12_000);
+        dyn_props.save_total_energy_weight(1_000_000_000);
+        dyn_props.save_total_energy_current_limit(1_000_000_000);
+        let owner = tron_addr(0x73);
+        db.accounts
+            .put(
+                &TronAddress::from_raw(owner),
+                &Account {
+                    address: owner.to_vec(),
+                    frozen_v2: vec![FreezeV2 { r#type: 1, amount: 10_000_000 }],
+                    account_resource: Some(AccountResource {
+                        acquired_delegated_frozen_v2_balance_for_energy: 5_000_000,
+                        energy_usage: 4_000,
+                        latest_consume_time_for_energy: 0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Forge a self-delegation row (the delegate opcode forbids creating one)
+        // with amount >= the undelegate balance, so the ONLY early return that
+        // can fire is the owner == receiver guard.
+        let caller = evm_addr_from_tron(owner);
+        let owner_tron = evm_to_tron_address(&caller);
+        let key = DelegatedResourceStore::v2_unlocked_key(&owner_tron, &owner_tron);
+        db.delegated_resources
+            .as_ref()
+            .unwrap()
+            .put_raw(
+                &key,
+                &tron_proto::DelegatedResource {
+                    from: owner_tron.as_bytes().to_vec(),
+                    to: owner_tron.as_bytes().to_vec(),
+                    frozen_balance_for_energy: 5_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut db = db;
+        // Self-undelegate must be rejected (push 0) despite the present record;
+        // without the guard the function runs to completion and returns 1.
+        assert_eq!(
+            db.tron_undelegate_resource(caller, 1_000_000, caller, 1),
+            0,
+            "undelegate with receiver == owner must be rejected, matching java validate"
+        );
+        // The owner's usage was not decayed and its latest_consume_time stays 0
+        // (step 1 never ran).
+        let owner_after = db.accounts.get(&TronAddress::from_raw(owner)).unwrap().unwrap();
+        let res = owner_after.account_resource.unwrap();
+        assert_eq!(res.energy_usage, 4_000, "owner usage untouched by rejected self-undelegate");
+        assert_eq!(
+            res.latest_consume_time_for_energy, 0,
+            "no update_usage stamp — the guard returned before processing"
         );
     }
 
