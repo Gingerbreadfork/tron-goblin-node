@@ -156,6 +156,48 @@ fn producer_gets_brokerage_into_allowance_and_remainder_into_cycle_pool() {
 }
 
 #[test]
+fn pre_change_delegation_block_reward_goes_straight_to_allowance() {
+    // java payReward else-branch (allowChangeDelegation OFF): the block reward
+    // goes directly to the producer's allowance with NO brokerage split and NO
+    // cycle pool, and standby is NOT paid per-block. Leave CHANGE_DELEGATION
+    // unset (default 0) to exercise that pre-fork path.
+    let state = fresh_state();
+    let producer = addr(0xa1);
+    let ws = WitnessStore::new(state.witnesses.clone());
+    ws.put(
+        &Address::from_raw(producer),
+        &Witness { address: producer.to_vec(), vote_count: 100, ..Default::default() },
+    )
+    .unwrap();
+    let accts = AccountStore::new(state.accounts.clone());
+    accts
+        .put(
+            &Address::from_raw(producer),
+            &Account { address: producer.to_vec(), balance: 0, allowance: 0, ..Default::default() },
+        )
+        .unwrap();
+
+    apply_unsigned(&state, &empty_block(1, [0u8; 32], producer, 1_700_000_000_000), None)
+        .expect("execute");
+
+    // Full witness_pay_per_block (32_000_000) lands in allowance, un-split.
+    let updated = accts.get(&Address::from_raw(producer)).unwrap().expect("producer account");
+    assert_eq!(updated.allowance, 32_000_000, "full block reward straight to allowance");
+
+    // No cycle pool written in the pre-fork path.
+    let dlg = DelegationStore::new(state.delegation.clone());
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    let cycle = dp.current_cycle_number();
+    assert_eq!(
+        dlg.get_reward(cycle, &Address::from_raw(producer)),
+        0,
+        "pre-fork path must not write a cycle pool"
+    );
+    // Fee pool stays 0 (it started 0; pre-fork drains it to 0 if supported).
+    assert_eq!(dp.transaction_fee_pool(), 0);
+}
+
+#[test]
 fn standby_pool_distributes_proportionally_across_top_127() {
     // Three witnesses: A=100 votes, B=200 votes, C=50 votes.
     // standby_pay = 16_000_000, vote_sum = 350.
