@@ -478,6 +478,13 @@ fn extract_owner_address(
         ContractType::TransferContract => unpack!(tron_proto::TransferContract),
         ContractType::TransferAssetContract => unpack!(tron_proto::TransferAssetContract),
         ContractType::VoteWitnessContract => unpack!(tron_proto::VoteWitnessContract),
+        // java extracts owner_address reflectively for ANY contract type with an
+        // owner_address field (TransactionCapsule.getOwner), so the permission
+        // gate must accept these too — the bandwidth extractor and dispatch
+        // already handle them. Omitting them rejected a canonical ClearABIContract
+        // tx (PermissionDenied) that java commits → silent state divergence.
+        ContractType::VoteAssetContract => unpack!(tron_proto::VoteAssetContract),
+        ContractType::ClearAbiContract => unpack!(tron_proto::ClearAbiContract),
         ContractType::WitnessCreateContract => unpack!(tron_proto::WitnessCreateContract),
         ContractType::WitnessUpdateContract => unpack!(tron_proto::WitnessUpdateContract),
         ContractType::UpdateBrokerageContract => unpack!(tron_proto::UpdateBrokerageContract),
