@@ -102,6 +102,7 @@ fn fixture() -> RpcState {
         eth_call_backends: None,
         tx_history: None,
         transaction_ret: None,
+        commitment: None,
         account_id_index: None,
         contracts: None,
         abis: None,

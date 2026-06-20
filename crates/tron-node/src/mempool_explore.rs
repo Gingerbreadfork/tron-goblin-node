@@ -716,7 +716,6 @@ pub async fn run_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as _;
 
     fn tx(ctype: ContractType, param: Vec<u8>) -> Transaction {
         Transaction {
