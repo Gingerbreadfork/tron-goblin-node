@@ -1299,20 +1299,32 @@ pub fn execute_create_with_trace(
                 .saturating_mul(CODE_DEPOSIT_GAS_PER_BYTE);
             let already_used = gas.tx_gas_used();
             let total_with_deposit = already_used.saturating_add(deposit_cost);
-            if total_with_deposit > energy_limit {
+            // EIP-3541 (allowTvmLondon): deployed runtime code may not begin
+            // with the 0xEF byte. java VMActuator throws InvalidCodeException →
+            // spendAllEnergy → failure. Nested CREATE/CREATE2 are covered by
+            // revm's CreateContractStartingWithEF; this guards the top-level
+            // manual deposit path. Both this and the code-deposit OOG spend all
+            // energy and discard the pre-installed account.
+            let ef_invalid =
+                proposals.allow_tvm_london && runtime_code.first() == Some(&0xEF);
+            if total_with_deposit > energy_limit || ef_invalid {
                 stores
                     .accounts
                     .delete(&tron_contract_addr)
-                    .expect("db error in execute_create cleaning up after code-deposit OOG");
+                    .expect("db error in execute_create cleaning up after failed deployment");
                 VmOutcome::Halt {
-                    reason: format!(
-                        "out of gas charging code-deposit ({} bytes × 200 = {} gas; \
-                         {} already used, budget {})",
-                        runtime_code.len(),
-                        deposit_cost,
-                        already_used,
-                        energy_limit
-                    ),
+                    reason: if ef_invalid {
+                        "deployed runtime code starts with 0xEF (EIP-3541)".to_string()
+                    } else {
+                        format!(
+                            "out of gas charging code-deposit ({} bytes × 200 = {} gas; \
+                             {} already used, budget {})",
+                            runtime_code.len(),
+                            deposit_cost,
+                            already_used,
+                            energy_limit
+                        )
+                    },
                     energy_used: energy_limit,
                 }
             } else {

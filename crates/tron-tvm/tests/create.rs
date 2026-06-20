@@ -192,6 +192,79 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
 }
 
 #[test]
+fn execute_create_rejects_eip3541_ef_runtime_when_london_active() {
+    // EIP-3541 (allowTvmLondon): a top-level deploy whose returned runtime code
+    // begins with 0xEF must FAIL (java throws InvalidCodeException), not deploy.
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_LONDON", 1);
+
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xa0);
+    let owner = Address::from_raw(owner_bytes);
+    stores
+        .accounts
+        .put(
+            &owner,
+            &Account {
+                address: owner.as_bytes().to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Init code that RETURNs a 1-byte runtime `[0xEF]` (right-aligned in a
+    // PUSH32 word, returned from offset 31, length 1).
+    let mut padded = [0u8; 32];
+    padded[31] = 0xEF;
+    let mut init_code = vec![0x7fu8]; // PUSH32
+    init_code.extend_from_slice(&padded);
+    init_code.extend_from_slice(&[
+        0x60, 0x00, // PUSH1 0
+        0x52, // MSTORE
+        0x60, 0x01, // PUSH1 1
+        0x60, 0x1f, // PUSH1 31
+        0xf3, // RETURN
+    ]);
+
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            contract_address: vec![],
+            abi: Some(Abi::default()),
+            bytecode: init_code,
+            call_value: 0,
+            consume_user_resource_percent: 100,
+            name: "EfReject".into(),
+            origin_energy_limit: 1_000_000,
+            code_hash: vec![],
+            trx_hash: vec![],
+            version: 1,
+        }),
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    let tx_id = [0xcd; 32];
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &create,
+        &tx_id,
+        500_000,
+    );
+    // The deploy must FAIL (a SUCCESS here would be the tripwire-poisoning
+    // flip). The control case (a non-0xEF runtime) deploys as Success in
+    // execute_create_deploys_contract_at_tron_derived_address.
+    match outcome {
+        VmOutcome::Halt { .. } => {}
+        other => panic!("expected Halt (EIP-3541 reject), got {other:?}"),
+    }
+}
+
+#[test]
 fn execute_create_cleans_up_on_init_code_revert() {
     let stores = fresh_stores();
 
