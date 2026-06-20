@@ -150,11 +150,12 @@ fn issue_rejects_inverted_or_negative_time_window() {
     c.end_time = 4_000_000;
     let err = asset::validate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::AssetIssueEnded), "got: {err:?}");
-    // start <= 0.
+    // start == 0: java rejects "Start time should be not empty" (checked
+    // before the end/window rules), surfacing as AssetIssueNotStarted.
     let mut c2 = base_issue();
     c2.start_time = 0;
     let err2 = asset::validate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c2).unwrap_err();
-    assert!(matches!(err2, ActuatorError::AssetIssueEnded), "got: {err2:?}");
+    assert!(matches!(err2, ActuatorError::AssetIssueNotStarted), "got: {err2:?}");
 }
 
 #[test]
@@ -291,7 +292,7 @@ fn update_rejects_account_with_no_issued_asset() {
         new_limit: 100,
         new_public_limit: 100,
     };
-    let err = asset::validate_update_asset(&ctx.accounts, &c).unwrap_err();
+    let err = asset::validate_update_asset(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::AccountAlreadyIssuedAsset), "got: {err:?}");
 }
 
@@ -306,6 +307,21 @@ fn update_rejects_negative_limits() {
     };
     alice.asset_issued_id = b"1000001".to_vec();
     ctx.accounts.put(&addr(ALICE), &alice).unwrap();
+    // Mainnet has ALLOW_SAME_TOKEN_NAME on, so UpdateAsset resolves the issued
+    // asset by the V2 id (alice.asset_issued_id). Set the flag and seed the V2
+    // store so validation passes the issuance/existence checks and reaches the
+    // limit checks under test.
+    ctx.dp.put_long(b" ALLOW_SAME_TOKEN_NAME", 1); // java's leading-space key
+    ctx.v2
+        .put(
+            1_000_001,
+            &AssetIssueContract {
+                id: "1000001".to_string(),
+                owner_address: ALICE.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     for (l, pl) in [(-1, 100), (100, -1), (-1, -1)] {
         let c = UpdateAssetContract {
             owner_address: ALICE.to_vec(),
@@ -314,7 +330,7 @@ fn update_rejects_negative_limits() {
             new_limit: l,
             new_public_limit: pl,
         };
-        let err = asset::validate_update_asset(&ctx.accounts, &c).unwrap_err();
+        let err = asset::validate_update_asset(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveAmount),
             "({l},{pl}) got: {err:?}"
@@ -335,7 +351,7 @@ fn update_writes_v1_and_v2_when_both_exist() {
         new_limit: 500,
         new_public_limit: 5000,
     };
-    asset::validate_update_asset(&ctx.accounts, &c).unwrap();
+    asset::validate_update_asset(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     asset::execute_update_asset(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
     let v2 = ctx.v2.get(1_000_001).unwrap().unwrap();
     assert_eq!(v2.description, b"updated description");

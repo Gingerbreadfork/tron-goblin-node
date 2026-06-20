@@ -227,7 +227,7 @@ fn inject_rejects_missing_exchange() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeMissing), "got: {err:?}");
 }
 
@@ -250,7 +250,7 @@ fn inject_rejects_non_creator_owner() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NotExchangeOwner), "got: {err:?}");
 }
 
@@ -264,7 +264,7 @@ fn inject_rejects_token_not_in_exchange() {
         token_id: b"9999999".to_vec(), // wrong token
         quant: 100,
     };
-    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::TokenNotInExchange), "got: {err:?}");
 }
 
@@ -279,7 +279,7 @@ fn inject_rejects_zero_or_negative_quant() {
             token_id: b"_".to_vec(),
             quant,
         };
-        let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+        let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveTokenQuant),
             "quant={quant} got: {err:?}"
@@ -299,7 +299,7 @@ fn inject_maintains_pool_ratio_and_debits_both_sides() {
         token_id: b"_".to_vec(),
         quant: 100_000_000,
     };
-    exchange::validate_exchange_inject(&ctx.accounts, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
     exchange::execute_exchange_inject(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 10_000_000_000 - 100_000_000);
@@ -320,10 +320,11 @@ fn inject_rejects_when_owner_lacks_other_side_balance() {
         token_id: b"_".to_vec(),
         quant: 100_000_000,
     };
-    // Validate passes (it doesn't check the other-side balance).
-    exchange::validate_exchange_inject(&ctx.accounts, &ctx.v2, &c).unwrap();
-    // Execute fails on the asset debit.
-    let err = exchange::execute_exchange_inject(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap_err();
+    // java's inject validate requires the owner to hold BOTH the injected
+    // token and the computed counterpart (here ~10M asset); Alice has 1k, so
+    // validation rejects before execute.
+    let err =
+        exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::InsufficientAssetBalance { .. }),
         "got: {err:?}"
@@ -343,7 +344,7 @@ fn withdraw_rejects_missing_exchange() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeMissing), "got: {err:?}");
 }
 
@@ -357,7 +358,7 @@ fn withdraw_rejects_non_creator_owner() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NotExchangeOwner), "got: {err:?}");
 }
 
@@ -372,7 +373,7 @@ fn withdraw_returns_both_sides_proportionally() {
         token_id: b"_".to_vec(),
         quant: 100_000_000,
     };
-    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
     exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 1_000_000_000 + 100_000_000);
@@ -398,7 +399,7 @@ fn withdraw_below_proportional_minimum_returns_zero_other_side_and_errors() {
         quant: 1,
     };
     // Validate passes (basic length / sign checks).
-    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
     // Execute: 1 * 1e12 / 1 = 1e12 which is < i64::MAX, so credit_token
     // happens; check the result against expectations.
     exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();

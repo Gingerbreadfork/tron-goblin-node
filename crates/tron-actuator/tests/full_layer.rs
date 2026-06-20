@@ -647,6 +647,9 @@ fn asset_issue_then_transfer() {
         owner_address: ALICE.to_vec(),
         name: b"TestToken".to_vec(),
         abbr: b"TTK".to_vec(),
+        // java's AssetIssue validate requires a non-empty url (validBytes,
+        // allow_empty = false).
+        url: b"https://test.token".to_vec(),
         total_supply: 1_000_000,
         trx_num: 1,
         num: 1,

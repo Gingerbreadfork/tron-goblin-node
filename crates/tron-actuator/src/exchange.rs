@@ -4,10 +4,12 @@
 //! Source: `ExchangeCreateActuator`, `ExchangeInjectActuator`,
 //! `ExchangeWithdrawActuator`, `ExchangeTransactionActuator`.
 //!
-//! **Pricing**: TRON's exchanges use a constant-product (`x * y = k`)
-//! formula. We implement the basic math here; java-tron has additional
-//! `allowHarden` / `allowStrictMath` flags that toggle alternate
-//! precision rules — those are not yet ported.
+//! **Pricing**: ExchangeTransaction uses java's two-step Bancor power curve
+//! over a fixed virtual supply (1e18), reproduced in
+//! [`execute_exchange_transaction`]. `f64::powf` matches `Math.pow` (the
+//! pre-`ALLOW_STRICT_MATH` path); last-ULP exactness under `StrictMath.pow`
+//! is a repo-wide follow-up. Inject/withdraw use exact integer (i128) ratio
+//! math.
 
 use tron_chainbase::{
     AccountStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
@@ -120,27 +122,127 @@ pub fn execute_exchange_create(
 
 pub fn validate_exchange_inject(
     accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
     v2: &ExchangeV2Store,
     contract: &ExchangeInjectContract,
 ) -> Result<(), ActuatorError> {
+    // java ExchangeInjectActuator.validate.
     let owner = require_owner(&contract.owner_address)?;
-    let account = accounts
+    let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
+    // Merge an asset-optimized account's TRC-10 balances inline before the
+    // owner-balance checks below, so they see the full balance java's
+    // getAssetMapV2 reports (the transfer path does the same).
+    tron_chainbase::import_all_asset(&mut account);
+    // calcFee() == 0 for exchange inject; the fee balance check is a no-op.
     let exchange = v2
         .get(contract.exchange_id)?
         .ok_or(ActuatorError::ExchangeMissing)?;
     if exchange.creator_address != owner.as_bytes() {
         return Err(ActuatorError::NotExchangeOwner);
     }
-    if contract.token_id != exchange.first_token_id && contract.token_id != exchange.second_token_id
+
+    let first_token_id = &exchange.first_token_id;
+    let second_token_id = &exchange.second_token_id;
+    let first_token_balance = exchange.first_token_balance;
+    let second_token_balance = exchange.second_token_balance;
+    let token_id = &contract.token_id;
+    let token_quant = contract.quant;
+
+    // java: allowSameTokenName == 1 requires a non-TRX token id to be a valid
+    // numeric token id.
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 1
+        && token_id.as_slice() != TRX_TOKEN_ID
+        && !is_number(token_id)
     {
+        return Err(ActuatorError::Validate("token id is not a valid number"));
+    }
+
+    if token_id != first_token_id && token_id != second_token_id {
         return Err(ActuatorError::TokenNotInExchange);
     }
-    if contract.quant <= 0 {
+
+    // java: an exchange with a zero-balance side is closed.
+    if first_token_balance == 0 || second_token_balance == 0 {
+        return Err(ActuatorError::Validate(
+            "Token balance in exchange is equal with 0,the exchange has been closed",
+        ));
+    }
+
+    if token_quant <= 0 {
         return Err(ActuatorError::NonPositiveTokenQuant);
     }
-    let _ = account; // balance check happens in execute when we know the other side
+
+    // java BigInteger: anotherTokenQuant = otherBalance * tokenQuant / tokenBalance
+    // (exact integer division). `longValueExact()` throws on overflow, mapped to
+    // our Overflow rejection.
+    let (another_id, another_token_quant, new_token_balance, new_another_token_balance) =
+        if token_id == first_token_id {
+            let another = (second_token_balance as i128) * (token_quant as i128)
+                / (first_token_balance as i128);
+            (
+                second_token_id,
+                another,
+                first_token_balance as i128 + token_quant as i128,
+                second_token_balance as i128 + another,
+            )
+        } else {
+            let another = (first_token_balance as i128) * (token_quant as i128)
+                / (second_token_balance as i128);
+            (
+                first_token_id,
+                another,
+                second_token_balance as i128 + token_quant as i128,
+                first_token_balance as i128 + another,
+            )
+        };
+    if another_token_quant > i64::MAX as i128 || another_token_quant < i64::MIN as i128 {
+        return Err(ActuatorError::Overflow);
+    }
+    let another_token_quant = another_token_quant as i64;
+
+    if another_token_quant <= 0 {
+        return Err(ActuatorError::NonPositiveTokenQuant);
+    }
+
+    let balance_limit = dyn_props
+        .get_long(b"EXCHANGE_BALANCE_LIMIT")
+        .unwrap_or(i64::MAX) as i128;
+    if new_token_balance > balance_limit || new_another_token_balance > balance_limit {
+        return Err(ActuatorError::ExchangeBalanceLimitExceeded);
+    }
+
+    // java: the owner must hold enough of both the injected token and the
+    // computed counterpart token. For TRX the check includes calcFee() (== 0).
+    if token_id.as_slice() == TRX_TOKEN_ID {
+        if account.balance < token_quant {
+            return Err(ActuatorError::InsufficientBalance {
+                balance: account.balance,
+                needed: token_quant,
+            });
+        }
+    } else if !asset_balance_enough_v2(&account, token_id, token_quant) {
+        return Err(ActuatorError::InsufficientAssetBalance {
+            has: asset_v2_balance(&account, token_id),
+            needs: token_quant,
+        });
+    }
+
+    if another_id.as_slice() == TRX_TOKEN_ID {
+        if account.balance < another_token_quant {
+            return Err(ActuatorError::InsufficientBalance {
+                balance: account.balance,
+                needed: another_token_quant,
+            });
+        }
+    } else if !asset_balance_enough_v2(&account, another_id, another_token_quant) {
+        return Err(ActuatorError::InsufficientAssetBalance {
+            has: asset_v2_balance(&account, another_id),
+            needs: another_token_quant,
+        });
+    }
+
     Ok(())
 }
 
@@ -208,26 +310,94 @@ pub fn execute_exchange_inject(
 
 pub fn validate_exchange_withdraw(
     accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
     v2: &ExchangeV2Store,
     contract: &ExchangeWithdrawContract,
 ) -> Result<(), ActuatorError> {
+    // java ExchangeWithdrawActuator.validate.
     let owner = require_owner(&contract.owner_address)?;
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
     }
+    // calcFee() == 0 for exchange withdraw; the fee balance check is a no-op.
     let exchange = v2
         .get(contract.exchange_id)?
         .ok_or(ActuatorError::ExchangeMissing)?;
     if exchange.creator_address != owner.as_bytes() {
         return Err(ActuatorError::NotExchangeOwner);
     }
-    if contract.token_id != exchange.first_token_id && contract.token_id != exchange.second_token_id
+
+    let first_token_id = &exchange.first_token_id;
+    let second_token_id = &exchange.second_token_id;
+    let first_token_balance = exchange.first_token_balance;
+    let second_token_balance = exchange.second_token_balance;
+    let token_id = &contract.token_id;
+    let token_quant = contract.quant;
+
+    // java: allowSameTokenName == 1 requires a non-TRX token id to be a valid
+    // numeric token id.
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 1
+        && token_id.as_slice() != TRX_TOKEN_ID
+        && !is_number(token_id)
     {
+        return Err(ActuatorError::Validate("token id is not a valid number"));
+    }
+
+    if token_id != first_token_id && token_id != second_token_id {
         return Err(ActuatorError::TokenNotInExchange);
     }
-    if contract.quant <= 0 {
+
+    if token_quant <= 0 {
         return Err(ActuatorError::NonPositiveTokenQuant);
     }
+
+    // java: an exchange with a zero-balance side is closed.
+    if first_token_balance == 0 || second_token_balance == 0 {
+        return Err(ActuatorError::Validate(
+            "Token balance in exchange is equal with 0,the exchange has been closed",
+        ));
+    }
+
+    // java BigDecimal.divideToIntegralValue: anotherTokenQuant is the integer
+    // part of otherBalance * tokenQuant / tokenBalance (truncated toward zero;
+    // operands are non-negative here). `longValueExact()` throws on overflow,
+    // mapped to our Overflow rejection.
+    let (token_balance, other_balance) = if token_id == first_token_id {
+        (first_token_balance, second_token_balance)
+    } else {
+        (second_token_balance, first_token_balance)
+    };
+    let another_token_quant =
+        (other_balance as i128) * (token_quant as i128) / (token_balance as i128);
+    if another_token_quant > i64::MAX as i128 || another_token_quant < i64::MIN as i128 {
+        return Err(ActuatorError::Overflow);
+    }
+    let another_token_quant = another_token_quant as i64;
+
+    // java: the withdrawn side and its counterpart cannot exceed the pool
+    // balances.
+    if token_balance < token_quant || other_balance < another_token_quant {
+        return Err(ActuatorError::Validate("exchange balance is not enough"));
+    }
+
+    if another_token_quant <= 0 {
+        return Err(ActuatorError::NonPositiveTokenQuant);
+    }
+
+    // java "Not precise enough": the scale-4 HALF_UP rational quotient must be
+    // within 0.0001 (one-sided) of the truncated integer quotient.
+    //   remainder = round_half_up(otherBalance * tokenQuant / tokenBalance, 4)
+    //               - anotherTokenQuant
+    //   reject if remainder / anotherTokenQuant > 0.0001
+    let rounded4 = div_round_half_up_scale4(
+        other_balance as i128 * token_quant as i128,
+        token_balance as i128,
+    );
+    let remainder = rounded4 - another_token_quant as f64;
+    if remainder / another_token_quant as f64 > 0.0001 {
+        return Err(ActuatorError::Validate("Not precise enough"));
+    }
+
     Ok(())
 }
 
@@ -390,6 +560,56 @@ pub fn execute_exchange_transaction(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Mirrors java `TransactionUtil.isNumber`: a non-empty id whose bytes are all
+/// ASCII digits, with no leading zero when the id has more than one digit.
+fn is_number(id: &[u8]) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    for &b in id {
+        if !b.is_ascii_digit() {
+            return false;
+        }
+    }
+    !(id.len() > 1 && id[0] == b'0')
+}
+
+/// Mirrors java `AccountCapsule.assetBalanceEnoughV2` on the allowSameTokenName
+/// == 1 path: the asset-V2 slot must exist and hold at least `amount`, and
+/// `amount` must be positive.
+fn asset_balance_enough_v2(account: &tron_proto::Account, token_id: &[u8], amount: i64) -> bool {
+    if amount <= 0 {
+        return false;
+    }
+    let key = String::from_utf8_lossy(token_id).into_owned();
+    matches!(account.asset_v2.get(&key), Some(&balance) if amount <= balance)
+}
+
+/// Current asset-V2 balance for `token_id` (0 if absent), for error reporting.
+fn asset_v2_balance(account: &tron_proto::Account, token_id: &[u8]) -> i64 {
+    let key = String::from_utf8_lossy(token_id).into_owned();
+    account.asset_v2.get(&key).copied().unwrap_or(0)
+}
+
+/// Mirrors java `BigDecimal(numer).divide(BigDecimal(denom), 4,
+/// RoundingMode.HALF_UP).doubleValue()` for non-negative operands: scale the
+/// quotient to four decimal places with half-up rounding, then convert to f64.
+fn div_round_half_up_scale4(numer: i128, denom: i128) -> f64 {
+    // Scale-4 HALF_UP of numer/denom, matching java's
+    // BigDecimal.divide(.., 4, ROUND_HALF_UP).doubleValue(). Scale only the
+    // REMAINDER (r < denom) rather than `numer * 10_000`, which would overflow
+    // i128 for large exchange balances (numer can approach 2^120; ×10_000 ≈
+    // 2^133). The integer quotient `q` equals anotherTokenQuant, already shown
+    // to fit i64, so `q * 10_000` is safe. Operands are non-negative here.
+    let q = numer / denom;
+    let r = numer % denom;
+    let frac_scaled = r * 10_000;
+    let fq = frac_scaled / denom;
+    let fr = frac_scaled % denom;
+    let frac = if 2 * fr >= denom { fq + 1 } else { fq };
+    (q * 10_000 + frac) as f64 / 10_000.0
+}
 
 /// Public re-export of [`debit_token`] for use by [`crate::market`].
 pub fn debit_token_impl(

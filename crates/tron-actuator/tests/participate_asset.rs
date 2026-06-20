@@ -12,7 +12,7 @@ use std::sync::Arc;
 use hex_literal::hex;
 use tron_actuator::{asset, ActuatorError};
 use tron_chainbase::{
-    AccountStore, AssetIssueStore, DynamicPropertiesStore, KvBackend, MemBackend,
+    AccountStore, AssetIssueStore, AssetIssueV2Store, DynamicPropertiesStore, KvBackend, MemBackend,
 };
 use tron_crypto::address::Address;
 use tron_proto::{
@@ -32,6 +32,7 @@ fn addr(b: [u8; 21]) -> Address {
 struct Ctx {
     accounts: AccountStore,
     v1: AssetIssueStore,
+    v2: AssetIssueV2Store,
     dp: DynamicPropertiesStore,
 }
 
@@ -39,6 +40,7 @@ fn ctx() -> Ctx {
     Ctx {
         accounts: AccountStore::new(mem()),
         v1: AssetIssueStore::new(mem()),
+        v2: AssetIssueV2Store::new(mem()),
         dp: DynamicPropertiesStore::new(mem()),
     }
 }
@@ -110,7 +112,7 @@ fn rejects_self_participate() {
     seed_issuer_with_asset(&ctx, 1, 10, 0, i64::MAX, 1_000_000);
     let mut c = base_contract(100);
     c.to_address = OWNER.to_vec(); // self
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(matches!(err, ActuatorError::SelfTransfer), "got: {err:?}");
 }
@@ -122,7 +124,7 @@ fn rejects_non_positive_amount() {
     seed_issuer_with_asset(&ctx, 1, 10, 0, i64::MAX, 1_000_000);
     for amt in [0i64, -1, -100] {
         let c = base_contract(amt);
-        let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+        let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
             .unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveAmount),
@@ -136,7 +138,7 @@ fn rejects_missing_owner_account() {
     let ctx = ctx();
     seed_issuer_with_asset(&ctx, 1, 10, 0, i64::MAX, 1_000_000);
     let c = base_contract(100);
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing), "got: {err:?}");
 }
@@ -147,7 +149,7 @@ fn rejects_insufficient_balance() {
     put_owner(&ctx, 10); // not enough
     seed_issuer_with_asset(&ctx, 1, 10, 0, i64::MAX, 1_000_000);
     let c = base_contract(100);
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(
         matches!(
@@ -167,7 +169,7 @@ fn rejects_unknown_asset_name() {
     put_owner(&ctx, 1_000_000);
     // Don't seed asset.
     let c = base_contract(100);
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(matches!(err, ActuatorError::AssetMissing), "got: {err:?}");
 }
@@ -182,7 +184,7 @@ fn rejects_to_address_not_matching_asset_owner() {
     wrong_to[0] = 0x41;
     wrong_to[20] = 0x99;
     c.to_address = wrong_to.to_vec();
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(
         matches!(err, ActuatorError::InvalidToAddress),
@@ -197,7 +199,7 @@ fn rejects_before_asset_start_time() {
     seed_issuer_with_asset(&ctx, 1, 10, 1_000_000, 5_000_000, 1_000_000);
     ctx.dp.save_latest_block_header_timestamp(500_000); // before start
     let c = base_contract(100);
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(
         matches!(err, ActuatorError::AssetIssueNotStarted),
@@ -212,11 +214,11 @@ fn rejects_at_or_after_asset_end_time() {
     seed_issuer_with_asset(&ctx, 1, 10, 0, 5_000_000, 1_000_000);
     ctx.dp.save_latest_block_header_timestamp(5_000_000); // exactly end
     let c = base_contract(100);
-    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(matches!(err, ActuatorError::AssetIssueEnded), "got: {err:?}");
     ctx.dp.save_latest_block_header_timestamp(6_000_000); // past end
-    let err2 = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c)
+    let err2 = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
         .unwrap_err();
     assert!(matches!(err2, ActuatorError::AssetIssueEnded));
 }
@@ -228,7 +230,7 @@ fn validate_passes_at_start_time_boundary() {
     seed_issuer_with_asset(&ctx, 1, 10, 1_000_000, 5_000_000, 1_000_000);
     ctx.dp.save_latest_block_header_timestamp(1_000_000); // exactly start
     let c = base_contract(100);
-    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
+    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
 }
 
 // ============================================================
@@ -242,8 +244,8 @@ fn execute_swaps_trx_for_asset_at_configured_ratio() {
     // 1 TRX = 10 asset units (trx_num=1, num=10).
     seed_issuer_with_asset(&ctx, 1, 10, 0, i64::MAX, 1_000_000);
     let c = base_contract(100); // 100 sun -> 1000 asset units
-    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
-    asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &c).unwrap();
+    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     let owner = ctx.accounts.get(&addr(OWNER)).unwrap().unwrap();
     let issuer = ctx.accounts.get(&addr(ISSUER)).unwrap().unwrap();
     assert_eq!(owner.balance, 1_000_000 - 100);
@@ -259,9 +261,10 @@ fn execute_rejects_when_exchange_amount_rounds_to_zero() {
     // 1000 TRX = 1 asset (trx_num=1000, num=1). 100 sun → floor(100*1/1000) = 0.
     seed_issuer_with_asset(&ctx, 1000, 1, 0, i64::MAX, 1_000_000);
     let c = base_contract(100);
-    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
-    let err = asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &c).unwrap_err();
-    assert!(matches!(err, ActuatorError::Overflow), "got: {err:?}");
+    // java validate rejects exchangeAmount <= 0 ("Can not process the exchange!").
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::NonPositiveAmount), "got: {err:?}");
 }
 
 #[test]
@@ -271,14 +274,11 @@ fn execute_rejects_when_issuer_runs_out_of_asset() {
     // Issuer has tiny asset stock (1 unit), but ratio asks for many units.
     seed_issuer_with_asset(&ctx, 1, 1000, 0, i64::MAX, 1);
     let c = base_contract(100); // 100 sun * 1000 / 1 = 100_000 units, way more than 1.
-    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
-    let err = asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &c).unwrap_err();
-    // Either InsufficientAssetBalance or Overflow depending on path.
+    // java validate rejects via assetBalanceEnoughV2 (issuer holds too little).
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
+        .unwrap_err();
     assert!(
-        matches!(
-            err,
-            ActuatorError::InsufficientAssetBalance { .. } | ActuatorError::Overflow
-        ),
+        matches!(err, ActuatorError::InsufficientAssetBalance { .. }),
         "got: {err:?}"
     );
 }
@@ -291,8 +291,9 @@ fn execute_overflow_on_large_amount_extreme_ratio() {
     // amount near i64::MAX/2^31 this overflows the i64 output.
     seed_issuer_with_asset(&ctx, 1, i32::MAX, 0, i64::MAX, i64::MAX);
     let c = base_contract(1_000_000_000_000_i64); // 1 TT sun
-    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
-    let err = asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &c).unwrap_err();
+    // java validate's multiplyExact overflows i64 → rejected at validate.
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
+        .unwrap_err();
     assert!(matches!(err, ActuatorError::Overflow), "got: {err:?}");
 }
 
@@ -314,10 +315,10 @@ fn execute_rejects_when_to_account_missing() {
     };
     ctx.v1.put(ASSET_NAME, &asset_record).unwrap();
     let c = base_contract(100);
-    // Validate passes (it doesn't load the to-account record).
-    asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
-    // Execute fails on missing target account.
-    let err = asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &c).unwrap_err();
+    // java validate loads the to-account for the asset-balance check, so a
+    // missing issuer account is rejected at validate (not execute).
+    let err = asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
+        .unwrap_err();
     assert!(matches!(err, ActuatorError::TargetAccountMissing), "got: {err:?}");
 }
 
@@ -328,8 +329,8 @@ fn execute_chains_multiple_participates_correctly() {
     seed_issuer_with_asset(&ctx, 1, 5, 0, i64::MAX, 10_000_000);
     let c = base_contract(1000);
     for _ in 0..3 {
-        asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
-        asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &c).unwrap();
+        asset::validate_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+        asset::execute_participate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     }
     let owner = ctx.accounts.get(&addr(OWNER)).unwrap().unwrap();
     let issuer = ctx.accounts.get(&addr(ISSUER)).unwrap().unwrap();
