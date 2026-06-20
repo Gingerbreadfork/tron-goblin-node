@@ -624,6 +624,22 @@ pub enum PrecompileError {
     BadInputLength { got: usize, expected: usize },
     #[error("malformed input")]
     Malformed,
+    /// An access that throws an *uncaught* exception in java-tron's
+    /// precompile body — e.g. an out-of-range `words[]` index or an
+    /// `Arrays.copyOfRange` past the end of the call data in
+    /// `ValidateMultiSign`/`extractSigArray`, whose try-block does not
+    /// cover those statements. In java the resulting
+    /// `ArrayIndexOutOfBoundsException` propagates to `VM.java`, which
+    /// runs `program.spendAllEnergy()` and halts → the whole transaction
+    /// reverts after burning the entire energy budget.
+    ///
+    /// The interpreter bridge (`evm.rs::dispatch_tron`) MUST map this
+    /// variant to a revert that consumes the full `gas_limit`, NOT to a
+    /// zero-cost revert (which is reserved for the success-with-false
+    /// `Ok(..)` precompile outputs). This is distinct from `Malformed`,
+    /// whose java counterpart returns a value rather than throwing.
+    #[error("uncaught precompile throw: spend all energy and revert")]
+    SpendAllRevert,
     #[error("context error: {0}")]
     Context(#[from] EvmContextError),
     #[error("handled by the EVM interpreter, not here")]
@@ -901,8 +917,14 @@ fn extract_bytes(data: &[u8], offset: usize, len: usize) -> Option<Vec<u8>> {
 /// and each 65-byte signature is read from
 /// `(bytesOffset + offset + 2) * WORD_SIZE` in the raw input.
 ///
-/// Returns `None` if any element would read out of bounds (java throws and
-/// the call result becomes false).
+/// Returns `None` if any element word index is out of range or a 65-byte
+/// signature read would start past the end of `data` — both throw an
+/// `ArrayIndexOutOfBoundsException` in java (`words[...]` /
+/// `Arrays.copyOfRange`). This throw is OUTSIDE `ValidateMultiSign`'s
+/// try-block but INSIDE `BatchValidateSign.doExecute`'s, so each caller
+/// maps `None` differently: `BatchValidateSign` returns the caught
+/// all-zero word, while `ValidateMultiSign` propagates a spend-all
+/// revert (`PrecompileError::SpendAllRevert`).
 fn extract_sig_array(words: &[[u8; WORD_SIZE]], offset: usize, data: &[u8]) -> Option<Vec<Vec<u8>>> {
     if words.is_empty() || offset > words.len() - 1 {
         return Some(Vec::new());
@@ -967,7 +989,15 @@ fn recover_addr_by_sign(sign: &[u8], hash: &[u8; WORD_SIZE]) -> Option<[u8; 20]>
 fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
     const MAX_SIZE: usize = 16;
 
-    let words = parse_words(input);
+    // java `DataWord.parseArray` floors `len = data.length / WORD_SIZE`,
+    // discarding any trailing partial word; `parse_words` rounds up. Truncate
+    // to the floor count so `words.len()` and every `words[i]` access match
+    // java's array exactly. (BatchValidateSign catches all throws and returns
+    // the all-zero word, so the floor count only affects which path produces
+    // that word, never the result.)
+    let word_count = input.len() / WORD_SIZE;
+    let parsed = parse_words(input);
+    let words = &parsed[..word_count];
     if words.len() < 5 {
         return Ok(data_boolean(false));
     }
@@ -991,13 +1021,27 @@ fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
         return Ok(data_boolean(false));
     }
 
-    let signatures = match extract_sig_array(&words, sig_head_idx, input) {
+    let signatures = match extract_sig_array(words, sig_head_idx, input) {
         Some(s) => s,
         None => return Ok(data_boolean(false)),
     };
     // addresses := contiguous 32-byte words after the array-length word
-    // (java `extractBytes32Array`).
+    // (java `extractBytes32Array`). java eagerly reads `words[addr_head_idx +
+    // i + 1]` for every `i` in `0..addr_array_size`; an out-of-range index
+    // throws `ArrayIndexOutOfBoundsException`, which `BatchValidateSign`'s
+    // outer try-block catches and turns into the all-zero word. Mirror that
+    // by rejecting up front when the declared address-array size runs past
+    // the available words, rather than partially filling the result. The
+    // well-formed path is unaffected: there `addr_array_size == cnt` and
+    // every address word exists.
     let addr_count = addr_array_size;
+    if addr_head_idx
+        .saturating_add(addr_array_size)
+        .saturating_add(1)
+        > words.len()
+    {
+        return Ok(data_boolean(false));
+    }
 
     let cnt = signatures.len();
     if cnt == 0 || cnt > MAX_SIZE || cnt != addr_count {
@@ -1041,37 +1085,65 @@ fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
 fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     const MAX_SIZE: usize = 5;
 
-    let words = parse_words(input);
-    if words.len() < 5 {
-        return Ok(data_boolean(false));
-    }
+    // java `DataWord.parseArray` is FLOOR division: `len = data.length /
+    // WORD_SIZE`, discarding any trailing partial word. Our `parse_words`
+    // rounds UP (zero-padding the last partial word), so truncate to the
+    // floor count to reproduce java's exact `words.length` — the value that
+    // governs which `words[i]` accesses throw `ArrayIndexOutOfBoundsException`.
+    let word_count = input.len() / WORD_SIZE;
+    let parsed = parse_words(input);
+    let words = &parsed[..word_count];
 
-    let addr = word_to_tron_address(&words[0]);
-    let permission_id = word_int_value_safe(&words[1]) as i32;
+    // java-tron `ValidateMultiSign.execute` accesses `words[0]`, `words[1]`,
+    // `words[2]`, `words[3]` and `words[words[3].intValueSafe() / WORD_SIZE]`
+    // BEFORE its try-block. An out-of-range index here throws
+    // `ArrayIndexOutOfBoundsException`, which is uncaught → `VM.java`
+    // `spendAllEnergy()` + whole-tx revert. These are NOT the
+    // success-with-false `Pair.of(true, DATA_FALSE)` returns inside the body;
+    // they burn the full energy budget.
+    let (Some(w0), Some(w1), Some(w2), Some(w3)) =
+        (words.first(), words.get(1), words.get(2), words.get(3))
+    else {
+        return Err(PrecompileError::SpendAllRevert);
+    };
+
+    let addr = word_to_tron_address(w0);
+    let permission_id = word_int_value_safe(w1) as i32;
 
     // Recovery prehash: SHA256(address(21) || ByteArray.fromInt(permissionId)
     // || words[2].getData()). `ByteArray.fromInt` is a 4-byte big-endian int.
     let mut combine = Vec::with_capacity(ADDRESS_LENGTH + 4 + WORD_SIZE);
     combine.extend_from_slice(addr.as_bytes());
     combine.extend_from_slice(&permission_id.to_be_bytes());
-    combine.extend_from_slice(&words[2]);
+    combine.extend_from_slice(w2);
     let hash: [u8; WORD_SIZE] = sha256(&combine);
 
     // `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet):
     // reject oversized arrays up front, then parse the `bytes[]` with offset
-    // indirection.
-    let sig_head_idx = word_int_value_safe(&words[3]) / WORD_SIZE;
+    // indirection. `words[words[3].intValueSafe() / WORD_SIZE]` is a pre-try
+    // access in java — an out-of-range head index throws → spend-all-revert,
+    // NOT a false result.
+    let sig_head_idx = word_int_value_safe(w3) / WORD_SIZE;
     let Some(sig_head) = words.get(sig_head_idx) else {
-        return Ok(data_boolean(false));
+        return Err(PrecompileError::SpendAllRevert);
     };
+    // `sigArraySize > MAX_SIZE` is an explicit `Pair.of(true, DATA_FALSE)`
+    // return in java — a successful precompile with a false word.
     if word_int_value_safe(sig_head) > MAX_SIZE {
         return Ok(data_boolean(false));
     }
 
-    let signatures = match extract_sig_array(&words, sig_head_idx, input) {
+    // `extractSigArray` is also pre-try in `ValidateMultiSign`: an
+    // out-of-range element word or a signature read past the end of the call
+    // data throws → spend-all-revert (see `extract_sig_array`). This differs
+    // from `BatchValidateSign`, whose identical throw is caught and returns a
+    // false word.
+    let signatures = match extract_sig_array(words, sig_head_idx, input) {
         Some(s) => s,
-        None => return Ok(data_boolean(false)),
+        None => return Err(PrecompileError::SpendAllRevert),
     };
+    // `signatures.length == 0 || > MAX_SIZE` is an explicit
+    // `Pair.of(true, DATA_FALSE)` return — a successful false result.
     if signatures.is_empty() || signatures.len() > MAX_SIZE {
         return Ok(data_boolean(false));
     }

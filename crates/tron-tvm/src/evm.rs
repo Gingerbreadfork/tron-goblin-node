@@ -360,6 +360,15 @@ impl TronPrecompiles {
                 // be defensive.
                 (PrecompileStatus::Revert, Bytes::new(), 0)
             }
+            Err(PrecompileError::SpendAllRevert) => {
+                // java-tron: an uncaught ArrayIndexOutOfBoundsException in the
+                // precompile body (e.g. ValidateMultiSign's pre-try word
+                // accesses) propagates to VM.java, which runs spendAllEnergy()
+                // and halts — the whole transaction reverts after burning the
+                // entire energy budget. A zero-cost revert (the Err arm below)
+                // is reserved for the success-with-false Ok(..) outputs.
+                return Some(make_halt(inputs.gas_limit, "uncaught precompile throw"));
+            }
             Err(_) => (PrecompileStatus::Revert, Bytes::new(), 0),
         };
 

@@ -418,13 +418,22 @@ fn batch_validate_sign_rejects_offset_out_of_bounds() {
 #[test]
 fn validate_multi_sign_rejects_short_input() {
     let ctx = MockCtx::default();
-    for n in 0..5 {
+    // java-tron reads the four head words (hash, address, permissionId, the
+    // bytes[] offset) BEFORE its try block, so fewer than four words throws an
+    // uncaught ArrayIndexOutOfBoundsException → VM.spendAllEnergy() + revert.
+    for n in 0..4 {
         let input = vec![0u8; n * 32];
-        let out = PrecompileImpl::ValidateMultiSign
-            .execute(&input, &ctx)
-            .unwrap();
-        assert_eq!(out.last(), Some(&0u8), "n={n} words must be false");
+        let out = PrecompileImpl::ValidateMultiSign.execute(&input, &ctx);
+        assert!(out.is_err(), "n={n} words: too few head words must spend-all-revert");
     }
+    // Four zero words: the head reads succeed, the (zero) offset points at a
+    // zero-length signature array and the zero address has no account, so this
+    // is an in-try false result, not a throw.
+    let input = vec![0u8; 4 * 32];
+    let out = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .unwrap();
+    assert_eq!(out.last(), Some(&0u8), "4 words, no account must be false");
 }
 
 #[test]

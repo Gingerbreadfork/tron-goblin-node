@@ -995,6 +995,157 @@ fn validate_multi_sign_resolves_active_permission_by_id() {
     assert_eq!(out.last(), Some(&1u8));
 }
 
+// --- ValidateMultiSign: malformed pre-try input → spend-all-revert ----------
+//
+// In java-tron the pre-try `words[0..3]` /
+// `words[words[3].intValueSafe()/WORD_SIZE]` / `extractSigArray` accesses
+// throw `ArrayIndexOutOfBoundsException` on malformed input. That throw is
+// NOT caught by `ValidateMultiSign.execute`'s try-block, so it propagates to
+// `VM.java`, which runs `spendAllEnergy()` and reverts the whole tx. We model
+// this as `PrecompileError::SpendAllRevert` — distinct from the in-body
+// `Pair.of(true, DATA_FALSE)` results, which stay `Ok(false-word)`.
+
+#[test]
+fn validate_multi_sign_too_few_words_is_spend_all_revert() {
+    let ctx = MockContext::default();
+    // Fewer than 4 words → `words[3]` (and earlier) is out of range in java,
+    // an uncaught throw. Must be the spend-all-revert variant, NOT Ok(false).
+    for word_count in [0usize, 1, 2, 3] {
+        let input = vec![0u8; word_count * 32];
+        let err = PrecompileImpl::ValidateMultiSign
+            .execute(&input, &ctx)
+            .unwrap_err();
+        assert!(
+            matches!(err, tron_tvm::PrecompileError::SpendAllRevert),
+            "{word_count} words must spend-all-revert, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_multi_sign_out_of_range_sig_head_is_spend_all_revert() {
+    let ctx = MockContext::default();
+    // 4 head words present, `words[3]` = 0x80 → sig-array head index 4, which
+    // is >= words.len() (4). java reads `words[4]` → AIOOBE → uncaught throw.
+    let target_addr = alice();
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word(&target_addr)); // words[0]
+    input.extend_from_slice(&word_with_low(0)); // words[1] perm id
+    input.extend_from_slice(&[0u8; 32]); // words[2] payload
+    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
+    assert_eq!(input.len(), 4 * 32);
+    let err = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .unwrap_err();
+    assert!(
+        matches!(err, tron_tvm::PrecompileError::SpendAllRevert),
+        "out-of-range sig-array head must spend-all-revert, got {err:?}"
+    );
+}
+
+#[test]
+fn validate_multi_sign_sig_element_past_data_is_spend_all_revert() {
+    let ctx = MockContext::default();
+    // Well-formed head (head idx 4 in range), length word declares 1 element
+    // whose pointer word puts the 65-byte signature read far past the end of
+    // the call data → java `Arrays.copyOfRange` throws (pre-try) → spend-all.
+    let target_addr = alice();
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word(&target_addr)); // words[0]
+    input.extend_from_slice(&word_with_low(0)); // words[1]
+    input.extend_from_slice(&[0u8; 32]); // words[2]
+    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
+    input.extend_from_slice(&word_with_low(1)); // words[4] len = 1
+    // words[5] element pointer: a huge byte offset so the signature read
+    // starts well past `data.len()` → extractBytes returns None → revert.
+    input.extend_from_slice(&word_with_low(0x10_000 * 32));
+    let err = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .unwrap_err();
+    assert!(
+        matches!(err, tron_tvm::PrecompileError::SpendAllRevert),
+        "signature read past data must spend-all-revert, got {err:?}"
+    );
+}
+
+#[test]
+fn validate_multi_sign_oversized_sig_array_is_ok_false_not_revert() {
+    // `sigArraySize > MAX_SIZE` is an explicit `Pair.of(true, DATA_FALSE)` in
+    // java — a SUCCESSFUL precompile with a false word, NOT a throw. Must stay
+    // Ok(false-word) so only one signature group's energy is charged.
+    let ctx = MockContext::default();
+    let target_addr = alice();
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word(&target_addr)); // words[0]
+    input.extend_from_slice(&word_with_low(0)); // words[1]
+    input.extend_from_slice(&[0u8; 32]); // words[2]
+    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
+    input.extend_from_slice(&word_with_low(6)); // words[4] len = 6 > MAX_SIZE 5
+    let out = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .expect("oversized declared size is success-with-false, not a revert");
+    assert_eq!(out.last(), Some(&0u8), "oversized array → false word");
+}
+
+#[test]
+fn validate_multi_sign_no_permission_is_ok_false_not_revert() {
+    // A well-formed, in-bounds call with one (garbage) signature against an
+    // account that has no permission falls through java's body to the final
+    // `Pair.of(true, DATA_FALSE)` — a success-with-false, NOT a revert.
+    let ctx = MockContext::default(); // alice absent from the store
+    let target_addr = alice();
+    let payload = [0u8; 32];
+    let sig = [0u8; 65]; // recovers to nothing meaningful; account is absent
+    let input = multi_sign_input(&target_addr, 0, &payload, &[sig]);
+    let out = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .expect("absent account is success-with-false, not a revert");
+    assert_eq!(out.last(), Some(&0u8));
+}
+
+// --- BatchValidateSign: declared address-array size past words → zero word --
+//
+// java `extractBytes32Array` reads `words[addr_head + i + 1]` for every
+// declared address; an out-of-range index throws, which `BatchValidateSign`'s
+// outer try-block catches and turns into the all-zero word. (Distinct from
+// ValidateMultiSign, whose identical throw is uncaught → spend-all-revert.)
+// BatchValidateSign always returns `Ok(..)` here — never a revert.
+
+#[test]
+fn batch_validate_sign_addr_array_past_words_is_zero_word() {
+    // Equal declared sig/addr counts (1 each) so the call clears the
+    // `cnt != addresses.length` gate, and a valid sig is extracted — but the
+    // single declared address element word lies one past the end of the data.
+    // java reads `words[addr_head + 1]` in extractBytes32Array → AIOOBE →
+    // caught by BatchValidateSign's outer try → all-zero word (never a
+    // revert). Our eager bounds check returns the same zero word instead of
+    // partially filling the result.
+    //
+    // Layout (9 words, indices 0..=8):
+    //   [0] hash
+    //   [1] sig head pointer = 3*32  → sig head idx 3
+    //   [2] addr head pointer = 8*32 → addr head idx 8 (the LAST word present)
+    //   [3] sig array len = 1
+    //   [4] sig element ptr = 0
+    //   [5..8] 96-byte signature block
+    //   [8] addr array len = 1  (its element word [9] is out of range)
+    let mut input = Vec::new();
+    input.extend_from_slice(&[0u8; 32]); // [0] hash
+    input.extend_from_slice(&word_with_low(3 * 32)); // [1] sig head idx 3
+    input.extend_from_slice(&word_with_low(8 * 32)); // [2] addr head idx 8
+    input.extend_from_slice(&word_with_low(1)); // [3] sig array len = 1
+    input.extend_from_slice(&word_with_low(0)); // [4] element ptr
+    let mut block = [0u8; 96];
+    block[..65].copy_from_slice(&[1u8; 65]);
+    input.extend_from_slice(&block); // [5..8] sig bytes
+    input.extend_from_slice(&word_with_low(1)); // [8] addr array len = 1
+    assert_eq!(input.len(), 9 * 32);
+    let out = PrecompileImpl::BatchValidateSign
+        .execute(&input, &MockContext::default())
+        .expect("BatchValidateSign never reverts — catches every throw");
+    assert_eq!(out, vec![0u8; 32], "declared addr element past data → zero word");
+}
+
 // =============================================================================
 // FreezeV2 / resource queries — all reads of Account fields
 // =============================================================================
