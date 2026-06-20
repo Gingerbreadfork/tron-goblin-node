@@ -429,6 +429,12 @@ fn execute_trigger_inner(
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
+            // TRON caps VM memory at java's `EnergyCost.MEM_LIMIT` (3 MiB);
+            // exceeding it yields MemoryLimitOOG — all energy consumed — matching
+            // java's OutOfMemoryException → spendAllEnergy. revm's default is
+            // ~4 GiB, so without this a >3 MiB-memory tx with a large feeLimit
+            // would SUCCEED here while java faults (a contractRet flip).
+            cfg.memory_limit = 3 * 1024 * 1024;
             // TRON fork: the opcode set comes from `spec` (proposal-resolved),
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
@@ -739,6 +745,12 @@ fn execute_trigger_inner_with_tracer(
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
+            // TRON caps VM memory at java's `EnergyCost.MEM_LIMIT` (3 MiB);
+            // exceeding it yields MemoryLimitOOG — all energy consumed — matching
+            // java's OutOfMemoryException → spendAllEnergy. revm's default is
+            // ~4 GiB, so without this a >3 MiB-memory tx with a large feeLimit
+            // would SUCCEED here while java faults (a contractRet flip).
+            cfg.memory_limit = 3 * 1024 * 1024;
             // TRON fork: the opcode set comes from `spec` (proposal-resolved),
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.
@@ -1168,6 +1180,12 @@ pub fn execute_create_with_trace(
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
             cfg.spec = spec;
+            // TRON caps VM memory at java's `EnergyCost.MEM_LIMIT` (3 MiB);
+            // exceeding it yields MemoryLimitOOG — all energy consumed — matching
+            // java's OutOfMemoryException → spendAllEnergy. revm's default is
+            // ~4 GiB, so without this a >3 MiB-memory tx with a large feeLimit
+            // would SUCCEED here while java faults (a contractRet flip).
+            cfg.memory_limit = 3 * 1024 * 1024;
             // TRON fork: the opcode set comes from `spec` (proposal-resolved),
             // but the *energy* schedule is TRON's Frontier-era table with a
             // Frontier-pinned gas spec. Keep the two decoupled.

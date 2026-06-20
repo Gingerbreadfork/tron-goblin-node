@@ -112,7 +112,7 @@ serde_json = "1"
 # TRON-specific bits (precompiles, CALLTOKEN) bolt on via revm's extension
 # points. `default-features = false` strips pieces we don't need
 # (KZG blobs, BLS) and uses a pure-Rust secp256k1.
-revm = { version = "40", default-features = false, features = ["std", "portable"] }
+revm = { version = "40", default-features = false, features = ["std", "portable", "memory_limit"] }
 # Ethereum-compatible Merkle-Patricia Trie. Used for accountStateRoot
 # computation (TRON inherits MPT semantics from Ethereum).
 eth_trie = "0.6"
