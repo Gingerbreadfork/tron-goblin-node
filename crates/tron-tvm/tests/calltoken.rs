@@ -247,6 +247,81 @@ fn calltoken_transfers_trc10_and_callee_reads_token_data() {
     );
 }
 
+/// CALL-F7b: a CALLTOKEN whose caller lacks the TRC-10 balance must SKIP the
+/// callee and push 0 (java `Program.callToAddress`: stackPushZero +
+/// refundEnergy + return) — NOT run the callee with no transfer. We assert the
+/// callee never executed (its storage writes are absent) and no token moved.
+#[test]
+fn calltoken_insufficient_token_balance_skips_callee() {
+    let stores = fresh_stores();
+    let token_id = 1_000_001i64;
+    let transfer_amount = 250i64;
+    let caller_balance = transfer_amount - 1; // one short
+
+    let caller_user = tron_addr(0xa0);
+    let caller_contract = tron_addr(0xc0);
+    let receiver_contract = tron_addr(0xc1);
+
+    let acct = Account {
+        address: caller_user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    stores.accounts.put(&Address::from_raw(caller_user), &acct).unwrap();
+
+    install_contract_with_balance(
+        &stores,
+        caller_contract,
+        &build_calltoken_caller(receiver_contract, token_id, transfer_amount),
+        token_id,
+        caller_balance,
+    );
+    install_contract_with_balance(&stores, receiver_contract, &build_calltoken_receiver(), 0, 0);
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: caller_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger,
+        500_000,
+    );
+    // The caller STOPs after CALLTOKEN (ignoring its 0 return), so the tx
+    // itself succeeds; the point is the callee was skipped.
+    match outcome {
+        VmOutcome::Success { .. } => {}
+        other => panic!("expected Success, got {other:?}"),
+    }
+
+    // Callee never ran → its storage slots were never written.
+    let slot0_key = StorageRowStore::compose_key(&Address::from_raw(receiver_contract), &[0u8; 32]);
+    assert!(
+        stores.storage.get(&slot0_key).unwrap().is_none(),
+        "callee must NOT have executed (no CALLTOKENVALUE SSTORE)"
+    );
+    // No token moved: caller still holds its (insufficient) balance, receiver none.
+    let caller_acct =
+        stores.accounts.get(&Address::from_raw(caller_contract)).unwrap().unwrap();
+    assert_eq!(
+        caller_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(caller_balance),
+        "caller's TRC-10 balance must be unchanged"
+    );
+    let receiver_acct =
+        stores.accounts.get(&Address::from_raw(receiver_contract)).unwrap().unwrap();
+    assert_eq!(
+        receiver_acct.asset_v2.get(&token_id.to_string()).copied(),
+        None,
+        "receiver must not have been credited"
+    );
+}
+
 /// Regression: a CALLTOKEN callee must see native CALLVALUE (`msg.value`) == 0.
 /// The old code popped a phantom `callValue` operand and passed the TRC-10
 /// token amount as the native call-value, so a callee guarded by

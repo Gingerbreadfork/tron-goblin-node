@@ -685,14 +685,35 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         let caller_pre = caller_account.asset_v2.get(&token_id_key).copied();
         let target_pre = target_account.asset_v2.get(&token_id_key).copied();
 
-        // Insufficient balance → push None, return None to let revm run
-        // the call without the side effect. The opcode itself doesn't
-        // signal a stack-side error here; the contract typically checks
-        // its own balance via TOKENBALANCE first.
+        // Insufficient TRC-10 balance → java `Program.callToAddress` does
+        // `stackPushZero(); refundEnergy(msg.getEnergy()); return;`: the
+        // callee never runs, the CALL pushes 0 (failure), and the full
+        // forwarded energy is refunded. Short-circuit the frame by returning
+        // a CallOutcome rather than `None` (which would let revm execute the
+        // callee with no transfer). Push `None` to `pending` first so the
+        // unconditional `pending.pop()` in `call_end` stays balanced.
+        //
+        // `Revert` makes `insert_call_outcome` push 0 on the stack
+        // (`is_ok()` is false) while still refunding the unspent gas
+        // (`is_ok_or_revert()` is true → `gas.erase_cost(remaining)`).
+        // Sizing the gas as `make_call_frame` would for this child —
+        // regular = gas_limit, reservoir = inputs.reservoir, nothing spent —
+        // refunds the full forwarded energy and preserves the reservoir.
         let caller_balance = caller_pre.unwrap_or(0);
         if caller_balance < transferred {
             self.pending.push(None);
-            return None;
+            let gas = revm::interpreter::Gas::new_with_regular_gas_and_reservoir(
+                inputs.gas_limit,
+                inputs.reservoir,
+            );
+            return Some(CallOutcome::new(
+                revm::interpreter::InterpreterResult {
+                    result: InstructionResult::Revert,
+                    output: revm::primitives::Bytes::new(),
+                    gas,
+                },
+                inputs.return_memory_offset.clone(),
+            ));
         }
 
         // Apply transfer.
