@@ -258,10 +258,23 @@ pub fn apply_maintenance(
     dyn_props: &DynamicPropertiesStore,
 ) -> Result<MaintenanceOutcome, tron_chainbase::StoreError> {
     let allow_change_delegation = dyn_props.allow_change_delegation();
+    // java `MaintenanceManager.doMaintenance` gates Vi accumulation on
+    // `useNewRewardAlgorithm()` (NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE set by
+    // proposal 59/67), NOT `allowChangeDelegation`. The two coincide on a
+    // long-active mainnet but diverge in the window between the two flags'
+    // activations on a from-genesis re-sync, where gating on the wrong flag
+    // would accumulate per-cycle Vi values java never wrote (perturbing
+    // new-algorithm rewards for voters whose window spans the switch). The
+    // cycle-advance/brokerage snapshot below stays on `allowChangeDelegation`,
+    // matching java line 151.
+    let use_new_reward_algorithm = dyn_props
+        .get_long(b"NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE")
+        .unwrap_or(i64::MAX)
+        != i64::MAX;
     let mut vi_accumulated_count = 0usize;
 
     // ── Step 1: Vi accumulation against the JUST-ENDED cycle's reward pool.
-    if allow_change_delegation {
+    if use_new_reward_algorithm {
         let cur_cycle = dyn_props.current_cycle_number();
         for (addr, witness) in witnesses.all()? {
             accumulate_witness_vi(delegation, cur_cycle, &addr, witness.vote_count);
