@@ -555,8 +555,10 @@ GET /v1/accounts/{address}/transactions/trc20       — TRC20 transfers
 GET /v1/accounts/{address}/transactions/trc721      — NFT transfers (extension)
 GET /v1/accounts/{address}/transactions/internal    — internal txs (extension)
 GET /v1/contracts/{address}/events                  — event search (scope = "all")
-GET /v1/archive/account?address=…&block=H           — state at height H
-GET /v1/archive/accountresource?address=…&block=H
+GET /v1/archive/account?address=…&block=H           — account state at height H
+GET /v1/archive/accountresource?address=…&block=H   — bandwidth/energy at height H
+GET /v1/archive/storage?address=…&slot=…&block=H    — contract storage slot at height H
+GET /v1/archive/coverage                            — archive's covered block range
 POST /v1/archive/triggerconstantcontract            — constant call at height H
 GET /v1/commitment/root                             — current state root + height
 GET /v1/commitment/status                           — committed/head heights, lag
