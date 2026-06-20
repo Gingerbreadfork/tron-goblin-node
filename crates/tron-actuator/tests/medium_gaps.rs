@@ -501,6 +501,30 @@ fn withdraw_rejects_no_allowance() {
 }
 
 #[test]
+fn withdraw_rejects_genesis_guard_representative() {
+    // java WithdrawBalanceActuator.validate rejects any genesis guard
+    // representative even with a positive allowance ("is a guard
+    // representative and is not allowed to withdraw Balance"). Without the
+    // guard a GR's WithdrawBalance would SUCCEED and fork from java's FAILED.
+    let gr = tron_types::mainnet_witnesses()[0].address;
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_latest_block_header_timestamp(1_700_000_000);
+    let acct = Account {
+        address: gr.to_vec(),
+        r#type: AccountType::Normal as i32,
+        allowance: 1_000_000, // would otherwise clear the allowance gate
+        ..Default::default()
+    };
+    accounts.put(&addr(gr), &acct).unwrap();
+    let c = WithdrawBalanceContract { owner_address: gr.to_vec() };
+    let delegation = DelegationStore::new(mem());
+    let err =
+        witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap_err();
+    assert!(matches!(err, ActuatorError::GuardRepresentativeWithdraw));
+}
+
+#[test]
 fn withdraw_rejects_too_soon_after_previous() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());

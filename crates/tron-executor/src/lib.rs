@@ -2744,10 +2744,16 @@ fn execute_block_logic(
                 }
             }
         }
-        // Always advance next_maintenance_time past this block.
+        // Always advance next_maintenance_time past this block. java's
+        // `updateNextMaintenanceTime` feeds `getNextMaintenanceTime()` (our
+        // `next_maintenance`) verbatim, NOT max'd with the block time: the
+        // result must stay on the interval grid anchored at the genesis seed.
+        // Substituting the block time (e.g. when the boundary slot was skipped
+        // and `raw.timestamp > next_maintenance`) shifts the anchor off-grid
+        // permanently, so subsequent boundaries fire at the wrong heights.
         let new_next = tron_consensus::compute_next_maintenance_time(
             raw.timestamp,
-            next_maintenance.max(raw.timestamp), // first-time init
+            next_maintenance,
             maintenance_interval,
         );
         dp.save_next_maintenance_time(new_next);

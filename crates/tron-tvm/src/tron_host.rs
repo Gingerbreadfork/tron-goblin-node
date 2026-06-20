@@ -862,6 +862,17 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
+        // java `WithdrawRewardProcessor.validate`: a genesis guard
+        // representative may not withdraw — validate throws, so the opcode
+        // fails before any settle/drain. Return 0 (failure) without mutating,
+        // matching java; the handler comment below notes this is the opcode's
+        // only validate gate.
+        if tron_types::mainnet_witnesses()
+            .iter()
+            .any(|w| &w.address == owner.as_bytes())
+        {
+            return 0;
+        }
         // java's TVM `WithdrawRewardProcessor.execute` settles pending
         // voter rewards into `allowance` first (`VoteRewardUtil
         // .withdrawReward`, gated on ALLOW_TVM_VOTE), then drains the

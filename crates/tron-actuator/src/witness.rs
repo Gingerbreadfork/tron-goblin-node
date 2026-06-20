@@ -179,6 +179,18 @@ pub fn validate_withdraw_balance(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
 
+    // java WithdrawBalanceActuator.validate: a genesis guard representative
+    // (any witness in the genesis block's witness list) is not allowed to
+    // withdraw — the actuator throws, so the tx FAILs. Without this guard a
+    // GR's WithdrawBalance SUCCEEDs (allowance → balance) and silently forks
+    // from java's recorded FAILED result.
+    if tron_types::mainnet_witnesses()
+        .iter()
+        .any(|w| &w.address == owner.as_bytes())
+    {
+        return Err(ActuatorError::GuardRepresentativeWithdraw);
+    }
+
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let ready_at = account.latest_withdraw_time + WITNESS_ALLOWANCE_FROZEN_TIME_MS;
     if account.latest_withdraw_time > 0 && now < ready_at {

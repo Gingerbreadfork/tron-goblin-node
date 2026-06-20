@@ -748,7 +748,7 @@ fn try_use_free_net(
     // recorded usage by up to 1 byte on ~2.4% of free-net charges, always
     // upward. Because `free_net_usage` is persisted and free-net consumption
     // burns no TRX (invisible to fee accounting), that drift accumulates
-    // silently until a free-net-only account near its 600-byte daily cap is
+    // silently until a free-net-only account near its 5000-byte daily cap is
     // wrongly rejected for "insufficient bandwidth". Every other quota path here
     // already grows from the decayed value at `now` (`try_use_account_net`, the
     // asset path, and `final_pub` immediately below).

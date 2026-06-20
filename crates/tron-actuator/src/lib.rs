@@ -98,6 +98,8 @@ pub enum ActuatorError {
     NoAllowance,
     #[error("withdrawal too soon: must wait until {ready_at} (now {now})")]
     WithdrawTooSoon { ready_at: i64, now: i64 },
+    #[error("account is a guard representative and is not allowed to withdraw balance")]
+    GuardRepresentativeWithdraw,
 
     // --- Account --------------------------------------------------------
     #[error("invalid account name")]
