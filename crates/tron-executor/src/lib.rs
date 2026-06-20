@@ -4132,16 +4132,16 @@ fn execute_vm_tx(
                 actuator_fee: 0,
             }
         }
-        tron_tvm::execute::VmOutcome::Halt { reason, .. } => {
+        tron_tvm::execute::VmOutcome::Halt { reason, result, .. } => {
             iso.commit()
                 .expect("db error in execute_vm_tx: commit flush failed on VM Halt");
-            // The reason is revm's `HaltReason` Debug form; OutOfGas
-            // maps onto TRON's OUT_OF_ENERGY, the rest are UNKNOWN.
-            receipt.result = if reason.contains("OutOfGas") {
-                tron_proto::transaction::result::ContractResult::OutOfEnergy as i32
-            } else {
-                tron_proto::transaction::result::ContractResult::Unknown as i32
-            };
+            // `result` is the structured java-tron `contractResult` the TVM
+            // mapped from revm's `HaltReason` at the halt site
+            // (`RuntimeImpl.setResultCode` parity) — OUT_OF_ENERGY /
+            // ILLEGAL_OPERATION / BAD_JUMP_DESTINATION / STACK_TOO_SMALL /
+            // STACK_TOO_LARGE / PRECOMPILED_CONTRACT / INVALID_CODE, or
+            // UNKNOWN for halts java has no dedicated code for.
+            receipt.result = result as i32;
             TxResult {
                 tx_id,
                 contract_type: Some(ty),

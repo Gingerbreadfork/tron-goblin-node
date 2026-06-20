@@ -14,13 +14,16 @@
 //!    on success.
 //! 4. Returns a [`VmOutcome`] describing what happened.
 //!
-//! **Out of scope for Phase 2** (deferred to a follow-up session):
-//! * `CALLTOKEN` opcode — needs an `EthInstructions` extension. Until
-//!   then, contracts that use `call_token_value` / `token_id` will run
-//!   *as if those fields were zero* — the TRC-10 transfer doesn't fire.
-//!   Returns [`VmOutcome::CallTokenIgnored`] when the fields are
-//!   non-zero so the caller can reject the tx rather than silently
-//!   diverging from java-tron.
+//! **Top-level TRC-10 transfers.** A `call_token_value` / `token_id`-bearing
+//! `TriggerSmartContract` or `CreateSmartContract` moves the TRC-10 from the
+//! caller to the target (the called contract, or the new contract address for
+//! a deploy) before the EVM runs, gated on `allowTvmTransferTrc10`, and
+//! reverses it if the frame fails — mirroring java's `VMActuator.call()` /
+//! `.create()` plus the `CALLTOKENVALUE` / `CALLTOKENID` opcode invoke.
+//! `VmOutcome::CallTokenIgnored` is retained only for its non-VM RPC
+//! consumers; the VM entry points no longer emit it.
+//!
+//! **Out of scope** (deferred):
 //! * `feeLimit` → revm `gas_limit` conversion. java-tron's `feeLimit`
 //!   is denominated in sun, with `gas_limit = feeLimit / energyFee`.
 //!   We pass the supplied `energy_limit` through directly.
@@ -28,7 +31,7 @@
 use std::sync::Arc;
 
 use revm::context::{Context, Evm, FrameStack, TxEnv};
-use revm::context_interface::result::ExecutionResult;
+use revm::context_interface::result::{ExecutionResult, HaltReason};
 use revm::handler::instructions::EthInstructions;
 use revm::inspector::InspectCommitEvm;
 use revm::interpreter::interpreter::EthInterpreter;
@@ -57,6 +60,48 @@ const BLACKHOLE_EVM_ADDRESS: [u8; 20] = [
 
 fn dynamic_energy_active(dyn_props: &DynamicPropertiesStore) -> bool {
     dyn_props.get_long(b"ALLOW_DYNAMIC_ENERGY").unwrap_or(0) == 1
+}
+
+/// Map a revm [`HaltReason`] to the java-tron `contractResult` code.
+///
+/// Mirrors `RuntimeImpl.setResultCode` (framework
+/// `common/runtime/RuntimeImpl.java`): each VM exception maps to a specific
+/// `contractResult`, and anything unrecognised falls through to `UNKNOWN`.
+/// The success/revert/out-of-time cases are handled before the VM produces a
+/// `Halt`, so they are not represented here.
+///
+/// revm's halt taxonomy is finer-grained than java's exception hierarchy, so
+/// several revm halts that java has no dedicated exception for (out-of-offset
+/// RETURNDATACOPY, static-call state changes, disallowed calls, create
+/// collisions, etc.) map to `UNKNOWN`, exactly as java leaves them.
+fn halt_reason_to_contract_result(
+    reason: &HaltReason,
+) -> tron_proto::transaction::result::ContractResult {
+    use tron_proto::transaction::result::ContractResult;
+    match reason {
+        // `OutOfEnergyException` → OUT_OF_ENERGY. Every OOG sub-kind (basic,
+        // memory, memory-limit, precompile, invalid-operand, reentrancy
+        // sentry) is the same TRON energy fault — matching the prior
+        // `reason.contains("OutOfGas")` string test this replaces.
+        HaltReason::OutOfGas(_) => ContractResult::OutOfEnergy,
+        // `IllegalOperationException` — unknown / disabled opcode (revm's
+        // 0xFE designated-invalid is the same fault class in java).
+        HaltReason::OpcodeNotFound | HaltReason::InvalidFEOpcode => {
+            ContractResult::IllegalOperation
+        }
+        // `BadJumpDestinationException`.
+        HaltReason::InvalidJump => ContractResult::BadJumpDestination,
+        // `StackTooSmallException` (pop from empty stack).
+        HaltReason::StackUnderflow => ContractResult::StackTooSmall,
+        // `StackTooLargeException` (push past the 1024-deep limit).
+        HaltReason::StackOverflow => ContractResult::StackTooLarge,
+        // `PrecompiledContractException`.
+        HaltReason::PrecompileError | HaltReason::PrecompileErrorWithContext(_) => {
+            ContractResult::PrecompiledContract
+        }
+        // Everything else java has no dedicated code for → UNKNOWN.
+        _ => ContractResult::Unknown,
+    }
 }
 
 /// Borrowed (or `Arc`'d) handles to every store the EVM needs to see.
@@ -149,14 +194,23 @@ pub enum VmOutcome {
     },
     /// Halted (OOG, invalid opcode, etc.). All energy spent.
     Halt {
+        /// Human-readable halt reason (revm `HaltReason` `Debug`/`Display`
+        /// form, or a manual CREATE-failure message). Surfaced in RPC/gRPC
+        /// error messages; NOT consensus-relevant.
         reason: String,
+        /// java-tron `contractResult` code for this halt, mapped from the
+        /// structured revm `HaltReason` at the site the halt is known
+        /// (`RuntimeImpl.setResultCode`). Carried here so the executor
+        /// records the precise code instead of string-matching `reason`.
+        result: tron_proto::transaction::result::ContractResult,
         energy_used: u64,
     },
-    /// The contract requested a TRC-10 transfer via `call_token_value` /
-    /// `token_id` — that's the `CALLTOKEN` opcode path, which isn't
-    /// implemented yet (Phase-2 follow-up). The transaction must be
-    /// rejected at the executor level rather than executed without the
-    /// transfer (which would diverge from java-tron).
+    /// Retained for non-VM RPC consumers (`trigger`/`call` previews in
+    /// `tron-grpc` / `tron-rpc`) that still match on it. The VM entry
+    /// points NO LONGER emit this: top-level token-funded
+    /// `TriggerSmartContract` and `CreateSmartContract` now perform the
+    /// TRC-10 transfer and execute (java parity), so a token-bearing tx
+    /// runs rather than being rejected.
     CallTokenIgnored {
         token_id: i64,
         call_token_value: i64,
@@ -622,6 +676,7 @@ fn execute_trigger_inner(
             } else {
                 VmOutcome::Halt {
                     reason: format!("{reason:?}"),
+                    result: halt_reason_to_contract_result(&reason),
                     energy_used: gas.tx_gas_used(),
                 }
             }
@@ -912,6 +967,7 @@ fn execute_trigger_inner_with_tracer(
             } else {
                 VmOutcome::Halt {
                     reason: format!("{reason:?}"),
+                    result: halt_reason_to_contract_result(&reason),
                     energy_used: gas.tx_gas_used(),
                 }
             }
@@ -1010,6 +1066,33 @@ fn apply_top_level_trc10(
     Ok(())
 }
 
+/// Reverse a token-funded deploy's up-front TRC-10 transfer (credit the
+/// caller, debit the new contract address) when the deploy fails before
+/// committing. Mirrors the trigger path's `unwind_on_failure`: java's
+/// reverted `rootRepository` deposit never reaches `commit()`, so the
+/// transfer must not persist. No-op when no transfer was applied
+/// (`token` is `None`, or its value is `0`). Errors are swallowed — the
+/// caller is already on a failure path and the per-tx session will be
+/// discarded on the consensus path.
+fn unwind_create_token(
+    stores: &VmStores,
+    contract: &CreateSmartContract,
+    contract_addr: &[u8],
+    token: Option<(i64, i64)>,
+) {
+    if let Some((id, val)) = token {
+        // `apply_top_level_trc10` returns early when `val == 0`, so the
+        // id-only case (token_value == 0) is a harmless no-op here.
+        let _ = apply_top_level_trc10(
+            &stores.accounts,
+            contract_addr,
+            &contract.owner_address,
+            id,
+            val,
+        );
+    }
+}
+
 /// Derive a top-level `CreateSmartContract`'s contract address.
 ///
 /// java-tron `WalletUtil.generateContractAddress(Transaction)`:
@@ -1071,18 +1154,6 @@ pub fn execute_create_with_trace(
     tx_id: &[u8; 32],
     energy_limit: u64,
 ) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
-    // Reject CALLTOKEN-on-CREATE for symmetry with execute_trigger.
-    if contract.call_token_value != 0 || contract.token_id != 0 {
-        return (
-            VmOutcome::CallTokenIgnored {
-                token_id: contract.token_id,
-                call_token_value: contract.call_token_value,
-            },
-            Vec::new(),
-            0,
-        );
-    }
-
     let Some(smart_contract) = &contract.new_contract else {
         return (
             VmOutcome::PreflightError("CreateSmartContract.new_contract missing".to_string()),
@@ -1183,6 +1254,60 @@ pub fn execute_create_with_trace(
     let proposals = crate::proposals::ProposalSet::from_store(&stores.dynamic_properties);
     let spec = proposals.resolve_spec();
     let chain_id = tron_chain_id(stores);
+
+    // Top-level token-funded deploy: java VMActuator.create() reads
+    // `tokenValue`/`tokenId` from the contract ONLY when
+    // `allowTvmTransferTrc10()` is active (lines 358-361), and then transfers
+    // the TRC-10 from the caller to the NEW contract address
+    // (`MUtil.transferToken`, lines 441-443) before init code runs. When the
+    // flag is OFF the values stay 0 — the deploy proceeds with NO token move
+    // and is NOT rejected. We mirror that: the debit/credit happens here,
+    // after the contract account is pre-installed (so the credit lands on the
+    // real account row, not a row the pre-install would overwrite) and before
+    // the EVM runs; on a failed deploy it is reversed alongside the
+    // pre-installed account cleanup. `with_top_level_token` (below) feeds the
+    // same numbers to the init code's CALLTOKENVALUE / CALLTOKENID opcodes,
+    // matching java's `createProgramInvoke(..., tokenValue, tokenId, ...)`.
+    let top_level_token: Option<(i64, i64)> = if proposals.allow_tvm_transfer_trc10
+        && (contract.call_token_value != 0 || contract.token_id != 0)
+    {
+        if contract.token_id <= 0 || contract.call_token_value < 0 {
+            // java `checkTokenValueAndId`: tokenValue > 0 with tokenId == 0
+            // (or a non-positive id) is a ContractValidateException. Clean up
+            // the pre-installed account so a rejected deploy leaves no trace.
+            let _ = stores.accounts.delete(&tron_contract_addr);
+            return (
+                VmOutcome::PreflightError(format!(
+                    "invalid TRC-10 top-level token on CREATE (id={}, value={})",
+                    contract.token_id, contract.call_token_value
+                )),
+                Vec::new(),
+                0,
+            );
+        }
+        if contract.call_token_value > 0 {
+            match apply_top_level_trc10(
+                &stores.accounts,
+                &contract.owner_address,
+                tron_contract_addr.as_bytes(),
+                contract.token_id,
+                contract.call_token_value,
+            ) {
+                Ok(_) => Some((contract.token_id, contract.call_token_value)),
+                Err(e) => {
+                    let _ = stores.accounts.delete(&tron_contract_addr);
+                    return (VmOutcome::PreflightError(e), Vec::new(), 0);
+                }
+            }
+        } else {
+            // tokenValue == 0 (tokenId may be set): no transfer, but the
+            // opcodes still see the id (java passes both into the invoke).
+            Some((contract.token_id, contract.call_token_value))
+        }
+    } else {
+        None
+    };
+
     let mut ctx = Context::mainnet()
         .with_db(tron_db)
         .modify_cfg_chained(|cfg| {
@@ -1262,6 +1387,13 @@ pub fn execute_create_with_trace(
         stores.votes.as_ref().map(Arc::clone),
         Arc::clone(&stores.delegated_resources),
     );
+    // Feed a token-funded deploy's (token_id, token_value) into the init
+    // code's CALLTOKENVALUE / CALLTOKENID opcodes (the asset_v2 transfer was
+    // already applied above), matching java's
+    // `createProgramInvoke(..., tokenValue, tokenId, ...)`.
+    if let Some((id, val)) = top_level_token {
+        trc10 = trc10.with_top_level_token(id, val);
+    }
     // TRON SELFDESTRUCT semantics: the journal's destroy rule follows
     // proposal #94 (not the Cancun opcode spec), and a self-target
     // destroy credits the burn account when TRC-10 transfers are live.
@@ -1293,6 +1425,12 @@ pub fn execute_create_with_trace(
     {
         Ok(tx) => tx,
         Err(e) => {
+            // TxEnv build failure: reverse the up-front TRC-10 transfer so the
+            // caller's asset_v2 is restored (the VM never ran). The pre-
+            // installed account is left as-is, matching the prior (token-free)
+            // failure behaviour — on the consensus path the per-tx session is
+            // reverted, discarding it.
+            unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
             return (
                 VmOutcome::PreflightError(format!("TxEnv build: {e:?}")),
                 Vec::new(),
@@ -1304,6 +1442,7 @@ pub fn execute_create_with_trace(
     let exec = match evm.inspect_tx_commit(tx) {
         Ok(r) => r,
         Err(e) => {
+            unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
             let energy_penalty = evm.inspector.energy_penalty_total();
             let traces = evm.inspector.into_internal_txs();
             return (VmOutcome::PreflightError(format!("{e:?}")), traces, energy_penalty);
@@ -1333,6 +1472,11 @@ pub fn execute_create_with_trace(
             let ef_invalid =
                 proposals.allow_tvm_london && runtime_code.first() == Some(&0xEF);
             if total_with_deposit > energy_limit || ef_invalid {
+                // Reverse the up-front TRC-10 transfer (restore the caller's
+                // asset_v2) before dropping the pre-installed account, so a
+                // failed deploy moves no token — matching java's discarded
+                // rootRepository deposit.
+                unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
                 stores
                     .accounts
                     .delete(&tron_contract_addr)
@@ -1349,6 +1493,15 @@ pub fn execute_create_with_trace(
                             already_used,
                             energy_limit
                         )
+                    },
+                    // java VMActuator: the EF-prefixed runtime throws
+                    // `InvalidCodeException` (line ~204-207) → INVALID_CODE; the
+                    // code-deposit shortfall throws `notEnoughSpendEnergy`
+                    // (line ~209-216) → OUT_OF_ENERGY.
+                    result: if ef_invalid {
+                        tron_proto::transaction::result::ContractResult::InvalidCode
+                    } else {
+                        tron_proto::transaction::result::ContractResult::OutOfEnergy
                     },
                     energy_used: energy_limit,
                 }
@@ -1417,8 +1570,9 @@ pub fn execute_create_with_trace(
             }
         }
         ExecutionResult::Revert { output, gas, .. } => {
-            // Init code reverted — clean up the pre-installed Account
-            // so deployment doesn't leak.
+            // Init code reverted — reverse the up-front TRC-10 transfer and
+            // clean up the pre-installed Account so deployment doesn't leak.
+            unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
             stores
                 .accounts
                 .delete(&tron_contract_addr)
@@ -1429,12 +1583,14 @@ pub fn execute_create_with_trace(
             }
         }
         ExecutionResult::Halt { reason, gas, .. } => {
+            unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
             stores
                 .accounts
                 .delete(&tron_contract_addr)
                 .expect("db error in execute_create cleaning up after Halt");
             VmOutcome::Halt {
                 reason: format!("{reason:?}"),
+                result: halt_reason_to_contract_result(&reason),
                 energy_used: gas.tx_gas_used(),
             }
         }
@@ -1467,6 +1623,91 @@ fn parse_tron_address_to_evm(raw: &[u8]) -> Result<EvmAddress, String> {
 #[allow(dead_code)]
 fn _evm_addr_dance(a: EvmAddress) -> tron_crypto::address::Address {
     evm_to_tron_address(&a)
+}
+
+#[cfg(test)]
+mod halt_result_tests {
+    use super::halt_reason_to_contract_result;
+    use revm::context_interface::result::{HaltReason, OutOfGasError};
+    use tron_proto::transaction::result::ContractResult;
+
+    /// `RuntimeImpl.setResultCode` parity: every revm `HaltReason` must map to
+    /// java-tron's specific `contractResult`, and unmapped halts to UNKNOWN.
+    #[test]
+    fn maps_each_halt_to_javas_contract_result() {
+        // OutOfGas (all sub-kinds) → OUT_OF_ENERGY (OutOfEnergyException).
+        for oog in [
+            OutOfGasError::Basic,
+            OutOfGasError::Memory,
+            OutOfGasError::MemoryLimit,
+            OutOfGasError::Precompile,
+            OutOfGasError::InvalidOperand,
+            OutOfGasError::ReentrancySentry,
+        ] {
+            assert_eq!(
+                halt_reason_to_contract_result(&HaltReason::OutOfGas(oog)),
+                ContractResult::OutOfEnergy,
+                "OutOfGas({oog:?}) must map to OUT_OF_ENERGY"
+            );
+        }
+
+        // Unknown / disabled / designated-invalid opcode → ILLEGAL_OPERATION.
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::OpcodeNotFound),
+            ContractResult::IllegalOperation
+        );
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::InvalidFEOpcode),
+            ContractResult::IllegalOperation
+        );
+
+        // Jump / stack faults.
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::InvalidJump),
+            ContractResult::BadJumpDestination
+        );
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::StackUnderflow),
+            ContractResult::StackTooSmall
+        );
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::StackOverflow),
+            ContractResult::StackTooLarge
+        );
+
+        // Precompile faults (unit + with-context) → PRECOMPILED_CONTRACT.
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::PrecompileError),
+            ContractResult::PrecompiledContract
+        );
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::PrecompileErrorWithContext(
+                "boom".to_string()
+            )),
+            ContractResult::PrecompiledContract
+        );
+
+        // Anything java has no dedicated code for → UNKNOWN (java fall-through).
+        for unmapped in [
+            HaltReason::OutOfOffset,
+            HaltReason::StateChangeDuringStaticCall,
+            HaltReason::CallNotAllowedInsideStatic,
+            HaltReason::CreateCollision,
+            HaltReason::NonceOverflow,
+            HaltReason::CreateContractSizeLimit,
+            HaltReason::CreateInitCodeSizeLimit,
+            HaltReason::NotActivated,
+            HaltReason::OverflowPayment,
+            HaltReason::OutOfFunds,
+            HaltReason::CallTooDeep,
+        ] {
+            assert_eq!(
+                halt_reason_to_contract_result(&unmapped),
+                ContractResult::Unknown,
+                "{unmapped:?} must fall through to UNKNOWN"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

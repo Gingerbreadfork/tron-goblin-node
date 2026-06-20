@@ -332,8 +332,15 @@ fn execute_create_rejects_eip3541_ef_runtime_when_london_active() {
     // The deploy must FAIL (a SUCCESS here would be the tripwire-poisoning
     // flip). The control case (a non-0xEF runtime) deploys as Success in
     // execute_create_deploys_contract_at_tron_derived_address.
+    // java VMActuator throws InvalidCodeException → contractResult INVALID_CODE.
     match outcome {
-        VmOutcome::Halt { .. } => {}
+        VmOutcome::Halt { result, .. } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::InvalidCode,
+                "EIP-3541 EF-prefixed runtime must record INVALID_CODE"
+            );
+        }
         other => panic!("expected Halt (EIP-3541 reject), got {other:?}"),
     }
 }
@@ -457,10 +464,16 @@ fn execute_create_halts_when_code_deposit_charge_exceeds_budget() {
         30_000,
     );
     match outcome {
-        VmOutcome::Halt { reason, .. } => {
+        VmOutcome::Halt { reason, result, .. } => {
             assert!(
                 reason.contains("code-deposit"),
                 "expected code-deposit OOG, got: {reason}"
+            );
+            // java VMActuator's notEnoughSpendEnergy path → OUT_OF_ENERGY.
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::OutOfEnergy,
+                "code-deposit shortfall must record OUT_OF_ENERGY"
             );
         }
         other => panic!("expected Halt for code-deposit OOG, got {other:?}"),
@@ -894,5 +907,234 @@ fn staking_opcode_shifts_following_nested_create_address() {
     assert!(
         stores.accounts.get(&child_n0).unwrap().is_none(),
         "child must NOT be at the nonce=0 address"
+    );
+}
+
+/// Init code that RETURNs the 1-byte `[0x00]` (STOP) runtime: PUSH1 1, PUSH1 0,
+/// RETURN reads mem[0..1] (zero) → runtime `[0x00]`.
+fn trivial_stop_init_code() -> Vec<u8> {
+    vec![0x60, 0x01, 0x60, 0x00, 0xf3]
+}
+
+/// java VMActuator.create(): a token-funded `CreateSmartContract`
+/// (`allowTvmTransferTrc10` ON, tokenValue > 0, valid tokenId) must DEPLOY
+/// (contractRet SUCCESS), transferring the TRC-10 from the caller to the NEW
+/// contract address (`MUtil.transferToken`). Before the fix the create path
+/// returned `CallTokenIgnored` → the executor flipped SUCCESS→FAILED and the
+/// TRC-10 credit was lost.
+#[test]
+fn token_funded_create_deploys_and_moves_trc10_when_flag_on() {
+    let stores = fresh_stores_with_contracts();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
+
+    const TOKEN_ID: i64 = 1_000_001;
+    const TOKEN_VALUE: i64 = 5_000;
+    let token_key = TOKEN_ID.to_string();
+
+    // Owner with TRX balance AND a TRC-10 (asset_v2) balance to fund the deploy.
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xd0);
+    let owner = Address::from_raw(owner_bytes);
+    let mut owner_acct = Account {
+        address: owner.as_bytes().to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    owner_acct.asset_v2.insert(token_key.clone(), 12_000);
+    stores.accounts.put(&owner, &owner_acct).unwrap();
+
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            bytecode: trivial_stop_init_code(),
+            consume_user_resource_percent: 100,
+            origin_energy_limit: 1_000_000,
+            name: "TokenFunded".into(),
+            abi: Some(Abi::default()),
+            ..Default::default()
+        }),
+        call_token_value: TOKEN_VALUE,
+        token_id: TOKEN_ID,
+    };
+
+    let tx_id = [0x11; 32];
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &create,
+        &tx_id,
+        500_000,
+    );
+    let addr_bytes = match outcome {
+        VmOutcome::Success { return_data, .. } => return_data,
+        other => panic!("expected Success for token-funded deploy, got {other:?}"),
+    };
+    assert_eq!(addr_bytes.len(), 21);
+    let mut a = [0u8; 21];
+    a.copy_from_slice(&addr_bytes);
+    let contract_addr = Address::from_raw(a);
+    assert_eq!(
+        a,
+        tron_tvm::execute::derive_top_level_contract_address(&tx_id, &owner_bytes)
+    );
+
+    // Caller debited by exactly TOKEN_VALUE.
+    let owner_after = stores.accounts.get(&owner).unwrap().unwrap();
+    assert_eq!(
+        *owner_after.asset_v2.get(&token_key).unwrap_or(&0),
+        12_000 - TOKEN_VALUE,
+        "caller's TRC-10 must be debited by the deploy endowment"
+    );
+
+    // New contract address credited the TRC-10 amount AND deployed (Contract).
+    let contract_acct = stores.accounts.get(&contract_addr).unwrap().unwrap();
+    assert_eq!(
+        *contract_acct.asset_v2.get(&token_key).unwrap_or(&0),
+        TOKEN_VALUE,
+        "new contract address must be credited the TRC-10 endowment"
+    );
+    assert_eq!(contract_acct.r#type, tron_proto::AccountType::Contract as i32);
+    assert_eq!(contract_acct.code, vec![0x00]);
+}
+
+/// java VMActuator.create() flag-off path: when `allowTvmTransferTrc10` is OFF,
+/// `tokenValue`/`tokenId` are forced to 0, so a token-bearing deploy still
+/// SUCCEEDS but moves NO TRC-10 (and is NOT rejected).
+#[test]
+fn token_funded_create_deploys_without_moving_trc10_when_flag_off() {
+    let stores = fresh_stores_with_contracts();
+    // ALLOW_TVM_TRANSFER_TRC10 left unset (0) → flag OFF.
+
+    const TOKEN_ID: i64 = 1_000_001;
+    const TOKEN_VALUE: i64 = 5_000;
+    let token_key = TOKEN_ID.to_string();
+
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xd1);
+    let owner = Address::from_raw(owner_bytes);
+    let mut owner_acct = Account {
+        address: owner.as_bytes().to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    owner_acct.asset_v2.insert(token_key.clone(), 12_000);
+    stores.accounts.put(&owner, &owner_acct).unwrap();
+
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            bytecode: trivial_stop_init_code(),
+            consume_user_resource_percent: 100,
+            origin_energy_limit: 1_000_000,
+            name: "FlagOff".into(),
+            abi: Some(Abi::default()),
+            ..Default::default()
+        }),
+        call_token_value: TOKEN_VALUE,
+        token_id: TOKEN_ID,
+    };
+
+    let tx_id = [0x22; 32];
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &create,
+        &tx_id,
+        500_000,
+    );
+    let addr_bytes = match outcome {
+        // Flag-off java deploys normally (tokenValue/tokenId forced 0).
+        VmOutcome::Success { return_data, .. } => return_data,
+        other => panic!("expected Success for flag-off token deploy, got {other:?}"),
+    };
+    let mut a = [0u8; 21];
+    a.copy_from_slice(&addr_bytes);
+    let contract_addr = Address::from_raw(a);
+
+    // No TRC-10 moved: caller keeps its full balance, contract holds none.
+    let owner_after = stores.accounts.get(&owner).unwrap().unwrap();
+    assert_eq!(
+        *owner_after.asset_v2.get(&token_key).unwrap_or(&0),
+        12_000,
+        "flag-off deploy must NOT debit the caller's TRC-10"
+    );
+    let contract_acct = stores.accounts.get(&contract_addr).unwrap().unwrap();
+    assert_eq!(
+        *contract_acct.asset_v2.get(&token_key).unwrap_or(&0),
+        0,
+        "flag-off deploy must NOT credit the new contract any TRC-10"
+    );
+    assert_eq!(contract_acct.r#type, tron_proto::AccountType::Contract as i32);
+}
+
+/// A token-funded deploy whose init code REVERTs must reverse the up-front
+/// TRC-10 transfer (caller made whole) and leave no contract account —
+/// mirroring java's discarded `rootRepository` deposit.
+#[test]
+fn token_funded_create_reverts_token_on_init_revert() {
+    let stores = fresh_stores_with_contracts();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
+
+    const TOKEN_ID: i64 = 1_000_001;
+    const TOKEN_VALUE: i64 = 5_000;
+    let token_key = TOKEN_ID.to_string();
+
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xd2);
+    let owner = Address::from_raw(owner_bytes);
+    let mut owner_acct = Account {
+        address: owner.as_bytes().to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    owner_acct.asset_v2.insert(token_key.clone(), 12_000);
+    stores.accounts.put(&owner, &owner_acct).unwrap();
+
+    // Init code: PUSH1 0 PUSH1 0 REVERT — reverts immediately.
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            bytecode: vec![0x60, 0x00, 0x60, 0x00, 0xfd],
+            consume_user_resource_percent: 100,
+            origin_energy_limit: 1_000_000,
+            ..Default::default()
+        }),
+        call_token_value: TOKEN_VALUE,
+        token_id: TOKEN_ID,
+    };
+
+    let tx_id = [0x33; 32];
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 0 },
+        &create,
+        &tx_id,
+        500_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Revert { .. }), "got {outcome:?}");
+
+    // Caller's TRC-10 fully restored.
+    let owner_after = stores.accounts.get(&owner).unwrap().unwrap();
+    assert_eq!(
+        *owner_after.asset_v2.get(&token_key).unwrap_or(&0),
+        12_000,
+        "init-revert must reverse the up-front TRC-10 transfer"
+    );
+
+    // No contract account left behind.
+    let addr = tron_tvm::execute::derive_top_level_contract_address(&tx_id, &owner_bytes);
+    assert!(
+        stores.accounts.get(&Address::from_raw(addr)).unwrap().is_none(),
+        "contract account should not persist after init-code revert"
     );
 }
