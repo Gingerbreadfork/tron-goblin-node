@@ -21,6 +21,8 @@
 //! — TOKENBALANCE opcode now returns the real `asset_v2` balance from
 //! AccountStore (not the default zero).
 
+use std::sync::Arc;
+
 use revm::context_interface::TronDatabaseExt;
 use revm::primitives::Address;
 use tron_chainbase::DelegatedResourceStore;
@@ -122,6 +124,39 @@ impl TronDatabase {
         resources
             .put_raw(key, record)
             .expect("db error writing delegated resource in staking bridge");
+    }
+
+    /// Snapshot the two V2 `DelegatedResourceAccountIndex` rows for `(from, to)`
+    /// and record a reversing journal entry, to be called BEFORE the bridge
+    /// writes (delegate) or clears (undelegate) them. Gives the RPC-only index
+    /// the same per-frame revert safety the consensus `DelegatedResource` row
+    /// has via `put_delegated_journaled`: a delegate/undelegate in an inner
+    /// frame that reverts leaves the index rows untouched, as in java's
+    /// discarded child `Repository`. No-op when no journal is attached.
+    fn journal_index_rows(
+        &self,
+        index: &Arc<tron_chainbase::DelegatedResourceAccountIndexStore>,
+        from: &tron_crypto::address::Address,
+        to: &tron_crypto::address::Address,
+    ) {
+        use tron_chainbase::DelegatedResourceAccountIndexStore as Idx;
+        let Some(journal) = &self.staking_journal else {
+            return;
+        };
+        let from_key = Idx::v2_from_key(from, to).to_vec();
+        let to_key = Idx::v2_to_key(from, to).to_vec();
+        let from_prior = index.get_raw(&from_key).ok().flatten();
+        let to_prior = index.get_raw(&to_key).ok().flatten();
+        journal
+            .lock()
+            .expect("staking journal mutex poisoned")
+            .push(StakingEntry::DelegatedResourceIndex {
+                index: Arc::clone(index),
+                from_key,
+                from_prior,
+                to_key,
+                to_prior,
+            });
     }
 
     /// Apply a `TOTAL_NET_WEIGHT` delta, recording it for reversal.
@@ -1348,13 +1383,13 @@ impl TronDatabaseExt for TronDatabase {
         // index rows stamped with the latest block-header timestamp (java
         // `repo.getDynamicPropertiesStore().getLatestBlockHeaderTimestamp()`).
         // The store is RPC-only — never read into any balance/usage/energy/
-        // consensus computation. It is routed through the per-frame VmSession
-        // at the executor (committed only when the frame succeeds), so a
-        // reverted VM frame discards these writes for free — the same per-frame
-        // rollback the consensus-bearing DelegatedResource row above gets from
-        // the staking journal, achieved here via the session instead, so the
-        // index needs no journal entry.
-        if let Some(index) = &self.delegated_resource_account_index {
+        // consensus computation. It is journaled (per-frame revert) AND
+        // session-wrapped at the executor (whole-tx revert), exactly like the
+        // consensus DelegatedResource row above: a delegate in an inner frame
+        // that reverts leaves no index row, matching java's discarded child
+        // Repository.
+        if let Some(index) = self.delegated_resource_account_index.clone() {
+            self.journal_index_rows(&index, &owner, &receiver);
             let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
             index
                 .delegate_v2(&owner, &receiver, now)
@@ -1561,10 +1596,11 @@ impl TronDatabaseExt for TronDatabase {
         //    && frozenBalanceForEnergy == 0`, which `RepositoryImpl` commits as
         //    a DELETE (`ByteUtil.isNullOrZeroArray` → `store.delete`). The TVM
         //    path has only the single unlocked record, so this is the exact
-        //    clear condition. RPC-only and session-wrapped, so a reverted VM
-        //    frame discards this for free.
+        //    clear condition. RPC-only; journaled (per-frame revert) and
+        //    session-wrapped (whole-tx revert) like the delegate path above.
         if record.frozen_balance_for_bandwidth == 0 && record.frozen_balance_for_energy == 0 {
-            if let Some(index) = &self.delegated_resource_account_index {
+            if let Some(index) = self.delegated_resource_account_index.clone() {
+                self.journal_index_rows(&index, &owner, &receiver);
                 index
                     .undelegate_v2(&owner, &receiver)
                     .expect("db error clearing delegated resource account index in undelegate bridge");

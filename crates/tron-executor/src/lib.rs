@@ -850,10 +850,11 @@ struct VmSession {
     // DELEGATERESOURCE / UNDELEGATERESOURCE opcode bridges write the
     // bidirectional `DelegatedResourceAccountIndex` rows through this handle
     // (java `DelegateResourceProcessor`/`UnDelegateResourceProcessor`). The
-    // store is RPC-only (never read into consensus), but it must roll back
-    // with the VM frame exactly like the delegation record, so it is wrapped
-    // here and committed only on frame success. `None` in setups that don't
-    // attach the index (read-only callers / unit tests).
+    // store is RPC-only (never read into consensus). Like the delegation
+    // record, it uses BOTH rollback mechanisms: the staking journal reverses
+    // inner-frame writes (per-frame revert) and this session discards them on
+    // a whole-tx revert (committed once on the top-level VM success). `None`
+    // in setups that don't attach the index (read-only callers / unit tests).
     delegated_resource_account_index: Option<Arc<SessionBackend>>,
     // Staking opcodes (FREEZEBALANCEV2 / UNFREEZEBALANCEV2 / CANCELALLUNFREEZEV2
     // / suicide) write the chain-global TOTAL_*_WEIGHT accumulators through this
