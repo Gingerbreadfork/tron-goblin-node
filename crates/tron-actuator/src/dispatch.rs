@@ -102,7 +102,7 @@ pub fn dispatch_validate(
         }
         ContractType::TransferAssetContract => {
             let c = unpack::<tron_proto::TransferAssetContract>(parameter)?;
-            crate::asset::validate_transfer_asset(stores.accounts, &c)
+            crate::asset::validate_transfer_asset(stores.accounts, stores.dyn_props, &c)
         }
         ContractType::VoteWitnessContract => {
             let c = unpack::<tron_proto::VoteWitnessContract>(parameter)?;

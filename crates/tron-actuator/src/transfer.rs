@@ -143,6 +143,16 @@ pub fn execute_transfer(
         .ok_or(ActuatorError::Overflow)?;
     accounts.put(&owner, &owner_account)?;
 
+    // java TransferActuator.execute (TransferActuator.java:60-65): after
+    // debiting the owner it sends `fee` to the blackhole — `burnTrx(fee)` on
+    // the `supportBlackHoleOptimization()` path (mainnet), else crediting the
+    // blackhole *account*. The owner balance and TransactionInfo.fee already
+    // match without this; only the chain-wide BURN_TRX_AMOUNT accumulator
+    // would drift. The fee is the create-new-account fee, 0 on mainnet, so
+    // this is inert in practice but keeps BURN_TRX_AMOUNT exact if a proposal
+    // ever raises CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT.
+    dynamic_properties.burn_trx(fee);
+
     // Credit amount to recipient.
     let mut to_acct = to_account.expect("filled in above");
     to_acct.balance = to_acct
@@ -150,12 +160,6 @@ pub fn execute_transfer(
         .checked_add(contract.amount)
         .ok_or(ActuatorError::Overflow)?;
     accounts.put(&to, &to_acct)?;
-
-    // The fee in java-tron is either burned (blackhole optimisation) or
-    // credited to the blackhole account. For v1 we treat it as
-    // unconditionally burned — drops out of the accounts store entirely.
-    // When ContractStore lands we can wire up the blackhole credit if the
-    // flag is unset.
 
     Ok(ExecutionResult {
         fee,
@@ -166,8 +170,10 @@ pub fn execute_transfer(
 /// Canonical key for the create-new-account fee. This key isn't in the
 /// `dynamic_properties_keys` module yet (that module exposes a curated
 /// subset); inline-defining it here keeps the actuator self-contained
-/// until the broader key catalog lands.
-const CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT: &[u8] = b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT";
+/// until the broader key catalog lands. Shared with `TransferAsset`, which
+/// charges the same fee when it auto-creates a recipient.
+pub(crate) const CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT: &[u8] =
+    b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT";
 
 /// Validate that `bytes` is a syntactically-correct TRON address: 21 bytes
 /// with the `0x41` mainnet prefix. Java-tron's `DecodeUtil.addressValid`

@@ -698,7 +698,7 @@ fn asset_issue_then_transfer() {
         asset_name: token_id.as_bytes().to_vec(),
         amount: 100,
     };
-    asset::validate_transfer_asset(&accounts, &xfer).unwrap();
+    asset::validate_transfer_asset(&accounts, &dp, &xfer).unwrap();
     asset::execute_transfer_asset(&accounts, &dp, &xfer).unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(bob.asset_v2.get(&token_id).copied().unwrap_or(0), 100);

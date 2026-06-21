@@ -270,8 +270,9 @@ fn execute_charges_create_fee_when_recipient_absent() {
     assert_eq!(accounts.get(&addr(ALICE)).unwrap().unwrap().balance, 65);
     // Bob: 30
     assert_eq!(accounts.get(&addr(BOB)).unwrap().unwrap().balance, 30);
-    // Fee 5 leaves the system (burned in this v1 — blackhole credit is a
-    // follow-up when the proposal flag lands).
+    // java TransferActuator.execute burns the fee (supportBlackHoleOptimization),
+    // so BURN_TRX_AMOUNT must increase by exactly the create fee.
+    assert_eq!(dyn_props.burn_trx_amount(), 5, "create fee added to BURN_TRX_AMOUNT");
 }
 
 #[test]

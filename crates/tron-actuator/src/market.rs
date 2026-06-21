@@ -183,6 +183,13 @@ pub fn execute_market_sell_asset(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let fee = dyn_props.get_long(b"MARKET_SELL_FEE").unwrap_or(0);
     account.balance = check_sub(account.balance, fee)?;
+    // java MarketSellAssetActuator.execute (MarketSellAssetActuator.java:127-132):
+    // after debiting the owner it sends `fee` to the blackhole — `burnTrx(fee)`
+    // on the supportBlackHoleOptimization path (mainnet), else crediting the
+    // blackhole account (approximated as a burn here). Market is disabled on
+    // mainnet and MARKET_SELL_FEE defaults to 0, so this is doubly inert, but
+    // it keeps BURN_TRX_AMOUNT exact if the market is ever activated with a fee.
+    dyn_props.burn_trx(fee);
     debit_token_impl(&mut account, &contract.sell_token_id, contract.sell_token_quantity)?;
     accounts.put(&owner, &account)?;
 
@@ -280,6 +287,13 @@ pub fn execute_market_cancel_order(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let fee = dyn_props.get_long(b"MARKET_CANCEL_FEE").unwrap_or(0);
     account.balance = check_sub(account.balance, fee)?;
+    // java MarketCancelOrderActuator.execute (MarketCancelOrderActuator.java:97-102):
+    // after debiting the owner it sends `fee` to the blackhole — `burnTrx(fee)`
+    // on the supportBlackHoleOptimization path (mainnet), else crediting the
+    // blackhole account (approximated as a burn here). Market is disabled on
+    // mainnet and MARKET_CANCEL_FEE defaults to 0, so this is doubly inert, but
+    // it keeps BURN_TRX_AMOUNT exact if the market is ever activated with a fee.
+    dyn_props.burn_trx(fee);
     // Return the unfilled sell quantity to the owner.
     credit_token_impl(&mut account, &order.sell_token_id, order.sell_token_quantity_remain)?;
     accounts.put(&owner, &account)?;
@@ -530,5 +544,136 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ActuatorError::MarketInvalidTokenId));
+    }
+
+    #[test]
+    fn execute_market_sell_debits_and_burns_fee() {
+        use std::sync::Arc;
+        use tron_chainbase::backend::MemBackend;
+        use tron_chainbase::{DynamicPropertiesStore, MarketOrderStore};
+        use tron_proto::Account;
+
+        const FEE: i64 = 1_000_000;
+        let accounts = AccountStore::new(Arc::new(MemBackend::new()));
+        let orders = MarketOrderStore::new(Arc::new(MemBackend::new()));
+        let market_account = MarketAccountStore::new(Arc::new(MemBackend::new()));
+        let dyn_props = DynamicPropertiesStore::new(Arc::new(MemBackend::new()));
+
+        let owner = test_owner();
+        dyn_props.put_long(b"MARKET_SELL_FEE", FEE);
+        accounts
+            .put(
+                &owner,
+                &Account {
+                    address: owner.as_bytes().to_vec(),
+                    balance: 10_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Sell TRX (the "_" pseudo-token) so the only asset plumbing is the
+        // owner's TRX balance: balance pays both the fee and the sell quantity.
+        let contract = MarketSellAssetContract {
+            owner_address: owner.as_bytes().to_vec(),
+            sell_token_id: b"_".to_vec(),
+            sell_token_quantity: 500_000,
+            buy_token_id: b"1000001".to_vec(),
+            buy_token_quantity: 1,
+        };
+
+        let result = execute_market_sell_asset(
+            &accounts,
+            &orders,
+            &market_account,
+            &dyn_props,
+            &contract,
+        )
+        .unwrap();
+
+        assert_eq!(result.fee, FEE, "result fee == MARKET_SELL_FEE");
+        let acct = accounts.get(&owner).unwrap().unwrap();
+        // balance = 10_000_000 - fee - sell_quantity.
+        assert_eq!(acct.balance, 10_000_000 - FEE - 500_000, "fee + sell debited");
+        // java MarketSellAssetActuator.execute burns the fee.
+        assert_eq!(dyn_props.burn_trx_amount(), FEE, "fee added to BURN_TRX_AMOUNT");
+    }
+
+    #[test]
+    fn execute_market_cancel_debits_and_burns_fee() {
+        use std::sync::Arc;
+        use tron_chainbase::backend::MemBackend;
+        use tron_chainbase::{DynamicPropertiesStore, MarketOrderStore};
+        use tron_proto::Account;
+
+        const FEE: i64 = 1_000_000;
+        let accounts = AccountStore::new(Arc::new(MemBackend::new()));
+        let orders = MarketOrderStore::new(Arc::new(MemBackend::new()));
+        let market_account = MarketAccountStore::new(Arc::new(MemBackend::new()));
+        let dyn_props = DynamicPropertiesStore::new(Arc::new(MemBackend::new()));
+
+        let owner = test_owner();
+        dyn_props.put_long(b"MARKET_CANCEL_FEE", FEE);
+        accounts
+            .put(
+                &owner,
+                &Account {
+                    address: owner.as_bytes().to_vec(),
+                    balance: 10_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Rest an ACTIVE order selling TRX so the cancel refunds TRX to the
+        // owner and the fee debit/burn is observable independently.
+        let order_id = make_order_id(&owner, b"_", b"1000001", 0);
+        let order = MarketOrder {
+            order_id: order_id.clone(),
+            owner_address: owner.as_bytes().to_vec(),
+            create_time: 0,
+            sell_token_id: b"_".to_vec(),
+            sell_token_quantity: 500_000,
+            buy_token_id: b"1000001".to_vec(),
+            buy_token_quantity: 1,
+            sell_token_quantity_remain: 500_000,
+            sell_token_quantity_return: 0,
+            state: OrderState::Active as i32,
+            prev: Vec::new(),
+            next: Vec::new(),
+        };
+        orders.put(&order_id, &order).unwrap();
+        market_account
+            .put(
+                &owner,
+                &MarketAccountOrder {
+                    owner_address: owner.as_bytes().to_vec(),
+                    orders: vec![order_id.clone()],
+                    count: 1,
+                    total_count: 1,
+                },
+            )
+            .unwrap();
+
+        let contract = MarketCancelOrderContract {
+            owner_address: owner.as_bytes().to_vec(),
+            order_id: order_id.clone(),
+        };
+
+        let result = execute_market_cancel_order(
+            &accounts,
+            &orders,
+            &market_account,
+            &dyn_props,
+            &contract,
+        )
+        .unwrap();
+
+        assert_eq!(result.fee, FEE, "result fee == MARKET_CANCEL_FEE");
+        let acct = accounts.get(&owner).unwrap().unwrap();
+        // balance = 10_000_000 - fee + refunded remain (500_000 TRX).
+        assert_eq!(acct.balance, 10_000_000 - FEE + 500_000, "fee debited, remain refunded");
+        // java MarketCancelOrderActuator.execute burns the fee.
+        assert_eq!(dyn_props.burn_trx_amount(), FEE, "fee added to BURN_TRX_AMOUNT");
     }
 }

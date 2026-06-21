@@ -417,7 +417,8 @@ fn transfer_asset_from_optimized_account_sees_store_balance() {
         amount: 300,
     };
     // validate must see the store balance (1000), not the empty inline 0.
-    asset::validate_transfer_asset(&accounts, &c).expect("validate sees store balance");
+    asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+        .expect("validate sees store balance");
     asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
         .expect("execute");
 
@@ -444,7 +445,8 @@ fn transfer_asset_rejects_self() {
         asset_name: b"1000001".to_vec(),
         amount: 10,
     };
-    let err = asset::validate_transfer_asset(&accounts, &c).unwrap_err();
+    let err = asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+        .unwrap_err();
     assert!(matches!(err, ActuatorError::SelfTransfer));
 }
 
@@ -459,7 +461,9 @@ fn transfer_asset_rejects_non_positive_amount() {
             asset_name: b"1000001".to_vec(),
             amount: amt,
         };
-        let err = asset::validate_transfer_asset(&accounts, &c).unwrap_err();
+        let err =
+            asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+                .unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveAmount),
             "amt={amt} got: {err:?}"
@@ -477,7 +481,8 @@ fn transfer_asset_rejects_empty_asset_name() {
         asset_name: Vec::new(),
         amount: 10,
     };
-    let err = asset::validate_transfer_asset(&accounts, &c).unwrap_err();
+    let err = asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+        .unwrap_err();
     assert!(matches!(err, ActuatorError::AssetMissing));
 }
 
@@ -490,7 +495,8 @@ fn transfer_asset_rejects_missing_owner() {
         asset_name: b"1000001".to_vec(),
         amount: 10,
     };
-    let err = asset::validate_transfer_asset(&accounts, &c).unwrap_err();
+    let err = asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+        .unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing));
 }
 
@@ -511,7 +517,8 @@ fn transfer_asset_rejects_insufficient_balance() {
         asset_name: b"1000001".to_vec(),
         amount: 100,
     };
-    let err = asset::validate_transfer_asset(&accounts, &c).unwrap_err();
+    let err = asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -538,12 +545,92 @@ fn transfer_asset_creates_recipient_account_if_missing() {
         asset_name: b"1000001".to_vec(),
         amount: 250,
     };
-    asset::validate_transfer_asset(&accounts, &c).unwrap();
+    asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
     asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 750);
     assert_eq!(*bob.asset_v2.get("1000001").unwrap(), 250);
+}
+
+#[test]
+fn transfer_asset_new_recipient_charges_and_burns_create_fee() {
+    // java TransferAssetActuator.execute: a new recipient adds
+    // getCreateNewAccountFeeInSystemContract() to the fee, debits the owner's
+    // TRX by it, and burns it (supportBlackHoleOptimization). With a non-zero
+    // fee this must show up in the owner balance, TransactionInfo.fee, and the
+    // chain-wide BURN_TRX_AMOUNT accumulator.
+    const FEE: i64 = 100_000;
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", FEE);
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 1_000_000,
+                asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let c = TransferAssetContract {
+        owner_address: ALICE.to_vec(),
+        to_address: BOB.to_vec(), // BOB does not yet exist
+        asset_name: b"1000001".to_vec(),
+        amount: 250,
+    };
+    asset::validate_transfer_asset(&accounts, &dp, &c).unwrap();
+    let result = asset::execute_transfer_asset(&accounts, &dp, &c).unwrap();
+
+    // Fee surfaced for TransactionInfo.fee.
+    assert_eq!(result.fee, FEE, "result fee == create-new-account fee");
+    assert!(result.created_recipient, "BOB was auto-created");
+
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
+    // Owner TRX debited by the fee.
+    assert_eq!(alice.balance, 1_000_000 - FEE, "owner TRX debited by fee");
+    // Asset moved.
+    assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 750);
+    assert_eq!(*bob.asset_v2.get("1000001").unwrap(), 250);
+    // BURN_TRX_AMOUNT accumulator incremented by the fee.
+    assert_eq!(dp.burn_trx_amount(), FEE, "fee added to BURN_TRX_AMOUNT");
+}
+
+#[test]
+fn transfer_asset_new_recipient_rejected_when_owner_cannot_pay_fee() {
+    // java validate: on a new recipient ownerAccount.getBalance() < fee is an
+    // error ("insufficient fee"). The asset balance is sufficient; only the
+    // TRX-fee balance is short.
+    const FEE: i64 = 100_000;
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", FEE);
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: FEE - 1, // one short of the create fee
+                asset_v2: BTreeMap::from([("1000001".to_string(), 1000i64)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = TransferAssetContract {
+        owner_address: ALICE.to_vec(),
+        to_address: BOB.to_vec(),
+        asset_name: b"1000001".to_vec(),
+        amount: 250,
+    };
+    let err = asset::validate_transfer_asset(&accounts, &dp, &c).unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::InsufficientBalance { .. }),
+        "got: {err:?}"
+    );
 }
 
 #[test]
@@ -597,7 +684,7 @@ fn transfer_asset_v1_fallback_works_when_only_v1_entry_exists() {
         asset_name: b"LegacyCoin".to_vec(),
         amount: 100,
     };
-    asset::validate_transfer_asset(&accounts, &c).unwrap();
+    asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
     asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();

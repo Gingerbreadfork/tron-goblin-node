@@ -24,7 +24,7 @@ use tron_proto::{
 };
 
 use crate::helpers::{check_add, check_sub, require_owner, require_to};
-use crate::transfer::ExecutionResult;
+use crate::transfer::{ExecutionResult, CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT};
 use crate::ActuatorError;
 
 /// 32-byte max for asset names. java-tron's `TransactionUtil.validAssetName`.
@@ -87,6 +87,7 @@ fn valid_asset_description(desc: &[u8]) -> bool {
 
 pub fn validate_transfer_asset(
     accounts: &AccountStore,
+    dynamic_properties: &DynamicPropertiesStore,
     contract: &TransferAssetContract,
 ) -> Result<(), ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -115,6 +116,23 @@ pub fn validate_transfer_asset(
             needs: contract.amount,
         });
     }
+
+    // java TransferAssetActuator.validate (TransferAssetActuator.java:168-176):
+    // calcFee() is 0, but on a NEW recipient the create-new-account fee is
+    // added and the owner must hold at least that much TRX. (When the
+    // recipient already exists java instead does the addExact recipient-balance
+    // overflow check, which is harmless for assets and elided here.)
+    if accounts.get(&to)?.is_none() {
+        let create_fee = dynamic_properties
+            .get_long(CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT)
+            .unwrap_or(0);
+        if owner_account.balance < create_fee {
+            return Err(ActuatorError::InsufficientBalance {
+                balance: owner_account.balance,
+                needed: create_fee,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -130,12 +148,19 @@ pub fn execute_transfer_asset(
     let mut owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
+    // java TransferAssetActuator.execute: calcFee() == 0; a new recipient adds
+    // the create-new-account fee. We accumulate it here and apply the
+    // debit + burn after the asset moves (java debits, then burns, then sets
+    // the result fee).
+    let mut fee = 0i64;
+    let mut created_recipient = false;
     let mut to_account = match accounts.get(&to)? {
         Some(a) => a,
         None => {
             // New recipient: java's TransferAssetActuator builds the
             // AccountCapsule with create_time + the default owner+active[id=2]
-            // permission (`withDefaultPermission = getAllowMultiSign() == 1`).
+            // permission (`withDefaultPermission = getAllowMultiSign() == 1`),
+            // then charges getCreateNewAccountFeeInSystemContract().
             let mut a = tron_proto::Account {
                 address: to.as_bytes().to_vec(),
                 r#type: tron_proto::AccountType::Normal as i32,
@@ -143,6 +168,10 @@ pub fn execute_transfer_asset(
                 ..Default::default()
             };
             crate::permission::apply_default_account_permissions(&mut a, dyn_props);
+            fee = dyn_props
+                .get_long(CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT)
+                .unwrap_or(0);
+            created_recipient = true;
             a
         }
     };
@@ -163,9 +192,23 @@ pub fn execute_transfer_asset(
     debit_asset(&mut owner_account, &key, contract.amount)?;
     credit_asset(&mut to_account, &key, contract.amount)?;
 
+    // java: adjustBalance(owner, -fee) then burnTrx(fee) on the
+    // supportBlackHoleOptimization path (mainnet); the legacy else-branch
+    // credits the blackhole account, which we approximate as a burn to match
+    // the other actuators. The fee debit lands on the same owner_account so it
+    // is written by the single put below and reverts atomically with the tx on
+    // failure. With the default-0 fee this is inert; it keeps the owner
+    // balance, TransactionInfo.fee, and BURN_TRX_AMOUNT exact if a proposal
+    // ever raises CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT.
+    owner_account.balance = check_sub(owner_account.balance, fee)?;
+    dyn_props.burn_trx(fee);
+
     accounts.put(&owner, &owner_account)?;
     accounts.put(&to, &to_account)?;
-    Ok(ExecutionResult::default())
+    Ok(ExecutionResult {
+        fee,
+        created_recipient,
+    })
 }
 
 // =============================================================================
