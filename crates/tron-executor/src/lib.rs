@@ -1072,6 +1072,13 @@ pub struct TxResult {
     /// fee, permission-update fee, … Summed into the stored
     /// `TransactionInfo.fee` alongside the receipt fees.
     pub actuator_fee: i64,
+    /// The non-fee `ret`-derived fields (`unfreezeAmount`, `assetIssueID`,
+    /// `exchangeId`, …) a non-VM actuator records in its
+    /// `TransactionResultCapsule`. `TransactionUtil.buildTransactionInfoInstance`
+    /// copies these straight onto the stored `TransactionInfo`; the index
+    /// hook does the same from here. Empty for VM txs (the VM path fills the
+    /// proto fields directly) and for rejected/failed txs.
+    pub ret_extras: tron_actuator::TransactionRetExtras,
 }
 
 impl TxResult {
@@ -1089,6 +1096,7 @@ impl TxResult {
             receipt: TxReceipt::default(),
             vm_return_data: Vec::new(),
             actuator_fee: 0,
+            ret_extras: tron_actuator::TransactionRetExtras::default(),
         }
     }
 }
@@ -3501,6 +3509,7 @@ fn execute_one_tx_isolated(
                 outcome: TxOutcome::Success,
                 receipt,
                 actuator_fee: result.fee,
+                ret_extras: result.ret,
                 ..TxResult::empty()
             }
         }
@@ -4217,6 +4226,7 @@ fn execute_vm_tx(
             receipt,
             vm_return_data: Vec::new(),
             actuator_fee: 0,
+            ret_extras: tron_actuator::TransactionRetExtras::default(),
         };
     }
 
@@ -4241,6 +4251,7 @@ fn execute_vm_tx(
                 receipt,
                 vm_return_data: return_data,
                 actuator_fee: 0,
+                ret_extras: tron_actuator::TransactionRetExtras::default(),
             }
         }
         tron_tvm::execute::VmOutcome::Revert { return_data, .. } => {
@@ -4266,6 +4277,7 @@ fn execute_vm_tx(
                 receipt,
                 vm_return_data: return_data,
                 actuator_fee: 0,
+                ret_extras: tron_actuator::TransactionRetExtras::default(),
             }
         }
         tron_tvm::execute::VmOutcome::TransferFailed { .. } => {
@@ -4294,6 +4306,7 @@ fn execute_vm_tx(
                 receipt,
                 vm_return_data: Vec::new(),
                 actuator_fee: 0,
+                ret_extras: tron_actuator::TransactionRetExtras::default(),
             }
         }
         tron_tvm::execute::VmOutcome::Halt { reason, result, .. } => {
@@ -4317,6 +4330,7 @@ fn execute_vm_tx(
                 receipt,
                 vm_return_data: Vec::new(),
                 actuator_fee: 0,
+                ret_extras: tron_actuator::TransactionRetExtras::default(),
             }
         }
         tron_tvm::execute::VmOutcome::CallTokenIgnored { .. } => {

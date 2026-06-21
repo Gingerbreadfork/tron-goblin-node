@@ -191,7 +191,8 @@ fn execute_moves_balance_between_existing_accounts() {
         result,
         ExecutionResult {
             fee: 0,
-            created_recipient: false
+            created_recipient: false,
+            ..Default::default()
         }
     );
     assert_eq!(accounts.get(&addr(ALICE)).unwrap().unwrap().balance, 70);

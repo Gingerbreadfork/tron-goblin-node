@@ -35,7 +35,7 @@ pub mod witness;
 
 pub use dispatch::{dispatch_execute, dispatch_validate, ActuatorStores, ActuatorTxCtx};
 pub use helpers::{check_add, check_mul, check_sub, decode_address};
-pub use transfer::{execute_transfer, validate_transfer, ExecutionResult};
+pub use transfer::{execute_transfer, validate_transfer, ExecutionResult, TransactionRetExtras};
 pub use vote_witness::{
     execute_vote_witness, tron_power_old_model, validate_vote_witness, MAX_VOTE_NUMBER,
     TRX_PRECISION,

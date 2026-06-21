@@ -700,5 +700,14 @@ pub fn execute_unfreeze_balance(
     votes_store.put(&owner, &votes_record)?;
 
     accounts.put(&owner, &account)?;
-    Ok(ExecutionResult::default())
+    // java `UnfreezeBalanceActuator.execute` sets `ret.setUnfreezeAmount(
+    // unfreezeBalance)` (UnfreezeBalanceActuator.java:295) — the unfrozen
+    // balance returned to the owner. Surfaced as TransactionInfo.unfreeze_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            unfreeze_amount: unfreeze_balance,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }

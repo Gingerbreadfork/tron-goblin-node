@@ -208,6 +208,7 @@ pub fn execute_transfer_asset(
     Ok(ExecutionResult {
         fee,
         created_recipient,
+        ..Default::default()
     })
 }
 
@@ -450,9 +451,16 @@ pub fn execute_asset_issue(
     owner_account.frozen_supply.extend(frozen_entries);
     accounts.put(&owner, &owner_account)?;
 
+    // java `AssetIssueActuator.execute` sets `ret.assetIssueID =
+    // Long.toString(tokenIdNum)` (AssetIssueActuator.java:123); the stored
+    // TransactionInfo carries it as `asset_issue_id`.
     Ok(ExecutionResult {
         fee,
-        created_recipient: false,
+        ret: crate::TransactionRetExtras {
+            asset_issue_id: next_token_id.to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
     })
 }
 

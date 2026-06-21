@@ -225,14 +225,24 @@ pub fn execute_market_sell_asset(
     };
     orders.put(&order_id, &order)?;
 
-    account_order.orders.push(order_id);
+    account_order.orders.push(order_id.clone());
     account_order.count += 1;
     account_order.total_count += 1;
     market_account.put(&owner, &account_order)?;
 
+    // java `MarketSellAssetActuator.execute` sets `ret.setOrderId(
+    // orderCapsule.getID())` (MarketSellAssetActuator.java:151). The matching
+    // engine (`matchOrder`) is the only producer of `ret.addOrderDetails`;
+    // this port does not run it, so no fills are matched and `order_details`
+    // stays empty — identical to java's no-match case (market is dormant on
+    // mainnet). Surfaced as TransactionInfo.order_id.
     Ok(ExecutionResult {
         fee,
-        created_recipient: false,
+        ret: crate::TransactionRetExtras {
+            order_id,
+            ..Default::default()
+        },
+        ..Default::default()
     })
 }
 
@@ -324,6 +334,7 @@ pub fn execute_market_cancel_order(
     Ok(ExecutionResult {
         fee,
         created_recipient: false,
+        ..Default::default()
     })
 }
 

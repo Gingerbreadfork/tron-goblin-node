@@ -103,6 +103,7 @@ pub fn execute_witness_create(
     Ok(ExecutionResult {
         fee,
         created_recipient: false,
+        ..Default::default()
     })
 }
 
@@ -258,5 +259,14 @@ pub fn execute_withdraw_balance(
     account.latest_withdraw_time = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     accounts.put(&owner, &account)?;
 
-    Ok(ExecutionResult::default())
+    // java `WithdrawBalanceActuator.execute` sets `ret.setWithdrawAmount(
+    // allowance)` (WithdrawBalanceActuator.java:69) — the settled reward
+    // allowance moved into balance. Surfaced as TransactionInfo.withdraw_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            withdraw_amount: allowance,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }

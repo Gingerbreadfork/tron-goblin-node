@@ -218,6 +218,25 @@ fn issue_rejects_duplicate_asset_name() {
 // AssetIssue — execute (state coherence)
 // ============================================================
 
+/// java `AssetIssueActuator.execute` sets `ret.setAssetIssueID(
+/// Long.toString(tokenIdNum))` (line 123). The actuator's
+/// `ExecutionResult.ret.asset_issue_id` must carry the new token id string
+/// so the stored `TransactionInfo.asset_issue_id` matches java's
+/// `gettransactioninfobyid` (F4 receipt fidelity).
+#[test]
+fn issue_execute_carries_asset_issue_id() {
+    let ctx = ctx();
+    put_account(&ctx, ALICE, 10_000_000_000);
+    let c = base_issue();
+    asset::validate_asset_issue(&ctx.accounts, &ctx.v1, &ctx.dp, &c).unwrap();
+    let result =
+        asset::execute_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    assert_eq!(
+        result.ret.asset_issue_id, "1000001",
+        "ret.asset_issue_id must be Long.toString(tokenIdNum) of the new asset"
+    );
+}
+
 #[test]
 fn issue_execute_assigns_token_id_and_writes_both_stores() {
     let ctx = ctx();

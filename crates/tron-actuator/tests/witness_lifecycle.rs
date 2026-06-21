@@ -14,12 +14,13 @@ use std::sync::Arc;
 use hex_literal::hex;
 use tron_actuator::{account, witness, ActuatorError};
 use tron_chainbase::{
-    AccountIndexStore, AccountStore, DynamicPropertiesStore, KvBackend, MemBackend, WitnessStore,
+    AccountIndexStore, AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend,
+    WitnessStore,
 };
 use tron_crypto::address::Address;
 use tron_proto::{
     Account, AccountType, AccountUpdateContract, Witness, WitnessCreateContract,
-    WitnessUpdateContract,
+    WitnessUpdateContract, WithdrawBalanceContract,
 };
 
 const ALICE: [u8; 21] = hex!("412e988a386a799f506693793c6a5af6b54dfaabfb");
@@ -373,4 +374,49 @@ fn update_account_writes_index_on_first_naming() {
     assert_eq!(alice.account_name, b"alice");
     let stored = idx.get(b"alice").unwrap().unwrap();
     assert_eq!(stored.as_bytes(), &ALICE);
+}
+
+// ============================================================
+// WithdrawBalance — F4 receipt fidelity
+// ============================================================
+
+/// java `WithdrawBalanceActuator.execute` sets
+/// `ret.setWithdrawAmount(allowance)` (line 69). The actuator's
+/// `ExecutionResult.ret.withdraw_amount` must carry the same value so the
+/// stored `TransactionInfo.withdraw_amount` matches java's
+/// `gettransactioninfobyid`. With `ALLOW_CHANGE_DELEGATION` off (default),
+/// reward settlement is a no-op, so the pre-set allowance is withdrawn
+/// verbatim.
+#[test]
+fn withdraw_balance_carries_withdraw_amount() {
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let allowance = 4_242_000i64;
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 0,
+                allowance,
+                latest_withdraw_time: 0,
+                r#type: AccountType::Normal as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = WithdrawBalanceContract { owner_address: ALICE.to_vec() };
+    witness::validate_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap();
+    let result =
+        witness::execute_withdraw_balance(&accounts, &dp, &delegation, None, &c).unwrap();
+
+    assert_eq!(
+        result.ret.withdraw_amount, allowance,
+        "ret.withdraw_amount must equal the withdrawn allowance"
+    );
+    // State side-effect unchanged: allowance moved into balance, zeroed.
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(alice.balance, allowance);
+    assert_eq!(alice.allowance, 0);
 }

@@ -109,6 +109,7 @@ pub fn execute_create_account(
     Ok(ExecutionResult {
         fee,
         created_recipient: true,
+        ..Default::default()
     })
 }
 
@@ -469,6 +470,7 @@ pub fn execute_account_permission_update(
     Ok(ExecutionResult {
         fee,
         created_recipient: false,
+        ..Default::default()
     })
 }
 

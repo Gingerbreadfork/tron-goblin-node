@@ -16,24 +16,87 @@
 //!   These need `ContractStore` (not yet ported) plus extra proposal
 //!   flags. They're listed in the crate-level docs.
 
+use std::collections::BTreeMap;
+
 use tron_chainbase::{AccountStore, DynamicPropertiesStore};
 use tron_crypto::address::{Address, ADDRESS_LENGTH, ADDRESS_PREFIX_MAINNET};
-use tron_proto::{Account, TransferContract};
+use tron_proto::{Account, MarketOrderDetail, TransferContract};
 
 use crate::ActuatorError;
 
 /// `ChainConstant.TRANSFER_FEE = 0` in java-tron. Pinned by a test.
 pub const TRANSFER_FEE: i64 = 0;
 
+/// The non-fee fields a java-tron `TransactionResultCapsule` (`ret`)
+/// carries beyond `fee`/`contractRet`, surfaced into the stored
+/// `TransactionInfo` by `TransactionUtil.buildTransactionInfoInstance`
+/// (`chainbase/.../capsule/utils/TransactionUtil.java:98-110`).
+///
+/// Each field maps 1:1 to a `programResult.getRet().getX()` read in that
+/// method and is set by exactly the actuator(s) that produce the value
+/// (see each `execute_*`). Non-VM actuators populate these; VM txs leave
+/// them at their defaults (the VM path fills the proto fields elsewhere).
+/// Defaults mean "unset" and serialise to the proto default (0 / empty),
+/// matching java's behaviour when an actuator never touches the field.
+///
+/// `Eq` is intentionally not derived: `MarketOrderDetail` (a prost message)
+/// implements only `PartialEq`, which is all the actuator tests need.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TransactionRetExtras {
+    /// `ret.unfreezeAmount` — set by `UnfreezeBalanceActuator` (v1) to the
+    /// unfrozen balance (`TransactionUtil:98`).
+    pub unfreeze_amount: i64,
+    /// `ret.assetIssueID` — `Long.toString(tokenIdNum)` of the asset
+    /// created by `AssetIssueActuator` (`TransactionUtil:99`).
+    pub asset_issue_id: String,
+    /// `ret.exchangeId` — id of the exchange created by
+    /// `ExchangeCreateActuator` (`TransactionUtil:100`).
+    pub exchange_id: i64,
+    /// `ret.withdrawAmount` — the reward allowance withdrawn by
+    /// `WithdrawBalanceActuator` (`TransactionUtil:101`).
+    pub withdraw_amount: i64,
+    /// `ret.withdrawExpireAmount` — the expired-unfreeze balance swept to
+    /// the owner's balance by `WithdrawExpireUnfreezeActuator`,
+    /// `UnfreezeBalanceV2Actuator`, or `CancelAllUnfreezeV2Actuator`
+    /// (`TransactionUtil:102`).
+    pub withdraw_expire_amount: i64,
+    /// `ret.cancelUnfreezeV2AmountMap` — per-resource (`BANDWIDTH` /
+    /// `ENERGY` / `TRON_POWER`) amount restored to frozen-V2 by
+    /// `CancelAllUnfreezeV2Actuator` (`TransactionUtil:103`).
+    pub cancel_unfreeze_v2_amount: BTreeMap<String, i64>,
+    /// `ret.exchangeReceivedAmount` — the other-token amount received by
+    /// `ExchangeTransactionActuator` (`TransactionUtil:104`).
+    pub exchange_received_amount: i64,
+    /// `ret.exchangeInjectAnotherAmount` — the other-token amount injected
+    /// alongside the named token by `ExchangeInjectActuator`
+    /// (`TransactionUtil:105`).
+    pub exchange_inject_another_amount: i64,
+    /// `ret.exchangeWithdrawAnotherAmount` — the other-token amount
+    /// withdrawn by `ExchangeWithdrawActuator` (`TransactionUtil:106`).
+    pub exchange_withdraw_another_amount: i64,
+    /// `ret.shieldedTransactionFee` — fee charged by
+    /// `ShieldedTransferActuator` (`TransactionUtil:108`).
+    pub shielded_transaction_fee: i64,
+    /// `ret.orderId` — id of the market order created by
+    /// `MarketSellAssetActuator` (`TransactionUtil:109`).
+    pub order_id: Vec<u8>,
+    /// `ret.orderDetailsList` — per-match fill details appended by the
+    /// `MarketSellAssetActuator` matching engine (`TransactionUtil:110`).
+    pub order_details: Vec<MarketOrderDetail>,
+}
+
 /// Result of a successful execute. Mirrors the energy/bandwidth/fee
 /// fields a real `TransactionResultCapsule` would set, but only with
-/// what `TransferActuator` can actually populate.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// what the actuator can actually populate.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionResult {
     /// Total TRX burned (fee that left the system).
     pub fee: i64,
     /// True if the recipient account was auto-created.
     pub created_recipient: bool,
+    /// The java `ret`-derived fields the stored `TransactionInfo` carries
+    /// beyond `fee` — populated only by the actuators that produce them.
+    pub ret: TransactionRetExtras,
 }
 
 /// Read-only validation. Returns `Ok(())` if `contract` would be accepted
@@ -164,6 +227,7 @@ pub fn execute_transfer(
     Ok(ExecutionResult {
         fee,
         created_recipient,
+        ..Default::default()
     })
 }
 

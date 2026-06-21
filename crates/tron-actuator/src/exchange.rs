@@ -113,9 +113,16 @@ pub fn execute_exchange_create(
         next_id,
     );
 
+    // java `ExchangeCreateActuator.execute` sets `ret.setExchangeId(id)`
+    // (ExchangeCreateActuator.java:125) — the id of the new exchange.
+    // Surfaced as TransactionInfo.exchange_id.
     Ok(ExecutionResult {
         fee,
-        created_recipient: false,
+        ret: crate::TransactionRetExtras {
+            exchange_id: next_id,
+            ..Default::default()
+        },
+        ..Default::default()
     })
 }
 
@@ -304,7 +311,18 @@ pub fn execute_exchange_inject(
     v1.put(exchange.exchange_id, &exchange)?;
     v2.put(exchange.exchange_id, &exchange)?;
 
-    Ok(ExecutionResult::default())
+    // java `ExchangeInjectActuator.execute` sets
+    // `ret.setExchangeInjectAnotherAmount(anotherTokenQuant)`
+    // (ExchangeInjectActuator.java:106) — the paired other-token amount
+    // injected. It does NOT set exchangeId. Surfaced as
+    // TransactionInfo.exchange_inject_another_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            exchange_inject_another_amount: other_quant,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 // =============================================================================
@@ -457,7 +475,18 @@ pub fn execute_exchange_withdraw(
     v1.put(exchange.exchange_id, &exchange)?;
     v2.put(exchange.exchange_id, &exchange)?;
 
-    Ok(ExecutionResult::default())
+    // java `ExchangeWithdrawActuator.execute` sets
+    // `ret.setExchangeWithdrawAnotherAmount(anotherTokenQuant)`
+    // (ExchangeWithdrawActuator.java:111) — the paired other-token amount
+    // withdrawn. It does NOT set exchangeId. Surfaced as
+    // TransactionInfo.exchange_withdraw_another_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            exchange_withdraw_another_amount: other_quant,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 // =============================================================================
@@ -658,7 +687,18 @@ pub fn execute_exchange_transaction(
     v1.put(exchange.exchange_id, &exchange)?;
     v2.put(exchange.exchange_id, &exchange)?;
 
-    Ok(ExecutionResult::default())
+    // java `ExchangeTransactionActuator.execute` sets
+    // `ret.setExchangeReceivedAmount(anotherTokenQuant)`
+    // (ExchangeTransactionActuator.java:99) — the other-token amount received
+    // from the swap (`output` here). Surfaced as
+    // TransactionInfo.exchange_received_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            exchange_received_amount: output,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 // =============================================================================

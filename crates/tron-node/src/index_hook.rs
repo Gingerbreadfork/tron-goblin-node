@@ -331,6 +331,26 @@ pub fn build_transaction_ret(
                     format!("{:?}", res.outcome).into_bytes()
                 },
                 internal_transactions: res.internal_transactions.clone(),
+                // The non-fee actuator `ret` fields, copied straight from the
+                // tx result exactly as java's
+                // `TransactionUtil.buildTransactionInfoInstance`
+                // (`chainbase/.../capsule/utils/TransactionUtil.java:98-110`)
+                // reads them off `programResult.getRet()`. Non-VM actuators set
+                // only the field(s) they produce; everything else stays at the
+                // proto default (0 / empty), matching java's unconditional set
+                // of every field from a freshly-built `ret`.
+                unfreeze_amount: res.ret_extras.unfreeze_amount,
+                asset_issue_id: res.ret_extras.asset_issue_id.clone(),
+                exchange_id: res.ret_extras.exchange_id,
+                withdraw_amount: res.ret_extras.withdraw_amount,
+                withdraw_expire_amount: res.ret_extras.withdraw_expire_amount,
+                cancel_unfreeze_v2_amount: res.ret_extras.cancel_unfreeze_v2_amount.clone(),
+                exchange_received_amount: res.ret_extras.exchange_received_amount,
+                exchange_inject_another_amount: res.ret_extras.exchange_inject_another_amount,
+                exchange_withdraw_another_amount: res.ret_extras.exchange_withdraw_another_amount,
+                shielded_transaction_fee: res.ret_extras.shielded_transaction_fee,
+                order_id: res.ret_extras.order_id.clone(),
+                order_details: res.ret_extras.order_details.clone(),
                 ..Default::default()
             }
         })
@@ -435,6 +455,7 @@ mod tests {
                 },
                 vm_return_data: vec![0xAB],
                 actuator_fee: 0,
+                ret_extras: Default::default(),
             }],
             maintenance: None,
             state_deltas: None,
@@ -502,6 +523,7 @@ mod tests {
             receipt,
             vm_return_data: vec![],
             actuator_fee: 0,
+            ret_extras: Default::default(),
         };
         let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
         let info = &ret.transactioninfo[0];
@@ -533,12 +555,68 @@ mod tests {
             receipt,
             vm_return_data: payload.clone(),
             actuator_fee: 0,
+            ret_extras: Default::default(),
         };
         let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
         let info = &ret.transactioninfo[0];
         assert_eq!(info.res_message, b"REVERT opcode executed".to_vec());
         assert_eq!(info.contract_result.len(), 1, "always a one-element list");
         assert_eq!(info.contract_result[0], payload, "revert payload rides through");
+    }
+
+    /// F4 receipt-fidelity: the non-fee actuator `ret` fields must ride from
+    /// the tx result onto the stored `TransactionInfo`, matching java's
+    /// `TransactionUtil.buildTransactionInfoInstance` (lines 98-110).
+    #[test]
+    fn carries_actuator_ret_extras_onto_transaction_info() {
+        let (block, id, tx_id) = block_with_transfer();
+        let mut cancel = std::collections::BTreeMap::new();
+        cancel.insert("BANDWIDTH".to_string(), 11i64);
+        cancel.insert("ENERGY".to_string(), 22i64);
+        cancel.insert("TRON_POWER".to_string(), 0i64);
+        let res = TxResult {
+            tx_id,
+            contract_type: None,
+            outcome: TxOutcome::Success,
+            internal_transactions: vec![],
+            vm_logs: vec![],
+            receipt: tron_executor::TxReceipt::default(),
+            vm_return_data: vec![],
+            actuator_fee: 0,
+            ret_extras: tron_actuator::TransactionRetExtras {
+                // WithdrawBalance → withdraw_amount; AssetIssue → asset_issue_id.
+                withdraw_amount: 12_345,
+                asset_issue_id: "1000001".to_string(),
+                // The remaining ret fields, one per producing actuator.
+                unfreeze_amount: 777,
+                exchange_id: 5,
+                withdraw_expire_amount: 88,
+                cancel_unfreeze_v2_amount: cancel,
+                exchange_received_amount: 100,
+                exchange_inject_another_amount: 200,
+                exchange_withdraw_another_amount: 300,
+                shielded_transaction_fee: 1_000_000,
+                order_id: vec![0xAA, 0xBB],
+                order_details: vec![],
+            },
+        };
+        let ret = build_transaction_ret(&block, &id, &report_with(&id, res));
+        let info = &ret.transactioninfo[0];
+        assert_eq!(info.withdraw_amount, 12_345, "WithdrawBalance carries withdraw_amount");
+        assert_eq!(info.asset_issue_id, "1000001", "AssetIssue carries asset_issue_id");
+        assert_eq!(info.unfreeze_amount, 777);
+        assert_eq!(info.exchange_id, 5);
+        assert_eq!(info.withdraw_expire_amount, 88);
+        assert_eq!(info.cancel_unfreeze_v2_amount.get("BANDWIDTH"), Some(&11));
+        assert_eq!(info.cancel_unfreeze_v2_amount.get("ENERGY"), Some(&22));
+        assert_eq!(info.cancel_unfreeze_v2_amount.get("TRON_POWER"), Some(&0));
+        assert_eq!(info.exchange_received_amount, 100);
+        assert_eq!(info.exchange_inject_another_amount, 200);
+        assert_eq!(info.exchange_withdraw_another_amount, 300);
+        assert_eq!(info.shielded_transaction_fee, 1_000_000);
+        assert_eq!(info.order_id, vec![0xAA, 0xBB]);
+        // The fee aggregation must remain untouched by the extras.
+        assert_eq!(info.fee, 0);
     }
 
     #[test]

@@ -361,9 +361,17 @@ pub fn execute_shielded_transfer(
     }
     dyn_props.put_long(b"TOTAL_SHIELDED_POOL_VALUE", new_pool);
 
+    // java `ShieldedTransferActuator.execute` sets
+    // `ret.setShieldedTransactionFee(fee)` on the success path
+    // (ShieldedTransferActuator.java:110). Surfaced as
+    // TransactionInfo.shielded_transaction_fee.
     Ok(ExecutionResult {
         fee,
         created_recipient,
+        ret: crate::TransactionRetExtras {
+            shielded_transaction_fee: fee,
+            ..Default::default()
+        },
     })
 }
 

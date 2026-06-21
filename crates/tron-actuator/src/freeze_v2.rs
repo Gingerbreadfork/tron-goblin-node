@@ -290,7 +290,18 @@ pub fn execute_unfreeze_balance_v2(
     tron_tvm::votes::update_vote_after_unstake(votes_store, &owner, &mut account)?;
 
     accounts.put(&owner, &account)?;
-    Ok(ExecutionResult::default())
+    // java `UnfreezeBalanceV2Actuator.execute` sets `ret.setWithdrawExpireAmount(
+    // unfreezeAmount)` (UnfreezeBalanceV2Actuator.java:98), where `unfreezeAmount`
+    // is the expired-unfreeze balance swept to the owner by `unfreezeExpire`
+    // (`swept` here) — NOT the just-unstaked `unfreezeBalance`. Surfaced as
+    // TransactionInfo.withdraw_expire_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            withdraw_expire_amount: swept,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 // =============================================================================
@@ -340,7 +351,17 @@ pub fn execute_withdraw_expire_unfreeze(
     });
     account.balance = check_add(account.balance, withdrawn)?;
     accounts.put(&owner, &account)?;
-    Ok(ExecutionResult::default())
+    // java `WithdrawExpireUnfreezeActuator.execute` sets
+    // `ret.setWithdrawExpireAmount(totalWithdrawUnfreeze)`
+    // (WithdrawExpireUnfreezeActuator.java:63) — the total expired-unfreeze
+    // balance withdrawn. Surfaced as TransactionInfo.withdraw_expire_amount.
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            withdraw_expire_amount: withdrawn,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 // =============================================================================
@@ -393,10 +414,15 @@ pub fn execute_cancel_all_unfreeze_v2(
     let old_energy = frozen_v2_with_delegated(&account, 1);
     let old_tron_power = frozen_v2_with_delegated(&account, 2);
 
+    // Expired-unfreeze balance swept to the owner — java's
+    // `atomicWithdrawExpireBalance` (CancelAllUnfreezeV2Actuator.java:60,108).
+    let mut withdraw_expire: i64 = 0;
+
     let pending = std::mem::take(&mut account.unfrozen_v2);
     for entry in pending {
         if entry.unfreeze_expire_time <= now {
             // Expired → withdraw to balance.
+            withdraw_expire = withdraw_expire.saturating_add(entry.unfreeze_amount);
             account.balance = check_add(account.balance, entry.unfreeze_amount)?;
         } else {
             // Not yet expired → restore to FreezeV2 of the same resource type.
@@ -434,5 +460,25 @@ pub fn execute_cancel_all_unfreeze_v2(
             contract.owner_address.iter().map(|b| format!("{:02x}", b)).collect::<String>(), restored_net, restored_energy, old_net, old_energy, net_delta, energy_delta,
             dyn_props.total_energy_weight(), dyn_props.total_net_weight());
     }
-    Ok(ExecutionResult::default())
+
+    // java `CancelAllUnfreezeV2Actuator.execute`:
+    //   ret.setWithdrawExpireAmount(withdrawExpireBalance)        // line 83
+    //   ret.putAllCancelUnfreezeV2AmountMap(cancelUnfreezeV2AmountMap)  // line 88
+    // where the map keys are the ResourceCode enum names and the values are
+    // the per-resource amounts restored to frozen-V2 (the triple's "number of
+    // unfreeze resources" = `restored_*` here). All three keys are written
+    // unconditionally, even when the value is 0.
+    let mut cancel_unfreeze_v2_amount = std::collections::BTreeMap::new();
+    cancel_unfreeze_v2_amount.insert("BANDWIDTH".to_string(), restored_net);
+    cancel_unfreeze_v2_amount.insert("ENERGY".to_string(), restored_energy);
+    cancel_unfreeze_v2_amount.insert("TRON_POWER".to_string(), restored_tron_power);
+
+    Ok(ExecutionResult {
+        ret: crate::TransactionRetExtras {
+            withdraw_expire_amount: withdraw_expire,
+            cancel_unfreeze_v2_amount,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
