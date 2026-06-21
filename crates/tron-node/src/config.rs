@@ -209,10 +209,16 @@ impl Default for StorageConfig {
 }
 
 /// Per-CF RocksDB tuning. Field defaults mirror java-tron's
-/// `StorageConfig.DbSettingsConfig` exactly; consumers (the RocksDB
-/// open path) should read via [`DbSettingsConfig::resolve`] so the
-/// `compact_threads = 0` "auto" sentinel expands to the host CPU count
-/// (matching `postProcess` in java-tron).
+/// `StorageConfig.DbSettingsConfig` exactly.
+///
+/// Accepted for `storage.dbSettings.*` config-file compatibility — a
+/// config.conf copied from java-tron parses without error. These fields
+/// are **not** wired into the store-open path: RocksDB column-family
+/// options are derived from the detected hardware at startup
+/// (`tron_chainbase::apply_runtime_tuning` / `rocksdb_tuning`), which
+/// supersedes the static java knobs. Only `storage.write_buffer_size_mb`,
+/// `storage.max_open_files`, and `storage.block_cache_mb` reach the open
+/// path. Setting any field here has no effect today.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbSettingsConfig {
     #[serde(default = "default_db_level_number", alias = "levelNumber")]
@@ -298,6 +304,10 @@ fn default_db_max_open_files_inner() -> i32 {
 /// Tx-cache config. Mirrors java-tron's
 /// `StorageConfig.TxCacheConfig`. `estimated_transactions` is clamped
 /// to `[100, 10_000]` via [`TxCacheConfig::clamp`].
+///
+/// Accepted for `storage.txCache.*` config-file compatibility; not yet
+/// wired into a runtime tx-cache (transaction dedup is handled elsewhere
+/// in the apply path). Setting these has no effect today.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxCacheConfig {
     #[serde(default = "default_tx_cache_estimated", alias = "estimatedTransactions")]

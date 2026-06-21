@@ -396,6 +396,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // NOT modified — only `DynamicPropertiesStore`'s head pointers.
     if let Some(checkpoint) = config.p2p.tip_test.clone() {
         use tron_chainbase::DynamicPropertiesStore;
+        // Refuse to overwrite a real synced head: this path moves the head
+        // pointer forward without applying any block, so doing it on a
+        // data-dir that already holds a synced chain bakes a permanent
+        // offset between the head pointer and the account/block stores —
+        // the exact silent-divergence the startup consistency guard above
+        // warns about. A fresh / genesis-only data-dir is safe to spoof.
+        guard_head_spoof(&stores, "--tip-test")?;
         let hash = hex::decode(&checkpoint.block_id_hex).map_err(|e| {
             RunError::Sync(format!(
                 "--tip-test hash hex: {e}"
@@ -1520,6 +1527,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         let tip_num = if let Some(cp) = &config.p2p.tip_test {
             cp.block_num
         } else {
+            // Discovering + spoofing the tip moves the head pointer forward
+            // without applying blocks; refuse on a data-dir that already holds
+            // a synced chain so the dashboard never clobbers a real node's head
+            // (see `guard_head_spoof`). The `--tip-test` branch above already
+            // went through the same guard.
+            guard_head_spoof(&stores, &format!("--{mode}"))?;
             info!("{mode}: discovering the live tip from the peer network…");
             match discover_tip(&combined_peers).await {
                 Some((num, hash)) => {
@@ -2146,11 +2159,21 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // waiting on an idle keep-alive connection from a monitoring client
     // (Prometheus scraping :9090, a wallet polling :8090) until that client
     // disconnects. Aborting the stragglers — rather than waiting out the
-    // runtime's own shutdown timeout — keeps Ctrl-C/SIGTERM snappy. Aborting
-    // is safe here: the only task that writes to disk (the peer_state
-    // flusher) is shutdown-driven and exits well inside the grace window, so
-    // it is never in the straggler set; the rest are network servers and
-    // periodic samplers with no durable mid-operation state.
+    // runtime's own shutdown timeout — keeps Ctrl-C/SIGTERM snappy.
+    //
+    // Aborting is safe for everything in the straggler set. The tasks that
+    // write durable state — the sync drivers (block apply) and the SR
+    // producer — observe the shutdown broadcast at every loop iteration and
+    // exit at a clean boundary, never mid-commit, so they self-terminate
+    // well inside the grace window. The drivers are not even in this handle
+    // set (they're awaited via the aggregator), so an abort here cannot land
+    // mid-apply. A block's commit I/O runs in a synchronous `run_blocking`
+    // closure that cannot be cancelled by `abort()`; any pipelined commit is
+    // flushed before that closure returns, and a crash mid-flush replays from
+    // the retained checkpoint manifest on the next startup. The remaining
+    // straggler candidates are network servers and periodic samplers with no
+    // durable mid-operation state. The peer_state flusher is shutdown-driven
+    // and also exits inside the grace window.
     let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
     let drain = tokio::time::timeout(Duration::from_secs(3), async {
         for h in handles {
@@ -2979,6 +3002,38 @@ fn chain_initialized(stores: &OpenedStores) -> bool {
     dp.latest_block_header_number().is_some()
 }
 
+/// Refuse to spoof the head pointer when the data-dir already holds a
+/// synced chain.
+///
+/// The `--tip-test` / `--explore` / `--mempool` paths move the
+/// `DynamicPropertiesStore` head pointer forward to a recent tip
+/// *without* applying any block — the chain state (accounts, blocks) is
+/// left untouched. On a fresh or genesis-only data-dir that's harmless:
+/// the spoofed head just steers `SyncBlockChain` locators at the live
+/// tail for a decode-only follow. But on a data-dir that already holds a
+/// real synced chain (head past genesis), overwriting the head pointer
+/// bakes a permanent offset between it and the account/block stores —
+/// the exact silent-divergence the startup consistency guard warns
+/// about, except here we would be the cause. Surface it as a hard
+/// startup error directing the operator at a throwaway `--data-dir`
+/// rather than corrupting their node's state.
+///
+/// `mode` names the triggering flag for the error message.
+fn guard_head_spoof(stores: &OpenedStores, mode: &str) -> Result<(), RunError> {
+    use tron_chainbase::DynamicPropertiesStore;
+    let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
+    let head = dp.latest_block_header_number().unwrap_or(0);
+    if head > 0 {
+        return Err(RunError::Sync(format!(
+            "{mode} would overwrite the head pointer of an already-synced chain \
+             (current head #{head}); refusing to corrupt this data-dir. \
+             Run the dashboard against a throwaway directory, e.g. \
+             `--data-dir $(mktemp -d)` (or use `try.sh`)."
+        )));
+    }
+    Ok(())
+}
+
 /// Apply the mainnet genesis block. Writes the genesis Block to
 /// `BlockStore` + the head pointer into `DynamicPropertiesStore`.
 /// Genesis allocations are NOT yet replayed into AccountStore — the
@@ -3201,6 +3256,47 @@ mod assemble_peers_tests {
         assert_eq!(super::fd_limit_target(1_048_576, 1_048_576), None);
         // Defensive: never lower an already-generous soft limit.
         assert_eq!(super::fd_limit_target(4096, 1024), None);
+    }
+
+    #[test]
+    fn head_spoof_guard_allows_fresh_and_genesis_only_dirs() {
+        use tron_chainbase::DynamicPropertiesStore;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Fresh data-dir (no head pointer written yet): the dashboard is
+        // free to spoof the head.
+        let stores = crate::storage::OpenedStores::open(tmp.path()).expect("open");
+        assert!(
+            super::guard_head_spoof(&stores, "--explore").is_ok(),
+            "fresh dir must be spoofable"
+        );
+
+        // Genesis-only (head == 0, as `initialize_genesis` leaves it):
+        // still safe — there is no synced chain to clobber.
+        let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
+        dp.save_latest_block_header_number(0);
+        assert!(
+            super::guard_head_spoof(&stores, "--explore").is_ok(),
+            "genesis-only dir must be spoofable"
+        );
+    }
+
+    #[test]
+    fn head_spoof_guard_refuses_synced_chain() {
+        use tron_chainbase::DynamicPropertiesStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = crate::storage::OpenedStores::open(tmp.path()).expect("open");
+
+        // A data-dir holding a synced chain (head past genesis): spoofing
+        // the head pointer here would bake a permanent offset against the
+        // account/block stores, so it must be refused.
+        let dp = DynamicPropertiesStore::new(stores.dyn_props.clone());
+        dp.save_latest_block_header_number(83_316_752);
+        let err = super::guard_head_spoof(&stores, "--explore")
+            .expect_err("synced chain must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("already-synced"), "message explains the refusal: {msg}");
+        assert!(msg.contains("83316752"), "message reports the current head: {msg}");
     }
 }
 
