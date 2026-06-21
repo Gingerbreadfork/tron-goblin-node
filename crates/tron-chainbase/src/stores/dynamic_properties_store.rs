@@ -138,6 +138,12 @@ pub mod keys {
     /// (java-tron `Manager.consumeMemoFee`; 0 until the SR proposal
     /// sets it).
     pub const MEMO_FEE: &[u8] = b"MEMO_FEE";
+    /// Comma-joined `unix_ms:fee` schedule of every historic `MEMO_FEE`
+    /// value (java-tron `MEMO_FEE_HISTORY`), e.g. `0:0,1660000000000:1000000`.
+    /// Appended by the MEMO_FEE proposal (#68) keyed on its expiration time —
+    /// served verbatim by the `getMemoFeePrices` RPC. The live fee is read
+    /// from `MEMO_FEE`, so this string has no state-root / consensus effect.
+    pub const MEMO_FEE_HISTORY: &[u8] = b"MEMO_FEE_HISTORY";
     /// java-tron `CONSENSUS_LOGIC_OPTIMIZATION` — gates several "v2"
     /// consensus behaviors (strict-math, witness sort, the in-block
     /// max-create-account-tx-size check).
@@ -481,8 +487,12 @@ impl DynamicPropertiesStore {
     pub const DEFAULT_MAX_CREATE_ACCOUNT_TX_SIZE: i64 = 1_000;
     /// java-tron `ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER` default.
     pub const DEFAULT_ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER: i64 = 1_000;
-    /// java-tron `ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO` default.
-    pub const DEFAULT_ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO: i64 = 10;
+    /// java-tron `ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO` init seed —
+    /// `DynamicPropertiesStore.init()` seeds `14400` (`24 * 60 * 10`, i.e.
+    /// one minute = 1/10 of the daily energy target). Every real database
+    /// carries this value (the java getter `orElseThrow`s when absent), so
+    /// this default is reached only on a fresh/empty properties directory.
+    pub const DEFAULT_ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO: i64 = 14_400;
 
     // -------------------- Resource pricing accessors -------------------
 
@@ -773,6 +783,19 @@ impl DynamicPropertiesStore {
     /// default); set on mainnet by SR proposal #68.
     pub fn memo_fee(&self) -> i64 {
         self.get_long(keys::MEMO_FEE).unwrap_or(0)
+    }
+
+    /// Historic `MEMO_FEE` schedule (`unix_ms:fee` pairs, comma-joined).
+    /// java's `getMemoFeeHistory` — `init()` seeds `"0:" + memoFee`
+    /// (`memoFee` defaults to 0), so an absent key falls back to `"0:0"`.
+    pub fn memo_fee_history(&self) -> String {
+        self.get_bytes(keys::MEMO_FEE_HISTORY)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| "0:0".to_string())
+    }
+    /// java's `saveMemoFeeHistory`.
+    pub fn save_memo_fee_history(&self, history: &str) {
+        self.write_or_panic(keys::MEMO_FEE_HISTORY, history.as_bytes());
     }
 
     /// java-tron `allowConsensusLogicOptimization()`.
@@ -1103,5 +1126,44 @@ mod weight_accumulator_tests {
         // ... and a reverting +250 restores the exact original value.
         d.add_total_energy_weight_unclamped(250);
         assert_eq!(d.total_energy_weight(), 100);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_default_tests {
+    use super::*;
+    use crate::MemBackend;
+    use std::sync::Arc;
+
+    fn dp() -> DynamicPropertiesStore {
+        DynamicPropertiesStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>)
+    }
+
+    /// On an empty properties directory the adaptive target ratio falls back to
+    /// java-tron's `init()` seed `14400` (`DynamicPropertiesStore.init` line
+    /// 449, `24 * 60 * 10`), not the prior literal `10`. Every real database
+    /// carries an explicit value, so this default is reached only on a fresh
+    /// node — but it must match java's seed for fresh-genesis fidelity.
+    #[test]
+    fn adaptive_target_ratio_default_matches_java_init_seed() {
+        let d = dp();
+        assert!(
+            d.get_long(keys::ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO).is_none(),
+            "fresh DB has no explicit ratio"
+        );
+        assert_eq!(d.adaptive_resource_limit_target_ratio(), 14_400);
+        // An explicit value still overrides the default.
+        d.put_long(keys::ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO, 2_880);
+        assert_eq!(d.adaptive_resource_limit_target_ratio(), 2_880);
+    }
+
+    /// The MEMO_FEE history defaults to java's init seed `"0:0"`
+    /// (`init()` line 927, `"0:" + memoFee` with `memoFee == 0`).
+    #[test]
+    fn memo_fee_history_default_matches_java_init_seed() {
+        let d = dp();
+        assert_eq!(d.memo_fee_history(), "0:0");
+        d.save_memo_fee_history("0:0,1700000000000:1000000");
+        assert_eq!(d.memo_fee_history(), "0:0,1700000000000:1000000");
     }
 }

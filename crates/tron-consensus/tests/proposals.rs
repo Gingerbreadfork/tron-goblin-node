@@ -242,3 +242,145 @@ fn parameter_id_to_key_pinned_values() {
     assert_eq!(parameter_id_to_key(50), None);
     assert_eq!(parameter_id_to_key(9999), None);
 }
+
+#[test]
+fn total_energy_limit_target_divisor_reads_live_ratio() {
+    // Fix #1: java's saveTotalEnergyLimit/saveTotalEnergyLimit2 divide by the
+    // LIVE getAdaptiveResourceLimitTargetRatio(), not a hardcoded 14400. With
+    // adaptive energy off (mainnet) the ratio is its init seed 14400; once a
+    // ratio-changing proposal (or ALLOW_ADAPTIVE_ENERGY) has moved it, a later
+    // TOTAL_ENERGY_LIMIT proposal must derive the target from the NEW ratio.
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+
+    // Seed a non-default ratio (e.g. proposal 33 wrote 24*60*2 = 2880).
+    dp.put_long(b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO", 2_880);
+
+    // TOTAL_ENERGY_LIMIT(17) = 90_000_000_000 → target = value / 2880.
+    proposals
+        .put(
+            10,
+            &make_proposal(10, vec![(17, 90_000_000_000)], 1_700_000_000_000, 20),
+        )
+        .unwrap();
+
+    let report =
+        activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
+    assert_eq!(report.approved, vec![10]);
+    assert_eq!(dp.get_long(b"TOTAL_ENERGY_LIMIT").unwrap(), 90_000_000_000);
+    assert_eq!(
+        dp.get_long(b"TOTAL_ENERGY_TARGET_LIMIT").unwrap(),
+        90_000_000_000 / 2_880,
+        "target must divide by the live ratio (2880), not 14400"
+    );
+}
+
+#[test]
+fn total_energy_limit_target_uses_default_ratio_when_unset() {
+    // With no ratio key present, the chainbase getter returns its init-seed
+    // default (14400), so the derived target matches java's pre-adaptive
+    // behaviour exactly.
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    proposals
+        .put(
+            11,
+            &make_proposal(11, vec![(17, 50_000_000_000)], 1_700_000_000_000, 20),
+        )
+        .unwrap();
+    activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
+    assert_eq!(
+        dp.get_long(b"TOTAL_ENERGY_TARGET_LIMIT").unwrap(),
+        50_000_000_000 / 14_400
+    );
+}
+
+#[test]
+fn allow_adaptive_energy_activation_sets_derived_keys() {
+    // Fix #2: the 0 -> 1 transition of ALLOW_ADAPTIVE_ENERGY(21) re-seeds the
+    // adaptive sub-state — ratio=2880, target=totalEnergyLimit/2880,
+    // multiplier=50 (java ProposalService.process lines 128-141).
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+
+    // A TOTAL_ENERGY_LIMIT must already be present for the target derivation.
+    dp.put_long(b"TOTAL_ENERGY_LIMIT", 90_000_000_000);
+
+    proposals
+        .put(20, &make_proposal(20, vec![(21, 1)], 1_700_000_000_000, 20))
+        .unwrap();
+
+    activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
+
+    assert_eq!(dp.get_long(b"ALLOW_ADAPTIVE_ENERGY").unwrap(), 1);
+    assert_eq!(
+        dp.get_long(b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO").unwrap(),
+        2_880
+    );
+    assert_eq!(
+        dp.get_long(b"TOTAL_ENERGY_TARGET_LIMIT").unwrap(),
+        90_000_000_000 / 2_880
+    );
+    assert_eq!(
+        dp.get_long(b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER").unwrap(),
+        50
+    );
+}
+
+#[test]
+fn allow_adaptive_energy_activation_is_idempotent() {
+    // java guards the whole block on `getAllowAdaptiveEnergy() == 0`, so a
+    // second activation (flag already 1) must NOT re-write the derived keys —
+    // we pre-set them to sentinel values and confirm they are untouched.
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+
+    dp.put_long(b"TOTAL_ENERGY_LIMIT", 90_000_000_000);
+    dp.put_long(b"ALLOW_ADAPTIVE_ENERGY", 1); // already enabled
+    // Sentinel values that the (skipped) derived writes would otherwise clobber.
+    dp.put_long(b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO", 7_777);
+    dp.put_long(b"TOTAL_ENERGY_TARGET_LIMIT", 8_888);
+    dp.put_long(b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER", 9_999);
+
+    proposals
+        .put(21, &make_proposal(21, vec![(21, 1)], 1_700_000_000_000, 20))
+        .unwrap();
+
+    let report =
+        activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
+    // Still recorded as an approved parameter update for the report.
+    assert_eq!(report.approved, vec![21]);
+    assert_eq!(report.parameter_updates, vec![(21, 21, 1)]);
+    // Derived keys untouched (guard skipped them).
+    assert_eq!(
+        dp.get_long(b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO").unwrap(),
+        7_777
+    );
+    assert_eq!(dp.get_long(b"TOTAL_ENERGY_TARGET_LIMIT").unwrap(), 8_888);
+    assert_eq!(
+        dp.get_long(b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER").unwrap(),
+        9_999
+    );
+}
+
+#[test]
+fn memo_fee_proposal_appends_history() {
+    // Fix #3: MEMO_FEE(68) appends `,expiration:value` to MEMO_FEE_HISTORY,
+    // keyed on the proposal's expiration time (java ProposalService.process
+    // lines 294-300). The default history is the init seed "0:0".
+    let proposals = ProposalStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+
+    let expiration = 1_700_000_000_000;
+    proposals
+        .put(30, &make_proposal(30, vec![(68, 1_000_000)], expiration, 20))
+        .unwrap();
+
+    activate_expired_proposals(&proposals, &dp, expiration + 10_000, &active_set(27)).unwrap();
+
+    assert_eq!(dp.get_long(b"MEMO_FEE").unwrap(), 1_000_000);
+    assert_eq!(
+        dp.memo_fee_history(),
+        format!("0:0,{}:{}", expiration, 1_000_000)
+    );
+}

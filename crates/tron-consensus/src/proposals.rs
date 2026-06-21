@@ -88,6 +88,24 @@ pub fn activate_expired_proposals(
             // that mapping in `parameter_id_to_key` below.
             for (param_id, value) in &proposal.parameters {
                 if let Some(key) = parameter_id_to_key(*param_id) {
+                    // ALLOW_ADAPTIVE_ENERGY(21) is idempotent: java only writes
+                    // the flag (and its derived keys) on the 0 -> 1 transition,
+                    // inside `if getAllowAdaptiveEnergy() == 0`
+                    // (ProposalService.process, lines 128-141). Capture the
+                    // prior value before the write so the side-effects below
+                    // can replicate that guard.
+                    let prev_allow_adaptive_energy = if *param_id == 21 {
+                        dyn_props.allow_adaptive_energy()
+                    } else {
+                        0
+                    };
+                    if *param_id == 21 && prev_allow_adaptive_energy != 0 {
+                        // Already enabled — java's guard skips the write and all
+                        // derived effects; mirror that and still record the
+                        // (no-op) parameter update for the report.
+                        report.parameter_updates.push((id, *param_id, *value));
+                        continue;
+                    }
                     dyn_props.put_long(key, *value);
                     // Price changes also append to the historic schedule
                     // (java's `ProposalService.process`, TRANSACTION_FEE /
@@ -136,14 +154,23 @@ pub fn activate_expired_proposals(
                             }
                         }
                         // Energy-limit proposals write derived keys too:
-                        //   17 — `saveTotalEnergyLimit`: target = v/14400.
-                        //   19 — `saveTotalEnergyLimit2`: target = v/14400,
+                        //   17 — `saveTotalEnergyLimit`: target = v / ratio.
+                        //   19 — `saveTotalEnergyLimit2`: target = v / ratio,
                         //        plus current = v when adaptive energy is
                         //        off (it is on mainnet:
                         //        ALLOW_ADAPTIVE_ENERGY = 0).
+                        // java reads the LIVE `getAdaptiveResourceLimitTargetRatio()`
+                        // as the divisor (DynamicPropertiesStore.saveTotalEnergyLimit
+                        // /saveTotalEnergyLimit2, lines 1319-1336), NOT a literal —
+                        // its init seed is 14400, but enabling ALLOW_ADAPTIVE_ENERGY
+                        // (code 21) sets it to 2880 and proposal 33 sets it to
+                        // `24 * 60 * value`. Mirror that by reading the current ratio.
                         17 | 19 => {
-                            dyn_props
-                                .put_long(b"TOTAL_ENERGY_TARGET_LIMIT", value / 14_400);
+                            let ratio = dyn_props.adaptive_resource_limit_target_ratio();
+                            if ratio != 0 {
+                                dyn_props
+                                    .put_long(b"TOTAL_ENERGY_TARGET_LIMIT", value / ratio);
+                            }
                             if *param_id == 19
                                 && dyn_props
                                     .get_long(b"ALLOW_ADAPTIVE_ENERGY")
@@ -174,6 +201,43 @@ pub fn activate_expired_proposals(
                                     current + 1,
                                 );
                             }
+                        }
+                        // MEMO_FEE(68) appends to its historic schedule the
+                        // same way the energy/bandwidth price histories do —
+                        // java's ProposalService.process lines 294-300:
+                        // `old + "," + proposalExpirationTime + ":" + value`.
+                        // The live fee is read from MEMO_FEE; this string is
+                        // RPC-query only (`getMemoFeePrices`), no state-root
+                        // effect.
+                        68 => {
+                            let appended = format!(
+                                "{},{}:{}",
+                                dyn_props.memo_fee_history(),
+                                proposal.expiration_time,
+                                value
+                            );
+                            dyn_props.save_memo_fee_history(&appended);
+                        }
+                        // ALLOW_ADAPTIVE_ENERGY(21): on the 0 -> 1 transition
+                        // (already guarded above by `prev_allow_adaptive_energy`)
+                        // java re-seeds the adaptive sub-state to its
+                        // "adaptive on" defaults — ProposalService.process
+                        // lines 128-141, gated on fork VERSION_3_6_5 which is
+                        // long-active on every mainnet database:
+                        //   ratio      = 2880  (24 * 60 * 2 — one minute = 1/2
+                        //                        of the daily energy target),
+                        //   target     = totalEnergyLimit / 2880,
+                        //   multiplier = 50.
+                        21 => {
+                            dyn_props
+                                .put_long(b"ADAPTIVE_RESOURCE_LIMIT_TARGET_RATIO", 2_880);
+                            let total = dyn_props
+                                .get_long(b"TOTAL_ENERGY_LIMIT")
+                                .unwrap_or(0);
+                            dyn_props
+                                .put_long(b"TOTAL_ENERGY_TARGET_LIMIT", total / 2_880);
+                            dyn_props
+                                .put_long(b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER", 50);
                         }
                         _ => {}
                     }
