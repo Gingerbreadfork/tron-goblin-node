@@ -45,8 +45,29 @@ pub fn ab_slot(time_ms: i64, genesis_time_ms: i64) -> i64 {
 /// Number of slots between `head_block_time` and `now`. Mirrors
 /// `DposSlot.getSlot`, used by block-producing SRs to figure out how
 /// many empty slots they need to skip past.
-pub fn slot_from_head(now_ms: i64, head_block_time_ms: i64, genesis_time_ms: i64) -> i64 {
-    let first_slot_time = slot_time_ms(1, head_block_time_ms, genesis_time_ms, false, 0);
+///
+/// `head_was_maintenance` + `maintenance_skip_slots` thread through to
+/// the `getTime(1)` baseline: when the head block crossed a maintenance
+/// boundary java's `getTime` adds `MAINTENANCE_SKIP_SLOTS` to the first
+/// expected production slot, so the production pause around maintenance
+/// is not mistaken for a missed slot. A producer that hardcodes
+/// `(false, 0)` would, right after a maintenance boundary, compute a
+/// relative slot two positions too high and so target the wrong witness
+/// / wrong block time.
+pub fn slot_from_head(
+    now_ms: i64,
+    head_block_time_ms: i64,
+    genesis_time_ms: i64,
+    head_was_maintenance: bool,
+    maintenance_skip_slots: i64,
+) -> i64 {
+    let first_slot_time = slot_time_ms(
+        1,
+        head_block_time_ms,
+        genesis_time_ms,
+        head_was_maintenance,
+        maintenance_skip_slots,
+    );
     if now_ms < first_slot_time {
         return 0;
     }

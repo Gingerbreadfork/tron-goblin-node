@@ -1,6 +1,8 @@
-//! Tests for the PBFT block-solidification pure function.
+//! Tests for the DPoS block-solidification pure functions.
 
-use tron_consensus::{latest_solid_block, solidity_threshold, RecentBlock};
+use tron_consensus::{
+    latest_solid_block, solid_block_from_witnesses, solidity_threshold, RecentBlock,
+};
 use tron_crypto::address::Address;
 
 fn witness(byte: u8) -> Address {
@@ -81,4 +83,48 @@ fn single_witness_active_set_solidifies_immediately() {
 #[test]
 fn empty_window_is_none() {
     assert!(latest_solid_block(&[], 27).is_none());
+}
+
+// --- solid_block_from_witnesses (java DposService.updateSolidBlock) -------
+
+#[test]
+fn java_solid_picks_sorted_index_eight_for_27() {
+    // 27 latest-block numbers head, head-1, ..., head-26 (any order):
+    // sorted ascending = [head-26 .. head], index (int)(27*0.3)=8 → head-18.
+    let head = 1000i64;
+    let latest: Vec<i64> = (0..27).map(|i| head - i).collect();
+    assert_eq!(solid_block_from_witnesses(&latest), Some(head - 18));
+}
+
+#[test]
+fn java_solid_index_matches_known_multiset() {
+    // [10,20,...,270] sorted, index 8 → 90.
+    let latest: Vec<i64> = (1..=27).map(|i| i as i64 * 10).collect();
+    assert_eq!(solid_block_from_witnesses(&latest), Some(90));
+}
+
+#[test]
+fn java_solid_lands_on_zero_when_under_threshold() {
+    // Only 8 of 27 witnesses produced (rest default to 0). Sorted ascending
+    // the entry at index 8 is still a 0 default → solid 0.
+    let mut latest = vec![0i64; 27];
+    for (i, v) in latest.iter_mut().take(8).enumerate() {
+        *v = 100 + i as i64;
+    }
+    assert_eq!(solid_block_from_witnesses(&latest), Some(0));
+}
+
+#[test]
+fn java_solid_position_truncates_like_int_cast() {
+    // (int)(size * 0.3): size=3 → 0, size=10 → 3, size=7 → 2.
+    assert_eq!(solid_block_from_witnesses(&[5, 1, 9]), Some(1)); // sorted[0]
+    let ten: Vec<i64> = (1..=10).collect();
+    assert_eq!(solid_block_from_witnesses(&ten), Some(4)); // sorted[3] = 4
+    let seven: Vec<i64> = (1..=7).collect();
+    assert_eq!(solid_block_from_witnesses(&seven), Some(3)); // sorted[2] = 3
+}
+
+#[test]
+fn java_solid_empty_is_none() {
+    assert!(solid_block_from_witnesses(&[]).is_none());
 }

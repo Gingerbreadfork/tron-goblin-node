@@ -9,9 +9,9 @@ use tron_chainbase::{
 };
 use tron_consensus::{
     ab_slot, apply_maintenance, best_head, compute_next_maintenance_time, is_maintenance_boundary,
-    scheduled_witness, scheduled_witness_index, slot_time_ms, update_active_witnesses,
-    verify_block_witness, ConsensusError, ForkChoice, BLOCK_PRODUCED_INTERVAL_MS,
-    MAX_ACTIVE_WITNESS_NUM,
+    scheduled_witness, scheduled_witness_index, slot_from_head, slot_time_ms,
+    update_active_witnesses, validate_block_consensus, verify_block_witness, ConsensusError,
+    ForkChoice, BLOCK_PRODUCED_INTERVAL_MS, MAINTENANCE_SKIP_SLOTS, MAX_ACTIVE_WITNESS_NUM,
 };
 use tron_crypto::address::Address;
 use tron_proto::block_header::Raw as BlockHeaderRaw;
@@ -98,6 +98,47 @@ fn slot_time_ms_advances_by_block_interval() {
     assert_eq!(result, g + 6_000);
 }
 
+// Fix #4 (producer slot math): `slot_from_head` = java `DposSlot.getSlot`,
+// which adds `MAINTENANCE_SKIP_SLOTS` to the `getTime(1)` baseline when the
+// head block crossed a maintenance boundary. A producer that hardcodes
+// `(false, 0)` would fire for the wrong slot right after maintenance.
+#[test]
+fn slot_from_head_no_maintenance_matches_simple_grid() {
+    let g = 1_700_000_001_000i64; // grid-aligned genesis
+    let head = g + 10 * BLOCK_PRODUCED_INTERVAL_MS; // slot 10
+    // getTime(1) (no maint) = head + 3000. A `now` one interval past it
+    // sits in relative slot 2.
+    let now = head + 2 * BLOCK_PRODUCED_INTERVAL_MS;
+    assert_eq!(slot_from_head(now, head, g, false, 0), 2);
+    // Exactly at getTime(1) → relative slot 1.
+    assert_eq!(slot_from_head(head + BLOCK_PRODUCED_INTERVAL_MS, head, g, false, 0), 1);
+    // Before getTime(1) → 0.
+    assert_eq!(slot_from_head(head + 1, head, g, false, 0), 0);
+}
+
+#[test]
+fn slot_from_head_maintenance_skip_pushes_first_slot_out() {
+    assert_eq!(MAINTENANCE_SKIP_SLOTS, 2);
+    let g = 1_700_000_001_000i64;
+    let head = g + 10 * BLOCK_PRODUCED_INTERVAL_MS; // slot 10
+    // With the head a maintenance block, getTime(1) = head + (1+2)*3000.
+    let first = head + (1 + MAINTENANCE_SKIP_SLOTS) * BLOCK_PRODUCED_INTERVAL_MS;
+    // A `now` that WOULD be relative slot 1 without the skip is still 0 with it.
+    let now_no_skip_slot1 = head + BLOCK_PRODUCED_INTERVAL_MS;
+    assert_eq!(slot_from_head(now_no_skip_slot1, head, g, false, 0), 1);
+    assert_eq!(
+        slot_from_head(now_no_skip_slot1, head, g, true, MAINTENANCE_SKIP_SLOTS),
+        0,
+        "the maintenance skip suppresses the first 2 post-maintenance slots"
+    );
+    // At the skipped first slot → relative slot 1.
+    assert_eq!(slot_from_head(first, head, g, true, MAINTENANCE_SKIP_SLOTS), 1);
+    assert_eq!(
+        slot_from_head(first + BLOCK_PRODUCED_INTERVAL_MS, head, g, true, MAINTENANCE_SKIP_SLOTS),
+        2
+    );
+}
+
 // =============================================================================
 // Block-witness validation
 // =============================================================================
@@ -172,6 +213,158 @@ fn verify_block_witness_rejects_empty_active_list() {
         verify_block_witness(&block, &[], 1_700_000_000_000),
         Err(ConsensusError::EmptyActiveWitnesses)
     );
+}
+
+// =============================================================================
+// Full block-acceptance gate — java DposService.validBlock
+// =============================================================================
+//
+// Fixtures: 27 witnesses, genesis `G`, head at absolute slot 100 (aligned).
+// The first expected slot after the head is `getTime(1) = G + 101*3000`
+// (no maintenance), so a block at `G + 101*3000` has relative slot 1 and
+// `currentSlot = getAbSlot(head) + 1 = 101`, scheduled witness index
+// `101 % 27 = 20`.
+
+// Genesis chosen as a multiple of BLOCK_PRODUCED_INTERVAL_MS so the slot
+// grid lines up with java's absolute-epoch alignment check
+// (`timeStamp % BLOCK_PRODUCED_INTERVAL == 0`, measured from epoch 0, not
+// from genesis). Real mainnet block timestamps are likewise grid-aligned.
+const G: i64 = 1_700_000_001_000;
+fn head_ts() -> i64 {
+    G + 100 * BLOCK_PRODUCED_INTERVAL_MS // absolute slot 100, grid-aligned
+}
+
+#[test]
+fn validate_block_consensus_accepts_scheduled_next_slot() {
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    let ts = G + 101 * BLOCK_PRODUCED_INTERVAL_MS; // relative slot 1
+    let block = make_block(101, ts, &witnesses[20]); // index (100+1)%27 = 20
+    assert!(
+        validate_block_consensus(&block, &witnesses, head_ts(), G, false, true).is_ok(),
+        "a correctly-scheduled next-slot block must pass"
+    );
+}
+
+#[test]
+fn validate_block_consensus_rejects_unscheduled_witness() {
+    // Fix #1: correctly-signed-but-wrong-SR. Witness index 20 is due;
+    // claim witness 19 instead.
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    let ts = G + 101 * BLOCK_PRODUCED_INTERVAL_MS;
+    let block = make_block(101, ts, &witnesses[19]);
+    match validate_block_consensus(&block, &witnesses, head_ts(), G, false, true) {
+        Err(ConsensusError::WrongWitness { expected, got, .. }) => {
+            assert_eq!(expected, witnesses[20]);
+            assert_eq!(got, witnesses[19]);
+        }
+        other => panic!("expected WrongWitness, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_block_consensus_rejects_same_slot_block() {
+    // Fix #3: bSlot <= hSlot is rejected (ungated) even with a correct
+    // witness for that slot. A block at the head's own slot (100).
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    let ts = head_ts(); // same absolute slot as head → bSlot == hSlot
+    // index for slot 100 = 100 % 27 = 19.
+    let block = make_block(100, ts, &witnesses[19]);
+    match validate_block_consensus(&block, &witnesses, head_ts(), G, false, false) {
+        Err(ConsensusError::NonAdvancingSlot { b_slot: 100, h_slot: 100 }) => {}
+        other => panic!("expected NonAdvancingSlot, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_block_consensus_rejects_backwards_time_block() {
+    // Fix #3: a block whose slot is BEFORE the head's is rejected.
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    let ts = G + 99 * BLOCK_PRODUCED_INTERVAL_MS; // slot 99 < head slot 100
+    let block = make_block(99, ts, &witnesses[99 % 27]);
+    assert!(matches!(
+        validate_block_consensus(&block, &witnesses, head_ts(), G, false, false),
+        Err(ConsensusError::NonAdvancingSlot { b_slot: 99, h_slot: 100 })
+    ));
+}
+
+#[test]
+fn validate_block_consensus_misalignment_gated_on_optimization() {
+    // Fix #3: timestamp not on the 3s grid. Rejected only when
+    // allowConsensusLogicOptimization is on.
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    let ts = G + 101 * BLOCK_PRODUCED_INTERVAL_MS + 17; // off the grid by 17ms
+    let block = make_block(101, ts, &witnesses[20]);
+
+    // Optimization ON → rejected for misalignment.
+    assert!(matches!(
+        validate_block_consensus(&block, &witnesses, head_ts(), G, false, true),
+        Err(ConsensusError::Misaligned { .. })
+    ));
+
+    // Optimization OFF → alignment not enforced. The 17ms still lands in
+    // relative slot 1 / currentSlot 101, so the scheduled-witness check
+    // (ungated) passes for witness 20.
+    assert!(validate_block_consensus(&block, &witnesses, head_ts(), G, false, false).is_ok());
+}
+
+#[test]
+fn validate_block_consensus_zero_slot_gated_on_optimization() {
+    // Fix #3: getSlot == 0 (timestamp hasn't reached the first expected
+    // slot after the head). Force it with a timestamp one slot AFTER the
+    // head's slot but BEFORE getTime(1): there is none in the aligned case,
+    // so use a head misaligned so getTime(1) sits a slot further out.
+    //
+    // Simpler: a block exactly at getTime(1) minus a hair still advances
+    // bSlot, but getSlot rounds to 0. Build head at slot 100 and a block at
+    // absolute slot 101 timestamp but shifted just under getTime(1).
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    // getTime(1) = G + 101*3000. A block at G + 101*3000 - 1 has bSlot
+    // = (101*3000 - 1)/3000 = 100... that fails monotonicity, not zero-slot.
+    // To isolate ZeroSlot we need bSlot > hSlot AND getSlot == 0, which the
+    // aligned grid can't produce. Use a maintenance head: getTime(1) jumps
+    // by MAINTENANCE_SKIP_SLOTS, leaving a window where bSlot advances but
+    // getSlot is still 0.
+    let ts = G + 101 * BLOCK_PRODUCED_INTERVAL_MS; // bSlot 101 > hSlot 100
+    let block = make_block(101, ts, &witnesses[20]);
+    // Head WAS maintenance → getTime(1) = aligned + (1+2)*3000 = G + 103*3000,
+    // so ts < getTime(1) → getSlot == 0.
+    assert!(matches!(
+        validate_block_consensus(&block, &witnesses, head_ts(), G, true, true),
+        Err(ConsensusError::ZeroSlot)
+    ));
+    // Optimization OFF → zero-slot not enforced; falls through to the
+    // scheduled-witness check. currentSlot = hSlot + 0 = 100 → index 19,
+    // so witness 20 is now WRONG.
+    assert!(matches!(
+        validate_block_consensus(&block, &witnesses, head_ts(), G, true, false),
+        Err(ConsensusError::WrongWitness { .. })
+    ));
+}
+
+#[test]
+fn validate_block_consensus_maintenance_skip_shifts_scheduled_witness() {
+    // Fix #3/#4 parity: the maintenance skip is folded into getSlot, and
+    // getScheduledWitness indexes (getAbSlot(head) + getSlot) — NOT
+    // getAbSlot(blockTime). With a maintenance head, a later block's
+    // relative slot is `(ts - getTime(1))/3000 + 1` where getTime(1) is
+    // pushed out by MAINTENANCE_SKIP_SLOTS.
+    assert_eq!(MAINTENANCE_SKIP_SLOTS, 2);
+    let witnesses: Vec<Address> = (0u8..27).map(addr).collect();
+    // First producible slot after a maintenance head = G + (100+1+2)*3000.
+    let ts = G + 103 * BLOCK_PRODUCED_INTERVAL_MS; // = getTime(1) for maint head
+    // getSlot = 1, currentSlot = 100 + 1 = 101, index 20.
+    let block = make_block(104, ts, &witnesses[20]);
+    assert!(
+        validate_block_consensus(&block, &witnesses, head_ts(), G, true, true).is_ok(),
+        "maintenance-skip block targets witness via (head_abs_slot + relative_slot)"
+    );
+    // The naive getAbSlot(blockTime) % 27 would be 103 % 27 = 22 — a
+    // DIFFERENT witness — proving the skip-aware path is exercised.
+    let block_wrong = make_block(104, ts, &witnesses[22]);
+    assert!(matches!(
+        validate_block_consensus(&block_wrong, &witnesses, head_ts(), G, true, true),
+        Err(ConsensusError::WrongWitness { .. })
+    ));
 }
 
 // =============================================================================

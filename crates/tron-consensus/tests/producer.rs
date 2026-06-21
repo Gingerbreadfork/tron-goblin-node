@@ -127,6 +127,29 @@ fn produce_block_rejects_non_monotonic_number() {
 }
 
 #[test]
+fn empty_block_tx_trie_root_is_32_zero_bytes() {
+    // java `BlockCapsule.calcMerkleRoot` returns `Sha256Hash.ZERO_HASH`
+    // (32 zero bytes) for a txless block, written into `txTrieRoot` by
+    // `setMerkleRoot` before the header is hashed/signed. A block WE
+    // produce must carry the same field so its hash + signed digest match
+    // java's for identical contents.
+    let (_priv, witness) = witness_keypair(0xa8);
+    let parent = genesis_block_id();
+
+    let block = assemble_block(&parent, 101, 1_700_000_003_000, &witness, vec![], 29).unwrap();
+    let raw = block.block_header.as_ref().unwrap().raw_data.as_ref().unwrap();
+    assert_eq!(
+        raw.tx_trie_root,
+        vec![0u8; 32],
+        "empty-block txTrieRoot must be 32 zero bytes, not empty"
+    );
+
+    // And the verifier accepts it (the verification side already treats
+    // empty + zero-hash as equivalent for a txless block).
+    verify_tx_trie_root(&block).expect("zero-hash root verifies for a txless block");
+}
+
+#[test]
 fn assemble_block_sets_witness_address_in_header() {
     let (_priv, witness) = witness_keypair(0xa5);
     let parent = genesis_block_id();

@@ -68,9 +68,16 @@ pub fn assemble_block(
         });
     }
 
+    // java `BlockCapsule.calcMerkleRoot` returns `Sha256Hash.ZERO_HASH`
+    // (32 zero bytes), NOT an empty value, for a txless block — and
+    // `setMerkleRoot` writes that into `txTrieRoot` before the header is
+    // hashed/signed. Substituting an empty `Vec` would change the header's
+    // serialized bytes, so a block WE produce would carry a different
+    // hash / signed digest than java's for the same contents. Use the
+    // all-zero 32-byte hash when there are no transactions.
     let tx_trie_root = tron_types::calc_tx_trie_root(&transactions)
         .map(|h| h.to_vec())
-        .unwrap_or_default();
+        .unwrap_or_else(|| vec![0u8; 32]);
 
     let raw = BlockHeaderRaw {
         timestamp: timestamp_ms,

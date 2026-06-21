@@ -63,6 +63,8 @@ pub use slot::{
 };
 pub use producer::{assemble_block, encode_for_broadcast, produce_block, ProducerError};
 pub use proposals::{activate_expired_proposals, parameter_id_to_key, ProposalActivationReport};
-pub use solidify::{latest_solid_block, solidity_threshold, RecentBlock};
+pub use solidify::{latest_solid_block, solid_block_from_witnesses, solidity_threshold, RecentBlock};
 pub use sr_epoch::{shared_from_current, SharedSrEpochSnapshot, SrEpochSnapshot};
-pub use validate::{verify_block_witness, ConsensusError};
+pub use validate::{
+    validate_block_consensus, verify_block_witness, ConsensusError, MAINTENANCE_SKIP_SLOTS,
+};

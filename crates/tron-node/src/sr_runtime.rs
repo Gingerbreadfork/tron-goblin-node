@@ -10,9 +10,10 @@
 //! low at the cost of a few wasted polls):
 //!
 //! 1. Read head info (number, hash, timestamp, genesis timestamp).
-//! 2. Compute `slot_from_head(now, head_time, genesis_time)` — how
-//!    many full slots have elapsed since the head. If zero, sleep
-//!    until the next slot boundary.
+//! 2. Compute `slot_from_head(now, head_time, genesis_time, …)` — how
+//!    many full slots have elapsed since the head (java `getSlot`,
+//!    including the maintenance skip when the head crossed a
+//!    maintenance boundary). If zero, sleep until the next slot.
 //! 3. Compute `abs_slot = ab_slot(head_time) + slots_since` —
 //!    the absolute slot number for the block we'd produce.
 //! 4. Load the active witness list. Compute
@@ -49,8 +50,7 @@ use tron_chainbase::{
     WitnessScheduleStore,
 };
 use tron_consensus::{
-    ab_slot, scheduled_witness, slot_from_head, BLOCK_PRODUCED_INTERVAL_MS,
-    KhaosDb,
+    ab_slot, scheduled_witness, slot_from_head, slot_time_ms, KhaosDb, MAINTENANCE_SKIP_SLOTS,
 };
 use tron_crypto::address::Address;
 use tron_executor::{execute_block_with_undo_and_config, StateBackends};
@@ -472,14 +472,31 @@ impl SrRuntime {
             return Ok(None);
         };
         let genesis_time = dp.genesis_block_timestamp().unwrap_or(0);
+        // java `consensusDelegate.lastHeadBlockIsMaintenance()` =
+        // `getStateFlag() == 1`. When the head block crossed a maintenance
+        // boundary `DposSlot.getTime` adds `MAINTENANCE_SKIP_SLOTS`, so both
+        // the relative slot (`getSlot`) and the produced block time
+        // (`getTime(slot)`) must account for it — without the skip a
+        // producer fires for the wrong slot/witness right after maintenance.
+        let head_was_maintenance = dp.state_flag() == 1;
 
-        // Compute the current absolute slot.
+        // Compute the relative slot since the head (java `getSlot`).
         let now_ms = current_time_ms();
-        let slots_since = slot_from_head(now_ms, head_time, genesis_time);
+        let slots_since = slot_from_head(
+            now_ms,
+            head_time,
+            genesis_time,
+            head_was_maintenance,
+            MAINTENANCE_SKIP_SLOTS,
+        );
         if slots_since < 1 {
             // Haven't crossed into the next slot yet.
             return Ok(None);
         }
+        // java `getScheduledWitness(slot)` indexes
+        // `active[(getAbSlot(headTime) + slot) % size]`; `target_slot` is
+        // that `currentSlot`. The maintenance skip is already folded into
+        // `slots_since`, so it must NOT be added again here.
         let head_abs_slot = ab_slot(head_time, genesis_time);
         let target_slot = head_abs_slot + slots_since;
         if target_slot <= last_produced_slot {
@@ -505,11 +522,20 @@ impl SrRuntime {
             return Ok(None);
         }
 
-        // The block's timestamp is the slot's "expected" time —
-        // `head_time + slots_since * BLOCK_PRODUCED_INTERVAL_MS`.
-        // We use the slot time, not `now_ms`, so produced timestamps
-        // align with the slot schedule.
-        let block_time = head_time + slots_since * BLOCK_PRODUCED_INTERVAL_MS;
+        // The block's timestamp is java's `dposSlot.getTime(slot)`: the
+        // head timestamp aligned DOWN to the 3s grid, plus
+        // `(slots_since + maintenance_skip) * interval`. We use the slot
+        // time (not `now_ms`) so produced timestamps land exactly on the
+        // schedule grid, and route through `slot_time_ms` so the
+        // maintenance skip + head alignment match java byte-for-byte —
+        // the prior `head_time + slots_since * interval` dropped both.
+        let block_time = slot_time_ms(
+            slots_since,
+            head_time,
+            genesis_time,
+            head_was_maintenance,
+            MAINTENANCE_SKIP_SLOTS,
+        );
 
         // Drain mempool: pull up to max_txs_per_block tx ids; only
         // keep ones still in the mempool's pending map (race-safe).
