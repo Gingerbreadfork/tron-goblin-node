@@ -71,5 +71,7 @@ pub use sync::{
     recv_block, recv_chain_inventory, recv_fetch_inv_data, recv_sync_request, send_block,
     send_chain_inventory, send_fetch_inv_data, send_sync_request, SyncError,
 };
-pub use transport::{Frame, FrameError, InboundByteBudget, TronFrameCodec, MAX_FRAME_BYTES};
+pub use transport::{
+    Frame, FrameError, InboundByteBudget, TronFrameCodec, MAX_FRAME_BYTES, MAX_MESSAGE_LENGTH,
+};
 pub use varint::{decode_varint32, encode_varint32, VarintError, MAX_VARINT32_BYTES};

@@ -353,6 +353,18 @@ where
                     ),
                     None => (Vec::new(), 0),
                 };
+                // Empty ids means the peer's locator shares no block with our
+                // main chain. java-tron's `SyncBlockChainMsgHandler` never replies
+                // with an empty `BlockChainInventory` in this case — `getLostBlockIds`
+                // throws (`SYNC_FAILED`) and the peer is disconnected with
+                // `INCOMPATIBLE_CHAIN`. A java peer that DID receive an empty
+                // inventory would reject it in `ChainInventoryMsgHandler.check()`
+                // ("blockIds is empty") with `BAD_MESSAGE` and drop us. Mirror java:
+                // close the connection instead of emitting an inventory it refuses.
+                if ids.is_empty() {
+                    debug!(%peer_addr, "inbound SyncBlockChain shares no common block; disconnecting");
+                    return Ok(());
+                }
                 let reply = tron_net::sync::chain_inventory_from_ids(&ids, remain);
                 tron_net::sync::send_chain_inventory(&mut conn, &reply)
                     .await
@@ -552,6 +564,69 @@ mod tests {
 
         let mut conn = PeerConnection::new(client_io);
         drive_client(&mut conn).await;
+
+        drop(conn);
+        let _ = server_task.await;
+    }
+
+    /// A peer whose locator shares no block with our main chain must NOT receive
+    /// an empty `BlockChainInventory` (java-tron's `ChainInventoryMsgHandler`
+    /// rejects an empty inventory with `BAD_MESSAGE`). Mirror java's
+    /// `SyncBlockChainMsgHandler`, which disconnects instead. We assert the
+    /// connection is closed with no inventory frame on the wire.
+    #[tokio::test]
+    async fn inbound_no_common_block_disconnects_without_empty_inventory() {
+        let server = test_server();
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let srv = server.clone();
+        let server_task =
+            tokio::spawn(async move { serve_inbound_peer(&srv, server_io, "fork-peer").await });
+
+        let genesis = genesis_block_id(&mainnet_inputs());
+        let ts = now_ms();
+        let from = Endpoint {
+            address: b"127.0.0.1".to_vec(),
+            address_ipv6: Vec::new(),
+            port: 18_888,
+            node_id: random_node_id(),
+        };
+        let mut conn = PeerConnection::new(client_io);
+        conn.libp2p_handshake(Libp2pHelloInputs {
+            from: from.clone(),
+            network_id: NETWORK_ID_MAINNET,
+            version: LIBP2P_VERSION,
+            timestamp_ms: ts,
+        })
+        .await
+        .expect("client libp2p handshake");
+        conn.handshake(HelloInputs {
+            from,
+            version: MAINNET_P2P_VERSION,
+            timestamp_ms: ts,
+            genesis,
+            solid: genesis,
+            head: genesis,
+            node_type: 0,
+            lowest_block_num: 0,
+            code_version: b"test-client",
+        })
+        .await
+        .expect("client app handshake");
+
+        // Locator entries that exist at NO number on the server's 1..=HEAD chain
+        // (numbers above HEAD), so there's no common ancestor.
+        let locator = vec![block_id(HEAD + 5), block_id(HEAD + 4)];
+        tron_net::sync::send_sync_request(&mut conn, &locator)
+            .await
+            .expect("send sync request");
+
+        // The server must close WITHOUT sending a (BlockChain)Inventory frame.
+        // A clean EOF surfaces as PeerClosed; never a decoded inventory.
+        match tron_net::sync::recv_chain_inventory(&mut conn).await {
+            Err(tron_net::SyncError::PeerClosed) => {}
+            Err(tron_net::SyncError::Frame(_)) => {}
+            other => panic!("expected peer close, got {other:?}"),
+        }
 
         drop(conn);
         let _ = server_task.await;

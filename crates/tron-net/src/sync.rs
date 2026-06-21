@@ -187,8 +187,16 @@ pub fn chain_inventory_from_ids(ids: &[BlockId], remain_num: i64) -> ChainInvent
 }
 
 /// Await a `SyncBlockChain` request (provider side). Returns the
-/// requester's chain summary.
-pub async fn recv_sync_request<S>(conn: &mut PeerConnection<S>) -> Result<ChainInventory, SyncError>
+/// requester's chain summary as a [`BlockInventory`].
+///
+/// java-tron's `SyncBlockChainMessage` extends `BlockInventoryMessage`, so the
+/// wire payload is a `BlockInventory` (`ids` + `type=SYNC`), NOT a
+/// `ChainInventory`. The two share the same field-1 (`ids`) layout, but field 2
+/// differs: `BlockInventory.type` (enum) vs `ChainInventory.remain_num`
+/// (int64). Decoding the request as `ChainInventory` would misread the `type`
+/// enum as `remain_num` — harmless only while `Type::SYNC == 0`, but wrong in
+/// principle. Decode the proto java actually sends.
+pub async fn recv_sync_request<S>(conn: &mut PeerConnection<S>) -> Result<BlockInventory, SyncError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -199,7 +207,7 @@ where
             got: frame.ty,
         });
     }
-    ChainInventory::decode(frame.payload).map_err(|e| SyncError::Decode(e.to_string()))
+    BlockInventory::decode(frame.payload).map_err(|e| SyncError::Decode(e.to_string()))
 }
 
 /// Await a `FetchInvData` (provider side). Returns the requested ids.

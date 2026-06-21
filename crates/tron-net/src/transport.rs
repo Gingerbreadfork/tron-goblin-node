@@ -33,6 +33,19 @@ use crate::varint::{decode_varint32, encode_varint32, VarintError};
 /// 10 MiB — large enough for full blocks, small enough to bound RAM.
 pub const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 
+/// The connection-layer message-length ceiling enforced by tronprotocol/libp2p:
+/// `Parameter.MAX_MESSAGE_LENGTH` (5 MiB). Two places in libp2p apply it:
+///   * `P2pProtobufVarint32FrameDecoder` rejects any inbound TCP frame whose
+///     declared length `>= MAX_MESSAGE_LENGTH` with `DisconnectReason.BAD_MESSAGE`.
+///   * `ProtoUtil.uncompressMessage` rejects a snappy frame whose *decompressed*
+///     length `>= MAX_MESSAGE_LENGTH` with `P2pException.BIG_MESSAGE`.
+///
+/// A peer never sends us a single message larger than this, so matching the
+/// bound tightens the snappy decompression-bomb guard to exactly java's
+/// behaviour (a wrapped frame java would reject as `BIG_MESSAGE`, we reject too)
+/// rather than the looser [`MAX_FRAME_BYTES`].
+pub const MAX_MESSAGE_LENGTH: usize = 5 * 1024 * 1024;
+
 /// Process-wide budget on inbound frame bytes being buffered concurrently
 /// across all peer connections (N-3). Clone-cheap (Arc-shared semaphore);
 /// create **one** and hand the same handle to every connection so they

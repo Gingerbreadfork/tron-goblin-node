@@ -92,7 +92,9 @@ async fn sync_request_carries_caller_summary_bytes() {
     assert_eq!(received.ids.len(), 1);
     assert_eq!(received.ids[0].hash, genesis.as_bytes());
     assert_eq!(received.ids[0].number, 0);
-    assert_eq!(received.remain_num, 0);
+    // java-tron's SyncBlockChainMessage carries a BlockInventory with
+    // `type = SYNC`; the request side never sets `remain_num`.
+    assert_eq!(received.r#type, tron_proto::block_inventory::Type::Sync as i32);
 }
 
 // === Full sync flow ========================================================

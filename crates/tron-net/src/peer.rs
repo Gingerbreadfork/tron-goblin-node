@@ -33,7 +33,9 @@ use tron_proto::{DisconnectMessage, Endpoint, HelloMessage, ReasonCode};
 
 use crate::hello::{build_hello, HelloInputs};
 use crate::message_type::MessageType;
-use crate::transport::{Frame, FrameError, InboundByteBudget, TronFrameCodec, MAX_FRAME_BYTES};
+use crate::transport::{
+    Frame, FrameError, InboundByteBudget, TronFrameCodec, MAX_MESSAGE_LENGTH,
+};
 
 /// Inputs needed for the libp2p-layer (connection-level) Hello.
 ///
@@ -513,10 +515,14 @@ where
 }
 
 /// Decompress a snappy frame, rejecting a decompression bomb whose
-/// declared output exceeds [`MAX_FRAME_BYTES`] *before* allocating (N-4).
-/// The on-wire frame is already capped, but snappy can inflate ~10 MiB
+/// declared output exceeds [`MAX_MESSAGE_LENGTH`] *before* allocating (N-4).
+/// The on-wire frame is already capped, but snappy can inflate ~5 MiB
 /// into hundreds of MiB; `decompress_len` reads only the frame's varint
 /// size prefix, so the guard is O(1) and allocation-free.
+///
+/// The bound matches tronprotocol/libp2p's `ProtoUtil.uncompressMessage`,
+/// which rejects a decompressed length `>= MAX_MESSAGE_LENGTH` (5 MiB) as
+/// `BIG_MESSAGE`: a wrapped frame a java peer would refuse, we refuse too.
 fn snappy_decompress_checked(data: &[u8]) -> Result<Vec<u8>, FrameError> {
     let declared = snap::raw::decompress_len(data).map_err(|e| {
         FrameError::Io(std::io::Error::new(
@@ -524,7 +530,7 @@ fn snappy_decompress_checked(data: &[u8]) -> Result<Vec<u8>, FrameError> {
             format!("snappy decompress_len: {e}"),
         ))
     })?;
-    if declared > MAX_FRAME_BYTES {
+    if declared >= MAX_MESSAGE_LENGTH {
         return Err(FrameError::TooLarge);
     }
     snap::raw::Decoder::new().decompress_vec(data).map_err(|e| {
@@ -679,6 +685,7 @@ fn libp2p_handshake_code_name(code: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::MAX_FRAME_BYTES;
 
     // === compress-wrap codepath coverage (N-6 / N-37) ===
     //
@@ -815,6 +822,27 @@ mod tests {
         let compressed = snap::raw::Encoder::new().compress_vec(&original).unwrap();
         let got = snappy_decompress_checked(&compressed).expect("normal frame decompresses");
         assert_eq!(got, original);
+    }
+
+    #[test]
+    fn snappy_decompress_checked_rejects_above_message_length() {
+        // A frame whose decompressed size sits between MAX_MESSAGE_LENGTH (5 MiB,
+        // java's libp2p BIG_MESSAGE ceiling) and MAX_FRAME_BYTES (our on-wire cap)
+        // must be rejected: a java peer's `ProtoUtil.uncompressMessage` would
+        // refuse it, so we refuse it too for parity.
+        let declared = MAX_MESSAGE_LENGTH + 1024;
+        assert!(declared < MAX_FRAME_BYTES);
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&vec![0u8; declared])
+            .unwrap();
+        assert!(
+            compressed.len() < MAX_FRAME_BYTES,
+            "compressed form must still fit the on-wire frame cap"
+        );
+        assert!(matches!(
+            snappy_decompress_checked(&compressed),
+            Err(FrameError::TooLarge)
+        ));
     }
 
     #[tokio::test]
