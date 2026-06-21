@@ -28,9 +28,10 @@ use crate::transfer::ExecutionResult;
 use crate::ActuatorError;
 
 /// 32-byte max for asset names. java-tron's `TransactionUtil.validAssetName`.
+/// Also the limit for an AssetIssue abbreviation: `AssetIssueActuator.validate`
+/// checks the abbr with `validAssetName`, not `validTokenAbbrName` (the latter's
+/// 5-byte limit is test-only in java and never applied to a real AssetIssue).
 pub const MAX_ASSET_NAME_BYTES: usize = 32;
-/// 5-byte max for token abbreviation. java `MAX_TOKEN_ABBR_NAME_LEN`.
-const MAX_TOKEN_ABBR_NAME_BYTES: usize = 5;
 /// 200-byte max for asset description. java `MAX_ASSET_DESCRIPTION_LEN`.
 const MAX_ASSET_DESCRIPTION_BYTES: usize = 200;
 /// 256-byte max for asset URL. java `MAX_URL_LEN`.
@@ -65,11 +66,6 @@ fn valid_bytes(bytes: &[u8], max_len: usize, allow_empty: bool) -> bool {
 /// java `TransactionUtil.validAssetName`.
 fn valid_asset_name(name: &[u8]) -> bool {
     valid_readable_bytes(name, MAX_ASSET_NAME_BYTES)
-}
-
-/// java `TransactionUtil.validTokenAbbrName`.
-fn valid_token_abbr_name(abbr: &[u8]) -> bool {
-    valid_readable_bytes(abbr, MAX_TOKEN_ABBR_NAME_BYTES)
 }
 
 /// java `TransactionUtil.validUrl` (`validBytes(url, MAX_URL_LEN, false)`):
@@ -207,8 +203,11 @@ pub fn validate_asset_issue(
         return Err(ActuatorError::AssetMissing);
     }
 
-    // java: abbr (if non-empty) must be a valid readable token-abbr name.
-    if !contract.abbr.is_empty() && !valid_token_abbr_name(&contract.abbr) {
+    // java AssetIssueActuator.validate checks the abbr (when non-empty) with
+    // validAssetName — readable bytes up to the 32-byte asset-name limit — NOT
+    // validTokenAbbrName (whose 5-byte limit is test-only in java and never
+    // applied to a real AssetIssue). e.g. abbr "PGON.PRO" (8 bytes) is valid.
+    if !contract.abbr.is_empty() && !valid_asset_name(&contract.abbr) {
         return Err(ActuatorError::AssetMissing);
     }
 
