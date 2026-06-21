@@ -15,7 +15,7 @@ use tron_consensus::{
 };
 use tron_crypto::address::Address;
 use tron_proto::block_header::Raw as BlockHeaderRaw;
-use tron_proto::{Block, BlockHeader, Vote as AccountVote, Votes, Witness};
+use tron_proto::{Account, Block, BlockHeader, Vote as AccountVote, Votes, Witness};
 use tron_types::BlockId;
 
 fn mem() -> Arc<dyn KvBackend> {
@@ -767,6 +767,190 @@ fn apply_maintenance_nonempty_vote_cycle_reranks_and_saves() {
     assert_eq!(schedule.load_active().unwrap().unwrap(), vec![w_a, w_b]);
     // Votes store cleared for the next cycle.
     assert!(votes.get(&voter).unwrap().is_none());
+}
+
+#[test]
+fn apply_maintenance_legacy_reward_selects_first_127_by_address_not_vote() {
+    // Legacy `IncentiveManager.reward` (allowChangeDelegation == 0, the default
+    // on a fresh store) pays the FIRST 127 witnesses in `getAllWitnesses()`
+    // DB-iteration order (address ascending) — NOT the top-127 by vote. With
+    // more than 127 registered witnesses these are different sets: the
+    // highest-address witness is excluded even if it holds the largest vote.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+    let accounts = AccountStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let dyn_props = DynamicPropertiesStore::new(mem());
+
+    // 128 registered witnesses, addresses ascending by seed 1..=128.
+    // Give every witness a uniform vote of 100 EXCEPT the highest-address
+    // one (seed 128), which holds the largest vote (10_000). A vote-sorted
+    // top-127 would keep seed 128 and drop a uniform-vote witness; the
+    // DB-order first-127 keeps seeds 1..=127 and drops seed 128.
+    const N: u8 = 128;
+    for seed in 1..=N {
+        let a = addr(seed);
+        let vote = if seed == N { 10_000 } else { 100 };
+        witnesses
+            .put(
+                &a,
+                &Witness {
+                    address: a.as_bytes().to_vec(),
+                    vote_count: vote,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // A registered witness always has an account on a real chain (java's
+        // `getAccount` returns it). Seed it with zero allowance so the legacy
+        // reward only adds to an existing row.
+        accounts
+            .put(
+                &a,
+                &Account {
+                    address: a.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    // A vote mutation so `countWitness` is non-empty (java wraps the reward in
+    // `if (!countWitness.isEmpty())`). Vote for the lowest-address witness.
+    let voter = addr(200);
+    votes
+        .put(
+            &voter,
+            &Votes {
+                address: voter.as_bytes().to_vec(),
+                old_votes: Vec::new(),
+                new_votes: vec![AccountVote {
+                    vote_address: addr(1).as_bytes().to_vec(),
+                    vote_count: 0,
+                }],
+            },
+        )
+        .unwrap();
+
+    apply_maintenance(
+        &witnesses,
+        &votes,
+        &schedule,
+        &accounts,
+        &delegation,
+        &dyn_props,
+    )
+    .unwrap();
+
+    // The first-127 subset is seeds 1..=127 (all vote 100). voteSum = 127*100
+    // = 12_700, totalPay = 115_200_000_000 (default WITNESS_STANDBY_ALLOWANCE).
+    // Each is paid (long)(100 * (115_200_000_000 / 12_700)).
+    let total_pay: i64 = dyn_props.witness_standby_allowance();
+    let vote_sum: i64 = 127 * 100;
+    let each_vote_pay = total_pay as f64 / vote_sum as f64;
+    let expected_pay = (100.0_f64 * each_vote_pay) as i64;
+    assert!(expected_pay > 0);
+
+    // An included low-address witness is paid the expected amount.
+    assert_eq!(
+        accounts.get(&addr(1)).unwrap().unwrap().allowance,
+        expected_pay
+    );
+    // The highest-address witness (seed 128) is OUTSIDE the first-127 even
+    // though it holds the largest vote — its allowance stays 0.
+    assert_eq!(accounts.get(&addr(N)).unwrap().unwrap().allowance, 0);
+}
+
+#[test]
+fn apply_maintenance_legacy_reward_pays_unconditionally_when_rounding_to_zero() {
+    // java `IncentiveManager.reward` calls `setAllowance(allowance + pay)` for
+    // every witness in the subset with NO `pay > 0` guard. A witness whose
+    // floored share rounds to 0 is still touched (allowance unchanged, account
+    // persisted). Verify a tiny-vote witness alongside a whale rounds to 0 pay
+    // yet the dominant witness is still paid the bulk.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+    let accounts = AccountStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let dyn_props = DynamicPropertiesStore::new(mem());
+
+    // Two witnesses: a whale (huge vote) and a dust witness whose floored
+    // share `(long)(1 * (totalPay / voteSum))` rounds to 0 because the whale
+    // dominates voteSum.
+    let whale = addr(10);
+    let dust = addr(20);
+    let whale_vote = 115_200_000_000i64; // makes per-vote pay ~= 1 sun
+    witnesses
+        .put(
+            &whale,
+            &Witness {
+                address: whale.as_bytes().to_vec(),
+                vote_count: whale_vote,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    witnesses
+        .put(
+            &dust,
+            &Witness {
+                address: dust.as_bytes().to_vec(),
+                vote_count: 0, // contributes nothing, rounds to 0 pay
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Both witnesses have accounts (java's `getAccount` is non-null for a
+    // registered witness). Seed both with zero allowance.
+    for w in [&whale, &dust] {
+        accounts
+            .put(
+                w,
+                &Account {
+                    address: w.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let voter = addr(200);
+    votes
+        .put(
+            &voter,
+            &Votes {
+                address: voter.as_bytes().to_vec(),
+                old_votes: Vec::new(),
+                new_votes: vec![AccountVote {
+                    vote_address: whale.as_bytes().to_vec(),
+                    vote_count: 0,
+                }],
+            },
+        )
+        .unwrap();
+
+    apply_maintenance(
+        &witnesses,
+        &votes,
+        &schedule,
+        &accounts,
+        &delegation,
+        &dyn_props,
+    )
+    .unwrap();
+
+    // voteSum = whale_vote + 0. each_vote_pay = totalPay / whale_vote.
+    let total_pay: i64 = dyn_props.witness_standby_allowance();
+    let each_vote_pay = total_pay as f64 / whale_vote as f64;
+    let whale_pay = (whale_vote as f64 * each_vote_pay) as i64;
+    assert_eq!(accounts.get(&whale).unwrap().unwrap().allowance, whale_pay);
+    // Dust witness: pay rounds to 0. java still calls setAllowance/saveAccount,
+    // so the account row is written with an unchanged (zero) allowance.
+    let dust_acct = accounts.get(&dust).unwrap();
+    assert!(dust_acct.is_some());
+    assert_eq!(dust_acct.unwrap().allowance, 0);
 }
 
 // =============================================================================

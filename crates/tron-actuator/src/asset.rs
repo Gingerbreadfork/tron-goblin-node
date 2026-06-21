@@ -412,9 +412,18 @@ pub fn execute_asset_issue(
     // accordingly so mainnet leaves no stray name-keyed V1 asset-issue row.
     let allow_same_token_name = dyn_props.allow_same_token_name().unwrap_or(0);
     if allow_same_token_name == 0 {
+        // Legacy arm: V1 keeps the contract's precision; the parallel V2 row
+        // is written with `precision` forced to 0
+        // (`assetIssueCapsuleV2.setPrecision(0)` at AssetIssueActuator.java:78).
+        // Mainnet (flag on) never enters here, so the V2 row keeps its
+        // declared precision via the shared `to_store` below.
         v1.put(&contract.name, &to_store)?;
+        let mut v2_store = to_store.clone();
+        v2_store.precision = 0;
+        v2.put(next_token_id, &v2_store)?;
+    } else {
+        v2.put(next_token_id, &to_store)?;
     }
-    v2.put(next_token_id, &to_store)?;
 
     // java: build a Frozen entry per FrozenSupply
     // (frozenBalance = frozenAmount, expireTime = startTime +

@@ -258,6 +258,41 @@ fn issue_execute_assigns_token_id_and_writes_both_stores() {
 }
 
 #[test]
+fn issue_execute_legacy_forces_v2_precision_zero_keeps_v1_precision() {
+    // java `AssetIssueActuator.execute` (AssetIssueActuator.java:77-82): on the
+    // legacy `getAllowSameTokenName() == 0` path the V1 capsule keeps the
+    // declared precision, while the parallel V2 capsule has `setPrecision(0)`
+    // before being written. Default `ctx()` has allowSameTokenName == 0.
+    let ctx = ctx();
+    put_account(&ctx, ALICE, 10_000_000_000);
+    let mut c = base_issue();
+    c.precision = 6;
+    asset::execute_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    // V1 row keeps the contract's declared precision.
+    let v1_entry = ctx.v1.get(b"TestCoin").unwrap().unwrap();
+    assert_eq!(v1_entry.precision, 6);
+    // V2 row is written with precision forced to 0 on the legacy path.
+    let v2_entry = ctx.v2.get(1_000_001).unwrap().unwrap();
+    assert_eq!(v2_entry.precision, 0);
+}
+
+#[test]
+fn issue_execute_mainnet_keeps_v2_precision() {
+    // On the mainnet `getAllowSameTokenName() == 1` else-branch the V2 capsule
+    // is written with the contract's declared precision (no `setPrecision(0)`).
+    let ctx = ctx();
+    ctx.dp.save_allow_same_token_name(1);
+    put_account(&ctx, ALICE, 10_000_000_000);
+    let mut c = base_issue();
+    c.precision = 6;
+    asset::execute_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    let v2_entry = ctx.v2.get(1_000_001).unwrap().unwrap();
+    assert_eq!(v2_entry.precision, 6);
+    // No V1 row on the mainnet path.
+    assert!(ctx.v1.get(b"TestCoin").unwrap().is_none());
+}
+
+#[test]
 fn issue_execute_writes_v2_only_when_allow_same_token_name_on() {
     // java `AssetIssueActuator.execute` (AssetIssueActuator.java:76-86): with
     // getAllowSameTokenName() == 1 (mainnet) the else-branch writes V2 ONLY;

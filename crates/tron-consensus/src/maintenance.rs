@@ -339,28 +339,34 @@ pub fn apply_maintenance(
     //    Gated on a non-empty vote tally to mirror java's `if (!countWitness
     //    .isEmpty())` wrapper around `incentiveManager.reward`.
     if !allow_change_delegation && !count_witness_empty {
-        // Top 127 by vote_count.
-        let mut by_vote: Vec<(Address, i64)> = witnesses
+        // java `IncentiveManager.reward(newWitnessAddressList)`: the argument
+        // is `MaintenanceManager`'s `newWitnessAddressList`, built by iterating
+        // `consensusDelegate.getAllWitnesses()` and appending each address in
+        // DB-iteration order (witness store keyed by address → ascending
+        // byte order). It is NOT vote-sorted. `IncentiveManager.reward` then
+        // takes `subList(0, WITNESS_STANDBY_LENGTH)` — the FIRST 127 by that
+        // address order — sums their `getVoteCount()` into `voteSum`, returns
+        // early on `voteSum <= 0`, and pays every witness in the subset
+        // `(long)(voteCount * ((double) totalPay / voteSum))` into `allowance`
+        // UNCONDITIONALLY (no `pay > 0` skip). `witnesses.all()` already
+        // returns rows in ascending key (address) order — the same as java's
+        // `getAllWitnesses()` — so no sort is applied here.
+        let by_address: Vec<(Address, i64)> = witnesses
             .all()?
             .into_iter()
             .map(|(addr, w)| (addr, w.vote_count))
             .collect();
-        // vote DESC then address-bytes DESC on a tie — `WitnessStore
-        // .sortWitnesses` with `isSortOpt = true` (mainnet) sorts by
-        // `createReadableString().reversed()`, the hex of the address
-        // descending, which is byte-order descending.
-        by_vote.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
         const STANDBY_LEN: usize = 127;
-        by_vote.truncate(STANDBY_LEN);
-        let vote_sum: i64 = by_vote.iter().map(|(_, v)| *v).sum();
+        let subset = &by_address[..by_address.len().min(STANDBY_LEN)];
+        let vote_sum: i64 = subset.iter().map(|(_, v)| *v).sum();
         if vote_sum > 0 {
             let total_pay = dyn_props.witness_standby_allowance();
             let each_vote_pay = total_pay as f64 / vote_sum as f64;
-            for (addr, vc) in &by_vote {
+            for (addr, vc) in subset {
+                // java: `(long)(voteCount * ((double) totalPay / voteSum))`,
+                // credited even when it rounds to 0 (java has no skip and
+                // `setAllowance` is always called).
                 let pay = (*vc as f64 * each_vote_pay) as i64;
-                if pay <= 0 {
-                    continue;
-                }
                 if let Some(mut acct) = accounts.get(addr)? {
                     acct.allowance = acct.allowance.saturating_add(pay);
                     accounts.put(addr, &acct)?;
