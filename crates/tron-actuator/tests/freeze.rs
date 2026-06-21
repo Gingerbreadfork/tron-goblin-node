@@ -149,6 +149,29 @@ fn freeze_v1_rejects_invalid_resource_code() {
     }
 }
 
+#[test]
+fn freeze_v1_rejects_when_unfreeze_delay_active() {
+    // java FreezeBalanceActuator.validate:271-274 — once Stake 2.0 is live
+    // (UNFREEZE_DELAY_DAYS > 0) every legacy v1 freeze is rejected, even one
+    // that would otherwise pass. On mainnet the delay is active.
+    let accounts = AccountStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    put_account(&accounts, ALICE, 100 * PRECISION);
+    let c = FreezeBalanceContract {
+        owner_address: ALICE.to_vec(),
+        frozen_balance: 10 * PRECISION,
+        frozen_duration: 3,
+        resource: 0,
+        receiver_address: Vec::new(),
+    };
+    // Without the delay, an otherwise-valid v1 freeze validates.
+    assert!(freeze::validate_freeze_balance(&accounts, &dp, &c).is_ok());
+    // With the delay active, the same freeze is closed.
+    dp.put_long(b"UNFREEZE_DELAY_DAYS", 14);
+    let err = freeze::validate_freeze_balance(&accounts, &dp, &c).unwrap_err();
+    assert!(matches!(err, ActuatorError::LegacyFreezeClosed), "got: {err:?}");
+}
+
 // ============================================================
 // FreezeBalance v1 — execute (weight accounting)
 // ============================================================

@@ -160,6 +160,8 @@ pub enum ActuatorError {
     InvalidResourceCode,
     #[error("V2 not enabled (supportUnfreezeDelay must be 1)")]
     UnfreezeDelayDisabled,
+    #[error("freeze v2 is open, old freeze is closed")]
+    LegacyFreezeClosed,
     #[error("nothing to unfreeze for this resource")]
     NothingToUnfreeze,
     #[error("unfreeze amount exceeds frozen balance")]

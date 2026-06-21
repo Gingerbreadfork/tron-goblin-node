@@ -86,6 +86,15 @@ pub fn validate_freeze_balance(
             return Err(ActuatorError::DelegationToContract);
         }
     }
+    // java `FreezeBalanceActuator.validate` final gate (FreezeBalanceActuator.java
+    // :271-274): once Stake 2.0 is live (`supportUnfreezeDelay()`, i.e.
+    // UNFREEZE_DELAY_DAYS > 0) the legacy v1 FreezeBalanceContract is closed
+    // entirely — every v1 freeze is rejected, after the resource/receiver checks
+    // above. On the mainnet snapshot the delay is active, so no v1 freeze can be
+    // produced or replayed; this gate keeps admission/production parity with java.
+    if dyn_props.support_unfreeze_delay() {
+        return Err(ActuatorError::LegacyFreezeClosed);
+    }
     Ok(())
 }
 
