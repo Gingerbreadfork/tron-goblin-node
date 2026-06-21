@@ -22,7 +22,7 @@ use tron_chainbase::{
     WitnessStore,
 };
 use tron_executor::StateBackends;
-use tron_mempool::TxValidatorFn;
+use tron_mempool::{TxValidatorFn, MAXIMUM_TIME_UNTIL_EXPIRATION_MS};
 use tron_proto::{transaction::contract::ContractType, Transaction};
 
 use crate::ref_block::validate_ref_block;
@@ -62,8 +62,45 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
 
     Box::new(move |tx: &Transaction| -> Result<(), String> {
         let raw = tx.raw_data.as_ref().ok_or("transaction has no raw_data")?;
-        if raw.contract.is_empty() {
-            return Err("transaction has no contracts".into());
+        // java-tron `Manager.processTransaction` (Manager.java:1522) rejects any
+        // tx whose contract list size is not exactly 1
+        // (`ContractSizeNotEqualToOneException`). Enforcing it here keeps us from
+        // admitting and relaying a multi- or zero-contract tx that every peer
+        // rejects on receive.
+        if raw.contract.len() != 1 {
+            return Err(format!(
+                "contract size should be exactly 1, actual: {}",
+                raw.contract.len()
+            ));
+        }
+
+        // Head-block-time-relative expiration window, matching java-tron
+        // `Manager.validateCommon` (Manager.java:835-841): reject when
+        // `expiration <= headBlockTime` (expired) or
+        // `expiration > headBlockTime + MAXIMUM_TIME_UNTIL_EXPIRATION` (too far
+        // future). The stateless mempool already enforces this window against
+        // wall-clock `now`; here it is re-checked against the committed head
+        // timestamp — the exact frame a peer uses on receive — so a node whose
+        // head lags wall-clock (catching up after downtime) admits the same
+        // set of txs a synced peer would. `expiration == 0` is "unset" and
+        // skips the check, mirroring java treating only positive expirations.
+        {
+            let dp = DynamicPropertiesStore::new(dyn_props_for_ref_block.clone());
+            if let Some(head_time) = dp.latest_block_header_timestamp() {
+                let expiration = raw.expiration;
+                if expiration > 0 {
+                    if expiration <= head_time {
+                        return Err(format!(
+                            "expiration {expiration} <= head block time {head_time}"
+                        ));
+                    }
+                    if expiration > head_time + MAXIMUM_TIME_UNTIL_EXPIRATION_MS {
+                        return Err(format!(
+                            "expiration {expiration} > head block time {head_time} + {MAXIMUM_TIME_UNTIL_EXPIRATION_MS}"
+                        ));
+                    }
+                }
+            }
         }
 
         // Per-tx replay gate. Anchored at the current chain head
@@ -136,8 +173,7 @@ pub fn build(state: &StateBackends) -> TxValidatorFn {
         // than silently rotting in pending.
         let ctx = ActuatorTxCtx::default();
 
-        // Multi-contract txs are rare on mainnet but possible —
-        // validate every contract.
+        // Exactly one contract per tx (enforced above, matching java).
         for contract in &raw.contract {
             let ty = ContractType::try_from(contract.r#type)
                 .map_err(|_| format!("unknown contract type {}", contract.r#type))?;

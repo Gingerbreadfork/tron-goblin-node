@@ -6,7 +6,9 @@
 //! * Decodes incoming protobuf `Transaction` bytes.
 //! * Recovers signers from `tx.signature[]` (rejects on format /
 //!   recovery failure).
-//! * Checks `raw_data.expiration > now`.
+//! * Checks `raw_data.expiration` falls in the accepted window —
+//!   `now < expiration <= now + MAXIMUM_TIME_UNTIL_EXPIRATION` (24h),
+//!   matching java-tron's `Manager.validateCommon`.
 //! * Dedups by `tx_id = sha256(raw_data.encode())`.
 //! * Caps total pending at `max_size` (default 2000, matching java-tron's
 //!   `Manager.MAX_TRANSACTION_PENDING`); evicts the oldest-expired
@@ -57,7 +59,19 @@ pub struct MempoolConfig {
     /// (An attacker with many keys can Sybil around this — it mainly
     /// bounds accidental single-sender floods and raises the bar.)
     pub per_sender_cap: usize,
+    /// Upper bound on how far in the future `raw_data.expiration` may sit,
+    /// in milliseconds, relative to the reference clock. Matches java-tron's
+    /// `Constant.MAXIMUM_TIME_UNTIL_EXPIRATION` (24h): `Manager.validateCommon`
+    /// rejects any tx whose `expiration > headBlockTime + MAXIMUM_TIME_UNTIL_EXPIRATION`.
+    /// Admitting a tx beyond this would relay it to peers that all reject it
+    /// on receive, so the same ceiling is enforced at admission.
+    pub max_future_expiration_ms: i64,
 }
+
+/// java-tron `Constant.MAXIMUM_TIME_UNTIL_EXPIRATION` — one day, in
+/// milliseconds. The widest window `Manager.validateCommon` accepts
+/// between a tx's `expiration` and the reference block time.
+pub const MAXIMUM_TIME_UNTIL_EXPIRATION_MS: i64 = 24 * 60 * 60 * 1_000;
 
 impl Default for MempoolConfig {
     fn default() -> Self {
@@ -67,6 +81,7 @@ impl Default for MempoolConfig {
             per_tx_max_bytes: 500 * 1024,
             max_bytes: 128 * 1024 * 1024,
             per_sender_cap: 256,
+            max_future_expiration_ms: MAXIMUM_TIME_UNTIL_EXPIRATION_MS,
         }
     }
 }
@@ -82,6 +97,12 @@ pub enum MempoolError {
     NoSignatures,
     #[error("transaction expired (expiration {expiration_ms} <= now {now_ms})")]
     Expired { expiration_ms: i64, now_ms: i64 },
+    #[error("transaction expiration too far in the future (expiration {expiration_ms} > now {now_ms} + {max_window_ms})")]
+    ExpirationTooFar {
+        expiration_ms: i64,
+        now_ms: i64,
+        max_window_ms: i64,
+    },
     #[error("signer recovery failed: {0}")]
     BadSignature(String),
     #[error("duplicate tx_id (already in mempool)")]
@@ -112,6 +133,7 @@ impl MempoolError {
             MempoolError::MissingRawData => "missing_raw_data",
             MempoolError::NoSignatures => "no_signatures",
             MempoolError::Expired { .. } => "expired",
+            MempoolError::ExpirationTooFar { .. } => "expiration_too_far",
             MempoolError::BadSignature(_) => "bad_signature",
             MempoolError::Duplicate => "duplicate",
             MempoolError::Full { .. } => "full",
@@ -272,11 +294,29 @@ impl TxMempool {
         // Snapshot what we need from raw_data so the borrow doesn't
         // leak into the moved-tx insertion below.
         let expiration_ms = raw_data.expiration;
-        if expiration_ms > 0 && expiration_ms <= now_ms {
-            return Err(MempoolError::Expired {
-                expiration_ms,
-                now_ms,
-            });
+        // Mirror java-tron `Manager.validateCommon` (Manager.java:835-841):
+        // reject when `expiration <= reference` (already expired) OR
+        // `expiration > reference + MAXIMUM_TIME_UNTIL_EXPIRATION` (too far in
+        // the future). Java's reference is the head block timestamp; the
+        // stateless mempool uses wall-clock `now` (a state-aware validator can
+        // re-check against head time). The upper bound matters for relay:
+        // without it we would accept and broadcast txs that every peer rejects
+        // on receive. `expiration_ms == 0` is treated as "unset" and skips the
+        // window check (the on-chain path applies its own slot-time default).
+        if expiration_ms > 0 {
+            if expiration_ms <= now_ms {
+                return Err(MempoolError::Expired {
+                    expiration_ms,
+                    now_ms,
+                });
+            }
+            if expiration_ms > now_ms + self.config.max_future_expiration_ms {
+                return Err(MempoolError::ExpirationTooFar {
+                    expiration_ms,
+                    now_ms,
+                    max_window_ms: self.config.max_future_expiration_ms,
+                });
+            }
         }
 
         // Recover at least one signer to ensure the signature bytes
@@ -659,6 +699,31 @@ mod tests {
         let bytes = signed_tx(1, -60_000);
         let err = m.submit(&bytes).unwrap_err();
         assert!(matches!(err, MempoolError::Expired { .. }));
+    }
+
+    #[test]
+    fn submit_expiration_too_far_in_future_rejected() {
+        // java-tron `Manager.validateCommon` rejects any tx whose
+        // expiration exceeds `reference + MAXIMUM_TIME_UNTIL_EXPIRATION`
+        // (24h). One hour past the ceiling must be rejected so we never
+        // relay a tx that every peer would reject on receive.
+        let m = TxMempool::new(MempoolConfig::default());
+        let bytes = signed_tx(1, MAXIMUM_TIME_UNTIL_EXPIRATION_MS + 60 * 60 * 1_000);
+        let err = m.submit(&bytes).unwrap_err();
+        assert!(matches!(err, MempoolError::ExpirationTooFar { .. }), "got {err:?}");
+        assert_eq!(m.pending_count(), 0);
+    }
+
+    #[test]
+    fn submit_expiration_just_inside_window_accepted() {
+        // The boundary is inclusive on the upper side in java
+        // (`expiration > reference + window` rejects, so `==` passes).
+        // A tx a minute under the ceiling must be admitted. Use a margin
+        // so the wall-clock read inside `submit` can't tip it over.
+        let m = TxMempool::new(MempoolConfig::default());
+        let bytes = signed_tx(1, MAXIMUM_TIME_UNTIL_EXPIRATION_MS - 60 * 1_000);
+        m.submit(&bytes).expect("inside the 24h window");
+        assert_eq!(m.pending_count(), 1);
     }
 
     #[test]
