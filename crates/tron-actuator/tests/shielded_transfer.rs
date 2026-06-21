@@ -250,6 +250,82 @@ fn rejects_from_amount_without_transparent_from() {
 }
 
 #[test]
+fn validate_rejects_transparent_from_with_no_owner_account() {
+    // java `validateTransparent`: a transparent_from spend whose owner
+    // account row is absent is rejected at validate time ("no OwnerAccount").
+    let (accounts, dp, nullifiers) = enabled_stores();
+    let c = ShieldedTransferContract {
+        transparent_from_address: vec![0x41u8; 21],
+        from_amount: 1000,
+        receive_description: vec![minimal_receive(1)],
+        ..Default::default()
+    };
+    let err = validate_shielded_transfer(&accounts, &dp, &nullifiers, None, &c, &[0u8; 32], 0)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::Validate(s) if s.contains("no OwnerAccount")));
+}
+
+#[test]
+fn validate_rejects_insufficient_transparent_from_balance() {
+    // Owner exists but holds less Zen than `from_amount` → rejected at
+    // validate ("balance is not sufficient").
+    let (accounts, dp, nullifiers) = enabled_stores();
+    let zen = "1000001";
+    dp.put_bytes(b"ZEN_TOKEN_ID", zen.as_bytes());
+    let from = vec![0x41u8; 21];
+    let mut owner = tron_proto::Account {
+        address: from.clone(),
+        ..Default::default()
+    };
+    owner.asset_v2.insert(zen.to_string(), 100); // only 100 Zen
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(&from);
+    accounts
+        .put(&tron_crypto::address::Address::from_raw(buf), &owner)
+        .unwrap();
+
+    let c = ShieldedTransferContract {
+        transparent_from_address: from,
+        from_amount: 500, // > 100
+        receive_description: vec![minimal_receive(1)],
+        ..Default::default()
+    };
+    let err = validate_shielded_transfer(&accounts, &dp, &nullifiers, None, &c, &[0u8; 32], 0)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::Validate(s) if s.contains("balance is not sufficient")));
+}
+
+#[test]
+fn validate_rejects_from_amount_not_greater_than_fee() {
+    // Owner holds enough Zen, but `from_amount <= fee` → rejected.
+    let (accounts, dp, nullifiers) = enabled_stores();
+    let zen = "1000001";
+    dp.put_bytes(b"ZEN_TOKEN_ID", zen.as_bytes());
+    let from = vec![0x41u8; 21];
+    let mut owner = tron_proto::Account {
+        address: from.clone(),
+        ..Default::default()
+    };
+    owner.asset_v2.insert(zen.to_string(), 10_000);
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(&from);
+    accounts
+        .put(&tron_crypto::address::Address::from_raw(buf), &owner)
+        .unwrap();
+
+    let c = ShieldedTransferContract {
+        transparent_from_address: from,
+        from_amount: 100,
+        receive_description: vec![minimal_receive(1)],
+        ..Default::default()
+    };
+    // fee == from_amount == 100 → must reject.
+    let err = validate_shielded_transfer(&accounts, &dp, &nullifiers, None, &c, &[0u8; 32], 100)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::Validate(s) if s.contains("great than fee")));
+}
+
+#[test]
 fn execute_records_nullifier() {
     let (accounts, dp, nullifiers) = enabled_stores();
     let sd = minimal_spend(0x77);

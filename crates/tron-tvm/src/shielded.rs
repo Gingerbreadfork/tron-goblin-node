@@ -1242,17 +1242,55 @@ fn insert_leaves(frontier: &mut [[u8; 32]; 33], leaf_count: i64, leaves: &[[u8; 
 // Small helpers
 // =============================================================================
 
+/// `DataWord.longValueSafe` over a 32-byte big-endian word.
+///
+/// java-tron (`DataWord.java:250`) reads the low 8 bytes as a long but
+/// **saturates to `Long.MAX_VALUE`** whenever the value would not fit a
+/// signed long: either a byte above the low 8 is non-zero
+/// (`bytesOccupied > 8`) or the low-8-byte value has its sign bit set
+/// (`longValue < 0`). The shielded precompiles read `value` and
+/// `leafCount` through this path, so a word like `0xFFFF…` must clamp to
+/// `i64::MAX` rather than wrap to a small/negative number — otherwise the
+/// `leafCount >= TREE_WIDTH` guard and the binding-signature value-balance
+/// diverge from java for adversarial inputs.
 fn parse_long(word: &[u8]) -> i64 {
-    // EVM DataWord.longValueSafe: low 8 bytes (big-endian) of the word.
+    debug_assert_eq!(word.len(), 32);
+    // `bytesOccupied > 8`: any of the top 24 bytes non-zero.
+    if word[..24].iter().any(|&b| b != 0) {
+        return i64::MAX;
+    }
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&word[24..32]);
-    i64::from_be_bytes(buf)
+    let v = i64::from_be_bytes(buf);
+    // `longValue < 0`: the low-8-byte value's sign bit is set.
+    if v < 0 {
+        return i64::MAX;
+    }
+    v
 }
 
+/// `DataWord.intValueSafe` over a 32-byte big-endian word.
+///
+/// java-tron (`DataWord.java:221`) reads the low 4 bytes as an int but
+/// **saturates to `Integer.MAX_VALUE`** when a byte above the low 4 is
+/// non-zero (`bytesOccupied > 4`) or the low-4-byte value is negative
+/// (`intValue < 0`). The transfer precompile parses dynamic-field offsets
+/// and the spend/output counts through this path; clamping keeps the
+/// `count` and offset bounds checks byte-identical to java for oversized
+/// or sign-bit-set words.
 fn parse_int(word: &[u8]) -> i32 {
+    debug_assert_eq!(word.len(), 32);
+    // `bytesOccupied > 4`: any of the top 28 bytes non-zero.
+    if word[..28].iter().any(|&b| b != 0) {
+        return i32::MAX;
+    }
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&word[28..32]);
-    i32::from_be_bytes(buf)
+    let v = i32::from_be_bytes(buf);
+    if v < 0 {
+        return i32::MAX;
+    }
+    v
 }
 
 fn data_word(b: bool) -> Vec<u8> {
@@ -1318,5 +1356,76 @@ mod insert_leaves_tests {
         // 32 (marker) + (1+1)*32 (slot word + one level hash) + 32 (root).
         assert_eq!(out.len(), 128);
         assert_eq!(out[31], 1);
+    }
+}
+
+#[cfg(test)]
+mod data_word_parse_tests {
+    use super::*;
+
+    fn word_lo64(v: u64) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    #[test]
+    fn parse_long_reads_small_in_range_value() {
+        assert_eq!(parse_long(&word_lo64(5)), 5);
+        assert_eq!(parse_long(&word_lo64(0)), 0);
+        assert_eq!(parse_long(&word_lo64(i64::MAX as u64)), i64::MAX);
+    }
+
+    #[test]
+    fn parse_long_saturates_when_high_bytes_set() {
+        // A byte above the low 8 set → `bytesOccupied > 8` → Long.MAX_VALUE.
+        let mut w = word_lo64(5);
+        w[7] = 0x01; // byte index 7 is well above the low-8-byte window.
+        assert_eq!(parse_long(&w), i64::MAX);
+    }
+
+    #[test]
+    fn parse_long_saturates_when_low8_is_negative() {
+        // Low 8 bytes with the sign bit set → `longValue < 0` → Long.MAX_VALUE.
+        assert_eq!(parse_long(&word_lo64(0x8000_0000_0000_0000)), i64::MAX);
+        assert_eq!(parse_long(&word_lo64(u64::MAX)), i64::MAX);
+    }
+
+    #[test]
+    fn parse_int_reads_small_in_range_value() {
+        let mut w = [0u8; 32];
+        w[28..32].copy_from_slice(&7u32.to_be_bytes());
+        assert_eq!(parse_int(&w), 7);
+    }
+
+    #[test]
+    fn parse_int_saturates_when_high_bytes_set() {
+        let mut w = [0u8; 32];
+        w[28..32].copy_from_slice(&2u32.to_be_bytes());
+        w[27] = 0x01; // byte above the low-4-byte window.
+        assert_eq!(parse_int(&w), i32::MAX);
+    }
+
+    #[test]
+    fn parse_int_saturates_when_low4_is_negative() {
+        let mut w = [0u8; 32];
+        w[28..32].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+        assert_eq!(parse_int(&w), i32::MAX);
+    }
+
+    // The mint/transfer leaf-count guard relies on the saturation: a
+    // `leafCount` word with high bytes set must clamp to a huge value so
+    // the `>= TREE_WIDTH` check rejects it, matching java's
+    // `longValueSafe()` semantics rather than wrapping to a small number.
+    #[test]
+    fn transfer_proof_rejects_leaf_count_with_high_bytes_via_saturation() {
+        // Build a 2080-byte all-zero transfer input, then set the
+        // leafCount word (offset 1280) to `0x…01_00000000` (low 8 bytes = 0
+        // but a higher byte set). Pre-saturation this read as 0 and
+        // proceeded; post-saturation it clamps to i64::MAX → rejected.
+        let mut data = vec![0u8; 2080];
+        // leafCount word lives at byte 1280; set a byte ABOVE the low-8.
+        data[1280 + 23] = 0x01; // byte index 23 of the 32-byte word.
+        assert_eq!(verify_transfer_proof(&data), vec![0u8; 32]);
     }
 }

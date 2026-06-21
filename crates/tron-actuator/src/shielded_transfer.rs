@@ -195,7 +195,7 @@ pub fn validate_shielded_transfer(
     check_receiver(contract)?;
 
     // === 3. validateTransparent (length, balance — for transparent halves). ===
-    validate_transparent(accounts, contract, fee)?;
+    validate_transparent(accounts, dyn_props, contract, fee)?;
 
     // === 4. Duplicate-detection within the transaction. ===
     let mut nf_set: HashSet<&[u8]> = HashSet::new();
@@ -460,7 +460,8 @@ fn check_receiver(c: &ShieldedTransferContract) -> Result<(), ActuatorError> {
 }
 
 fn validate_transparent(
-    _accounts: &AccountStore,
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
     c: &ShieldedTransferContract,
     fee: i64,
 ) -> Result<(), ActuatorError> {
@@ -496,15 +497,68 @@ fn validate_transparent(
     if has_from && has_to && c.transparent_from_address == c.transparent_to_address {
         return Err(ActuatorError::Validate("Can't transfer zen to yourself"));
     }
-    if has_from && c.from_amount <= fee {
-        return Err(ActuatorError::Validate(
-            "Validate ShieldedTransferContract error, fromAmount should be great than fee",
-        ));
+
+    let zen_token_id = read_zen_token_id(dyn_props);
+
+    // Transparent-from owner: the account must exist, hold enough Zen,
+    // and spend strictly more than `from_amount > 0` and `> fee`.
+    // Mirrors `ShieldedTransferActuator.validateTransparent`
+    // (ShieldedTransferActuator.java:428-446) in its exact check order.
+    if has_from {
+        let owner = zen_balance(accounts, &c.transparent_from_address, &zen_token_id)?
+            .ok_or(ActuatorError::Validate(
+                "Validate ShieldedTransferContract error, no OwnerAccount",
+            ))?;
+        if c.from_amount <= 0 {
+            return Err(ActuatorError::Validate("from_amount must be greater than 0"));
+        }
+        if owner < c.from_amount {
+            return Err(ActuatorError::Validate(
+                "Validate ShieldedTransferContract error, balance is not sufficient",
+            ));
+        }
+        if c.from_amount <= fee {
+            return Err(ActuatorError::Validate(
+                "Validate ShieldedTransferContract error, fromAmount should be great than fee",
+            ));
+        }
     }
-    if has_to && c.to_amount <= 0 {
-        return Err(ActuatorError::Validate("to_amount must be greater than 0"));
+
+    // Transparent-to recipient: `to_amount > 0`, and if the recipient
+    // already exists, `getZenBalance(toAccount) + toAmount` must not
+    // overflow i64 (java's `addExact`). Mirrors lines 448-461.
+    if has_to {
+        if c.to_amount <= 0 {
+            return Err(ActuatorError::Validate("to_amount must be greater than 0"));
+        }
+        if let Some(balance) = zen_balance(accounts, &c.transparent_to_address, &zen_token_id)? {
+            if balance.checked_add(c.to_amount).is_none() {
+                return Err(ActuatorError::Validate("long overflow"));
+            }
+        }
     }
     Ok(())
+}
+
+/// Read an account's Zen (TRC-10) balance — `account.getAssetV2(zenTokenId)`.
+/// Returns `Ok(None)` when the account row is absent (java's
+/// `accountStore.get(addr) == null`), `Ok(Some(0))` when present without a
+/// Zen entry, otherwise the stored amount.
+fn zen_balance(
+    accounts: &AccountStore,
+    addr: &[u8],
+    zen_token_id: &str,
+) -> Result<Option<i64>, ActuatorError> {
+    use tron_crypto::address::Address;
+    if addr.len() != ADDRESS_LENGTH {
+        return Err(ActuatorError::Validate("address must be 21 bytes"));
+    }
+    let mut buf = [0u8; 21];
+    buf.copy_from_slice(addr);
+    let a = Address::from_raw(buf);
+    Ok(accounts
+        .get(&a)?
+        .map(|acct| acct.asset_v2.get(zen_token_id).copied().unwrap_or(0)))
 }
 
 fn check_proofs(
