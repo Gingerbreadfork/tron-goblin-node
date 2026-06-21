@@ -25,39 +25,21 @@ pub enum ProofOutcome {
     Invalid,
 }
 
-/// Recompute the root from `proof` and compare it to `expected_root`.
+/// Recompute the root a `proof` reconstructs to, walking from the leaf slot
+/// (level 256) up to the root (level 0). At each step the sibling is either the
+/// next entry in `proof.siblings` (when the mask bit is set) or the level
+/// default. The leaf's own contribution is its leaf-node hash when present, or
+/// the empty-leaf default when absent — exactly the structure
+/// [`crate::commitment::smt::Smt::apply`] produces, so a proof drawn from a
+/// tree reconstructs that tree's root.
 ///
-/// For an inclusion proof (`proof.leaf_value_hash` is `Some`), also require
-/// `keccak256(value_bytes) == proof.leaf_value_hash`; `value_bytes` must be
-/// supplied. For an exclusion check pass `value_bytes = None`.
-///
-/// The reconstruction walks from the leaf slot (level 256) up to the root
-/// (level 0). At each step the sibling is either the next entry in
-/// `proof.siblings` (when the mask bit is set) or the level default. The
-/// leaf's own contribution is its leaf-node hash when present, or the
-/// empty-leaf default when absent — exactly the structure [`crate::commitment::smt::Smt::apply`]
-/// produces, so a valid proof reconstructs the same root.
-pub fn verify_proof(
-    expected_root: &NodeHash,
-    proof: &Proof,
-    value_bytes: Option<&[u8]>,
-) -> ProofOutcome {
+/// Returns `None` for a structurally malformed proof: the mask claims more
+/// siblings than the list supplies, or the list carries siblings the mask never
+/// references. This is the pure reconstruction shared by [`verify_proof`] and
+/// by the proof generator, which adopts the reconstructed root so the served
+/// `(root, proof)` pair is self-consistent by construction.
+pub fn reconstruct_root(proof: &Proof) -> Option<NodeHash> {
     let d = default_hashes();
-
-    // Inclusion proofs bind the supplied value to the proven leaf hash.
-    let included = match proof.leaf_value_hash {
-        Some(vh) => {
-            let Some(value) = value_bytes else {
-                // An inclusion proof demands the value to bind it.
-                return ProofOutcome::Invalid;
-            };
-            if keccak256(value) != vh {
-                return ProofOutcome::Invalid;
-            }
-            true
-        }
-        None => false,
-    };
 
     // The node hash at the current level as we fold upward. Start at the leaf
     // slot (level 256).
@@ -76,7 +58,7 @@ pub fn verify_proof(
         let sibling = if proof.mask_bit(level) {
             if next_sibling == 0 {
                 // Mask claims a sibling the list can't supply — malformed.
-                return ProofOutcome::Invalid;
+                return None;
             }
             next_sibling -= 1;
             proof.siblings[next_sibling]
@@ -96,8 +78,40 @@ pub fn verify_proof(
     // Every claimed sibling must have been consumed; a leftover means a
     // malformed mask/siblings pairing.
     if next_sibling != 0 {
-        return ProofOutcome::Invalid;
+        return None;
     }
+
+    Some(acc)
+}
+
+/// Recompute the root from `proof` and compare it to `expected_root`.
+///
+/// For an inclusion proof (`proof.leaf_value_hash` is `Some`), also require
+/// `keccak256(value_bytes) == proof.leaf_value_hash`; `value_bytes` must be
+/// supplied. For an exclusion check pass `value_bytes = None`.
+pub fn verify_proof(
+    expected_root: &NodeHash,
+    proof: &Proof,
+    value_bytes: Option<&[u8]>,
+) -> ProofOutcome {
+    // Inclusion proofs bind the supplied value to the proven leaf hash.
+    let included = match proof.leaf_value_hash {
+        Some(vh) => {
+            let Some(value) = value_bytes else {
+                // An inclusion proof demands the value to bind it.
+                return ProofOutcome::Invalid;
+            };
+            if keccak256(value) != vh {
+                return ProofOutcome::Invalid;
+            }
+            true
+        }
+        None => false,
+    };
+
+    let Some(acc) = reconstruct_root(proof) else {
+        return ProofOutcome::Invalid;
+    };
 
     if acc != *expected_root {
         return ProofOutcome::Invalid;

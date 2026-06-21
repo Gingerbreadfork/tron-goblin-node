@@ -34,7 +34,7 @@ pub use builder::{
     BuildState, Committed, CommitmentBuilder, CommitmentCounters, CommitmentDeltaRef,
     CommitmentMsg, ResumeSource,
 };
-pub use proof::{verify_proof, ProofOutcome};
+pub use proof::{reconstruct_root, verify_proof, ProofOutcome};
 pub use reader::{leaf_path_for, CommitmentReader, CommitmentStatus};
 pub use smt::{
     default_hashes, hash_internal, hash_leaf, path_bit, CommitmentError, LeafPath, NodeBackend,

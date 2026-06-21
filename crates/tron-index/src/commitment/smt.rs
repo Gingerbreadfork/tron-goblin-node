@@ -336,11 +336,16 @@ impl<B: NodeBackend> Smt<B> {
                 // The sibling shares the top `level` bits but flips bit `level`.
                 let sib_prefix = sibling_prefix(path, level);
                 // A sibling at child_level that this batch ALSO touches lives
-                // in `current`; otherwise read it from the backend.
+                // in `current`; otherwise materialize it from the backend. At
+                // the leaf-slot level (child_level == DEPTH) the sibling is a
+                // LEAF row, not an internal node, so it must be read from the
+                // leaf store and re-hashed — a pre-existing sibling leaf that
+                // shares the top `level` bits would otherwise be folded in as
+                // the empty default, corrupting the parent.
                 let sib_hash = match current.get(&sib_prefix) {
                     Some(h) => *h,
                     None => self
-                        .read_node(child_level, &sib_prefix)?
+                        .read_subtree_hash(child_level, &sib_prefix)?
                         .unwrap_or(d[child_level]),
                 };
 
@@ -391,7 +396,7 @@ impl<B: NodeBackend> Smt<B> {
         for level in 0..DEPTH {
             let child_level = level + 1;
             let sib_prefix = sibling_prefix(path, level);
-            let sib = self.read_node(child_level, &sib_prefix)?;
+            let sib = self.read_subtree_hash(child_level, &sib_prefix)?;
             if let Some(h) = sib {
                 if h != d[child_level] {
                     Proof::set_mask_bit(&mut mask, level);
@@ -408,9 +413,28 @@ impl<B: NodeBackend> Smt<B> {
         })
     }
 
-    /// Read a stored internal node, masking the prefix to its level so the
-    /// backend key is canonical.
-    fn read_node(&self, level: usize, prefix: &LeafPath) -> Result<Option<NodeHash>, CommitmentError> {
+    /// Materialized hash of the subtree rooted at `(level, prefix)`, or `None`
+    /// when that subtree is empty (its level default).
+    ///
+    /// At an internal level (`level < DEPTH`) this reads the stored node,
+    /// masking the prefix to its level so the backend key is canonical. At the
+    /// leaf-slot level (`level == DEPTH`) the "subtree" is a single leaf: the
+    /// leaf row is read by full path and re-hashed with [`hash_leaf`], because
+    /// leaves are persisted as value-hash rows, not as internal nodes. Folding
+    /// or proving over a sibling leaf therefore reconstructs its leaf-node hash
+    /// rather than treating it as the empty default.
+    fn read_subtree_hash(
+        &self,
+        level: usize,
+        prefix: &LeafPath,
+    ) -> Result<Option<NodeHash>, CommitmentError> {
+        if level >= DEPTH {
+            // `prefix` is the full leaf path at the leaf-slot level.
+            return Ok(self
+                .backend
+                .get_leaf(prefix)?
+                .map(|vh| hash_leaf(prefix, &vh)));
+        }
         let canon = mask_prefix(prefix, level);
         self.backend.get_node(level, &canon)
     }
@@ -942,6 +966,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- Forged-proof soundness ---------------------------------------------
+
+    #[test]
+    fn forged_proofs_do_not_validate() {
+        use crate::commitment::proof::{verify_proof, ProofOutcome};
+
+        let be = MemNodeBackend::new();
+        for i in 0..16u64 {
+            let p = path(i * 5 + 1);
+            apply_persist(&be, &[(p, Some(keccak256(&i.to_be_bytes())))]);
+        }
+        let root = current_root(&be);
+        let smt = Smt::open(&be, root);
+
+        // A present key cannot be forged as ABSENT: drop the leaf value hash to
+        // turn an inclusion proof into a (false) exclusion proof and verify it
+        // against the real root.
+        let present = path(1);
+        let mut as_excluded = smt.prove(&present).unwrap();
+        assert!(as_excluded.leaf_value_hash.is_some());
+        as_excluded.leaf_value_hash = None;
+        assert_eq!(
+            verify_proof(&root, &as_excluded, None),
+            ProofOutcome::Invalid,
+            "a present key forged as absent must not verify"
+        );
+
+        // An absent key cannot be forged as PRESENT: attach a value hash to an
+        // exclusion proof and try to bind a value to it.
+        let absent = path(987_654);
+        assert!(smt.backend().get_leaf(&absent).unwrap().is_none());
+        let mut as_included = smt.prove(&absent).unwrap();
+        let forged_raw = b"forged".to_vec();
+        as_included.leaf_value_hash = Some(keccak256(&forged_raw));
+        assert_eq!(
+            verify_proof(&root, &as_included, Some(&forged_raw)),
+            ProofOutcome::Invalid,
+            "an absent key forged as present must not verify"
+        );
+
+        // Flipping a single mask bit (claiming a default sibling is real, or
+        // vice versa) breaks reconstruction.
+        let mut bit_flipped = smt.prove(&present).unwrap();
+        bit_flipped.sibling_mask[0] ^= 0x80;
+        assert_eq!(
+            verify_proof(&root, &bit_flipped, Some(&0u64.to_be_bytes())),
+            ProofOutcome::Invalid,
+            "a tampered sibling mask must not verify"
+        );
+
+        // Re-ordering the sibling list (swapping two real siblings) changes the
+        // reconstructed root.
+        let mut reordered = smt.prove(&present).unwrap();
+        if reordered.siblings.len() >= 2 {
+            let n = reordered.siblings.len();
+            reordered.siblings.swap(0, n - 1);
+            assert_eq!(
+                verify_proof(&root, &reordered, Some(&0u64.to_be_bytes())),
+                ProofOutcome::Invalid,
+                "re-ordered siblings must not verify"
+            );
+        }
+    }
+
+    // -- Sibling leaves at the deepest level --------------------------------
+
+    #[test]
+    fn sibling_leaves_at_leaf_slot_level_are_order_independent() {
+        use crate::commitment::proof::{verify_proof, ProofOutcome};
+
+        // Two paths that share the top 255 bits and differ only at bit 255.
+        // Their leaf nodes are siblings at the leaf-slot level (256). Folding
+        // them incrementally (each in its own apply, so neither sibling is in
+        // the other's batch) must equal a single batch and the reference
+        // path-merge: the incremental sibling read crosses into the leaf store.
+        let mut a = [0u8; 32];
+        a[0] = 0xAB;
+        a[31] = 0xF0; // ...1111 0000 → bit 255 = 0
+        let mut b = a;
+        b[31] = 0xF1; // ...1111 0001 → bit 255 = 1
+        assert_eq!(mask_prefix(&a, 255), mask_prefix(&b, 255));
+        assert!(!path_bit(&a, 255));
+        assert!(path_bit(&b, 255));
+
+        let raw_a = b"value-a".to_vec();
+        let raw_b = b"value-b".to_vec();
+        let va = keccak256(&raw_a);
+        let vb = keccak256(&raw_b);
+
+        // Incremental: insert a, then b (and in the reverse order too).
+        let be = MemNodeBackend::new();
+        apply_persist(&be, &[(a, Some(va))]);
+        apply_persist(&be, &[(b, Some(vb))]);
+        let incr = current_root(&be);
+
+        let be_rev = MemNodeBackend::new();
+        apply_persist(&be_rev, &[(b, Some(vb))]);
+        apply_persist(&be_rev, &[(a, Some(va))]);
+        let incr_rev = current_root(&be_rev);
+
+        // Single batch.
+        let be2 = MemNodeBackend::new();
+        apply_persist(&be2, &[(a, Some(va)), (b, Some(vb))]);
+        let batch = current_root(&be2);
+
+        // Reference path-merge.
+        let mut set = BTreeMap::new();
+        set.insert(a, va);
+        set.insert(b, vb);
+        let reference = reference_root(&set);
+
+        assert_eq!(batch, reference, "single batch must match reference");
+        assert_eq!(incr, reference, "insert a then b must match reference");
+        assert_eq!(incr_rev, reference, "insert b then a must match reference");
+
+        // Proofs over the incrementally-built tree must verify: each leaf's
+        // sibling is the other leaf, so the proof carries a real bit-255
+        // sibling that the verifier folds back to the same root.
+        let smt = Smt::open(&be, incr);
+        let pr_a = smt.prove(&a).unwrap();
+        let pr_b = smt.prove(&b).unwrap();
+        assert!(!pr_a.siblings.is_empty(), "a's deepest sibling is b's leaf");
+        assert!(!pr_b.siblings.is_empty(), "b's deepest sibling is a's leaf");
+        assert_eq!(verify_proof(&incr, &pr_a, Some(&raw_a)), ProofOutcome::Included);
+        assert_eq!(verify_proof(&incr, &pr_b, Some(&raw_b)), ProofOutcome::Included);
+
+        // Deleting one of the pair must leave a tree equal to the surviving
+        // leaf alone — the parent at level 255 re-folds `a` against an empty
+        // bit-255 slot, never against the stale `b` leaf.
+        apply_persist(&be, &[(b, None)]);
+        let after_delete = current_root(&be);
+        let mut just_a = BTreeMap::new();
+        just_a.insert(a, va);
+        assert_eq!(after_delete, reference_root(&just_a));
+        let be_solo = MemNodeBackend::new();
+        let solo = apply_persist(&be_solo, &[(a, Some(va))]);
+        assert_eq!(after_delete, solo);
     }
 
     // -- Extra: apply emits delete-node ops that round-trip to default ------

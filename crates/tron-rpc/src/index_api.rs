@@ -1376,12 +1376,11 @@ async fn commitment_proof(
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e),
     };
 
-    let (height, root) = match reader.root() {
-        Ok(r) => r,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-    let proof = match reader.prove(store, &raw_key) {
-        Ok(p) => p,
+    // One self-consistent (height, root, proof) triple: the served root is the
+    // one the proof reconstructs to, so the response always verifies even if
+    // the background builder folds a block during the walk.
+    let (height, root, proof) = match reader.prove_consistent(store, &raw_key) {
+        Ok(t) => t,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 

@@ -39,7 +39,8 @@ pub use archive::{
     PruneStats, ARCHIVE_FORMAT_VERSION,
 };
 pub use commitment::{
-    default_hashes, leaf_path_for, verify_proof, BootstrapCursor, BuildState, Committed,
+    default_hashes, leaf_path_for, reconstruct_root, verify_proof, BootstrapCursor, BuildState,
+    Committed,
     CommitmentBuilder, CommitmentCounters, CommitmentDeltaRef, CommitmentError, CommitmentMeta,
     CommitmentMsg, CommitmentReader, CommitmentStatus, CommitmentStore, LeafPath, NodeBackend,
     NodeHash, NodeOp, Proof, ProofOutcome, ProofStep, ResumeSource, Smt, COMMITMENT_FORMAT_VERSION,
