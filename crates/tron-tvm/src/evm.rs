@@ -343,7 +343,12 @@ impl TronPrecompiles {
             block_timestamp_ms: self.block_timestamp_ms,
         };
 
-        // Compute the effective energy cost (incl. dynamic-energy penalty).
+        // Flat precompile energy cost. java-tron charges a precompile its
+        // `getEnergyForData(data)` directly (`Program.callToPrecompiledAddress`),
+        // never scaling it by the `ALLOW_DYNAMIC_ENERGY` per-contract factor —
+        // that factor only multiplies ordinary opcode costs in `VM.play()`. The
+        // CALL opcode that invokes the precompile carries the factor; the
+        // precompile body does not.
         let energy_cost = match pre.effective_energy_cost(input_bytes, &ctx) {
             Ok(g) => g,
             Err(_) => {

@@ -412,3 +412,68 @@ fn reverted_sub_call_does_not_persist_callee_energy_usage() {
         "a reverted sub-call's energy_usage must not persist"
     );
 }
+
+#[test]
+fn reverted_top_level_tx_discards_catch_up_and_usage() {
+    // java-tron `VMActuator.execute` only calls `rootRepository.commit()` when
+    // the program neither threw nor reverted (VMActuator.java:234-250). A
+    // top-level REVERT therefore discards the whole per-tx repository deposit,
+    // including the `ContractStateCapsule` rows that `updateContextContractFactor`
+    // (catch-up: cycle advance + factor grow/decay) and `addContextContractUsage`
+    // wrote. The stored `ContractState` must read back exactly as it was before
+    // the tx — otherwise a reverted tx would silently advance a contract's
+    // dynamic-energy cycle/factor and drift every later charge.
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_DYNAMIC_ENERGY", 1);
+    stores.dynamic_properties.put_long(b"DYNAMIC_ENERGY_THRESHOLD", 1);
+    stores.dynamic_properties.put_long(b"DYNAMIC_ENERGY_INCREASE_FACTOR", 10_000);
+    stores.dynamic_properties.put_long(b"DYNAMIC_ENERGY_MAX_FACTOR", 100_000);
+    stores.dynamic_properties.save_current_cycle_number(7);
+
+    // Contract C: do a little work, then REVERT at the top level.
+    let mut c_code = make_workload(8);
+    c_code.pop(); // drop the trailing STOP
+    c_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // PUSH1 0 PUSH1 0 REVERT
+    let c = install(&stores, 0x07, &c_code);
+    let c_addr = Address::from_raw(c);
+
+    // Pre-tx stored state: a stale cycle (3) with a sentinel factor + usage.
+    // A successful run would catch up to cycle 7 and reset usage; a revert
+    // must leave all three fields untouched.
+    let pre = ContractState {
+        update_cycle: 3,
+        energy_factor: 1_234,
+        energy_usage: 555,
+    };
+    stores.contract_state.put(&c_addr, &pre).unwrap();
+
+    let owner = fund_user(&stores, 0x08);
+    let trigger = TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: c.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 0,
+        },
+        &trigger,
+        10_000_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::Revert { .. }),
+        "expected a top-level REVERT, got {outcome:?}"
+    );
+
+    let post = stores.contract_state.get(&c_addr).unwrap().unwrap();
+    assert_eq!(
+        post, pre,
+        "a reverted top-level tx must not persist the catch-up cycle advance, \
+         factor change, or energy usage"
+    );
+}

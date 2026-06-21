@@ -305,4 +305,72 @@ mod tests {
         let stored = s.get(&a).unwrap().unwrap();
         assert_eq!(stored.energy_usage, 1_500);
     }
+
+    /// Byte-exact port of java-tron's `ContractStateCapsuleTest.testCatchUpCycle`
+    /// (`framework/src/test/java/org/tron/core/capsule/ContractStateCapsuleTest.java`).
+    /// Every expected `energy_factor` here is the value java-tron's
+    /// `ContractStateCapsule.catchUpToCycle` produces for the same inputs, so this
+    /// pins the grow/decay ramp — including the `(long)`-cast truncation of the
+    /// IEEE-754 product and the fdlibm `StrictMath.pow` decay path — against the
+    /// reference implementation. A drift in rounding, operation order, or the
+    /// strict-math selection would break exactly one of these assertions.
+    #[test]
+    fn catch_up_matches_java_golden_vectors() {
+        // (stored, new_cycle, threshold, increase, max, strict) -> expected factor.
+        // Mirrors each `catchUpToCycle` call in the java test, in order.
+        let seed = |factor: i64| ContractState {
+            energy_usage: 1_000_000,
+            energy_factor: factor,
+            update_cycle: 1000,
+        };
+        // factor reads via the no-write `caught_up` so each vector starts fresh.
+        let factor_of = |stored: ContractState,
+                         new_cycle: i64,
+                         threshold: i64,
+                         increase: i64,
+                         max: i64,
+                         strict: bool|
+         -> i64 {
+            ContractStateStore::caught_up(Some(stored), new_cycle, threshold, increase, max, strict)
+                .0
+                .energy_factor
+        };
+
+        // Vector 1: same-cycle no-op leaves the factor untouched.
+        let (state, changed) =
+            ContractStateStore::caught_up(Some(seed(5000)), 1000, 2_000_000, 2000, 1_000, false);
+        assert!(!changed, "same-cycle catch-up must report no change");
+        assert_eq!(state.update_cycle, 1000);
+        assert_eq!(state.energy_usage, 1_000_000, "usage preserved on no-op");
+        assert_eq!(state.energy_factor, 5000);
+
+        // Vector 2: grow (usage 1M > 900k) then decay over the remaining 9 cycles.
+        assert_eq!(factor_of(seed(5000), 1010, 900_000, 1000, 10_000, false), 3137);
+
+        // Vector 3: usage 1M > threshold 2M is false → pure decay over 1 cycle.
+        assert_eq!(factor_of(seed(5000), 1001, 2_000_000, 2000, 10_000, false), 4250);
+
+        // Vector 4: usage == threshold (1M) is NOT strictly greater → pure decay.
+        assert_eq!(factor_of(seed(5000), 1001, 1_000_000, 2000, 10_000, false), 4250);
+
+        // Vector 5: grow by 20% then no decay (adjacent cycle).
+        assert_eq!(factor_of(seed(5000), 1001, 900_000, 2000, 10_000, false), 8000);
+
+        // Vector 6: grow by 50% but the max-factor clamp pins it at 10_000.
+        assert_eq!(factor_of(seed(5000), 1001, 900_000, 5000, 10_000, false), 10_000);
+
+        // Vectors 7-9: grow to 10_000 then decay over 1/2/3 cycles (non-strict pow).
+        assert_eq!(factor_of(seed(5000), 1002, 900_000, 5000, 10_000, false), 7500);
+        assert_eq!(factor_of(seed(5000), 1003, 900_000, 5000, 10_000, false), 5312);
+        assert_eq!(factor_of(seed(5000), 1004, 900_000, 5000, 10_000, false), 3398);
+
+        // Vectors 10-12: the strict-math (fdlibm `StrictMath.pow`) decay path.
+        // Longer idle windows make the last-ULP difference vs platform powf
+        // observable, so these pin the fdlibm port specifically.
+        assert_eq!(factor_of(seed(5000), 1005, 900_000, 5000, 10_000, true), 1723);
+        assert_eq!(factor_of(seed(5000), 1006, 900_000, 5000, 10_000, true), 258);
+
+        // Vector 13: a long-enough idle window decays the factor to the 0 floor.
+        assert_eq!(factor_of(seed(5000), 1007, 900_000, 5000, 10_000, true), 0);
+    }
 }
