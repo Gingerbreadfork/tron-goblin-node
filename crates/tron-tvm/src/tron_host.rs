@@ -354,8 +354,59 @@ impl TronDatabaseExt for TronDatabase {
         };
         let owner_t = evm_to_tron_address(&owner);
         let obtainer_t = evm_to_tron_address(&obtainer);
-        let Ok(Some(mut owner_account)) = self.accounts.get(&owner_t) else {
-            return 0;
+        let owner_lookup = self.accounts.get(&owner_t);
+        // Env-gated entry diagnostic (TRON_TRACE_SUICIDE_TX=<root-tx-hex-prefix>):
+        // log every tron_suicide invocation within the matching root tx — its
+        // owner/obtainer, the destroy flag, and whether the owner row resolves
+        // in the (session-wrapped) AccountStore. A `false` here means the
+        // SELFDESTRUCT bails before the TRC-10/freeze sweep, so the inheritor
+        // never receives the contract's holdings — the manifestation behind a
+        // missing-inheritor-credit divergence. Off by default.
+        if let Ok(want_tx) = std::env::var("TRON_TRACE_SUICIDE_TX") {
+            let txid: String =
+                self.root_tx_id.iter().map(|b| format!("{b:02x}")).collect();
+            let want = want_tx.trim().trim_start_matches("0x").to_ascii_lowercase();
+            if !want.is_empty() && txid.starts_with(&want) {
+                eprintln!(
+                    "SUICIDETRACE_ENTRY tx={} owner={} obtainer={} will_destroy={} in_store={}",
+                    &txid[..16.min(txid.len())],
+                    owner_t.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    obtainer_t.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    will_destroy,
+                    matches!(owner_lookup, Ok(Some(_))),
+                );
+            }
+        }
+        // java reads the dying contract from the in-flight `Repository`
+        // (`getContractState().getAccount(owner)`), which layers same-tx
+        // writes — including a contract CREATE/CREATE2-deployed THIS tx — over
+        // committed state. Our `self.accounts` is the session-wrapped COMMITTED
+        // store and does NOT reflect a same-tx deployment (the revm journal
+        // holds it until the final `DatabaseCommit::commit`). A SELFDESTRUCT by
+        // a contract created earlier in the SAME tx therefore finds no owner row
+        // and used to bail before `createAccountIfNotExist(obtainer)` ran —
+        // orphaning the inheritor (java creates it empty and persists it; with
+        // no inheritor row our commit-time empty-account skip then prunes the
+        // beneficiary revm independently touched, leaving the target missing for
+        // later txs). When the owner was created locally this tx, synthesize the
+        // empty account the in-flight Repository would have returned (a fresh
+        // CREATE contract holds no TRX/TRC-10/freeze until something endows it,
+        // so an all-default row is byte-equivalent) and proceed, so the
+        // inheritor is created and the freeze/TRC-10 sweep still runs against
+        // whatever the row holds.
+        let owner_created_locally = self.pending_created_contracts.contains_key(&owner);
+        let mut owner_account = match owner_lookup {
+            Ok(Some(acc)) => acc,
+            // Owner deployed THIS tx but not yet in the committed store: use the
+            // empty account the in-flight Repository would return, so the
+            // inheritor still gets created and any holdings still sweep.
+            Ok(None) if owner_created_locally => tron_proto::Account {
+                address: owner_t.as_bytes().to_vec(),
+                ..Default::default()
+            },
+            // No owner row and not a same-tx creation, or a read error: nothing
+            // to validate or move (matches the historical bail).
+            _ => return 0,
         };
 
         let now_ms = dyn_props.latest_block_header_timestamp().unwrap_or(0);
@@ -490,15 +541,25 @@ impl TronDatabaseExt for TronDatabase {
         }
 
         // Make sure the inheritor exists on chain (java
-        // `createAccountIfNotExist`).
-        let mut inheritor_account = match self.accounts.get(&inheritor_t) {
-            Ok(Some(acc)) => acc,
-            _ => tron_proto::Account {
-                address: inheritor_t.as_bytes().to_vec(),
-                create_time: now_ms,
-                ..Default::default()
-            },
+        // `createAccountIfNotExist` -> `createNormalAccount`). A freshly created
+        // inheritor is stamped with the head-block timestamp and, when
+        // ALLOW_MULTI_SIGN is on, gets the default owner+active[id=2]
+        // permission — exactly as java's `createNormalAccount` builds it. An
+        // existing inheritor keeps its row untouched.
+        let (mut inheritor_account, inheritor_is_new) = match self.accounts.get(&inheritor_t) {
+            Ok(Some(acc)) => (acc, false),
+            _ => (
+                tron_proto::Account {
+                    address: inheritor_t.as_bytes().to_vec(),
+                    create_time: now_ms,
+                    ..Default::default()
+                },
+                true,
+            ),
         };
+        if inheritor_is_new {
+            tron_chainbase::apply_default_account_permissions(&mut inheritor_account, &dyn_props);
+        }
 
         // ---- TRC-10 sweep ----
         if allow_trc10 {
@@ -506,13 +567,46 @@ impl TronDatabaseExt for TronDatabase {
             // account-asset store, not inline; import them before the sweep so
             // SELFDESTRUCT forwards the contract's real token holdings to the
             // inheritor (java AccountCapsule.getAssetMapV2 imports first).
+            // Env-gated diagnostic (TRON_TRACE_SUICIDE=<owner-21-byte-tron-hex>):
+            // log the dying owner's asset state BEFORE and AFTER import so the
+            // lost-token divergence at this exact sweep can be confirmed (whether
+            // the loss is asset_optimized=false skipping the store rows, or the
+            // store simply having no rows for the owner). Off by default.
+            let suicide_trace = std::env::var("TRON_TRACE_SUICIDE").ok().filter(|w| {
+                let w = w.trim().trim_start_matches("0x").to_ascii_lowercase();
+                let hx: String =
+                    owner_t.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+                !w.is_empty() && hx == w
+            });
+            if suicide_trace.is_some() {
+                let store_rows = tron_chainbase::account_asset_rows_for_trace(&owner_t);
+                eprintln!(
+                    "SUICIDETRACE owner={} optimized={} inline_pre={:?} store_rows={:?} \
+                     inheritor={} will_destroy={}",
+                    owner_t.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    owner_account.asset_optimized,
+                    owner_account.asset_v2,
+                    store_rows,
+                    inheritor_t.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    will_destroy,
+                );
+            }
             tron_chainbase::import_all_asset(&mut owner_account);
+            if suicide_trace.is_some() {
+                eprintln!("SUICIDETRACE owner_post_import asset_v2={:?}", owner_account.asset_v2);
+            }
             for (token, amount) in std::mem::take(&mut owner_account.asset_v2) {
                 if amount == 0 {
                     continue;
                 }
                 let slot = inheritor_account.asset_v2.entry(token).or_insert(0);
                 *slot = slot.saturating_add(amount);
+            }
+            if suicide_trace.is_some() {
+                eprintln!(
+                    "SUICIDETRACE inheritor_post_sweep asset_v2={:?}",
+                    inheritor_account.asset_v2
+                );
             }
         }
 

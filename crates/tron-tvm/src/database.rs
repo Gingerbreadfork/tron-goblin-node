@@ -581,23 +581,79 @@ impl DatabaseCommit for TronDatabase {
                 }
             }
 
-            // EIP-161 / java parity: a CALL that merely TOUCHES a previously
-            // non-existent address WITHOUT transferring value must not create an
-            // account — java gates `createAccountIfNotExist` on endowment > 0
-            // (Program.callToAddress), and EIP-161 deletes touched-empty
-            // accounts. revm touches the target regardless, so a zero-value CALL
-            // to a fresh address would otherwise persist a phantom empty account
-            // here — both a snapshot-diff drift AND a cross-tx energy divergence
-            // (a later value-CALL would skip the 25000 NEW_ACCT_CALL charge java
-            // still applies, since the account would already exist). Skip a
-            // freshly-touched account that ended up empty (no balance, no code)
-            // and is not a deployed contract. Value-funded accounts (balance > 0)
-            // and created contracts are persisted as before; existing accounts
-            // are never affected (is_new_account is false for them).
+            // java parity: a CALL that merely TOUCHES a previously non-existent
+            // address WITHOUT any endowment must not create an account. java
+            // gates `createAccountIfNotExist` on `endowment > 0`
+            // (`Program.callToAddress`, Program.java) for both TRX-value CALLs and
+            // TRC-10 `CALLTOKEN`s; a zero-value CALL reaches the callee without
+            // ever calling `createNormalAccount`. revm, however, touches the
+            // target of every CALL (`transfer_loaded` marks it touched even at
+            // zero value), so a zero-value CALL to a fresh address would
+            // otherwise persist a phantom account that java never created.
+            //
+            // The phantom is a cross-tx energy divergence: java charges the 25000
+            // `NEW_ACCT_CALL` surcharge on a later value-CALL when the target row
+            // is ABSENT (`EnergyCost.isDeadAccount` == `getAccount == null`, not
+            // EIP-161 emptiness). A phantom would make us skip that charge.
+            //
+            // java does NOT implement EIP-161 touched-empty deletion: once an
+            // account exists (created via any endowment), it is persisted
+            // unconditionally (`RepositoryImpl.commitAccountCache` writes every
+            // CREATE/DIRTY row, no empty-account pruning). So the skip must be
+            // tight — it fires ONLY for a genuine zero-endowment touch. An account
+            // that received TRC-10 assets via `CALLTOKEN` (TRX balance 0 but a
+            // non-empty asset map) was created by java's
+            // `addTokenBalance -> createAccount` and MUST persist; an
+            // asset-optimized account keeps its assets in the separate
+            // account-asset store, so import them before judging emptiness.
+            // Value-funded accounts (balance > 0), created contracts, and any
+            // account with changed storage are persisted; existing accounts are
+            // never affected (`is_new_account` is false for them).
+            // Env-gated diagnostic (TRON_TRACE_ACCT=<21-byte-tron-addr-hex>): log
+            // the commit-time state of the traced address (is_new, balance, inline
+            // asset map, whether the empty-account skip below would prune it) so a
+            // missing-receiver / pruned-credit divergence can be confirmed at the
+            // commit decision. Off by default; a cheap `env::var` check otherwise.
+            if let Ok(want) = std::env::var("TRON_TRACE_ACCT") {
+                let want = want.trim().trim_start_matches("0x").to_ascii_lowercase();
+                let hx = tron_addr
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                if !want.is_empty() && hx == want {
+                    let txid = self
+                        .root_tx_id
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+                    eprintln!(
+                        "ACCTTRACE COMMIT addr={hx} tx={} is_new={} balance={} code_empty={} \
+                         asset_v2={:?} asset_optimized={} touched_storage={}",
+                        &txid[..16.min(txid.len())],
+                        is_new_account,
+                        tron_account.balance,
+                        tron_account.code.is_empty(),
+                        tron_account.asset_v2,
+                        tron_account.asset_optimized,
+                        account
+                            .storage
+                            .values()
+                            .any(|s| s.present_value != s.original_value),
+                    );
+                }
+            }
+
             if is_new_account
                 && created_contract.is_none()
                 && tron_account.balance == 0
                 && tron_account.code.is_empty()
+                && {
+                    let mut probe = tron_account.clone();
+                    tron_chainbase::import_all_asset(&mut probe);
+                    probe.asset_v2.values().all(|&v| v == 0)
+                        && probe.asset.values().all(|&v| v == 0)
+                }
                 && !account
                     .storage
                     .values()

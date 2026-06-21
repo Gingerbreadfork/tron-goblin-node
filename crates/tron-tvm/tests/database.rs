@@ -400,9 +400,12 @@ fn storage_uses_v1_layout_when_contract_version_is_1() {
 
 #[test]
 fn commit_skips_touched_empty_new_account() {
-    // EIP-161 / java parity: a CALL that merely touches a previously
-    // non-existent address with no value, code, or storage must NOT create an
-    // account (java gates createAccountIfNotExist on endowment > 0).
+    // java parity: a zero-endowment CALL that merely touches a previously
+    // non-existent address — no TRX value, no TRC-10 asset, no code, no
+    // storage — must NOT create an account. java gates createAccountIfNotExist
+    // on `endowment > 0` (Program.callToAddress), so it never calls
+    // createNormalAccount for a bare touch. revm touches the target regardless,
+    // so this skip filters the phantom revm would otherwise leave behind.
     let mut db = fresh_db();
     let evm_addr = EvmAddress::from([0xab; 20]);
     let tron_addr = evm_to_tron_address(&evm_addr);
@@ -420,8 +423,8 @@ fn commit_skips_touched_empty_new_account() {
 
 #[test]
 fn commit_persists_value_funded_new_account() {
-    // The flip side: a CALL that transfers value to a new address DOES create
-    // it — the empty-account skip must not drop a value-funded account.
+    // The flip side: a CALL that transfers TRX value to a new address DOES
+    // create it — the zero-endowment skip must not drop a value-funded account.
     let mut db = fresh_db();
     let evm_addr = EvmAddress::from([0xac; 20]);
     let tron_addr = evm_to_tron_address(&evm_addr);
@@ -437,4 +440,78 @@ fn commit_persists_value_funded_new_account() {
         .unwrap()
         .expect("a value-funded new account must be persisted");
     assert_eq!(acct.balance, 500);
+}
+
+#[test]
+fn commit_preserves_token_funded_account_with_zero_trx_balance() {
+    // Regression for the commit-time empty-account skip over-pruning a
+    // token-only account: a CALLTOKEN to a fresh address makes java
+    // run `addTokenBalance -> createAccount(Normal)`, leaving an account with
+    // TRX balance 0 but a NON-EMPTY asset map. java persists it
+    // unconditionally (commitAccountCache writes every CREATE row — there is no
+    // EIP-161 empty-account deletion). Our CALLTOKEN inspector writes the
+    // asset-bearing row to the AccountStore DURING execution, so when the
+    // later DatabaseCommit visits the same (revm-touched, zero-TRX) address it
+    // reads an EXISTING row — the skip must not fire and the assets must
+    // survive.
+    let mut db = fresh_db();
+    let evm_addr = EvmAddress::from([0xad; 20]);
+    let tron_addr = evm_to_tron_address(&evm_addr);
+
+    // Inspector-written CALLTOKEN target: TRX balance 0, holds a TRC-10 asset.
+    let mut seeded = tron_proto::Account {
+        address: tron_addr.as_bytes().to_vec(),
+        balance: 0,
+        ..Default::default()
+    };
+    seeded.asset_v2.insert("1005157".to_string(), 8_888_888);
+    db.accounts.put(&tron_addr, &seeded).unwrap();
+
+    // revm touched the same address at zero value (CALLTOKEN's child frame
+    // marks the target touched even though no TRX moved).
+    let mut changes = revm::primitives::AddressMap::default();
+    changes.insert(evm_addr, make_touched_account(0));
+    db.commit(changes);
+
+    let acct = db
+        .accounts
+        .get(&tron_addr)
+        .unwrap()
+        .expect("a token-funded account (TRX balance 0, non-empty asset map) must persist");
+    assert_eq!(acct.balance, 0);
+    assert_eq!(
+        acct.asset_v2.get("1005157").copied(),
+        Some(8_888_888),
+        "TRC-10 asset balance must survive the commit"
+    );
+}
+
+#[test]
+fn commit_preserves_account_holding_only_legacy_v1_assets() {
+    // The emptiness probe must also honour the legacy v1 `asset` map, not only
+    // `asset_v2`: an account carrying only a v1 TRC-10 balance (TRX 0, no code,
+    // no storage) was still created by a token endowment java persists, so a
+    // touched-empty revm commit over that row must not prune it.
+    let mut db = fresh_db();
+    let evm_addr = EvmAddress::from([0xae; 20]);
+    let tron_addr = evm_to_tron_address(&evm_addr);
+
+    let mut seeded = tron_proto::Account {
+        address: tron_addr.as_bytes().to_vec(),
+        balance: 0,
+        ..Default::default()
+    };
+    seeded.asset.insert("1005074".to_string(), 2_222_222); // legacy v1 asset map
+    db.accounts.put(&tron_addr, &seeded).unwrap();
+
+    let mut changes = revm::primitives::AddressMap::default();
+    changes.insert(evm_addr, make_touched_account(0));
+    db.commit(changes);
+
+    let acct = db
+        .accounts
+        .get(&tron_addr)
+        .unwrap()
+        .expect("an account holding only legacy v1 TRC-10 assets must persist");
+    assert_eq!(acct.asset.get("1005074").copied(), Some(2_222_222));
 }

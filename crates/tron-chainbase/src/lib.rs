@@ -33,7 +33,8 @@ pub use rocksdb_backend::{
 pub use session::SessionBackend;
 pub use snapshot::SnapshotKvBackend;
 pub use stores::{
-    dynamic_properties_keys, import_all_asset, set_account_asset_backend, witness_schedule_keys,
+    account_asset_rows_for_trace, dynamic_properties_keys, import_all_asset,
+    set_account_asset_backend, witness_schedule_keys,
     AbiStore, AccountAssetStore,
     AccountIdIndexStore, AccountIndexStore, AccountStore, AccountTraceStore, AssetIssueStore,
     AssetIssueV2Store, BalanceTraceStore, BlockIndexStore, BlockStore, BlockUndoDecodeError,

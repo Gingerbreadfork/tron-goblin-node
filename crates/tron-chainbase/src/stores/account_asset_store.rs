@@ -50,6 +50,25 @@ pub fn import_all_asset(account: &mut Account) {
     }
 }
 
+/// Diagnostic: return the raw `(asset_id_string, balance)` rows the global
+/// account-asset backend holds for `owner`, IGNORING the per-account
+/// `asset_optimized` flag. Used only by env-gated SELFDESTRUCT tracing to tell
+/// apart "store has no rows" from "asset_optimized=false skipped the rows".
+/// Empty when no backend is installed (unit tests). Not on any consensus path.
+pub fn account_asset_rows_for_trace(owner: &Address) -> Vec<(String, i64)> {
+    let Some(backend) = ACCOUNT_ASSET_BACKEND.get() else {
+        return Vec::new();
+    };
+    AccountAssetStore::new(backend.clone())
+        .get_all_assets(owner)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(id, bal)| (String::from_utf8_lossy(&id).into_owned(), bal))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub struct AccountAssetStore {
     backend: Arc<dyn KvBackend>,
 }

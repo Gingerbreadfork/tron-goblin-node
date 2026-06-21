@@ -556,12 +556,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     // Flipped on below when the historical-state archive
                     // ([index] capture_state_deltas) is enabled.
                     capture_state_deltas: false,
-                    // Log-only: the success/failure contractRet tripwire always
-                    // logs a divergence at ERROR, but does not hard-reject the
-                    // block (which would halt sync). Flip to `true` for a strict
-                    // validation re-sync once a clean run confirms no remaining
-                    // divergence (e.g. after re-syncing past the address-fix).
-                    verify_contract_ret: false,
+                    // The success/failure contractRet tripwire always logs a
+                    // divergence at ERROR; hard-rejecting the block (which halts
+                    // sync at that block) is opt-in via the
+                    // TRON_VERIFY_CONTRACT_RET env gate, for a strict-validation
+                    // re-sync. Default (unset) is log-only so a production node
+                    // never halts on a divergence.
+                    verify_contract_ret: std::env::var("TRON_VERIFY_CONTRACT_RET").is_ok(),
                 };
                 (
                     vm.support_constant,

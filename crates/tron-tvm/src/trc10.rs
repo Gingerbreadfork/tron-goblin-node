@@ -274,6 +274,17 @@ impl Trc10Inspector {
         accounts
             .put(&t.target_addr, &target_account)
             .expect("db error in Trc10Inspector unwinding target account after revert");
+        // Env-gated diagnostic (TRON_TRACE_ACCT): a frame revert rolled back the
+        // traced address's CALLTOKEN credit. If java keeps this credit, this is the
+        // over-revert that orphans the receiver.
+        trace_acct_event(
+            &t.target_addr,
+            "CALLTOKEN_UNWIND",
+            &format_args!(
+                "token={} amt={} target_pre={:?}",
+                t.token_id_key, t.transferred, t.target_pre
+            ),
+        );
         let _ = t.transferred;
     }
 
@@ -472,6 +483,27 @@ impl Trc10Inspector {
     pub fn energy_penalty_total(&self) -> u64 {
         self.energy_penalty_total
     }
+}
+
+/// Env-gated per-account diagnostic. When `TRON_TRACE_ACCT` is set to the hex
+/// of a 21-byte TRON address, emit one `ACCTTRACE` line on stderr each time the
+/// traced address is credited / unwound / committed, so a lost-token or
+/// over-revert divergence vs java can be localized to the exact op. Off (and a
+/// cheap `env::var` check) when the variable is unset.
+fn trace_acct_event(
+    addr: &tron_crypto::address::Address,
+    event: &str,
+    detail: &std::fmt::Arguments<'_>,
+) {
+    let Ok(want) = std::env::var("TRON_TRACE_ACCT") else {
+        return;
+    };
+    let want = want.trim().trim_start_matches("0x").to_ascii_lowercase();
+    let addr_hex: String = addr.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    if want.is_empty() || addr_hex != want {
+        return;
+    }
+    eprintln!("ACCTTRACE {event} addr={addr_hex} {detail}");
 }
 
 impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
@@ -751,6 +783,22 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         accounts
             .put(&target_addr, &target_account)
             .expect("db error in Trc10Inspector::call writing target account for CALLTOKEN transfer");
+
+        // Env-gated diagnostic (TRON_TRACE_ACCT=<21-byte-tron-addr-hex>): log a
+        // CALLTOKEN credit to the traced address so a missing-receiver / lost-token
+        // divergence can be pinned to the exact op. Off by default; no-op unless set.
+        trace_acct_event(
+            &target_addr,
+            "CALLTOKEN_CREDIT",
+            &format_args!(
+                "token={} from={} amt={} target_was_new={} new_target_bal={}",
+                token_id_key,
+                caller_addr.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                transferred,
+                target_was_new,
+                new_target,
+            ),
+        );
 
         self.pending.push(Some(PendingTransfer {
             caller_addr,

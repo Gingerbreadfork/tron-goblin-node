@@ -15,14 +15,14 @@
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AbiStore, AccountStore, CodeStore, ContractStateStore, ContractStore,
+    AbiStore, AccountAssetStore, AccountStore, CodeStore, ContractStateStore, ContractStore,
     DelegatedResourceStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend,
     StorageRowStore, VotesStore, WitnessStore,
 };
 use tron_crypto::address::Address;
-use tron_proto::{Account, TriggerSmartContract};
+use tron_proto::{smart_contract::Abi, Account, CreateSmartContract, SmartContract, TriggerSmartContract};
 use tron_tvm::database::code_hash;
-use tron_tvm::execute::{execute_trigger, VmBlockEnv, VmOutcome, VmStores};
+use tron_tvm::execute::{execute_create, execute_trigger, VmBlockEnv, VmOutcome, VmStores};
 
 /// Mainnet burn account (`TLsV52sRDL79HXGGm9yzwKibb6BeruhUzy`).
 const BLACKHOLE: [u8; 21] = [
@@ -318,4 +318,159 @@ fn restriction_suicide_absent_heir_charges_new_acct_topup() {
         "PUSH20 (3) + SUICIDE_V2 (5000) + NEW_ACCT_CALL (25000) for a \
          store-absent (dead) beneficiary"
     );
+}
+
+/// The GasFree-withdrawal shape (mainnet block 83,324,067, tx 73b9ba50…):
+/// an `asset_optimized` deposit shell whose TRC-10 holdings live ONLY in the
+/// separate account-asset store (empty inline `asset_v2`) SELFDESTRUCTs with a
+/// STORE-ABSENT beneficiary. java `MUtil.transferAllToken` reads the dying
+/// account's `getAssetMapV2()` — which imports the optimized balances first —
+/// and forwards every token to the freshly-created obtainer.
+///
+/// This pins the two coupled requirements that the 83,324,209 DelegateResource
+/// divergence depended on:
+///   1. `tron_suicide` must `import_all_asset` the optimized owner BEFORE the
+///      sweep, or it reads an empty inline map and forwards nothing.
+///   2. The obtainer, created fresh holding ONLY TRC-10 (zero TRX, no code),
+///      must survive the commit-time empty-account skip because its imported
+///      asset map is non-empty.
+/// Without (1) the obtainer is created token-less and (2) then prunes it away,
+/// leaving the receiver absent — exactly the symptom that failed the later
+/// DelegateResource to that address.
+#[test]
+fn optimized_shell_suicide_forwards_store_assets_to_fresh_heir() {
+    // Install the process-wide account-asset backend (java
+    // `AssetUtil.setAccountAssetStore`) so `import_all_asset` is live. Keyed by
+    // address, so the other tests in this binary (all non-optimized accounts)
+    // are unaffected. `OnceLock::set` is idempotent across this file's tests.
+    let asset_backend = mem();
+    tron_chainbase::set_account_asset_backend(asset_backend.clone());
+    let asset_store = AccountAssetStore::new(asset_backend);
+
+    let stores = fresh_stores(false);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xc2); // the deposit shell
+    let heir = tron_addr(0xc3); // fresh GasFree wallet — NO store row
+    install_caller(&stores, caller, 1_000_000);
+    install_contract(&stores, contract, suicide_bytecode(heir), 0);
+
+    // Mark the shell asset-optimized with its TRC-10 balances held ONLY in the
+    // account-asset store and an EMPTY inline `asset_v2` — the real on-chain
+    // representation of an optimized account (java
+    // `AssetUtil.getAssetOptimization`).
+    {
+        let a = Address::from_raw(contract);
+        let mut acc = stores.accounts.get(&a).unwrap().unwrap();
+        acc.asset_optimized = true;
+        acc.asset_v2.clear();
+        stores.accounts.put(&a, &acc).unwrap();
+        asset_store.put(&a, b"1005074", 2_222_222).unwrap();
+        asset_store.put(&a, b"1005157", 8_888_888).unwrap();
+        asset_store.put(&a, b"1005155", 2_000_000).unwrap();
+    }
+
+    let out = run(&stores, caller, contract);
+    assert!(matches!(out, VmOutcome::Success { .. }), "{out:?}");
+
+    // The heir must exist (NOT pruned) and carry every swept token inline.
+    let heir_acc = stores
+        .accounts
+        .get(&Address::from_raw(heir))
+        .unwrap()
+        .expect("fresh token-only heir survives commit (non-empty asset map is not pruned)");
+    assert_eq!(heir_acc.asset_v2.get("1005074"), Some(&2_222_222));
+    assert_eq!(heir_acc.asset_v2.get("1005157"), Some(&8_888_888));
+    assert_eq!(heir_acc.asset_v2.get("1005155"), Some(&2_000_000));
+
+    // The shell is destroyed; its inline asset map is gone with it.
+    assert!(
+        stores.accounts.get(&Address::from_raw(contract)).unwrap().is_none(),
+        "dying shell account deleted at commit"
+    );
+}
+
+/// The actual GasFree-withdrawal shape on mainnet (block 83,324,067, tx
+/// 73b9ba50…): the deposit shell is CREATE2-deployed IN THE SAME TX, and its
+/// constructor immediately SELFDESTRUCTs to a fresh GasFree wallet. The dying
+/// owner therefore has NO row in the committed `AccountStore` — it lives only
+/// in the in-flight revm journal until the final commit.
+///
+/// java reads the owner from the in-flight `Repository`
+/// (`getContractState().getAccount(owner)`), which sees the same-tx deployment,
+/// so `Program.suicide` still runs `createAccountIfNotExist(obtainer)` and
+/// persists the freshly-created (empty) beneficiary. Our host reads the
+/// COMMITTED store, which doesn't reflect the same-tx CREATE2 — so `tron_suicide`
+/// used to bail before creating the obtainer, and the empty beneficiary revm
+/// independently touched was then pruned by the commit-time empty-account skip,
+/// leaving the address ABSENT. A later `DelegateResourceContract` to that
+/// address then failed `TargetAccountMissing` (the 83,324,209 divergence).
+///
+/// Fix: when the dying owner was created locally this tx, synthesize the empty
+/// account the in-flight Repository would return and proceed, so the obtainer is
+/// created and persists.
+///
+/// The reproduction needs a NESTED deploy: a top-level factory contract (which
+/// IS pre-installed in the store) runs a CREATE2 whose child's constructor
+/// SELFDESTRUCTs to a fresh heir. Only the nested child is journal-only (the
+/// `in_store=false` case); a top-level `execute_create` contract is pre-written
+/// to the store before its constructor runs, so it would never hit the bail.
+#[test]
+fn same_tx_created_contract_suicide_persists_fresh_heir() {
+    let stores = fresh_stores(false);
+    // CREATE2 needs ALLOW_TVM_CONSTANTINOPLE (revm PETERSBURG); the suicide's
+    // `createAccountIfNotExist` is gated on ALLOW_TVM_SOLIDITY_059 (java).
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_SOLIDITY_059", 1);
+    let caller = tron_addr(0x11);
+    let factory = tron_addr(0xf0);
+    let heir = tron_addr(0xd1); // fresh GasFree wallet — NO store row
+    install_caller(&stores, caller, 1_000_000_000);
+
+    // The child's init code = its constructor: PUSH20 <heir-evm> SELFDESTRUCT.
+    // It self-destructs before returning runtime, so the child is created and
+    // destroyed within this one tx and never reaches the committed store.
+    let mut child_init = vec![0x73u8]; // PUSH20
+    child_init.extend_from_slice(&heir[1..]);
+    child_init.push(0xff); // SELFDESTRUCT
+    assert_eq!(child_init.len(), 22);
+
+    // Factory runtime: place the 22-byte child init code at memory offset 0,
+    // then CREATE2(value=0, offset=0, size=22, salt=0).
+    //   PUSH32 <child_init left-aligned, right-padded to 32>  ; the init bytes
+    //   PUSH1 0   MSTORE                                      ; mem[0..32]=word
+    //   PUSH1 0   ; salt
+    //   PUSH1 22  ; size
+    //   PUSH1 0   ; offset
+    //   PUSH1 0   ; value
+    //   CREATE2
+    //   STOP
+    let mut word = [0u8; 32];
+    word[..22].copy_from_slice(&child_init); // left-aligned, MSTORE keeps order
+    let mut factory_runtime = vec![0x7fu8]; // PUSH32
+    factory_runtime.extend_from_slice(&word);
+    factory_runtime.extend_from_slice(&[
+        0x60, 0x00, // PUSH1 0  (mem offset)
+        0x52, // MSTORE
+        0x60, 0x00, // PUSH1 0  (salt)
+        0x60, 0x16, // PUSH1 22 (size)
+        0x60, 0x00, // PUSH1 0  (offset)
+        0x60, 0x00, // PUSH1 0  (value)
+        0xf5, // CREATE2
+        0x00, // STOP
+    ]);
+    install_contract(&stores, factory, factory_runtime, 0);
+
+    let out = run(&stores, caller, factory);
+    assert!(matches!(out, VmOutcome::Success { .. }), "{out:?}");
+
+    // The fresh heir MUST exist after commit — java's createAccountIfNotExist
+    // creates it and never prunes it; our synthetic-owner path must do the same.
+    let heir_acc = stores
+        .accounts
+        .get(&Address::from_raw(heir))
+        .unwrap()
+        .expect("fresh heir of a same-tx (nested CREATE2) self-destructing contract must persist");
+    assert_eq!(heir_acc.address, heir.to_vec());
+    // Stamped with the head-block timestamp (java createNormalAccount).
+    assert_eq!(heir_acc.create_time, 1_700_000_000_000);
 }
