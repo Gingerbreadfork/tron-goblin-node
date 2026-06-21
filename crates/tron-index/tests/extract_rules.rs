@@ -4,7 +4,7 @@
 //! reverted-tx logs absent, calldata addresses not indexed).
 
 use prost::Message as _;
-use tron_index::{extract_block, keys, CaptureSet, NativeRow, Trc20Row, Trc721Row, DIR_FROM, DIR_TO, TRANSFER_TOPIC};
+use tron_index::{extract_block, keys, CaptureSet, InternalRow, NativeRow, Trc20Row, Trc721Row, DIR_FROM, DIR_TO, TRANSFER_TOPIC};
 use tron_proto::transaction::contract::ContractType;
 
 fn addr(b: u8) -> [u8; 21] {
@@ -425,6 +425,108 @@ fn transfer_topic_constant_matches_known_value() {
         hex::encode(TRANSFER_TOPIC),
         "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Internal transactions
+// ---------------------------------------------------------------------------
+
+fn internal_rows_of(
+    block: &tron_proto::Block,
+    ret: &tron_proto::TransactionRet,
+) -> Vec<(Vec<u8>, InternalRow)> {
+    let entries = extract_block(100, block, Some(ret), &caps_all());
+    entries
+        .puts
+        .iter()
+        .filter(|(k, _)| k[0] == keys::NS_INTERNAL)
+        .map(|(k, v)| (k.clone(), InternalRow::decode(v.as_slice()).unwrap()))
+        .collect()
+}
+
+/// The root frame of every smart-contract call carries a spurious
+/// `{tokenId: "0", call_value: 0}` leg (java's
+/// `InternalTransaction` unconditionally maps `String.valueOf(getTokenId())`
+/// for the root frame, so a non-token call yields tokenId "0"). It must
+/// NOT surface as a token transfer on the row.
+#[test]
+fn internal_non_token_call_does_not_report_token_zero() {
+    let c = tron_proto::TriggerSmartContract {
+        owner_address: addr(1).to_vec(),
+        contract_address: addr(9).to_vec(),
+        ..Default::default()
+    };
+    let block = block_of(vec![tx_with(ContractType::TriggerSmartContract, c.encode_to_vec())]);
+    let itx = tron_proto::InternalTransaction {
+        caller_address: addr(1).to_vec(),
+        transfer_to_address: addr(9).to_vec(),
+        call_value_info: vec![
+            // native leg (always first, empty tokenId)
+            tron_proto::internal_transaction::CallValueInfo {
+                call_value: 500,
+                token_id: String::new(),
+            },
+            // root-frame no-token sentinel leg
+            tron_proto::internal_transaction::CallValueInfo {
+                call_value: 0,
+                token_id: "0".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let ret = tron_proto::TransactionRet {
+        transactioninfo: vec![tron_proto::TransactionInfo {
+            internal_transactions: vec![itx],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rows = internal_rows_of(&block, &ret);
+    assert_eq!(rows.len(), 2, "caller + target each get a row");
+    for (_, r) in &rows {
+        assert_eq!(r.call_value, 500, "native value from the empty-tokenId leg");
+        assert_eq!(r.token_id, None, "tokenId \"0\" is the no-token sentinel, never a token");
+    }
+}
+
+/// A genuine TRC10 leg (positive id, leading zeros stripped) surfaces as
+/// the row's token, with the native value taken from leg 0.
+#[test]
+fn internal_token_call_reports_real_token_id() {
+    let c = tron_proto::TriggerSmartContract {
+        owner_address: addr(1).to_vec(),
+        contract_address: addr(9).to_vec(),
+        ..Default::default()
+    };
+    let block = block_of(vec![tx_with(ContractType::TriggerSmartContract, c.encode_to_vec())]);
+    let itx = tron_proto::InternalTransaction {
+        caller_address: addr(1).to_vec(),
+        transfer_to_address: addr(9).to_vec(),
+        call_value_info: vec![
+            tron_proto::internal_transaction::CallValueInfo {
+                call_value: 0,
+                token_id: String::new(),
+            },
+            tron_proto::internal_transaction::CallValueInfo {
+                call_value: 4242,
+                token_id: "1002000".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let ret = tron_proto::TransactionRet {
+        transactioninfo: vec![tron_proto::TransactionInfo {
+            internal_transactions: vec![itx],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rows = internal_rows_of(&block, &ret);
+    assert_eq!(rows.len(), 2);
+    for (_, r) in &rows {
+        assert_eq!(r.call_value, 0, "no native value moved");
+        assert_eq!(r.token_id.as_deref(), Some("1002000"));
+    }
 }
 
 #[test]

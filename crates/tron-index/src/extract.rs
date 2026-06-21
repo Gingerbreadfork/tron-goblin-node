@@ -663,10 +663,24 @@ pub fn extract_block(
                     .find(|cv| cv.token_id.is_empty())
                     .map(|cv| cv.call_value)
                     .unwrap_or(0);
+                // The token leg, when present. java-tron's
+                // `TransactionUtil.buildInternalTransaction` always emits
+                // the native leg as `call_value_info[0]` (empty tokenId)
+                // and then appends one entry per token in the frame's
+                // `tokenInfo` map. For the ROOT frame of any
+                // smart-contract call, that map is populated
+                // unconditionally with `String.valueOf(getTokenId())` —
+                // so a plain (non-token) call carries a spurious
+                // `{tokenId: "0", call_value: 0}` second entry
+                // (`InternalTransaction.java`). Token id `"0"` is the
+                // no-token sentinel (real TRC10 ids are positive and
+                // emitted with leading zeros stripped), so it never
+                // denotes an actual token transfer and must not surface
+                // as one on the row.
                 let token_id = itx
                     .call_value_info
                     .iter()
-                    .find(|cv| !cv.token_id.is_empty())
+                    .find(|cv| !cv.token_id.is_empty() && cv.token_id != "0")
                     .map(|cv| cv.token_id.clone());
                 let mut dirs: BTreeMap<Addr, u32> = BTreeMap::new();
                 *dirs.entry(caller).or_insert(0) |= DIR_FROM;
