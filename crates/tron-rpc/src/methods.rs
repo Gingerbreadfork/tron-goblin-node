@@ -154,6 +154,46 @@ pub fn parse_eth_address(s: &str) -> Result<Address, RpcError> {
     Ok(Address::from_raw(buf))
 }
 
+/// Render an address byte string in the eth-namespace `0x…`-hex form,
+/// dropping the leading `0x41` TRON prefix when present. Mirrors java's
+/// `ByteArray.toJsonHexAddress` (`ByteArray.java:121`): an empty input
+/// yields JSON `null` (the field is then omitted / null), and a 21-byte
+/// `41…` address is emitted as its bare 20-byte body.
+fn json_hex_address(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        return Value::Null;
+    }
+    if bytes.len() == ADDRESS_LENGTH && bytes[0] == 0x41 {
+        Value::String(hex_bytes(&bytes[1..]))
+    } else {
+        Value::String(hex_bytes(bytes))
+    }
+}
+
+/// Resolve the ENERGY_FEE (sun per energy unit) in effect at `timestamp_ms`,
+/// mirroring java's `Wallet.getEnergyFee(timestamp)` (`Wallet.java:4433`)
+/// which walks `ENERGY_PRICE_HISTORY` ("t0:p0,t1:p1,…", strictly increasing
+/// `t`) from the newest entry and returns the first price whose checkpoint
+/// time is `< timestamp`. Falls back to the live `ENERGY_FEE` when no entry
+/// applies (`parseEnergyFee` returned -1). Matches
+/// `JsonRpcApiUtil.parseEnergyFee` (`JsonRpcApiUtil.java:503`).
+fn energy_fee_at(s: &RpcState, timestamp_ms: i64) -> i64 {
+    let history = s.dyn_props.energy_price_history();
+    for entry in history.split(',').rev() {
+        let mut parts = entry.split(':');
+        let (Some(time_str), Some(price_str)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(time), Ok(price)) = (time_str.parse::<i64>(), price_str.parse::<i64>()) else {
+            continue;
+        };
+        if timestamp_ms > time {
+            return price;
+        }
+    }
+    s.dyn_props.get_long(b"ENERGY_FEE").unwrap_or(210)
+}
+
 // =============================================================================
 // web3_*
 // =============================================================================
@@ -250,7 +290,7 @@ pub fn eth_get_block_by_number(p: &Value, s: &RpcState) -> Result<Value, RpcErro
         Ok(b) => b,
         Err(_) => return Ok(Value::Null),
     };
-    Ok(encode_block_for_rpc(&id, &block, full_txs))
+    Ok(encode_eth_block(s, &id, &block, full_txs))
 }
 
 pub fn eth_get_block_by_hash(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
@@ -268,7 +308,7 @@ pub fn eth_get_block_by_hash(p: &Value, s: &RpcState) -> Result<Value, RpcError>
     buf.copy_from_slice(&hash_bytes);
     let id = tron_types::BlockId::from_raw(buf);
     match s.blocks.get(&id) {
-        Ok(block) => Ok(encode_block_for_rpc(&id, &block, full_txs)),
+        Ok(block) => Ok(encode_eth_block(s, &id, &block, full_txs)),
         Err(_) => Ok(Value::Null),
     }
 }
@@ -471,23 +511,42 @@ pub fn eth_get_transaction_by_hash(p: &Value, s: &RpcState) -> Result<Value, Rpc
     let mut tx_id = [0u8; 32];
     tx_id.copy_from_slice(&hash_bytes);
 
-    match s.transactions.get(&tx_id) {
-        Ok(Some(tron_chainbase::StoredTransaction::Full(tx))) => Ok(encode_tx_for_rpc(&tx_id, &tx)),
-        Ok(Some(tron_chainbase::StoredTransaction::BlockRef(block_num))) => {
-            // The full body lives in the BlockStore. Look it up.
-            if let Ok(id) = s.block_index.get(block_num) {
-                if let Ok(block) = s.blocks.get(&id) {
-                    for tx in &block.transactions {
-                        if let Some(raw) = &tx.raw_data {
-                            let id_bytes = tron_crypto::hash::sha256(&raw.encode_to_vec());
-                            if id_bytes == tx_id {
-                                return Ok(encode_tx_for_rpc(&tx_id, tx));
-                            }
+    // Resolve the containing block to recover the tx index, energy usage and
+    // block-context fields java's `getTransactionByHash`
+    // (`TronJsonRpcImpl.java:708`) sets on the `TransactionResult`. The block
+    // number comes from the receipt (TransactionInfo) when present, otherwise
+    // the transaction store's block reference.
+    let block_num = s
+        .tx_history
+        .as_ref()
+        .and_then(|h| h.get(&tx_id).ok().flatten())
+        .map(|info| info.block_number)
+        .or_else(|| match s.transactions.get(&tx_id) {
+            Ok(Some(tron_chainbase::StoredTransaction::BlockRef(n))) => Some(n),
+            _ => None,
+        });
+
+    if let Some(block_num) = block_num {
+        if let Ok(id) = s.block_index.get(block_num) {
+            if let Ok(block) = s.blocks.get(&id) {
+                for (idx, tx) in block.transactions.iter().enumerate() {
+                    if let Some(raw) = &tx.raw_data {
+                        let id_bytes = tron_crypto::hash::sha256(&raw.encode_to_vec());
+                        if id_bytes == tx_id {
+                            let ctx = eth_tx_block_context(s, &id, &block, idx, &tx_id);
+                            return Ok(encode_eth_tx(&tx_id, tx, Some(ctx)));
                         }
                     }
                 }
             }
-            Ok(Value::Null)
+        }
+    }
+
+    // No block found — surface the bare tx (java's standalone
+    // `TransactionResult(tx, wallet)` form: empty block fields).
+    match s.transactions.get(&tx_id) {
+        Ok(Some(tron_chainbase::StoredTransaction::Full(tx))) => {
+            Ok(encode_eth_tx(&tx_id, &tx, None))
         }
         _ => Ok(Value::Null),
     }
@@ -597,6 +656,310 @@ fn encode_tx_for_rpc(tx_id: &[u8; 32], tx: &tron_proto::Transaction) -> Value {
     })
 }
 
+/// Block-context fields java's `TransactionResult` block constructor
+/// (`TransactionResult.java:96`) stamps onto a tx: the containing block
+/// hash + number, the tx index within the block, the tx's energy usage
+/// total (`gas`) and the energy fee at the block timestamp (`gasPrice`).
+struct EthTxContext {
+    block_hash: String,
+    block_number: i64,
+    tx_index: u64,
+    energy_used: i64,
+    energy_fee: i64,
+}
+
+/// Build the [`EthTxContext`] for a tx located at `tx_index` in `block`,
+/// reading its energy usage from the receipt store when available.
+fn eth_tx_block_context(
+    s: &RpcState,
+    block_id: &tron_types::BlockId,
+    block: &tron_proto::Block,
+    tx_index: usize,
+    tx_id: &[u8; 32],
+) -> EthTxContext {
+    let number = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+        .map(|r| r.number)
+        .unwrap_or(0);
+    let timestamp = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+        .map(|r| r.timestamp)
+        .unwrap_or(0);
+    let energy_used = s
+        .tx_history
+        .as_ref()
+        .and_then(|h| h.get(tx_id).ok().flatten())
+        .and_then(|info| info.receipt.map(|r| r.energy_usage_total))
+        .unwrap_or(0);
+    EthTxContext {
+        block_hash: hex_bytes(block_id.as_bytes()),
+        block_number: number,
+        tx_index: tx_index as u64,
+        energy_used,
+        energy_fee: energy_fee_at(s, timestamp),
+    }
+}
+
+/// Render the `input` (call data) of a tx, mirroring
+/// `TransactionResult.parseInput` (`TransactionResult.java:74`): only a
+/// `TriggerSmartContract`'s `data` is surfaced; every other type yields
+/// `"0x"`.
+fn eth_tx_input(tx: &tron_proto::Transaction) -> String {
+    let Some(raw) = tx.raw_data.as_ref() else {
+        return "0x".into();
+    };
+    let Some(contract) = raw.contract.first() else {
+        return "0x".into();
+    };
+    if contract.r#type
+        != tron_proto::transaction::contract::ContractType::TriggerSmartContract as i32
+    {
+        return "0x".into();
+    }
+    let Some(param) = &contract.parameter else {
+        return "0x".into();
+    };
+    match tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param.value.as_slice()) {
+        Ok(c) if !c.data.is_empty() => format!("0x{}", hex::encode(&c.data)),
+        _ => "0x".into(),
+    }
+}
+
+/// Split a tx's first signature (`r[32] ‖ s[32] ‖ v[1]`) into the eth
+/// `v` / `r` / `s` hex strings, mirroring `TransactionResult.parseSignature`
+/// (`TransactionResult.java:58`). An unsigned tx yields the all-zero form.
+fn eth_tx_signature(tx: &tron_proto::Transaction) -> (Value, Value, Value) {
+    match tx.signature.first() {
+        Some(sig) if sig.len() == 65 => (
+            Value::String(hex_bytes(&sig[64..65])),
+            Value::String(hex_bytes(&sig[0..32])),
+            Value::String(hex_bytes(&sig[32..64])),
+        ),
+        _ => (
+            Value::String(hex_bytes(&[0u8; 1])),
+            Value::String(hex_bytes(&[0u8; 32])),
+            Value::String(hex_bytes(&[0u8; 32])),
+        ),
+    }
+}
+
+/// Render a transaction in java's eth-namespace `TransactionResult` shape.
+/// `ctx` carries the block-context fields; when `None` (tx not yet in a
+/// block) the block fields collapse to java's standalone-constructor
+/// defaults (`blockHash`/`blockNumber`/`transactionIndex` = `"0x"`,
+/// `gas` = `"0x0"`, `gasPrice` = `"0x"`).
+fn encode_eth_tx(tx_id: &[u8; 32], tx: &tron_proto::Transaction, ctx: Option<EthTxContext>) -> Value {
+    let contract = tx
+        .raw_data
+        .as_ref()
+        .and_then(|r| r.contract.first());
+
+    // from/to/value derive from the first contract. java zeroes `from` for
+    // genesis-block txs (block 0); everything else uses the contract owner.
+    let (from, to, value) = match contract {
+        Some(c) => {
+            let block_num = ctx.as_ref().map(|c| c.block_number).unwrap_or(-1);
+            let from = if block_num == 0 {
+                Value::String(hex_bytes(&[0u8; 20]))
+            } else {
+                addr_or_zero20(json_hex_address(&contract_owner_address(c)))
+            };
+            let to = addr_or_zero20(json_hex_address(&contract_to_address(c)));
+            (from, to, contract_value(c, tx_id))
+        }
+        None => (
+            Value::String(hex_bytes(&[0u8; 20])),
+            Value::String(hex_bytes(&[0u8; 20])),
+            0,
+        ),
+    };
+
+    let (v, r, sig_s) = eth_tx_signature(tx);
+
+    let (block_hash, block_number, tx_index, gas, gas_price) = match &ctx {
+        Some(c) => (
+            Value::String(c.block_hash.clone()),
+            Value::String(hex_i64(c.block_number)),
+            Value::String(hex_u64(c.tx_index)),
+            Value::String(hex_i64(c.energy_used)),
+            Value::String(hex_i64(c.energy_fee)),
+        ),
+        None => (
+            Value::String("0x".into()),
+            Value::String("0x".into()),
+            Value::String("0x".into()),
+            Value::String("0x0".into()),
+            Value::String("0x".into()),
+        ),
+    };
+
+    json!({
+        "hash": hex_bytes(tx_id),
+        "nonce": hex_bytes(&[0u8; 8]),
+        "blockHash": block_hash,
+        "blockNumber": block_number,
+        "transactionIndex": tx_index,
+        "from": from,
+        "to": to,
+        "gas": gas,
+        "gasPrice": gas_price,
+        "value": hex_i64(value),
+        "input": eth_tx_input(tx),
+        "type": "0x0",
+        "v": v,
+        "r": r,
+        "s": sig_s,
+    })
+}
+
+/// Resolve the eth `value` of a tx's first contract. `TransferContract` /
+/// `TransferAssetContract` / `TriggerSmartContract` carry the value inline;
+/// other types either have no transferable value or need a TransactionInfo
+/// lookup java performs for unfreeze/withdraw — those collapse to 0 here.
+fn contract_value(contract: &tron_proto::transaction::Contract, _tx_id: &[u8; 32]) -> i64 {
+    use prost::Message as _;
+    let Some(param) = &contract.parameter else {
+        return 0;
+    };
+    use tron_proto::transaction::contract::ContractType;
+    let ty = match ContractType::try_from(contract.r#type) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    match ty {
+        ContractType::TransferContract => tron_proto::TransferContract::decode(param.value.as_slice())
+            .map(|c| c.amount)
+            .unwrap_or(0),
+        ContractType::TransferAssetContract => {
+            tron_proto::TransferAssetContract::decode(param.value.as_slice())
+                .map(|c| c.amount)
+                .unwrap_or(0)
+        }
+        ContractType::TriggerSmartContract => {
+            tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param.value.as_slice())
+                .map(|c| c.call_value)
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// `json_hex_address` returns null for an empty address; java's
+/// `TransactionResult` falls back to the zero 20-byte address in that case
+/// (`ByteArray.toJsonHex(new byte[20])`).
+fn addr_or_zero20(addr: Value) -> Value {
+    match addr {
+        Value::Null => Value::String(hex_bytes(&[0u8; 20])),
+        v => v,
+    }
+}
+
+/// Render a block in java's eth-namespace `BlockResult` shape
+/// (`BlockResult.java:91`). Distinct from [`encode_block_for_rpc`], which
+/// serves the TRON-native wallet endpoints; this one carries the full eth
+/// field set (zeroed `sha3Uncles` / `logsBloom` / `stateRoot` placeholders,
+/// `gasLimit` = Σ feeLimit, `gasUsed` = Σ energyUsageTotal, etc.).
+fn encode_eth_block(
+    s: &RpcState,
+    id: &tron_types::BlockId,
+    block: &tron_proto::Block,
+    full_txs: bool,
+) -> Value {
+    let header = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref());
+    let (number, timestamp, parent_hash, tx_trie_root, account_state_root, witness_address) =
+        match header {
+            Some(r) => (
+                r.number,
+                r.timestamp,
+                r.parent_hash.clone(),
+                r.tx_trie_root.clone(),
+                r.account_state_root.clone(),
+                r.witness_address.clone(),
+            ),
+            None => (0, 0, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+
+    let energy_fee = energy_fee_at(s, timestamp);
+    let mut gas_limit_in_block: i64 = 0;
+    let mut gas_used_in_block: i64 = 0;
+
+    let transactions: Vec<Value> = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(idx, tx)| {
+            let tx_id = tx
+                .raw_data
+                .as_ref()
+                .map(|r| tron_crypto::hash::sha256(&r.encode_to_vec()))
+                .unwrap_or([0u8; 32]);
+            // gasLimit = Σ feeLimit; gasUsed = Σ energyUsageTotal (java
+            // `BlockResult` loop, lines 129-142).
+            if let Some(raw) = tx.raw_data.as_ref() {
+                gas_limit_in_block += raw.fee_limit;
+            }
+            let energy_used = s
+                .tx_history
+                .as_ref()
+                .and_then(|h| h.get(&tx_id).ok().flatten())
+                .and_then(|info| info.receipt.map(|r| r.energy_usage_total))
+                .unwrap_or(0);
+            gas_used_in_block += energy_used;
+            if full_txs {
+                let ctx = EthTxContext {
+                    block_hash: hex_bytes(id.as_bytes()),
+                    block_number: number,
+                    tx_index: idx as u64,
+                    energy_used,
+                    energy_fee,
+                };
+                encode_eth_tx(&tx_id, tx, Some(ctx))
+            } else {
+                json!(hex_bytes(&tx_id))
+            }
+        })
+        .collect();
+
+    // java zeroes the miner for the genesis block (`BlockResult.java:107`).
+    let miner = if number == 0 {
+        Value::String(hex_bytes(&[0u8; 20]))
+    } else {
+        addr_or_zero20(json_hex_address(&witness_address))
+    };
+
+    json!({
+        "number": hex_i64(number),
+        "hash": hex_bytes(id.as_bytes()),
+        "parentHash": hex_bytes(&parent_hash),
+        "nonce": hex_bytes(&[0u8; 8]),
+        "sha3Uncles": hex_bytes(&[0u8; 32]),
+        "logsBloom": format!("0x{}", "00".repeat(256)),
+        "transactionsRoot": hex_bytes(&tx_trie_root),
+        "stateRoot": hex_bytes(&account_state_root),
+        "receiptsRoot": hex_bytes(&[0u8; 32]),
+        "miner": miner,
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "extraData": "0x",
+        "size": hex_u64(block.encoded_len() as u64),
+        "gasLimit": hex_i64(gas_limit_in_block),
+        "gasUsed": hex_i64(gas_used_in_block),
+        // java emits `timestamp` in seconds (block ms / 1000).
+        "timestamp": hex_i64(timestamp / 1000),
+        "transactions": Value::Array(transactions),
+        "uncles": Value::Array(vec![]),
+        "baseFeePerGas": "0x0",
+        "mixHash": hex_bytes(&[0u8; 32]),
+    })
+}
+
 // =============================================================================
 // Additional eth_* read methods
 // =============================================================================
@@ -639,7 +1002,8 @@ pub fn eth_get_transaction_by_block_number_and_index(
         .as_ref()
         .map(|raw| tron_crypto::hash::sha256(&raw.encode_to_vec()))
         .unwrap_or([0u8; 32]);
-    Ok(encode_tx_for_rpc(&tx_id_bytes, tx))
+    let ctx = eth_tx_block_context(s, &id, &block, idx as usize, &tx_id_bytes);
+    Ok(encode_eth_tx(&tx_id_bytes, tx, Some(ctx)))
 }
 
 /// `eth_getTransactionByBlockHashAndIndex` — same as above, but
@@ -676,7 +1040,8 @@ pub fn eth_get_transaction_by_block_hash_and_index(
         .as_ref()
         .map(|raw| tron_crypto::hash::sha256(&raw.encode_to_vec()))
         .unwrap_or([0u8; 32]);
-    Ok(encode_tx_for_rpc(&tx_id_bytes, tx))
+    let ctx = eth_tx_block_context(s, &id, &block, idx as usize, &tx_id_bytes);
+    Ok(encode_eth_tx(&tx_id_bytes, tx, Some(ctx)))
 }
 
 // =============================================================================
@@ -2374,19 +2739,130 @@ pub fn eth_get_transaction_receipt(p: &Value, s: &RpcState) -> Result<Value, Rpc
     let Ok(Some(info)) = history.get(&tx_id) else {
         return Ok(Value::Null);
     };
-    Ok(encode_receipt_for_rpc(&tx_id, &info))
+
+    // java's `getTransactionReceipt` (`TronJsonRpcImpl.java:822`) resolves
+    // the containing block, then walks the block's TransactionInfo list to
+    // recover the tx index plus the cumulative gas / log count of every
+    // preceding tx (`findTransactionContext`, line 859). Those, the block
+    // hash, the from/to of the tx's first contract, and the energy fee at
+    // the block timestamp are all surfaced on the receipt.
+    let block_id = s.block_index.get(info.block_number).ok();
+    let block = block_id.as_ref().and_then(|id| s.blocks.get(id).ok());
+
+    let mut tx_index: u64 = 0;
+    let mut cumulative_gas: i64 = 0;
+    let mut cumulative_log_count: u64 = 0;
+    let mut from = Value::Null;
+    let mut to = Value::Null;
+    let mut energy_fee = energy_fee_at(s, 0);
+
+    if let (Some(block), Some(history)) = (&block, &s.tx_history) {
+        if let Some(ts_ms) = block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|r| r.timestamp)
+        {
+            energy_fee = energy_fee_at(s, ts_ms);
+        }
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            let Some(raw) = &tx.raw_data else { continue };
+            let id = tron_crypto::hash::sha256(&raw.encode_to_vec());
+            if id == tx_id {
+                tx_index = idx as u64;
+                let (f, t) = receipt_from_to(tx);
+                from = f;
+                to = t;
+                break;
+            }
+            if let Ok(Some(prev)) = history.get(&id) {
+                cumulative_gas += prev
+                    .receipt
+                    .as_ref()
+                    .map(|r| r.energy_usage_total)
+                    .unwrap_or(0);
+                cumulative_log_count += prev.log.len() as u64;
+            }
+        }
+    }
+
+    Ok(encode_receipt_for_rpc(ReceiptContext {
+        tx_id: &tx_id,
+        info: &info,
+        block_id,
+        tx_index,
+        cumulative_gas,
+        cumulative_log_count,
+        from,
+        to,
+        energy_fee,
+    }))
 }
 
-fn encode_receipt_for_rpc(tx_id: &[u8; 32], info: &tron_proto::TransactionInfo) -> Value {
+/// Pre-resolved per-tx context for assembling an eth `TransactionReceipt`,
+/// mirroring java's `TransactionReceipt.TransactionContext`.
+struct ReceiptContext<'a> {
+    tx_id: &'a [u8; 32],
+    info: &'a tron_proto::TransactionInfo,
+    block_id: Option<tron_types::BlockId>,
+    tx_index: u64,
+    cumulative_gas: i64,
+    cumulative_log_count: u64,
+    from: Value,
+    to: Value,
+    energy_fee: i64,
+}
+
+/// Extract the eth `from` / `to` of a tx from its first contract,
+/// mirroring `TransactionReceipt` (`TransactionReceipt.java:96`):
+/// `from` is the contract owner, `to` the contract's destination address
+/// per `JsonRpcApiUtil.getToAddress`. Both are rendered prefix-stripped
+/// (20-byte eth form); absent values become JSON null.
+fn receipt_from_to(tx: &tron_proto::Transaction) -> (Value, Value) {
+    let Some(raw) = tx.raw_data.as_ref() else {
+        return (Value::Null, Value::Null);
+    };
+    let Some(contract) = raw.contract.first() else {
+        return (Value::Null, Value::Null);
+    };
+    let from = json_hex_address(&contract_owner_address(contract));
+    let to = json_hex_address(&contract_to_address(contract));
+    (from, to)
+}
+
+fn encode_receipt_for_rpc(ctx: ReceiptContext<'_>) -> Value {
+    let ReceiptContext {
+        tx_id,
+        info,
+        block_id,
+        tx_index,
+        cumulative_gas,
+        cumulative_log_count,
+        from,
+        to,
+        energy_fee,
+    } = ctx;
+
+    let block_hash = block_id
+        .as_ref()
+        .map(|id| Value::String(hex_bytes(id.as_bytes())))
+        .unwrap_or(Value::Null);
+    let tx_index_hex = hex_u64(tx_index);
+    let block_number_hex = hex_i64(info.block_number);
+
     let logs: Vec<Value> = info
         .log
         .iter()
         .enumerate()
         .map(|(i, l)| {
             json!({
-                "logIndex": hex_u64(i as u64),
+                // Block-cumulative log index (java's `logIndex +
+                // context.cumulativeLogCount`, `TransactionReceipt.java:114`).
+                "logIndex": hex_u64(cumulative_log_count + i as u64),
                 "transactionHash": hex_bytes(tx_id),
-                "blockNumber": hex_i64(info.block_number),
+                "transactionIndex": tx_index_hex,
+                "blockHash": block_hash,
+                "blockNumber": block_number_hex,
                 "address": hex_bytes(&l.address),
                 "data": hex_bytes(&l.data),
                 "topics": l.topics.iter().map(|t| hex_bytes(t)).collect::<Vec<_>>(),
@@ -2394,30 +2870,37 @@ fn encode_receipt_for_rpc(tx_id: &[u8; 32], info: &tron_proto::TransactionInfo) 
             })
         })
         .collect();
-    let status = if info.result == 0 { "0x1" } else { "0x0" };
+
+    // Status is derived from the `ResourceReceipt.result` `contractResult`
+    // enum, not `TransactionInfo.result`: java does `getReceipt()
+    // .getResultValue() <= 1 ? "0x1" : "0x0"` (`TransactionReceipt.java:86`).
+    // `contractResult` DEFAULT(0)/SUCCESS(1) are success; everything else
+    // (REVERT(2), OUT_OF_ENERGY(10), …) is failure.
+    let energy_usage_total = info
+        .receipt
+        .as_ref()
+        .map(|r| r.energy_usage_total)
+        .unwrap_or(0);
+    let receipt_result = info.receipt.as_ref().map(|r| r.result).unwrap_or(0);
+    let status = if receipt_result <= 1 { "0x1" } else { "0x0" };
+
     json!({
         "transactionHash": hex_bytes(tx_id),
-        "blockNumber": hex_i64(info.block_number),
-        "blockHash": null,
-        "transactionIndex": "0x0",
-        "from": null,
-        "to": null,
-        "cumulativeGasUsed": hex_i64(info
-            .receipt
-            .as_ref()
-            .map(|r| r.energy_usage_total)
-            .unwrap_or(0)),
-        "gasUsed": hex_i64(info
-            .receipt
-            .as_ref()
-            .map(|r| r.energy_usage_total)
-            .unwrap_or(0)),
+        "transactionIndex": tx_index_hex,
+        "blockHash": block_hash,
+        "blockNumber": block_number_hex,
+        "from": from,
+        "to": to,
+        // Cumulative gas includes this tx's own usage (java:
+        // `context.cumulativeGas + txInfo.getReceipt().getEnergyUsageTotal()`).
+        "cumulativeGasUsed": hex_i64(cumulative_gas + energy_usage_total),
+        "gasUsed": hex_i64(energy_usage_total),
         "contractAddress": if info.contract_address.is_empty() { Value::Null }
-                          else { Value::String(hex_bytes(&info.contract_address)) },
+                          else { json_hex_address(&info.contract_address) },
         "logs": logs,
         "logsBloom": format!("0x{}", "00".repeat(256)),
         "status": status,
-        "effectiveGasPrice": "0x0",
+        "effectiveGasPrice": hex_i64(energy_fee),
         "type": "0x0",
     })
 }
@@ -2440,15 +2923,23 @@ pub fn eth_get_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(history) = &s.tx_history else {
         return Ok(Value::Array(vec![]));
     };
+    // Stored `TransactionInfo.Log.address` is the bare 20-byte EVM form
+    // (no `0x41` prefix) — java-tron's `LogFilter.matchesContractAddress`
+    // compares against `addressToByteArray`, which is `DataWord.getLast20Bytes`
+    // (`JsonRpcApiUtil.java:415`). `parse_eth_address` returns the 21-byte
+    // TRON form, so the filter must drop the leading prefix byte before
+    // comparing — otherwise a 21-vs-20 length mismatch silently never
+    // matches and the address filter (the most common `eth_getLogs` case)
+    // returns nothing.
     let addr_filter: Vec<Vec<u8>> = match obj.get("address") {
-        Some(Value::String(s)) => vec![parse_eth_address(s)?.as_bytes().to_vec()],
+        Some(Value::String(s)) => vec![parse_eth_address(s)?.as_bytes()[1..].to_vec()],
         Some(Value::Array(arr)) => arr
             .iter()
             .filter_map(|v| v.as_str())
             .map(parse_eth_address)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|a| a.as_bytes().to_vec())
+            .map(|a| a.as_bytes()[1..].to_vec())
             .collect(),
         _ => Vec::new(),
     };
@@ -2474,11 +2965,19 @@ pub fn eth_get_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     for block_num in from_block..=to_block {
         let Ok(id) = s.block_index.get(block_num) else { continue };
         let Ok(block) = s.blocks.get(&id) else { continue };
-        for tx in &block.transactions {
+        // `logIndex` is the position within the *block*, accumulated across
+        // every tx's logs in tx order — not the per-tx index. java-tron's
+        // `LogMatch.matchBlock` carries `logIndexInBlock` over the whole
+        // block (`LogMatch.java:46,74`), and `transactionIndex` is the tx's
+        // ordinal `i` in the block (`LogMatch.java:61`).
+        let mut log_index_in_block: u64 = 0;
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
             let Some(raw) = &tx.raw_data else { continue };
             let tx_id = tron_crypto::hash::sha256(&raw.encode_to_vec());
             let Ok(Some(info)) = history.get(&tx_id) else { continue };
-            for (log_idx, log) in info.log.iter().enumerate() {
+            for log in info.log.iter() {
+                let this_log_index = log_index_in_block;
+                log_index_in_block += 1;
                 if !addr_filter.is_empty() && !addr_filter.iter().any(|a| a == &log.address) {
                     continue;
                 }
@@ -2494,9 +2993,9 @@ pub fn eth_get_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
                     continue;
                 }
                 out.push(json!({
-                    "logIndex": hex_u64(log_idx as u64),
+                    "logIndex": hex_u64(this_log_index),
                     "transactionHash": hex_bytes(&tx_id),
-                    "transactionIndex": "0x0",
+                    "transactionIndex": hex_u64(tx_index as u64),
                     "blockNumber": hex_i64(block_num),
                     "blockHash": hex_bytes(id.as_bytes()),
                     "address": hex_bytes(&log.address),
@@ -4568,6 +5067,77 @@ fn fmt_tron_address(addr: &[u8]) -> String {
         format!("0x{}", hex::encode(addr))
     } else {
         format!("0x{}", hex::encode(addr))
+    }
+}
+
+/// The 21-byte owner (`from`) of a contract. Every TRON contract carries
+/// an `owner_address` as its first field; java reads it via
+/// `TransactionCapsule.getOwner` (`TransactionReceipt.java:98`). Decoded
+/// leniently and read straight off the `Any` parameter.
+fn contract_owner_address(contract: &tron_proto::transaction::Contract) -> Vec<u8> {
+    use prost::Message as _;
+    let Some(param) = &contract.parameter else {
+        return Vec::new();
+    };
+    use tron_proto::transaction::contract::ContractType;
+    let ty = match ContractType::try_from(contract.r#type) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    macro_rules! owner {
+        ($t:ty) => {
+            <$t>::decode(param.value.as_slice())
+                .map(|c| c.owner_address)
+                .unwrap_or_default()
+        };
+    }
+    match ty {
+        ContractType::TransferContract => owner!(tron_proto::TransferContract),
+        ContractType::TransferAssetContract => owner!(tron_proto::TransferAssetContract),
+        ContractType::TriggerSmartContract => {
+            tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param.value.as_slice())
+                .map(|c| c.owner_address)
+                .unwrap_or_default()
+        }
+        ContractType::CreateSmartContract => {
+            tron_proto::decode_lenient::<tron_proto::CreateSmartContract>(param.value.as_slice())
+                .map(|c| c.owner_address)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The contract's destination (`to`) address, mirroring
+/// `JsonRpcApiUtil.getToAddress` / `getTo` (`JsonRpcApiUtil.java:116`).
+/// Only the address-bearing contract types are handled; the rest yield an
+/// empty address (rendered as JSON null), exactly as java's switch leaves
+/// `toAddressList` empty.
+fn contract_to_address(contract: &tron_proto::transaction::Contract) -> Vec<u8> {
+    use prost::Message as _;
+    let Some(param) = &contract.parameter else {
+        return Vec::new();
+    };
+    use tron_proto::transaction::contract::ContractType;
+    let ty = match ContractType::try_from(contract.r#type) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    match ty {
+        ContractType::TransferContract => tron_proto::TransferContract::decode(param.value.as_slice())
+            .map(|c| c.to_address)
+            .unwrap_or_default(),
+        ContractType::TransferAssetContract => {
+            tron_proto::TransferAssetContract::decode(param.value.as_slice())
+                .map(|c| c.to_address)
+                .unwrap_or_default()
+        }
+        ContractType::TriggerSmartContract => {
+            tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param.value.as_slice())
+                .map(|c| c.contract_address)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -7137,8 +7707,22 @@ pub fn eth_get_block_receipts(p: &Value, s: &RpcState) -> Result<Value, RpcError
         return Ok(json!([]));
     };
 
+    // java's `getTransactionReceiptsFromBlock` (`TronJsonRpcImpl.java:933`)
+    // walks the block in tx order, threading the running cumulative gas and
+    // log count through each receipt (the values *before* the current tx).
+    let energy_fee = energy_fee_at(
+        s,
+        block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|r| r.timestamp)
+            .unwrap_or(0),
+    );
     let mut receipts = Vec::with_capacity(block.transactions.len());
-    for tx in &block.transactions {
+    let mut cumulative_gas: i64 = 0;
+    let mut cumulative_log_count: u64 = 0;
+    for (tx_index, tx) in block.transactions.iter().enumerate() {
         let Some(raw) = tx.raw_data.as_ref() else {
             continue;
         };
@@ -7148,7 +7732,24 @@ pub fn eth_get_block_receipts(p: &Value, s: &RpcState) -> Result<Value, RpcError
         let Ok(Some(info)) = history.get(&tx_id) else {
             continue;
         };
-        receipts.push(encode_receipt_for_rpc(&tx_id, &info));
+        let (from, to) = receipt_from_to(tx);
+        receipts.push(encode_receipt_for_rpc(ReceiptContext {
+            tx_id: &tx_id,
+            info: &info,
+            block_id: Some(block_id),
+            tx_index: tx_index as u64,
+            cumulative_gas,
+            cumulative_log_count,
+            from,
+            to,
+            energy_fee,
+        }));
+        cumulative_gas += info
+            .receipt
+            .as_ref()
+            .map(|r| r.energy_usage_total)
+            .unwrap_or(0);
+        cumulative_log_count += info.log.len() as u64;
     }
     Ok(json!(receipts))
 }
@@ -7737,5 +8338,210 @@ mod constant_call_tests {
             ..Default::default()
         };
         assert!(delegated_resource_non_empty(&with_expire));
+    }
+}
+
+#[cfg(test)]
+mod eth_encoding_tests {
+    use super::*;
+
+    fn log(address: Vec<u8>, topics: Vec<Vec<u8>>, data: Vec<u8>) -> tron_proto::transaction_info::Log {
+        tron_proto::transaction_info::Log { address, topics, data }
+    }
+
+    #[test]
+    fn log_address_filter_matches_stored_20_byte_address() {
+        // `eth_getLogs` stores log addresses as bare 20-byte EVM form;
+        // `parse_eth_address` yields the 21-byte 0x41-prefixed TRON form, so
+        // the filter must strip the prefix byte before comparing — otherwise
+        // 21-vs-20 never matches and the address filter returns nothing.
+        let stored: Vec<u8> = vec![0x99u8; 20];
+        let filter_str = format!("0x{}", "99".repeat(20));
+        let parsed = parse_eth_address(&filter_str).unwrap();
+        let filter_key = parsed.as_bytes()[1..].to_vec();
+        assert_eq!(filter_key, stored);
+        // The full 21-byte form (the pre-fix bug) would NOT match.
+        assert_ne!(parsed.as_bytes().to_vec(), stored);
+    }
+
+    #[test]
+    fn json_hex_address_strips_41_prefix_and_nulls_empty() {
+        // 21-byte 0x41-prefixed TRON address renders as its bare 20-byte body.
+        let mut tron = vec![0x41u8];
+        tron.extend_from_slice(&[0xabu8; 20]);
+        assert_eq!(
+            json_hex_address(&tron),
+            Value::String(format!("0x{}", "ab".repeat(20)))
+        );
+        // Already 20-byte (no prefix) passes through unchanged.
+        assert_eq!(
+            json_hex_address(&[0xcd; 20]),
+            Value::String(format!("0x{}", "cd".repeat(20)))
+        );
+        // Empty -> JSON null (java toJsonHexAddress).
+        assert_eq!(json_hex_address(&[]), Value::Null);
+    }
+
+    #[test]
+    fn receipt_status_uses_contract_result_not_info_result() {
+        // ResourceReceipt.result is the contractResult enum: DEFAULT(0) and
+        // SUCCESS(1) are success ("0x1"); REVERT(2)+ are failure ("0x0").
+        // The legacy code keyed off TransactionInfo.result (code enum), which
+        // would have flipped these.
+        let tx_id = [0u8; 32];
+        let mk = |result: i32| {
+            let info = tron_proto::TransactionInfo {
+                block_number: 5,
+                receipt: Some(tron_proto::ResourceReceipt {
+                    energy_usage_total: 100,
+                    result,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let v = encode_receipt_for_rpc(ReceiptContext {
+                tx_id: &tx_id,
+                info: &info,
+                block_id: None,
+                tx_index: 0,
+                cumulative_gas: 0,
+                cumulative_log_count: 0,
+                from: Value::Null,
+                to: Value::Null,
+                energy_fee: 210,
+            });
+            v["status"].as_str().unwrap().to_string()
+        };
+        assert_eq!(mk(0), "0x1"); // DEFAULT
+        assert_eq!(mk(1), "0x1"); // SUCCESS
+        assert_eq!(mk(2), "0x0"); // REVERT
+        assert_eq!(mk(10), "0x0"); // OUT_OF_ENERGY
+    }
+
+    #[test]
+    fn receipt_cumulative_gas_and_log_index_and_fee() {
+        let tx_id = [7u8; 32];
+        let info = tron_proto::TransactionInfo {
+            block_number: 9,
+            receipt: Some(tron_proto::ResourceReceipt {
+                energy_usage_total: 40,
+                result: 1,
+                ..Default::default()
+            }),
+            log: vec![
+                log(vec![1u8; 20], vec![vec![2u8; 32]], vec![3u8; 4]),
+                log(vec![4u8; 20], vec![], vec![]),
+            ],
+            ..Default::default()
+        };
+        let v = encode_receipt_for_rpc(ReceiptContext {
+            tx_id: &tx_id,
+            info: &info,
+            block_id: None,
+            tx_index: 3,
+            cumulative_gas: 1000, // gas of preceding txs
+            cumulative_log_count: 5, // logs of preceding txs
+            from: Value::Null,
+            to: Value::Null,
+            energy_fee: 280,
+        });
+        // cumulativeGasUsed includes this tx's own usage (1000 + 40 = 1040).
+        assert_eq!(v["cumulativeGasUsed"], json!("0x410"));
+        assert_eq!(v["gasUsed"], json!("0x28"));
+        assert_eq!(v["effectiveGasPrice"], json!("0x118")); // 280
+        assert_eq!(v["transactionIndex"], json!("0x3"));
+        let logs = v["logs"].as_array().unwrap();
+        // logIndex is block-cumulative: 5 + 0, 5 + 1.
+        assert_eq!(logs[0]["logIndex"], json!("0x5"));
+        assert_eq!(logs[1]["logIndex"], json!("0x6"));
+        assert_eq!(logs[0]["transactionIndex"], json!("0x3"));
+    }
+
+    #[test]
+    fn eth_tx_signature_splits_r_s_v() {
+        let mut sig = vec![0u8; 65];
+        sig[0..32].copy_from_slice(&[0xaa; 32]); // r
+        sig[32..64].copy_from_slice(&[0xbb; 32]); // s
+        sig[64] = 0x1c; // v
+        let tx = tron_proto::Transaction { signature: vec![sig], ..Default::default() };
+        let (v, r, s) = eth_tx_signature(&tx);
+        assert_eq!(r, Value::String(format!("0x{}", "aa".repeat(32))));
+        assert_eq!(s, Value::String(format!("0x{}", "bb".repeat(32))));
+        assert_eq!(v, Value::String("0x1c".to_string()));
+    }
+
+    #[test]
+    fn eth_tx_unsigned_yields_zero_rsv() {
+        let tx = tron_proto::Transaction::default();
+        let (v, r, s) = eth_tx_signature(&tx);
+        assert_eq!(v, Value::String("0x00".to_string()));
+        assert_eq!(r, Value::String(format!("0x{}", "00".repeat(32))));
+        assert_eq!(s, Value::String(format!("0x{}", "00".repeat(32))));
+    }
+
+    #[test]
+    fn eth_tx_input_only_for_trigger_smart_contract() {
+        use prost::Message as _;
+        // TriggerSmartContract carries data -> surfaced as input.
+        let trigger = tron_proto::TriggerSmartContract {
+            owner_address: vec![0x41; 21],
+            contract_address: vec![0x41; 21],
+            data: vec![0xde, 0xad, 0xbe, 0xef],
+            ..Default::default()
+        };
+        let any = prost_types::Any {
+            type_url: String::new(),
+            value: trigger.encode_to_vec(),
+        };
+        let contract = tron_proto::transaction::Contract {
+            r#type: tron_proto::transaction::contract::ContractType::TriggerSmartContract as i32,
+            parameter: Some(any),
+            ..Default::default()
+        };
+        let tx = tron_proto::Transaction {
+            raw_data: Some(tron_proto::transaction::Raw {
+                contract: vec![contract],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(eth_tx_input(&tx), "0xdeadbeef");
+
+        // A non-trigger tx yields "0x".
+        let transfer = tron_proto::TransferContract {
+            owner_address: vec![0x41; 21],
+            to_address: vec![0x41; 21],
+            amount: 5,
+        };
+        let any2 = prost_types::Any {
+            type_url: String::new(),
+            value: transfer.encode_to_vec(),
+        };
+        let tx2 = tron_proto::Transaction {
+            raw_data: Some(tron_proto::transaction::Raw {
+                contract: vec![tron_proto::transaction::Contract {
+                    r#type: tron_proto::transaction::contract::ContractType::TransferContract as i32,
+                    parameter: Some(any2),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(eth_tx_input(&tx2), "0x");
+    }
+
+    #[test]
+    fn eth_tx_standalone_has_empty_block_fields() {
+        // ctx=None mirrors java's TransactionResult(tx, wallet) form.
+        let tx = tron_proto::Transaction::default();
+        let v = encode_eth_tx(&[9u8; 32], &tx, None);
+        assert_eq!(v["blockHash"], json!("0x"));
+        assert_eq!(v["blockNumber"], json!("0x"));
+        assert_eq!(v["transactionIndex"], json!("0x"));
+        assert_eq!(v["gas"], json!("0x0"));
+        assert_eq!(v["gasPrice"], json!("0x"));
+        assert_eq!(v["type"], json!("0x0"));
+        assert_eq!(v["nonce"], json!("0x0000000000000000"));
     }
 }
