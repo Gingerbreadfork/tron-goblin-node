@@ -479,10 +479,16 @@ pub fn consume_energy(
     // recalculation at every block boundary (or maintenance, depending
     // on java-tron's path). Bump whether the energy came from frozen
     // or fee — adaptive scaling is about chain-wide load, not how the
-    // user paid.
+    // user paid. `wrapping_add` matches java's plain `long +=`
+    // (`ReceiptCapsule`/`EnergyProcessor` do `getBlockEnergyUsage() + energy`,
+    // which wraps on i64 overflow rather than saturating). It is also the
+    // exact fold the Block-STM commutative-delta commit replays
+    // (`base + Σ delta` via `wrapping_add`), so the serial and parallel paths
+    // stay byte-identical for this accumulator at the (physically
+    // unreachable) overflow boundary.
     if dyn_props.allow_adaptive_energy() == 1 {
         let cur = dyn_props.block_energy_usage();
-        dyn_props.save_block_energy_usage(cur.saturating_add(energy_used_i));
+        dyn_props.save_block_energy_usage(cur.wrapping_add(energy_used_i));
     }
 
     if let Ok(t) = std::env::var("TRON_ETRACE") {

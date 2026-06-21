@@ -1381,6 +1381,94 @@ fn parallel_vm_execution_is_byte_identical_to_serial() {
     assert_eq!(rs.block_id, rp.block_id, "block id diverged");
 }
 
+/// Block-STM: the chain-global `BLOCK_ENERGY_USAGE` accumulator must fold
+/// byte-identically to serial. With `ALLOW_ADAPTIVE_ENERGY = 1`, every VM tx's
+/// energy charge RMWs that single dyn_props key (`block_energy_usage += used`) —
+/// a would-be N-deep chain. The parallel path treats it as a commutative delta
+/// (each tx records only its `+= used`; the commit sums `base + Σ delta` with
+/// `wrapping_add`, matching java's plain `long +=`). Driving a multi-tx block
+/// down that path with adaptive on (so the accumulator code actually executes)
+/// and asserting full-state byte-identity proves the fold reproduces serial.
+///
+/// Note: the post-block adaptive update resets `BLOCK_ENERGY_USAGE` to 0 every
+/// block (java `EnergyProcessor.updateTotalEnergyAverageUsage`), so the
+/// accumulator is unobservable post-block; non-vacuity is asserted on the per-tx
+/// receipt energy instead, and parity on the energy-fee-debited account balances
+/// carried in the full-state dump.
+#[test]
+fn parallel_block_energy_usage_accumulator_matches_serial() {
+    use tron_chainbase::DynamicPropertiesStore;
+    use tron_executor::ExecConfig;
+
+    // A tiny energy-using contract with NO storage write, so the only shared
+    // chain-global state every call touches is `BLOCK_ENERGY_USAGE` via the
+    // energy charge — isolating the commutative-accumulator fold.
+    // PUSH1 1 PUSH1 2 ADD POP STOP.
+    let noop_code: Vec<u8> = vec![0x60, 0x01, 0x60, 0x02, 0x01, 0x50, 0x00];
+    let c_addr = addr_with_byte(0xe2);
+
+    let callers: Vec<([u8; 32], [u8; 21])> = (0..8u8).map(|i| caller_keypair(0x60 + i)).collect();
+
+    let setup = |state: &StateBackends| {
+        install_contract(state, c_addr, &noop_code);
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        // Adaptive energy ON → every energy charge bumps BLOCK_ENERGY_USAGE.
+        dp.put_long(b"ALLOW_ADAPTIVE_ENERGY", 1);
+        let accounts = AccountStore::new(state.accounts.clone());
+        for (_, caller) in &callers {
+            // Fund the caller so the energy bill is paid via the TRX-fee path
+            // (no frozen energy) — the charge still bumps BLOCK_ENERGY_USAGE.
+            accounts
+                .put(
+                    &Address::from_raw(*caller),
+                    &Account {
+                        address: caller.to_vec(),
+                        balance: 1_000_000_000,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    };
+    let txs = || {
+        callers
+            .iter()
+            .map(|(pk, c)| trigger_tx(pk, *c, c_addr))
+            .collect::<Vec<_>>()
+    };
+
+    let serial_cfg = ExecConfig::unsigned();
+    let par_cfg = ExecConfig {
+        parallel_exec: true,
+        ..ExecConfig::unsigned()
+    };
+
+    let s = build_state();
+    setup(&s);
+    let rs = execute_block_with_config(&s, &make_block(1, [0u8; 32], txs()), None, &serial_cfg)
+        .expect("serial");
+    let p = build_state();
+    setup(&p);
+    let rp = execute_block_with_config(&p, &make_block(1, [0u8; 32], txs()), None, &par_cfg)
+        .expect("parallel");
+
+    // Non-vacuous: every tx actually consumed energy, so the BLOCK_ENERGY_USAGE
+    // `+=` (and its commutative-delta fold under parallel) genuinely executed.
+    let serial_energy: i64 = rs.tx_results.iter().map(|r| r.receipt.energy_usage_total).sum();
+    assert!(serial_energy > 0, "no energy consumed — accumulator path not exercised");
+
+    let so: Vec<_> = rs.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    let po: Vec<_> = rp.tx_results.iter().map(|r| format!("{:?}", r.outcome)).collect();
+    assert!(so.iter().all(|o| o == "Success"), "a call failed: {so:?}");
+    assert_eq!(so, po, "tx outcomes diverged");
+    assert_eq!(
+        dump_vm_state(&s),
+        dump_vm_state(&p),
+        "parallel diverged from serial with the BLOCK_ENERGY_USAGE accumulator active"
+    );
+    assert_eq!(rs.block_id, rp.block_id, "block id diverged");
+}
+
 /// Block-STM: the deferred per-contract dynamic-energy fold must be byte-identical
 /// to serial. Every call to a contract that's already caught-up this cycle RMWs
 /// its `ContractState.energy_usage` (a windowed `+=` whose factor is fixed for the
