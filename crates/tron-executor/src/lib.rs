@@ -871,6 +871,16 @@ struct VmSession {
     // committed only when the frame succeeds — so they must be discarded on a
     // frame revert exactly like the account writes.
     dyn_props: Arc<SessionBackend>,
+    // The TVM reward-settle path (VOTEWITNESS / WITHDRAWREWARD /
+    // UNFREEZEBALANCEV2 / SELFDESTRUCT → `VoteRewardUtil.withdrawReward`) writes
+    // the voter's begin-cycle / end-cycle / account-vote rows through this
+    // handle. java scopes those to the frame's `RepositoryImpl.delegationCache`,
+    // flushed to the parent only on frame `commit()` and discarded on revert —
+    // so a WHOLE-tx VM revert must drop them here, exactly like the votes /
+    // delegated-resource writes. (The inner-frame-revert variant is covered by
+    // the staking journal's `Delegation` reverser, the same dual mechanism the
+    // votes / delegated-resource rows use.)
+    delegation: Arc<SessionBackend>,
 }
 
 impl VmSession {
@@ -892,6 +902,7 @@ impl VmSession {
         delegated_resources: Arc<dyn KvBackend>,
         delegated_resource_account_index: Option<Arc<dyn KvBackend>>,
         dyn_props: Arc<dyn KvBackend>,
+        delegation: Arc<dyn KvBackend>,
     ) -> Self {
         Self {
             accounts: Arc::new(SessionBackend::new(accounts)),
@@ -903,6 +914,7 @@ impl VmSession {
             delegated_resource_account_index: delegated_resource_account_index
                 .map(|b| Arc::new(SessionBackend::new(b))),
             dyn_props: Arc::new(SessionBackend::new(dyn_props)),
+            delegation: Arc::new(SessionBackend::new(delegation)),
         }
     }
 
@@ -919,6 +931,7 @@ impl VmSession {
             s.commit()?;
         }
         self.dyn_props.commit()?;
+        self.delegation.commit()?;
         Ok(())
     }
 
@@ -937,6 +950,7 @@ impl VmSession {
             s.revert();
         }
         self.dyn_props.revert();
+        self.delegation.revert();
     }
 }
 
@@ -3734,6 +3748,7 @@ fn execute_vm_tx(
         view.delegated_resources.clone(),
         view.delegated_resource_account_index.clone(),
         view.dyn_props.clone(),
+        view.delegation.clone(),
     );
 
     let vm_stores = tron_tvm::execute::VmStores {
@@ -3756,7 +3771,15 @@ fn execute_vm_tx(
                     b.clone() as _,
                 ))
             }),
-        delegation: Arc::new(DelS::new(view.delegation.clone() as _)),
+        // Routed through the inner `vm_session` so a WHOLE-tx VM revert discards
+        // the begin/end-cycle + account-vote rows the TVM reward-settle writes
+        // (java's frame-scoped delegationCache — committed only on success). The
+        // staking journal's `Delegation` reverser covers the inner-frame-revert
+        // variant; the two together mirror how votes / delegated-resources roll
+        // back. NOTE: the precompiles + host hold an `Arc<DelegationStore>` over
+        // the SAME `vm_session.delegation` backend, so a reward-balance read and
+        // a settle write see one consistent overlay.
+        delegation: Arc::new(DelS::new(vm_session.delegation.clone() as _)),
         // Attach BlockIndexStore so BLOCKHASH(n) returns real hashes
         // for the last 256 blocks (when the backend is configured).
         // Read-only from the VM's perspective — no inner-session

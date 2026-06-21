@@ -75,6 +75,59 @@ impl TronDatabase {
         }
     }
 
+    /// Record reversing snapshots of every `DelegationStore` row the TVM
+    /// reward settle (`withdraw_reward_tvm` → `VoteRewardUtil.withdrawReward`)
+    /// can write for `addr`, WITHOUT writing anything. Must be called BEFORE
+    /// the settle. The settle writes at most three rows for the voter:
+    /// `set_begin_cycle` (the raw-address key), `set_end_cycle` (the
+    /// `end-<hex>` key), and `set_account_vote` for the *next* cycle
+    /// (`<current_cycle>-<hex>-account-vote`). It only reads (never writes)
+    /// witness-Vi / reward / vote rows, so those need no snapshot.
+    ///
+    /// The account-vote key depends on the current cycle number, which the
+    /// settle reads from `dyn_props`; capture it the same way so the snapshot
+    /// covers the exact key the settle will touch.
+    ///
+    /// java scopes these writes to the frame's `RepositoryImpl.delegationCache`
+    /// (`updateBeginCycle` / `updateEndCycle` / `updateAccountVote` →
+    /// `putDelegation`), flushed to the parent only on frame `commit()` and
+    /// dropped on revert. On a LIFO unwind these snapshots restore the prior
+    /// row bytes (or delete a freshly created row), so an inner-frame revert —
+    /// even when the top-level tx succeeds — leaves no delegation trace, exactly
+    /// as java discards the uncommitted child deposit.
+    fn snapshot_delegation_rows(
+        &self,
+        delegation: &Arc<tron_chainbase::DelegationStore>,
+        addr: &TronAddress,
+    ) {
+        use tron_chainbase::DelegationStore;
+        let Some(journal) = &self.staking_journal else {
+            return;
+        };
+        let current_cycle = self
+            .dyn_props
+            .as_ref()
+            .map(|dp| dp.current_cycle_number())
+            .unwrap_or(0);
+        // The settle writes account_vote at `end_cycle = current_cycle` (the
+        // bulk path) — see `withdraw_reward`. The no-live-votes path writes only
+        // begin_cycle. Snapshot the union of keys either path can touch.
+        let keys = [
+            DelegationStore::begin_cycle_key(addr).to_vec(),
+            DelegationStore::end_cycle_key(addr),
+            DelegationStore::account_vote_key(current_cycle, addr),
+        ];
+        let mut guard = journal.lock().expect("staking journal mutex poisoned");
+        for key in keys {
+            let prior = delegation.get_raw(&key).ok().flatten();
+            guard.push(StakingEntry::Delegation {
+                store: Arc::clone(delegation),
+                key,
+                prior,
+            });
+        }
+    }
+
     /// Snapshot `addr`'s current `Account` row (if the journal is attached),
     /// then write `account` to the store.
     fn put_account_journaled(&self, addr: &TronAddress, account: &tron_proto::Account) {
@@ -547,6 +600,10 @@ impl TronDatabaseExt for TronDatabase {
             if let Some(delegation) = self.delegation.clone() {
                 // Snapshot before the settle writes `allowance` to the store.
                 self.snapshot_account(&owner_t);
+                // ...and the begin/end-cycle + account-vote rows the settle
+                // writes into the delegation store (java's frame-scoped
+                // delegationCache — discarded on revert).
+                self.snapshot_delegation_rows(&delegation, &owner_t);
                 // `VoteRewardUtil.withdrawReward` — gated on ALLOW_TVM_VOTE
                 // (the enclosing `allow_vote` already enforces it).
                 let _ = crate::reward::withdraw_reward_tvm(
@@ -1005,6 +1062,7 @@ impl TronDatabaseExt for TronDatabase {
             // Snapshot before the settle mutates `allowance` straight to the
             // store, so a frame revert reverses the settle write too.
             self.snapshot_account(&owner);
+            self.snapshot_delegation_rows(&delegation, &owner);
             crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_vote_witness settling rewards");
         }
@@ -1065,6 +1123,7 @@ impl TronDatabaseExt for TronDatabase {
         if let Some(delegation) = self.delegation.clone() {
             // Snapshot before the settle writes `allowance` to the store.
             self.snapshot_account(&owner);
+            self.snapshot_delegation_rows(&delegation, &owner);
             crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect("db error in TronDatabaseExt::tron_withdraw_reward settling rewards");
         }
@@ -1192,6 +1251,7 @@ impl TronDatabaseExt for TronDatabase {
         if let Some(delegation) = self.delegation.clone() {
             // Snapshot before the settle writes `allowance` to the store.
             self.snapshot_account(&owner);
+            self.snapshot_delegation_rows(&delegation, &owner);
             crate::reward::withdraw_reward_tvm(&owner, &self.accounts, &delegation, &dyn_props, self.reward_vi.as_deref())
                 .expect(
                     "db error in TronDatabaseExt::tron_unfreeze_balance_v2 settling rewards",

@@ -1978,3 +1978,190 @@ fn diag_factory_withdraw_energy() {
         other => eprintln!("Factory outcome: {other:?}"),
     }
 }
+
+// =============================================================================
+// Inner-frame-revert reward-settle leak (delegation store)
+// =============================================================================
+//
+// The TVM reward-settle path (`VoteRewardUtil.withdrawReward`, reached by
+// VOTEWITNESS / WITHDRAWREWARD / UNFREEZEBALANCEV2 / SELFDESTRUCT under
+// ALLOW_TVM_VOTE) writes the voter's begin-cycle / end-cycle / account-vote
+// rows straight into the `delegation` store. java scopes those to the frame's
+// `RepositoryImpl.delegationCache`, flushed to the parent only on frame
+// `commit()` and discarded on revert. Like the other staking bridges these
+// writes BYPASS revm's journal, so without the staking-journal `Delegation`
+// reverser an inner CALL frame that reverts (while the outer tx succeeds) would
+// leak the begin/end-cycle + account-vote markers — silently shifting the
+// voter's future reward window, invisible to the contractRet tripwire.
+//
+// These tests run at the VM level (no executor `VmSession`), so they isolate
+// the per-frame journal mechanism. The companion whole-tx-revert path (the
+// `VmSession.delegation` overlay) is covered in tron-executor's tests.
+
+/// Seed `voter`'s delegation + account state so a WITHDRAWREWARD settle has a
+/// finalised cycle to close out and therefore WRITES the three delegation rows
+/// (`set_begin_cycle` / `set_end_cycle` / `set_account_vote`). Mirrors the
+/// reward-cycle fixture in tron-executor's `rewards.rs`.
+fn seed_reward_cycle(stores: &VmStores, voter: [u8; 21], witness: [u8; 21]) {
+    use tron_proto::Vote;
+    let dlg = &stores.delegation;
+    // current cycle = 5; the witness's cycle-0 reward pool drives a nonzero
+    // settle, and the voter's vote is in that pool.
+    stores.dynamic_properties.put_long(b"CURRENT_CYCLE_NUMBER", 5);
+    dlg.add_reward(0, &Address::from_raw(witness), 1_000_000_000);
+    // A finalised Vi so `computeReward` has a positive delta to pay.
+    dlg.set_witness_vi_raw(
+        4,
+        &Address::from_raw(witness),
+        &tron_tvm::reward::encode_signed_be(2_000_000_000_000_000_000),
+    );
+    dlg.set_begin_cycle(&Address::from_raw(voter), 0);
+    dlg.set_end_cycle(&Address::from_raw(voter), 1);
+    dlg.set_account_vote(
+        0,
+        &Address::from_raw(voter),
+        &Account {
+            address: voter.to_vec(),
+            votes: vec![Vote { vote_address: witness.to_vec(), vote_count: 100 }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+/// Capture the three delegation rows the settle can touch, for a before/after
+/// comparison. Reads the raw bytes so an absent row stays distinct from a zero.
+fn delegation_row_bytes(stores: &VmStores, addr: [u8; 21]) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    let dlg = &stores.delegation;
+    let a = Address::from_raw(addr);
+    let begin = dlg.get_raw(&DelegationStore::begin_cycle_key(&a)).unwrap();
+    let end = dlg.get_raw(&DelegationStore::end_cycle_key(&a)).unwrap();
+    // The settle writes account_vote at the CURRENT cycle (5 in the fixture).
+    let av = dlg.get_raw(&DelegationStore::account_vote_key(5, &a)).unwrap();
+    (begin, end, av)
+}
+
+/// Build an inner contract that runs WITHDRAWREWARD (0xd9) then `tail`
+/// (REVERT or STOP). The withdrawn amount is left on the stack and POPped.
+fn withdraw_reward_then(tail: &[u8]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.push(0xd9); // WITHDRAWREWARD — settles for the executing contract
+    bc.push(0x50); // POP the withdrawn amount
+    bc.extend_from_slice(tail);
+    bc
+}
+
+/// Regression: WITHDRAWREWARD inside an inner CALL frame that REVERTS must NOT
+/// leak the begin/end-cycle + account-vote rows the settle writes — even though
+/// the outer tx SUCCEEDS. Before the fix the bridge's direct delegation-store
+/// writes survived the inner revert (revm's journal misses them and there is no
+/// per-frame `VmSession`), shifting the voter's future reward window.
+#[test]
+fn inner_frame_revert_does_not_leak_withdraw_reward_delegation() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa7);
+    let outer_addr = tron_addr(0xc7);
+    let inner_addr = tron_addr(0xb7);
+    let witness = tron_addr(0x77);
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    // INNER: WITHDRAWREWARD then REVERT(0,0).
+    let mut tail = Vec::new();
+    tail.extend(push1(0)); // REVERT len
+    tail.extend(push1(0)); // REVERT offset
+    tail.push(0xfd); // REVERT → inner frame fails
+    install_contract(&stores, inner_addr, withdraw_reward_then(&tail), 0);
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(inner_evm, 400_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+    register_witness(&stores, witness);
+    // The settle reads the inner contract's votes; give it the same vote.
+    {
+        let mut acct = stores.accounts.get(&Address::from_raw(inner_addr)).unwrap().unwrap();
+        acct.votes = vec![tron_proto::Vote { vote_address: witness.to_vec(), vote_count: 100 }];
+        stores.accounts.put(&Address::from_raw(inner_addr), &acct).unwrap();
+    }
+    seed_reward_cycle(&stores, inner_addr, witness);
+
+    let before = delegation_row_bytes(&stores, inner_addr);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        2_000_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "outer frame must SUCCEED (it ignores the inner revert), got: {outcome:?}"
+    );
+
+    let after = delegation_row_bytes(&stores, inner_addr);
+    assert_eq!(
+        before, after,
+        "inner-frame WITHDRAWREWARD leaked delegation rows (begin/end-cycle/account-vote) past the revert"
+    );
+}
+
+/// Control: the SAME WITHDRAWREWARD, but the inner frame SUCCEEDS (STOP). The
+/// settle MUST persist its delegation writes — proving the fix only suppresses
+/// the REVERTED-frame writes, not legitimate committed ones. After a successful
+/// settle java advances begin_cycle to `current_cycle` (5) and writes the
+/// account-vote snapshot at that cycle.
+#[test]
+fn inner_frame_success_still_commits_withdraw_reward_delegation() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa8);
+    let outer_addr = tron_addr(0xc8);
+    let inner_addr = tron_addr(0xb8);
+    let witness = tron_addr(0x88);
+    let inner_evm: [u8; 20] = inner_addr[1..].try_into().unwrap();
+
+    // INNER: WITHDRAWREWARD then STOP → inner SUCCEEDS.
+    install_contract(&stores, inner_addr, withdraw_reward_then(&[0x00]), 0);
+    install_contract(&stores, outer_addr, outer_calls_then_succeeds(inner_evm, 400_000), 0);
+    install_caller(&stores, caller_user, 100_000_000);
+    register_witness(&stores, witness);
+    {
+        let mut acct = stores.accounts.get(&Address::from_raw(inner_addr)).unwrap().unwrap();
+        acct.votes = vec![tron_proto::Vote { vote_address: witness.to_vec(), vote_count: 100 }];
+        stores.accounts.put(&Address::from_raw(inner_addr), &acct).unwrap();
+    }
+    seed_reward_cycle(&stores, inner_addr, witness);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, outer_addr),
+        2_000_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "outer must succeed: {outcome:?}");
+
+    let inner = Address::from_raw(inner_addr);
+    // java's withdrawReward tail: begin_cycle = current (5), end_cycle = 6,
+    // account_vote snapshot written at current cycle (5).
+    assert_eq!(
+        stores.delegation.get_begin_cycle(&inner),
+        5,
+        "committed WITHDRAWREWARD must advance begin_cycle to current_cycle"
+    );
+    assert_eq!(
+        stores.delegation.get_end_cycle(&inner),
+        6,
+        "committed WITHDRAWREWARD must set end_cycle = current_cycle + 1"
+    );
+    assert!(
+        stores.delegation.get_account_vote(5, &inner).unwrap().is_some(),
+        "committed WITHDRAWREWARD must write the current-cycle account-vote snapshot"
+    );
+}
+
+/// `register_witness`-equivalent local (this file has no `register_witness`).
+fn register_witness(stores: &VmStores, addr: [u8; 21]) {
+    stores
+        .witnesses
+        .put(
+            &Address::from_raw(addr),
+            &tron_proto::Witness { address: addr.to_vec(), ..Default::default() },
+        )
+        .unwrap();
+}

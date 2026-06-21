@@ -252,6 +252,30 @@ impl DelegationStore {
             .put(&Self::account_vote_key(cycle, address), &account.encode_to_vec())?;
         Ok(())
     }
+
+    // -------------------- Raw key access ------------------------------
+    //
+    // Untyped backend access keyed by a pre-built composite key (the
+    // `*_key` builders above). Used by the TVM staking-journal's
+    // `Delegation` reverser, which must snapshot and restore the exact
+    // on-disk bytes of a begin-cycle / end-cycle / account-vote row
+    // regardless of its logical type — mirroring java-tron's
+    // `RepositoryImpl.putDelegation`, whose per-frame `delegationCache`
+    // is keyed/valued by raw bytes and discarded wholesale on revert.
+
+    pub fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.backend.get(key)?)
+    }
+
+    pub fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.backend.put(key, value)?;
+        Ok(())
+    }
+
+    pub fn delete_raw(&self, key: &[u8]) -> Result<(), StoreError> {
+        self.backend.delete(key)?;
+        Ok(())
+    }
 }
 
 // --- Helpers -----------------------------------------------------------------

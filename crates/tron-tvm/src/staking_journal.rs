@@ -40,7 +40,7 @@
 use std::sync::{Arc, Mutex};
 
 use tron_chainbase::{
-    AccountStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore,
+    AccountStore, DelegatedResourceAccountIndexStore, DelegatedResourceStore, DelegationStore,
     DynamicPropertiesStore, VotesStore,
 };
 use tron_crypto::address::Address as TronAddress;
@@ -88,6 +88,24 @@ pub enum StakingEntry {
         to_key: Vec<u8>,
         to_prior: Option<DelegatedResourceAccountIndex>,
     },
+    /// Prior bytes of a single `DelegationStore` row keyed by its raw
+    /// composite key (`None` = absent before → restore deletes it). Written
+    /// by the TVM reward-settle path (`VoteRewardUtil.withdrawReward` →
+    /// `set_begin_cycle` / `set_end_cycle` / `set_account_vote`) inside
+    /// VOTEWITNESS / WITHDRAWREWARD / UNFREEZEBALANCEV2 / SELFDESTRUCT
+    /// handlers. Like the `DelegatedResourceIndex` variant it is NOT threaded
+    /// through `reverse`, so the entry carries its own `Arc` to the store.
+    /// java scopes those writes to the frame's `RepositoryImpl.delegationCache`,
+    /// flushed to the parent ONLY on frame success (`commitDelegationCache` runs
+    /// inside `commit()`) and discarded on revert — so an inner frame that
+    /// reverts (or a whole-tx revert) must leave these begin/end-cycle and
+    /// account-vote markers untouched. Leaking them shifts a voter's future
+    /// reward window, a silent divergence the contractRet tripwire can't see.
+    Delegation {
+        store: Arc<DelegationStore>,
+        key: Vec<u8>,
+        prior: Option<Vec<u8>>,
+    },
     /// `TOTAL_NET_WEIGHT` was bumped by `delta`; reverse subtracts it.
     NetWeight { delta: i64 },
     /// `TOTAL_ENERGY_WEIGHT` was bumped by `delta`.
@@ -126,6 +144,11 @@ impl std::fmt::Debug for StakingEntry {
                 .field("from_prior", from_prior)
                 .field("to_key", to_key)
                 .field("to_prior", to_prior)
+                .finish_non_exhaustive(),
+            StakingEntry::Delegation { key, prior, .. } => f
+                .debug_struct("Delegation")
+                .field("key", key)
+                .field("prior", prior)
                 .finish_non_exhaustive(),
             StakingEntry::NetWeight { delta } => {
                 f.debug_struct("NetWeight").field("delta", delta).finish()
@@ -257,6 +280,19 @@ impl StakingJournal {
                     }
                 }
             }
+            StakingEntry::Delegation { store, key, prior } => match prior {
+                // The store exposes a true `delete_raw`, so an absent prior is
+                // reversed by deleting (the begin-cycle / end-cycle /
+                // account-vote keys are never written with a zeroed default —
+                // a missing key is semantically distinct from a zero value, so
+                // restoring must clear the row, not write zeros).
+                Some(bytes) => store
+                    .put_raw(&key, &bytes)
+                    .expect("db error reversing staking-journal delegation write"),
+                None => store
+                    .delete_raw(&key)
+                    .expect("db error reversing staking-journal delegation create"),
+            },
             StakingEntry::NetWeight { delta } => {
                 dyn_props.add_total_net_weight_unclamped(-delta)
             }
@@ -371,5 +407,65 @@ mod tests {
         journal.unwind_to(0, &accts, None, &dr, &dp);
         assert_eq!(index.get_raw(&from_key).unwrap().unwrap().timestamp, 100, "prior from-row restored");
         assert_eq!(index.get_raw(&to_key).unwrap().unwrap().timestamp, 100, "prior to-row restored");
+    }
+
+    /// A `Delegation` entry whose row was ABSENT before the write (a fresh
+    /// reward-settle marker — e.g. the next-cycle account-vote snapshot) is
+    /// reversed by DELETING the row, matching java's discarded
+    /// `delegationCache` on a frame revert.
+    #[test]
+    fn delegation_revert_deletes_fresh_row() {
+        let store = Arc::new(DelegationStore::new(mem()));
+        let voter = addr(0x55);
+        let key = DelegationStore::end_cycle_key(&voter);
+
+        let mut journal = StakingJournal::default();
+        // Snapshot the prior (absent), journal, then write — as the host does.
+        journal.push(StakingEntry::Delegation {
+            store: Arc::clone(&store),
+            key: key.clone(),
+            prior: store.get_raw(&key).unwrap(),
+        });
+        store.set_end_cycle(&voter, 6);
+        assert_eq!(store.get_end_cycle(&voter), 6);
+
+        let (accts, dr, dp) = other_stores();
+        journal.unwind_to(0, &accts, None, &dr, &dp);
+        assert!(
+            store.get_raw(&key).unwrap().is_none(),
+            "fresh delegation row must be deleted on revert (REMARK semantics restored)"
+        );
+        // Reads now fall back to the missing-row sentinel, exactly as before.
+        assert_eq!(store.get_end_cycle(&voter), tron_chainbase::REMARK);
+    }
+
+    /// A `Delegation` entry whose row EXISTED before (e.g. begin_cycle already
+    /// set) is reversed by restoring the exact prior bytes, not a delete.
+    #[test]
+    fn delegation_revert_restores_prior_row() {
+        let store = Arc::new(DelegationStore::new(mem()));
+        let voter = addr(0x66);
+        let key = DelegationStore::begin_cycle_key(&voter).to_vec();
+
+        store.set_begin_cycle(&voter, 0);
+        let prior = store.get_raw(&key).unwrap();
+
+        let mut journal = StakingJournal::default();
+        journal.push(StakingEntry::Delegation {
+            store: Arc::clone(&store),
+            key: key.clone(),
+            prior,
+        });
+        // The settle advances begin_cycle to the current cycle.
+        store.set_begin_cycle(&voter, 5);
+        assert_eq!(store.get_begin_cycle(&voter), 5);
+
+        let (accts, dr, dp) = other_stores();
+        journal.unwind_to(0, &accts, None, &dr, &dp);
+        assert_eq!(
+            store.get_begin_cycle(&voter),
+            0,
+            "prior begin_cycle bytes must be restored on revert"
+        );
     }
 }

@@ -1943,3 +1943,228 @@ fn pipelined_parallel_storage_plus_dynamic_energy_matches_serial() {
     assert_eq!(dump_vm_state(&s), dump_vm_state(&p), "storage+energy pipeline state diverged from serial");
     let _ = std::fs::remove_dir_all(&root_s); let _ = std::fs::remove_dir_all(&root_p);
 }
+
+// =============================================================================
+// Whole-tx VM revert must NOT leak reward-settle delegation writes
+// =============================================================================
+//
+// The TVM reward-settle path (`VoteRewardUtil.withdrawReward` — WITHDRAWREWARD /
+// VOTEWITNESS / UNFREEZEBALANCEV2 / SELFDESTRUCT under ALLOW_TVM_VOTE) writes the
+// voter's begin-cycle / end-cycle / account-vote rows into the `delegation`
+// store. java scopes those to the frame's `RepositoryImpl.delegationCache`,
+// flushed to the parent only when the frame `commit()`s and discarded on revert.
+//
+// At the executor level the per-tx `VmSession` is the analogue of java's child
+// `rootRepository`: on a whole-tx VM revert the executor calls
+// `vm_session.revert()` (discarding the VM's writes) but still `iso.commit()`s
+// the OUTER `TxSession` (so the energy bill + bandwidth charge survive — the
+// "energy is paid even on revert" rule). The `delegation` store is now routed
+// through `vm_session`, so its reward-settle writes are dropped on revert exactly
+// like the votes / delegated-resource writes. This test proves it: a top-level
+// contract that WITHDRAWREWARDs (a real settle that WOULD write the three rows)
+// then REVERTs must leave the delegation rows byte-identical to their pre-tx
+// state, while the success control confirms a committed settle persists them.
+
+/// Seed the stores so a WITHDRAWREWARD by `contract` settles a finalised cycle
+/// (and therefore WOULD write begin/end-cycle + account-vote rows). Returns the
+/// three raw delegation rows captured BEFORE any tx runs.
+fn seed_reward_state_and_capture(
+    state: &StateBackends,
+    contract: [u8; 21],
+    witness: [u8; 21],
+) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    use tron_chainbase::{
+        AccountStore, CodeStore, DelegationStore, DynamicPropertiesStore, WitnessStore,
+    };
+    use tron_proto::{Vote, Witness};
+
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    dp.put_long(b"ALLOW_TVM_VOTE", 1);
+    dp.put_long(b"CURRENT_CYCLE_NUMBER", 5);
+    dp.save_latest_block_header_timestamp(1_700_000_000_000);
+
+    WitnessStore::new(state.witnesses.clone())
+        .put(
+            &Address::from_raw(witness),
+            &Witness { address: witness.to_vec(), ..Default::default() },
+        )
+        .unwrap();
+
+    // Contract holds 100 votes for the witness so the settle pays a nonzero
+    // reward and writes its delegation rows.
+    let accounts = AccountStore::new(state.accounts.clone());
+    // WITHDRAWREWARD with no contract code STOPs immediately; install minimal
+    // bytecode so the trigger actually enters the VM.
+    let bytecode: Vec<u8> = {
+        // WITHDRAWREWARD (0xd9), POP, then REVERT(0,0).
+        vec![0xd9, 0x50, 0x60, 0x00, 0x60, 0x00, 0xfd]
+    };
+    let code = CodeStore::new(state.code.as_ref().unwrap().clone());
+    let hash = tron_crypto::hash::keccak256(&bytecode);
+    code.put(&hash, &bytecode).unwrap();
+    accounts
+        .put(
+            &Address::from_raw(contract),
+            &Account {
+                address: contract.to_vec(),
+                balance: 0,
+                code: bytecode.clone(),
+                code_hash: hash.to_vec(),
+                votes: vec![Vote { vote_address: witness.to_vec(), vote_count: 100 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let dlg = DelegationStore::new(state.delegation.clone());
+    dlg.add_reward(0, &Address::from_raw(witness), 1_000_000_000);
+    dlg.set_witness_vi_raw(
+        4,
+        &Address::from_raw(witness),
+        &tron_tvm::reward::encode_signed_be(2_000_000_000_000_000_000),
+    );
+    dlg.set_begin_cycle(&Address::from_raw(contract), 0);
+    dlg.set_end_cycle(&Address::from_raw(contract), 1);
+    dlg.set_account_vote(
+        0,
+        &Address::from_raw(contract),
+        &Account {
+            address: contract.to_vec(),
+            votes: vec![Vote { vote_address: witness.to_vec(), vote_count: 100 }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let a = Address::from_raw(contract);
+    (
+        dlg.get_raw(&DelegationStore::begin_cycle_key(&a)).unwrap(),
+        dlg.get_raw(&DelegationStore::end_cycle_key(&a)).unwrap(),
+        dlg.get_raw(&DelegationStore::account_vote_key(5, &a)).unwrap(),
+    )
+}
+
+fn make_trigger_tx(caller_priv: [u8; 32], caller: [u8; 21], contract: [u8; 21]) -> Transaction {
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let any = Any {
+        type_url: "type.googleapis.com/protocol.TriggerSmartContract".into(),
+        value: trigger.encode_to_vec(),
+    };
+    let mut tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TriggerSmartContract as i32,
+                parameter: Some(any),
+                ..Default::default()
+            }],
+            timestamp: 1_700_000_000_000,
+            fee_limit: 1_000_000_000,
+            ..Default::default()
+        }),
+        signature: Vec::new(),
+        ret: Vec::new(),
+        unparsed_field10: None,
+    };
+    tron_types::sign_transaction(&mut tx, &caller_priv).expect("sign tx");
+    tx
+}
+
+#[test]
+fn whole_tx_revert_does_not_leak_reward_settle_delegation() {
+    use tron_chainbase::{AccountStore, DelegationStore};
+
+    let state = build_state();
+    let (caller_priv, caller) = caller_keypair(0xaa);
+    let contract = addr_with_byte(0xcd);
+    let witness = addr_with_byte(0x99);
+
+    AccountStore::new(state.accounts.clone())
+        .put(
+            &Address::from_raw(caller),
+            &Account { address: caller.to_vec(), balance: 1_000_000_000, ..Default::default() },
+        )
+        .unwrap();
+
+    // Contract bytecode WITHDRAWREWARDs then REVERTs → whole tx reverts.
+    let before = seed_reward_state_and_capture(&state, contract, witness);
+
+    let tx = make_trigger_tx(caller_priv, caller, contract);
+    let block = make_block(1, [0u8; 32], vec![tx]);
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
+
+    // The tx reverts (top-level REVERT). The point is the delegation rows.
+    assert!(
+        !matches!(report.tx_results[0].outcome, TxOutcome::Success),
+        "tx must NOT succeed (it REVERTs), got: {:?}",
+        report.tx_results[0].outcome
+    );
+
+    let dlg = DelegationStore::new(state.delegation.clone());
+    let a = Address::from_raw(contract);
+    let after = (
+        dlg.get_raw(&DelegationStore::begin_cycle_key(&a)).unwrap(),
+        dlg.get_raw(&DelegationStore::end_cycle_key(&a)).unwrap(),
+        dlg.get_raw(&DelegationStore::account_vote_key(5, &a)).unwrap(),
+    );
+    assert_eq!(
+        before, after,
+        "whole-tx revert leaked reward-settle delegation rows (VmSession must discard them)"
+    );
+}
+
+#[test]
+fn whole_tx_success_commits_reward_settle_delegation() {
+    use tron_chainbase::{AccountStore, CodeStore, DelegationStore};
+
+    let state = build_state();
+    let (caller_priv, caller) = caller_keypair(0xab);
+    let contract = addr_with_byte(0xce);
+    let witness = addr_with_byte(0x9a);
+
+    AccountStore::new(state.accounts.clone())
+        .put(
+            &Address::from_raw(caller),
+            &Account { address: caller.to_vec(), balance: 1_000_000_000, ..Default::default() },
+        )
+        .unwrap();
+
+    seed_reward_state_and_capture(&state, contract, witness);
+    // Overwrite the contract code with the SUCCESS variant: WITHDRAWREWARD,
+    // POP, STOP — the settle commits.
+    let bytecode: Vec<u8> = vec![0xd9, 0x50, 0x00];
+    let code = CodeStore::new(state.code.as_ref().unwrap().clone());
+    let hash = tron_crypto::hash::keccak256(&bytecode);
+    code.put(&hash, &bytecode).unwrap();
+    let accounts = AccountStore::new(state.accounts.clone());
+    let mut acct = accounts.get(&Address::from_raw(contract)).unwrap().unwrap();
+    acct.code = bytecode.clone();
+    acct.code_hash = hash.to_vec();
+    accounts.put(&Address::from_raw(contract), &acct).unwrap();
+
+    let tx = make_trigger_tx(caller_priv, caller, contract);
+    let block = make_block(1, [0u8; 32], vec![tx]);
+    let report = apply_unsigned(&state, &block, None).expect("execute_block");
+    assert!(
+        matches!(report.tx_results[0].outcome, TxOutcome::Success),
+        "tx must succeed, got: {:?}",
+        report.tx_results[0].outcome
+    );
+
+    let dlg = DelegationStore::new(state.delegation.clone());
+    let a = Address::from_raw(contract);
+    // java's settle tail: begin_cycle = current (5), end_cycle = 6, account_vote
+    // snapshot at the current cycle.
+    assert_eq!(dlg.get_begin_cycle(&a), 5, "committed settle must advance begin_cycle");
+    assert_eq!(dlg.get_end_cycle(&a), 6, "committed settle must set end_cycle = current+1");
+    assert!(
+        dlg.get_account_vote(5, &a).unwrap().is_some(),
+        "committed settle must write the current-cycle account-vote snapshot"
+    );
+}
