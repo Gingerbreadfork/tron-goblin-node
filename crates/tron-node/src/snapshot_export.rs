@@ -70,6 +70,12 @@ pub enum ExportError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "{count} pending checkpoint manifest(s) at {dir:?}: the node was not cleanly stopped, \
+         so `database/` is missing its last flush batch. Stop the node (which merges pending \
+         checkpoints) before exporting, or use the live `export_via_checkpoint` path."
+    )]
+    PendingCheckpoint { dir: PathBuf, count: usize },
 }
 
 /// Bundle `data_dir/db/*` into a tarball at `output_path`.
@@ -87,6 +93,23 @@ pub fn export_to_tarball(
     let db_root = crate::storage::resolve_db_root(data_dir);
     if !db_root.is_dir() {
         return Err(ExportError::DbDirEmpty(db_root));
+    }
+
+    // Refuse to tar a base with un-merged cross-store checkpoint
+    // manifests. They live at `data_dir/checkpoint/` (a sibling of
+    // `database/`, not inside it), so the tarball — which bundles only
+    // `database/` — would omit the most-recent flush batch, producing a
+    // snapshot whose head pointer is ahead of its stores. A clean stop
+    // merges every pending manifest into `database/` and removes them;
+    // their presence means the node was not cleanly stopped first.
+    let checkpoint = tron_chainbase::CheckPointV2::new(data_dir);
+    if let Ok(pending) = checkpoint.list() {
+        if !pending.is_empty() {
+            return Err(ExportError::PendingCheckpoint {
+                dir: checkpoint.root_path().to_path_buf(),
+                count: pending.len(),
+            });
+        }
     }
 
     let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&db_root)
@@ -423,6 +446,38 @@ mod tests {
 
         cleanup(&data_dir);
         let _ = std::fs::remove_file(&output);
+        cleanup(output.parent().unwrap());
+    }
+
+    /// A tarball export omits `data_dir/checkpoint/` (it lives outside
+    /// `database/`), so an un-merged checkpoint manifest there means the
+    /// archive would miss the last flush batch. The export must refuse
+    /// rather than silently ship a head-ahead-of-stores snapshot.
+    #[serial_test::serial(snapshot)]
+    #[test]
+    fn export_refuses_when_pending_checkpoint_manifests_present() {
+        let data_dir = build_minimal_data_dir();
+        // Plant a pending checkpoint manifest at data_dir/checkpoint/.
+        let cp = tron_chainbase::CheckPointV2::new(&data_dir);
+        cp.write(&[tron_chainbase::CheckpointEntry {
+            db_name: "account".into(),
+            key: b"k".to_vec(),
+            value: Some(b"v".to_vec()),
+        }])
+        .unwrap();
+
+        let output = temp_dir("output-pending").join("snap.tar.gz");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let err =
+            export_to_tarball(&data_dir, &output, Compression::Gzip).unwrap_err();
+        assert!(
+            matches!(err, ExportError::PendingCheckpoint { count: 1, .. }),
+            "got {err:?}"
+        );
+        // No partial output should remain.
+        assert!(!output.exists());
+
+        cleanup(&data_dir);
         cleanup(output.parent().unwrap());
     }
 

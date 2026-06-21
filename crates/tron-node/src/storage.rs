@@ -692,6 +692,62 @@ impl OpenedStores {
         })
     }
 
+    /// Map a java-tron store directory name to the open backend, using
+    /// the exact `@Value("…")` dbName each store carries in java's
+    /// `ChainBaseManager`. Returns `None` for a name this node does not
+    /// open (`recent-block`, `account-trace`, `tree-block-index`,
+    /// `section-bloom`, `zkProof`, `accountTrie`, … — auxiliary or
+    /// rebuildable stores that are not consensus base state).
+    ///
+    /// The resolver is the single bridge from a java-format checkpoint
+    /// (`tmp` / `checkpoint/<ts>`) row's `db_name` to the destination
+    /// backend during [`crate::snapshot_import`] replay; it must stay in
+    /// lockstep with the dbNames passed to `wrap`/`open` in
+    /// [`Self::open_inner`].
+    pub fn backend_for_store_name(&self, name: &str) -> Option<Arc<dyn KvBackend>> {
+        let be = match name {
+            "account" => &self.accounts,
+            "account-asset" => &self.account_asset,
+            "witness" => &self.witnesses,
+            "votes" => &self.votes,
+            "delegation" => &self.delegation,
+            "DelegatedResource" => &self.delegated_resources,
+            "DelegatedResourceAccountIndex" => &self.delegated_resource_account_index,
+            "properties" => &self.dyn_props,
+            "proposal" => &self.proposals,
+            "accountid-index" => &self.name_index,
+            "account-index" => &self.id_index,
+            "asset-issue" => &self.asset_v1,
+            "asset-issue-v2" => &self.asset_v2,
+            "contract" => &self.contracts,
+            "abi" => &self.abi,
+            "exchange" => &self.exchange_v1,
+            "exchange-v2" => &self.exchange_v2,
+            "market_order" => &self.market_orders,
+            "market_account" => &self.market_account,
+            "market_pair_to_price" => &self.market_pair_to_price,
+            "market_pair_price_to_order" => &self.market_pair_price_to_order,
+            "nullifier" => &self.nullifiers,
+            "IncrementalMerkleTree" => &self.merkle_trees,
+            "code" => &self.code,
+            "storage-row" => &self.storage_row,
+            "contract-state" => &self.contract_state,
+            "block-index" => &self.block_index,
+            "block" => &self.blocks,
+            "trans" => &self.transactions,
+            "transactionHistoryStore" => &self.tx_history,
+            "transactionRetStore" => &self.transaction_ret,
+            "balance-trace" => &self.balance_trace,
+            "witness_schedule" => &self.witness_schedule,
+            "reward-vi" => &self.reward_vi,
+            "pbft-sign-data" => &self.pbft_sign_data,
+            "common-database" => &self.common_database,
+            "common" => &self.common,
+            _ => return None,
+        };
+        Some(be.clone())
+    }
+
     /// java `ChainBaseManager`: the node runs a LITE dataset when the
     /// lowest block in `block-index` is above 1 — the history below it
     /// was pruned (`admin db lite` / java's LiteFullNodeTool split).

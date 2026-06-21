@@ -159,6 +159,45 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         config.storage.max_open_files,
     )?;
 
+    // java-tron checkpoint replay: a data dir copied straight from a
+    // java-tron node (the usual mainnet-snapshot form) carries a redo
+    // log of the most-recent flush batch in `database/tmp` (V1) or
+    // `database/checkpoint/<ts>` (V2) that java replays over its stores
+    // on every startup (`SnapshotManager.recover`). If the operator
+    // dropped such a dir in by hand instead of going through
+    // `snapshot_import` (which already merges it), the base would sit up
+    // to one flush behind the head pointer — a silent consensus
+    // divergence. Replaying is idempotent for an already-flushed base,
+    // so run it unconditionally, then remove the merged checkpoint so it
+    // isn't reconsidered (this node uses its own checkpoint format).
+    {
+        let db_root = crate::storage::resolve_db_root(&config.data_dir);
+        match tron_chainbase::replay_java_checkpoint(&db_root, |name| {
+            stores.backend_for_store_name(name)
+        }) {
+            Ok(0) => {}
+            Ok(n) => {
+                info!(
+                    entries = n,
+                    "replayed java-tron checkpoint redo log into base stores \
+                     (imported data dir was not fully flushed)"
+                );
+                for sub in [
+                    tron_chainbase::JAVA_CHECKPOINT_V1_DIR,
+                    tron_chainbase::JAVA_CHECKPOINT_V2_DIR,
+                ] {
+                    let p = db_root.join(sub);
+                    if p.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(&p) {
+                            warn!(path = ?p, error = %e, "failed to remove merged java checkpoint");
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "java checkpoint replay failed; continuing"),
+        }
+    }
+
     // Checkpoint-V2 recovery: if the previous run crashed between the
     // manifest write and the per-store flush, replay any orphan
     // manifests into the freshly-opened root backends so the chain

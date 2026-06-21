@@ -458,8 +458,64 @@ pub fn import_from_directory(
     // subsequent import. Do bubble up `OpenedStores::open` errors
     // (RocksDB corruption etc.) as `Storage`.
     let stores = OpenedStores::open(data_dir)?;
+    // Replay any java-format checkpoint planted alongside the stores so
+    // the imported base is fully flushed (see `merge_java_checkpoint`).
+    merge_java_checkpoint(&stores, data_dir)?;
     let report = build_report(&stores, store_names, bytes_copied)?;
     Ok(report)
+}
+
+/// Replay a java-tron on-disk checkpoint (`database/tmp` V1 or
+/// `database/checkpoint/<ts>` V2) into the freshly-opened stores, then
+/// drop it so it is not replayed again.
+///
+/// java-tron persists the most-recent flush batch as a redo log and
+/// replays it over the per-store databases on every startup
+/// (`SnapshotManager.recover`); its LiteFullNode snapshot tool does the
+/// same when producing a snapshot (`DbLite.mergeCheckpoint2Snapshot`).
+/// A raw filesystem copy of a java data dir — the usual mainnet
+/// snapshot form — carries that checkpoint un-merged. Without this
+/// replay the imported base would sit up to one flush batch behind the
+/// head pointer recorded in `properties`: a silent, permanent
+/// divergence from consensus that no per-store decode check would
+/// catch. Replaying is idempotent for an already-flushed base (the rows
+/// re-write the same final state), so it is safe to run unconditionally.
+///
+/// The replayed checkpoint store is removed afterwards: this node uses
+/// its own checkpoint format and never reads the java one again, so
+/// leaving it would only mislead a later re-import.
+fn merge_java_checkpoint(
+    stores: &OpenedStores,
+    data_dir: &Path,
+) -> Result<(), ImportError> {
+    let db_root = crate::storage::resolve_db_root(data_dir);
+    let applied = tron_chainbase::replay_java_checkpoint(&db_root, |name| {
+        stores.backend_for_store_name(name)
+    })
+    .map_err(|e| ImportError::Verification(format!("java checkpoint replay: {e}")))?;
+    if applied > 0 {
+        // Drop the now-merged checkpoint stores so a future re-import of
+        // this data dir doesn't re-detect them as pending. A symlink
+        // import points these at the source snapshot — unlink the symlink
+        // itself rather than `remove_dir_all` through it, which would
+        // delete the source's checkpoint.
+        for sub in [
+            tron_chainbase::JAVA_CHECKPOINT_V1_DIR,
+            tron_chainbase::JAVA_CHECKPOINT_V2_DIR,
+        ] {
+            let p = db_root.join(sub);
+            match std::fs::symlink_metadata(&p) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let _ = std::fs::remove_file(&p);
+                }
+                Ok(_) => {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Import from a **live** java-tron RocksDB tree without requiring
@@ -1058,6 +1114,76 @@ mod tests {
         assert_eq!(report.head_block_hash_hex.len(), 64);
         // mainnet_witnesses() seeds 27 SRs at genesis.
         assert_eq!(report.witness_count, 27);
+
+        cleanup(snap_db.parent().unwrap());
+        cleanup(&dest);
+    }
+
+    /// A java-tron data dir copied straight from a node carries a redo
+    /// log (`tmp` V1 checkpoint) of its most-recent flush batch. Import
+    /// must replay that batch into the planted stores — exactly as
+    /// java's startup `recover` and its LiteFullNode tool do — or the
+    /// base sits a flush behind the head pointer. Verify the replay
+    /// lands the row and removes the merged checkpoint afterwards.
+    #[serial_test::serial(snapshot)]
+    #[test]
+    fn import_replays_java_tmp_checkpoint_into_stores() {
+        use tron_chainbase::{KvBackend, RocksDbBackend};
+
+        let snap_db = build_minimal_snapshot();
+
+        // Plant a java-format V1 checkpoint (`tmp`) inside the snapshot's
+        // database dir with one PUT for the `account` store and one for
+        // the skippable `trans-cache` store. Key envelope is
+        // `[4-byte BE name length][db_name][real key]`; value is
+        // `[operator byte][payload]` with operator 3 = java PUT.
+        let simple_encode = |name: &str| -> Vec<u8> {
+            let b = name.as_bytes();
+            let mut r = (b.len() as u32).to_be_bytes().to_vec();
+            r.extend_from_slice(b);
+            r
+        };
+        let cp_key = |db: &str, key: &[u8]| -> Vec<u8> {
+            let mut k = simple_encode(db);
+            k.extend_from_slice(key);
+            k
+        };
+        let put_val = |payload: &[u8]| -> Vec<u8> {
+            let mut v = vec![3u8];
+            v.extend_from_slice(payload);
+            v
+        };
+        let mut acct_addr = [0u8; 21];
+        acct_addr[0] = 0x41;
+        acct_addr[20] = 0x7c;
+        {
+            let tmp = snap_db.join("tmp");
+            std::fs::create_dir_all(&tmp).unwrap();
+            let cp = RocksDbBackend::open(&tmp).unwrap();
+            cp.put(&cp_key("account", &acct_addr), &put_val(b"checkpoint-account-row"))
+                .unwrap();
+            cp.put(&cp_key("trans-cache", b"txid"), &put_val(b"ignored"))
+                .unwrap();
+        }
+
+        let dest = temp_dir("dest-java-cp");
+        import_from_directory(&snap_db, &dest, ImportMode::Copy, false).expect("import");
+
+        // The account row from the checkpoint must be present in the
+        // imported account store.
+        let stores = OpenedStores::open(&dest).expect("open imported");
+        assert_eq!(
+            stores.accounts.get(&acct_addr).unwrap().as_deref(),
+            Some(b"checkpoint-account-row".as_ref()),
+            "java checkpoint account row was not merged on import"
+        );
+        // The merged checkpoint store must be gone so a re-import does
+        // not re-detect it.
+        drop(stores);
+        assert!(
+            !crate::storage::resolve_db_root(&dest).join("tmp").exists(),
+            "merged java tmp checkpoint should be removed after import"
+        );
 
         cleanup(snap_db.parent().unwrap());
         cleanup(&dest);

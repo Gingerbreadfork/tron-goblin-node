@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod blockstm;
 pub mod checkpoint_v2;
+pub mod java_checkpoint;
 pub mod pending_overlay;
 pub mod permissions;
 pub mod rocksdb_backend;
@@ -24,6 +25,10 @@ pub use backend::{KvBackend, KvError, MemBackend, ShardedMemBackend, WriteOp};
 pub use checkpoint_v2::{
     decode_manifest, encode_manifest, CheckPointV2, CheckpointEntry, CheckpointError,
     CheckpointId, CHECKPOINT_DIR_NAME,
+};
+pub use java_checkpoint::{
+    has_pending_java_checkpoint, replay_java_checkpoint, JavaCheckpointError,
+    JAVA_CHECKPOINT_V1_DIR, JAVA_CHECKPOINT_V2_DIR,
 };
 pub use pending_overlay::PendingOverlay;
 pub use permissions::{apply_default_account_permissions, default_account_permissions};
