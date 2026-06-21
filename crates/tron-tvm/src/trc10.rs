@@ -718,14 +718,24 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
             ..Default::default()
         });
         if target_was_new {
-            // java createAccountIfNotExist stamps a freshly-created account's
-            // create_time with the head-block timestamp (matching the commit
-            // path + TransferActuator). Only on creation.
-            target_account.create_time = self
-                .dyn_props
-                .as_ref()
-                .and_then(|d| d.latest_block_header_timestamp())
-                .unwrap_or(0);
+            // java `Program.callToAddress` -> `createAccountIfNotExist`
+            // (endowment > 0, here guaranteed since this hook short-circuits
+            // `tron_token_value == 0` calls before reaching the new-target
+            // branch) -> `RepositoryImpl.createNormalAccount`, which builds the
+            // account `withDefaultPermission = getAllowMultiSign() == 1`:
+            // create_time = head-block timestamp, plus the default owner(id=0)
+            // + active(id=2) permission pair when ALLOW_MULTI_SIGN is on.
+            // Mirrors the value-CALL commit path (database.rs) and the
+            // SELFDESTRUCT inheritor (tron_host.rs). Without the permissions a
+            // later multisig tx from this account would diverge from java.
+            if let Some(dyn_props) = self.dyn_props.as_ref() {
+                target_account.create_time =
+                    dyn_props.latest_block_header_timestamp().unwrap_or(0);
+                tron_chainbase::apply_default_account_permissions(
+                    &mut target_account,
+                    dyn_props,
+                );
+            }
         }
 
         // An asset-optimized account holds its TRC-10 balances in the separate

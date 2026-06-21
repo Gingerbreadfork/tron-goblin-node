@@ -239,6 +239,25 @@ fn issue_execute_assigns_token_id_and_writes_both_stores() {
 }
 
 #[test]
+fn issue_execute_writes_v2_only_when_allow_same_token_name_on() {
+    // java `AssetIssueActuator.execute` (AssetIssueActuator.java:76-86): with
+    // getAllowSameTokenName() == 1 (mainnet) the else-branch writes V2 ONLY;
+    // the V1 store row + setPrecision(0) is the legacy == 0 path only.
+    let ctx = ctx();
+    ctx.dp.save_allow_same_token_name(1);
+    put_account(&ctx, ALICE, 10_000_000_000);
+    let c = base_issue();
+    asset::execute_asset_issue(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    // V2 row written under the assigned token id.
+    assert!(ctx.v2.get(1_000_001).unwrap().is_some());
+    // V1 (name-keyed) row must NOT be written on the mainnet path.
+    assert!(
+        ctx.v1.get(b"TestCoin").unwrap().is_none(),
+        "no V1 asset-issue row may be written when allowSameTokenName is on"
+    );
+}
+
+#[test]
 fn issue_execute_with_frozen_supply_credits_only_liquid_portion() {
     let ctx = ctx();
     put_account(&ctx, ALICE, 10_000_000_000);

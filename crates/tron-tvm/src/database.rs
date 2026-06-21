@@ -583,9 +583,15 @@ impl DatabaseCommit for TronDatabase {
             // to store the original (un-padded) bytes so the code-hash
             // round-trip matches java-tron and the CodeStore contents
             // are bit-identical.
+            // `deployed_code_hash` captures keccak256(runtime_code) for a
+            // nested CREATE so the `SmartContract` row written below can carry
+            // it (java `saveCode` sets `code_hash = Hash.sha3(code)` under
+            // ALLOW_TVM_CONSTANTINOPLE, ON on mainnet).
+            let mut deployed_code_hash: Option<Vec<u8>> = None;
             if let Some(code) = &account.info.code {
                 let raw = code.original_byte_slice();
                 if !raw.is_empty() {
+                    deployed_code_hash = Some(keccak256(raw).to_vec());
                     // Key the runtime code by ADDRESS, matching java-tron's
                     // `RepositoryImpl.saveCode(address, ...)` so a later
                     // `getCode(address)` (and our address-keyed `basic_ref`)
@@ -702,8 +708,12 @@ impl DatabaseCommit for TronDatabase {
             // originAddress=creator, trxHash=rootTxId iff CREATE2, version=1 }`
             // (no ABI/name/bytecode/originEnergyLimit — those stay default; the
             // ABI lives in `AbiStore`, which a nested deploy never populates).
-            // `code_hash` is left empty, matching java's lazy fill on first
-            // EXTCODEHASH. Needs the `ContractStore`; read-only setups omit it.
+            // `code_hash` is set to keccak256(runtime_code): java `saveCode`
+            // (Program.java nested-CREATE -> RepositoryImpl.saveCode) eagerly
+            // fills it under ALLOW_TVM_CONSTANTINOPLE (ON on mainnet). No VM
+            // impact (EXTCODEHASH recomputes from code bytes) — state-byte +
+            // `getcontract` RPC fidelity. Needs the `ContractStore`; read-only
+            // setups omit it.
             if let (Some((creator, is_create2)), Some(contracts)) =
                 (created_contract, &self.contracts)
             {
@@ -712,6 +722,7 @@ impl DatabaseCommit for TronDatabase {
                     origin_address: creator_tron.as_bytes().to_vec(),
                     contract_address: tron_addr.as_bytes().to_vec(),
                     consume_user_resource_percent: 100,
+                    code_hash: deployed_code_hash.clone().unwrap_or_default(),
                     trx_hash: if is_create2 {
                         self.root_tx_id.to_vec()
                     } else {
@@ -767,9 +778,23 @@ impl DatabaseCommit for TronDatabase {
                         hx(&value_bytes),
                     );
                 }
-                self.storage
-                    .put(&composite, &value_bytes)
-                    .expect("db error in DatabaseCommit::commit writing storage slot");
+                // java `Storage.commit()`
+                // (org.tron.core.vm.program.Storage): a dirty row whose
+                // committed value is zero (`new DataWord(row.getValue())
+                // .isZero()`) is DELETED, not persisted as a 32-byte-zero row;
+                // only a non-zero value is `put`. `U256::is_zero` matches
+                // `DataWord.isZero` (all 32 bytes zero). VM reads/refunds are
+                // unaffected (an absent row reads back ZERO either way) — this
+                // is pure persisted-byte parity.
+                if slot.present_value.is_zero() {
+                    self.storage
+                        .delete(&composite)
+                        .expect("db error in DatabaseCommit::commit deleting zeroed storage slot");
+                } else {
+                    self.storage
+                        .put(&composite, &value_bytes)
+                        .expect("db error in DatabaseCommit::commit writing storage slot");
+                }
             }
         }
     }

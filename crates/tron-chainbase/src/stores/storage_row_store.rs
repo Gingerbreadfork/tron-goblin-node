@@ -102,6 +102,15 @@ impl StorageRowStore {
         Ok(())
     }
 
+    /// Remove a storage row. java `Storage.commit()` deletes the row when the
+    /// committed value is zero (`new DataWord(value).isZero()`) rather than
+    /// persisting a 32-byte-zero row, so SSTORE-to-zero leaves no key behind.
+    /// Idempotent.
+    pub fn delete(&self, key: &[u8; KEY_LEN]) -> Result<(), StoreError> {
+        self.backend.delete(key)?;
+        Ok(())
+    }
+
     pub fn get(&self, key: &[u8; KEY_LEN]) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self.backend.get(key)?)
     }

@@ -1609,7 +1609,7 @@ pub fn execute_create_with_trace(
                 // rejects plain TRX transfers to Contract-type accounts).
                 if let Ok(Some(mut acct)) = stores.accounts.get(&tron_contract_addr) {
                     acct.code = runtime_code;
-                    acct.code_hash = runtime_hash;
+                    acct.code_hash = runtime_hash.clone();
                     acct.r#type = tron_proto::AccountType::Contract as i32;
                     if acct.account_name.is_empty() {
                         acct.account_name = smart_contract.name.clone().into_bytes();
@@ -1634,6 +1634,14 @@ pub fn execute_create_with_trace(
                     // `clearVersion()` (version 0); don't let a tx-supplied
                     // version persist (it would also flip the storage layout).
                     row.version = 0;
+                    // java `RepositoryImpl.saveCode` (reached from
+                    // `VMActuator` after init code returns, ALLOW_TVM_CONSTANTINOPLE
+                    // ON on mainnet) eagerly sets the contract row's
+                    // `code_hash = Hash.sha3(code)` = keccak256(runtime_code).
+                    // `runtime_hash` above is exactly that. No VM impact
+                    // (EXTCODEHASH recomputes from the code bytes) — state-byte
+                    // + `getcontract` RPC fidelity.
+                    row.code_hash = runtime_hash.clone();
                     contracts
                         .put(&tron_contract_addr, &row)
                         .expect("db error in execute_create writing contract row");

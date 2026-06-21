@@ -382,6 +382,44 @@ fn outer_staticcalls(inner_evm: &[u8; 20]) -> Vec<u8> {
     bc
 }
 
+// =============================================================================
+// SSTORE-to-zero DELETES the storage row (java Storage.commit isZero -> delete).
+// =============================================================================
+
+#[test]
+fn sstore_to_zero_deletes_the_storage_row() {
+    // java `Storage.commit()` (org.tron.core.vm.program.Storage): a dirty row
+    // whose committed value is zero is `store.delete`d, not persisted as a
+    // 32-byte-zero row. Pre-seed slot 7 with a non-zero value (so a row
+    // exists), run a contract that SSTOREs 0 there, and assert the row is gone.
+    let (stores, _contracts) = fresh_stores();
+    let caller = tron_addr(0xa1);
+    let c = tron_addr(0xc1);
+
+    // SSTORE(key=7, value=0): PUSH1 0 (value); PUSH1 7 (key); SSTORE; STOP.
+    let bytecode = vec![0x60, 0x00, 0x60, 0x07, 0x55, 0x00];
+    install_eoa(&stores, caller, 0);
+    install_contract(&stores, c, bytecode, 0);
+
+    // Pre-seed slot 7 with a non-zero value so there is a row to delete and the
+    // VM sees original_value != 0 (forcing a committed write of the new zero).
+    let mut slot7 = [0u8; 32];
+    slot7[31] = 7;
+    let key = StorageRowStore::compose_key(&Address::from_raw(c), &slot7);
+    let mut nonzero = [0u8; 32];
+    nonzero[31] = 0x2a;
+    stores.storage.put(&key, &nonzero).unwrap();
+    assert!(stores.storage.get(&key).unwrap().is_some(), "pre-seed failed");
+
+    let out = run(&stores, caller, c);
+    assert!(matches!(out, VmOutcome::Success { .. }), "got {out:?}");
+
+    assert!(
+        stores.storage.get(&key).unwrap().is_none(),
+        "SSTORE-to-zero must DELETE the row, not persist a 32-byte-zero row"
+    );
+}
+
 #[test]
 fn static_context_delegate_reverts_without_mutation() {
     let (stores, _contracts) = fresh_stores();

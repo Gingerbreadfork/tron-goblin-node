@@ -361,12 +361,15 @@ pub fn execute_asset_issue(
     to_store.id = next_token_id.to_string();
     to_store.owner_address = owner.as_bytes().to_vec();
 
-    // java: on the legacy (allowSameTokenName == 0) path the V1 capsule has
-    // its precision forced to 0 and is written alongside the V2 capsule;
-    // post-fork only V2 is written. We write both stores so name-keyed reads
-    // keep working; the V1 copy's precision divergence is harmless because
-    // mainnet (allowSameTokenName == 1) never reads it.
-    v1.put(&contract.name, &to_store)?;
+    // java `AssetIssueActuator.execute` (AssetIssueActuator.java:76-86): the V1
+    // store is written ONLY on the legacy `getAllowSameTokenName() == 0` path
+    // (alongside V2, with V2 precision forced to 0); when the flag is on
+    // (mainnet) it takes the else-branch and writes V2 ONLY. Gate the V1 write
+    // accordingly so mainnet leaves no stray name-keyed V1 asset-issue row.
+    let allow_same_token_name = dyn_props.allow_same_token_name().unwrap_or(0);
+    if allow_same_token_name == 0 {
+        v1.put(&contract.name, &to_store)?;
+    }
     v2.put(next_token_id, &to_store)?;
 
     // java: build a Frozen entry per FrozenSupply

@@ -322,6 +322,84 @@ fn calltoken_insufficient_token_balance_skips_callee() {
     );
 }
 
+/// A CALLTOKEN to a fresh address creates the recipient EOA with the default
+/// owner(id=0) + active(id=2) permission pair. java `Program.callToAddress`
+/// (endowment > 0) -> `createAccountIfNotExist` -> `RepositoryImpl
+/// .createNormalAccount`, which builds the account
+/// `withDefaultPermission = getAllowMultiSign() == 1` (mainnet). Without it a
+/// later multisig tx from this account would diverge ("permission_id 2 not
+/// found").
+#[test]
+fn calltoken_to_fresh_address_applies_default_permissions() {
+    let stores = fresh_stores();
+    // ALLOW_MULTI_SIGN drives `withDefaultPermission`; head-block timestamp is
+    // stamped as the new account's create_time.
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    stores.dynamic_properties.save_latest_block_header_timestamp(1_700_000_000_000);
+
+    let token_id = 1_000_001i64;
+    let transfer_amount = 250i64;
+    let initial_balance = 10_000i64;
+
+    let caller_user = tron_addr(0xa0);
+    let caller_contract = tron_addr(0xc0);
+    // A brand-new recipient EOA — deliberately NOT pre-installed.
+    let fresh_target = tron_addr(0xee);
+
+    let acct = Account { address: caller_user.to_vec(), balance: 1_000_000_000, ..Default::default() };
+    stores.accounts.put(&Address::from_raw(caller_user), &acct).unwrap();
+
+    install_contract_with_balance(
+        &stores,
+        caller_contract,
+        &build_calltoken_caller(fresh_target, token_id, transfer_amount),
+        token_id,
+        initial_balance,
+    );
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: caller_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger,
+        500_000,
+    );
+    match outcome {
+        VmOutcome::Success { .. } => {}
+        other => panic!("expected Success, got {other:?}"),
+    }
+
+    let target_acct = stores
+        .accounts
+        .get(&Address::from_raw(fresh_target))
+        .unwrap()
+        .expect("fresh CALLTOKEN recipient must exist after the transfer");
+    // Token was credited.
+    assert_eq!(
+        target_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(transfer_amount),
+        "fresh recipient must be credited the transferred TRC-10 amount"
+    );
+    // create_time stamped from the head-block timestamp.
+    assert_eq!(target_acct.create_time, 1_700_000_000_000);
+    // Default owner(id=0) + active(id=2) permission pair attached.
+    let owner = target_acct.owner_permission.expect("default owner permission missing");
+    assert_eq!(owner.id, 0, "owner permission id");
+    assert_eq!(owner.threshold, 1);
+    assert_eq!(target_acct.active_permission.len(), 1, "exactly one active permission");
+    assert_eq!(
+        target_acct.active_permission[0].id, 2,
+        "default active permission must carry id=2 (java createDefaultActivePermission)"
+    );
+}
+
 /// CALL-F8: a CALLTOKEN to the executing contract's OWN address is rejected
 /// (java throws TransferException, halting the frame) and must NOT net-mint
 /// tokens to the caller. Before the fix the inspector wrote caller-then-target

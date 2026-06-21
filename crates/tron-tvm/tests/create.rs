@@ -192,6 +192,94 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
 }
 
 #[test]
+fn execute_create_contract_row_carries_keccak_code_hash() {
+    // java `RepositoryImpl.saveCode` (RepositoryImpl.java:625-633, reached from
+    // VMActuator after init code returns; ALLOW_TVM_CONSTANTINOPLE ON on
+    // mainnet) eagerly sets the contract row's
+    // `code_hash = Hash.sha3(code)` = keccak256(runtime_code).
+    let stores = fresh_stores_with_contracts();
+
+    let mut owner_bytes = [0u8; 21];
+    owner_bytes[0] = 0x41;
+    owner_bytes[1..].fill(0xa0);
+    let owner = Address::from_raw(owner_bytes);
+    stores
+        .accounts
+        .put(
+            &owner,
+            &Account {
+                address: owner.as_bytes().to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Init code that returns the 5-byte runtime `PUSH1 0 PUSH1 0 RETURN`.
+    let runtime = vec![0x60u8, 0x00, 0x60, 0x00, 0xf3];
+    let mut padded = [0u8; 32];
+    padded[27..].copy_from_slice(&runtime);
+    let mut init_code = vec![0x7fu8]; // PUSH32
+    init_code.extend_from_slice(&padded);
+    init_code.extend_from_slice(&[
+        0x60, 0x00, // PUSH1 0
+        0x52, // MSTORE
+        0x60, 0x05, // PUSH1 5
+        0x60, 0x1b, // PUSH1 27
+        0xf3, // RETURN
+    ]);
+
+    let create = CreateSmartContract {
+        owner_address: owner_bytes.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner_bytes.to_vec(),
+            contract_address: vec![],
+            abi: Some(Abi::default()),
+            bytecode: init_code,
+            call_value: 0,
+            consume_user_resource_percent: 100,
+            name: "Trivial".into(),
+            origin_energy_limit: 1_000_000,
+            code_hash: vec![],
+            trx_hash: vec![],
+            version: 1,
+        }),
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    let tx_id = [0xab; 32];
+    let outcome = execute_create(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &create,
+        &tx_id,
+        500_000,
+    );
+    let addr_bytes = match outcome {
+        VmOutcome::Success { return_data, .. } => return_data,
+        other => panic!("expected Success, got {other:?}"),
+    };
+    let mut a = [0u8; 21];
+    a.copy_from_slice(&addr_bytes);
+    let contract_addr = Address::from_raw(a);
+
+    let row = stores
+        .contracts
+        .as_ref()
+        .unwrap()
+        .get(&contract_addr)
+        .unwrap()
+        .expect("SmartContract row missing after deploy");
+    let expected = tron_crypto::hash::keccak256(&runtime);
+    assert_eq!(
+        row.code_hash,
+        expected.as_slice(),
+        "deployed contract row must carry keccak256(runtime_code)"
+    );
+}
+
+#[test]
 fn execute_create_stamps_create_time_from_head_block_timestamp() {
     // java stamps a created contract's create_time with the head-block
     // timestamp (getLatestBlockHeaderTimestamp), not 0 and not the executing
@@ -683,6 +771,19 @@ fn nested_create2_writes_contract_row_and_marks_account() {
     assert_eq!(row.trx_hash, tx_id.to_vec());
     assert_eq!(row.contract_address, child.to_vec());
     assert_eq!(row.version, 0);
+
+    // java `saveCode` (Program.java nested CREATE -> RepositoryImpl.saveCode,
+    // ALLOW_TVM_CONSTANTINOPLE ON) sets the row's
+    // `code_hash = Hash.sha3(code)` = keccak256(runtime_code). The child init
+    // `PUSH1 1 PUSH1 0 RETURN` returns mem[0..1] = a single 0x00 byte.
+    let child_runtime = child_acct.code.clone();
+    assert_eq!(child_runtime, vec![0x00], "child runtime code");
+    let expected_hash = tron_crypto::hash::keccak256(&child_runtime);
+    assert_eq!(
+        row.code_hash,
+        expected_hash.as_slice(),
+        "nested CREATE2 contract row must carry keccak256(runtime_code)"
+    );
 }
 
 /// Regression (block 83,349,051): java-tron enforces NO contract-code-size
