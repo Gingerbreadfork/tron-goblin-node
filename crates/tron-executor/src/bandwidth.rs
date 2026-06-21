@@ -280,7 +280,10 @@ fn try_use_asset_account_net(
         Some(p) => p,
         None => return Ok(None),
     };
-    let transfer = TransferAssetContract::decode(parameter.value.as_slice())
+    // Lenient decode — java's generated parser skips fields with no matching
+    // known tag, so the bandwidth charge must too (see
+    // `tron_proto::decode_lenient`).
+    let transfer = tron_proto::decode_lenient::<TransferAssetContract>(parameter.value.as_slice())
         .map_err(|e| BandwidthError::Store(StoreError::Decode(e.to_string())))?;
 
     let asset_name = transfer.asset_name;
@@ -593,13 +596,14 @@ fn contract_creates_new_account(
     };
     match ContractType::try_from(contract.r#type).ok() {
         Some(ContractType::AccountCreateContract) => Ok(true),
-        Some(ContractType::TransferContract) => match tron_proto::TransferContract::decode(param)
-        {
-            Ok(c) => to_missing(&c.to_address, accounts),
-            Err(_) => Ok(true),
-        },
+        Some(ContractType::TransferContract) => {
+            match tron_proto::decode_lenient::<tron_proto::TransferContract>(param) {
+                Ok(c) => to_missing(&c.to_address, accounts),
+                Err(_) => Ok(true),
+            }
+        }
         Some(ContractType::TransferAssetContract) => {
-            match TransferAssetContract::decode(param) {
+            match tron_proto::decode_lenient::<TransferAssetContract>(param) {
                 Ok(c) => to_missing(&c.to_address, accounts),
                 Err(_) => Ok(true),
             }

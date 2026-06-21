@@ -280,7 +280,9 @@ impl ExploreState {
                 }
                 Some(ContractType::TriggerSmartContract) => {
                     g.calls += 1;
-                    if let Ok(c) = TriggerSmartContract::decode(param) {
+                    if let Ok(c) =
+                        tron_proto::decode_lenient::<TriggerSmartContract>(param)
+                    {
                         if c.call_value > 0 {
                             b_trx += c.call_value as u128;
                         }

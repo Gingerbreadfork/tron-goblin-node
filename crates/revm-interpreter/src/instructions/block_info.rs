@@ -61,14 +61,36 @@ pub fn difficulty<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result
 /// Implements the GASLIMIT instruction.
 ///
 /// Pushes the current block's gas limit onto the stack.
+///
+/// TRON fork: java's `gasLimitAction` (OperationActions.java:517) pushes
+/// `DataWord.ZERO()` unconditionally — TRON has no block gas limit. We push 0
+/// here (rather than zeroing `BlockEnv.gas_limit`, which would make revm reject
+/// any tx whose `gas_limit` exceeds the block limit). Ethereum-only hosts keep
+/// the real block gas limit.
 pub fn gaslimit<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    if context.host.tron_enabled() {
+        push!(context.interpreter, primitives::U256::ZERO);
+        return Ok(());
+    }
     push!(context.interpreter, context.host.gas_limit());
     Ok(())
 }
 
 /// EIP-3198: BASEFEE opcode
+///
+/// TRON fork: java's `baseFeeAction` (OperationActions.java:538, registered
+/// under `allowTvmLondon`) pushes `dynamicPropertiesStore.getEnergyFee()` —
+/// NOT a London-style block base fee. We push the energy fee via the host
+/// (rather than `BlockEnv.basefee`, which would trip revm's legacy
+/// `gas_price >= basefee` tx-validation). Ethereum-only hosts push the real
+/// block base fee. The LONDON spec check (≈ TRON's `allowTvmLondon` gate)
+/// stays — the opcode is only reachable when London is active.
 pub fn basefee<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     check!(context.interpreter, LONDON);
+    if context.host.tron_enabled() {
+        push!(context.interpreter, context.host.tron_energy_fee());
+        return Ok(());
+    }
     push!(context.interpreter, context.host.basefee());
     Ok(())
 }

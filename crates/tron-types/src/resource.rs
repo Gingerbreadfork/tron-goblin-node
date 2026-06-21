@@ -574,10 +574,19 @@ pub fn delegatable_frozen_v2(
     let mut decayed = account.clone();
     update_usage(&mut decayed, kind, now_slot, gates, harden);
     let decayed_usage = usage(&decayed, kind);
-    // java: `(long)(usage * TRX_PRECISION * ((double) totalWeight / totalLimit))`.
+    // java `DelegateResourceProcessor.validate` (DelegateResourceProcessor.java:63):
+    //   `(long)(getNetUsage() * TRX_PRECISION * ((double) totalWeight / totalLimit))`.
+    // Java evaluates left-to-right with java promotion rules: `getNetUsage()`
+    // (long) `* TRX_PRECISION` (long) is a **long integer multiply FIRST**
+    // (forming the exact i64 product `usage * 1_000_000`); only THEN is that
+    // long promoted to `double` for the `* ((double) totalWeight / totalLimit)`
+    // multiply, with the final `(long)` truncation. A single all-f64 expression
+    // (`(usage as f64) * (TRX_PRECISION as f64) * ratio`) loses precision
+    // differently once `usage` exceeds 2^53 / TRX_PRECISION, so reproduce the
+    // integer-first grouping exactly.
     let usage_weight = if total_limit > 0 {
-        ((decayed_usage as f64) * (TRX_PRECISION as f64) * (total_weight as f64 / total_limit as f64))
-            as i64
+        let usage_times_precision = decayed_usage.wrapping_mul(TRX_PRECISION);
+        ((usage_times_precision as f64) * (total_weight as f64 / total_limit as f64)) as i64
     } else {
         0
     };
@@ -1418,6 +1427,48 @@ mod tests {
         );
         // The input account must be untouched (the decay is on a clone).
         assert_eq!(account.account_resource.as_ref().unwrap().energy_usage, 5);
+    }
+
+    /// java `DelegateResourceProcessor.validate` (DelegateResourceProcessor.java:63)
+    /// forms `usage * TRX_PRECISION` as an exact `long` integer multiply BEFORE
+    /// promoting to `double` for the `* (totalWeight / totalLimit)` ratio. Reproduce
+    /// the integer-first grouping: at a large usage the result must equal the
+    /// integer product scaled by the ratio (totalWeight==totalLimit ⇒ ratio 1.0),
+    /// which an all-`f64` `usage_f64 * TRX_PRECISION_f64` chain would round
+    /// differently once `usage * TRX_PRECISION` exceeds 2^53.
+    #[test]
+    fn delegatable_frozen_v2_energy_usage_weight_integer_first_grouping() {
+        let now_slot = 1_000;
+        // usage chosen so usage*TRX_PRECISION = 9_000_000_999_000_000 > 2^53,
+        // where the integer product is exact but an f64 product would round.
+        let usage = 9_000_000_999i64;
+        let account = Account {
+            // Frozen pool large enough that the subtraction stays positive.
+            frozen_v2: vec![tron_proto::account::FreezeV2 {
+                r#type: 1,
+                amount: 20_000_000_000_000_000,
+            }],
+            account_resource: Some(AccountResource {
+                energy_usage: usage,
+                latest_consume_time_for_energy: now_slot,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let delegatable = delegatable_frozen_v2(
+            &account,
+            ResourceKind::Energy,
+            now_slot,
+            1_000_000_000,
+            1_000_000_000,
+            GATES_V2,
+            false,
+        );
+        // ratio == 1.0, so usage_weight == (long)((usage * TRX_PRECISION) as f64),
+        // i.e. exactly java's integer-first grouping.
+        let usage_weight = ((usage.wrapping_mul(TRX_PRECISION)) as f64) as i64;
+        let expected = 20_000_000_000_000_000 - usage_weight;
+        assert_eq!(delegatable, expected);
     }
 
     /// An account with no energy usage can delegate its entire frozen-V2 pool.

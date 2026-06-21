@@ -176,17 +176,39 @@ fn merkle_input(depth: u64, lhs: [u8; 32], rhs: [u8; 32]) -> Vec<u8> {
 }
 
 #[test]
-fn merkle_hash_rejects_wrong_input_length() {
+fn merkle_hash_rejects_short_input_accepts_long() {
+    // java `MerkleHash.execute` (PrecompiledContracts.java:1686) reads exactly
+    // the first three 32-byte words; the only failure is a `< 96`-byte input
+    // (the `arraycopy(data, 64, …)` throws). A short input → `Pair.of(false, …)`
+    // → spend-all-energy revert (`SpendAllRevert`); a LONGER input is accepted
+    // and the tail beyond byte 96 is ignored.
     let ctx = MockCtx::default();
-    // Too short.
+    // Too short → reject (spend-all).
     let out = PrecompileImpl::MerkleHash.execute(&[0u8; 64], &ctx);
-    assert!(out.is_err(), "merkle_hash must reject 64-byte input");
-    // Too long.
-    let out = PrecompileImpl::MerkleHash.execute(&[0u8; 128], &ctx);
-    assert!(out.is_err(), "merkle_hash must reject 128-byte input");
-    // Empty.
+    assert!(
+        matches!(out, Err(tron_tvm::PrecompileError::SpendAllRevert)),
+        "merkle_hash must spend-all-revert a 64-byte input, got {out:?}"
+    );
+    // Empty → reject (spend-all).
     let out = PrecompileImpl::MerkleHash.execute(&[], &ctx);
-    assert!(out.is_err(), "merkle_hash must reject empty input");
+    assert!(
+        matches!(out, Err(tron_tvm::PrecompileError::SpendAllRevert)),
+        "merkle_hash must spend-all-revert empty input, got {out:?}"
+    );
+    // 128 bytes (>= 96) with a valid depth-0 → SUCCESS; the same as the
+    // 96-byte form because the trailing 32 bytes are ignored.
+    let mut long = merkle_input(0, [0x11u8; 32], [0x22u8; 32]);
+    long.extend_from_slice(&[0xccu8; 32]); // ignored tail
+    let long_out = PrecompileImpl::MerkleHash
+        .execute(&long, &ctx)
+        .expect("128-byte merkle_hash input must succeed (tail ignored)");
+    let short_out = PrecompileImpl::MerkleHash
+        .execute(&merkle_input(0, [0x11u8; 32], [0x22u8; 32]), &ctx)
+        .expect("96-byte merkle_hash input must succeed");
+    assert_eq!(
+        long_out, short_out,
+        "the 32-byte tail beyond word 3 must be ignored"
+    );
 }
 
 #[test]

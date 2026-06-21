@@ -464,14 +464,20 @@ fn extract_owner_address(
     contract: &Contract,
     ty: ContractType,
 ) -> Result<Address, PermissionError> {
-    use prost::Message;
     let parameter = contract
         .parameter
         .as_ref()
         .ok_or(PermissionError::DecodeOwner("missing parameter"))?;
+    // java extracts the owner from the contract message decoded by the
+    // standard generated parser, which skips any field whose tag matches no
+    // known field (a known field number with a mismatched wire type included).
+    // Use the same lenient decode so the permission gate admits exactly the
+    // txs java admits — a strict prost decode would reject a
+    // malformed-but-skippable parameter that java commits (see
+    // `tron_proto::decode_lenient`).
     macro_rules! unpack {
         ($T:ty) => {{
-            let c = <$T as Message>::decode(parameter.value.as_slice())
+            let c = tron_proto::decode_lenient::<$T>(parameter.value.as_slice())
                 .map_err(|_| PermissionError::DecodeOwner(concat!("decode ", stringify!($T))))?;
             c.owner_address
         }};
@@ -516,8 +522,10 @@ fn extract_owner_address(
             unpack!(tron_proto::CancelAllUnfreezeV2Contract)
         }
         ContractType::CreateSmartContract => {
-            let c = tron_proto::CreateSmartContract::decode(parameter.value.as_slice())
-                .map_err(|_| PermissionError::DecodeOwner("decode CreateSmartContract"))?;
+            let c = tron_proto::decode_lenient::<tron_proto::CreateSmartContract>(
+                parameter.value.as_slice(),
+            )
+            .map_err(|_| PermissionError::DecodeOwner("decode CreateSmartContract"))?;
             c.owner_address
         }
         ContractType::TriggerSmartContract => unpack!(tron_proto::TriggerSmartContract),
@@ -535,8 +543,10 @@ fn extract_owner_address(
         ContractType::MarketSellAssetContract => unpack!(tron_proto::MarketSellAssetContract),
         ContractType::MarketCancelOrderContract => unpack!(tron_proto::MarketCancelOrderContract),
         ContractType::ShieldedTransferContract => {
-            let c = tron_proto::ShieldedTransferContract::decode(parameter.value.as_slice())
-                .map_err(|_| PermissionError::DecodeOwner("decode ShieldedTransferContract"))?;
+            let c = tron_proto::decode_lenient::<tron_proto::ShieldedTransferContract>(
+                parameter.value.as_slice(),
+            )
+            .map_err(|_| PermissionError::DecodeOwner("decode ShieldedTransferContract"))?;
             // For shielded txs, the "owner" for permission purposes is
             // the transparent-from address. If it's empty (fully
             // shielded), permission enforcement is a no-op — the

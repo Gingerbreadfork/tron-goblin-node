@@ -265,6 +265,59 @@ impl TronDatabaseExt for TronDatabase {
         matches!(self.accounts.get(&tron_addr), Ok(Some(_)))
     }
 
+    fn tron_contract_version(&self, address: Address) -> i32 {
+        // The version of the contract whose code a CALL frame is about to
+        // execute. java reads `invoke.getDeposit().getContract(codeAddress)
+        // .getContractVersion()` (CALL child, `Program.java:1146`) and
+        // `deployedContract.getContractVersion()` for the top-level frame
+        // (`VMActuator.java:531`). A brand-new top-level CREATE is forced to
+        // version 1 (`VMActuator.java:325,415`); we mirror that with the
+        // per-tx override below, since the deploy's `SmartContract` row isn't
+        // written until commit (so a plain store read would see 0 mid-deploy).
+        if let Some((deploy_addr, version)) = self.top_level_deploy_version {
+            if deploy_addr == address {
+                return version;
+            }
+        }
+        match &self.contracts {
+            Some(contracts) => match contracts.get(&evm_to_tron_address(&address)) {
+                Ok(Some(c)) => c.version,
+                // No contract row (EOA / not-yet-committed deploy) → version 0,
+                // matching java's `getContract(addr) == null` default.
+                _ => 0,
+            },
+            None => 0,
+        }
+    }
+
+    fn tron_allow_tvm_vote(&self) -> bool {
+        // java `VMConfig.allowTvmVote()` — the `ALLOW_TVM_VOTE` proposal flag.
+        // Gates the FREEZE/UNFREEZE (Stake 1.0) static-call guard.
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_TVM_VOTE").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_allow_tvm_compatible_evm(&self) -> bool {
+        // java `VMConfig.allowTvmCompatibleEvm()` — the `ALLOW_TVM_COMPATIBLE_EVM`
+        // proposal flag (#66). First half of the per-frame 1/64-retention /
+        // GASPRICE version gate.
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_TVM_COMPATIBLE_EVM").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_energy_fee(&self) -> i64 {
+        // java `DynamicPropertiesStore.getEnergyFee()` — pushed by BASEFEE and
+        // by version-1 GASPRICE.
+        match &self.dyn_props {
+            Some(dp) => dp.energy_fee(),
+            None => 0,
+        }
+    }
+
     fn tron_root_tx_id(&self) -> revm::primitives::B256 {
         revm::primitives::B256::from(self.root_tx_id)
     }
@@ -1346,7 +1399,13 @@ impl TronDatabaseExt for TronDatabase {
         let Some(resources) = self.delegated_resources.clone() else {
             return 0;
         };
-        if balance <= 0 || resource_type > 1 {
+        // java `DelegateResourceProcessor.validate` (DelegateResourceProcessor.java:53):
+        // `delegateBalance < TRX_PRECISION` is rejected — the delegate amount must
+        // be at least 1 TRX (1_000_000 sun). This subsumes the `balance <= 0` case
+        // (0 or negative is also < 1 TRX). `resource_type > 1` mirrors java's
+        // ResourceCode switch default (only BANDWIDTH=0 / ENERGY=1 are valid).
+        const TRX_PRECISION: i64 = 1_000_000;
+        if balance < TRX_PRECISION || resource_type > 1 {
             return 0;
         }
         let owner = evm_to_tron_address(&caller);
@@ -1415,6 +1474,13 @@ impl TronDatabaseExt for TronDatabase {
             Ok(Some(a)) => a,
             _ => return 0,
         };
+        // java `DelegateResourceProcessor.validate` (DelegateResourceProcessor.java:111):
+        // delegating to a contract address is rejected ("Do not allow delegate
+        // resources to contract addresses"). Mirror the revert path (return 0, no
+        // state mutation) before any balance/record write.
+        if receiver_account.r#type == tron_proto::AccountType::Contract as i32 {
+            return 0;
+        }
         match resource {
             0 => {
                 receiver_account.acquired_delegated_frozen_v2_balance_for_bandwidth =
@@ -1862,22 +1928,41 @@ fn self_freeze_expire(
     }
 }
 
-/// Delegation lookup is a follow-up — `TronDatabase` doesn't carry a
-/// `DelegatedResourceStore` Arc today. java-tron's equivalent reads
-/// `DelegatedResourceCapsule` keyed `(from, to)` and returns
-/// `expireTimeForBandwidth` / `expireTimeForEnergy`. The precompile
-/// path at `crates/tron-tvm/src/precompiles.rs` already has the
-/// store-side logic — wire it through here when DB grows the field.
+/// FREEZEEXPIRETIME (0xd7) delegate path — `caller != target`.
+///
+/// java `Program.freezeExpireTime` (Program.java:2013-2026): look up the
+/// `DelegatedResource` row at the V1 key `createDbKey(owner, target)` (=
+/// `from || to`, no prefix), and return the per-resource expire time guarded by
+/// a non-zero frozen balance:
+/// * `resourceCode == 0` (bandwidth) → `expireTimeForBandwidth` iff
+///   `frozenBalanceForBandwidth != 0`,
+/// * `resourceCode == 1` (energy) → `expireTimeForEnergy` iff
+///   `frozenBalanceForEnergy != 0`.
+///
+/// Returns the raw stored millis (the opcode handler divides by 1000); `0` when
+/// no store is attached, no record exists, the resource type is out of range,
+/// or the matching frozen balance is zero. Mirrors java's `return 0` fallbacks.
 fn delegate_freeze_expire(
-    _db: &TronDatabase,
-    _caller: &TronAddress,
-    _target: &TronAddress,
-    _resource_type: u32,
+    db: &TronDatabase,
+    caller: &TronAddress,
+    target: &TronAddress,
+    resource_type: u32,
 ) -> i64 {
-    // Silence "unused import" warning while keeping the type alias in
-    // scope as a hint to whoever wires this in next.
-    let _ = DelegatedResourceStore::v1_key as fn(_, _) -> _;
-    0
+    let Some(resources) = &db.delegated_resources else {
+        return 0;
+    };
+    // java keys the lookup `createDbKey(owner, target)` — the V1 `from || to`.
+    let key = DelegatedResourceStore::v1_key(caller, target);
+    let Ok(Some(record)) = resources.get_raw(&key) else {
+        return 0;
+    };
+    match resource_type {
+        // Bandwidth.
+        0 if record.frozen_balance_for_bandwidth != 0 => record.expire_time_for_bandwidth,
+        // Energy.
+        1 if record.frozen_balance_for_energy != 0 => record.expire_time_for_energy,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

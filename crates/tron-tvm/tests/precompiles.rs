@@ -552,26 +552,29 @@ fn p256_verify_rejects_off_curve_public_key() {
 
 #[test]
 fn blake2f_rejects_wrong_input_length() {
+    // java `Blake2F.execute` (PrecompiledContracts.java:1899) returns
+    // `Pair.of(false, ZERO)` for a wrong length, which
+    // `Program.callToPrecompiledAddress` (Program.java:1762-1768) turns into
+    // `refundEnergy(0)` — spend ALL forwarded energy + push 0 + revert. The
+    // bridge maps that to `SpendAllRevert` (NOT a zero-cost `BadInputLength`
+    // revert, which would refund the unused energy).
     let ctx = MockContext::default();
     let err = PrecompileImpl::Blake2F.execute(&[0u8; 212], &ctx).unwrap_err();
-    assert!(matches!(
-        err,
-        tron_tvm::PrecompileError::BadInputLength { got: 212, expected: 213 }
-    ));
+    assert!(matches!(err, tron_tvm::PrecompileError::SpendAllRevert));
     let err = PrecompileImpl::Blake2F.execute(&[0u8; 214], &ctx).unwrap_err();
-    assert!(matches!(
-        err,
-        tron_tvm::PrecompileError::BadInputLength { got: 214, expected: 213 }
-    ));
+    assert!(matches!(err, tron_tvm::PrecompileError::SpendAllRevert));
 }
 
 #[test]
 fn blake2f_rejects_invalid_finalization_flag() {
+    // java `Blake2F.execute` (PrecompiledContracts.java:1903) returns
+    // `Pair.of(false, ZERO)` when `data[212] & 0xFE != 0` → spend-all-energy
+    // revert (see `blake2f_rejects_wrong_input_length`).
     let ctx = MockContext::default();
     let mut input = [0u8; 213];
     input[212] = 2; // not 0 or 1
     let err = PrecompileImpl::Blake2F.execute(&input, &ctx).unwrap_err();
-    assert!(matches!(err, tron_tvm::PrecompileError::Malformed));
+    assert!(matches!(err, tron_tvm::PrecompileError::SpendAllRevert));
 }
 
 #[test]
@@ -1615,17 +1618,16 @@ fn freeze_v2_precompiles_return_zero_for_unknown_account() {
 }
 
 // =============================================================================
-// Per-contract dynamic energy penalty (Phase 2b)
+// Precompile energy cost is the flat `getEnergyForData` — NO dynamic penalty
 // =============================================================================
 //
-// The flow at consensus time:
-//   1. Interpreter dispatches CALL to a precompile address.
-//   2. Computes `effective_energy_cost(input, ctx)`:
-//      - Reads `ALLOW_DYNAMIC_ENERGY` from chain params.
-//      - Reads the *callee's* (i.e. the contract being executed) factor
-//        from `ContractStateStore` via the EvmContext seam.
-//      - Returns `base * (DECIMAL + factor) / DECIMAL` if both on; else `base`.
-//   3. Deducts that amount from the contract's energy budget.
+// java-tron charges a precompile call its flat `getEnergyForData(data)` with NO
+// `ALLOW_DYNAMIC_ENERGY` scaling: `Program.callToPrecompiledAddress`
+// (Program.java:1737) compares `requiredEnergy = contract.getEnergyForData(data)`
+// directly against the forwarded energy — the per-contract dynamic-energy factor
+// only ever multiplies ordinary opcode costs (`VM.getEnergyCost`), never a
+// precompile call. So `effective_energy_cost` returns `base` regardless of the
+// callee's factor or the `ALLOW_DYNAMIC_ENERGY` flag.
 
 #[test]
 fn effective_energy_cost_returns_base_when_dynamic_energy_disabled() {
@@ -1641,7 +1643,9 @@ fn effective_energy_cost_returns_base_when_dynamic_energy_disabled() {
 }
 
 #[test]
-fn effective_energy_cost_doubles_when_factor_equals_decimal() {
+fn effective_energy_cost_ignores_factor_even_when_flag_on() {
+    // java does NOT apply the dynamic-energy penalty to precompile calls, so a
+    // non-zero factor + ALLOW_DYNAMIC_ENERGY=1 must still charge the flat base.
     let mut ctx = MockContext::default();
     ctx.callee = Some(alice());
     ctx.dynamic_factors.insert(alice(), DYNAMIC_ENERGY_FACTOR_DECIMAL);
@@ -1651,7 +1655,7 @@ fn effective_energy_cost_doubles_when_factor_equals_decimal() {
     let eff = PrecompileImpl::VoteCount
         .effective_energy_cost(&[], &ctx)
         .unwrap();
-    assert_eq!(eff, 2 * base, "factor=DECIMAL must double the cost");
+    assert_eq!(eff, base, "precompile cost must be the flat base, no penalty");
 }
 
 #[test]
@@ -1668,7 +1672,8 @@ fn effective_energy_cost_falls_back_to_zero_factor_for_unknown_contract() {
 }
 
 #[test]
-fn effective_energy_cost_partial_factor_applies_correct_percentage() {
+fn effective_energy_cost_partial_factor_ignored() {
+    // A partial factor is likewise ignored — precompiles never carry the penalty.
     let mut ctx = MockContext::default();
     ctx.callee = Some(alice());
     ctx.dynamic_factors
@@ -1679,5 +1684,5 @@ fn effective_energy_cost_partial_factor_applies_correct_percentage() {
     let eff = PrecompileImpl::ValidateMultiSign
         .effective_energy_cost(&[], &ctx)
         .unwrap();
-    assert_eq!(eff, base + base / 4);
+    assert_eq!(eff, base);
 }

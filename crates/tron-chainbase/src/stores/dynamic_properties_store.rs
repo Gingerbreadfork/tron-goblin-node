@@ -60,6 +60,8 @@ pub mod keys {
     pub const LATEST_EXCHANGE_NUM: &[u8] = b"LATEST_EXCHANGE_NUM";
     pub const NEXT_MAINTENANCE_TIME: &[u8] = b"NEXT_MAINTENANCE_TIME";
     pub const MAINTENANCE_TIME_INTERVAL: &[u8] = b"MAINTENANCE_TIME_INTERVAL";
+    pub const PROPOSAL_EXPIRE_TIME: &[u8] = b"PROPOSAL_EXPIRE_TIME";
+    pub const EXCHANGE_BALANCE_LIMIT: &[u8] = b"EXCHANGE_BALANCE_LIMIT";
     pub const WITNESS_PAY_PER_BLOCK: &[u8] = b"WITNESS_PAY_PER_BLOCK";
     pub const WITNESS_127_PAY_PER_BLOCK: &[u8] = b"WITNESS_127_PAY_PER_BLOCK";
     pub const WITNESS_STANDBY_ALLOWANCE: &[u8] = b"WITNESS_STANDBY_ALLOWANCE";
@@ -371,6 +373,31 @@ impl DynamicPropertiesStore {
     }
     pub fn save_maintenance_time_interval(&self, v: i64) {
         self.put_long(keys::MAINTENANCE_TIME_INTERVAL, v);
+    }
+
+    /// java `DynamicPropertiesStore.getProposalExpireTime()`: the stored
+    /// `PROPOSAL_EXPIRE_TIME` (proposal #92, post-4.8.1) is honored only when it
+    /// is strictly within `(MIN_PROPOSAL_EXPIRE_TIME, MAX_PROPOSAL_EXPIRE_TIME)`
+    /// = `(0, 31_536_003_000)`; otherwise the node-config default
+    /// `DEFAULT_PROPOSAL_EXPIRE_TIME` = 259_200_000 ms (3 days) is returned.
+    pub fn proposal_expire_time(&self) -> i64 {
+        const DEFAULT_PROPOSAL_EXPIRE_TIME: i64 = 259_200_000; // 3 days
+        const MIN_PROPOSAL_EXPIRE_TIME: i64 = 0;
+        const MAX_PROPOSAL_EXPIRE_TIME: i64 = 31_536_003_000; // 365 days + 3000 ms
+        match self.get_long(keys::PROPOSAL_EXPIRE_TIME) {
+            Some(t) if t > MIN_PROPOSAL_EXPIRE_TIME && t < MAX_PROPOSAL_EXPIRE_TIME => t,
+            _ => DEFAULT_PROPOSAL_EXPIRE_TIME,
+        }
+    }
+
+    /// java `DynamicPropertiesStore.getExchangeBalanceLimit()` — the per-side
+    /// cap an exchange may hold. Saved to `1_000_000_000_000_000` (1e15) at
+    /// genesis; every imported mainnet DB has it. The default mirrors that
+    /// genesis value for fresh/test state (java throws when the key is absent,
+    /// which only happens before genesis init).
+    pub fn exchange_balance_limit(&self) -> i64 {
+        self.get_long(keys::EXCHANGE_BALANCE_LIMIT)
+            .unwrap_or(1_000_000_000_000_000)
     }
 
     // -------------------- Reward parameters ----------------------------

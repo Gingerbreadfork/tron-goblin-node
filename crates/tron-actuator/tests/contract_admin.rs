@@ -42,11 +42,16 @@ struct Ctx {
 }
 
 fn ctx() -> Ctx {
+    let dp = DynamicPropertiesStore::new(mem());
+    // UpdateEnergyLimit's java gate is `latestBlockHeaderNumber >=
+    // blockNumForEnergyLimit` (4_727_890). Seed a height well past it so the
+    // gate is satisfied for the ownership/bounds tests, matching the live chain.
+    dp.save_latest_block_header_number(50_000_000);
     Ctx {
         accounts: AccountStore::new(mem()),
         contracts: ContractStore::new(mem()),
         abi: AbiStore::new(mem()),
-        dp: DynamicPropertiesStore::new(mem()),
+        dp,
     }
 }
 
@@ -199,7 +204,7 @@ fn update_energy_limit_rejects_missing_owner() {
         origin_energy_limit: 20_000_000,
     };
     let err =
-        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &c).unwrap_err();
+        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing));
 }
 
@@ -213,7 +218,7 @@ fn update_energy_limit_rejects_invalid_address() {
         origin_energy_limit: 1_000,
     };
     let err =
-        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &c).unwrap_err();
+        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::InvalidAddress));
 }
 
@@ -229,7 +234,7 @@ fn update_energy_limit_rejects_non_positive_limit() {
             origin_energy_limit: lim,
         };
         let err =
-            contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &c)
+            contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c)
                 .unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveEnergyLimit),
@@ -248,7 +253,7 @@ fn update_energy_limit_rejects_missing_contract() {
         origin_energy_limit: 1_000,
     };
     let err =
-        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &c).unwrap_err();
+        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ContractMissing));
 }
 
@@ -264,7 +269,7 @@ fn update_energy_limit_rejects_non_owner() {
         origin_energy_limit: 1_000,
     };
     let err =
-        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &c).unwrap_err();
+        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NotContractOwner));
 }
 
@@ -278,12 +283,35 @@ fn update_energy_limit_writes_new_value() {
         contract_address: CONTRACT.to_vec(),
         origin_energy_limit: 42_000_000,
     };
-    contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &c).unwrap();
+    contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c).unwrap();
     contract_admin::execute_update_energy_limit(&ctx.contracts, &c).unwrap();
     let post = ctx.contracts.get(&addr(CONTRACT)).unwrap().unwrap();
     assert_eq!(post.origin_energy_limit, 42_000_000);
     // Other fields unchanged.
     assert_eq!(post.consume_user_resource_percent, 30);
+}
+
+#[test]
+fn update_energy_limit_rejects_before_activation_height() {
+    // java ReceiptCapsule.checkForEnergyLimit gate: below blockNumForEnergyLimit
+    // (4_727_890) the contract type is unrecognized and the tx FAILs. This gate
+    // fires ahead of all ownership/bounds checks.
+    let ctx = ctx();
+    ctx.dp.save_latest_block_header_number(4_727_889); // one below the gate
+    put_account(&ctx, OWNER);
+    put_contract(&ctx, CONTRACT, OWNER);
+    let c = UpdateEnergyLimitContract {
+        owner_address: OWNER.to_vec(),
+        contract_address: CONTRACT.to_vec(),
+        origin_energy_limit: 42_000_000,
+    };
+    let err =
+        contract_admin::validate_update_energy_limit(&ctx.accounts, &ctx.contracts, &ctx.dp, &c)
+            .unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::EnergyLimitNotActivated),
+        "got: {err:?}"
+    );
 }
 
 // ============================================================

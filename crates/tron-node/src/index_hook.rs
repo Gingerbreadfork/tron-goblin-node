@@ -31,7 +31,6 @@
 
 use std::sync::Arc;
 
-use prost::Message as _;
 use tron_chainbase::{KvBackend, TransactionRetStore};
 use tron_proto::transaction::contract::ContractType;
 use tron_proto::{Block, TransactionInfo, TransactionRet};
@@ -351,12 +350,12 @@ fn vm_contract_address(tx: &tron_proto::Transaction, tx_id: &[u8; 32]) -> Vec<u8
     let param = contract.parameter.as_ref().map(|p| p.value.as_slice()).unwrap_or(&[]);
     match ContractType::try_from(contract.r#type).ok() {
         Some(ContractType::TriggerSmartContract) => {
-            tron_proto::TriggerSmartContract::decode(param)
+            tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param)
                 .map(|c| c.contract_address)
                 .unwrap_or_default()
         }
         Some(ContractType::CreateSmartContract) => {
-            let Ok(c) = tron_proto::CreateSmartContract::decode(param) else {
+            let Ok(c) = tron_proto::decode_lenient::<tron_proto::CreateSmartContract>(param) else {
                 return Vec::new();
             };
             // One shared copy of the consensus-critical derivation —
@@ -370,6 +369,7 @@ fn vm_contract_address(tx: &tron_proto::Transaction, tx_id: &[u8; 32]) -> Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use tron_chainbase::MemBackend;
     use tron_executor::{TxOutcome, TxResult};
 

@@ -28,6 +28,9 @@ pub mod tron {
 /// keep working.
 pub use tron::libp2p;
 
+pub mod lenient;
+pub use lenient::decode_lenient;
+
 pub use protocol::*;
 
 pub use prost::Message;

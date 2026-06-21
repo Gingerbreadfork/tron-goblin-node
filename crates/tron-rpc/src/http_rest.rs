@@ -1291,7 +1291,8 @@ fn decode_contract_parameter(contract_type: i32, value: &[u8]) -> Option<Value> 
             jput(&mut m, "to_address", hexb(&c.to_address));
         }
         CT::TriggerSmartContract => {
-            let c = tron_proto::TriggerSmartContract::decode(value).ok()?;
+            let c =
+                tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(value).ok()?;
             jput(&mut m, "data", hexb(&c.data));
             jput(&mut m, "owner_address", hexb(&c.owner_address));
             jput(&mut m, "contract_address", hexb(&c.contract_address));

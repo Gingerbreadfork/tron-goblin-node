@@ -3755,8 +3755,13 @@ fn execute_vm_tx(
     let mut out_of_time_energy: Option<u64> = None;
     let (caller_addr, trigger_contract_addr, outcome, vm_traces, energy_penalty) = match ty {
         ContractType::TriggerSmartContract => {
+            // Decode the way java's generated parser does — skipping any field
+            // whose tag matches no known field (e.g. call-data mis-encoded
+            // under field 3 / `call_value`). A strict prost decode would
+            // reject such a tx pre-VM (DEFAULT, no energy) whereas java skips
+            // the stray field and runs an empty-data call to REVERT.
             let trigger: tron_proto::TriggerSmartContract =
-                match prost::Message::decode(parameter.value.as_slice()) {
+                match tron_proto::decode_lenient(parameter.value.as_slice()) {
                     Ok(t) => t,
                     Err(e) => {
                         iso.revert();
@@ -3813,8 +3818,10 @@ fn execute_vm_tx(
             }
         }
         ContractType::CreateSmartContract => {
+            // Lenient decode (java's generated-parser skip-unknown semantics),
+            // matching the TriggerSmartContract arm above.
             let create: tron_proto::CreateSmartContract =
-                match prost::Message::decode(parameter.value.as_slice()) {
+                match tron_proto::decode_lenient(parameter.value.as_slice()) {
                     Ok(c) => c,
                     Err(e) => {
                         iso.revert();
@@ -4396,9 +4403,14 @@ fn extract_owner_for_bandwidth(
     ty: ContractType,
 ) -> Result<tron_crypto::address::Address, ()> {
     let parameter = contract.parameter.as_ref().ok_or(())?;
+    // java decodes the contract message with the standard generated parser,
+    // which skips fields whose tag matches no known field (including a known
+    // field number with a mismatched wire type). Use the same lenient decode
+    // so the owner — and the bandwidth charge — match java even on a
+    // malformed-but-skippable parameter (see `tron_proto::decode_lenient`).
     macro_rules! unpack {
         ($T:ty) => {{
-            let c = <$T as prost::Message>::decode(parameter.value.as_slice()).map_err(|_| ())?;
+            let c = tron_proto::decode_lenient::<$T>(parameter.value.as_slice()).map_err(|_| ())?;
             c.owner_address
         }};
     }
@@ -4429,7 +4441,7 @@ fn extract_owner_for_bandwidth(
         // bandwidth charge for ALL smart-contract transactions).
         ContractType::TriggerSmartContract => unpack!(tron_proto::TriggerSmartContract),
         ContractType::CreateSmartContract => {
-            let c = <tron_proto::CreateSmartContract as prost::Message>::decode(
+            let c = tron_proto::decode_lenient::<tron_proto::CreateSmartContract>(
                 parameter.value.as_slice(),
             )
             .map_err(|_| ())?;

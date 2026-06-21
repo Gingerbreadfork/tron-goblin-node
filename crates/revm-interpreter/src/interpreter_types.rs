@@ -66,6 +66,15 @@ pub trait InputsTr {
     fn tron_token_value(&self) -> i64 {
         0
     }
+
+    /// **TRON-fork extension.** The deployed `SmartContract.version` of the
+    /// contract executing in *this* frame (java `getContractVersion()`). Used
+    /// by the CALL/CREATE energy-forwarding sites and the GASPRICE opcode to
+    /// gate the EIP-150 1/64 retention on `allowTvmCompatibleEvm() &&
+    /// version == 1`. Defaults to `0` (legacy contract).
+    fn tron_contract_version(&self) -> i32 {
+        0
+    }
 }
 
 /// Trait needed for legacy bytecode.

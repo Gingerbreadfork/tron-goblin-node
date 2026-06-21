@@ -255,7 +255,7 @@ fn proposal_create_then_approve_then_delete() {
         owner_address: ALICE.to_vec(),
         parameters: std::collections::BTreeMap::from([(1i64, 1_000i64)]),
     };
-    proposal::validate_proposal_create(&accounts, &witnesses, &create).unwrap();
+    proposal::validate_proposal_create(&accounts, &witnesses, &dp, &create).unwrap();
     proposal::execute_proposal_create(&proposals, &dp, &create).unwrap();
     assert!(proposals.get(1).unwrap().is_some());
 

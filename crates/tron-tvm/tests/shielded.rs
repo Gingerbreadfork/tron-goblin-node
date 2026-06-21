@@ -50,10 +50,15 @@ fn merkle_hash_output_is_32_bytes() {
 }
 
 #[test]
-fn decode_rejects_wrong_length() {
+fn decode_rejects_short_accepts_at_least_96() {
+    // java `MerkleHash.execute` throws (→ reject) only when `data.length < 96`;
+    // a length >= 96 is accepted and the tail beyond byte 96 is ignored.
     assert!(decode_merkle_hash_input(&[]).is_none());
     assert!(decode_merkle_hash_input(&[0u8; 95]).is_none());
-    assert!(decode_merkle_hash_input(&[0u8; 97]).is_none());
+    // Exactly 96 and longer: accepted (depth 0 here, all-zero words).
+    assert!(decode_merkle_hash_input(&[0u8; 96]).is_some());
+    assert!(decode_merkle_hash_input(&[0u8; 97]).is_some());
+    assert!(decode_merkle_hash_input(&[0u8; 128]).is_some());
 }
 
 #[test]

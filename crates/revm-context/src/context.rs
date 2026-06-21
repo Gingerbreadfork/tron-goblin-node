@@ -667,6 +667,22 @@ impl<
         true
     }
 
+    fn tron_contract_version(&self, address: Address) -> i32 {
+        self.journaled_state.db().tron_contract_version(address)
+    }
+
+    fn tron_allow_tvm_vote(&self) -> bool {
+        self.journaled_state.db().tron_allow_tvm_vote()
+    }
+
+    fn tron_allow_tvm_compatible_evm(&self) -> bool {
+        self.journaled_state.db().tron_allow_tvm_compatible_evm()
+    }
+
+    fn tron_energy_fee(&self) -> U256 {
+        U256::from(self.journaled_state.db().tron_energy_fee().max(0) as u64)
+    }
+
     fn tron_root_tx_id(&self) -> B256 {
         self.journaled_state.db().tron_root_tx_id()
     }

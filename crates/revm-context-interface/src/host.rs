@@ -304,6 +304,52 @@ pub trait Host {
         0
     }
 
+    /// **TRON fork** — the deployed `SmartContract.version` of the contract
+    /// at `address` (java `ContractCapsule.getContractVersion()`), or `0`
+    /// when there is no contract row. Read once when a CALL frame is built
+    /// so the frame can carry the executing contract's version — java-tron
+    /// gates the EIP-150 1/64 gas retention (`Program.getCallEnergy` /
+    /// `getCreateEnergy`) AND the GASPRICE push (`gasPriceAction`) on
+    /// `allowTvmCompatibleEvm() && getContractVersion() == 1`. Default `0`
+    /// keeps non-TRON hosts on the upstream "always retain" behaviour.
+    #[inline]
+    fn tron_contract_version(&self, _address: Address) -> i32 {
+        0
+    }
+
+    /// **TRON fork** — is the `ALLOW_TVM_VOTE` proposal active? java gates the
+    /// FREEZE/UNFREEZE (0xd5/0xd6, Stake 1.0) static-call guard on
+    /// `VMConfig.allowTvmVote()` (`OperationActions.java:781,800`), unlike the
+    /// Stake 2.0 / vote / withdraw opcodes whose guard is unconditional.
+    /// Default `false`.
+    #[inline]
+    fn tron_allow_tvm_vote(&self) -> bool {
+        false
+    }
+
+    /// **TRON fork** — is the `ALLOW_TVM_COMPATIBLE_EVM` proposal active? This is
+    /// the first half of java's `allowTvmCompatibleEvm() && getContractVersion()
+    /// == 1` gate on the EIP-150 1/64 retention (`Program.getCallEnergy` /
+    /// `getCreateEnergy`) and the GASPRICE push (`gasPriceAction`). The
+    /// per-frame retention/GASPRICE logic must apply the version gate ONLY when
+    /// this flag is active; otherwise (flag off, or a non-TRON host) it keeps
+    /// the unconditional EIP-150 behaviour. Default `false`.
+    #[inline]
+    fn tron_allow_tvm_compatible_evm(&self) -> bool {
+        false
+    }
+
+    /// **TRON fork** — `DynamicPropertiesStore.getEnergyFee()` (sun per energy),
+    /// the value java's `baseFeeAction` (BASEFEE, OperationActions.java:538)
+    /// pushes, and `gasPriceAction` pushes for a version-1 contract. Exposed to
+    /// the opcode handlers directly (rather than via `BlockEnv.basefee`) so
+    /// setting it doesn't trip revm's legacy `gas_price >= basefee` tx check.
+    /// Default `0`.
+    #[inline]
+    fn tron_energy_fee(&self) -> U256 {
+        U256::ZERO
+    }
+
     /// **TRON fork** — the root transaction id (`sha256(raw_data)`) of the tx
     /// currently executing. Used to derive nested-CREATE addresses
     /// (`0x41 || sha3omit12(rootTxId || nonce_be8)`). Default `ZERO`.

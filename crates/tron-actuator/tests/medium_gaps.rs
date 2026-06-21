@@ -368,6 +368,7 @@ fn create_account_writes_new_account_with_create_time() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     dp.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", 100_000);
+    dp.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1); // mainnet: burn the fee
     dp.save_latest_block_header_timestamp(1_700_000_000);
     put_account(&accounts, ALICE, 1_000_000_000);
     let c = AccountCreateContract {
@@ -382,6 +383,8 @@ fn create_account_writes_new_account_with_create_time() {
     assert_eq!(bob.create_time, 1_700_000_000);
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 1_000_000_000 - 100_000);
+    // java CreateAccountActuator.execute burns the create fee.
+    assert_eq!(dp.burn_trx_amount(), 100_000);
 }
 
 // ============================================================
@@ -695,7 +698,11 @@ fn unfreeze_asset_rejects_when_all_entries_still_locked() {
 #[test]
 fn unfreeze_asset_releases_only_expired_entries() {
     let accounts = AccountStore::new(mem());
+    let asset_v1 = AssetIssueStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
+    // Mainnet path: allowSameTokenName == 1 → key is the issued *id*, credited
+    // to the V2 map only (java addAssetAmountV2's `== 1` branch).
+    dp.save_allow_same_token_name(1);
     dp.save_latest_block_header_timestamp(5_000);
     let mut alice = Account {
         address: ALICE.to_vec(),
@@ -718,12 +725,56 @@ fn unfreeze_asset_releases_only_expired_entries() {
         owner_address: ALICE.to_vec(),
     };
     asset::validate_unfreeze_asset(&accounts, &dp, &c).unwrap();
-    asset::execute_unfreeze_asset(&accounts, &dp, &c).unwrap();
+    asset::execute_unfreeze_asset(&accounts, &asset_v1, &dp, &c).unwrap();
     let alice_after = accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice_after.frozen_supply.len(), 1);
     assert_eq!(alice_after.frozen_supply[0].frozen_balance, 200);
     // Released 100 units credited to the issued asset slot.
     assert_eq!(*alice_after.asset_v2.get("1000001").unwrap(), 100);
+}
+
+#[test]
+fn unfreeze_asset_legacy_path_credits_v1_name_and_v2_id() {
+    // Pre-fork path: allowSameTokenName == 0. java UnfreezeAssetActuator.execute
+    // selects getAssetIssuedName() and addAssetAmountV2 writes the same total to
+    // BOTH the V1 `asset` map (keyed by name) and the V2 `asset_v2` map (keyed
+    // by the token id looked up from the V1 asset store).
+    let accounts = AccountStore::new(mem());
+    let asset_v1 = AssetIssueStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_same_token_name(0);
+    dp.save_latest_block_header_timestamp(5_000);
+
+    // V1 asset capsule keyed by name "MyToken" with id "1000007".
+    let issue = tron_proto::AssetIssueContract {
+        id: "1000007".to_string(),
+        name: b"MyToken".to_vec(),
+        ..Default::default()
+    };
+    asset_v1.put(b"MyToken", &issue).unwrap();
+
+    let mut alice = Account {
+        address: ALICE.to_vec(),
+        r#type: AccountType::Normal as i32,
+        ..Default::default()
+    };
+    alice.asset_issued_name = b"MyToken".to_vec();
+    alice.asset_issued_id = b"1000007".to_vec();
+    alice.frozen_supply = vec![Frozen {
+        frozen_balance: 100,
+        expire_time: 4_000, // expired
+    }];
+    accounts.put(&addr(ALICE), &alice).unwrap();
+
+    let c = UnfreezeAssetContract {
+        owner_address: ALICE.to_vec(),
+    };
+    asset::validate_unfreeze_asset(&accounts, &dp, &c).unwrap();
+    asset::execute_unfreeze_asset(&accounts, &asset_v1, &dp, &c).unwrap();
+    let after = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    // Both maps carry the released 100: V1 by name, V2 by id.
+    assert_eq!(*after.asset.get("MyToken").unwrap(), 100);
+    assert_eq!(*after.asset_v2.get("1000007").unwrap(), 100);
 }
 
 // Reference Carol so unused-const warning stays quiet across refactors.

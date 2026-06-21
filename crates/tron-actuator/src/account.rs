@@ -21,8 +21,14 @@ pub const MAX_ACCOUNT_NAME_BYTES: usize = 200;
 pub const MIN_ACCOUNT_ID_BYTES: usize = 8;
 pub const MAX_ACCOUNT_ID_BYTES: usize = 32;
 
+/// Mirrors java `TransactionUtil.validAccountName` =
+/// `validBytes(name, MAX_ACCOUNT_NAME_LEN=200, allowEmpty=true)`: an empty name
+/// is VALID (java's `validBytes` returns `allowEmpty` for empty input), and a
+/// non-empty name must be at most 200 bytes. The empty-name case matters
+/// because java accepts an `AccountUpdate` that clears the name, so rejecting it
+/// here would flip the recorded contractRet from SUCCESS to FAILED.
 fn name_valid(name: &[u8]) -> bool {
-    !name.is_empty() && name.len() <= MAX_ACCOUNT_NAME_BYTES
+    name.len() <= MAX_ACCOUNT_NAME_BYTES
 }
 
 fn id_valid(id: &[u8]) -> bool {
@@ -77,6 +83,16 @@ pub fn execute_create_account(
         .unwrap_or(0);
     owner_account.balance = check_sub(owner_account.balance, fee)?;
     accounts.put(&owner, &owner_account)?;
+
+    // java CreateAccountActuator.execute: after debiting the owner it sends
+    // `fee` to the blackhole — `burnTrx(fee)` when
+    // `supportBlackHoleOptimization()` is on, else crediting the blackhole
+    // *account*. Mainnet runs with the optimization active (the legacy
+    // account-credit is approximated as a burn, matching the bandwidth/energy
+    // fee paths). The fee is 0 on mainnet, so this is inert in practice, but it
+    // keeps BURN_TRX_AMOUNT exact if CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT
+    // is ever raised by proposal.
+    dyn_props.burn_trx(fee);
 
     let mut new_account = Account {
         address: new_addr.as_bytes().to_vec(),
@@ -418,6 +434,13 @@ pub fn execute_account_permission_update(
         .get_long(b"UPDATE_ACCOUNT_PERMISSION_FEE")
         .unwrap_or(0);
     account.balance = check_sub(account.balance, fee)?;
+    // java AccountPermissionUpdateActuator.execute: after debiting the fee it
+    // routes `fee` to the blackhole — `burnTrx(fee)` when
+    // `supportBlackHoleOptimization()` is on, else crediting the blackhole
+    // *account*. Mainnet runs the optimization (legacy account-credit
+    // approximated as a burn, like the bandwidth/energy fee paths), so
+    // BURN_TRX_AMOUNT must include the 100-TRX permission-update fee.
+    dyn_props.burn_trx(fee);
     // java `AccountCapsule.updatePermissions`: the stored ids are FORCED —
     // owner→0, witness→1 (only when the account is a witness), actives→2+index
     // — regardless of what the contract supplied.

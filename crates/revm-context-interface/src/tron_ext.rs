@@ -228,6 +228,26 @@ pub trait TronDatabaseExt {
         (Address::ZERO, 0)
     }
 
+    /// See [`crate::host::Host::tron_contract_version`].
+    fn tron_contract_version(&self, _address: Address) -> i32 {
+        0
+    }
+
+    /// See [`crate::host::Host::tron_allow_tvm_vote`].
+    fn tron_allow_tvm_vote(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_allow_tvm_compatible_evm`].
+    fn tron_allow_tvm_compatible_evm(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_energy_fee`].
+    fn tron_energy_fee(&self) -> i64 {
+        0
+    }
+
     /// See [`crate::host::Host::tron_root_tx_id`].
     fn tron_root_tx_id(&self) -> primitives::B256 {
         primitives::B256::ZERO

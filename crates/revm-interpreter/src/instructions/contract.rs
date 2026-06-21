@@ -112,8 +112,20 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
         .spec_id()
         .is_enabled_in(SpecId::TANGERINE)
     {
-        // Take remaining gas and deduce l64 part of it.
-        gas_limit = context.host.gas_params().call_stipend_reduction(gas_limit);
+        // TRON fork: java's `Program.getCreateEnergy` (`Program.java:1865`,
+        // called via `EnergyCost.java:505`) retains the 1/64 ONLY when
+        // `allowTvmCompatibleEvm() && getContractVersion() == 1`, keyed on the
+        // version of the frame *executing* this CREATE. Skip the retention
+        // exactly when the flag is on but this frame's version is not 1 (a
+        // version-0 / legacy frame forwards ALL energy even with the flag on);
+        // with the flag off (Ethereum hosts, or TRON before #66) keep the
+        // unconditional EIP-150 retention.
+        let tron_skip_retention = context.host.tron_allow_tvm_compatible_evm()
+            && context.interpreter.input.tron_contract_version() != 1;
+        if !tron_skip_retention {
+            // Take remaining gas and deduce l64 part of it.
+            gas_limit = context.host.gas_params().call_stipend_reduction(gas_limit);
+        }
     }
     // TRON fork: forwarded child gas is never scaled by the parent's
     // dynamic-energy factor nor counted toward its contract usage (see
@@ -122,8 +134,10 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
         return Err(InstructionResult::OutOfGas);
     }
 
-    // Call host to interact with target contract
-    let create_inputs = CreateInputs::new(
+    // Call host to interact with target contract. TRON fork: the created
+    // contract's init frame inherits the parent's contract version
+    // (`Program.java:915`), so stamp this frame's version onto the inputs.
+    let mut create_inputs = CreateInputs::new(
         context.interpreter.input.target_address(),
         scheme,
         value,
@@ -131,6 +145,7 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
         gas_limit,
         context.interpreter.gas.reservoir(),
     );
+    create_inputs.set_tron_contract_version(context.interpreter.input.tron_contract_version());
     context
         .interpreter
         .bytecode
@@ -499,6 +514,15 @@ pub fn freeze_expire_time<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -
 /// `tron_freeze`), which returns 0 before any state change; the default Host
 /// impl returns 0 unconditionally.
 pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `freezeAction` (OperationActions.java:781) throws
+    // StaticCallModificationException — BEFORE any stack pop / increaseNonce —
+    // when `VMConfig.allowTvmVote() && program.isStaticCall()`. Unlike the Stake
+    // 2.0 ops, FREEZE/UNFREEZE gate the guard on `allowTvmVote`. Firing here
+    // (before the host bridge bumps the internal-tx nonce) keeps the nonce —
+    // which seeds nested CREATE2 addresses — unchanged on a static-context call.
+    if context.host.tron_allow_tvm_vote() {
+        require_non_staticcall!(context.interpreter);
+    }
     popn!(
         [resource_type, frozen_balance, receiver_address],
         context.interpreter
@@ -525,6 +549,11 @@ pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 /// UNFREEZE (0xd6) — Stake 1.0 unfreeze. Stack: `[resourceType,
 /// receiverAddress]`. Pushes `1`/`0`.
 pub fn unfreeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `unfreezeAction` (OperationActions.java:800): static-call guard gated
+    // on `VMConfig.allowTvmVote()`, before any stack pop / increaseNonce.
+    if context.host.tron_allow_tvm_vote() {
+        require_non_staticcall!(context.interpreter);
+    }
     popn!([resource_type, receiver_address], context.interpreter);
     let caller = context.interpreter.input.target_address();
     let receiver = receiver_address.into_address();
@@ -669,6 +698,9 @@ fn data_word_int_value_safe(v: &U256) -> usize {
 /// WITHDRAWREWARD (0xd9) — withdraw accumulated SR rewards. Stack
 /// in=0, out=1. The pushed value is the withdrawn amount.
 pub fn withdraw_reward<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `withdrawRewardAction` (OperationActions.java:911): unconditional
+    // static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     let caller = context.interpreter.input.target_address();
     let amount = context.host.tron_withdraw_reward(caller);
     push!(context.interpreter, U256::from(amount.max(0) as u64));
@@ -678,6 +710,9 @@ pub fn withdraw_reward<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> R
 /// FREEZEBALANCEV2 (0xda) — Stake 2.0 freeze. Stack: `[resourceType,
 /// frozenBalance]`. Pushes `1`/`0`.
 pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `freezeBalanceV2Action` (OperationActions.java:824): unconditional
+    // static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     popn!([resource_type, frozen_balance], context.interpreter);
     let caller = context.interpreter.input.target_address();
     let Some(frozen) = u256_to_i64_exact(&frozen_balance) else {
@@ -696,6 +731,9 @@ pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
 /// UNFREEZEBALANCEV2 (0xdb) — Stake 2.0 unfreeze. Stack:
 /// `[resourceType, unfreezeBalance]`. Pushes `1`/`0`.
 pub fn unfreeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `unfreezeBalanceV2Action` (OperationActions.java:836): unconditional
+    // static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     popn!([resource_type, unfreeze_balance], context.interpreter);
     let caller = context.interpreter.input.target_address();
     let Some(unfreeze) = u256_to_i64_exact(&unfreeze_balance) else {
@@ -714,6 +752,9 @@ pub fn unfreeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) 
 /// CANCELALLUNFREEZEV2 (0xdc) — cancel every pending unfreeze.
 /// Stack in=0, out=1 (success bool).
 pub fn cancel_all_unfreeze_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `cancelAllUnfreezeV2Action` (OperationActions.java:859): unconditional
+    // static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     let caller = context.interpreter.input.target_address();
     let result = context.host.tron_cancel_all_unfreeze_v2(caller);
     push!(context.interpreter, U256::from(result.max(0) as u64));
@@ -725,6 +766,9 @@ pub fn cancel_all_unfreeze_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT
 pub fn withdraw_expire_unfreeze<IT: ITy, H: Host + ?Sized>(
     context: Ictx<'_, H, IT>,
 ) -> Result {
+    // java `withdrawExpireUnfreezeAction` (OperationActions.java:849):
+    // unconditional static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     let caller = context.interpreter.input.target_address();
     let amount = context.host.tron_withdraw_expire_unfreeze(caller);
     push!(context.interpreter, U256::from(amount.max(0) as u64));
@@ -740,6 +784,9 @@ pub fn withdraw_expire_unfreeze<IT: ITy, H: Host + ?Sized>(
 /// separate function. We mirror the basic signature; the Host method
 /// accepts the lock flags so a fuller integration can use them.
 pub fn delegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `delegateResourceAction` (OperationActions.java:869): unconditional
+    // static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     popn!(
         [resource_type, delegate_balance, receiver_address],
         context.interpreter
@@ -765,6 +812,9 @@ pub fn delegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
 /// UNDELEGATERESOURCE (0xdf) — undelegate Stake 2.0 resource. Stack:
 /// `[resourceType, unDelegateBalance, receiverAddress]`. Pushes `1`/`0`.
 pub fn undelegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    // java `unDelegateResourceAction` (OperationActions.java:882): unconditional
+    // static-call guard, thrown before increaseNonce.
+    require_non_staticcall!(context.interpreter);
     popn!(
         [resource_type, undelegate_balance, receiver_address],
         context.interpreter

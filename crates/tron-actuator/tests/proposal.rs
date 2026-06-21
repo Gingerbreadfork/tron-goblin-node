@@ -76,7 +76,9 @@ fn put_witness(ctx: &Ctx, who: [u8; 21]) {
 
 fn one_param() -> BTreeMap<i64, i64> {
     let mut p = BTreeMap::new();
-    p.insert(0, 100); // ChainParameter id 0 = MAINTENANCE_TIME_INTERVAL
+    // ChainParameter id 0 = MAINTENANCE_TIME_INTERVAL, valid range
+    // [3*27*1000, 24*3600*1000] = [81_000, 86_400_000] ms.
+    p.insert(0, 86_400_000);
     p
 }
 
@@ -91,7 +93,7 @@ fn create_rejects_missing_owner_account() {
         owner_address: ALICE.to_vec(),
         parameters: one_param(),
     };
-    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &c).unwrap_err();
+    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing), "got: {err:?}");
 }
 
@@ -103,7 +105,7 @@ fn create_rejects_non_witness_proposer() {
         owner_address: ALICE.to_vec(),
         parameters: one_param(),
     };
-    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &c).unwrap_err();
+    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::WitnessMissing), "got: {err:?}");
 }
 
@@ -115,7 +117,7 @@ fn create_rejects_empty_parameters_map() {
         owner_address: ALICE.to_vec(),
         parameters: BTreeMap::new(),
     };
-    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &c).unwrap_err();
+    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::EmptyProposalParameters),
         "got: {err:?}"
@@ -135,9 +137,9 @@ fn create_assigns_sequential_ids_and_records_proposer() {
         owner_address: BOB.to_vec(),
         parameters: one_param(),
     };
-    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &c1).unwrap();
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c1).unwrap();
     proposal::execute_proposal_create(&ctx.proposals, &ctx.dp, &c1).unwrap();
-    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &c2).unwrap();
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c2).unwrap();
     proposal::execute_proposal_create(&ctx.proposals, &ctx.dp, &c2).unwrap();
     let p1 = ctx.proposals.get(1).unwrap().unwrap();
     let p2 = ctx.proposals.get(2).unwrap().unwrap();
@@ -150,6 +152,137 @@ fn create_assigns_sequential_ids_and_records_proposer() {
             .unwrap_or(0),
         2
     );
+}
+
+#[test]
+fn create_rejects_unknown_parameter_code() {
+    // java ProposalType.getEnum throws "Does not support code" for an id not in
+    // the enum, rejecting the proposal.
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    let mut params = BTreeMap::new();
+    params.insert(9999, 1); // no such chain parameter
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: params,
+    };
+    let err =
+        proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::ProposalParameterOutOfRange),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn create_rejects_maintenance_interval_out_of_range() {
+    // MAINTENANCE_TIME_INTERVAL valid range is [81_000, 86_400_000] ms.
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    for v in [100i64, 86_400_001] {
+        let mut params = BTreeMap::new();
+        params.insert(0, v);
+        let c = ProposalCreateContract {
+            owner_address: ALICE.to_vec(),
+            parameters: params,
+        };
+        let err =
+            proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c)
+                .unwrap_err();
+        assert!(
+            matches!(err, ActuatorError::ProposalParameterOutOfRange),
+            "v={v} got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn create_rejects_boolean_parameter_with_non_one_value() {
+    // ALLOW_CREATION_OF_CONTRACTS (id 9) is "only allowed to be 1".
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    let mut params = BTreeMap::new();
+    params.insert(9, 0);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: params,
+    };
+    let err =
+        proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::ProposalParameterOutOfRange),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn create_rejects_dependency_not_satisfied() {
+    // ALLOW_TVM_TRANSFER_TRC10 (id 18) requires ALLOW_SAME_TOKEN_NAME first.
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    let mut params = BTreeMap::new();
+    params.insert(18, 1);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: params,
+    };
+    // Without the dependency flag set → rejected.
+    let err =
+        proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::ProposalParameterOutOfRange),
+        "got: {err:?}"
+    );
+    // With ALLOW_SAME_TOKEN_NAME approved (note the leading-space java key) →
+    // accepted.
+    ctx.dp.put_long(b" ALLOW_SAME_TOKEN_NAME", 1);
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap();
+}
+
+#[test]
+fn create_accepts_in_range_fee_parameter() {
+    // ENERGY_FEE (id 11) has no value check; ASSET_ISSUE_FEE (id 4) accepts
+    // [0, LONG_VALUE].
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    let mut params = BTreeMap::new();
+    params.insert(11, 420); // ENERGY_FEE
+    params.insert(4, 1_024_000_000); // ASSET_ISSUE_FEE
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: params,
+    };
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap();
+}
+
+#[test]
+fn create_expiration_uses_java_truncating_formula() {
+    // java ProposalCreateActuator.execute:
+    //   now3 = now + getProposalExpireTime()  (259_200_000 default = 3 days)
+    //   round = (now3 - nextMaintenanceTime) / interval  (truncating)
+    //   expiration = nextMaintenanceTime + (round + 1) * interval
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    let now: i64 = 1_700_000_000_000;
+    let interval: i64 = 6 * 60 * 60 * 1000; // 6h
+    let next_maint: i64 = now + interval; // next boundary 6h out
+    ctx.dp.save_latest_block_header_timestamp(now);
+    ctx.dp.save_maintenance_time_interval(interval);
+    ctx.dp.save_next_maintenance_time(next_maint);
+
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: one_param(),
+    };
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap();
+    proposal::execute_proposal_create(&ctx.proposals, &ctx.dp, &c).unwrap();
+
+    let now3 = now + 259_200_000;
+    let round = (now3 - next_maint) / interval;
+    let expected = next_maint + (round + 1) * interval;
+    let p = ctx.proposals.get(1).unwrap().unwrap();
+    assert_eq!(p.expiration_time, expected);
+    assert_eq!(p.create_time, now);
 }
 
 // ============================================================

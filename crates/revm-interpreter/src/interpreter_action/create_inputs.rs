@@ -18,6 +18,13 @@ pub struct CreateInputs {
     gas_limit: u64,
     /// State gas reservoir (EIP-8037). Passed from parent frame to child frame.
     reservoir: u64,
+    /// **TRON fork** — the `SmartContract.version` the created contract's init
+    /// frame executes as. java's nested CREATE child inherits the *parent's*
+    /// version (`Program.java:915`: `setContractVersion(getContractVersion())`),
+    /// so the CREATE opcode handler stamps this from the executing frame's
+    /// version. A top-level CREATE forces 1 (`VMActuator.java:415`). Governs the
+    /// child's EIP-150 1/64 retention + GASPRICE. Default `0` (legacy).
+    tron_contract_version: i32,
     /// Cached created address. This is computed lazily and cached to avoid
     /// redundant keccak computations when inspectors call `created_address`.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -46,9 +53,21 @@ impl CreateInputs {
             init_code,
             gas_limit,
             reservoir,
+            tron_contract_version: 0,
             cached_address: OnceCell::new(),
             cached_init_code_hash: OnceCell::new(),
         }
+    }
+
+    /// **TRON fork** — the `SmartContract.version` the created contract's init
+    /// frame runs as (see the field doc). Stamped by the CREATE opcode handler.
+    pub const fn tron_contract_version(&self) -> i32 {
+        self.tron_contract_version
+    }
+
+    /// **TRON fork** — set the version the init frame runs as.
+    pub const fn set_tron_contract_version(&mut self, version: i32) {
+        self.tron_contract_version = version;
     }
 
     /// Returns the address that this create call will create.

@@ -137,6 +137,8 @@ fn create_witness_at_exact_fee_succeeds() {
         owner_address: ALICE.to_vec(),
         url: b"https://example.test".to_vec(),
     };
+    // Mainnet has the blackhole optimization on, so the upgrade cost is burned.
+    dp.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     witness::validate_witness_create(&accounts, &witnesses, &dp, &c).unwrap();
     witness::execute_witness_create(&accounts, &witnesses, &dp, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -146,6 +148,9 @@ fn create_witness_at_exact_fee_succeeds() {
     assert_eq!(w.address, ALICE);
     assert_eq!(w.url, "https://example.test");
     assert_eq!(w.vote_count, 0);
+    // java WitnessCreateActuator.createWitness burns the upgrade cost into
+    // BURN_TRX_AMOUNT (supportBlackHoleOptimization).
+    assert_eq!(dp.burn_trx_amount(), 9_999_000_000);
 }
 
 #[test]
@@ -249,7 +254,10 @@ fn update_witness_changes_url_only() {
 // ============================================================
 
 #[test]
-fn update_account_rejects_empty_name() {
+fn update_account_accepts_empty_name() {
+    // java TransactionUtil.validAccountName = validBytes(name, 200,
+    // allowEmpty=true): an EMPTY account name is VALID. Rejecting it (the
+    // previous behavior) would flip a SUCCESS to FAILED versus the chain.
     let accounts = AccountStore::new(mem());
     let idx = AccountIndexStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
@@ -257,6 +265,20 @@ fn update_account_rejects_empty_name() {
     let c = AccountUpdateContract {
         owner_address: ALICE.to_vec(),
         account_name: Vec::new(),
+    };
+    account::validate_update_account(&accounts, &idx, &dp, &c).unwrap();
+}
+
+#[test]
+fn update_account_rejects_name_over_200_bytes() {
+    // java validBytes upper bound: a name longer than 200 bytes is invalid.
+    let accounts = AccountStore::new(mem());
+    let idx = AccountIndexStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    put_funded(&accounts, ALICE, 0);
+    let c = AccountUpdateContract {
+        owner_address: ALICE.to_vec(),
+        account_name: vec![b'a'; 201],
     };
     let err = account::validate_update_account(&accounts, &idx, &dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::InvalidAccountName));

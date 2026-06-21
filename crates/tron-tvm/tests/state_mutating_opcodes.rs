@@ -1099,6 +1099,145 @@ fn delegate_resource_creates_record_and_moves_balances() {
     assert_eq!(record.frozen_balance_for_bandwidth, amount as i64);
 }
 
+/// Build the standard DELEGATERESOURCE contract: push [receiver, balance,
+/// resource] and run 0xde, then SSTORE the result and STOP.
+fn delegate_contract_bytecode(receiver: [u8; 21], amount: u64, resource: u8) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.push(0x73);
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(push_u64(amount));
+    bc.extend(push1(resource));
+    bc.push(0xde);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    bc
+}
+
+/// java `DelegateResourceProcessor.validate` (DelegateResourceProcessor.java:53):
+/// `delegateBalance < TRX_PRECISION` (1 TRX = 1_000_000 sun) is rejected → the
+/// opcode reverts (pushes 0) with NO state mutation.
+#[test]
+fn delegate_resource_rejects_balance_below_one_trx() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa8);
+    let contract_addr = tron_addr(0xc8);
+    let receiver = tron_addr(0xd8);
+
+    let amount = 999_999u64; // one sun below 1 TRX
+    let bc = delegate_contract_bytecode(receiver, amount, 0);
+    let hash = code_hash(&bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(contract_addr),
+            &Account {
+                address: contract_addr.to_vec(),
+                code: bc.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 10_000_000 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(receiver),
+            &Account { address: receiver.to_vec(), ..Default::default() },
+        )
+        .unwrap();
+    install_caller(&stores, caller_user, 1_000_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, contract_addr),
+        500_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+    // No mutation: owner FreezeV2 untouched, no DelegatedResource row.
+    let owner = stores.accounts.get(&Address::from_raw(contract_addr)).unwrap().unwrap();
+    assert_eq!(
+        owner.frozen_v2.iter().find(|f| f.r#type == 0).unwrap().amount,
+        10_000_000,
+        "a sub-1-TRX delegate must not debit the owner FreezeV2"
+    );
+    assert_eq!(owner.delegated_frozen_v2_balance_for_bandwidth, 0);
+    let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    assert!(
+        stores.delegated_resources.get_raw(&key).unwrap().is_none(),
+        "a sub-1-TRX delegate must not write a DelegatedResource row"
+    );
+}
+
+/// java `DelegateResourceProcessor.validate` (DelegateResourceProcessor.java:111):
+/// delegating to a contract-type receiver is rejected → revert, no mutation.
+#[test]
+fn delegate_resource_rejects_contract_receiver() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa7);
+    let contract_addr = tron_addr(0xc7);
+    let receiver = tron_addr(0xd7);
+
+    let amount = 3_000_000u64; // >= 1 TRX, so only the receiver-type check can reject
+    let bc = delegate_contract_bytecode(receiver, amount, 0);
+    let hash = code_hash(&bc);
+    stores.code.put(hash.as_slice(), &bc).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(contract_addr),
+            &Account {
+                address: contract_addr.to_vec(),
+                code: bc.clone(),
+                code_hash: hash.as_slice().to_vec(),
+                frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 10_000_000 }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Receiver is a CONTRACT-type account → java rejects.
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(receiver),
+            &Account {
+                address: receiver.to_vec(),
+                r#type: tron_proto::AccountType::Contract as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_caller(&stores, caller_user, 1_000_000_000);
+
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger(caller_user, contract_addr),
+        500_000,
+    );
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+    let owner = stores.accounts.get(&Address::from_raw(contract_addr)).unwrap().unwrap();
+    assert_eq!(
+        owner.frozen_v2.iter().find(|f| f.r#type == 0).unwrap().amount,
+        10_000_000,
+        "delegating to a contract receiver must not debit the owner FreezeV2"
+    );
+    let key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    assert!(
+        stores.delegated_resources.get_raw(&key).unwrap().is_none(),
+        "delegating to a contract receiver must not write a DelegatedResource row"
+    );
+}
+
 #[test]
 fn undelegate_resource_reverses_a_delegation() {
     let stores = fresh_stores();

@@ -534,6 +534,13 @@ fn execute_trigger_inner(
             // underflowed.
             b.number = U256::from(block.block_number.max(0) as u64);
             b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
+            // GASLIMIT (0x45) pushes 0 and BASEFEE (0x48) pushes
+            // `getEnergyFee()` (java `gasLimitAction` / `baseFeeAction`); both
+            // are handled in the opcode handlers (block_info.rs) reading the
+            // host, NOT via BlockEnv — setting BlockEnv.gas_limit=0 would make
+            // revm reject the tx (gas_limit > block limit) and setting
+            // BlockEnv.basefee would trip the legacy `gas_price >= basefee`
+            // check.
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -871,6 +878,13 @@ fn execute_trigger_inner_with_tracer(
             // underflowed.
             b.number = U256::from(block.block_number.max(0) as u64);
             b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
+            // GASLIMIT (0x45) pushes 0 and BASEFEE (0x48) pushes
+            // `getEnergyFee()` (java `gasLimitAction` / `baseFeeAction`); both
+            // are handled in the opcode handlers (block_info.rs) reading the
+            // host, NOT via BlockEnv — setting BlockEnv.gas_limit=0 would make
+            // revm reject the tx (gas_limit > block limit) and setting
+            // BlockEnv.basefee would trip the legacy `gas_price >= basefee`
+            // check.
         });
     if let Some(cap) = gas_cap_override {
         ctx = ctx.modify_cfg_chained(|cfg| {
@@ -1299,6 +1313,15 @@ pub fn execute_create_with_trace(
     let spec = proposals.resolve_spec();
     let chain_id = tron_chain_id(stores);
 
+    // java VMActuator.create() forces a brand-new contract's program frame to
+    // version 1 under `ALLOW_TVM_COMPATIBLE_EVM` (VMActuator.java:325,415); with
+    // the flag off it clears the version (0). The deploy's `SmartContract` row
+    // isn't written until commit, so tell the db to report this version for the
+    // deploy address during the init-code run — that drives the per-frame
+    // EIP-150 1/64 retention + GASPRICE for any CALL/CREATE the init code makes.
+    let deploy_version = if proposals.allow_tvm_compatible_evm { 1 } else { 0 };
+    tron_db = tron_db.with_top_level_deploy_version(evm_contract_addr, deploy_version);
+
     // Top-level token-funded deploy: java VMActuator.create() reads
     // `tokenValue`/`tokenId` from the contract ONLY when
     // `allowTvmTransferTrc10()` is active (lines 358-361), and then transfers
@@ -1395,6 +1418,9 @@ pub fn execute_create_with_trace(
             // underflowed.
             b.number = U256::from(block.block_number.max(0) as u64);
             b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
+            // GASLIMIT (0x45) pushes 0 and BASEFEE (0x48) pushes `getEnergyFee()`
+            // via the opcode handlers (block_info.rs) reading the host, NOT via
+            // BlockEnv (see the trigger build sites for why).
         });
     let precompiles = TronPrecompiles::new(
         spec,

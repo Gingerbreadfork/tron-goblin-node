@@ -103,7 +103,11 @@ pub fn validate_vm(
 }
 
 fn decode<T: Message + Default>(any: &Any) -> Result<T, ActuatorError> {
-    T::decode(any.value.as_slice()).map_err(|e| {
+    // java's generated parser skips fields with no matching known tag; mirror
+    // it so admission accepts the same VM-bound txs java does, including a
+    // parameter with a malformed-but-skippable field (see
+    // `tron_proto::decode_lenient`).
+    tron_proto::decode_lenient::<T>(any.value.as_slice()).map_err(|e| {
         ActuatorError::Store(format!("failed to decode VM contract parameter: {e}"))
     })
 }

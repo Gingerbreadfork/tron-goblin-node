@@ -78,6 +78,15 @@ pub fn execute_witness_create(
     owner_account.is_witness = true;
     accounts.put(&owner, &owner_account)?;
 
+    // java WitnessCreateActuator.createWitness: after debiting the upgrade
+    // cost it routes `cost` to the blackhole — `burnTrx(cost)` when
+    // `supportBlackHoleOptimization()` is on, otherwise crediting the blackhole
+    // *account*. Mainnet has the optimization active (the only path we model;
+    // the legacy account-credit is approximated as a burn here, mirroring the
+    // bandwidth/energy fee paths), so the BURN_TRX_AMOUNT accumulator tracks
+    // every witness-create cost as java does.
+    dyn_props.burn_trx(fee);
+
     let witness = Witness {
         address: owner.as_bytes().to_vec(),
         vote_count: 0,

@@ -700,8 +700,16 @@ pub fn merkle_hash(depth: usize, lhs: &[u8; 32], rhs: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Decode the standard `[depth(32)][lhs(32)][rhs(32)]` precompile input.
+///
+/// java-tron's `MerkleHash.execute` (`PrecompiledContracts.java:1686`) reads
+/// exactly the first three 32-byte words via `parseInt(data)` +
+/// `System.arraycopy(data, 32, …)` + `System.arraycopy(data, 64, …)`. It throws
+/// only when `data.length < 96` (the second arraycopy reads `data[64..96)`); a
+/// LONGER input is accepted and the tail beyond byte 96 is ignored. So accept
+/// `len >= 96` and slice the first three words; reject `len < 96` (`None`),
+/// which the caller maps to java's `Pair.of(false, …)` spend-all-energy revert.
 pub fn decode_merkle_hash_input(input: &[u8]) -> Option<(usize, [u8; 32], [u8; 32])> {
-    if input.len() != 96 {
+    if input.len() < 96 {
         return None;
     }
     let depth_bytes: [u8; 8] = input[24..32].try_into().ok()?;

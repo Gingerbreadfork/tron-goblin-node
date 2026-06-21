@@ -437,7 +437,7 @@ fn transaction_rejects_missing_owner_account() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing), "got: {err:?}");
 }
 
@@ -452,7 +452,7 @@ fn transaction_rejects_missing_exchange() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeMissing), "got: {err:?}");
 }
 
@@ -468,7 +468,7 @@ fn transaction_rejects_token_not_in_exchange() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::TokenNotInExchange), "got: {err:?}");
 }
 
@@ -485,7 +485,7 @@ fn transaction_rejects_zero_quant_or_expected() {
             expected,
         };
         let err =
-            exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap_err();
+            exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveTokenQuant),
             "({quant},{expected}) got: {err:?}"
@@ -508,7 +508,7 @@ fn transaction_applies_bancor_pricing() {
         quant: 100_000_000,
         expected: 90_000_000, // accept slippage
     };
-    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap();
     exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // First side grew by the swapped 100_000_000; second shrank by the exact
@@ -551,17 +551,73 @@ fn transaction_rejects_when_owner_lacks_input_balance() {
         quant: 100_000_000,
         expected: 1,
     };
-    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
+    // java ExchangeTransactionActuator.validate rejects up front when the owner
+    // cannot fund the TRX swap (`balance < tokenQuant + calcFee()`); the prior
+    // version deferred this to execute. Now validate catches it like java.
     let err =
-        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
-    // We're short on TRX; debit returns InsufficientBalance via check_sub.
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(
-        matches!(
-            err,
-            ActuatorError::InsufficientBalance { .. }
-                | ActuatorError::Overflow
-                | ActuatorError::Validate(_)
-        ),
+        matches!(err, ActuatorError::InsufficientBalance { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn transaction_rejects_closed_exchange() {
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
+    // java: `firstTokenBalance == 0 || secondTokenBalance == 0` → closed.
+    seed_trx_asset_exchange(&ctx, 1, ALICE, 0, 1_000_000_000);
+    let c = ExchangeTransactionContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(),
+        quant: 100_000_000,
+        expected: 1,
+    };
+    let err =
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+    assert!(matches!(err, ActuatorError::ExchangeClosed), "got: {err:?}");
+}
+
+#[test]
+fn transaction_rejects_balance_limit_exceeded() {
+    // Set a tiny EXCHANGE_BALANCE_LIMIT so the post-swap sell-side balance
+    // exceeds it. java: `tokenBalance + tokenQuant > balanceLimit` → reject.
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
+    ctx.dp.put_long(b"EXCHANGE_BALANCE_LIMIT", 1_500_000_000);
+    seed_trx_asset_exchange(&ctx, 1, ALICE, 1_000_000_000, 1_000_000_000);
+    let c = ExchangeTransactionContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(),
+        quant: 1_000_000_000, // 1e9 sell + 1e9 balance = 2e9 > 1.5e9 limit
+        expected: 1,
+    };
+    let err =
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::ExchangeBalanceLimitExceeded),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn transaction_rejects_output_below_expected_in_validate() {
+    // java rejects in validate when the Bancor output is below `expected`; the
+    // prior version only caught this in execute.
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
+    seed_trx_asset_exchange(&ctx, 1, ALICE, 1_000_000_000, 1_000_000_000);
+    let c = ExchangeTransactionContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(),
+        quant: 100_000_000,
+        expected: 99_999_999_999, // unattainable
+    };
+    let err =
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::ExchangeOutputBelowExpected),
         "got: {err:?}"
     );
 }
@@ -578,7 +634,7 @@ fn transaction_with_swap_in_opposite_direction_also_works() {
         quant: 100_000_000,
         expected: 1,
     };
-    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap();
     exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // Asset side grew, TRX side shrank.

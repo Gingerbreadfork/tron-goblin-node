@@ -2038,7 +2038,6 @@ pub fn debug_trace_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     let contract = raw.contract.first().ok_or_else(|| {
         RpcError::internal("stored tx has no contracts; cannot trace")
     })?;
-    use prost::Message as _;
     use tron_proto::transaction::contract::ContractType;
     let ty = ContractType::try_from(contract.r#type).map_err(|_| {
         RpcError::internal(format!("unknown contract type {}", contract.r#type))
@@ -2054,8 +2053,13 @@ pub fn debug_trace_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcErro
             ty
         )));
     }
-    let trigger = tron_proto::TriggerSmartContract::decode(parameter.value.as_slice())
-        .map_err(|e| RpcError::internal(format!("decode TriggerSmartContract: {e}")))?;
+    // Lenient decode (java's generated-parser skip-unknown semantics) so a tx
+    // java commits — even with a malformed-but-skippable parameter — can be
+    // traced instead of erroring here.
+    let trigger = tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(
+        parameter.value.as_slice(),
+    )
+    .map_err(|e| RpcError::internal(format!("decode TriggerSmartContract: {e}")))?;
     let mut req_from = [0u8; 21];
     if trigger.owner_address.len() == 21 {
         req_from.copy_from_slice(&trigger.owner_address);
@@ -4390,7 +4394,9 @@ fn pending_tx_to_and_value(tx: &tron_proto::Transaction) -> (String, i64) {
             }
         }
         ContractType::TriggerSmartContract => {
-            if let Ok(c) = tron_proto::TriggerSmartContract::decode(param.value.as_slice()) {
+            if let Ok(c) =
+                tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(param.value.as_slice())
+            {
                 return (fmt_tron_address(&c.contract_address), c.call_value);
             }
         }

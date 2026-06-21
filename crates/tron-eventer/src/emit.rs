@@ -161,7 +161,9 @@ fn inspect_first_contract(tx: &tron_proto::Transaction) -> DecodedContract {
             }
         }
         Some(ContractType::TriggerSmartContract) => {
-            if let Ok(c) = tron_proto::TriggerSmartContract::decode(any.value.as_slice()) {
+            if let Ok(c) = tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(
+                any.value.as_slice(),
+            ) {
                 out.from_address = b58(&c.owner_address);
                 out.to_address = b58(&c.contract_address);
                 out.contract_address = b58(&c.contract_address);

@@ -71,11 +71,27 @@ pub fn execute_clear_abi(
 // UpdateEnergyLimitContractActuator
 // =============================================================================
 
+/// java `CommonParameter.blockNumForEnergyLimit` — node-config gate (default
+/// `enery.limit.block.num`). On mainnet it is the historical activation height
+/// of the per-contract `origin_energy_limit` field; before it,
+/// `UpdateEnergyLimitContract` is not a recognized contract type and the tx
+/// FAILs. The replay/snapshot window is far past this height, so the gate is
+/// satisfied — it is added for full-history parity.
+const BLOCK_NUM_FOR_ENERGY_LIMIT: i64 = 4_727_890;
+
 pub fn validate_update_energy_limit(
     accounts: &AccountStore,
     contracts: &ContractStore,
+    dyn_props: &DynamicPropertiesStore,
     contract: &UpdateEnergyLimitContract,
 ) -> Result<(), ActuatorError> {
+    // java UpdateEnergyLimitContractActuator.validate opens with
+    // `ReceiptCapsule.checkForEnergyLimit(ds)` = `latestBlockHeaderNumber >=
+    // blockNumForEnergyLimit`; failing it throws ("unexpected type
+    // [UpdateEnergyLimitContract]") → the tx FAILs.
+    if dyn_props.latest_block_header_number().unwrap_or(0) < BLOCK_NUM_FOR_ENERGY_LIMIT {
+        return Err(ActuatorError::EnergyLimitNotActivated);
+    }
     let owner = require_owner(&contract.owner_address)?;
     let target =
         decode_address(&contract.contract_address).ok_or(ActuatorError::InvalidAddress)?;

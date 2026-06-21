@@ -1,6 +1,6 @@
 use crate::{
     interpreter::Interpreter,
-    interpreter_types::{InterpreterTypes as ITy, MemoryTr, RuntimeFlag, StackTr},
+    interpreter_types::{InputsTr, InterpreterTypes as ITy, MemoryTr, RuntimeFlag, StackTr},
     InstructionContext as Ictx, InstructionResult,
 };
 use context_interface::{cfg::GasParams, host::LoadError, Host};
@@ -89,12 +89,33 @@ pub fn load_acc_and_calc_gas<H: Host + ?Sized>(
     let host = &mut context.host;
 
     // EIP-150: Gas cost changes for IO-heavy operations
+    //
+    // TRON fork: java's `Program.getCallEnergy` (`Program.java:1856`, called by
+    // `EnergyCost.java:505`) retains the 1/64 ONLY when `allowTvmCompatibleEvm()
+    // && getContractVersion() == 1`, keyed on the version of the frame
+    // *executing* this CALL. So skip the retention exactly when the flag is on
+    // but this frame's contract version is not 1 — a version-0 (legacy) frame
+    // forwards ALL energy even with the flag on. With the flag off (Ethereum
+    // hosts, or TRON before #66) we never skip, preserving the unconditional
+    // EIP-150 retention. (When TRON's flag is off, `tron_gas_params_for(false)`
+    // also sets the divisor to 0, so `call_stipend_reduction` is itself a no-op.)
+    let tron_skip_retention =
+        host.tron_allow_tvm_compatible_evm() && interpreter.input.tron_contract_version() != 1;
     let mut gas_limit = if interpreter.runtime_flag.spec_id().is_enabled_in(TANGERINE) {
-        // On mainnet this will take return 63/64 of gas_limit.
-        let reduced_gas_limit = host
-            .gas_params()
-            .call_stipend_reduction(interpreter.gas.remaining());
-        min(reduced_gas_limit, stack_gas_limit)
+        // java's `getCallEnergy(requested, available)` returns `min(requested,
+        // available)`; the 1/64 only reduces `available` first, and only for a
+        // version-1 frame. So `available` is the caller's remaining energy,
+        // optionally 1/64-reduced; the forwarded gas is min(available, requested).
+        let available = if tron_skip_retention {
+            // version-0 (legacy) frame: forward ALL remaining energy (no 1/64),
+            // but still cap to the caller's remaining + the requested amount.
+            interpreter.gas.remaining()
+        } else {
+            // On mainnet this will take return 63/64 of gas_limit.
+            host.gas_params()
+                .call_stipend_reduction(interpreter.gas.remaining())
+        };
+        min(available, stack_gas_limit)
     } else {
         stack_gas_limit
     };

@@ -157,33 +157,27 @@ impl PrecompileImpl {
         ALL_PRECOMPILES.iter().copied().find(|p| &p.address() == addr)
     }
 
-    /// Final energy cost after applying the per-contract dynamic-energy
-    /// penalty. Reads `dynamic_energy_factor(callee)` from `ctx` and the
-    /// `ALLOW_DYNAMIC_ENERGY` chain parameter; multiplies the base
-    /// `energy_cost(input)` by `(DECIMAL + factor) / DECIMAL` when both
-    /// the flag is on and the factor is non-zero.
+    /// Energy cost for this precompile call.
     ///
-    /// Use this at the boundary between the interpreter and the
-    /// precompile: it's the consensus-correct energy charge.
+    /// java-tron charges precompiles their flat `getEnergyForData(data)` with
+    /// NO dynamic-energy penalty: `Program.callToPrecompiledAddress`
+    /// (Program.java:1737) compares `requiredEnergy = contract.getEnergyForData(
+    /// data)` directly against the forwarded energy — the `ALLOW_DYNAMIC_ENERGY`
+    /// per-contract scaling (`VM.getEnergyCost` → `adjustGasEnergyForDynamic`)
+    /// only ever multiplies ordinary opcode costs, never a precompile call's
+    /// `getEnergyForData`. The earlier penalty applied here was consensus-
+    /// harmless (the factor is 0 for the precompile addresses, which are not
+    /// `ALLOW_DYNAMIC_ENERGY`-tracked contracts) but did not match java.
+    ///
+    /// Use this at the boundary between the interpreter and the precompile: it's
+    /// the consensus-correct energy charge. `ctx` is retained for signature
+    /// stability (the dispatch site already holds it).
     pub fn effective_energy_cost(
         self,
         input: &[u8],
-        ctx: &dyn EvmContext,
+        _ctx: &dyn EvmContext,
     ) -> Result<u64, crate::energy::EnergyError> {
-        let base = self.energy_cost(input);
-        // ALLOW_DYNAMIC_ENERGY is `0` (off) or `1` (on) under its
-        // dynamic-properties key. java-tron also gates this behind the
-        // proposal flag of the same name, which is checked elsewhere by
-        // the call site; we read the flag for completeness so a single
-        // call resolves the whole cost.
-        let allow = ctx
-            .chain_parameter_long(b"ALLOW_DYNAMIC_ENERGY")
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-            == 1;
-        let factor = ctx.dynamic_energy_factor(&ctx.callee()).unwrap_or(0);
-        crate::energy::effective_energy_cost(base, factor, allow)
+        Ok(self.energy_cost(input))
     }
 
     /// Compute the energy cost. Mirrors `getEnergyForData` in each
@@ -339,7 +333,13 @@ impl PrecompileImpl {
 /// `0x01000004` — Sapling `MerkleHash`. Wraps `tron_tvm::shielded::merkle_hash`.
 fn merkle_hash_precompile(input: &[u8]) -> PrecompileResult {
     let Some((depth, lhs, rhs)) = crate::shielded::decode_merkle_hash_input(input) else {
-        return Err(PrecompileError::Malformed);
+        // java `MerkleHash.execute` (PrecompiledContracts.java:1686) catches a
+        // short-input / bad-level throw and returns `Pair.of(false, EMPTY)`,
+        // which `Program.callToPrecompiledAddress` (Program.java:1762-1768)
+        // turns into `refundEnergy(0)` — spend ALL forwarded energy, push 0,
+        // revert. Map that to `SpendAllRevert` (NOT a zero-cost revert, which is
+        // reserved for the `Ok(false)`-style success-with-DATA_FALSE outputs).
+        return Err(PrecompileError::SpendAllRevert);
     };
     Ok(crate::shielded::merkle_hash(depth, &lhs, &rhs).to_vec())
 }
@@ -369,17 +369,20 @@ pub(crate) fn blake2f_energy_cost(input: &[u8]) -> u64 {
 /// compression — same primitive, no re-implementation.
 fn blake2f_precompile(input: &[u8]) -> PrecompileResult {
     const INPUT_LEN: usize = 213;
+    // java `Blake2F.execute` (PrecompiledContracts.java:1898-1906) returns
+    // `Pair.of(false, DataWord.ZERO().getData())` on a wrong length OR a bad
+    // finalization flag (`data[212] & 0xFE != 0`). `Program.callToPrecompiledAddress`
+    // (Program.java:1762-1768) maps a `false` precompile result to
+    // `refundEnergy(0)` — spend ALL forwarded energy, push 0, revert. Map both
+    // malformed cases to `SpendAllRevert` (NOT a zero-cost revert).
     if input.len() != INPUT_LEN {
-        return Err(PrecompileError::BadInputLength {
-            got: input.len(),
-            expected: INPUT_LEN,
-        });
+        return Err(PrecompileError::SpendAllRevert);
     }
     // Finalization flag must be 0 or 1 (java-tron rejects anything else;
     // the bitmask `& 0xFE != 0` means any non-zero high bit).
     let f_byte = input[212];
     if f_byte & 0xFEu8 != 0 {
-        return Err(PrecompileError::Malformed);
+        return Err(PrecompileError::SpendAllRevert);
     }
     let f = f_byte == 1;
 

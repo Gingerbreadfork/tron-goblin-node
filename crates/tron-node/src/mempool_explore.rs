@@ -156,7 +156,7 @@ pub fn decode_tx_summary(tx: &Transaction) -> TxSummary {
         }
         Some(ContractType::TriggerSmartContract) => {
             s.kind = TxKind::Call;
-            if let Ok(c) = TriggerSmartContract::decode(param) {
+            if let Ok(c) = tron_proto::decode_lenient::<TriggerSmartContract>(param) {
                 s.amount_sun = c.call_value.max(0) as u128;
                 if c.data.len() >= 4 {
                     let sel = [c.data[0], c.data[1], c.data[2], c.data[3]];

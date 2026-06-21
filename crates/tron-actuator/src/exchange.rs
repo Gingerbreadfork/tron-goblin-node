@@ -56,7 +56,7 @@ pub fn validate_exchange_create(
     if contract.first_token_balance <= 0 || contract.second_token_balance <= 0 {
         return Err(ActuatorError::NonPositiveTokenQuant);
     }
-    let limit = dyn_props.get_long(b"EXCHANGE_BALANCE_LIMIT").unwrap_or(i64::MAX);
+    let limit = dyn_props.exchange_balance_limit();
     if contract.first_token_balance > limit || contract.second_token_balance > limit {
         return Err(ActuatorError::ExchangeBalanceLimitExceeded);
     }
@@ -467,23 +467,128 @@ pub fn execute_exchange_withdraw(
 pub fn validate_exchange_transaction(
     accounts: &AccountStore,
     v2: &ExchangeV2Store,
+    dyn_props: &DynamicPropertiesStore,
     contract: &ExchangeTransactionContract,
 ) -> Result<(), ActuatorError> {
+    // Ported from java ExchangeTransactionActuator.validate, in java's exact
+    // order so the first failing check fires the same rejection java records.
+    // The fee is 0 here, so java's `balance < calcFee()` and TRX-fee guards are
+    // inert; the substantive divergence is the closed-exchange and
+    // balance-limit checks, which our execute-only path could not catch
+    // (java rejects at validate → recorded contractRet FAILED, not SUCCESS).
     let owner = require_owner(&contract.owner_address)?;
-    if accounts.get(&owner)?.is_none() {
-        return Err(ActuatorError::OwnerAccountMissing);
-    }
+    let account = accounts
+        .get(&owner)?
+        .ok_or(ActuatorError::OwnerAccountMissing)?;
+
     let exchange = v2
         .get(contract.exchange_id)?
         .ok_or(ActuatorError::ExchangeMissing)?;
-    if contract.token_id != exchange.first_token_id && contract.token_id != exchange.second_token_id
+
+    let token_id = &contract.token_id;
+    let token_quant = contract.quant;
+    let token_expected = contract.expected;
+
+    // java: allowSameTokenName==1 && tokenID != "_" && !isNumber(tokenID) →
+    // "token id is not a valid number". TRX is the "_" sentinel.
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 1
+        && token_id.as_slice() != TRX_TOKEN_ID
+        && !is_number(token_id)
     {
+        return Err(ActuatorError::MarketInvalidTokenId);
+    }
+
+    // token is one of the pair.
+    if token_id != &exchange.first_token_id && token_id != &exchange.second_token_id {
         return Err(ActuatorError::TokenNotInExchange);
     }
-    if contract.quant <= 0 || contract.expected <= 0 {
+    if token_quant <= 0 {
         return Err(ActuatorError::NonPositiveTokenQuant);
     }
+    if token_expected <= 0 {
+        return Err(ActuatorError::NonPositiveTokenQuant);
+    }
+
+    // Closed exchange: either side at zero balance.
+    if exchange.first_token_balance == 0 || exchange.second_token_balance == 0 {
+        return Err(ActuatorError::ExchangeClosed);
+    }
+
+    // Balance limit: the SELL side's balance after adding `token_quant` must
+    // not exceed EXCHANGE_BALANCE_LIMIT (1e15 at genesis).
+    let balance_limit = dyn_props.exchange_balance_limit();
+    let sell_balance = if token_id == &exchange.first_token_id {
+        exchange.first_token_balance
+    } else {
+        exchange.second_token_balance
+    };
+    let token_balance = sell_balance.wrapping_add(token_quant);
+    if token_balance > balance_limit {
+        return Err(ActuatorError::ExchangeBalanceLimitExceeded);
+    }
+
+    // Owner balance/asset sufficiency. For TRX (the "_" sentinel) java checks
+    // `balance < tokenQuant + calcFee()`; calcFee() is 0.
+    if token_id.as_slice() == TRX_TOKEN_ID {
+        let needed = token_quant.wrapping_add(0); // + calcFee()
+        if account.balance < needed {
+            return Err(ActuatorError::InsufficientBalance {
+                balance: account.balance,
+                needed,
+            });
+        }
+    } else {
+        let mut acct = account.clone();
+        tron_chainbase::import_all_asset(&mut acct);
+        if !asset_balance_enough_v2(&acct, token_id, token_quant) {
+            return Err(ActuatorError::InsufficientAssetBalance {
+                has: asset_v2_balance(&acct, token_id),
+                needs: token_quant,
+            });
+        }
+    }
+
+    // java: anotherTokenQuant = exchangeCapsule.transaction(tokenID, tokenQuant)
+    // and reject when it is below `tokenExpected`. Mirror the Bancor curve
+    // exactly via the shared helper so validate and execute never drift.
+    let (sell_balance_before, buy_balance_before) = if token_id == &exchange.first_token_id {
+        (exchange.first_token_balance, exchange.second_token_balance)
+    } else {
+        (exchange.second_token_balance, exchange.first_token_balance)
+    };
+    let another_token_quant = exchange_transaction_output(
+        sell_balance_before,
+        buy_balance_before,
+        token_quant,
+        dyn_props.allow_strict_math(),
+    );
+    if another_token_quant < token_expected {
+        return Err(ActuatorError::ExchangeOutputBelowExpected);
+    }
     Ok(())
+}
+
+/// java `ExchangeCapsule.transaction` / `ExchangeProcessor.exchange`: the
+/// two-step Bancor power curve over a fixed virtual supply (1e18), returning the
+/// amount of the *buy* token received for `sell_quant` of the *sell* token.
+/// Shared by validate and execute so they cannot diverge. See
+/// [`execute_exchange_transaction`] for the arithmetic-fidelity notes.
+fn exchange_transaction_output(
+    sell_balance_before: i64,
+    buy_balance_before: i64,
+    sell_quant: i64,
+    use_strict_math: bool,
+) -> i64 {
+    let mut supply: i64 = 1_000_000_000_000_000_000;
+    let new_balance = sell_balance_before.wrapping_add(sell_quant) as f64;
+    let issued = -(supply as f64)
+        * (1.0 - pow(1.0 + sell_quant as f64 / new_balance, 0.0005, use_strict_math));
+    let relay = issued as i64;
+    supply = supply.wrapping_add(relay);
+    supply = supply.wrapping_sub(relay);
+    let exchange_balance = buy_balance_before as f64
+        * (pow(1.0 + relay as f64 / supply as f64, 2000.0, use_strict_math) - 1.0);
+    exchange_balance as i64
 }
 
 pub fn execute_exchange_transaction(
@@ -526,18 +631,12 @@ pub fn execute_exchange_transaction(
     // (fdlibm) over `Math.pow` on `allowStrictMath` (proposal 87); the `pow`
     // helper mirrors that — `strict_pow` (bit-exact fdlibm) when the flag is on,
     // `f64::powf` (== pre-87 `Math.pow`) when off.
-    let mut supply: i64 = 1_000_000_000_000_000_000;
-    // exchangeToSupply(sell_balance, sell_quant)
-    let new_balance = my_balance_before.wrapping_add(contract.quant) as f64;
-    let issued = -(supply as f64)
-        * (1.0 - pow(1.0 + contract.quant as f64 / new_balance, 0.0005, use_strict_math));
-    let relay = issued as i64;
-    supply = supply.wrapping_add(relay);
-    // exchangeFromSupply(buy_balance, relay)
-    supply = supply.wrapping_sub(relay);
-    let exchange_balance = other_balance_before as f64
-        * (pow(1.0 + relay as f64 / supply as f64, 2000.0, use_strict_math) - 1.0);
-    let output = exchange_balance as i64;
+    let output = exchange_transaction_output(
+        my_balance_before,
+        other_balance_before,
+        contract.quant,
+        use_strict_math,
+    );
     if output < contract.expected {
         return Err(ActuatorError::ExchangeOutputBelowExpected);
     }

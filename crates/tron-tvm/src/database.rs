@@ -154,6 +154,15 @@ pub struct TronDatabase {
     /// commit, so its entry — though still present here — is simply ignored
     /// (commit only acts on addresses that show up in the committed change set).
     pub(crate) pending_created_contracts: HashMap<EvmAddress, (EvmAddress, bool)>,
+    /// Top-level `CreateSmartContract` deploy address + the version its init
+    /// frame executes as. java-tron forces a brand-new CREATE to version 1
+    /// (`VMActuator.java:325,415`) under `ALLOW_TVM_COMPATIBLE_EVM`; because
+    /// the deploy's `SmartContract` row is not written until commit, a plain
+    /// [`tron_contract_version`](crate::TronDatabase) lookup would otherwise
+    /// see 0 during the init-code run and (wrongly) forward all gas on a
+    /// nested CALL/CREATE. `execute_create` sets this so the deploy frame
+    /// retains the 1/64 exactly as java does. `None` for trigger txs.
+    pub(crate) top_level_deploy_version: Option<(EvmAddress, i32)>,
 }
 
 impl TronDatabase {
@@ -183,7 +192,16 @@ impl TronDatabase {
             create_nonce: 0,
             staking_journal: None,
             pending_created_contracts: HashMap::new(),
+            top_level_deploy_version: None,
         }
+    }
+
+    /// Mark the top-level `CreateSmartContract` deploy address so its init
+    /// frame executes as `version` for the EIP-150 1/64 / GASPRICE gates
+    /// (java forces a new CREATE to version 1 under `ALLOW_TVM_COMPATIBLE_EVM`).
+    pub fn with_top_level_deploy_version(mut self, address: EvmAddress, version: i32) -> Self {
+        self.top_level_deploy_version = Some((address, version));
+        self
     }
 
     /// Attach the shared per-frame staking/suicide rollback journal (the same

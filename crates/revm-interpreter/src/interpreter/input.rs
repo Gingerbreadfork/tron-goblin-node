@@ -34,6 +34,16 @@ pub struct InputsImpl {
     /// `Gas` tracker before the first opcode runs. Default `0` = no
     /// penalty (zero-overhead path).
     pub tron_dynamic_factor: i64,
+    /// **TRON fork** — the deployed `SmartContract.version` (0 or 1) of the
+    /// contract whose code *this* frame executes (java `Program.contractVersion`,
+    /// `getContractVersion()`). Set when the frame is built: a CALL child gets
+    /// the callee/bytecode address's stored version (`Program.java:1146`); a
+    /// CREATE child inherits the parent's (`Program.java:915`); a top-level
+    /// CREATE is forced to 1 (`VMActuator.java:415`). java gates the EIP-150
+    /// 1/64 gas retention (`getCallEnergy`/`getCreateEnergy`) and the GASPRICE
+    /// push (`gasPriceAction`) on `allowTvmCompatibleEvm() && version == 1`.
+    /// Default `0` (legacy contract / non-TRON host).
+    pub tron_contract_version: i32,
 }
 
 impl InputsTr for InputsImpl {
@@ -63,5 +73,9 @@ impl InputsTr for InputsImpl {
 
     fn tron_token_value(&self) -> i64 {
         self.tron_token_value
+    }
+
+    fn tron_contract_version(&self) -> i32 {
+        self.tron_contract_version
     }
 }

@@ -656,6 +656,7 @@ pub fn validate_unfreeze_asset(
 
 pub fn execute_unfreeze_asset(
     accounts: &AccountStore,
+    v1: &AssetIssueStore,
     dyn_props: &DynamicPropertiesStore,
     contract: &UnfreezeAssetContract,
 ) -> Result<ExecutionResult, ActuatorError> {
@@ -677,8 +678,28 @@ pub fn execute_unfreeze_asset(
     // Merge optimized balances inline so the credit adds to (not overwrites)
     // any existing store balance for this asset (java's importAllAsset).
     tron_chainbase::import_all_asset(&mut account);
-    let key = String::from_utf8_lossy(&account.asset_issued_id).into_owned();
-    credit_asset(&mut account, &key, unlocked)?;
+
+    // java UnfreezeAssetActuator.execute → `addAssetAmountV2(key, unfreeze)`:
+    // the key and the maps written are gated on `allowSameTokenName`.
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
+        // Legacy: key is the V1 issued *name*. java's addAssetAmountV2 looks up
+        // the V1 asset capsule by name to find its token id, then writes the
+        // SAME total to both the V1 `asset` map (keyed by name) and the V2
+        // `asset_v2` map (keyed by id).
+        let name_key = String::from_utf8_lossy(&account.asset_issued_name).into_owned();
+        let token_id = v1
+            .get(&account.asset_issued_name)?
+            .map(|c| c.id)
+            .unwrap_or_default();
+        let current = account.asset.get(&name_key).copied().unwrap_or(0);
+        let updated = check_add(current, unlocked)?;
+        account.asset.insert(name_key, updated);
+        account.asset_v2.insert(token_id, updated);
+    } else {
+        // Mainnet: key is the V2 issued *id*; only the V2 map is written.
+        let id_key = String::from_utf8_lossy(&account.asset_issued_id).into_owned();
+        credit_asset(&mut account, &id_key, unlocked)?;
+    }
     accounts.put(&owner, &account)?;
     Ok(ExecutionResult::default())
 }

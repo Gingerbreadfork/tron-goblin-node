@@ -188,6 +188,8 @@ pub enum ActuatorError {
     NotExchangeOwner,
     #[error("token id not in this exchange's pair")]
     TokenNotInExchange,
+    #[error("token balance in exchange is equal with 0, the exchange has been closed")]
+    ExchangeClosed,
     #[error("token quantity must be > 0")]
     NonPositiveTokenQuant,
     #[error("exchange balance limit exceeded")]
@@ -222,6 +224,8 @@ pub enum ActuatorError {
     ConstantinopleDisabled,
     #[error("origin_energy_limit must be > 0")]
     NonPositiveEnergyLimit,
+    #[error("UpdateEnergyLimitContract is not activated at this block height")]
+    EnergyLimitNotActivated,
     #[error("consume_user_resource_percent must be in 0..=100")]
     PercentOutOfRange,
 

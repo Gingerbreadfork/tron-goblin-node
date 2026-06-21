@@ -203,6 +203,14 @@ impl EthFrame<EthInterpreter> {
         // this frame's target. Default impl (non-TRON hosts) returns 0
         // → zero-overhead pass-through for upstream EVM behaviour.
         let tron_dynamic_factor = ctx.tron_dynamic_energy_factor(inputs.target_address);
+        // TRON fork: the executing contract's `SmartContract.version`. java sets
+        // a CALL child frame's version from the callee's deployed code address
+        // (`Program.java:1146`: `getContract(codeAddress).getContractVersion()`)
+        // — `bytecode_address` is that code address. The top-level trigger frame
+        // gets the deployed contract's stored version (`VMActuator.java:531`),
+        // and a top-level CREATE is forced to 1 via the host's per-tx override.
+        // Governs the EIP-150 1/64 retention + GASPRICE (version-1 only).
+        let tron_contract_version = ctx.tron_contract_version(inputs.bytecode_address);
         let interpreter_input = InputsImpl {
             target_address: inputs.target_address,
             caller_address: inputs.caller,
@@ -212,6 +220,7 @@ impl EthFrame<EthInterpreter> {
             tron_token_id: inputs.tron_token_id,
             tron_token_value: inputs.tron_token_value,
             tron_dynamic_factor,
+            tron_contract_version,
         };
         let is_static = inputs.is_static;
         let gas_limit = inputs.gas_limit;
@@ -390,6 +399,13 @@ impl EthFrame<EthInterpreter> {
         // TRON fork: a freshly-created contract has no prior dynamic
         // factor (it hasn't been touched yet). Subsequent CALLs into
         // it will pick up whatever the ContractStateStore says.
+        //
+        // The init frame's contract version is inherited from the parent (java
+        // `Program.java:915` — nested CREATE child copies the parent's version),
+        // stamped onto `CreateInputs` by the CREATE opcode handler; a top-level
+        // CREATE forces 1 (`VMActuator.java:415`). Governs the init code's
+        // EIP-150 1/64 retention + GASPRICE.
+        let tron_contract_version = inputs.tron_contract_version();
         let interpreter_input = InputsImpl {
             target_address: created_address,
             caller_address: inputs.caller(),
@@ -399,6 +415,7 @@ impl EthFrame<EthInterpreter> {
             tron_token_id: 0,
             tron_token_value: 0,
             tron_dynamic_factor: 0,
+            tron_contract_version,
         };
         let gas_limit = inputs.gas_limit();
 

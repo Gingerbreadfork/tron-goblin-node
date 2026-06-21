@@ -162,7 +162,12 @@ pub fn dispatch_validate(
         }
         ContractType::ProposalCreateContract => {
             let c = unpack::<tron_proto::ProposalCreateContract>(parameter)?;
-            crate::proposal::validate_proposal_create(stores.accounts, stores.witnesses, &c)
+            crate::proposal::validate_proposal_create(
+                stores.accounts,
+                stores.witnesses,
+                stores.dyn_props,
+                &c,
+            )
         }
         ContractType::ProposalApproveContract => {
             let c = unpack::<tron_proto::ProposalApproveContract>(parameter)?;
@@ -290,7 +295,12 @@ pub fn dispatch_validate(
         }
         ContractType::ExchangeTransactionContract => {
             let c = unpack::<tron_proto::ExchangeTransactionContract>(parameter)?;
-            crate::exchange::validate_exchange_transaction(stores.accounts, stores.exchange_v2, &c)
+            crate::exchange::validate_exchange_transaction(
+                stores.accounts,
+                stores.exchange_v2,
+                stores.dyn_props,
+                &c,
+            )
         }
         ContractType::MarketSellAssetContract => {
             let c = unpack::<tron_proto::MarketSellAssetContract>(parameter)?;
@@ -326,6 +336,7 @@ pub fn dispatch_validate(
             crate::contract_admin::validate_update_energy_limit(
                 stores.accounts,
                 stores.contracts,
+                stores.dyn_props,
                 &c,
             )
         }
@@ -485,7 +496,12 @@ pub fn dispatch_execute(
         }
         ContractType::UnfreezeAssetContract => {
             let c = unpack::<tron_proto::UnfreezeAssetContract>(parameter)?;
-            crate::asset::execute_unfreeze_asset(stores.accounts, stores.dyn_props, &c)
+            crate::asset::execute_unfreeze_asset(
+                stores.accounts,
+                stores.asset_v1,
+                stores.dyn_props,
+                &c,
+            )
         }
         ContractType::FreezeBalanceContract => {
             let c = unpack::<tron_proto::FreezeBalanceContract>(parameter)?;

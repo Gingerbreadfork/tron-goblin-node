@@ -372,6 +372,8 @@ fn accepts_valid_contract_and_executes_with_fee() {
         },
     ).unwrap();
 
+    // Mainnet has the blackhole optimization on → the fee is burned.
+    dp.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     let c = valid_contract(&owner);
     validate_account_permission_update(&accounts, &dp, &c).expect("valid contract");
     let result = execute_account_permission_update(&accounts, &dp, &c).unwrap();
@@ -382,6 +384,8 @@ fn accepts_valid_contract_and_executes_with_fee() {
     assert!(after.owner_permission.is_some());
     assert!(after.witness_permission.is_none());
     assert_eq!(after.active_permission.len(), 1);
+    // java AccountPermissionUpdateActuator.execute burns the fee.
+    assert_eq!(dp.burn_trx_amount(), 100_000_000);
 }
 
 // =============================================================================
