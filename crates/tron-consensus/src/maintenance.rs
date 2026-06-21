@@ -258,6 +258,14 @@ pub fn apply_maintenance(
     dyn_props: &DynamicPropertiesStore,
 ) -> Result<MaintenanceOutcome, tron_chainbase::StoreError> {
     let allow_change_delegation = dyn_props.allow_change_delegation();
+
+    // ── Step 0: strip the genesis Super-Representative bootstrap votes once
+    //    the REMOVE_THE_POWER_OF_THE_GR proposal has armed the flag. java
+    //    runs this as the very first action of `doMaintenance`
+    //    (MaintenanceManager line 91), before Vi accumulation and the vote
+    //    tally, so the de-boosted vote counts feed the same-cycle re-rank.
+    try_remove_the_power_of_the_gr(witnesses, dyn_props)?;
+
     // java `MaintenanceManager.doMaintenance` gates Vi accumulation on
     // `useNewRewardAlgorithm()` (NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE set by
     // proposal 59/67), NOT `allowChangeDelegation`. The two coincide on a
@@ -419,6 +427,58 @@ pub fn apply_maintenance(
         new_cycle,
         vi_accumulated_count,
     })
+}
+
+// =============================================================================
+// Genesis-SR power removal
+// =============================================================================
+
+/// `REMOVE_THE_POWER_OF_THE_GR` dynamic-property key — mirrors java-tron's
+/// `DynamicPropertiesStore.REMOVE_THE_POWER_OF_THE_GR` byte literal.
+const REMOVE_THE_POWER_OF_THE_GR: &[u8] = b"REMOVE_THE_POWER_OF_THE_GR";
+
+/// Cancel the artificial bootstrap votes the 27 genesis Super
+/// Representatives were seeded with at block 0.
+///
+/// Mirrors `MaintenanceManager.tryRemoveThePowerOfTheGr`: when the
+/// `REMOVE_THE_POWER_OF_THE_GR` flag is exactly `1` (armed by an approved
+/// proposal #10 — see `proposals::activate_expired_proposals`), subtract
+/// each genesis witness's original `vote_count` from its accumulated total
+/// and then mark the flag spent (`-1`) so it never fires again.
+///
+/// The genesis vote counts come from [`tron_types::mainnet_witnesses`] —
+/// the same `config.conf` table used to seed the witnesses at genesis, so
+/// the subtraction exactly undoes the seed. java reads them from
+/// `dposService.getGenesisBlock().getWitnesses()`, which is the parsed
+/// `genesis.block.witnesses` config.
+///
+/// Lifecycle of the flag:
+///   * genesis init  → `0` (DynamicPropertiesStore default).
+///   * proposal #10 approved → `1` (write guarded on the prior value being
+///     `0`, see `proposals.rs`).
+///   * first maintenance after arming → this function debits the votes and
+///     writes `-1`.
+/// Any other stored value (`0`, `-1`, or absent) is a no-op.
+///
+/// On a from-genesis re-sync this fires once, at the historical maintenance
+/// after proposal #10 passed. When booting from a post-removal snapshot the
+/// flag is already `-1`, so this is a no-op.
+fn try_remove_the_power_of_the_gr(
+    witnesses: &WitnessStore,
+    dyn_props: &DynamicPropertiesStore,
+) -> Result<(), tron_chainbase::StoreError> {
+    if dyn_props.get_long(REMOVE_THE_POWER_OF_THE_GR) != Some(1) {
+        return Ok(());
+    }
+    for gr in tron_types::mainnet_witnesses() {
+        let addr = Address::from_raw(gr.address);
+        if let Some(mut witness) = witnesses.get(&addr)? {
+            witness.vote_count = witness.vote_count.saturating_sub(gr.vote_count);
+            witnesses.put(&addr, &witness)?;
+        }
+    }
+    dyn_props.put_long(REMOVE_THE_POWER_OF_THE_GR, -1);
+    Ok(())
 }
 
 // =============================================================================

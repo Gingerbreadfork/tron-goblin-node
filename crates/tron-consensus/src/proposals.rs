@@ -106,6 +106,21 @@ pub fn activate_expired_proposals(
                         report.parameter_updates.push((id, *param_id, *value));
                         continue;
                     }
+                    // REMOVE_THE_POWER_OF_THE_GR(10) writes the proposal value
+                    // only while the flag is still the genesis default `0`
+                    // (java `ProposalService.process`: `if
+                    // getRemoveThePowerOfTheGr() == 0`). Once
+                    // `MaintenanceManager.tryRemoveThePowerOfTheGr` has spent
+                    // it (`-1`), re-applying the value would re-arm the flag
+                    // and double-debit the genesis SR votes at the next
+                    // maintenance. Skip the write but still record the
+                    // (no-op) parameter update for the report.
+                    if *param_id == 10
+                        && dyn_props.get_long(b"REMOVE_THE_POWER_OF_THE_GR") != Some(0)
+                    {
+                        report.parameter_updates.push((id, *param_id, *value));
+                        continue;
+                    }
                     dyn_props.put_long(key, *value);
                     // Price changes also append to the historic schedule
                     // (java's `ProposalService.process`, TRANSACTION_FEE /

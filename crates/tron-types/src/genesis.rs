@@ -13,7 +13,7 @@
 //!    See [`GENESIS_OWNER_ADDRESS`].
 //!
 //! 2. **The witness address of the genesis block is a UTF-8-encoded
-//!    sentence from Tim Berners-Lee** — 115 ASCII bytes. Java's
+//!    sentence from Tim Berners-Lee** — 116 ASCII bytes. Java's
 //!    `setWitness(String)` does `getBytes()` and stores them in
 //!    `BlockHeader.raw.witness_address`. See [`MAINNET_WITNESS_QUOTE`].
 //!
@@ -58,7 +58,7 @@ pub const GENESIS_OWNER_ADDRESS: &[u8] = b"0x000000000000000000000";
 /// > A new system must allow existing systems to be linked together
 /// > without requiring any central control or coordination
 ///
-/// Stored as raw UTF-8 (115 ASCII bytes). Source:
+/// Stored as raw UTF-8 (116 ASCII bytes). Source:
 /// `BlockUtil.newGenesisBlockCapsule` → `blockCapsule.setWitness(quote)`.
 pub const MAINNET_WITNESS_QUOTE: &[u8] =
     b"A new system must allow existing systems to be linked together without \
@@ -293,4 +293,86 @@ pub fn mainnet_witnesses() -> &'static [GenesisWitness] {
             })
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical TRON mainnet genesis `BlockId`, as published on
+    /// every mainnet node and block explorer. Layout is
+    /// `number(8 bytes BE) || sha256(BlockHeader.raw)[8..32]`, so the
+    /// leading 8 bytes are zero (block 0) and the trailing 24 bytes are
+    /// the header hash. Any change to the genesis recipe — parent hash,
+    /// timestamp, the 3 transfer txs, the 23-byte ASCII owner literal, or
+    /// the Tim Berners-Lee witness quote — moves this value and forks the
+    /// chain from block 0.
+    const MAINNET_GENESIS_BLOCK_ID: &str =
+        "00000000000000001ebf88508a03865c71d452e25f4d51194196a1d22b6653dc";
+
+    #[test]
+    fn mainnet_genesis_block_id_matches_published_value() {
+        let id = genesis_block_id(&mainnet_inputs());
+        assert_eq!(
+            hex::encode(id.as_bytes()),
+            MAINNET_GENESIS_BLOCK_ID,
+            "mainnet genesis BlockId must equal the published chain value"
+        );
+        assert_eq!(id.num(), 0, "genesis block number is 0");
+    }
+
+    #[test]
+    fn genesis_block_shape() {
+        let block = build_genesis_block(&mainnet_inputs());
+        // Exactly the 3 mainnet asset transfers (Zion / Sun / Blackhole).
+        assert_eq!(block.transactions.len(), 3);
+        let raw = block
+            .block_header
+            .expect("genesis has a header")
+            .raw_data
+            .expect("genesis header has raw data");
+        assert_eq!(raw.number, 0);
+        assert_eq!(raw.timestamp, 0);
+        assert_eq!(raw.parent_hash, MAINNET_PARENT_HASH.to_vec());
+        // The witness field is the raw UTF-8 of the Tim Berners-Lee quote.
+        assert_eq!(raw.witness_address, MAINNET_WITNESS_QUOTE.to_vec());
+        assert_eq!(MAINNET_WITNESS_QUOTE.len(), 116);
+        // The genesis owner is the 23-byte ASCII literal, not zero bytes.
+        assert_eq!(GENESIS_OWNER_ADDRESS.len(), 23);
+        assert_eq!(GENESIS_OWNER_ADDRESS, b"0x000000000000000000000");
+    }
+
+    #[test]
+    fn mainnet_asset_addresses_round_trip_base58() {
+        // The hard-coded 21-byte asset addresses must equal the decode of
+        // the public Base58Check strings in config.conf.
+        let expect = [
+            ("TLLM21wteSPs4hKjbxgmH1L6poyMjeTbHm", "Zion", 99_000_000_000_000_000i64),
+            ("TXmVpin5vq5gdZsciyyjdZgKRUju4st1wM", "Sun", 0),
+            ("TLsV52sRDL79HXGGm9yzwKibb6BeruhUzy", "Blackhole", i64::MIN),
+        ];
+        assert_eq!(MAINNET_ASSETS.len(), expect.len());
+        for (asset, (b58, name, balance)) in MAINNET_ASSETS.iter().zip(expect) {
+            let decoded = tron_crypto::base58check::decode_address(b58)
+                .expect("mainnet asset base58 must decode");
+            assert_eq!(&asset.address, decoded.as_bytes());
+            assert_eq!(asset.name, name);
+            assert_eq!(asset.balance, balance);
+        }
+    }
+
+    #[test]
+    fn mainnet_witnesses_are_the_27_genesis_grs() {
+        let ws = mainnet_witnesses();
+        assert_eq!(ws.len(), 27, "mainnet seeds exactly 27 genesis SRs");
+        // GR1 has the highest vote (100_000_026), GR27 the lowest
+        // (100_000_000); each step down is exactly 1.
+        assert_eq!(ws[0].vote_count, 100_000_026);
+        assert_eq!(ws[0].url, "http://GR1.com");
+        assert_eq!(ws[26].vote_count, 100_000_000);
+        assert_eq!(ws[26].url, "http://GR27.com");
+        for pair in ws.windows(2) {
+            assert_eq!(pair[0].vote_count - pair[1].vote_count, 1);
+        }
+    }
 }

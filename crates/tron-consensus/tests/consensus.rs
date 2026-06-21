@@ -808,3 +808,114 @@ fn best_head_returns_error_on_empty_input() {
     let candidates: Vec<ForkChoice> = vec![];
     assert!(best_head(&candidates).is_err());
 }
+
+// =============================================================================
+// REMOVE_THE_POWER_OF_THE_GR (genesis SR power removal)
+// =============================================================================
+
+/// When `REMOVE_THE_POWER_OF_THE_GR == 1`, the next maintenance subtracts
+/// each genesis Super Representative's original bootstrap vote_count from its
+/// accumulated total, then marks the flag spent (`-1`). Mirrors
+/// `MaintenanceManager.tryRemoveThePowerOfTheGr`.
+#[test]
+fn apply_maintenance_removes_gr_power_when_armed() {
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+    let accounts = AccountStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let dyn_props = DynamicPropertiesStore::new(mem());
+
+    // Seed two real genesis SRs with their bootstrap vote plus some
+    // accumulated real votes on top.
+    let grs = tron_types::mainnet_witnesses();
+    let g0 = &grs[0]; // GR1, bootstrap vote 100_000_026
+    let g1 = &grs[1]; // GR2, bootstrap vote 100_000_025
+    let a0 = Address::from_raw(g0.address);
+    let a1 = Address::from_raw(g1.address);
+    let extra0 = 500i64;
+    let extra1 = 700i64;
+    witnesses
+        .put(
+            &a0,
+            &Witness {
+                address: a0.as_bytes().to_vec(),
+                vote_count: g0.vote_count + extra0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    witnesses
+        .put(
+            &a1,
+            &Witness {
+                address: a1.as_bytes().to_vec(),
+                vote_count: g1.vote_count + extra1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Arm the flag (as an approved proposal #10 would).
+    dyn_props.put_long(b"REMOVE_THE_POWER_OF_THE_GR", 1);
+
+    apply_maintenance(
+        &witnesses,
+        &votes,
+        &schedule,
+        &accounts,
+        &delegation,
+        &dyn_props,
+    )
+    .unwrap();
+
+    // The genesis bootstrap votes are gone; only the real votes remain.
+    assert_eq!(witnesses.get(&a0).unwrap().unwrap().vote_count, extra0);
+    assert_eq!(witnesses.get(&a1).unwrap().unwrap().vote_count, extra1);
+    // Flag is now spent.
+    assert_eq!(dyn_props.get_long(b"REMOVE_THE_POWER_OF_THE_GR"), Some(-1));
+}
+
+/// The removal is a strict once-only: a second maintenance with the flag at
+/// `-1` must NOT subtract the genesis votes again.
+#[test]
+fn apply_maintenance_gr_power_removal_is_once_only() {
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+    let accounts = AccountStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let dyn_props = DynamicPropertiesStore::new(mem());
+
+    let g0 = &tron_types::mainnet_witnesses()[0];
+    let a0 = Address::from_raw(g0.address);
+    witnesses
+        .put(
+            &a0,
+            &Witness {
+                address: a0.as_bytes().to_vec(),
+                vote_count: 1234,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Already-spent flag → no-op.
+    dyn_props.put_long(b"REMOVE_THE_POWER_OF_THE_GR", -1);
+    apply_maintenance(
+        &witnesses, &votes, &schedule, &accounts, &delegation, &dyn_props,
+    )
+    .unwrap();
+    assert_eq!(witnesses.get(&a0).unwrap().unwrap().vote_count, 1234);
+    assert_eq!(dyn_props.get_long(b"REMOVE_THE_POWER_OF_THE_GR"), Some(-1));
+
+    // Default `0` (never armed) → also a no-op.
+    let dyn_props2 = DynamicPropertiesStore::new(mem());
+    dyn_props2.put_long(b"REMOVE_THE_POWER_OF_THE_GR", 0);
+    apply_maintenance(
+        &witnesses, &votes, &schedule, &accounts, &delegation, &dyn_props2,
+    )
+    .unwrap();
+    assert_eq!(witnesses.get(&a0).unwrap().unwrap().vote_count, 1234);
+    assert_eq!(dyn_props2.get_long(b"REMOVE_THE_POWER_OF_THE_GR"), Some(0));
+}
