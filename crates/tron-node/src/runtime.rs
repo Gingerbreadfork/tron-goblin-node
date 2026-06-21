@@ -520,6 +520,28 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // Resolve `vm.*` once and derive the effective constant-call cap.
     // java-tron clamps `eth_call`-style read gas to whichever is
     // smaller of `rpc.eth_call_gas_cap` and `vm.maxEnergyLimitForConstant`.
+    // Constant-call settings forwarded to every RpcState below. java's
+    // `maxEnergyLimitForConstant` (default 100M) is the ceiling for
+    // `triggerConstantContract` / `estimateEnergy`; `estimate_energy`
+    // and `estimate_energy_max_retry` gate / bound `estimateEnergy`'s
+    // binary search; `energy_fee` / `max_fee_limit` map feeLimit↔energy.
+    let constant_call_energy_limit = config
+        .resolve_vm()
+        .map(|vm| vm.max_energy_limit_for_constant.max(0) as u64)
+        .unwrap_or(100_000_000);
+    let estimate_energy_enabled = config
+        .resolve_vm()
+        .map(|vm| vm.estimate_energy)
+        .unwrap_or(false);
+    let estimate_energy_max_retry = config
+        .resolve_vm()
+        .map(|vm| vm.estimate_energy_max_retry.max(0) as u32)
+        .unwrap_or(3);
+    // The live `ENERGY_FEE` / `MAX_FEE_LIMIT` are read from dyn_props at
+    // call time; seed the genesis/config defaults here.
+    let constant_energy_fee = tron_chainbase::DynamicPropertiesStore::DEFAULT_ENERGY_FEE;
+    let constant_max_fee_limit = 15_000_000_000_i64;
+
     let (support_constant, eth_call_gas_cap, constant_call_timeout_ms, exec_config) =
         match config.resolve_vm() {
             Ok(vm) => {
@@ -781,6 +803,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
             .with_support_constant(support_constant)
+            .with_estimate_energy(estimate_energy_enabled)
+            .with_estimate_energy_max_retry(estimate_energy_max_retry)
+            .with_constant_call_budget(
+                constant_call_energy_limit,
+                constant_energy_fee,
+                constant_max_fee_limit,
+            )
             .with_constant_call_timeout_ms(constant_call_timeout_ms)
             .with_pubsub(pubsub.clone());
         let addr: std::net::SocketAddr = format!("{}:{}", config.rpc.host, config.rpc.port)
@@ -846,6 +875,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
             .with_support_constant(support_constant)
+            .with_estimate_energy(estimate_energy_enabled)
+            .with_estimate_energy_max_retry(estimate_energy_max_retry)
+            .with_constant_call_budget(
+                constant_call_energy_limit,
+                constant_energy_fee,
+                constant_max_fee_limit,
+            )
             .with_constant_call_timeout_ms(constant_call_timeout_ms)
             .with_pubsub(pubsub.clone());
         // The firehose tail service mounts on this same port when the
@@ -897,6 +933,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
             .with_support_constant(support_constant)
+            .with_estimate_energy(estimate_energy_enabled)
+            .with_estimate_energy_max_retry(estimate_energy_max_retry)
+            .with_constant_call_budget(
+                constant_call_energy_limit,
+                constant_energy_fee,
+                constant_max_fee_limit,
+            )
             // The /v1 surfaces run constant calls too (token metadata,
             // archive trigger-at-height — the latter over at-height
             // store views, the slowest read path in the node), so the

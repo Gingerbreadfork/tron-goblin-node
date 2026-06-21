@@ -1609,13 +1609,20 @@ pub fn build_call_vm_stores(b: &crate::state::EthCallBackends) -> tron_tvm::exec
 /// mid-execution if the wall-clock budget elapses. Otherwise routes
 /// through `execute_trigger_with_gas_cap` (no deadline overhead).
 /// java-tron's `vm.constantCallTimeoutMs` plumbing terminates here.
-pub(crate) fn dispatch_constant_trigger(
+pub fn dispatch_constant_trigger(
     s: &RpcState,
     vm_stores: &tron_tvm::execute::VmStores,
     block_env: tron_tvm::execute::VmBlockEnv,
     trigger: &tron_proto::TriggerSmartContract,
     energy_limit: u64,
 ) -> (tron_tvm::execute::VmOutcome, u64) {
+    // The gas-cap override becomes revm's `CfgEnv::tx_gas_limit_cap`. A
+    // constant call's `energy_limit` can be `maxEnergyLimitForConstant`
+    // (100M), which exceeds the operator's `eth_call_gas_cap` default
+    // (50M) — revm would then reject the tx with
+    // `TxGasLimitGreaterThanCap`. Lift the cap to at least the budget we
+    // chose so the explicit constant-call ceiling is honoured.
+    let gas_cap = energy_limit.max(s.eth_call_gas_cap);
     if s.constant_call_timeout_ms > 0 {
         let timeout_ms = s.constant_call_timeout_ms as u64;
         let deadline = std::time::Instant::now()
@@ -1625,7 +1632,7 @@ pub(crate) fn dispatch_constant_trigger(
             block_env,
             trigger,
             energy_limit,
-            s.eth_call_gas_cap,
+            gas_cap,
             deadline,
             timeout_ms,
         );
@@ -1636,12 +1643,13 @@ pub(crate) fn dispatch_constant_trigger(
         block_env,
         trigger,
         energy_limit,
-        s.eth_call_gas_cap,
+        gas_cap,
     );
     (outcome, energy_penalty)
 }
 
 /// Decode an `eth_call` "TransactionRequest" JSON-RPC object.
+#[derive(Debug)]
 struct EthCallRequest {
     from: [u8; 21],
     to: [u8; 21],
@@ -2870,7 +2878,19 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// REST layer (or supplied as hex by JSON-RPC callers). `function_selector`
 /// is keccak256-hashed (first 4 bytes) and prepended to `parameter`,
 /// exactly as java-tron's `Util.getSelector` + parameter concat does.
-fn parse_constant_call_request(p: &Value, gas_cap: u64) -> Result<EthCallRequest, RpcError> {
+/// Parse a TRON-shape constant-call request (`triggerConstantContract`
+/// / `estimateEnergy` HTTP+JSON-RPC). The energy budget defaults to
+/// `max_energy_for_constant` (java `CommonParameter.maxEnergyLimitForConstant`,
+/// 100M) and, when an explicit `fee_limit` is supplied, is clamped to
+/// `min(max_energy_for_constant, fee_limit / energy_fee)` — java
+/// `VMActuator.validate` (`maxEnergyLimit = min(maxEnergyLimitForConstant,
+/// feeLimit / energyFee)`). An explicit `gas`/`energy_limit` (eth-style)
+/// is honoured but still capped to the constant-call ceiling.
+fn parse_constant_call_request(
+    p: &Value,
+    max_energy_for_constant: u64,
+    energy_fee: i64,
+) -> Result<EthCallRequest, RpcError> {
     let obj = p
         .get(0)
         .and_then(|v| v.as_object())
@@ -2941,16 +2961,38 @@ fn parse_constant_call_request(p: &Value, gas_cap: u64) -> Result<EthCallRequest
     } else {
         0
     };
+    // java `VMActuator.validate`: when `getEnergyLimitHardFork()` is
+    // active (current mainnet), a constant call with `callValue < 0` is
+    // rejected with `ContractValidateException("callValue must be >=
+    // 0")`. The on-chain actuator clamps to 0 elsewhere; reject here so
+    // the constant-call/validate surface matches java rather than
+    // silently running with value 0.
+    if value < 0 {
+        return Err(RpcError::invalid_params("callValue must be >= 0"));
+    }
 
-    let default_gas = (gas_cap.saturating_sub(1_000_000)).min(15_000_000);
-    let gas = obj
+    // Energy budget. java `VMActuator`: a constant call gets
+    // `maxEnergyLimitForConstant` by default, lowered to
+    // `min(maxEnergyLimitForConstant, feeLimit / energyFee)` when a
+    // positive `fee_limit` is supplied. An explicit eth-style
+    // `gas`/`energy_limit` overrides but is still capped to the ceiling.
+    let from_fee_limit = obj
+        .get("fee_limit")
+        .or_else(|| obj.get("feeLimit"))
+        .and_then(|v| v.as_i64())
+        .filter(|&f| f > 0 && energy_fee > 0)
+        .map(|f| ((f / energy_fee) as u64).min(max_energy_for_constant));
+    let explicit_gas = obj
         .get("gas")
+        .or_else(|| obj.get("energy_limit"))
         .and_then(|v| v.as_str())
         .map(parse_hex_quantity)
-        .transpose()?
-        .map(|g| g as u64)
-        .unwrap_or(default_gas)
-        .min(gas_cap);
+        .transpose()?;
+    let gas = match (explicit_gas, from_fee_limit) {
+        (Some(g), _) => g.min(max_energy_for_constant),
+        (None, Some(g)) => g,
+        (None, None) => max_energy_for_constant,
+    };
 
     Ok(EthCallRequest {
         from: from_arr,
@@ -3059,7 +3101,11 @@ pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcEr
         &params_obj
     };
 
-    let req = parse_constant_call_request(params, s.eth_call_gas_cap)?;
+    let req = parse_constant_call_request(
+        params,
+        s.constant_call_energy_limit,
+        constant_call_energy_fee(s),
+    )?;
     let vm_stores = build_call_vm_stores(b);
     let block_number = s.dyn_props.latest_block_header_number().unwrap_or(0);
     let block_timestamp_ms = s.dyn_props.latest_block_header_timestamp().unwrap_or(0);
@@ -3078,6 +3124,19 @@ pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcEr
     let (outcome, energy_penalty) =
         dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
     Ok(constant_outcome_to_json(outcome, energy_penalty))
+}
+
+/// The live `getEnergyFee()` (sun per energy) for the constant-call and
+/// `estimateEnergy` feeLimit↔energy conversions. java reads it from
+/// `DynamicPropertiesStore` at call time; fall back to the cached
+/// config/genesis default when the key is absent.
+pub fn constant_call_energy_fee(s: &RpcState) -> i64 {
+    let live = s.dyn_props.get_long(b"ENERGY_FEE").unwrap_or(s.energy_fee);
+    if live > 0 {
+        live
+    } else {
+        s.energy_fee.max(1)
+    }
 }
 
 /// `broadcastTransaction(tx)` — accepts a transaction but doesn't
@@ -3580,6 +3639,46 @@ pub fn account_resource_view(
     }
 }
 
+/// Per-asset free-net usage/limit maps for `getAccountNet` /
+/// `getAccountResource` (java `setAssetNetLimit` over
+/// `getAllFreeAssetNetUsageV2`). `assetNetUsed` is each held asset's
+/// free-net usage decayed to `now_slot`; `assetNetLimit` is the asset's
+/// `free_asset_net_limit` from its AssetIssue. The caller must have
+/// already merged the account-asset store into `account` (java's
+/// `importAllAsset`). Shared by the JSON-RPC and gRPC surfaces.
+pub fn account_asset_net_maps(
+    account: &tron_proto::Account,
+    s: &RpcState,
+    now_slot: i64,
+) -> (
+    std::collections::BTreeMap<String, i64>,
+    std::collections::BTreeMap<String, i64>,
+) {
+    let asset_net_used = materialized_asset_net_usage(account, now_slot);
+    let mut asset_net_limit: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for key in asset_net_used.keys() {
+        let limit = key
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| s.assets_v2.as_ref().and_then(|st| st.get(id).ok().flatten()))
+            .map(|issue| issue.free_asset_net_limit)
+            .unwrap_or(0);
+        asset_net_limit.insert(key.clone(), limit);
+    }
+    (asset_net_used, asset_net_limit)
+}
+
+/// Merge an asset-optimized account's separately-stored TRC-10 balances
+/// back into `asset_v2` (java's `importAllAsset`) when the
+/// `account-asset` store is attached. No-op for non-optimized accounts.
+/// Exposed so the gRPC surface can match the JSON-RPC asset handling.
+pub fn merge_account_assets_if_present(account: &mut tron_proto::Account, s: &RpcState) {
+    if let Some(store) = &s.account_assets {
+        merge_account_assets(account, store);
+    }
+}
+
 pub fn get_account_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let addr_str = p
         .get(0)
@@ -3651,7 +3750,7 @@ pub fn get_account_net(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("missing address"))?;
     let addr = parse_eth_address(addr_str)?;
-    let account = match s
+    let mut account = match s
         .accounts
         .get(&addr)
         .map_err(|e| RpcError::internal(format!("account read: {e}")))?
@@ -3659,35 +3758,38 @@ pub fn get_account_net(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         Some(a) => a,
         None => return Ok(json!({})),
     };
-    let now_slot = s.dyn_props.latest_block_header_number().unwrap_or(0);
-    let net_limit = tron_executor::bandwidth::calculate_global_net_limit(&account, &s.dyn_props);
-    let net_usage = tron_executor::resource::increase_default(
-        account.net_usage,
-        0,
-        account.latest_consume_time,
-        now_slot,
-    );
-    let free_net_limit = s.dyn_props.free_net_limit();
-    let free_net_usage = tron_executor::resource::increase_default(
-        account.free_net_usage,
-        0,
-        account.latest_consume_free_time,
-        now_slot,
-    );
+    // java `Wallet.getAccountNet` runs `BandwidthProcessor.updateUsage`
+    // (read-time net + free-net decay) then `calculateGlobalNetLimit`.
+    // Route through the shared `account_resource_view`, which decays with
+    // `dp.head_slot()` (timestamp/3000) — NOT block height, since
+    // `latest_consume_time` is stored in slot units — using
+    // `recovery_account` for net and `increase_default` for free-net.
+    if let Some(store) = &s.account_assets {
+        merge_account_assets(&mut account, store);
+    }
+    let now_slot = s.dyn_props.head_slot();
+    let asset_net_used = materialized_asset_net_usage(&account, now_slot);
+    let mut asset_net_limit: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for key in asset_net_used.keys() {
+        let limit = key
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| s.assets_v2.as_ref().and_then(|st| st.get(id).ok().flatten()))
+            .map(|issue| issue.free_asset_net_limit)
+            .unwrap_or(0);
+        asset_net_limit.insert(key.clone(), limit);
+    }
+    let v = account_resource_view(&account, &s.dyn_props);
     Ok(json!({
-        "freeNetUsed": free_net_usage,
-        "freeNetLimit": free_net_limit,
-        "NetUsed": net_usage,
-        "NetLimit": net_limit,
-        "TotalNetLimit": s.dyn_props.total_net_limit(),
-        "TotalNetWeight": s.dyn_props.total_net_weight(),
-        // Assetwise free quotas are an additional dimension — provide
-        // an empty map when the account hasn't transferred any TRC-10s.
-        // Real clients reach for the per-asset issuer pool via
-        // getassetissuebyid; surfacing the full map here would be O(N)
-        // and rarely-used.
-        "assetNetUsed": Value::Object(Default::default()),
-        "assetNetLimit": Value::Object(Default::default()),
+        "freeNetUsed": v.free_net_used,
+        "freeNetLimit": v.free_net_limit,
+        "NetUsed": v.net_used,
+        "NetLimit": v.net_limit,
+        "TotalNetLimit": v.total_net_limit,
+        "TotalNetWeight": v.total_net_weight,
+        "assetNetUsed": kv_array(&asset_net_used),
+        "assetNetLimit": kv_array(&asset_net_limit),
     }))
 }
 
@@ -3740,10 +3842,51 @@ fn legacy_tron_power(a: &tron_proto::Account) -> i64 {
 /// V1 key encoding under the hood for v2 — the difference is in how the
 /// `frozen_balance_for_*` fields are populated, not the key).
 pub fn get_delegated_resource_v2(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    // Same shape as get_delegated_resource. We expose this as a
-    // distinct method because TronWeb's `tronWeb.trx.getDelegatedResourceV2`
-    // exists as a separate call even though the on-disk layout overlaps.
-    get_delegated_resource(p, s)
+    let Some(dr) = &s.delegated_resources else {
+        return Ok(json!({ "delegatedResource": Vec::<Value>::new() }));
+    };
+    let from_str = p
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("missing from address"))?;
+    let to_str = p
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("missing to address"))?;
+    let from = parse_eth_address(from_str)?;
+    let to = parse_eth_address(to_str)?;
+    // java `Wallet.getDelegatedResourceV2` reads BOTH Stake-2.0 keys:
+    // `createDbKeyV2(from, to, false)` (unlocked) and `(.., true)`
+    // (locked) — the V1 no-prefix key is empty post Stake-2.0. Each is
+    // included only if it passes `nonEmptyResource` (any non-zero
+    // expire/frozen field). Mirrors the gRPC `lookup_delegated_v2`.
+    let unlocked_key = tron_chainbase::DelegatedResourceStore::v2_unlocked_key(&from, &to);
+    let locked_key = tron_chainbase::DelegatedResourceStore::v2_locked_key(&from, &to);
+    let mut list: Vec<Value> = Vec::new();
+    for key in [unlocked_key.as_slice(), locked_key.as_slice()] {
+        if let Ok(Some(r)) = dr.get_raw(key) {
+            if delegated_resource_non_empty(&r) {
+                list.push(json!({
+                    "from": hex_bytes(&r.from),
+                    "to": hex_bytes(&r.to),
+                    "frozenBalanceForBandwidth": r.frozen_balance_for_bandwidth,
+                    "frozenBalanceForEnergy": r.frozen_balance_for_energy,
+                    "expireTimeForBandwidth": r.expire_time_for_bandwidth,
+                    "expireTimeForEnergy": r.expire_time_for_energy,
+                }));
+            }
+        }
+    }
+    Ok(json!({ "delegatedResource": list }))
+}
+
+/// java-tron `Wallet.nonEmptyResource` — a delegated-resource row counts
+/// only if at least one of its expire/frozen fields is non-zero.
+pub fn delegated_resource_non_empty(r: &tron_proto::DelegatedResource) -> bool {
+    r.expire_time_for_bandwidth != 0
+        || r.expire_time_for_energy != 0
+        || r.frozen_balance_for_bandwidth != 0
+        || r.frozen_balance_for_energy != 0
 }
 
 /// `getDelegatedResourceAccountIndex(address)` — for V1 delegations:
@@ -3758,23 +3901,84 @@ pub fn get_delegated_resource_account_index(p: &Value, s: &RpcState) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("missing address"))?;
     let addr = parse_eth_address(addr_str)?;
-    let key = tron_chainbase::DelegatedResourceAccountIndexStore::legacy_key(&addr);
-    encode_delegate_account_index(idx.get_raw(&key))
+    // java `getIndex`: a legacy aggregated row (bare 21-byte key) wins
+    // if present; otherwise prefix-scan the V1 FROM/TO slices.
+    let legacy_key = tron_chainbase::DelegatedResourceAccountIndexStore::legacy_key(&addr);
+    if let Ok(Some(legacy)) = idx.get_raw(&legacy_key) {
+        return encode_delegate_account_index(Ok(Some(legacy)));
+    }
+    let aggregated = scan_delegate_account_index(
+        s,
+        &addr,
+        tron_chainbase::V1_FROM_PREFIX,
+        tron_chainbase::V1_TO_PREFIX,
+    )?;
+    encode_delegate_account_index(Ok(Some(aggregated)))
 }
 
 /// `getDelegatedResourceAccountIndexV2(address)` — same shape, v2
-/// prefix-0x03/0x04 index entries. Only V2 has the per-resource-type
-/// breakdown but the index proto layout is identical.
+/// prefix-0x03/0x04 index entries. java `getV2Index` always prefix-scans
+/// the V2 FROM/TO slices (no legacy aggregated fallback).
 pub fn get_delegated_resource_account_index_v2(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    // The "v2 index" in java-tron is the same proto as v1 — there is
-    // no separate per-account-id index store for v2 in current mainnet.
-    // The v2 entries are written through the V2 prefixes (0x03/0x04)
-    // of the same DelegatedResourceAccountIndexStore. java-tron's
-    // `getDelegatedResourceAccountIndexV2` reads from `getV2Index`,
-    // which scans the V2-prefix slice and aggregates into the same
-    // `DelegatedResourceAccountIndex` shape. Until the store exposes a
-    // by-prefix scan, we return the same per-address aggregate as v1.
-    get_delegated_resource_account_index(p, s)
+    if s.delegated_resource_account_index.is_none() {
+        return Ok(Value::Null);
+    }
+    let addr_str = p
+        .get(0)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RpcError::invalid_params("missing address"))?;
+    let addr = parse_eth_address(addr_str)?;
+    let aggregated = scan_delegate_account_index(
+        s,
+        &addr,
+        tron_chainbase::V2_FROM_PREFIX,
+        tron_chainbase::V2_TO_PREFIX,
+    )?;
+    encode_delegate_account_index(Ok(Some(aggregated)))
+}
+
+/// Port of java-tron `DelegatedResourceAccountIndexStore.getWithPrefix`.
+/// Prefix-scans the FROM slice (`from_prefix ‖ address` → `toAccounts`)
+/// and the TO slice (`to_prefix ‖ address` → `fromAccounts`), each sorted
+/// by the row's `timestamp`, and assembles a single
+/// `DelegatedResourceAccountIndex` keyed on `address`. Returns an empty
+/// (but `account`-populated) index when no rows match — matching java,
+/// which always returns a non-null capsule.
+pub fn scan_delegate_account_index(
+    s: &RpcState,
+    address: &Address,
+    from_prefix: u8,
+    to_prefix: u8,
+) -> Result<tron_proto::DelegatedResourceAccountIndex, RpcError> {
+    use prost::Message as _;
+    let collect_sorted = |prefix: u8| -> Result<Vec<Vec<u8>>, RpcError> {
+        let Some(backend) = &s.delegated_resource_account_index_backend else {
+            return Ok(Vec::new());
+        };
+        let mut key = Vec::with_capacity(1 + ADDRESS_LENGTH);
+        key.push(prefix);
+        key.extend_from_slice(address.as_bytes());
+        let rows = backend
+            .scan_prefix(&key)
+            .map_err(|e| RpcError::internal(format!("delegate index scan: {e}")))?;
+        // Decode each row, keep (timestamp, account), sort by timestamp.
+        let mut decoded: Vec<(i64, Vec<u8>)> = rows
+            .into_iter()
+            .filter_map(|(_, v)| {
+                tron_proto::DelegatedResourceAccountIndex::decode(v.as_slice())
+                    .ok()
+                    .map(|idx| (idx.timestamp, idx.account))
+            })
+            .collect();
+        decoded.sort_by_key(|(ts, _)| *ts);
+        Ok(decoded.into_iter().map(|(_, acc)| acc).collect())
+    };
+    Ok(tron_proto::DelegatedResourceAccountIndex {
+        account: address.as_bytes().to_vec(),
+        to_accounts: collect_sorted(from_prefix)?,
+        from_accounts: collect_sorted(to_prefix)?,
+        timestamp: 0,
+    })
 }
 
 fn encode_delegate_account_index(
@@ -3807,10 +4011,14 @@ pub fn get_can_withdraw_unfreeze_amount(p: &Value, s: &RpcState) -> Result<Value
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("missing address"))?;
     let addr = parse_eth_address(addr_str)?;
-    let now_ms = p
-        .get(1)
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| s.dyn_props.latest_block_header_timestamp().unwrap_or(0));
+    // java `Wallet.getCanWithdrawUnfreezeAmount`: a negative timestamp
+    // returns 0 outright (before the account lookup). A timestamp of
+    // EXACTLY 0 — including an explicit `0`, not just an absent arg —
+    // is substituted with the latest block-header timestamp.
+    let requested = p.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+    if requested < 0 {
+        return Ok(json!({ "amount": 0_i64 }));
+    }
     let account = match s
         .accounts
         .get(&addr)
@@ -3818,6 +4026,11 @@ pub fn get_can_withdraw_unfreeze_amount(p: &Value, s: &RpcState) -> Result<Value
     {
         Some(a) => a,
         None => return Ok(json!({ "amount": 0_i64 })),
+    };
+    let now_ms = if requested == 0 {
+        s.dyn_props.latest_block_header_timestamp().unwrap_or(0)
+    } else {
+        requested
     };
     let amount: i64 = account
         .unfrozen_v2
@@ -4985,8 +5198,10 @@ pub fn get_transaction_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError>
 /// java-tron's implementation has been deprecated and returns 0
 /// (see `TransactionStore.getTotalTransactions`). We mirror that.
 /// `getTransactionCountByBlockNum(num)` — number of transactions in the
-/// block at `num`. java-tron `GetTransactionCountByBlockNumServlet`
-/// (`{count: -1}` when the block is unknown).
+/// block at `num`. java-tron `Wallet.getTransactionCountByBlockNum`
+/// initialises `count = 0` and returns it unchanged when the block is
+/// unknown (a `StoreException` is caught and logged), so a missing block
+/// reports `{count: 0}`, NOT `-1`.
 pub fn get_transaction_count_by_block_num(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let num = p
         .get(0)
@@ -4999,7 +5214,7 @@ pub fn get_transaction_count_by_block_num(p: &Value, s: &RpcState) -> Result<Val
         .ok()
         .and_then(|id| s.blocks.get(&id).ok())
         .map(|b| b.transactions.len() as i64)
-        .unwrap_or(-1);
+        .unwrap_or(0);
     Ok(json!({ "count": count }))
 }
 
@@ -5143,25 +5358,215 @@ fn energy_breakdown_json(
     })
 }
 
+/// java-tron `Wallet.TRX_PRECISION` — the binary search's convergence
+/// resolution on the feeLimit axis (1 TRX = 1_000_000 sun).
+const TRX_PRECISION: i64 = 1_000_000;
+
+/// Result of one constant-call probe inside the `estimateEnergy` search.
+pub enum EstimateProbe {
+    /// The call succeeded at the given budget; carries the single-run
+    /// `energy_used` (java `ProgramResult.getEnergyUsed()`).
+    Success { energy_used: u64 },
+    /// The call FAILED (revert / halt / transfer-failed) at the budget.
+    Failed,
+    /// The call timed out (java `Program.OutOfTimeException`). The
+    /// search retries up to `estimate_energy_max_retry` times.
+    Timeout,
+    /// A non-VM failure (preflight/validate error) — abort the search.
+    Abort { message: String },
+}
+
+/// Run java-tron's `Wallet.estimateEnergy` feeLimit binary search.
+///
+/// `probe(fee_limit)` runs one constant call whose energy budget is
+/// `min(maxEnergyLimitForConstant, fee_limit / energy_fee)` (the caller
+/// wires that conversion). The search mirrors java exactly:
+///   1. Probe at `high = maxFeeLimit`; bail if it FAILS.
+///   2. `low = energyFee * energyUsed`; optional `2*low` bisection seed.
+///   3. Bisect while `low + TRX_PRECISION < high`.
+///   4. Final probe at `high`; on SUCCESS return `ceil(high / energyFee)`.
+///
+/// Returns `Ok(Some(energy_required))` on success, `Ok(None)` when the
+/// final probe still fails, and `Err` on a preflight/abort or when the
+/// retry budget is exhausted on a timeout.
+pub fn estimate_energy_search(
+    energy_fee: i64,
+    max_fee_limit: i64,
+    max_retry: u32,
+    mut probe: impl FnMut(i64) -> EstimateProbe,
+) -> Result<Option<i64>, RpcError> {
+    let energy_fee = energy_fee.max(1);
+    let mut retry = max_retry as i64;
+
+    // `probe` with the java retry-on-timeout loop wrapped around it.
+    let mut probe_retry = |fee_limit: i64, retry: &mut i64| -> Result<EstimateProbe, RpcError> {
+        loop {
+            match probe(fee_limit) {
+                EstimateProbe::Timeout => {
+                    *retry -= 1;
+                    if *retry < 0 {
+                        return Err(RpcError::internal(
+                            "estimate energy: constant call timed out (retry budget exhausted)",
+                        ));
+                    }
+                }
+                other => return Ok(other),
+            }
+        }
+    };
+
+    let mut high = max_fee_limit;
+
+    // Initial probe at the max fee limit; if even that fails, return.
+    let first = probe_retry(high, &mut retry)?;
+    let energy_used = match first {
+        EstimateProbe::Success { energy_used } => energy_used,
+        EstimateProbe::Failed => return Ok(None),
+        EstimateProbe::Abort { message } => return Err(RpcError::invalid_params(message)),
+        EstimateProbe::Timeout => unreachable!("probe_retry resolves Timeout"),
+    };
+
+    let mut low = energy_fee.saturating_mul(energy_used as i64);
+
+    // java seeds the bisection with `2 * low` when it's below `high`.
+    let two_times = low.saturating_mul(2);
+    if two_times < high {
+        match probe_retry(two_times, &mut retry)? {
+            EstimateProbe::Success { .. } => high = two_times,
+            EstimateProbe::Failed => low = two_times,
+            EstimateProbe::Abort { message } => return Err(RpcError::invalid_params(message)),
+            EstimateProbe::Timeout => unreachable!(),
+        }
+    }
+
+    while low + TRX_PRECISION < high {
+        let mid = (low + high) / 2;
+        match probe_retry(mid, &mut retry)? {
+            EstimateProbe::Success { .. } => high = mid,
+            EstimateProbe::Failed => low = mid,
+            EstimateProbe::Abort { message } => return Err(RpcError::invalid_params(message)),
+            EstimateProbe::Timeout => unreachable!(),
+        }
+    }
+
+    // Final confirmation probe at `high` (java re-runs to set the result).
+    match probe_retry(high, &mut retry)? {
+        EstimateProbe::Success { .. } => {
+            // ceil(high / energyFee) — java `Math.ceil`.
+            let energy_required = (high + energy_fee - 1) / energy_fee;
+            Ok(Some(energy_required))
+        }
+        EstimateProbe::Failed => Ok(None),
+        EstimateProbe::Abort { message } => Err(RpcError::invalid_params(message)),
+        EstimateProbe::Timeout => unreachable!(),
+    }
+}
+
+/// Map a constant-call `VmOutcome` into an `EstimateProbe`. Shared by
+/// the JSON-RPC and gRPC `estimateEnergy` paths.
+pub fn outcome_to_estimate_probe(outcome: &tron_tvm::execute::VmOutcome) -> EstimateProbe {
+    use tron_tvm::execute::VmOutcome;
+    match outcome {
+        VmOutcome::Success { energy_used, .. } => EstimateProbe::Success {
+            energy_used: *energy_used,
+        },
+        VmOutcome::Revert { .. }
+        | VmOutcome::Halt { .. }
+        | VmOutcome::TransferFailed { .. }
+        | VmOutcome::CallTokenIgnored { .. } => EstimateProbe::Failed,
+        VmOutcome::Timeout { .. } => EstimateProbe::Timeout,
+        VmOutcome::PreflightError(msg) => EstimateProbe::Abort {
+            message: msg.clone(),
+        },
+    }
+}
+
+/// `estimateEnergy(call)` — java `Wallet.estimateEnergy`: binary-searches
+/// the minimal feeLimit at which the constant call still succeeds and
+/// returns `ceil(feeLimit / energyFee)` as `energy_required`. Gated on
+/// `vm.estimateEnergy` (and, like java, `vm.supportConstant`).
 pub fn estimate_energy(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let gas_value = eth_estimate_gas(p, s)?;
-    // eth_estimateGas returns a hex string; decode back to i64.
-    let energy = gas_value
-        .as_str()
-        .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(0) as i64;
-    let mut out = json!({
-        "result": { "result": true },
-        "energy_required": energy,
-    });
+    // java `Wallet.estimateEnergy`: throws if estimateEnergy is off, then
+    // throws again if supportConstant is off ("estimate energy cannot work").
+    if !s.estimate_energy {
+        return Err(RpcError::invalid_request(
+            "this node does not support estimate energy \
+             (set vm.estimateEnergy = true to enable)",
+        ));
+    }
+    if !s.support_constant {
+        return Err(RpcError::invalid_request(
+            "this node does not support constant, so estimate energy cannot work \
+             (set vm.supportConstant = true to enable)",
+        ));
+    }
+    let Some(b) = &s.eth_call_backends else {
+        return Err(RpcError::internal(
+            "estimateEnergy not available: server built without EVM call backends",
+        ));
+    };
+
+    let energy_fee = constant_call_energy_fee(s);
+    // Parse the request once; the binary search re-uses the decoded
+    // call (only the energy budget changes per probe).
+    let req = parse_constant_call_request(p, s.constant_call_energy_limit, energy_fee)?;
+    let block_env = tron_tvm::execute::VmBlockEnv {
+        block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+    };
+    let trigger = tron_proto::TriggerSmartContract {
+        owner_address: req.from.to_vec(),
+        contract_address: req.to.to_vec(),
+        call_value: req.value,
+        data: req.data.clone(),
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    let max_energy = s.constant_call_energy_limit;
+    let result = estimate_energy_search(
+        energy_fee,
+        s.max_fee_limit,
+        s.estimate_energy_max_retry,
+        |fee_limit| {
+            // java `VMActuator.validate`: budget = min(maxEnergyForConstant,
+            // feeLimit / energyFee).
+            let budget = ((fee_limit / energy_fee.max(1)) as u64).min(max_energy);
+            // Re-running the VM session each probe is required: each probe
+            // must start from the same pre-call state (java resets the
+            // context via `cleanContextAndTriggerConstantContract`). A fresh
+            // `build_call_vm_stores` wraps fresh sessions, so rebuild it.
+            let probe_stores = build_call_vm_stores(b);
+            let (outcome, _penalty) =
+                dispatch_constant_trigger(s, &probe_stores, block_env, &trigger, budget);
+            outcome_to_estimate_probe(&outcome)
+        },
+    )?;
+
+    let mut out = match result {
+        Some(energy_required) => json!({
+            "result": { "result": true },
+            "energy_required": energy_required,
+        }),
+        None => {
+            return Ok(json!({
+                "result": {
+                    "result": false,
+                    "code": "CONTRACT_EXE_ERROR",
+                    "message": "estimate failed: constant call reverted at maxFeeLimit",
+                },
+            }));
+        }
+    };
+
     // Energy breakdown — where the energy goes (per-opcode), the call-frame
     // tree, and the halting op/reason if it would fail. Best-effort: a missing
     // tracer backend or a parse error just omits the field, leaving the total.
-    if let Ok(req) = parse_eth_call_request(p, s.eth_call_gas_cap) {
-        if let Ok((_outcome, logs, frames)) =
-            traced_call_outputs(s, &req, tron_tvm::tracer::TracerOptions::default())
-        {
-            out["energy_breakdown"] = energy_breakdown_json(&logs, &frames);
+    if let Ok((_outcome, logs, frames)) =
+        traced_call_outputs(s, &req, tron_tvm::tracer::TracerOptions::default())
+    {
+        if let Value::Object(map) = &mut out {
+            map.insert("energy_breakdown".to_string(), energy_breakdown_json(&logs, &frames));
         }
     }
     Ok(out)
@@ -5385,28 +5790,27 @@ pub fn get_transaction_info_by_id_solidity(p: &Value, s: &RpcState) -> Result<Va
     Ok(encode_transaction_info(&info))
 }
 
-/// `getAccountSolidity(address)` — live account read aliased to the
-/// solidified namespace. java-tron returns the account state at the
-/// solidified block, which would require a separate state snapshot
-/// we don't maintain. We return the live state with a `solidified:
-/// false` flag in the response so callers can detect the divergence.
+/// `getAccountSolidity(address)` — `walletsolidity/getaccount`. java-tron
+/// reads the account at `LATEST_SOLIDIFIED_BLOCK_NUM` from a separate
+/// solidified-state snapshot, which this node does not maintain
+/// (non-block-keyed solidified reads have no historical store). The
+/// returned shape is byte-identical to `getAccount` against the LIVE
+/// state. We deliberately do NOT inject a non-java marker field
+/// (`__solidified`): a wallet diffing this against java's
+/// `walletsolidity/getaccount` must see the same `Account` proto JSON,
+/// and the (rare) staleness window between live head and the solidified
+/// block is the documented limitation here.
 pub fn get_account_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let mut result = get_account(p, s)?;
-    if let Value::Object(map) = &mut result {
-        map.insert("__solidified".to_string(), Value::Bool(false));
-    }
-    Ok(result)
+    get_account(p, s)
 }
 
-/// `getDelegatedResourceSolidity(from, to)` — same as
-/// `getDelegatedResource`. Live read with the same `__solidified:
-/// false` flag rationale.
+/// `getDelegatedResourceSolidity(from, to)` — `walletsolidity` alias of
+/// `getDelegatedResource`. Same architectural limitation as
+/// [`get_account_solidity`]: served from live state (no solidified
+/// snapshot), and without a non-java marker field so the response shape
+/// matches java's `walletsolidity/getdelegatedresource`.
 pub fn get_delegated_resource_solidity(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let mut result = get_delegated_resource(p, s)?;
-    if let Value::Object(map) = &mut result {
-        map.insert("__solidified".to_string(), Value::Bool(false));
-    }
-    Ok(result)
+    get_delegated_resource(p, s)
 }
 
 // =============================================================================
@@ -7179,5 +7583,159 @@ mod eth_call_tests {
         // The halting op + reason are surfaced (the "why it would OOG").
         assert_eq!(v["halt"]["op"], "EXTCODESIZE");
         assert_eq!(v["halt"]["reason"], "OutOfGas(Basic)");
+    }
+}
+
+#[cfg(test)]
+mod constant_call_tests {
+    use super::*;
+
+    fn trigger_obj() -> Value {
+        json!([{
+            "to": "0x412e988a386a799f506693793c6a5af6b54dfaabfb",
+        }])
+    }
+
+    // ---- F1: constant-call energy ceiling -------------------------------
+
+    #[test]
+    fn constant_call_defaults_to_max_energy_for_constant() {
+        // No gas/feeLimit → java budgets the full maxEnergyLimitForConstant.
+        let req = parse_constant_call_request(&trigger_obj(), 100_000_000, 100).unwrap();
+        assert_eq!(req.gas, 100_000_000);
+    }
+
+    #[test]
+    fn constant_call_fee_limit_caps_below_max() {
+        // feeLimit = 1_000_000_000 sun / energyFee 100 = 10_000_000 energy,
+        // which is below the 100M ceiling → budget = 10M.
+        let mut o = trigger_obj();
+        o[0]["fee_limit"] = json!(1_000_000_000_i64);
+        let req = parse_constant_call_request(&o, 100_000_000, 100).unwrap();
+        assert_eq!(req.gas, 10_000_000);
+    }
+
+    #[test]
+    fn constant_call_fee_limit_clamped_to_ceiling() {
+        // feeLimit / energyFee = 200M, above the 100M ceiling → clamp to 100M.
+        let mut o = trigger_obj();
+        o[0]["fee_limit"] = json!(20_000_000_000_i64);
+        let req = parse_constant_call_request(&o, 100_000_000, 100).unwrap();
+        assert_eq!(req.gas, 100_000_000);
+    }
+
+    #[test]
+    fn constant_call_explicit_gas_capped_to_ceiling() {
+        let mut o = trigger_obj();
+        o[0]["gas"] = json!("0xf4240"); // 1_000_000
+        let req = parse_constant_call_request(&o, 100_000_000, 100).unwrap();
+        assert_eq!(req.gas, 1_000_000);
+        // Above the ceiling → clamped.
+        o[0]["gas"] = json!("0x77359400"); // 2_000_000_000
+        let req = parse_constant_call_request(&o, 100_000_000, 100).unwrap();
+        assert_eq!(req.gas, 100_000_000);
+    }
+
+    // ---- F6: reject negative callValue on the constant-call path --------
+
+    #[test]
+    fn constant_call_rejects_negative_call_value() {
+        let mut o = trigger_obj();
+        o[0]["call_value"] = json!(-1_i64);
+        let err = parse_constant_call_request(&o, 100_000_000, 100).unwrap_err();
+        assert!(err.message.contains("callValue must be >= 0"));
+    }
+
+    // ---- F2: estimateEnergy binary search -------------------------------
+
+    // A synthetic cost model: the call SUCCEEDS iff the energy budget is
+    // >= `threshold`. The search must converge `ceil(high / energyFee)` to
+    // the smallest energy that still succeeds, within TRX_PRECISION.
+    fn run_search(threshold: u64, energy_fee: i64) -> Option<i64> {
+        let max_fee_limit = 15_000_000_000;
+        let max_energy = 100_000_000u64;
+        estimate_energy_search(energy_fee, max_fee_limit, 3, |fee_limit| {
+            let budget = ((fee_limit / energy_fee.max(1)) as u64).min(max_energy);
+            if budget >= threshold {
+                // The single-run energy_used is the threshold itself.
+                EstimateProbe::Success {
+                    energy_used: threshold,
+                }
+            } else {
+                EstimateProbe::Failed
+            }
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn estimate_search_converges_near_threshold() {
+        let energy_fee = 100;
+        let threshold = 4_062; // mirrors the real USDT balanceOf energy_used.
+        let result = run_search(threshold, energy_fee).expect("should succeed");
+        // Within TRX_PRECISION/energyFee energy of the true threshold.
+        let slack = TRX_PRECISION / energy_fee;
+        assert!(
+            result >= threshold as i64 && result <= threshold as i64 + slack,
+            "result {result} not within [{threshold}, {}]",
+            threshold as i64 + slack
+        );
+    }
+
+    #[test]
+    fn estimate_search_returns_none_when_always_failing() {
+        // threshold above what maxFeeLimit can buy (100M ceiling) → never
+        // succeeds → first probe FAILS → None.
+        let result = run_search(200_000_000, 100);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn estimate_search_low_threshold_floors_to_one_trx_resolution() {
+        // A trivially-cheap call still can't converge below TRX_PRECISION
+        // of feeLimit; with energyFee 100 the floor is ~10_000 energy.
+        let result = run_search(1, 100).expect("should succeed");
+        assert!(result >= 1);
+        assert!(result <= TRX_PRECISION / 100 + 1);
+    }
+
+    #[test]
+    fn estimate_search_aborts_on_preflight() {
+        let err = estimate_energy_search(100, 15_000_000_000, 3, |_fee| EstimateProbe::Abort {
+            message: "no contract".to_string(),
+        })
+        .unwrap_err();
+        assert!(err.message.contains("no contract"));
+    }
+
+    #[test]
+    fn estimate_search_exhausts_retry_on_persistent_timeout() {
+        let mut calls = 0u32;
+        let err = estimate_energy_search(100, 15_000_000_000, 2, |_fee| {
+            calls += 1;
+            EstimateProbe::Timeout
+        })
+        .unwrap_err();
+        assert!(err.message.contains("timed out"));
+        // max_retry=2 → 3 attempts (initial + 2 retries) before giving up.
+        assert_eq!(calls, 3);
+    }
+
+    // ---- #3 / #8: delegated-resource non-empty filter -------------------
+
+    #[test]
+    fn delegated_resource_non_empty_predicate() {
+        let empty = tron_proto::DelegatedResource::default();
+        assert!(!delegated_resource_non_empty(&empty));
+        let with_frozen = tron_proto::DelegatedResource {
+            frozen_balance_for_bandwidth: 1,
+            ..Default::default()
+        };
+        assert!(delegated_resource_non_empty(&with_frozen));
+        let with_expire = tron_proto::DelegatedResource {
+            expire_time_for_energy: 123,
+            ..Default::default()
+        };
+        assert!(delegated_resource_non_empty(&with_expire));
     }
 }

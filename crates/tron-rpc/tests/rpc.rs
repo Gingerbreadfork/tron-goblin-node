@@ -1534,10 +1534,11 @@ async fn get_paginated_proposal_list_returns_empty_without_proposals() {
 }
 
 #[tokio::test]
-async fn estimate_energy_returns_unsupported_without_evm_backends() {
+async fn estimate_energy_gated_off_by_default() {
     let (addr, ..) = spawn_server().await;
-    // No eth_call_backends attached → eth_estimateGas errors, and
-    // estimate_energy bubbles that up.
+    // `vm.estimateEnergy` defaults to false (java `Args.estimateEnergy`),
+    // so the method is gated off before it can run — returns a clear
+    // "does not support estimate energy" error object.
     let resp = call(
         addr,
         json!({"jsonrpc":"2.0","method":"estimateEnergy",
@@ -1546,6 +1547,14 @@ async fn estimate_energy_returns_unsupported_without_evm_backends() {
     )
     .await;
     assert!(resp["error"].is_object());
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not support estimate energy"),
+        "got: {}",
+        resp["error"]["message"]
+    );
 }
 
 #[tokio::test]
@@ -1735,7 +1744,7 @@ async fn get_now_block_solidity_returns_solid_head_block() {
 }
 
 #[tokio::test]
-async fn get_account_solidity_flags_divergence_from_java_tron() {
+async fn get_account_solidity_matches_get_account_shape() {
     let (addr, accounts, ..) = spawn_server().await;
     let mut a = [0u8; 21];
     a[0] = 0x41;
@@ -1754,8 +1763,14 @@ async fn get_account_solidity_flags_divergence_from_java_tron() {
                "params":["0x9999999999999999999999999999999999999999"],"id":1}),
     )
     .await;
-    // Returns live state with the divergence flag set.
-    assert_eq!(resp["result"]["__solidified"], false);
+    // No solidified snapshot exists, so this aliases live state — but the
+    // shape must be byte-identical to java's `walletsolidity/getaccount`
+    // (the live `Account` proto JSON). No non-java marker field.
+    assert_eq!(resp["result"]["balance"], 42);
+    assert!(
+        resp["result"].get("__solidified").is_none(),
+        "non-java __solidified field must not be emitted"
+    );
 }
 
 #[tokio::test]

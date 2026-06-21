@@ -79,6 +79,12 @@ pub struct RpcState {
     /// Delegated-resource per-account index — needed for the v1/v2
     /// `getDelegatedResourceAccountIndex` family.
     pub delegated_resource_account_index: Option<Arc<DelegatedResourceAccountIndexStore>>,
+    /// Raw backend behind `delegated_resource_account_index`. java's
+    /// `getIndex`/`getV2Index` prefix-scan the FROM/TO slices
+    /// (`0x01/0x02` for V1, `0x03/0x04` for V2) and sort by timestamp;
+    /// the typed store exposes only point `get_raw`, so the prefix-scan
+    /// in the RPC/gRPC handlers needs the raw `scan_prefix` here.
+    pub delegated_resource_account_index_backend: Option<Arc<dyn KvBackend>>,
     /// Market (DEX) stores. All four are needed for the
     /// `getMarketOrder*` / `getMarketPair*` family; passing them
     /// independently lets a non-DEX node leave them unattached.
@@ -131,6 +137,39 @@ pub struct RpcState {
     /// keep this off (default). `eth_call` is always on — only the
     /// TRON-shape RPC consults this flag.
     pub support_constant: bool,
+    /// `vm.estimateEnergy` java-tron gate. When `false`, the
+    /// `estimateEnergy` RPC/gRPC throws `CONTRACT_VALIDATE_ERROR`
+    /// ("this node does not support estimate energy") rather than
+    /// running the binary search (java `Wallet.estimateEnergy`,
+    /// `Args.estimateEnergy`). Independent of `support_constant`,
+    /// though java additionally requires `support_constant` for
+    /// estimate to work. Default `false`.
+    pub estimate_energy: bool,
+    /// `vm.estimateEnergyMaxRetry` — number of times the
+    /// `estimateEnergy` binary search retries a single
+    /// `cleanContextAndTriggerConstantContract` invocation on an
+    /// OutOfTime (timeout) outcome before giving up. java clamps to
+    /// `[0, 10]`; default `3`.
+    pub estimate_energy_max_retry: u32,
+    /// `vm.maxEnergyLimitForConstant` — the hard ceiling on energy a
+    /// constant call (`triggerConstantContract` / `estimateEnergy`)
+    /// may consume (java `CommonParameter.maxEnergyLimitForConstant`,
+    /// default 100_000_000). A plain constant call (feeLimit 0)
+    /// budgets exactly this; when a feeLimit is supplied the budget is
+    /// `min(this, feeLimit / energyFee)` (java `VMActuator.validate`).
+    /// Distinct from `eth_call_gas_cap`, which is the go-ethereum-style
+    /// per-call gas cap for the `eth_call` family.
+    pub constant_call_energy_limit: u64,
+    /// `getEnergyFee()` (sun per energy) — needed by `estimateEnergy`
+    /// to map between feeLimit (sun) and energy units during the
+    /// binary search, and by the constant-call feeLimit→energy cap.
+    /// java reads it from `DynamicPropertiesStore`; we cache the
+    /// genesis/config default here and the live value is read from
+    /// `dyn_props` at call time.
+    pub energy_fee: i64,
+    /// `getMaxFeeLimit()` (sun) — the upper bound `estimateEnergy`'s
+    /// binary search starts from (java `dps.getMaxFeeLimit()`).
+    pub max_fee_limit: i64,
     /// `vm.constantCallTimeoutMs`. Wall-clock budget (milliseconds)
     /// allowed for a single read-only EVM call (`eth_call`,
     /// `eth_estimateGas`, `triggerConstantContract`). `0` means no
@@ -207,11 +246,17 @@ impl RpcState {
             chain_id,
             eth_call_gas_cap: 50_000_000,
             support_constant: false,
+            estimate_energy: false,
+            estimate_energy_max_retry: 3,
+            constant_call_energy_limit: 100_000_000,
+            energy_fee: 100,
+            max_fee_limit: 15_000_000_000,
             constant_call_timeout_ms: 0,
             pubsub: None,
             contracts: None,
             abis: None,
             delegated_resource_account_index: None,
+            delegated_resource_account_index_backend: None,
             market_orders: None,
             market_accounts: None,
             market_pair_to_price: None,
@@ -342,6 +387,38 @@ impl RpcState {
         self
     }
 
+    /// Toggle the `estimateEnergy` RPC/gRPC. When `false` the method
+    /// returns java-tron's `CONTRACT_VALIDATE_ERROR` ("this node does
+    /// not support estimate energy"). java `Args.estimateEnergy`.
+    pub fn with_estimate_energy(mut self, enabled: bool) -> Self {
+        self.estimate_energy = enabled;
+        self
+    }
+
+    /// Set the `estimateEnergy` binary-search retry budget
+    /// (java-clamped to `[0, 10]` by the config layer). Used to retry a
+    /// single constant-call probe on an OutOfTime outcome.
+    pub fn with_estimate_energy_max_retry(mut self, retry: u32) -> Self {
+        self.estimate_energy_max_retry = retry;
+        self
+    }
+
+    /// Set the constant-call energy ceiling
+    /// (`vm.maxEnergyLimitForConstant`, default 100M) and the
+    /// `energyFee` / `maxFeeLimit` constants the constant-call and
+    /// `estimateEnergy` paths use to map between feeLimit and energy.
+    pub fn with_constant_call_budget(
+        mut self,
+        max_energy_for_constant: u64,
+        energy_fee: i64,
+        max_fee_limit: i64,
+    ) -> Self {
+        self.constant_call_energy_limit = max_energy_for_constant;
+        self.energy_fee = energy_fee;
+        self.max_fee_limit = max_fee_limit;
+        self
+    }
+
     /// Set the constant-call wall-clock budget. `0` (default) means no
     /// timeout. Non-zero values cause `eth_call` / `eth_estimateGas` /
     /// `triggerConstantContract` to return an error to the client when
@@ -381,7 +458,10 @@ impl RpcState {
         idx: Arc<dyn KvBackend>,
     ) -> Self {
         self.delegated_resource_account_index =
-            Some(Arc::new(DelegatedResourceAccountIndexStore::new(idx)));
+            Some(Arc::new(DelegatedResourceAccountIndexStore::new(idx.clone())));
+        // Retain the raw backend for the FROM/TO prefix scans java's
+        // `getIndex`/`getV2Index` perform.
+        self.delegated_resource_account_index_backend = Some(idx);
         self
     }
 

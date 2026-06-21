@@ -260,7 +260,7 @@ pub fn router_with_limits(
             ),
         )
         .route("/wallet/getmarketpairlist", getter_no_arg!(methods::get_market_pair_list))
-        .route("/wallet/getblock", mapped!(methods::get_block, ["id_or_num", "detail"]))
+        .route("/wallet/getblock", post(http_get_block))
         .route(
             "/wallet/getblockbalance",
             mapped!(methods::get_block_balance_trace, ["number"]),
@@ -1134,6 +1134,57 @@ async fn get_block_by_id(
     raw.copy_from_slice(&bytes);
     let id = tron_types::BlockId::from_raw(raw);
     let Ok(block) = crate::blocking::run_blocking(|| state.blocks.get(&id)) else {
+        return api_ok(json!({}));
+    };
+    let mut v = format_block_for_http(&id, &block);
+    rewrite_addresses(&mut v, visible);
+    api_ok(v)
+}
+
+/// `POST /wallet/getblock` — body `{id_or_num?, detail?}`. java-tron's
+/// unified block fetch: `id_or_num` is either a numeric string (block
+/// number) or a 32-byte block-hash hex; absent → head block. Renders the
+/// TRON HTTP block shape (`format_block_for_http`) like the other
+/// `/wallet/getblock*` routes, NOT the ETH-style JSON-RPC shape.
+async fn http_get_block(
+    State(state): State<RpcState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body_val = body.map(|j| j.0).unwrap_or_else(|| json!({}));
+    let visible = visible_flag(&body_val, &query);
+    let id_or_num = body_val
+        .get("id_or_num")
+        .or_else(|| body_val.get("idOrNum"))
+        .cloned();
+    let resolved = crate::blocking::run_blocking(move || {
+        let id = match id_or_num.as_ref() {
+            // Numeric (string or JSON number) → block number.
+            Some(Value::Number(n)) => state.block_index.get(n.as_i64()?).ok()?,
+            Some(Value::String(s)) if s.parse::<i64>().is_ok() => {
+                state.block_index.get(s.parse::<i64>().unwrap()).ok()?
+            }
+            // 32-byte hex → block hash.
+            Some(Value::String(s)) => {
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                let bytes = hex::decode(s).ok()?;
+                if bytes.len() != 32 {
+                    return None;
+                }
+                let mut raw = [0u8; 32];
+                raw.copy_from_slice(&bytes);
+                tron_types::BlockId::from_raw(raw)
+            }
+            // Absent → head block.
+            _ => {
+                let head = state.dyn_props.latest_block_header_number().unwrap_or(0);
+                state.block_index.get(head).ok()?
+            }
+        };
+        let block = state.blocks.get(&id).ok()?;
+        Some((id, block))
+    });
+    let Some((id, block)) = resolved else {
         return api_ok(json!({}));
     };
     let mut v = format_block_for_http(&id, &block);

@@ -107,6 +107,7 @@ fn fixture() -> RpcState {
         contracts: None,
         abis: None,
         delegated_resource_account_index: None,
+        delegated_resource_account_index_backend: None,
         market_orders: None,
         market_accounts: None,
         market_pair_to_price: None,
@@ -121,6 +122,11 @@ fn fixture() -> RpcState {
         nullifiers: None,
         eth_call_gas_cap: 50_000_000,
         support_constant: false,
+        estimate_energy: false,
+        estimate_energy_max_retry: 3,
+        constant_call_energy_limit: 100_000_000,
+        energy_fee: 100,
+        max_fee_limit: 15_000_000_000,
         constant_call_timeout_ms: 0,
         pubsub: None,
         index: None,
@@ -401,6 +407,54 @@ async fn grpc_server_serves_basic_read_methods() {
     }
 
     // ---- shutdown ----
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+/// F3: the gRPC `TriggerConstantContract` / `EstimateEnergy` methods are
+/// gated like java's `Wallet` — `supportConstant` is off in the fixture,
+/// so both must reject (java throws `ContractValidateException`; we map
+/// to `FailedPrecondition`) rather than silently running.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_constant_and_estimate_gated_off_by_default() {
+    use tron_proto::protocol::TriggerSmartContract;
+
+    let state = fixture(); // support_constant=false, estimate_energy=false
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let shut = async move {
+            let _ = shutdown_rx.await;
+        };
+        tron_grpc::start_server(state, addr, shut).await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut client =
+        WalletClient::connect(format!("http://{}", addr)).await.expect("connect");
+
+    let trigger = TriggerSmartContract {
+        owner_address: vec![0x41; 21],
+        contract_address: vec![0x41; 21],
+        ..Default::default()
+    };
+    let const_err = client
+        .trigger_constant_contract(trigger.clone())
+        .await
+        .expect_err("constant call must be gated off");
+    assert_eq!(const_err.code(), tonic::Code::FailedPrecondition);
+    assert!(const_err.message().contains("does not support constant"));
+
+    let est_err = client
+        .estimate_energy(trigger)
+        .await
+        .expect_err("estimate must be gated off");
+    assert_eq!(est_err.code(), tonic::Code::FailedPrecondition);
+    assert!(est_err.message().contains("does not support estimate energy"));
+
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }

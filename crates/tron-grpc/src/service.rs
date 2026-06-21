@@ -129,16 +129,22 @@ fn lookup_delegated_v2(
     let from = Address::from_raw(from_arr);
     let to = Address::from_raw(to_arr);
     // v2 splits locked + unlocked across two keys; the gRPC response
-    // shape collapses them into one list, matching java-tron.
+    // shape collapses them into one list, matching java-tron. java
+    // `Wallet.getDelegatedResourceV2` additionally drops any row that
+    // fails `nonEmptyResource` (all expire/frozen fields zero).
     let unlocked_key =
         tron_chainbase::DelegatedResourceStore::v2_unlocked_key(&from, &to);
     let locked_key = tron_chainbase::DelegatedResourceStore::v2_locked_key(&from, &to);
     let mut delegated_resource = Vec::new();
     if let Ok(Some(d)) = store.get_raw(&unlocked_key) {
-        delegated_resource.push(d);
+        if tron_rpc::methods::delegated_resource_non_empty(&d) {
+            delegated_resource.push(d);
+        }
     }
     if let Ok(Some(d)) = store.get_raw(&locked_key) {
-        delegated_resource.push(d);
+        if tron_rpc::methods::delegated_resource_non_empty(&d) {
+            delegated_resource.push(d);
+        }
     }
     DelegatedResourceList { delegated_resource }
 }
@@ -304,41 +310,35 @@ fn run_constant_call(
     state: &RpcState,
     trigger: &tron_proto::protocol::TriggerSmartContract,
 ) -> Option<tron_tvm::execute::VmOutcome> {
+    run_constant_call_with_budget(state, trigger, state.constant_call_energy_limit)
+}
+
+/// Run one read-only constant call against `state` with an explicit
+/// energy budget. A plain `triggerConstantContract` uses
+/// `maxEnergyLimitForConstant` (java `VMActuator`, default 100M);
+/// `estimateEnergy`'s binary search supplies a per-probe budget derived
+/// from the trial feeLimit. Routes through the shared
+/// `dispatch_constant_trigger` so the revm gas cap is lifted to at least
+/// the budget — identical plumbing to the JSON-RPC surface.
+fn run_constant_call_with_budget(
+    state: &RpcState,
+    trigger: &tron_proto::protocol::TriggerSmartContract,
+    energy_limit: u64,
+) -> Option<tron_tvm::execute::VmOutcome> {
     let b = state.eth_call_backends.as_ref()?;
     let vm_stores = tron_rpc::methods::build_call_vm_stores(b);
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: state.dyn_props.latest_block_header_number().unwrap_or(0),
         block_timestamp_ms: state.dyn_props.latest_block_header_timestamp().unwrap_or(0),
     };
-    // Match java-tron's constant-call default — `MAX_CPU_TIME_OF_ONE_TX`
-    // worth of energy. We use a generous 16M cap (same as eth_call's
-    // hardcoded limit until the revm fork lifts it) so deep TVM reads
-    // succeed.
-    const CONSTANT_CALL_ENERGY: u64 = 16_000_000;
-    // If the operator configured a wall-clock budget, route through
-    // the deadline-enforcing entry point so the VM is preempted
-    // mid-execution.
-    if state.constant_call_timeout_ms > 0 {
-        let timeout_ms = state.constant_call_timeout_ms as u64;
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(timeout_ms);
-        let (outcome, _traces, _energy_penalty) = tron_tvm::execute::execute_trigger_with_deadline(
-            &vm_stores,
-            block_env,
-            trigger,
-            CONSTANT_CALL_ENERGY,
-            state.eth_call_gas_cap,
-            deadline,
-            timeout_ms,
-        );
-        return Some(outcome);
-    }
-    Some(tron_tvm::execute::execute_trigger(
+    let (outcome, _energy_penalty) = tron_rpc::methods::dispatch_constant_trigger(
+        state,
         &vm_stores,
         block_env,
         trigger,
-        CONSTANT_CALL_ENERGY,
-    ))
+        energy_limit,
+    );
+    Some(outcome)
 }
 
 /// Wrap a `VmOutcome` into the `TransactionExtention` shape
@@ -375,12 +375,16 @@ fn build_constant_response(
             energy_used,
             ..
         }) => (
-            vec![return_data.clone()],
+            vec![return_data],
             energy_used as i64,
             Return {
                 result: false,
                 code: r#return::ResponseCode::ContractExeError as i32,
-                message: format!("REVERT: 0x{}", hex::encode(return_data)).into_bytes(),
+                // java `Wallet.callConstantContract`: a revert sets the
+                // literal message "REVERT opcode executed"; the revert
+                // payload travels only in `constant_result` (above), not
+                // the message. HTTP/JSON-RPC already match this.
+                message: b"REVERT opcode executed".to_vec(),
             },
         ),
         Some(tron_tvm::execute::VmOutcome::TransferFailed { energy_used }) => (
@@ -1251,27 +1255,34 @@ impl Wallet for WalletService {
         }
         let mut addr = [0u8; 21];
         addr.copy_from_slice(&probe.address);
-        let acct = self
+        let mut acct = self
             .state
             .accounts
             .get(&Address::from_raw(addr))
             .ok()
             .flatten()
             .unwrap_or_default();
-        let dp = &self.state.dyn_props;
+        // java `Wallet.getAccountNet` runs `BandwidthProcessor.updateUsage`
+        // (read-time net + free-net decay) then `calculateGlobalNetLimit`
+        // (the PER-ACCOUNT net limit, NOT the chain-wide TOTAL_NET_LIMIT),
+        // and fills the per-asset free-net maps. Route through the shared
+        // `account_resource_view` (decays with `head_slot()`, since
+        // `latest_consume_time` is in slot units) + the shared asset-net
+        // helper — identical to the JSON-RPC path.
+        tron_rpc::methods::merge_account_assets_if_present(&mut acct, &self.state);
+        let now_slot = self.state.dyn_props.head_slot();
+        let (asset_net_used, asset_net_limit) =
+            tron_rpc::methods::account_asset_net_maps(&acct, &self.state, now_slot);
+        let v = tron_rpc::methods::account_resource_view(&acct, &self.state.dyn_props);
         Ok(Response::new(protocol::AccountNetMessage {
-            free_net_used: acct.free_net_usage,
-            free_net_limit: dp.get_long(b"FREE_NET_LIMIT").unwrap_or(5000),
-            net_used: acct.net_usage,
-            // Account.net_window_size + tron-executor's resource math
-            // give the per-account limit. For a minimal first cut we
-            // surface the global cap; clients reading this will see
-            // the same total as `getChainParameters`.
-            net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
-            asset_net_used: std::collections::BTreeMap::new(),
-            asset_net_limit: std::collections::BTreeMap::new(),
-            total_net_limit: dp.get_long(b"TOTAL_NET_LIMIT").unwrap_or(0),
-            total_net_weight: dp.get_long(b"TOTAL_NET_WEIGHT").unwrap_or(0),
+            free_net_used: v.free_net_used,
+            free_net_limit: v.free_net_limit,
+            net_used: v.net_used,
+            net_limit: v.net_limit,
+            asset_net_used,
+            asset_net_limit,
+            total_net_limit: v.total_net_limit,
+            total_net_weight: v.total_net_weight,
         }))
     }
 
@@ -1285,7 +1296,7 @@ impl Wallet for WalletService {
         }
         let mut addr = [0u8; 21];
         addr.copy_from_slice(&probe.address);
-        let acct = self
+        let mut acct = self
             .state
             .accounts
             .get(&Address::from_raw(addr))
@@ -1293,15 +1304,20 @@ impl Wallet for WalletService {
             .flatten()
             .unwrap_or_default();
         // Shared computation with the JSON-RPC handler: per-account limits,
-        // read-time usage decay (java's head_slot), tron-power, storage.
+        // read-time usage decay (java's head_slot), tron-power, storage,
+        // and the per-asset free-net maps (java's `setAssetNetLimit`).
+        tron_rpc::methods::merge_account_assets_if_present(&mut acct, &self.state);
+        let now_slot = self.state.dyn_props.head_slot();
+        let (asset_net_used, asset_net_limit) =
+            tron_rpc::methods::account_asset_net_maps(&acct, &self.state, now_slot);
         let v = tron_rpc::methods::account_resource_view(&acct, &self.state.dyn_props);
         Ok(Response::new(protocol::AccountResourceMessage {
             free_net_used: v.free_net_used,
             free_net_limit: v.free_net_limit,
             net_used: v.net_used,
             net_limit: v.net_limit,
-            asset_net_used: std::collections::BTreeMap::new(),
-            asset_net_limit: std::collections::BTreeMap::new(),
+            asset_net_used,
+            asset_net_limit,
             total_net_limit: v.total_net_limit,
             total_net_weight: v.total_net_weight,
             total_tron_power_weight: v.total_tron_power_weight,
@@ -1335,13 +1351,26 @@ impl Wallet for WalletService {
             .ok()
             .flatten()
             .unwrap_or_default();
-        // java-tron caps unfreezeV2 entries at 32 per account; the
-        // "available" count = (cap - active entries).
+        // java `Wallet.getAvailableUnfreezeCount` =
+        // `UNFREEZE_MAX_TIMES - AccountCapsule.getUnfreezingV2Count(now)`,
+        // where `getUnfreezingV2Count` counts only entries whose
+        // `unfreezeExpireTime > now` (ACTIVE unfreezes) — expired-but-
+        // unwithdrawn entries don't count against the cap. The JSON-RPC
+        // path already does this; mirror it (was `unfrozen_v2.len()`).
         const UNFREEZE_V2_CAP: i64 = 32;
-        let used = acct.unfrozen_v2.len() as i64;
+        let now_ms = self
+            .state
+            .dyn_props
+            .latest_block_header_timestamp()
+            .unwrap_or(0);
+        let active = acct
+            .unfrozen_v2
+            .iter()
+            .filter(|e| e.unfreeze_expire_time > now_ms)
+            .count() as i64;
         Ok(Response::new(
             protocol::GetAvailableUnfreezeCountResponseMessage {
-                count: (UNFREEZE_V2_CAP - used).max(0),
+                count: (UNFREEZE_V2_CAP - active).max(0),
             },
         ))
     }
@@ -1351,6 +1380,15 @@ impl Wallet for WalletService {
         req: Request<protocol::CanWithdrawUnfreezeAmountRequestMessage>,
     ) -> Result<Response<protocol::CanWithdrawUnfreezeAmountResponseMessage>, Status> {
         let r = req.into_inner();
+        // java `Wallet.getCanWithdrawUnfreezeAmount`: a negative timestamp
+        // returns 0 outright; a timestamp of EXACTLY 0 is substituted with
+        // the latest block-header timestamp (the gRPC path previously did
+        // neither, treating an unset/0 timestamp literally).
+        if r.timestamp < 0 {
+            return Ok(Response::new(
+                protocol::CanWithdrawUnfreezeAmountResponseMessage { amount: 0 },
+            ));
+        }
         if r.owner_address.len() != 21 {
             return Ok(Response::new(
                 protocol::CanWithdrawUnfreezeAmountResponseMessage { amount: 0 },
@@ -1365,12 +1403,20 @@ impl Wallet for WalletService {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let now_ms = if r.timestamp == 0 {
+            self.state
+                .dyn_props
+                .latest_block_header_timestamp()
+                .unwrap_or(0)
+        } else {
+            r.timestamp
+        };
         // Sum every `unfrozen_v2` entry whose `unfreeze_expire_time`
-        // is at or before the requested timestamp — those are claimable.
+        // is at or before the effective timestamp — those are claimable.
         let amount: i64 = acct
             .unfrozen_v2
             .iter()
-            .filter(|e| e.unfreeze_expire_time <= r.timestamp)
+            .filter(|e| e.unfreeze_expire_time <= now_ms)
             .map(|e| e.unfreeze_amount)
             .sum();
         Ok(Response::new(
@@ -2088,13 +2134,23 @@ impl Wallet for WalletService {
                 protocol::DelegatedResourceAccountIndex::default(),
             ));
         };
-        // v1 layout uses the simple address-keyed legacy entry.
-        let key = tron_chainbase::DelegatedResourceAccountIndexStore::legacy_key(
-            &Address::from_raw(addr),
-        );
-        Ok(Response::new(
-            idx.get_raw(&key).ok().flatten().unwrap_or_default(),
-        ))
+        let address = Address::from_raw(addr);
+        // java `getIndex`: a legacy aggregated row (bare 21-byte key) wins
+        // if present; otherwise prefix-scan the V1 FROM/TO slices
+        // (0x01/0x02), sorting each by timestamp.
+        let legacy_key =
+            tron_chainbase::DelegatedResourceAccountIndexStore::legacy_key(&address);
+        if let Ok(Some(legacy)) = idx.get_raw(&legacy_key) {
+            return Ok(Response::new(legacy));
+        }
+        let aggregated = tron_rpc::methods::scan_delegate_account_index(
+            &self.state,
+            &address,
+            tron_chainbase::V1_FROM_PREFIX,
+            tron_chainbase::V1_TO_PREFIX,
+        )
+        .map_err(|e| Status::internal(e.message))?;
+        Ok(Response::new(aggregated))
     }
 
     async fn get_delegated_resource_account_index_v2(
@@ -2109,20 +2165,21 @@ impl Wallet for WalletService {
         }
         let mut addr = [0u8; 21];
         addr.copy_from_slice(&v);
-        let Some(idx) = &self.state.delegated_resource_account_index else {
+        if self.state.delegated_resource_account_index.is_none() {
             return Ok(Response::new(
                 protocol::DelegatedResourceAccountIndex::default(),
             ));
-        };
-        // v2 indexes are split per from/to direction and per receiver
-        // — proper assembly needs a prefix-scan helper that the store
-        // doesn't yet expose. Fall back to legacy until that lands.
-        let key = tron_chainbase::DelegatedResourceAccountIndexStore::legacy_key(
+        }
+        // java `getV2Index`: always prefix-scan the V2 FROM/TO slices
+        // (0x03/0x04), sorting each by timestamp; no legacy fallback.
+        let aggregated = tron_rpc::methods::scan_delegate_account_index(
+            &self.state,
             &Address::from_raw(addr),
-        );
-        Ok(Response::new(
-            idx.get_raw(&key).ok().flatten().unwrap_or_default(),
-        ))
+            tron_chainbase::V2_FROM_PREFIX,
+            tron_chainbase::V2_TO_PREFIX,
+        )
+        .map_err(|e| Status::internal(e.message))?;
+        Ok(Response::new(aggregated))
     }
 
     async fn get_can_delegated_max_size(
@@ -2550,7 +2607,22 @@ impl Wallet for WalletService {
         &self,
         req: Request<protocol::TriggerSmartContract>,
     ) -> Result<Response<TransactionExtention>, Status> {
+        // java `Wallet.callConstantContract` throws when supportConstant
+        // is off ("this node does not support constant"). The JSON-RPC
+        // path already gates; mirror it here.
+        if !self.state.support_constant {
+            return Err(Status::failed_precondition(
+                "this node does not support constant",
+            ));
+        }
         let trigger = req.into_inner();
+        // java `VMActuator.validate`: reject callValue < 0 on the
+        // constant-call/validate path (EnergyLimitHardFork is active on
+        // mainnet). The on-chain actuator clamps elsewhere; here we
+        // surface the validate error rather than running with value 0.
+        if trigger.call_value < 0 {
+            return Err(Status::invalid_argument("callValue must be >= 0"));
+        }
         let outcome = run_constant_call(&self.state, &trigger);
         build_constant_response(&self.state, &trigger, outcome).map(Response::new)
     }
@@ -2559,52 +2631,61 @@ impl Wallet for WalletService {
         &self,
         req: Request<protocol::TriggerSmartContract>,
     ) -> Result<Response<protocol::EstimateEnergyMessage>, Status> {
+        // java `Wallet.estimateEnergy`: throws if estimateEnergy is off,
+        // then if supportConstant is off. The JSON-RPC path gates the
+        // same way.
+        if !self.state.estimate_energy {
+            return Err(Status::failed_precondition(
+                "this node does not support estimate energy",
+            ));
+        }
+        if !self.state.support_constant {
+            return Err(Status::failed_precondition(
+                "this node does not support constant, so estimate energy cannot work",
+            ));
+        }
         let trigger = req.into_inner();
-        let outcome = run_constant_call(&self.state, &trigger);
-        let (success, energy_required, message) = match &outcome {
-            Some(tron_tvm::execute::VmOutcome::Success { energy_used, .. }) => {
-                (true, *energy_used as i64, String::new())
-            }
-            Some(tron_tvm::execute::VmOutcome::Revert {
-                energy_used,
-                return_data,
-                ..
-            }) => (
-                false,
-                *energy_used as i64,
-                format!("REVERT: 0x{}", hex::encode(return_data)),
-            ),
-            Some(tron_tvm::execute::VmOutcome::TransferFailed { energy_used }) => {
-                (false, *energy_used as i64, "TRANSFER_FAILED".to_string())
-            }
-            Some(tron_tvm::execute::VmOutcome::Halt {
-                reason,
-                energy_used,
-                ..
-            }) => (false, *energy_used as i64, format!("{reason:?}")),
-            Some(tron_tvm::execute::VmOutcome::CallTokenIgnored {
-                token_id,
-                call_token_value,
-            }) => (
+        if trigger.call_value < 0 {
+            return Err(Status::invalid_argument("callValue must be >= 0"));
+        }
+        if self.state.eth_call_backends.is_none() {
+            return Err(Status::failed_precondition(
+                "EVM backends not configured on this node",
+            ));
+        }
+
+        // java `Wallet.estimateEnergy`: binary-search the minimal feeLimit
+        // at which the constant call still succeeds; each probe runs the
+        // call with energy budget `min(maxEnergyLimitForConstant,
+        // feeLimit / energyFee)`; return `ceil(high / energyFee)`. Shared
+        // search core with the JSON-RPC path.
+        let state = &self.state;
+        let energy_fee = tron_rpc::methods::constant_call_energy_fee(state);
+        let max_energy = state.constant_call_energy_limit;
+        let trigger_ref = &trigger;
+        let search = tron_rpc::methods::estimate_energy_search(
+            energy_fee,
+            state.max_fee_limit,
+            state.estimate_energy_max_retry,
+            |fee_limit| {
+                let budget = ((fee_limit / energy_fee.max(1)) as u64).min(max_energy);
+                match run_constant_call_with_budget(state, trigger_ref, budget) {
+                    Some(outcome) => tron_rpc::methods::outcome_to_estimate_probe(&outcome),
+                    None => tron_rpc::methods::EstimateProbe::Abort {
+                        message: "EVM backends not configured on this node".to_string(),
+                    },
+                }
+            },
+        );
+
+        let (success, energy_required, message) = match search {
+            Ok(Some(energy_required)) => (true, energy_required, String::new()),
+            Ok(None) => (
                 false,
                 0,
-                format!(
-                    "CALLTOKEN not implemented in estimate; token_id={} value={}",
-                    token_id, call_token_value
-                ),
+                "estimate failed: constant call reverted at maxFeeLimit".to_string(),
             ),
-            Some(tron_tvm::execute::VmOutcome::PreflightError(e)) => {
-                (false, 0, format!("preflight: {e}"))
-            }
-            Some(tron_tvm::execute::VmOutcome::Timeout {
-                energy_used,
-                deadline_ms,
-            }) => (
-                false,
-                *energy_used as i64,
-                format!("constant call timed out after {deadline_ms}ms"),
-            ),
-            None => (false, 0, "EVM backends not configured on this node".into()),
+            Err(e) => (false, 0, e.message),
         };
         Ok(Response::new(protocol::EstimateEnergyMessage {
             result: Some(Return {
