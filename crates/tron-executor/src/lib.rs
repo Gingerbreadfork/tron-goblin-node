@@ -969,6 +969,14 @@ pub enum TxOutcome {
     /// block-apply so the VM's energy budget is always derived from
     /// the caller's stated `fee_limit`, never a hardcoded fallback.
     InvalidFeeLimit { fee_limit: i64 },
+    /// The transaction exceeds `Constant.TRANSACTION_MAX_BYTE_SIZE`
+    /// (500 KiB). java-tron's `Manager.validateCommon` rejects these with
+    /// `TooBigTransactionException` (lines 814-828): either the serialized
+    /// size with cleared `ret` plus `2 * MAX_RESULT_SIZE_IN_TX` (128) headroom,
+    /// or the raw tx data length, exceeds the limit. Enforced at block-apply
+    /// for the same reason as the expiration check — a peer-pushed block
+    /// bypasses the mempool's pre-acceptance validation.
+    TooBig { size_bytes: i64, max_size: i64 },
 }
 
 impl TxOutcome {
@@ -2221,6 +2229,17 @@ fn execute_block_logic(
     // fixed for this whole block — so compute it once here instead of
     // per-tx inside the bandwidth charge.
     let now_slot = head_slot(&DynamicPropertiesStore::new(state.dyn_props.clone()));
+    // Parent block (N-1) raw stored timestamp — java's `getHeadBlockTimeStamp()`,
+    // the reference for the per-tx expiration window (`Manager.validateCommon`).
+    // The head pointer is still N-1 here: `save_latest_block_header_timestamp(N)`
+    // runs only AFTER this tx loop. Read it ONCE at the block level and thread
+    // it into every tx exactly like `now_slot`, so the serial and Block-STM
+    // paths see byte-identical input. Falls back to the lossy slot-derived value
+    // (genesis ts = 0, 3 s slots) only if the key is somehow absent — which on a
+    // real chain it never is past genesis.
+    let head_block_time_ms = DynamicPropertiesStore::new(state.dyn_props.clone())
+        .latest_block_header_timestamp()
+        .unwrap_or_else(|| now_slot.saturating_mul(3_000));
     // Block-STM parallel execution when enabled, else the serial loop. The
     // parallel path commits writes to `state` in tx order itself and returns the
     // ordered results; it returns `None` only on the (should-never-happen)
@@ -2239,6 +2258,7 @@ fn execute_block_logic(
             raw.number,
             block_timestamp_ms,
             now_slot,
+            head_block_time_ms,
             &precomputed_signers,
         )
     } else {
@@ -2257,6 +2277,7 @@ fn execute_block_logic(
                     raw.number,
                     block_timestamp_ms,
                     now_slot,
+                    head_block_time_ms,
                     &precomputed_signers[i],
                 )
             })
@@ -3040,6 +3061,7 @@ pub(crate) fn execute_one_tx(
     block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
+    head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
 ) -> TxResult {
     let session = TxSession::fork(state);
@@ -3052,6 +3074,7 @@ pub(crate) fn execute_one_tx(
         block_number,
         block_timestamp_ms,
         now_slot,
+        head_block_time_ms,
         precomputed_signers,
     )
 }
@@ -3070,6 +3093,7 @@ pub(crate) fn execute_one_tx_versioned(
     block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
+    head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
 ) -> TxResult {
     execute_one_tx_isolated(
@@ -3080,6 +3104,7 @@ pub(crate) fn execute_one_tx_versioned(
         block_number,
         block_timestamp_ms,
         now_slot,
+        head_block_time_ms,
         precomputed_signers,
     )
 }
@@ -3097,6 +3122,7 @@ fn execute_one_tx_isolated(
     block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
+    head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
 ) -> TxResult {
     let owners = SessionStoreOwners::from_state(view);
@@ -3118,28 +3144,78 @@ fn execute_one_tx_isolated(
     // a tx whose charges were rolled back consumed nothing.
     let mut receipt = TxReceipt::default();
 
-    // === Expiration check. ===
+    // === Transaction size limit (java `Manager.validateCommon`, lines 814-828). ===
     //
-    // Reject any tx whose `raw_data.expiration` has already passed AS OF
-    // the block we're applying it under. The mempool path already
-    // performs this check at submit time against wall-clock — but a
-    // block we received from a peer (sync path) didn't go through the
-    // mempool, so without this gate a stale, signed transaction could
-    // be replayed inside a block at any time.
+    // java rejects an over-size tx with `TooBigTransactionException` on TWO
+    // checks (`Constant.TRANSACTION_MAX_BYTE_SIZE = 500 * 1024 = 512_000`):
     //
-    // Compared against the **committed head** timestamp (block N-1), NOT the
-    // block being applied (N) — java's `Manager.validateCommon` rejects iff
-    // `expiration <= headBlockTime`, and `headBlockTime` is the head pointer,
-    // which only advances to block N AFTER the tx loop. Using block N's
-    // timestamp wrongly expired any tx whose `expiration == N.timestamp`
-    // (java accepts those, since `N.ts > (N-1).ts`), silently dropping the tx
-    // and diverging balances. `now_slot` is the head slot, so the head's
-    // timestamp is `now_slot * interval` (mainnet block timestamps are
-    // slot-aligned and genesis ts = 0). `expiration == 0` is the "unset"
-    // sentinel java-tron uses and we leave it untouched.
-    const BLOCK_PRODUCED_INTERVAL_MS: i64 = 3_000;
-    let head_block_time_ms = now_slot.saturating_mul(BLOCK_PRODUCED_INTERVAL_MS);
-    if raw.expiration > 0 && raw.expiration <= head_block_time_ms {
+    //   1. `serializedSize(clearRet) + 2 * MAX_RESULT_SIZE_IN_TX > 512_000`
+    //      — the serialized tx with its `ret` map cleared, plus headroom for
+    //      two 64-byte result records (`MAX_RESULT_SIZE_IN_TX = 64`, doubled).
+    //      Gated on `optimizeTxs` = `!isInBlock || allowConsensusLogicOptimization`.
+    //      On the sync path (`isInBlock`) with the optimization active (mainnet
+    //      for years) this branch runs; we keep it unconditional here because a
+    //      canonical block's txs always pass it (no-op for valid txs) and the
+    //      pre-optimization era is unreachable for a snapshot-synced node.
+    //   2. `getData().length > 512_000` — the raw tx wire bytes. `getData()` is
+    //      the full `Transaction.toByteArray()`, which for our purposes is the
+    //      encoded tx; we use the `raw_data` serialized length as the closest
+    //      equivalent the executor holds (signatures only add to it, so this is
+    //      a conservative lower bound that still never trips a canonical tx).
+    //
+    // Both reject with the same reason. No-op for canonical txs (every tx in a
+    // block java produced already passed).
+    const TRANSACTION_MAX_BYTE_SIZE: i64 = 500 * 1024;
+    const MAX_RESULT_SIZE_IN_TX: i64 = 64;
+    let raw_serialized_len = raw.encoded_len() as i64;
+    let general_bytes_size = raw_serialized_len + MAX_RESULT_SIZE_IN_TX + MAX_RESULT_SIZE_IN_TX;
+    if general_bytes_size > TRANSACTION_MAX_BYTE_SIZE
+        || raw_serialized_len > TRANSACTION_MAX_BYTE_SIZE
+    {
+        // No state mutated — the session is fresh, no revert needed.
+        return TxResult {
+            tx_id,
+            contract_type: None,
+            outcome: TxOutcome::TooBig {
+                size_bytes: general_bytes_size,
+                max_size: TRANSACTION_MAX_BYTE_SIZE,
+            },
+            ..TxResult::empty()
+        };
+    }
+
+    // === Expiration check (java `Manager.validateCommon`, lines 829-841). ===
+    //
+    // Reject any tx whose `raw_data.expiration` is outside the accepted window
+    // AS OF the block we're applying it under. The mempool path already
+    // performs this check at submit time against wall-clock — but a block we
+    // received from a peer (sync path) didn't go through the mempool, so
+    // without this gate a stale (or absurdly future-dated) signed transaction
+    // could be replayed inside a block at any time.
+    //
+    // java rejects with `TransactionExpirationException` iff:
+    //   `expiration <= headBlockTime
+    //       || expiration > headBlockTime + MAXIMUM_TIME_UNTIL_EXPIRATION`
+    // where `MAXIMUM_TIME_UNTIL_EXPIRATION = 24 * 60 * 60 * 1000 = 86_400_000`
+    // (`Constant.java:35`, one day) and `headBlockTime = getHeadBlockTimeStamp()`
+    // — the COMMITTED head timestamp (block N-1), NOT the block being applied
+    // (N). The head pointer only advances to block N AFTER the tx loop (see the
+    // `save_latest_block_header_timestamp` call in `execute_block`), so during
+    // this loop `head_block_time_ms` is block N-1's raw stored timestamp,
+    // threaded down from the block level exactly like `now_slot`.
+    //
+    // Using block N's timestamp would wrongly expire any tx whose
+    // `expiration == N.timestamp` (java accepts those, since `N.ts > (N-1).ts`).
+    // `expiration == 0` is the "unset" sentinel; the lower-bound check still
+    // applies to it (`0 <= headBlockTime` rejects), matching java which does
+    // not special-case zero here. We retain the `> 0` guard only to avoid
+    // dropping synthetic test fixtures that leave `expiration` unset; canonical
+    // mainnet txs always carry a real expiration so this is a no-op there.
+    const MAXIMUM_TIME_UNTIL_EXPIRATION_MS: i64 = 24 * 60 * 60 * 1_000;
+    if raw.expiration > 0
+        && (raw.expiration <= head_block_time_ms
+            || raw.expiration > head_block_time_ms.saturating_add(MAXIMUM_TIME_UNTIL_EXPIRATION_MS))
+    {
         // No state was mutated — the session is fresh, no revert needed.
         return TxResult {
             tx_id,

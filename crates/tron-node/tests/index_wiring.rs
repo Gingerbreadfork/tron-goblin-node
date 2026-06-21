@@ -51,6 +51,15 @@ fn caller_keypair(seed: u8) -> ([u8; 32], [u8; 21]) {
 
 fn fresh_state() -> (StateBackends, Arc<dyn KvBackend>) {
     let blocks_be = mem();
+    let dyn_props_be = mem();
+    // Seed the committed head (genesis/block 0) timestamp so the per-tx
+    // expiration window (`Manager.validateCommon`: `expiration <= headTime`
+    // and `expiration > headTime + 24h` both reject) has a realistic
+    // reference when block 1 is applied. The test txs carry
+    // `expiration = base + 86_400_000`, which sits exactly at the accepted
+    // upper bound for `base = 1_700_000_000_000` (the `>` check is strict).
+    tron_chainbase::DynamicPropertiesStore::new(dyn_props_be.clone())
+        .save_latest_block_header_timestamp(1_700_000_000_000);
     (
         StateBackends {
             accounts: mem(),
@@ -59,7 +68,7 @@ fn fresh_state() -> (StateBackends, Arc<dyn KvBackend>) {
             delegation: mem(),
             delegated_resources: mem(),
             delegated_resource_account_index: None,
-            dyn_props: mem(),
+            dyn_props: dyn_props_be,
             proposals: mem(),
             name_index: mem(),
             id_index: mem(),

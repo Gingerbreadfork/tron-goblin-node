@@ -3,11 +3,15 @@
 
 use std::sync::Arc;
 
-use tron_chainbase::{KvBackend, MemBackend, VotesStore, WitnessScheduleStore, WitnessStore};
+use tron_chainbase::{
+    AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend, VotesStore,
+    WitnessScheduleStore, WitnessStore,
+};
 use tron_consensus::{
-    ab_slot, best_head, compute_next_maintenance_time, is_maintenance_boundary, scheduled_witness,
-    scheduled_witness_index, slot_time_ms, update_active_witnesses, verify_block_witness,
-    ConsensusError, ForkChoice, BLOCK_PRODUCED_INTERVAL_MS, MAX_ACTIVE_WITNESS_NUM,
+    ab_slot, apply_maintenance, best_head, compute_next_maintenance_time, is_maintenance_boundary,
+    scheduled_witness, scheduled_witness_index, slot_time_ms, update_active_witnesses,
+    verify_block_witness, ConsensusError, ForkChoice, BLOCK_PRODUCED_INTERVAL_MS,
+    MAX_ACTIVE_WITNESS_NUM,
 };
 use tron_crypto::address::Address;
 use tron_proto::block_header::Raw as BlockHeaderRaw;
@@ -398,6 +402,178 @@ fn update_active_witnesses_caps_at_27() {
     // Highest 27 by vote_count: indices 3..30 (vote_count 3..29).
     assert_eq!(report.new_active[0], candidates[29]);
     assert_eq!(report.new_active[26], candidates[3]);
+}
+
+#[test]
+fn update_active_witnesses_breaks_vote_tie_by_address_bytes_desc() {
+    // java `WitnessStore.sortWitnesses` with `isSortOpt = true` (the
+    // `allowWitnessSortOptimization` proposal, active on mainnet for years)
+    // sorts vote DESC then `createReadableString().reversed()` — the hex of
+    // the address DESCENDING, which is byte-order DESCENDING. On a vote tie
+    // at the top of the ranking the HIGHER address must come first.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+
+    // Two candidates with identical vote_count; distinct address bytes.
+    let low = addr(1);
+    let high = addr(2);
+    for a in [low, high] {
+        witnesses
+            .put(
+                &a,
+                &Witness {
+                    address: a.as_bytes().to_vec(),
+                    vote_count: 500,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let report =
+        update_active_witnesses(&witnesses, &votes, &schedule, &[], &[low, high]).unwrap();
+
+    // Equal votes → higher address bytes ranks first (DESC tie-break).
+    assert_eq!(report.new_active[0], high);
+    assert_eq!(report.new_active[1], low);
+}
+
+#[test]
+fn apply_maintenance_empty_vote_cycle_leaves_active_list_untouched() {
+    // java `MaintenanceManager.doMaintenance` wraps updateWitness + reward +
+    // isJobs in `if (!countWitness.isEmpty())`. A cycle with no vote
+    // mutations (empty `countWitness`) must NOT re-rank, re-`save_active`, pay
+    // legacy rewards, or flip `isJobs`: the persisted active list stays
+    // exactly as the previous cycle wrote it.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+    let accounts = AccountStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let dyn_props = DynamicPropertiesStore::new(mem());
+
+    // Two registered witnesses, ranked low → high by vote_count.
+    let w_lo = addr(10);
+    let w_hi = addr(20);
+    witnesses
+        .put(
+            &w_lo,
+            &Witness {
+                address: w_lo.as_bytes().to_vec(),
+                vote_count: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    witnesses
+        .put(
+            &w_hi,
+            &Witness {
+                address: w_hi.as_bytes().to_vec(),
+                vote_count: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Seed a STALE persisted active list that does NOT match the current
+    // vote-count ranking — if the gate is broken, the no-op cycle would
+    // re-rank and overwrite this with [w_hi, w_lo].
+    let stale_active = vec![w_lo];
+    schedule.save_active(&stale_active).unwrap();
+
+    // No voter records at all → countWitness is empty.
+    let outcome = apply_maintenance(
+        &witnesses,
+        &votes,
+        &schedule,
+        &accounts,
+        &delegation,
+        &dyn_props,
+    )
+    .unwrap();
+
+    // Active list left exactly as it was — no re-rank, no save.
+    assert_eq!(schedule.load_active().unwrap().unwrap(), stale_active);
+    assert_eq!(outcome.new_active, stale_active);
+    assert!(!outcome.changed);
+    // Vote counts untouched (no accumulation step ran).
+    assert_eq!(witnesses.get(&w_lo).unwrap().unwrap().vote_count, 100);
+    assert_eq!(witnesses.get(&w_hi).unwrap().unwrap().vote_count, 200);
+    // Legacy reward (flag off by default in fresh dyn_props) did not pay out.
+    assert!(accounts.get(&w_lo).unwrap().is_none());
+    assert!(accounts.get(&w_hi).unwrap().is_none());
+}
+
+#[test]
+fn apply_maintenance_nonempty_vote_cycle_reranks_and_saves() {
+    // The companion to the empty-cycle no-op: with a real vote mutation,
+    // `countWitness` is non-empty so the re-rank + save_active DO run.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+    let accounts = AccountStore::new(mem());
+    let delegation = DelegationStore::new(mem());
+    let dyn_props = DynamicPropertiesStore::new(mem());
+
+    let w_a = addr(10);
+    let w_b = addr(20);
+    witnesses
+        .put(
+            &w_a,
+            &Witness {
+                address: w_a.as_bytes().to_vec(),
+                vote_count: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    witnesses
+        .put(
+            &w_b,
+            &Witness {
+                address: w_b.as_bytes().to_vec(),
+                vote_count: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    schedule.save_active(&[w_b, w_a]).unwrap();
+
+    // A voter pushes w_a past w_b: +500 to w_a.
+    let voter = addr(100);
+    votes
+        .put(
+            &voter,
+            &Votes {
+                address: voter.as_bytes().to_vec(),
+                old_votes: Vec::new(),
+                new_votes: vec![AccountVote {
+                    vote_address: w_a.as_bytes().to_vec(),
+                    vote_count: 500,
+                }],
+            },
+        )
+        .unwrap();
+
+    let outcome = apply_maintenance(
+        &witnesses,
+        &votes,
+        &schedule,
+        &accounts,
+        &delegation,
+        &dyn_props,
+    )
+    .unwrap();
+
+    // w_a now 600 > w_b 200 → re-ranked and persisted.
+    assert_eq!(witnesses.get(&w_a).unwrap().unwrap().vote_count, 600);
+    assert_eq!(outcome.new_active, vec![w_a, w_b]);
+    assert!(outcome.changed);
+    assert_eq!(schedule.load_active().unwrap().unwrap(), vec![w_a, w_b]);
+    // Votes store cleared for the next cycle.
+    assert!(votes.get(&voter).unwrap().is_none());
 }
 
 // =============================================================================

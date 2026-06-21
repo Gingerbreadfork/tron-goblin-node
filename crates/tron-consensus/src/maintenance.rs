@@ -291,27 +291,57 @@ pub fn apply_maintenance(
         .map(|(a, _)| a)
         .collect();
     let prev_active = schedule.load_active()?.unwrap_or_default();
-    let report = update_active_witnesses(
-        witnesses,
-        votes,
-        schedule,
-        &voters,
-        &candidate_witnesses,
-    )?;
-    // Clear the votes store so the next cycle starts fresh.
+
+    // java-tron `MaintenanceManager.doMaintenance` (lines 102-149) wraps the
+    // entire `updateWitness` + `incentiveManager.reward` + `isJobs` flip block
+    // in `if (!countWitness.isEmpty())`. `countWitness` is this cycle's vote
+    // tally (`countVote`), which inserts a key for EVERY vote entry across
+    // every voter's `old_votes` / `new_votes` — so it is empty iff no voter
+    // record carried any vote entry at all. When it is empty java touches
+    // NOTHING: no vote-count accumulation, no re-rank, no `save_active`, no
+    // reward payout, no `isJobs` flip — the persisted active list is left
+    // exactly as the previous cycle wrote it. We must do the same, or a
+    // zero-vote-mutation cycle would re-rank/persist (and, on the legacy path,
+    // pay rewards) where java is a no-op. The vote-store clear, the Vi
+    // accumulation (Step 1) and the cycle-advance / brokerage snapshot (Step 5)
+    // stay OUTSIDE the gate, matching java (lines 95-100 and 151-159 sit
+    // outside the `if`, and the iterator in `countVote` deletes as it walks).
+    let count_witness_empty = all_votes
+        .iter()
+        .all(|(_, v)| v.old_votes.is_empty() && v.new_votes.is_empty());
+
+    let report = if count_witness_empty {
+        // No vote mutations this cycle — leave the active list untouched.
+        MaintenanceReport {
+            new_active: prev_active.clone(),
+            changed: false,
+            vote_deltas: Vec::new(),
+        }
+    } else {
+        update_active_witnesses(witnesses, votes, schedule, &voters, &candidate_witnesses)?
+    };
+    // Clear the votes store so the next cycle starts fresh. java-tron clears
+    // unconditionally — `countVote`'s iterator deletes every record as it
+    // walks, regardless of whether the tally ends up empty.
     for (voter, _) in &all_votes {
         votes.delete(voter)?;
     }
 
     // ── Step 3: legacy IncentiveManager.reward (only when flag off).
-    if !allow_change_delegation {
+    //    Gated on a non-empty vote tally to mirror java's `if (!countWitness
+    //    .isEmpty())` wrapper around `incentiveManager.reward`.
+    if !allow_change_delegation && !count_witness_empty {
         // Top 127 by vote_count.
         let mut by_vote: Vec<(Address, i64)> = witnesses
             .all()?
             .into_iter()
             .map(|(addr, w)| (addr, w.vote_count))
             .collect();
-        by_vote.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_bytes().cmp(b.0.as_bytes())));
+        // vote DESC then address-bytes DESC on a tie — `WitnessStore
+        // .sortWitnesses` with `isSortOpt = true` (mainnet) sorts by
+        // `createReadableString().reversed()`, the hex of the address
+        // descending, which is byte-order descending.
+        by_vote.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
         const STANDBY_LEN: usize = 127;
         by_vote.truncate(STANDBY_LEN);
         let vote_sum: i64 = by_vote.iter().map(|(_, v)| *v).sum();
@@ -332,19 +362,22 @@ pub fn apply_maintenance(
     }
 
     // ── Step 4: isJobs flip — mirror java-tron's MaintenanceManager line 134.
-    let prev_set: std::collections::HashSet<_> = prev_active.iter().copied().collect();
-    let new_set: std::collections::HashSet<_> = report.new_active.iter().copied().collect();
-    if prev_set != new_set {
-        for addr in prev_set.difference(&new_set) {
-            if let Some(mut w) = witnesses.get(addr)? {
-                w.is_jobs = false;
-                witnesses.put(addr, &w)?;
+    //    Inside the same `!countWitness.isEmpty()` wrapper as Step 2/3.
+    if !count_witness_empty {
+        let prev_set: std::collections::HashSet<_> = prev_active.iter().copied().collect();
+        let new_set: std::collections::HashSet<_> = report.new_active.iter().copied().collect();
+        if prev_set != new_set {
+            for addr in prev_set.difference(&new_set) {
+                if let Some(mut w) = witnesses.get(addr)? {
+                    w.is_jobs = false;
+                    witnesses.put(addr, &w)?;
+                }
             }
-        }
-        for addr in new_set.difference(&prev_set) {
-            if let Some(mut w) = witnesses.get(addr)? {
-                w.is_jobs = true;
-                witnesses.put(addr, &w)?;
+            for addr in new_set.difference(&prev_set) {
+                if let Some(mut w) = witnesses.get(addr)? {
+                    w.is_jobs = true;
+                    witnesses.put(addr, &w)?;
+                }
             }
         }
     }

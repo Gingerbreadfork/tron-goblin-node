@@ -110,6 +110,15 @@ impl StateBundle {
             (mem(), mem(), mem(), mem());
         let nullifiers_be = mem();
         let market_account_be = mem();
+        // Seed the committed head (block 0) timestamp so the per-tx expiration
+        // window has a realistic reference: `head_block_time_ms` reads this
+        // value (java's `getHeadBlockTimeStamp`). The default `transfer_tx`
+        // expiration is `head + MAXIMUM_TIME_UNTIL_EXPIRATION` (24h), which
+        // sits exactly at the accepted upper bound (the check is strict `>`),
+        // so default fixtures pass both expiration bounds. Without a head the
+        // genesis fallback (ts = 0) would reject any far-future expiration.
+        let base_dyn_props = DynamicPropertiesStore::new(dyn_props_be.clone());
+        base_dyn_props.save_latest_block_header_timestamp(1_700_000_000_000);
         Self {
             accounts: AccountStore::new(accounts_be.clone()),
             witnesses: WitnessStore::new(witnesses_be.clone()),
@@ -624,19 +633,24 @@ fn expiration_zero_sentinel_is_not_treated_as_expired() {
     assert_eq!(state.accounts.get(&addr(BOB)).unwrap().unwrap().balance, 100);
 }
 
-/// Companion: an `expiration` exactly one millisecond AFTER the block
-/// timestamp passes (the rejection condition is `<=`, not `<`). Pins
-/// the boundary so a future refactor doesn't accidentally make it
-/// inclusive on the high end.
+/// Companion: an `expiration` exactly one millisecond AFTER the committed
+/// head timestamp passes (the lower-bound rejection is `<=`, not `<`). Pins
+/// the boundary so a future refactor doesn't accidentally make it inclusive
+/// on the high end. The head must be set explicitly — `head_block_time_ms`
+/// reads the committed `latest_block_header_timestamp` (java's
+/// `getHeadBlockTimeStamp`), so the expiration must also sit BELOW the
+/// `head + MAXIMUM_TIME_UNTIL_EXPIRATION` upper bound (24h).
 #[test]
 fn expiration_one_ms_in_the_future_passes() {
     let state = StateBundle::fresh();
     put_account(&state.accounts, ALICE, 1_000_000);
     put_account(&state.accounts, BOB, 0);
 
+    let head_ts = 1_700_000_001_000; // committed head (block N-1)
+    state.dyn_props.save_latest_block_header_timestamp(head_ts);
+
     let mut tx = transfer_tx(ALICE, BOB, 100);
-    let block_ts = 1_700_000_000_000 + 3000;
-    tx.raw_data.as_mut().unwrap().expiration = block_ts + 1;
+    tx.raw_data.as_mut().unwrap().expiration = head_ts + 1; // 1ms after head
     // sign_transaction pushes (multi-sig semantics) — clear first so we
     // re-sign exactly once after the raw_data mutation above.
     tx.signature.clear();
@@ -648,6 +662,118 @@ fn expiration_one_ms_in_the_future_passes() {
         matches!(report.tx_results[0].outcome, TxOutcome::Success),
         "got: {:?}", report.tx_results[0].outcome
     );
+}
+
+/// Fix #2: the upper expiration bound. java's `Manager.validateCommon`
+/// (lines 835-836) rejects `expiration > headBlockTime +
+/// MAXIMUM_TIME_UNTIL_EXPIRATION` (`Constant.java:35` = 86_400_000 ms, one
+/// day) with `TransactionExpirationException`, in addition to the lower
+/// `expiration <= headBlockTime` bound. A tx dated more than 24h past the
+/// committed head is rejected as `Expired`.
+#[test]
+fn expiration_beyond_one_day_window_is_rejected() {
+    const MAXIMUM_TIME_UNTIL_EXPIRATION_MS: i64 = 24 * 60 * 60 * 1_000;
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    let head_ts = 1_700_000_001_000;
+    state.dyn_props.save_latest_block_header_timestamp(head_ts);
+
+    // Exactly the upper bound passes (`>` not `>=`); one ms past it is
+    // rejected. Run two txs in one block to pin BOTH sides of the boundary.
+    let at_bound_exp = head_ts + MAXIMUM_TIME_UNTIL_EXPIRATION_MS; // accepted
+    let past_bound_exp = head_ts + MAXIMUM_TIME_UNTIL_EXPIRATION_MS + 1; // rejected
+
+    let mut tx_ok = transfer_tx(ALICE, BOB, 100);
+    tx_ok.raw_data.as_mut().unwrap().expiration = at_bound_exp;
+    tx_ok.signature.clear();
+    tron_types::sign_transaction(&mut tx_ok, &ALICE_PRIV).expect("re-sign");
+
+    let mut tx_bad = transfer_tx(ALICE, BOB, 100);
+    tx_bad.raw_data.as_mut().unwrap().expiration = past_bound_exp;
+    tx_bad.signature.clear();
+    tron_types::sign_transaction(&mut tx_bad, &ALICE_PRIV).expect("re-sign");
+
+    let block = build_block(1, [0u8; 32], vec![tx_ok, tx_bad]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+
+    assert!(
+        matches!(report.tx_results[0].outcome, TxOutcome::Success),
+        "tx at the 24h bound must pass: {:?}",
+        report.tx_results[0].outcome
+    );
+    match &report.tx_results[1].outcome {
+        TxOutcome::Expired { expiration_ms, block_timestamp_ms } => {
+            assert_eq!(*expiration_ms, past_bound_exp);
+            assert_eq!(*block_timestamp_ms, head_ts);
+        }
+        other => panic!("tx past the 24h bound must be Expired, got {other:?}"),
+    }
+    // Only the accepted tx moved funds (100), the rejected one did not.
+    assert_eq!(state.accounts.get(&addr(BOB)).unwrap().unwrap().balance, 100);
+}
+
+/// Fix #4: the transaction size limit. java's `Manager.validateCommon`
+/// (lines 814-828) rejects a tx whose serialized size (with `ret` cleared)
+/// plus `2 * MAX_RESULT_SIZE_IN_TX` (128) exceeds
+/// `Constant.TRANSACTION_MAX_BYTE_SIZE` (500 KiB = 512_000) — or whose raw
+/// data length alone exceeds it — with `TooBigTransactionException`. We
+/// enforce at block-apply (peer-pushed blocks bypass the mempool). Inflate
+/// the tx `data` (memo) field past the limit; the size gate rejects it
+/// before any fee is charged.
+#[test]
+fn oversize_transaction_is_rejected_at_block_apply() {
+    const TRANSACTION_MAX_BYTE_SIZE: usize = 500 * 1024;
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    let mut tx = transfer_tx(ALICE, BOB, 100);
+    // A memo larger than the limit pushes the serialized raw_data past
+    // 512_000 bytes on its own.
+    tx.raw_data.as_mut().unwrap().data = vec![0x7au8; TRANSACTION_MAX_BYTE_SIZE + 1];
+    tx.signature.clear();
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).expect("re-sign");
+
+    let block = build_block(1, [0u8; 32], vec![tx]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+
+    match &report.tx_results[0].outcome {
+        TxOutcome::TooBig { size_bytes, max_size } => {
+            assert_eq!(*max_size, TRANSACTION_MAX_BYTE_SIZE as i64);
+            assert!(
+                *size_bytes > TRANSACTION_MAX_BYTE_SIZE as i64,
+                "reported size {size_bytes} must exceed the limit"
+            );
+        }
+        other => panic!("expected TxOutcome::TooBig, got {other:?}"),
+    }
+    // No state mutation and no fee charged — Alice keeps her full balance.
+    assert_eq!(
+        state.accounts.get(&addr(ALICE)).unwrap().unwrap().balance,
+        1_000_000_000
+    );
+    assert_eq!(state.accounts.get(&addr(BOB)).unwrap().unwrap().balance, 0);
+}
+
+/// Companion: a normal-sized transfer is NOT rejected by the size gate —
+/// pins that the +128 result headroom doesn't false-trip a legitimate tx
+/// well under the limit.
+#[test]
+fn normal_size_transaction_passes_the_size_gate() {
+    let state = StateBundle::fresh();
+    put_account(&state.accounts, ALICE, 1_000_000);
+    put_account(&state.accounts, BOB, 0);
+
+    let block = build_block(1, [0u8; 32], vec![transfer_tx(ALICE, BOB, 100)]);
+    let report = execute_block(&state.backends(), &block, None).unwrap();
+    assert!(
+        matches!(report.tx_results[0].outcome, TxOutcome::Success),
+        "got: {:?}",
+        report.tx_results[0].outcome
+    );
+    assert_eq!(state.accounts.get(&addr(BOB)).unwrap().unwrap().balance, 100);
 }
 
 /// Regression: the default `ExecConfig` requires a non-empty

@@ -86,6 +86,43 @@ fn seed_alice(state: &StateBackends) {
     ).unwrap();
 }
 
+/// The fixed Nov-2023 base that every block-builder call site writes its
+/// timestamps relative to (genesis = this value, block 2 = `+3000`, etc.).
+/// The builders translate it to a wall-clock-anchored base at runtime (see
+/// [`block_time_base_ms`]) so it never appears on the actual chain.
+const FIXED_BLOCK_TIME_BASE_MS: i64 = 1_700_000_000_000;
+
+/// Wall-clock-anchored block-time base, computed once per process.
+///
+/// These tests have two expiration windows that must AGREE on the same tx:
+///   * block-apply (`Manager.validateCommon`): rejects `expiration <= headTime`
+///     or `expiration > headTime + 24h`, where `headTime` is the committed
+///     parent block's timestamp;
+///   * mempool repush: a separate WALL-CLOCK comparison against `now`.
+/// A reorged-out tx must pass apply (so it landed in the reorged block) AND be
+/// re-pushable (wall-clock future). That only holds when the chain head sits
+/// near wall-clock `now`, so we anchor block timestamps (and tx expirations) to
+/// `now` rather than a fixed 2023 value — otherwise the >1-day gap between a
+/// fixed-2023 head and a wall-clock-future expiration trips the 24h upper bound.
+/// Floored to a 3 s slot boundary to keep block timestamps slot-aligned.
+fn block_time_base_ms() -> i64 {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<i64> = OnceLock::new();
+    *BASE.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        (now / 3_000) * 3_000
+    })
+}
+
+/// Translate a fixed-base block timestamp (`FIXED_BLOCK_TIME_BASE_MS + delta`)
+/// from a call site into the runtime wall-clock-anchored base.
+fn rebase_block_ts(fixed_ts: i64) -> i64 {
+    block_time_base_ms() + (fixed_ts - FIXED_BLOCK_TIME_BASE_MS)
+}
+
 /// Build a signed transfer tx from a deterministic owner derived from
 /// `seed` so distinct seeds produce distinct tx_ids. Owner is funded
 /// in the mempool's view (the validator runs against an empty
@@ -102,10 +139,7 @@ fn signed_transfer(seed: u8, expiration_offset_ms: i64) -> (Transaction, [u8; 32
         to_address: to.to_vec(),
         amount: 100,
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let base_ms = block_time_base_ms();
     let mut tx = Transaction {
         raw_data: Some(TxRaw {
             contract: vec![TxContract {
@@ -116,8 +150,8 @@ fn signed_transfer(seed: u8, expiration_offset_ms: i64) -> (Transaction, [u8; 32
                 }),
                 ..Default::default()
             }],
-            expiration: now_ms + expiration_offset_ms,
-            timestamp: now_ms,
+            expiration: base_ms + expiration_offset_ms,
+            timestamp: base_ms,
             ..Default::default()
         }),
         signature: vec![],
@@ -146,10 +180,7 @@ fn alice_transfer(to: [u8; 21], amount: i64, expiration_offset_ms: i64) -> Trans
         to_address: to.to_vec(),
         amount,
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let base_ms = block_time_base_ms();
     let mut tx = Transaction {
         raw_data: Some(TxRaw {
             contract: vec![TxContract {
@@ -160,8 +191,8 @@ fn alice_transfer(to: [u8; 21], amount: i64, expiration_offset_ms: i64) -> Trans
                 }),
                 ..Default::default()
             }],
-            expiration: now_ms + expiration_offset_ms,
-            timestamp: now_ms,
+            expiration: base_ms + expiration_offset_ms,
+            timestamp: base_ms,
             ..Default::default()
         }),
         signature: vec![],
@@ -173,6 +204,7 @@ fn alice_transfer(to: [u8; 21], amount: i64, expiration_offset_ms: i64) -> Trans
 }
 
 fn block_with_tx(num: i64, parent_hash: [u8; 32], ts: i64, tx: Transaction) -> Block {
+    let ts = rebase_block_ts(ts);
     let txs = vec![tx];
     let tx_trie = tron_types::calc_tx_trie_root(&txs)
         .map(|h| h.to_vec())
@@ -198,6 +230,7 @@ fn block_with_tx(num: i64, parent_hash: [u8; 32], ts: i64, tx: Transaction) -> B
 }
 
 fn empty_block(num: i64, parent_hash: [u8; 32], ts: i64) -> Block {
+    let ts = rebase_block_ts(ts);
     let mut block = Block {
         transactions: Vec::new(),
         block_header: Some(BlockHeader {
@@ -353,9 +386,10 @@ fn expired_tx_dropped_during_repush() {
     let mempool = Arc::new(TxMempool::new(MempoolConfig::default()));
     let mut driver = make_driver(state.clone(), blocks_be, stack, mempool.clone());
 
-    // Tx with a 1ms expiration window — by the time the reorg runs
-    // it'll be expired. Block-apply doesn't check expiration so the
-    // block accepts; mempool.submit DOES check.
+    // Tx with a 1ms-after-head expiration — block 2a accepts it (its
+    // expiration is `head + 1`, inside the block-apply window), but by the
+    // time the reorg runs wall-clock has elapsed past it, so the mempool
+    // repush's wall-clock expiry check drops it.
     let (tx, tx_id_bytes, _raw) = signed_transfer(0x99, 1);
 
     let g = empty_block(1, [0u8; 32], 1_700_000_000_000);

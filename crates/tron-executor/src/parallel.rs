@@ -388,6 +388,7 @@ pub(crate) fn execute_block_parallel(
     block_number: i64,
     block_timestamp_ms: i64,
     now_slot: i64,
+    head_block_time_ms: i64,
     signers: &[Result<Vec<Address>, String>],
 ) -> Option<Vec<TxResult>> {
     let n = txs.len();
@@ -442,6 +443,7 @@ pub(crate) fn execute_block_parallel(
             block_number,
             block_timestamp_ms,
             now_slot,
+            head_block_time_ms,
             &signers[i],
         );
         // Publish the EFFECTIVE write-set (no-op read-modify-writes dropped —

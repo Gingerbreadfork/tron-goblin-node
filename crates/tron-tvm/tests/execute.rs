@@ -118,6 +118,70 @@ fn execute_trigger_succeeds_for_simple_return_contract() {
     }
 }
 
+/// A memory expansion past the 3 MiB cap (`EnergyCost.MEM_LIMIT`) must halt
+/// with `OUT_OF_MEMORY`, NOT `OUT_OF_ENERGY`. java-tron's
+/// `EnergyCost.checkMemorySize` throws `OutOfMemoryException` when
+/// `newMemSize > MEM_LIMIT` (EnergyCost.java:543-547), which
+/// `RuntimeImpl.setResultCode` maps to `contractResult OUT_OF_MEMORY`
+/// (RuntimeImpl.java:110-112). revm surfaces the same cap breach as
+/// `OutOfGasError::MemoryLimit`, distinct from an ordinary energy OOG.
+#[test]
+fn memory_expansion_past_3mib_halts_out_of_memory() {
+    use tron_proto::transaction::result::ContractResult;
+
+    let stores = fresh_stores();
+    // MSTORE at byte offset 4 MiB (0x0040_0000) expands memory to 4 MiB + 32,
+    // exceeding the 3 MiB hard cap → MemoryLimitOOG. MSTORE pops `offset`
+    // (top of stack) then `value`, so push the value first and the offset on
+    // top.
+    //   PUSH1 0x00         // value
+    //   PUSH4 0x00400000   // offset = 4 MiB (> 3 MiB cap)
+    //   MSTORE
+    //   STOP
+    let contract_addr = install_contract(
+        &stores,
+        0xcb,
+        &[
+            0x60, 0x00, // PUSH1 0          (value)
+            0x63, 0x00, 0x40, 0x00, 0x00, // PUSH4 0x00400000 (offset)
+            0x52, // MSTORE
+            0x00, // STOP
+        ],
+    );
+    let owner_addr = fund_account(&stores, 0xab, 1_000_000_000);
+
+    let trigger = TriggerSmartContract {
+        owner_address: owner_addr.to_vec(),
+        contract_address: contract_addr.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+
+    // Generous energy budget — the cap check fires regardless of remaining
+    // energy (revm checks `limit_reached` before recording the expansion
+    // cost), so this must surface OUT_OF_MEMORY rather than OUT_OF_ENERGY.
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 0,
+        },
+        &trigger,
+        100_000_000,
+    );
+
+    match outcome {
+        VmOutcome::Halt { result, .. } => assert_eq!(
+            result,
+            ContractResult::OutOfMemory,
+            "3 MiB cap breach must record OUT_OF_MEMORY, got {result:?}"
+        ),
+        other => panic!("expected Halt(OUT_OF_MEMORY), got {other:?}"),
+    }
+}
+
 /// Regression: the `TIMESTAMP` / `NUMBER` opcodes must reflect the executing
 /// block's env. They previously returned the revm BlockEnv defaults
 /// (timestamp=1, number=0) because the block env was never populated, so any
