@@ -192,6 +192,18 @@ pub enum VmOutcome {
         return_data: Vec<u8>,
         energy_used: u64,
     },
+    /// A value-transfer operation raised a `TransferException` (java-tron):
+    /// `Program.transfer` / endowment-out-of-long-range / self-transfer
+    /// validation failure (`Program.java` lines 491/563/1038/1091/1104/…).
+    /// Unlike a plain revert this surfaces `contractResult TRANSFER_FAILED`,
+    /// but energetically it is identical — a `TransferException` is exempt from
+    /// `spendAllEnergy` (`VM.java` / `VMActuator`), so `energy_used` is the
+    /// energy consumed up to the throw (forwarded call energy refunded), NOT
+    /// the full limit. Distinct from `Halt` (which DOES spend-all). The VM
+    /// state is unwound exactly like a revert.
+    TransferFailed {
+        energy_used: u64,
+    },
     /// Halted (OOG, invalid opcode, etc.). All energy spent.
     Halt {
         /// Human-readable halt reason (revm `HaltReason` `Debug`/`Display`
@@ -631,6 +643,16 @@ fn execute_trigger_inner(
         revm::interpreter::set_op_trace(false);
         eprintln!("OPTRACE_TX_END");
     }
+    // TRON fork: did a value-transfer raise a `TransferException`? The
+    // CALL/CALLTOKEN opcode handler sets this on the journal before returning
+    // `InstructionResult::TransferFailed`. A `TransferException` settles its
+    // gas exactly like a revert (consumed-only, `spendAllEnergy`-exempt) and so
+    // surfaces from revm as `ExecutionResult::Revert` — but it must record
+    // `contractResult TRANSFER_FAILED`, so we relabel the Revert outcome below.
+    let transfer_failed = {
+        use revm::context_interface::JournalTr as _;
+        evm.ctx.journaled_state.tron_transfer_failed()
+    };
     // If the EVM failed and we did a top-level TRC-10 transfer up front,
     // reverse it so the caller's asset_v2 balance is restored.
     let unwind_on_failure = |stores: &VmStores| {
@@ -657,9 +679,19 @@ fn execute_trigger_inner(
         },
         Ok(ExecutionResult::Revert { output, gas, .. }) => {
             unwind_on_failure(stores);
-            VmOutcome::Revert {
-                return_data: output.to_vec(),
-                energy_used: gas.tx_gas_used(),
+            if transfer_failed {
+                // A `TransferException` unwound the whole tx at a value-transfer
+                // opcode. State is reverted just like a normal REVERT; only the
+                // recorded `contractResult` differs (TRANSFER_FAILED). Energy is
+                // the consumed total (spend-all-exempt), already in `gas`.
+                VmOutcome::TransferFailed {
+                    energy_used: gas.tx_gas_used(),
+                }
+            } else {
+                VmOutcome::Revert {
+                    return_data: output.to_vec(),
+                    energy_used: gas.tx_gas_used(),
+                }
             }
         }
         Ok(ExecutionResult::Halt { reason, gas, .. }) => {
@@ -943,6 +975,12 @@ fn execute_trigger_inner_with_tracer(
         }
     };
     let deadline_tripped = evm.inspector.deadline_exceeded();
+    // See `execute_trigger_inner`: a `TransferException` settles like a revert
+    // but records `contractResult TRANSFER_FAILED`.
+    let transfer_failed = {
+        use revm::context_interface::JournalTr as _;
+        evm.ctx.journaled_state.tron_transfer_failed()
+    };
     let timeout_budget_ms = deadline.map(|(_, ms)| ms).unwrap_or(0);
     let vm_outcome = match outcome {
         Ok(ExecutionResult::Success { output, gas, logs, .. }) => VmOutcome::Success {
@@ -952,9 +990,15 @@ fn execute_trigger_inner_with_tracer(
         },
         Ok(ExecutionResult::Revert { output, gas, .. }) => {
             unwind_on_failure(stores);
-            VmOutcome::Revert {
-                return_data: output.to_vec(),
-                energy_used: gas.tx_gas_used(),
+            if transfer_failed {
+                VmOutcome::TransferFailed {
+                    energy_used: gas.tx_gas_used(),
+                }
+            } else {
+                VmOutcome::Revert {
+                    return_data: output.to_vec(),
+                    energy_used: gas.tx_gas_used(),
+                }
             }
         }
         Ok(ExecutionResult::Halt { reason, gas, .. }) => {

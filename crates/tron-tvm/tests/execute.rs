@@ -418,3 +418,168 @@ fn sstore_clear_does_not_refund_matching_java_tron() {
         "TRON has no SSTORE-clear refund: with_clear={with_clear} no_clear={no_clear}"
     );
 }
+
+/// PUSH32 of a full 32-byte big-endian value.
+fn push32(bytes: [u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(33);
+    out.push(0x7f); // PUSH32
+    out.extend_from_slice(&bytes);
+    out
+}
+
+/// Build a contract that issues a single `CALL` to `target` with `value` as
+/// the TRX call-value, then (if reached) SSTOREs slot 0 := 1 and STOPs. The
+/// trailing SSTORE exists so a divergent "CALL returns 0, contract continues"
+/// path (the pre-fix revm behaviour) is observable as extra consumed energy /
+/// a persisted slot vs java halting at the CALL.
+///
+/// CALL stack (top first): `[gas, to, value, inOffset, inSize, outOffset,
+/// outSize]` — pushed in reverse.
+fn build_call_with_value(target: [u8; 21], value: [u8; 32]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend_from_slice(&[0x60, 0x00]); // PUSH1 0  outSize
+    bc.extend_from_slice(&[0x60, 0x00]); // PUSH1 0  outOffset
+    bc.extend_from_slice(&[0x60, 0x00]); // PUSH1 0  inSize
+    bc.extend_from_slice(&[0x60, 0x00]); // PUSH1 0  inOffset
+    bc.extend(push32(value)); //              value
+    bc.push(0x73); // PUSH20 target (strip 0x41 prefix)
+    bc.extend_from_slice(&target[1..]);
+    bc.extend(push32({
+        // gas = 50_000 forwarded
+        let mut g = [0u8; 32];
+        g[30] = 0xc3;
+        g[31] = 0x50;
+        g
+    }));
+    bc.push(0xf1); // CALL
+    // If the contract were allowed to continue past the CALL (the pre-fix
+    // path), this persists slot 0 := 1.
+    bc.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]); // PUSH1 1 PUSH1 0 SSTORE
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// java-tron `Program.callToAddress` evaluates `msg.getEndowment().value()
+/// .longValueExact()` before the transfer; a value above `Long.MAX_VALUE`
+/// throws `ArithmeticException` → `TransferException("endowment out of long
+/// range")`, which surfaces `contractResult TRANSFER_FAILED`, charges only the
+/// consumed energy (spend-all-exempt), and terminates the whole transaction at
+/// the CALL. A balance can never reach 2^63, so upstream revm would instead let
+/// the value-transfer fail with OutOfFunds, push 0, and let the contract
+/// continue — recording REVERT (or even SUCCESS) and a different energy total.
+#[test]
+fn call_value_over_i64_max_is_transfer_failed_not_revert() {
+    let stores = fresh_stores();
+    // A do-nothing callee (STOP); the CALL never reaches it.
+    let callee = install_contract(&stores, 0xc2, &[0x00]);
+    // value = 2^63 (one above i64::MAX) — `longValueExact()` would throw.
+    let mut value = [0u8; 32];
+    value[24] = 0x80; // byte 24 (of 0..32) sets bit 63
+    let caller = install_contract(&stores, 0xc3, &build_call_with_value(callee, value));
+    let owner = fund_account(&stores, 0xa3, 1_000_000_000);
+
+    let trigger = TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: caller.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let energy_limit = 1_000_000u64;
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger,
+        energy_limit,
+    );
+
+    match outcome {
+        VmOutcome::TransferFailed { energy_used } => {
+            // A `TransferException` is spend-all-exempt: the energy is the
+            // consumed total up to the CALL (forwarded gas refunded), NOT the
+            // full limit.
+            assert!(
+                energy_used > 0 && energy_used < energy_limit,
+                "TransferFailed energy must be consumed-only (0 < {energy_used} < {energy_limit})"
+            );
+        }
+        other => panic!("expected TransferFailed, got {other:?}"),
+    }
+}
+
+/// A CALL value that DOES fit in i64 takes the normal path (here: a plain
+/// value transfer the caller can't fund → revm pushes 0, the contract
+/// continues to its SSTORE+STOP and succeeds). Guards against the
+/// out-of-range guard over-firing on in-range values.
+#[test]
+fn call_value_within_i64_is_not_transfer_failed() {
+    let stores = fresh_stores();
+    let callee = install_contract(&stores, 0xc4, &[0x00]); // STOP
+    // value = 10 (well within i64 range); caller contract has 0 balance, so
+    // the transfer fails with OutOfFunds and the CALL pushes 0 — but that is
+    // NOT a TransferException, so execution continues.
+    let mut value = [0u8; 32];
+    value[31] = 0x0a;
+    let caller = install_contract(&stores, 0xc5, &build_call_with_value(callee, value));
+    let owner = fund_account(&stores, 0xa5, 1_000_000_000);
+
+    let trigger = TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: caller.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger,
+        1_000_000,
+    );
+    assert!(
+        !matches!(outcome, VmOutcome::TransferFailed { .. }),
+        "an in-range CALL value must NOT be TransferFailed, got {outcome:?}"
+    );
+}
+
+/// A `TransferException` in java unwinds EVERY frame (the exception propagates
+/// out of `Program.callToAddress` past `VM.play` into the parent op loop, on up
+/// to `VMActuator`) — it does NOT let the parent push 0 and continue. So even a
+/// DEEPLY-NESTED out-of-range CALL must fail the WHOLE transaction as
+/// TRANSFER_FAILED. Guards the `frame_return_result` tx-fatal short-circuit.
+#[test]
+fn nested_call_value_over_i64_max_fails_whole_tx() {
+    let stores = fresh_stores();
+    // Leaf callee: a do-nothing STOP; never reached (the CALL into it throws).
+    let leaf = install_contract(&stores, 0xc6, &[0x00]);
+    // Inner contract issues the out-of-range CALL to `leaf`, then would SSTORE
+    // + STOP if it were allowed to continue.
+    let mut value = [0u8; 32];
+    value[24] = 0x80; // 2^63, one above i64::MAX
+    let inner = install_contract(&stores, 0xc7, &build_call_with_value(leaf, value));
+    // Outer contract CALLs `inner` (value 0, in-range), then SSTORE 1 + STOP.
+    let outer_value = [0u8; 32];
+    let outer = install_contract(&stores, 0xc8, &build_call_with_value(inner, outer_value));
+    let owner = fund_account(&stores, 0xa8, 1_000_000_000);
+
+    let trigger = TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: outer.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        &trigger,
+        2_000_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::TransferFailed { .. }),
+        "a nested out-of-range CALL must fail the whole tx as TransferFailed, got {outcome:?}"
+    );
+}

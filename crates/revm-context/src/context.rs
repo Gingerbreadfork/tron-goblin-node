@@ -708,6 +708,10 @@ impl<
         self.journaled_state.tron_account_created_locally(address)
     }
 
+    fn tron_mark_transfer_failed(&mut self) {
+        self.journaled_state.tron_mark_transfer_failed();
+    }
+
     fn tron_suicide(&mut self, owner: Address, obtainer: Address, will_destroy: bool) -> i64 {
         let result = self
             .journaled_state

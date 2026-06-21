@@ -245,6 +245,13 @@ pub trait Host {
         false
     }
 
+    /// TRON fork: record that a value-transfer operation raised a
+    /// `TransferException` (transfer/endowment/self-transfer validation
+    /// failure). Set by the CALL/CALLTOKEN opcode handler before returning
+    /// `InstructionResult::TransferFailed`; read by the executor to surface
+    /// `contractResult TRANSFER_FAILED`. Default no-op.
+    fn tron_mark_transfer_failed(&mut self) {}
+
     /// TRON fork: SELFDESTRUCT chainbase side-effects (see
     /// `TronDatabaseExt::tron_suicide`). Returns `0` ok / `-1` revert.
     fn tron_suicide(&mut self, _owner: Address, _obtainer: Address, _will_destroy: bool) -> i64 {

@@ -3965,6 +3965,13 @@ fn execute_vm_tx(
         (None, Some(tron_tvm::execute::VmOutcome::Revert { energy_used, .. })) => {
             (*energy_used, false)
         }
+        // A `TransferException` is `spendAllEnergy`-exempt (`VM.java` /
+        // `VMActuator`): it charges only the energy consumed up to the throw,
+        // exactly like a revert — NOT the full limit. So the energy comes
+        // straight from the outcome, no spend-all override.
+        (None, Some(tron_tvm::execute::VmOutcome::TransferFailed { energy_used })) => {
+            (*energy_used, false)
+        }
         (None, Some(tron_tvm::execute::VmOutcome::Halt { energy_used, .. })) => {
             (*energy_used, false)
         }
@@ -4152,6 +4159,34 @@ fn execute_vm_tx(
                 vm_logs: Vec::new(),
                 receipt,
                 vm_return_data: return_data,
+                actuator_fee: 0,
+            }
+        }
+        tron_tvm::execute::VmOutcome::TransferFailed { .. } => {
+            // java-tron `Program.TransferException` (a `BytecodeExecution
+            // Exception` mapped to `contractResult TRANSFER_FAILED` at
+            // `RuntimeImpl.setResultCode`): a value-transfer validation failure
+            // (endowment-out-of-long-range / transfer trx|trc10 failed /
+            // self-transfer). Settled exactly like a revert — the VM frame was
+            // already discarded by `vm_session.revert()`, bandwidth + the
+            // consumed-only energy charge (NOT spend-all; a `TransferException`
+            // is exempt) survive in the per-tx session, so `iso.commit()`
+            // flushes those — only the recorded `contractResult` differs.
+            iso.commit().expect(
+                "db error in execute_vm_tx: commit flush failed on VM TransferFailed",
+            );
+            receipt.result =
+                tron_proto::transaction::result::ContractResult::TransferFailed as i32;
+            TxResult {
+                tx_id,
+                contract_type: Some(ty),
+                outcome: TxOutcome::ExecutionFailed(ActuatorError::Store(
+                    "VM transfer failed".to_string(),
+                )),
+                internal_transactions: proto_internal_txs,
+                vm_logs: Vec::new(),
+                receipt,
+                vm_return_data: Vec::new(),
                 actuator_fee: 0,
             }
         }

@@ -5,7 +5,10 @@ use crate::{
 use auto_impl::auto_impl;
 use context::{ContextTr, Database, Evm, FrameStack};
 use context_interface::context::ContextError;
-use interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit, InterpreterResult};
+use interpreter::{
+    interpreter::EthInterpreter, interpreter_action::FrameInit, InstructionResult,
+    InterpreterResult,
+};
 
 /// Type alias for database error within a context
 pub type ContextDbError<CTX> = ContextError<ContextTrDbError<CTX>>;
@@ -223,6 +226,18 @@ where
     ) -> Result<Option<<Self::Frame as FrameTr>::FrameResult>, ContextDbError<Self::Context>> {
         if self.frame_stack.get().is_finished() {
             self.frame_stack.pop();
+        }
+        // TRON fork: a `TransferException` (`InstructionResult::TransferFailed`)
+        // is tx-fatal — java unwinds EVERY frame to the top rather than letting
+        // the parent's call-return push 0/1 and continue (`Program.callToAddress`
+        // throws past `VM.play` into the parent's op loop, on up to
+        // `VMActuator`). Mirror that: clear the frame stack so the result
+        // propagates straight to the top frame as the transaction's outcome,
+        // skipping the parent `return_result` continuation. Gas already settled
+        // consumed-only (the result is in `is_ok_or_revert`).
+        if result.interpreter_result().result == InstructionResult::TransferFailed {
+            self.frame_stack.clear();
+            return Ok(Some(result));
         }
         if self.frame_stack.index().is_none() {
             return Ok(Some(result));

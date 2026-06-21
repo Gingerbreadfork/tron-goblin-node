@@ -1748,6 +1748,14 @@ pub fn eth_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
                 message: format!("execution reverted: 0x{}", hex::encode(&return_data)),
             })
         }
+        tron_tvm::execute::VmOutcome::TransferFailed { .. } => {
+            // A value-transfer validation failure (`TransferException`); no
+            // return data. Surface it like a revert for eth_call clients.
+            Err(RpcError {
+                code: 3,
+                message: "execution reverted: transfer failed".to_string(),
+            })
+        }
         tron_tvm::execute::VmOutcome::Halt { reason, .. } => Err(RpcError::internal(format!(
             "execution halted: {reason}"
         ))),
@@ -2979,6 +2987,12 @@ fn constant_outcome_to_json(outcome: tron_tvm::execute::VmOutcome, energy_penalt
             "energy_used": energy_used,
             "constant_result": [hex::encode(&return_data)],
             "transaction": { "ret": [{ "contractRet": "REVERT" }] },
+        }),
+        VmOutcome::TransferFailed { energy_used } => json!({
+            "result": { "result": false, "code": "CONTRACT_EXE_ERROR", "message": "transfer failed" },
+            "energy_used": energy_used,
+            "constant_result": [""],
+            "transaction": { "ret": [{ "contractRet": "TRANSFER_FAILED" }] },
         }),
         VmOutcome::Halt {
             energy_used,

@@ -383,6 +383,15 @@ fn build_constant_response(
                 message: format!("REVERT: 0x{}", hex::encode(return_data)).into_bytes(),
             },
         ),
+        Some(tron_tvm::execute::VmOutcome::TransferFailed { energy_used }) => (
+            Vec::new(),
+            energy_used as i64,
+            Return {
+                result: false,
+                code: r#return::ResponseCode::ContractExeError as i32,
+                message: b"TRANSFER_FAILED".to_vec(),
+            },
+        ),
         Some(tron_tvm::execute::VmOutcome::Halt {
             reason,
             energy_used,
@@ -2565,6 +2574,9 @@ impl Wallet for WalletService {
                 *energy_used as i64,
                 format!("REVERT: 0x{}", hex::encode(return_data)),
             ),
+            Some(tron_tvm::execute::VmOutcome::TransferFailed { energy_used }) => {
+                (false, *energy_used as i64, "TRANSFER_FAILED".to_string())
+            }
             Some(tron_tvm::execute::VmOutcome::Halt {
                 reason,
                 energy_used,

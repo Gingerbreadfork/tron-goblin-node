@@ -42,6 +42,20 @@ pub enum InstructionResult {
     InvalidEOFInitCode,
     /// `ExtDelegateCall` calling a non EOF contract.
     InvalidExtDelegateCallTarget,
+    /// TRON fork: a value-transfer operation (CALL/CALLCODE/CALLTOKEN) failed
+    /// `Program.transfer` validation — java-tron raises a `TransferException`
+    /// (`Program.java`: "transfer trx/trc10 failed", "endowment out of long
+    /// range", "Cannot transfer … to yourself"). A `TransferException` is a
+    /// `BytecodeExecutionException` that, unlike a plain halt, is EXEMPT from
+    /// `spendAllEnergy` (`VM.java` / `VMActuator`) — so it charges only the
+    /// energy consumed up to the throw (forwarded call energy refunded), the
+    /// same as a revert — yet it terminates the WHOLE transaction (the
+    /// exception unwinds every frame) and surfaces `contractResult
+    /// TRANSFER_FAILED`. Grouped with the revert codes so its gas settles
+    /// consumed-only; propagated tx-fatal by `frame_return_result` (it never
+    /// reaches a parent's call-return push-0/1) and tagged on the journal so
+    /// the executor records `TRANSFER_FAILED` rather than `REVERT`.
+    TransferFailed,
 
     // Error Codes
     /// Out of gas error.
@@ -180,6 +194,7 @@ macro_rules! return_revert {
             | $crate::InstructionResult::InvalidEOFInitCode
             | $crate::InstructionResult::CreateInitCodeStartingEF00
             | $crate::InstructionResult::InvalidExtDelegateCallTarget
+            | $crate::InstructionResult::TransferFailed
     };
 }
 
@@ -327,6 +342,13 @@ impl<HaltReasonTr: From<HaltReason>> From<InstructionResult> for SuccessOrHalt<H
             InstructionResult::SelfDestruct => Self::Success(SuccessReason::SelfDestruct),
             InstructionResult::Suspend => Self::Internal(InternalResult::Suspend),
             InstructionResult::Revert => Self::Revert,
+            // TRON fork: a transfer-failed halt settles exactly like a revert
+            // (consumed-only energy, state unwound) — java's `TransferException`
+            // is `spendAllEnergy`-exempt. It maps to `Self::Revert` so the final
+            // gas is consumed-only and the output empty; the executor
+            // distinguishes it from a real REVERT (→ `contractResult
+            // TRANSFER_FAILED`) via the journal's `tron_transfer_failed` flag.
+            InstructionResult::TransferFailed => Self::Revert,
             InstructionResult::CreateInitCodeStartingEF00 => Self::Revert,
             InstructionResult::CallTooDeep => Self::Halt(HaltReason::CallTooDeep.into()), // not gonna happen for first call
             InstructionResult::OutOfFunds => Self::Halt(HaltReason::OutOfFunds.into()), // Check for first call is done separately.

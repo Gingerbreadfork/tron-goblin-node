@@ -177,6 +177,29 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     let (gas_limit, bytecode, bytecode_hash, charged_new_account_state_gas) =
         load_acc_and_calc_gas(&mut context, to, has_transfer, is_call, local_gas_limit)?;
 
+    // TRON fork: the call value (endowment) must fit in a signed 64-bit long.
+    // java-tron's `Program.callToAddress` evaluates `msg.getEndowment().value()
+    // .longValueExact()` BEFORE any transfer/balance check (`Program.java`); a
+    // value above `Long.MAX_VALUE` (2^63-1) throws `ArithmeticException`, caught
+    // and rethrown as `TransferException("endowment out of long range")` after
+    // `refundEnergy(msg.getEnergy())`. A balance can never reach that magnitude,
+    // so upstream revm would instead let `transfer_loaded` fail with
+    // `OutOfFunds`, push 0, and let the contract continue to its own REVERT —
+    // diverging from java (`contractResult REVERT`, refund) where the whole tx
+    // dies as `TRANSFER_FAILED` at this opcode. Mirror java: refund the
+    // forwarded `gas_limit`, mark the transfer-failure, and return the tx-fatal
+    // `TransferFailed` (consumed-only energy, no spend-all). Applies to the
+    // value-bearing call opcodes (CALL/CALLCODE); DELEGATECALL/STATICCALL carry
+    // no popped value. Only under the TRON VM (`tron_enabled`).
+    if matches!(KIND, CALL | CALLCODE)
+        && u256_to_i64_exact(&value).is_none()
+        && context.host.tron_enabled()
+    {
+        context.interpreter.gas.erase_cost(gas_limit);
+        context.host.tron_mark_transfer_failed();
+        return Err(InstructionResult::TransferFailed);
+    }
+
     // TRON fork: a CALL with non-zero TRX value to the executing contract's
     // OWN address is forbidden. java-tron's `Program.callToAddress` enters the
     // transfer block (its `senderAddress != contextAddress` guard is a
@@ -185,22 +208,25 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     // ("Cannot transfer TRX to yourself"), which `callToAddress` rethrows as a
     // `TransferException` after `refundEnergy(msg.getEnergy())`. A
     // `TransferException` is exempt from `spendAllEnergy` (VM.java) and ends the
-    // executing frame with a failure (`TRANSFER_FAILED`), the forwarded energy
+    // whole transaction as a failure (`TRANSFER_FAILED`), the forwarded energy
     // refunded. We mirror that here: refund the forwarded `gas_limit` (java's
-    // `msg.getEnergy()`, which includes the value-transfer stipend) and halt the
-    // executing frame with `Revert` — which, like a `TransferException`, ends
-    // the frame as a failure WITHOUT spending all energy (the top-level
-    // `last_frame_result` erases the remaining gas for `is_ok_or_revert`,
-    // matching java's consumed-only charge). Only fires under the TRON VM
-    // (`tron_enabled`); upstream EVM keeps the legal `from == to` self-transfer.
-    // CALLCODE/DELEGATECALL/STATICCALL never reach here: CALLCODE/DELEGATECALL
-    // keep the caller's own context (java sets `contextAddress = senderAddress`,
-    // so its self-guard is false) and STATICCALL carries no value.
+    // `msg.getEnergy()`, which includes the value-transfer stipend), mark the
+    // transfer-failure on the journal (→ `contractResult TRANSFER_FAILED`), and
+    // return the tx-fatal `TransferFailed` — which, like a `TransferException`,
+    // ends execution WITHOUT spending all energy (it settles consumed-only, the
+    // same as a revert, via `last_frame_result`'s `is_ok_or_revert` branch) and
+    // unwinds every frame (`frame_return_result` short-circuits it to the top).
+    // Only fires under the TRON VM (`tron_enabled`); upstream EVM keeps the
+    // legal `from == to` self-transfer. CALLCODE/DELEGATECALL/STATICCALL never
+    // reach here: CALLCODE/DELEGATECALL keep the caller's own context (java sets
+    // `contextAddress = senderAddress`, so its self-guard is false) and
+    // STATICCALL carries no value.
     if KIND == CALL && has_transfer && to == context.interpreter.input.target_address()
         && context.host.tron_enabled()
     {
         context.interpreter.gas.erase_cost(gas_limit);
-        return Err(InstructionResult::Revert);
+        context.host.tron_mark_transfer_failed();
+        return Err(InstructionResult::TransferFailed);
     }
 
     let target_address = if matches!(KIND, CALLCODE | DELEGATECALL) {
@@ -316,16 +342,19 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // transfer block and `VMUtils.validateForSmartContract(... tokenId ...)`
     // throws "Cannot transfer asset to yourself", rethrown as a
     // `TransferException` after `refundEnergy(msg.getEnergy())`. Mirror it:
-    // refund the forwarded `gas_limit` and halt this frame with `Revert`
-    // (failure, no spend-all). Doing this in the opcode handler — BEFORE the
-    // child frame is created — also means `Trc10Inspector::call` never runs for
-    // a self-CALLTOKEN, so the asset_v2 debit/credit (which would otherwise
-    // net-mint `value` to the caller, since the caller and target rows are the
-    // same account) never happens. CALLTOKEN is a TRON-only opcode, so no
-    // `tron_enabled` gate is needed.
+    // refund the forwarded `gas_limit`, mark the transfer-failure on the journal
+    // (→ `contractResult TRANSFER_FAILED`), and return the tx-fatal
+    // `TransferFailed` (consumed-only energy, no spend-all; unwinds every frame).
+    // Doing this in the opcode handler — BEFORE the child frame is created —
+    // also means `Trc10Inspector::call` never runs for a self-CALLTOKEN, so the
+    // asset_v2 debit/credit (which would otherwise net-mint `value` to the
+    // caller, since the caller and target rows are the same account) never
+    // happens. CALLTOKEN is a TRON-only opcode, so no `tron_enabled` gate is
+    // needed.
     if has_transfer && to == context.interpreter.input.target_address() {
         context.interpreter.gas.erase_cost(gas_limit);
-        return Err(InstructionResult::Revert);
+        context.host.tron_mark_transfer_failed();
+        return Err(InstructionResult::TransferFailed);
     }
 
     // Saturate the i128 stack words to i64. java-tron rejects out-of-i64

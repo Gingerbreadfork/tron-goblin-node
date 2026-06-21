@@ -101,6 +101,14 @@ pub struct JournalInner<ENTRY> {
     ///
     /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
     pub selfdestructed_addresses: Vec<Address>,
+    /// TRON fork: set when a value-transfer operation raised a
+    /// `TransferException` (a transfer/endowment/self-transfer validation
+    /// failure — see [`crate::interpreter::InstructionResult::TransferFailed`]).
+    /// The opcode handler sets this before returning `TransferFailed`; the
+    /// executor reads it after the run to record `contractResult
+    /// TRANSFER_FAILED` instead of a plain `REVERT`. Transient per-transaction
+    /// state, cleared on `commit_tx` / `discard_tx`.
+    pub tron_transfer_failed: bool,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -125,6 +133,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg: JournalCfg::default(),
             warm_addresses: WarmAddresses::new(),
             selfdestructed_addresses: Vec::new(),
+            tron_transfer_failed: false,
         }
     }
 
@@ -159,6 +168,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg,
             warm_addresses,
             selfdestructed_addresses,
+            tron_transfer_failed,
         } = self;
         // Cfg and state are not changed. They are always set again before execution.
         let _ = cfg;
@@ -176,6 +186,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         logs.clear();
         selfdestructed_addresses.clear();
+        // TRON fork: the transfer-failed flag is intentionally NOT cleared
+        // here. `commit_tx` runs as the LAST step of `execution_result`, AFTER
+        // the `ExecutionResult` is built — but the executor reads the flag
+        // AFTER `inspect_tx_commit` returns, so clearing here would always lose
+        // it. The flag is per-transaction state reset in `JournalInner::new()`
+        // (the TRON executor builds a fresh journal per VM transaction).
+        let _ = tron_transfer_failed;
     }
 
     /// Discard the current transaction, by reverting the journal entries and incrementing the transaction id.
@@ -191,6 +208,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg,
             warm_addresses,
             selfdestructed_addresses,
+            tron_transfer_failed,
         } = self;
         let is_spurious_dragon_enabled = cfg.spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -202,6 +220,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         logs.clear();
         selfdestructed_addresses.clear();
         transaction_id.increment();
+        // TRON fork: see `commit_tx` — the flag is read after the run returns,
+        // so it is reset in `JournalInner::new()` (fresh per VM tx), not here.
+        let _ = tron_transfer_failed;
 
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase_and_access_list();
@@ -225,10 +246,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             cfg,
             warm_addresses,
             selfdestructed_addresses,
+            tron_transfer_failed,
         } = self;
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase_and_access_list();
         selfdestructed_addresses.clear();
+        // TRON fork: see `commit_tx` — reset in `JournalInner::new()`, not here.
+        let _ = tron_transfer_failed;
 
         let mut state = mem::take(state);
 

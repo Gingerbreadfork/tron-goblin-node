@@ -150,6 +150,20 @@ pub trait JournalTr {
         false
     }
 
+    /// TRON fork: record that a value-transfer operation raised a
+    /// `TransferException` (transfer/endowment/self-transfer validation
+    /// failure). Set by the CALL/CALLTOKEN opcode handler before it returns
+    /// [`crate::InstructionResult::TransferFailed`]; read by the executor to
+    /// surface `contractResult TRANSFER_FAILED`. Default no-op for journals
+    /// that don't carry the flag.
+    fn tron_mark_transfer_failed(&mut self) {}
+
+    /// TRON fork: did a value-transfer operation raise a `TransferException`
+    /// during this transaction? See [`Self::tron_mark_transfer_failed`].
+    fn tron_transfer_failed(&self) -> bool {
+        false
+    }
+
     /// TRON fork: set the journal's SELFDESTRUCT overrides (restriction
     /// gate + burn-account redirect). Default no-op for journals that
     /// don't carry the TRON cfg.

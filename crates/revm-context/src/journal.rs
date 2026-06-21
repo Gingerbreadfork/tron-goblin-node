@@ -220,6 +220,16 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn tron_mark_transfer_failed(&mut self) {
+        self.inner.tron_transfer_failed = true;
+    }
+
+    #[inline]
+    fn tron_transfer_failed(&self) -> bool {
+        self.inner.tron_transfer_failed
+    }
+
+    #[inline]
     fn set_tron_selfdestruct_overrides(
         &mut self,
         restriction: Option<bool>,
