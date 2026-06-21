@@ -313,10 +313,16 @@ pub fn build_apply(
                                     .find(|cv| cv.token_id.is_empty())
                                     .map(|cv| cv.call_value)
                                     .unwrap_or(0),
+                                // java's `InternalTransaction` writes "0"
+                                // as the no-token sentinel for a plain
+                                // (TRX-only) call leg; real TRC10 ids are
+                                // positive. Skip both the empty and the
+                                // "0" entries so a non-token call never
+                                // emits a phantom token leg downstream.
                                 token_id: itx
                                     .call_value_info
                                     .iter()
-                                    .find(|cv| !cv.token_id.is_empty())
+                                    .find(|cv| !cv.token_id.is_empty() && cv.token_id != "0")
                                     .map(|cv| cv.token_id.clone())
                                     .unwrap_or_default(),
                                 rejected: itx.rejected,
@@ -554,6 +560,99 @@ mod tests {
         assert_eq!(a.txs[0].amount, 20);
         assert!(!a.txinfo_missing);
         assert_eq!(w.counters().gap_repaired_blocks.load(Ordering::Relaxed), 2);
+    }
+
+    /// java's `InternalTransaction` records a plain (TRX-only) call leg
+    /// with the no-token sentinel `tokenId == "0"`; only a positive id
+    /// is a real TRC10 move. `build_apply` must not surface that "0" as
+    /// a token leg, or external consumers would see a phantom token on
+    /// every ordinary contract call.
+    #[test]
+    fn internal_tx_zero_token_sentinel_is_not_emitted() {
+        let owner = vec![0x41; 21];
+        let to = vec![0x42; 21];
+        let raw = tron_proto::transaction::Raw {
+            contract: vec![tron_proto::transaction::Contract {
+                r#type: tron_proto::transaction::contract::ContractType::TriggerSmartContract
+                    as i32,
+                parameter: Some(prost_types::Any {
+                    type_url: String::new(),
+                    value: tron_proto::TriggerSmartContract {
+                        owner_address: owner.clone(),
+                        contract_address: to.clone(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tx = tron_proto::Transaction {
+            raw_data: Some(raw),
+            ret: vec![tron_proto::transaction::Result {
+                contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tx_id = tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
+        let block = Block {
+            transactions: vec![tx],
+            block_header: Some(tron_proto::BlockHeader {
+                raw_data: Some(tron_proto::block_header::Raw {
+                    number: 100,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        // Two internal transactions: one a plain TRX-only call (the "0"
+        // sentinel), one a real TRC10 move (positive id).
+        let ret = TransactionRet {
+            block_number: 100,
+            block_time_stamp: 0,
+            transactioninfo: vec![tron_proto::TransactionInfo {
+                id: tx_id.to_vec(),
+                block_number: 100,
+                internal_transactions: vec![
+                    tron_proto::InternalTransaction {
+                        caller_address: owner.clone(),
+                        transfer_to_address: to.clone(),
+                        call_value_info: vec![
+                            tron_proto::internal_transaction::CallValueInfo {
+                                call_value: 7,
+                                token_id: String::new(),
+                            },
+                            tron_proto::internal_transaction::CallValueInfo {
+                                call_value: 0,
+                                token_id: "0".to_string(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    tron_proto::InternalTransaction {
+                        caller_address: owner.clone(),
+                        transfer_to_address: to.clone(),
+                        call_value_info: vec![tron_proto::internal_transaction::CallValueInfo {
+                            call_value: 5,
+                            token_id: "1000001".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+
+        let a = build_apply(100, &block, Some(&ret), 0);
+        let itxs = &a.txs[0].internal_txs;
+        assert_eq!(itxs.len(), 2);
+        // Plain call leg: TRX value carried, no phantom token id.
+        assert_eq!(itxs[0].call_value, 7);
+        assert_eq!(itxs[0].token_id, "", "the \"0\" sentinel must not surface as a token");
+        // Real TRC10 move: positive id preserved.
+        assert_eq!(itxs[1].token_id, "1000001");
     }
 
     #[test]

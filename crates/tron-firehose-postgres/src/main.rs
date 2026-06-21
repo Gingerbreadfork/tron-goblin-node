@@ -339,19 +339,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         cursor: st_cursor,
     };
 
+    // A fresh consumer (empty cursor) legitimately begins at whatever
+    // the node still retains: when its requested `from_seq` predates
+    // retention the node replays from the oldest retained entry, so the
+    // first seq we see may be > 1. That is the documented start path,
+    // not a gap. A non-empty cursor means we are RESUMING, and only
+    // then is a seq jump a true retention hole between what we already
+    // stored and what the node can still serve.
+    let mut resuming = cursor > 0;
     let mut expected_seq = cursor as u64 + 1;
     while let Some(entry) = stream.message().await? {
         if entry.seq > expected_seq {
-            // Older than the node's retention — the derived tables are
-            // missing a range and cannot be repaired from the stream.
-            return Err(format!(
-                "firehose retention gap: expected seq {expected_seq}, got {} — \
-                 re-sync this database from scratch (TRUNCATE the fh_* tables) or raise \
-                 [index.firehose] retain_mb on the node",
-                entry.seq
-            )
-            .into());
+            if !resuming {
+                // Fresh start past retention: adopt the oldest retained
+                // entry as the baseline and consume forward from it
+                // (`expected_seq` is advanced to `entry.seq + 1` below).
+                tracing::info!(
+                    start_seq = entry.seq,
+                    "starting fresh at the oldest retained firehose entry"
+                );
+            } else {
+                // Older than the node's retention — the derived tables
+                // are missing a range and cannot be repaired from the
+                // stream.
+                return Err(format!(
+                    "firehose retention gap: expected seq {expected_seq}, got {} — \
+                     re-sync this database from scratch (TRUNCATE the fh_* tables) or raise \
+                     [index.firehose] retain_mb on the node",
+                    entry.seq
+                )
+                .into());
+            }
         }
+        resuming = true;
         let txn = pg.transaction().await?;
         apply_entry(&txn, &stmts, &entry).await?;
         txn.commit().await?;

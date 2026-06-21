@@ -285,17 +285,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .into_inner();
 
+    // A fresh sink (cursor 0) legitimately begins at whatever the node
+    // still retains — if `from_seq` predates retention the node replays
+    // from the oldest retained entry, so the first seq may be > 1. That
+    // is the documented start path. A non-empty cursor means we are
+    // RESUMING, and only then is a seq jump a true retention hole
+    // between what is already stored and what the node can still serve.
+    let mut resuming = cursor > 0;
     let mut expected_seq = cursor + 1;
     while let Some(entry) = tail.message().await? {
         if entry.seq > expected_seq {
-            return Err(format!(
-                "firehose retention gap: expected seq {expected_seq}, got {} — \
-                 TRUNCATE the fh_* tables and re-sync, or raise [index.firehose] retain_mb \
-                 on the node",
-                entry.seq
-            )
-            .into());
+            if !resuming {
+                // Fresh start past retention: adopt the oldest retained
+                // entry as the baseline (`expected_seq` advances below).
+                tracing::info!(
+                    start_seq = entry.seq,
+                    "starting fresh at the oldest retained firehose entry"
+                );
+            } else {
+                return Err(format!(
+                    "firehose retention gap: expected seq {expected_seq}, got {} — \
+                     TRUNCATE the fh_* tables and re-sync, or raise [index.firehose] retain_mb \
+                     on the node",
+                    entry.seq
+                )
+                .into());
+            }
         }
+        resuming = true;
         apply_entry(&ch, &entry).await?;
         if entry.seq % 1000 == 0 {
             tracing::info!(seq = entry.seq, "cursor");
