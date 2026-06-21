@@ -84,6 +84,16 @@ pub struct TransactionEvent {
     pub transaction_index: i32,
     #[serde(rename = "contractType")]
     pub contract_type: String,
+    /// java-tron `TransactionLogTrigger.result` — the transaction's
+    /// `contractRet` as an uppercase enum string (`"SUCCESS"`,
+    /// `"REVERT"`, `"OUT_OF_TIME"`, ...). Distinct from
+    /// [`Self::contract_result`].
+    #[serde(rename = "result")]
+    pub result: String,
+    /// java-tron `TransactionLogTrigger.contractResult` — the lowercase
+    /// hex of the VM's return data (`ProgramResult.getHReturn()`), NOT
+    /// the `contractRet` string. Empty for non-VM transactions and when
+    /// the VM produced no return value.
     #[serde(rename = "contractResult")]
     pub contract_result: String,
     #[serde(rename = "fromAddress")]
@@ -94,6 +104,14 @@ pub struct TransactionEvent {
     pub contract_address: String,
     #[serde(rename = "feeLimit")]
     pub fee_limit: i64,
+    /// java-tron `TransactionLogTrigger.energyUsage` — energy covered by
+    /// the caller's frozen quota (`ResourceReceipt.energyUsage`).
+    #[serde(rename = "energyUsage")]
+    pub energy_usage: i64,
+    /// java-tron `TransactionLogTrigger.originEnergyUsage` — energy
+    /// covered by the contract origin's quota.
+    #[serde(rename = "originEnergyUsage")]
+    pub origin_energy_usage: i64,
     #[serde(rename = "energyUsageTotal")]
     pub energy_usage_total: i64,
     #[serde(rename = "energyFee")]

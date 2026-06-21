@@ -5602,7 +5602,17 @@ impl SyncDriver {
             .iter()
             .map(|r| tron_eventer::TxOutcomeSlice {
                 tx_id: r.tx_id,
-                contract_result: format!("{:?}", r.outcome),
+                // java-tron `TransactionLogTrigger.result` is the
+                // `contractRet` enum string; `contractResult` is the hex
+                // of the VM return data. The two are separate fields.
+                result: contract_ret_string(r.receipt.result).to_string(),
+                contract_result_hex: if r.vm_return_data.is_empty() {
+                    String::new()
+                } else {
+                    hex::encode(&r.vm_return_data)
+                },
+                energy_usage: r.receipt.energy_usage,
+                origin_energy_usage: r.receipt.origin_energy_usage,
                 energy_usage_total: r.receipt.energy_usage_total,
                 energy_fee: r.receipt.energy_fee,
                 net_usage: r.receipt.net_usage,
@@ -6546,6 +6556,19 @@ fn fifo_set_insert(
         }
     }
     true
+}
+
+/// Render a `Transaction.Result.contractResult` enum value as the
+/// uppercase string java-tron's `contractRet.toString()` produces — the
+/// value posted on `TransactionLogTrigger.result`. The proto-generated
+/// `as_str_name` returns the constant names verbatim (`SUCCESS`,
+/// `OUT_OF_TIME`, `TRANSFER_FAILED`, ...). Non-VM transactions carry
+/// `DEFAULT` (0); an unrecognised value maps to `UNKNOWN`.
+fn contract_ret_string(result: i32) -> &'static str {
+    use tron_proto::transaction::result::ContractResult;
+    ContractResult::try_from(result)
+        .unwrap_or(ContractResult::Unknown)
+        .as_str_name()
 }
 
 /// Extract the `owner_address` (first protobuf field, tag=1, wire-type

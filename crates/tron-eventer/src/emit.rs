@@ -17,11 +17,18 @@ use crate::trigger::{names, BlockEvent, TransactionEvent};
 #[derive(Debug, Clone, Default)]
 pub struct TxOutcomeSlice {
     pub tx_id: [u8; 32],
-    /// `"SUCCESS"` / `"REVERT"` / `"FAILED"` etc. — the textual form
-    /// java-tron writes into `contractResult`.
-    pub contract_result: String,
+    /// `"SUCCESS"` / `"REVERT"` / `"OUT_OF_TIME"` etc. — the transaction's
+    /// `contractRet` as an uppercase enum string. java-tron writes this
+    /// into `TransactionLogTrigger.result` (NOT `contractResult`).
+    pub result: String,
+    /// Lowercase hex of the VM's return data
+    /// (`ProgramResult.getHReturn()`). java-tron writes this into
+    /// `TransactionLogTrigger.contractResult`. Empty for non-VM txs.
+    pub contract_result_hex: String,
     /// Receipt fields java's `TransactionLogTrigger` copies from
     /// `TransactionInfo` — zero when the caller doesn't track them.
+    pub energy_usage: i64,
+    pub origin_energy_usage: i64,
     pub energy_usage_total: i64,
     pub energy_fee: i64,
     pub net_usage: i64,
@@ -76,11 +83,14 @@ pub fn emit_block_and_transactions(
             block_number,
             transaction_index: index as i32,
             contract_type: decoded.contract_type,
-            contract_result: outcome.contract_result.clone(),
+            result: outcome.result.clone(),
+            contract_result: outcome.contract_result_hex.clone(),
             from_address: decoded.from_address,
             to_address: decoded.to_address,
             contract_address: decoded.contract_address,
             fee_limit: tx.raw_data.as_ref().map(|r| r.fee_limit).unwrap_or(0),
+            energy_usage: outcome.energy_usage,
+            origin_energy_usage: outcome.origin_energy_usage,
             energy_usage_total: outcome.energy_usage_total,
             energy_fee: outcome.energy_fee,
             net_usage: outcome.net_usage,
@@ -236,7 +246,7 @@ mod tests {
         };
         let outcomes = vec![TxOutcomeSlice {
             tx_id: [0xcd; 32],
-            contract_result: "SUCCESS".into(),
+            result: "SUCCESS".into(),
             ..Default::default()
         }];
 
@@ -257,7 +267,10 @@ mod tests {
                 assert_eq!(t.block_number, 42);
                 assert_eq!(t.transaction_index, 0);
                 assert_eq!(t.contract_type, "TransferContract");
-                assert_eq!(t.contract_result, "SUCCESS");
+                // `result` carries the contractRet string; `contract_result`
+                // is the (here empty) VM return-data hex.
+                assert_eq!(t.result, "SUCCESS");
+                assert_eq!(t.contract_result, "");
                 assert_eq!(t.fee_limit, 100_000);
             }
             other => panic!("expected Transaction trigger second, got {other:?}"),

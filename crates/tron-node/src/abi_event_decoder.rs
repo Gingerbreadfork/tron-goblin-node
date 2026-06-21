@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use tron_eventer::{ContractEvent, ContractLogEvent};
 use tron_proto::smart_contract::Abi;
-use tron_rpc::abi::{decode_event_log, decoded_value_to_json, AbiError, DecodedParam};
+use tron_rpc::abi::{decode_event_log, event_param_to_string, AbiError, DecodedParam};
 
 /// Outcome of an ABI-decode attempt.
 #[derive(Debug, Clone)]
@@ -85,14 +85,14 @@ where
                 origin_address: ctx.origin_address_hex.clone(),
                 caller_address: ctx.caller_address_hex.clone(),
                 creator_address: ctx.creator_address_hex.clone(),
+                // java-tron's `eventSignature` is the canonical signature
+                // STRING — `name(type,type,...)` — not the topic-0 hash
+                // (ContractTriggerCapsule.java:87). `eventSignatureFull`
+                // additionally carries each param's name
+                // (LogEventWrapper.getEventSignatureFull).
+                event_signature: event_signature(&event_name, &decoded.params),
+                event_signature_full: event_signature_full(&event_name, &decoded.params),
                 event_name,
-                event_signature: hex::encode(topics[0]),
-                event_signature_full: decoded
-                    .params
-                    .iter()
-                    .map(|p| p.r#type.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
                 topic_map,
                 data_map,
                 unique_id: ctx.unique_id.clone(),
@@ -131,32 +131,67 @@ fn make_log_event(ctx: &EventLogContext, topics: &[[u8; 32]], data: &[u8]) -> Co
     }
 }
 
+/// Canonical event signature string `name(type,type,...)` — the value
+/// java-tron stores in `ContractEventTrigger.eventSignature`
+/// (ContractTriggerCapsule.java:66-87).
+fn event_signature(name: &str, params: &[DecodedParam]) -> String {
+    let types = params
+        .iter()
+        .map(|p| p.r#type.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}({types})")
+}
+
+/// Full event signature `name(type name,type name,...)` — java-tron's
+/// `LogEventWrapper.getEventSignatureFull`. Params with an empty name
+/// contribute just their type (no trailing space).
+fn event_signature_full(name: &str, params: &[DecodedParam]) -> String {
+    let parts = params
+        .iter()
+        .map(|p| {
+            if p.name.is_empty() {
+                p.r#type.clone()
+            } else {
+                format!("{} {}", p.r#type, p.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}({parts})")
+}
+
 /// Split a decoded param vector into the two maps `ContractEvent`
-/// expects:
+/// expects, matching java-tron's `ContractEventParserAbi.parseTopics` /
+/// `parseEventData` keying exactly:
 ///
-/// * `topic_map` — every `indexed` param keyed by name (or empty
-///   placeholder when the ABI entry has no name).
+/// * `topic_map` — every `indexed` param.
 /// * `data_map` — every non-indexed param.
 ///
-/// Values are stringified via [`decoded_value_to_json`] →
-/// `to_string()` to keep the schema field type narrow (java-tron
-/// stores stringified values everywhere too).
+/// Each param is inserted under TWO keys (java does the same): the
+/// param's absolute position in the event's input list (`"0"`, `"1"`,
+/// ...), and — when the ABI gives the param a name — that name. The
+/// positional key is always present so consumers can index by position
+/// even for unnamed params; java never invents an `argN` placeholder.
+///
+/// Values are formatted via [`event_param_to_string`] — bare strings
+/// using TRON conventions (base58check addresses, decimal ints, raw
+/// hex for bytes), NOT the JSON-quoted eth-RPC rendering.
 fn split_params(
     params: &[DecodedParam],
 ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let mut topic_map = BTreeMap::new();
     let mut data_map = BTreeMap::new();
     for (i, p) in params.iter().enumerate() {
-        let key = if p.name.is_empty() {
-            format!("arg{i}")
+        let value = event_param_to_string(&p.value);
+        let map = if p.indexed {
+            &mut topic_map
         } else {
-            p.name.clone()
+            &mut data_map
         };
-        let value = decoded_value_to_json(&p.value).to_string();
-        if p.indexed {
-            topic_map.insert(key, value);
-        } else {
-            data_map.insert(key, value);
+        map.insert(i.to_string(), value.clone());
+        if !p.name.is_empty() {
+            map.insert(p.name.clone(), value);
         }
     }
     (topic_map, data_map)
@@ -243,17 +278,29 @@ mod tests {
             ..Default::default()
         };
         let result = decode_one_log(&ctx, &[0x41; 21], &topics, &data, |_| Some(abi.clone()));
+        let _ = topic0;
         match result {
             DecodedLog::Event(ev) => {
                 assert_eq!(ev.event_name, "Transfer");
-                assert_eq!(ev.event_signature, hex::encode(topic0));
-                assert!(ev.event_signature_full.contains("address"));
-                assert!(ev.event_signature_full.contains("uint256"));
-                assert_eq!(ev.topic_map.len(), 2);
+                // java stores the signature STRING, not the topic0 hash.
+                assert_eq!(ev.event_signature, "Transfer(address,address,uint256)");
+                assert_eq!(
+                    ev.event_signature_full,
+                    "Transfer(address from,address to,uint256 value)"
+                );
+                // Dual key scheme: positional index + name for every param.
+                assert_eq!(ev.topic_map.len(), 4); // {0, from, 1, to}
                 assert!(ev.topic_map.contains_key("from"));
                 assert!(ev.topic_map.contains_key("to"));
-                assert_eq!(ev.data_map.len(), 1);
+                assert_eq!(ev.topic_map.get("0"), ev.topic_map.get("from"));
+                assert_eq!(ev.topic_map.get("1"), ev.topic_map.get("to"));
+                // indexed addresses render as base58check TRON addresses.
+                assert!(ev.topic_map.get("from").unwrap().starts_with('T'));
+                assert_eq!(ev.data_map.len(), 2); // {2, value}
                 assert!(ev.data_map.contains_key("value"));
+                assert_eq!(ev.data_map.get("2"), ev.data_map.get("value"));
+                // non-indexed uint renders as a bare decimal string.
+                assert_eq!(ev.data_map.get("value").unwrap(), "1000");
             }
             DecodedLog::Log(_) => panic!("expected ContractEvent, got Log"),
         }

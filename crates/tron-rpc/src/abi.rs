@@ -358,6 +358,54 @@ pub fn decoded_value_to_json(v: &DynSolValue) -> Value {
     }
 }
 
+/// Render a decoded event parameter the way java-tron's
+/// `ContractEventParser` does for the `topicMap` / `dataMap` values
+/// posted on a `contractEventTrigger`.
+///
+/// This is intentionally distinct from [`decoded_value_to_json`] (which
+/// targets the eth-compatible RPC/`eth_getLogs` schema): the logsfilter
+/// values are bare strings, never JSON-quoted, and use TRON conventions
+/// the RPC schema does not:
+///
+/// * `int` / `uint` / `trcToken` → decimal string, e.g. `"1000"`
+///   (`ContractEventParser.parseDataBytes` → `BigInteger.toString()` /
+///   `parseTopic` → `DataWord.bigIntValue`).
+/// * `address` → base58check TRON address, e.g. `"TUQPrDEJ..."`
+///   (`StringUtil.encode58Check(convertToTronAddress(last20Bytes))`).
+/// * `bool` → `"true"` / `"false"`.
+/// * `bytesN` / `bytes` → lowercase hex, no `0x` prefix
+///   (`Hex.toHexString`).
+/// * `string` → the raw UTF-8 string.
+/// * arrays / tuples are not decoded field-by-field by java's parser
+///   (it falls back to raw hex of the whole `data` word); they are not
+///   reached on the per-field path here.
+pub fn event_param_to_string(v: &DynSolValue) -> String {
+    match v {
+        DynSolValue::Bool(b) => b.to_string(),
+        DynSolValue::Int(i, _bits) => i.to_string(),
+        DynSolValue::Uint(u, _bits) => u.to_string(),
+        DynSolValue::FixedBytes(b, n) => hex::encode(&b.as_slice()[..*n]),
+        DynSolValue::Bytes(b) => hex::encode(b),
+        DynSolValue::String(s) => s.clone(),
+        // java converts the 20-byte EVM address to the 21-byte TRON form
+        // (0x41 prefix) and base58check-encodes it.
+        DynSolValue::Address(a) => {
+            let mut tron = [0u8; 21];
+            tron[0] = 0x41;
+            tron[1..].copy_from_slice(a.as_slice());
+            tron_crypto::base58check::encode_check(&tron)
+        }
+        DynSolValue::Function(f) => hex::encode(f.as_slice()),
+        DynSolValue::Array(items)
+        | DynSolValue::FixedArray(items)
+        | DynSolValue::Tuple(items) => items
+            .iter()
+            .map(event_param_to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
 /// Convenience: render a full [`DecodedCall`] as JSON suitable for
 /// embedding in an RPC response.
 pub fn decoded_call_to_json(call: &DecodedCall) -> Value {
@@ -670,5 +718,42 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("1"));
         assert_eq!(arr[1].as_str(), Some("2"));
+    }
+
+    #[test]
+    fn event_param_uint_is_bare_decimal_no_quotes() {
+        let v = DynSolValue::Uint(alloy_primitives::U256::from(1000u64), 256);
+        // java `ContractEventParser` → BigInteger.toString(): bare "1000".
+        assert_eq!(event_param_to_string(&v), "1000");
+    }
+
+    #[test]
+    fn event_param_bool_is_lowercase_word() {
+        assert_eq!(event_param_to_string(&DynSolValue::Bool(true)), "true");
+        assert_eq!(event_param_to_string(&DynSolValue::Bool(false)), "false");
+    }
+
+    #[test]
+    fn event_param_bytes_is_bare_hex_no_0x() {
+        let v = DynSolValue::Bytes(vec![0x01, 0x09]);
+        assert_eq!(event_param_to_string(&v), "0109");
+    }
+
+    #[test]
+    fn event_param_string_is_raw_utf8() {
+        let v = DynSolValue::String("abcdefg123".to_string());
+        assert_eq!(event_param_to_string(&v), "abcdefg123");
+    }
+
+    #[test]
+    fn event_param_address_is_base58check_tron() {
+        // The EVM address used in java's EventParserTest
+        // (ca35b7d915458ef540ade6068dfe2f44e8fa733c) decodes to this
+        // base58check TRON address; `event_param_to_string` must match
+        // (0x41 prefix + base58check), not the eth-style 0x hex.
+        let bytes = hex::decode("ca35b7d915458ef540ade6068dfe2f44e8fa733c").unwrap();
+        let a = alloy_primitives::Address::from_slice(&bytes);
+        let s = event_param_to_string(&DynSolValue::Address(a));
+        assert_eq!(s, "TUQPrDEJkV4ttkrL7cVv1p3mikWYfM7LWt");
     }
 }
