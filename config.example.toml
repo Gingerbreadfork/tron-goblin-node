@@ -245,11 +245,35 @@ save_internal_tx = false                  # [wired]
 # Persist "featured" internal txs: system-contract calls (delegate / freeze …).
 save_featured_internal_tx = false         # [wired]
 
+# Persist cancelAllUnfreezeV2 per-unfreeze details. Inert unless BOTH
+# save_internal_tx and save_featured_internal_tx are also true.
+save_cancel_all_unfreeze_v2_details = false
+
 # Enable the eth-style estimateGas RPC.
 estimate_energy = false
 
+# Max retry attempts in the estimateGas binary search (java-tron clamps to 0..10).
+estimate_energy_max_retry = 3
+
 # Compiled-bytecode LRU cache size.
 lru_cache_size = 500
+
+# Long-running-contract rate-limit gate. A contract trips it when its
+# CPU-time / mainnet-time ratio exceeds max_time_ratio while it also runs past
+# long_running_time (ms); min_time_ratio is the lower "fast enough" bound. Raise
+# max_time_ratio on slow hosts so the gate doesn't fire on legitimate calls.
+min_time_ratio = 0.0
+max_time_ratio = 5.0
+long_running_time = 10
+
+# Block-STM optimistic parallel block execution during bulk catch-up,
+# byte-identical to the serial path. OFF by default: it won ~1.4-3.2x on an
+# in-memory benchmark but measured SLOWER than serial on a real RocksDB-backed
+# mainnet catch-up (per-read MVCC bookkeeping + many-thread contention), so it
+# is left in for A/B experimentation rather than as a speedup. The sync driver
+# only engages it per-block while bulk-syncing, never at the tip. Run with
+# BLOCKSTM_DEBUG=1 to log per-block convergence (rounds / reexecs / converged).
+parallel_exec = false
 
 # Overlap each applied block's commit + undo-log fsync with the next block's
 # execution during bulk sync (identical writes in identical order — only the
