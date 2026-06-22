@@ -1245,36 +1245,33 @@ fn format_block_for_http(id: &tron_types::BlockId, block: &tron_proto::Block) ->
     })
 }
 
+/// One `transaction.Contract` → java/TronGrid JSON: the enum NAME for `type`
+/// and `parameter: { value: <decoded message>, type_url }` (proto3 JsonFormat
+/// style). Not-yet-modeled types keep the raw hex value so nothing is lost.
+pub(crate) fn format_contract_for_http(c: &tron_proto::transaction::Contract) -> Value {
+    use serde_json::Map;
+    let type_name = tron_proto::transaction::contract::ContractType::try_from(c.r#type)
+        .map(|t| t.as_str_name().to_string())
+        .unwrap_or_else(|_| c.r#type.to_string());
+    let mut m = Map::new();
+    if let Some(any) = c.parameter.as_ref() {
+        let value = decode_contract_parameter(c.r#type, &any.value)
+            .unwrap_or_else(|| json!(hex::encode(&any.value)));
+        m.insert(
+            "parameter".into(),
+            json!({ "value": value, "type_url": any.type_url }),
+        );
+    }
+    m.insert("type".into(), json!(type_name));
+    if c.permission_id != 0 {
+        m.insert("Permission_id".into(), json!(c.permission_id));
+    }
+    Value::Object(m)
+}
+
 pub(crate) fn format_raw_data_for_http(raw: &tron_proto::transaction::Raw) -> Value {
     use serde_json::Map;
-    let contracts: Vec<Value> = raw
-        .contract
-        .iter()
-        .map(|c| {
-            // java renders `type` as the enum NAME and `parameter.value`
-            // as the DECODED contract message (proto3 JsonFormat with a
-            // type registry) — not raw hex.
-            let type_name = tron_proto::transaction::contract::ContractType::try_from(c.r#type)
-                .map(|t| t.as_str_name().to_string())
-                .unwrap_or_else(|_| c.r#type.to_string());
-            let mut m = Map::new();
-            if let Some(any) = c.parameter.as_ref() {
-                let value = decode_contract_parameter(c.r#type, &any.value)
-                    // Unknown / not-yet-modeled types keep the raw hex so
-                    // no information is lost.
-                    .unwrap_or_else(|| json!(hex::encode(&any.value)));
-                m.insert(
-                    "parameter".into(),
-                    json!({ "value": value, "type_url": any.type_url }),
-                );
-            }
-            m.insert("type".into(), json!(type_name));
-            if c.permission_id != 0 {
-                m.insert("Permission_id".into(), json!(c.permission_id));
-            }
-            Value::Object(m)
-        })
-        .collect();
+    let contracts: Vec<Value> = raw.contract.iter().map(format_contract_for_http).collect();
     let mut m = Map::new();
     m.insert("contract".into(), json!(contracts));
     m.insert("ref_block_bytes".into(), json!(hex::encode(&raw.ref_block_bytes)));

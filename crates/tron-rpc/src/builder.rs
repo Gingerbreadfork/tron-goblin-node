@@ -101,20 +101,12 @@ pub fn tx_to_envelope(tx: &Transaction) -> Result<Value, RpcError> {
         .ok_or_else(|| RpcError::internal("builder produced tx with no raw_data"))?;
     let raw_data_bytes = raw.encode_to_vec();
     let tx_id = tron_crypto::hash::sha256(&raw_data_bytes);
+    // Decode each contract to the full java/TronGrid shape (enum-name `type`,
+    // `parameter.value`), keeping this envelope's own raw_data field set.
     let contracts: Vec<Value> = raw
         .contract
         .iter()
-        .map(|c| {
-            json!({
-                "type": c.r#type,
-                "permission_id": c.permission_id,
-                "parameter_type_url": c
-                    .parameter
-                    .as_ref()
-                    .map(|p| p.type_url.clone())
-                    .unwrap_or_default(),
-            })
-        })
+        .map(crate::http_rest::format_contract_for_http)
         .collect();
     Ok(json!({
         "visible": false,

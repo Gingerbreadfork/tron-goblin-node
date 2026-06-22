@@ -5741,7 +5741,9 @@ pub fn get_transaction_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError>
         "signature": tx.signature.iter().map(|s| hex_bytes(s)).collect::<Vec<_>>(),
         "ret": tx.ret.iter().map(|r| json!({
             "fee": r.fee,
-            "contractRet": r.contract_ret,
+            "contractRet": tron_proto::transaction::result::ContractResult::try_from(r.contract_ret)
+                .map(|c| c.as_str_name().to_string())
+                .unwrap_or_else(|_| r.contract_ret.to_string()),
         })).collect::<Vec<_>>(),
     }))
 }
