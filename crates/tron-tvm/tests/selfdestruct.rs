@@ -20,9 +20,9 @@ use tron_chainbase::{
     StorageRowStore, VotesStore, WitnessStore,
 };
 use tron_crypto::address::Address;
-use tron_proto::{smart_contract::Abi, Account, CreateSmartContract, SmartContract, TriggerSmartContract};
+use tron_proto::{Account, TriggerSmartContract};
 use tron_tvm::database::code_hash;
-use tron_tvm::execute::{execute_create, execute_trigger, VmBlockEnv, VmOutcome, VmStores};
+use tron_tvm::execute::{execute_trigger, VmBlockEnv, VmOutcome, VmStores};
 
 /// Mainnet burn account (`TLsV52sRDL79HXGGm9yzwKibb6BeruhUzy`).
 const BLACKHOLE: [u8; 21] = [
