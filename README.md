@@ -1,24 +1,27 @@
 # <img src="goblin.svg" width="48" alt="" valign="middle"> Tron Goblin Node
 
-[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Status](https://img.shields.io/badge/status-pre--release-yellow) ![Tests](https://img.shields.io/badge/tests-2434%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
+[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Tests](https://img.shields.io/badge/tests-2640%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
 
 A Rust implementation of the [TRON](https://tron.network) full-node
 protocol — the same role java-tron plays, written from scratch in
 Rust with byte-exact database and wire compatibility as a stated
 goal.
 
-> **Status: pre-release, experimental.** Pointed at public mainnet from
-> a java-tron RocksDB snapshot, it catches up a multi-day backlog, holds
-> the live tip, and applies real blocks into RocksDB chainbase state —
-> and the block hashes it computes from its own executed state match the
-> canonical chain block-for-block. Transactions run through an optional
-> **Block-STM** parallel executor that stays byte-identical to the serial
-> path, and it rebuilds head state on a fork-switch (reorg-driven
-> rollback). Still open: full *state*-exactness across every edge case
-> (block headers carry no state root, so that's verified separately by
-> RPC reads — see below), long-running mainnet soak, and assorted polish.
-> See [Status](#status) for specifics. This is **not** a drop-in
-> production replacement for java-tron today — though that is the goal.
+> Pointed at public mainnet from a
+> java-tron RocksDB snapshot, it replayed **over half a million real
+> mainnet blocks up to the live tip with zero consensus divergences** —
+> every transaction's computed success/failure cross-checked, block for
+> block, against the chain's own canonical `contractRet` — then flipped
+> from catch-up to tracking head-of-chain in real time. The block hashes
+> it derives from its own executed state match the canonical chain
+> block-for-block. Transactions run through an optional **Block-STM**
+> parallel executor that stays byte-identical to the serial path, and the
+> node rebuilds head state on a fork-switch (reorg-driven rollback). What
+> it does **not** yet claim: a long-term soak under real peer churn, or
+> that every last state edge case is covered (TRON headers carry no state
+> root, so state is verified separately by RPC reads — see below). Run it
+> as a second / validating client, or alongside java-tron, until you've
+> proven it in your own environment. See [Status](#status) for specifics.
 
 
 ## ⚡ Watch real TRON mainnet, live — in one command
@@ -170,9 +173,9 @@ can actually profile, debug, and tune without fighting a JVM.
 
 The short version: `tron-goblin-node` imports, validates, and executes
 live mainnet blocks into **byte-exact** RocksDB state, syncs off public
-mainnet and holds the tip, produces blocks as an SR, and serves
-java-tron's full API surface — plus developer tooling java-tron doesn't
-have. What works today, by area:
+mainnet up to the live tip and tracks head-of-chain, produces blocks as an
+SR, and serves java-tron's full API surface — plus developer tooling
+java-tron doesn't have. What works today, by area:
 
 ### ⚙️ Consensus & execution
 
@@ -190,8 +193,10 @@ have. What works today, by area:
   transfer fields, the TRON opcodes (`0xd0..0xd4`), the per-contract
   dynamic-energy model, and Sapling shielded-TRC-20 (Groth16) proving.
   Read-only (`triggerconstantcontract`) results for tested TRC-20s (USDT
-  and others) match java-tron **byte-for-byte**; energy-accounting parity
-  is close, with residual gaps tracked under [Known gaps](#known-gaps).
+  and others) match java-tron **byte-for-byte**, and energy accounting
+  tracks java-tron closely enough that every transaction's
+  success / out-of-energy / revert outcome held block-for-block across the
+  half-million-block replay.
 - **Consensus self-audit watchdog** — every transaction's computed
   success/failure is cross-checked against the block's canonical
   `contractRet` (the only divergence signal a stateless-root chain gives
@@ -205,7 +210,7 @@ have. What works today, by area:
   branch's state back per-block, re-applies the winner, and re-pushes
   reverted txs to the mempool, recovering atomically on failure and never
   crossing the irreversible block. Two backends: undo-store (default) and
-  a snapshot overlay (`--snapshot-reorg`).
+  a snapshot overlay (`storage.snapshot_reorg`).
 
 ### 🌐 Networking & mempool
 
@@ -292,9 +297,10 @@ have. What works today, by area:
 
 Real, currently-open items:
 
-- ❌ **Long-running mainnet soak / endurance.** Short live sessions
-  pass; multi-hour, multi-day stability under realistic peer churn
-  hasn't been characterized.
+- ❌ **Long-term soak / endurance.** The node reaches and holds the tip,
+  but stability over a long-running deployment under sustained peer churn
+  — memory, file descriptors, compaction pressure — hasn't been
+  characterized.
 - ❌ **Probably a number of other things.** java-tron is large
   and old; some quirks will only surface when a specific client or
   workload hits them. This list will be updated as new items are
@@ -310,28 +316,28 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **2328** |
+| Workspace tests passing | **2640** |
 | Ignored — live-network (6), Sapling Groth16 proving (5), perf/diagnostic (7) | 18 |
-| Integration test files (`crates/*/tests/`) | 121 |
-| Source modules with `#[cfg(test)]` blocks | 125 |
+| Integration test files (`crates/*/tests/`) | 123 |
+| Source modules with `#[cfg(test)]` blocks | 139 |
 
 Per-crate breakdown of the test surface (where coverage lives is
 where parity risk lives):
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `tron-node`      | 373 | `tron-types`     |  60 |
-| `tron-actuator`  | 321 | `tron-net`       |  77 |
-| `tron-rpc`       | 317 | `tron-index`     |  55 |
-| `tron-tvm`       | 322 | `tron-crypto`    |  35 |
-| `tron-chainbase` | 228 | `tron-mempool`   |  25 |
-| `tron-executor`  | 162 | `tron-wallet`    |  22 |
-| `tron-consensus` |  88 | `tron-eventer`   |  16 |
-| `tron-grpc`      |  66 | `tron-firehose-*`|   8 |
-| `tron-proto`     |   8 | `tron-replay`    |   8 |
+| `tron-node`      | 392 | `tron-types`     |  72 |
+| `tron-actuator`  | 368 | `tron-net`       |  78 |
+| `tron-rpc`       | 364 | `tron-index`     |  96 |
+| `tron-tvm`       | 401 | `tron-crypto`    |  35 |
+| `tron-chainbase` | 246 | `tron-mempool`   |  27 |
+| `tron-executor`  | 171 | `tron-wallet`    |  22 |
+| `tron-consensus` | 117 | `tron-eventer`   |  16 |
+| `tron-grpc`      |  67 | `tron-firehose-*`|   8 |
+| `tron-proto`     |  13 | `tron-replay`    |   8 |
 
-These principal crates account for 2,191 of the 2,328 passing tests; the
-remaining ~137 live in the four vendored `revm-*` forks and the
+These principal crates account for 2,501 of the 2,640 passing tests; the
+remaining ~139 live in the four vendored `revm-*` forks and the
 `tron-state-diff` / `tron-eventer-kafka` tooling crates.
 
 Notable test categories:
@@ -439,7 +445,7 @@ The full workspace compiles in ~3–5 minutes on a modern machine.
 Tests:
 
 ```sh
-cargo test --workspace            # 2328 tests, all defaults
+cargo test --workspace            # 2640 tests, all defaults
 cargo test --workspace --release -- --include-ignored
                                   # + 18 opt-in: Sapling proving (~50 MB
                                   # Groth16 params), live-network, diagnostics
@@ -600,10 +606,31 @@ consumers through one protocol. External processes tail it over gRPC
 reference consumers ship in-workspace — `tron-firehose-postgres`
 (exactly-once into an explorer schema), `tron-firehose-nats`
 (JetStream bridge), and `tron-firehose-clickhouse` (analytics schema).
-Format and cursor protocol: [`working/FIREHOSE.md`](working/FIREHOSE.md).
+Format, cursor protocol, and consumer setup:
+[docs/apis-indexing-firehose.md](docs/apis-indexing-firehose.md).
 
 Every `[index]` knob is annotated in
 [`config.example.toml`](config.example.toml).
+
+## Documentation
+
+This README is the high-level tour. Deeper, task-oriented guides live in
+[`docs/`](docs/):
+
+| Guide | For |
+| --- | --- |
+| [Architecture](docs/architecture.md) | The workspace layers, core invariants, and how a block flows through them. |
+| [Operations](docs/operations.md) | Building, running, importing snapshots, and operating the services day to day. |
+| [Configuration](docs/configuration.md) | Choosing safe runtime settings; every knob is also annotated in [`config.example.toml`](config.example.toml). |
+| [Security & Production Readiness](docs/security-production.md) | The hardening checklist before exposing a node publicly. |
+| [APIs, Indexing & Firehose](docs/apis-indexing-firehose.md) | The RPC / REST / gRPC surface, the `/v1` history API, archive reads, and the firehose. |
+| [Historical-State Archive](docs/historical-state-archive.md) | Reading account / contract state — or running constant calls — as-of a past block. |
+| [Verifiable State Commitment](docs/verifiable-state-commitment.md) | The opt-in cryptographic state root, offline proofs, and the node-equality self-check. |
+| [Development](docs/development.md) | Building, testing, and validating parity when changing code. |
+| [Troubleshooting](docs/troubleshooting.md) | Diagnosing common failures. |
+
+A terser, structured set written for AI coding assistants lives under
+[`docs/llm/`](docs/llm/).
 
 ## Compatibility notes
 
