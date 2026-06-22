@@ -468,7 +468,7 @@ async fn wallet_getaccountbalance_echoes_block_identifier() {
 /// `POST /wallet/getcontractinfo` for an unknown contract returns null
 /// (matching java-tron). Spot-checks the addr-decoding path doesn't crash.
 #[tokio::test]
-async fn wallet_getcontractinfo_unknown_address_returns_null() {
+async fn wallet_getcontractinfo_unknown_address_returns_empty_object() {
     let (addr, ..) = spawn_http_server().await;
     let resp = http_post(
         addr,
@@ -476,9 +476,9 @@ async fn wallet_getcontractinfo_unknown_address_returns_null() {
         json!({"value": format!("0x{}", hex::encode(ALICE_HEX))}),
     )
     .await;
-    // Our fixture has no contracts store attached → method returns
-    // null. Pin that as the expected shape.
-    assert!(resp.is_null() || resp.get("Error").is_some(), "got: {resp}");
+    // Missing contract → empty object, matching java-tron (verified against
+    // TronGrid: getcontractinfo on a non-contract returns {}).
+    assert_eq!(resp, json!({}), "got: {resp}");
 }
 
 /// Spawn a server whose state has the head pointer (`number` + `hash`)

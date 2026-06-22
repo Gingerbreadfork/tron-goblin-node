@@ -139,7 +139,16 @@ pub fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RpcError> {
 /// The Ethereum-compat layer accepts the 20-byte form (post-prefix
 /// bytes) and prepends `0x41` automatically.
 pub fn parse_eth_address(s: &str) -> Result<Address, RpcError> {
-    let bytes = parse_hex_bytes(s)?;
+    // Accept every form a caller might send: base58check (`T…`, the TRON wallet
+    // form), bare TRON hex (`41…` or a 20-byte body), and eth-style `0x…` hex.
+    // The eth JSON-RPC layer only ever sends `0x…`; TRON REST clients send
+    // `T…`/`41…`. All normalise to the same 21-byte `0x41`-prefixed address.
+    if s.starts_with('T') {
+        return tron_crypto::base58check::decode_address(s)
+            .map_err(|e| RpcError::invalid_params(format!("bad base58 address: {e:?}")));
+    }
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))
+        .map_err(|e| RpcError::invalid_params(format!("bad address hex: {e}")))?;
     let mut buf = [0u8; ADDRESS_LENGTH];
     buf[0] = 0x41;
     match bytes.len() {
@@ -1420,7 +1429,7 @@ pub fn get_exchange_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             "secondTokenId": String::from_utf8_lossy(&e.second_token_id).to_string(),
             "secondTokenBalance": e.second_token_balance,
         })),
-        _ => Ok(Value::Null),
+        _ => Ok(json!({})),
     }
 }
 
@@ -3351,7 +3360,7 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("missing account id"))?;
     let id_bytes = parse_hex_bytes(id_str).unwrap_or_else(|_| id_str.as_bytes().to_vec());
     let Ok(Some(addr)) = idx.get(&id_bytes) else {
-        return Ok(Value::Null);
+        return Ok(json!({}));
     };
     let genesis_ms = s.dyn_props.genesis_block_timestamp().unwrap_or(0);
     match s.accounts.get(&addr) {
@@ -3362,7 +3371,7 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             apply_read_usage_recovery(&mut a, &s.dyn_props);
             Ok(encode_account_for_rpc(&a, genesis_ms))
         }
-        _ => Ok(Value::Null),
+        _ => Ok(json!({})),
     }
 }
 
@@ -4738,7 +4747,8 @@ pub fn get_contract(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let addr = parse_eth_address(addr_str)?;
     match load_contract_with_abi(s, &addr)? {
         Some(contract) => Ok(encode_smart_contract(&contract)),
-        None => Ok(Value::Null),
+        // java-tron returns an empty object (not null) for a non-contract.
+        None => Ok(json!({})),
     }
 }
 
@@ -4756,7 +4766,7 @@ pub fn get_contract_info(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("missing contract address"))?;
     let addr = parse_eth_address(addr_str)?;
     let Some(contract) = load_contract_with_abi(s, &addr)? else {
-        return Ok(Value::Null);
+        return Ok(json!({}));
     };
     // java: a contract row without code yields runtimecode = "".
     let runtime_code = match &s.code {
@@ -4951,7 +4961,7 @@ pub fn get_proposal_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             "approvalsCount": p.approvals.len(),
             "state": p.state,
         })),
-        None => Ok(Value::Null),
+        None => Ok(json!({})),
     }
 }
 
@@ -6611,19 +6621,8 @@ fn parse_addr_field(p: &Value, field: &str) -> Result<Vec<u8>, RpcError> {
         .get(field)
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params(format!("missing {field}")))?;
-    let bytes = parse_hex_bytes(s)?;
-    match bytes.len() {
-        20 => {
-            let mut out = vec![0u8; 21];
-            out[0] = 0x41;
-            out[1..].copy_from_slice(&bytes);
-            Ok(out)
-        }
-        21 if bytes[0] == 0x41 => Ok(bytes),
-        n => Err(RpcError::invalid_params(format!(
-            "{field} must be a 20- or 21-byte address (got {n} bytes)"
-        ))),
-    }
+    // Accept base58 / bare-hex / 0x-hex (see parse_eth_address).
+    Ok(parse_eth_address(s)?.as_bytes().to_vec())
 }
 
 /// Pull a named field from `params[0]` as an i64. Accepts JSON number
@@ -6651,6 +6650,38 @@ fn parse_i32_field(p: &Value, field: &str, default: i32) -> Result<i32, RpcError
         return Err(RpcError::invalid_params(format!("{field}: out of i32 range")));
     }
     Ok(v as i32)
+}
+
+/// Parse a `resource` field as the `ResourceCode` enum: accepts the int
+/// (0=BANDWIDTH, 1=ENERGY, 2=TRON_POWER) or the enum-name string that
+/// java-tron / TronWeb send. Defaults to `default` when absent.
+fn parse_resource_field(p: &Value, field: &str, default: i32) -> Result<i32, RpcError> {
+    let obj = match p.get(0).and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(default),
+    };
+    match obj.get(field) {
+        None => Ok(default),
+        Some(v) if v.is_null() => Ok(default),
+        Some(v) => {
+            if let Some(s) = v.as_str() {
+                match s.to_ascii_uppercase().as_str() {
+                    "BANDWIDTH" => Ok(0),
+                    "ENERGY" => Ok(1),
+                    "TRON_POWER" => Ok(2),
+                    other => other.parse::<i32>().map_err(|_| {
+                        RpcError::invalid_params(format!("resource: unknown ResourceCode {s:?}"))
+                    }),
+                }
+            } else if let Some(n) = v.as_i64() {
+                Ok(n as i32)
+            } else {
+                Err(RpcError::invalid_params(
+                    "resource: expected a ResourceCode name or number",
+                ))
+            }
+        }
+    }
 }
 
 /// Pull a named field as hex bytes.
@@ -6725,7 +6756,7 @@ pub fn freeze_balance_v2(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let tc = tron_proto::FreezeBalanceV2Contract {
         owner_address: parse_addr_field(p, "owner_address")?,
         frozen_balance: parse_i64_field(p, "frozen_balance", 0)?,
-        resource: parse_i32_field(p, "resource", 0)?,
+        resource: parse_resource_field(p, "resource", 0)?,
     };
     let contract = wrap_contract(ContractType::FreezeBalanceV2Contract, &tc, 0);
     let tx = build_unsigned_tx(s, contract, 0)?;
@@ -6737,7 +6768,7 @@ pub fn unfreeze_balance_v2(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let tc = tron_proto::UnfreezeBalanceV2Contract {
         owner_address: parse_addr_field(p, "owner_address")?,
         unfreeze_balance: parse_i64_field(p, "unfreeze_balance", 0)?,
-        resource: parse_i32_field(p, "resource", 0)?,
+        resource: parse_resource_field(p, "resource", 0)?,
     };
     let contract = wrap_contract(ContractType::UnfreezeBalanceV2Contract, &tc, 0);
     let tx = build_unsigned_tx(s, contract, 0)?;
@@ -6774,7 +6805,7 @@ pub fn delegate_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .unwrap_or(false);
     let tc = tron_proto::DelegateResourceContract {
         owner_address: parse_addr_field(p, "owner_address")?,
-        resource: parse_i32_field(p, "resource", 0)?,
+        resource: parse_resource_field(p, "resource", 0)?,
         balance: parse_i64_field(p, "balance", 0)?,
         receiver_address: parse_addr_field(p, "receiver_address")?,
         lock,
@@ -6789,7 +6820,7 @@ pub fn delegate_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 pub fn un_delegate_resource(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let tc = tron_proto::UnDelegateResourceContract {
         owner_address: parse_addr_field(p, "owner_address")?,
-        resource: parse_i32_field(p, "resource", 0)?,
+        resource: parse_resource_field(p, "resource", 0)?,
         balance: parse_i64_field(p, "balance", 0)?,
         receiver_address: parse_addr_field(p, "receiver_address")?,
     };
@@ -7420,7 +7451,7 @@ pub fn freeze_balance(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         owner_address: parse_addr_field(p, "owner_address")?,
         frozen_balance: parse_i64_field(p, "frozen_balance", 0)?,
         frozen_duration: parse_i64_field(p, "frozen_duration", 3)?,
-        resource: parse_i32_field(p, "resource", 0)?,
+        resource: parse_resource_field(p, "resource", 0)?,
         receiver_address: receiver,
     };
     let contract = wrap_contract(ContractType::FreezeBalanceContract, &tc, 0);
@@ -7434,7 +7465,7 @@ pub fn unfreeze_balance(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let receiver = parse_addr_field(p, "receiver_address").unwrap_or_default();
     let tc = tron_proto::UnfreezeBalanceContract {
         owner_address: parse_addr_field(p, "owner_address")?,
-        resource: parse_i32_field(p, "resource", 0)?,
+        resource: parse_resource_field(p, "resource", 0)?,
         receiver_address: receiver,
     };
     let contract = wrap_contract(ContractType::UnfreezeBalanceContract, &tc, 0);
@@ -8527,5 +8558,43 @@ mod eth_encoding_tests {
         assert_eq!(v["gasPrice"], json!("0x"));
         assert_eq!(v["type"], json!("0x0"));
         assert_eq!(v["nonce"], json!("0x0000000000000000"));
+    }
+
+    #[test]
+    fn parse_eth_address_accepts_tron_and_eth_forms() {
+        // Every form a caller might send resolves to the same 21-byte address.
+        let want = parse_eth_address("0x4e52313edd8bf9e3a067f4f188e5f06493f4785d").unwrap();
+        assert_eq!(
+            parse_eth_address("414e52313edd8bf9e3a067f4f188e5f06493f4785d").unwrap(),
+            want,
+            "bare TRON hex (41-prefixed)"
+        );
+        assert_eq!(
+            parse_eth_address("TH7LAr74GTajgnYTbWz1j3qdvzfdhFDNV5").unwrap(),
+            want,
+            "base58check (T…)"
+        );
+        assert_eq!(
+            parse_eth_address("0x414e52313edd8bf9e3a067f4f188e5f06493f4785d").unwrap(),
+            want,
+            "0x with full 21-byte body"
+        );
+    }
+
+    #[test]
+    fn parse_resource_field_accepts_enum_name_or_int() {
+        let f = |v: serde_json::Value| {
+            parse_resource_field(&json!([{ "resource": v }]), "resource", 0).unwrap()
+        };
+        assert_eq!(f(json!("BANDWIDTH")), 0);
+        assert_eq!(f(json!("ENERGY")), 1);
+        assert_eq!(f(json!("energy")), 1, "case-insensitive");
+        assert_eq!(f(json!("TRON_POWER")), 2);
+        assert_eq!(f(json!(1)), 1, "int still works");
+        assert_eq!(
+            parse_resource_field(&json!([{}]), "resource", 0).unwrap(),
+            0,
+            "absent → default"
+        );
     }
 }

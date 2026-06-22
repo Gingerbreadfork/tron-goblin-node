@@ -3206,7 +3206,7 @@ async fn get_contract_info_matches_java_wrapper_shape() {
 }
 
 #[tokio::test]
-async fn get_contract_returns_null_when_account_missing() {
+async fn get_contract_returns_empty_object_when_account_missing() {
     use tron_chainbase::ContractStore;
 
     let accounts_be = mem();
@@ -3243,5 +3243,5 @@ async fn get_contract_returns_null_when_account_missing() {
                "params":[format!("0x{}", hex::encode(&contract_tron[1..]))],"id":1}),
     )
     .await;
-    assert_eq!(resp["result"], Value::Null);
+    assert_eq!(resp["result"], json!({}));
 }
