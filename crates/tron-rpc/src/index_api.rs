@@ -632,35 +632,16 @@ async fn contract_events(
     (StatusCode::OK, Json(envelope(data, page.fingerprint, reader)))
 }
 
-/// Stored-transaction → JSON, mirroring `gettransactionbyid`'s shape
-/// (raw_data summary, signatures, ret).
+/// Stored-transaction → JSON in the full java/TronGrid shape (decoded
+/// contract `parameter.value`, enum-name `type`), reusing the same
+/// `format_raw_data_for_http` decoder `getblockbynum` renders with.
 fn transaction_to_json(tx: &tron_proto::Transaction) -> Value {
-    let raw = tx.raw_data.as_ref();
-    let contracts: Vec<Value> = raw
-        .map(|r| {
-            r.contract
-                .iter()
-                .map(|c| {
-                    json!({
-                        "type": c.r#type,
-                        "permission_id": c.permission_id,
-                        "parameter_type_url": c
-                            .parameter
-                            .as_ref()
-                            .map(|p| p.type_url.clone())
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     json!({
-        "raw_data": {
-            "expiration": raw.map(|r| r.expiration).unwrap_or(0),
-            "timestamp": raw.map(|r| r.timestamp).unwrap_or(0),
-            "fee_limit": raw.map(|r| r.fee_limit).unwrap_or(0),
-            "contract": contracts,
-        },
+        "raw_data": tx
+            .raw_data
+            .as_ref()
+            .map(crate::http_rest::format_raw_data_for_http)
+            .unwrap_or_else(|| json!({})),
         "signature": tx.signature.iter().map(hex::encode).collect::<Vec<_>>(),
         "ret": tx.ret.iter().map(|r| json!({
             "fee": r.fee,

@@ -5727,35 +5727,17 @@ pub fn get_transaction_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError>
         }
     };
 
-    let raw = tx.raw_data.as_ref();
-    let contracts: Vec<Value> = raw
-        .map(|r| {
-            r.contract
-                .iter()
-                .map(|c| {
-                    json!({
-                        "type": c.r#type,
-                        "permission_id": c.permission_id,
-                        "parameter_type_url": c
-                            .parameter
-                            .as_ref()
-                            .map(|p| p.type_url.clone())
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Full java/TronGrid raw_data shape (decoded contract `parameter.value`,
+    // enum-name `type`), reusing the same decoder `getblockbynum` renders with.
+    let raw_data = tx
+        .raw_data
+        .as_ref()
+        .map(crate::http_rest::format_raw_data_for_http)
+        .unwrap_or_else(|| json!({}));
 
     Ok(json!({
         "txID": hex_bytes(&id),
-        "raw_data": {
-            "expiration": raw.map(|r| r.expiration).unwrap_or(0),
-            "timestamp": raw.map(|r| r.timestamp).unwrap_or(0),
-            "fee_limit": raw.map(|r| r.fee_limit).unwrap_or(0),
-            "contract_count": contracts.len(),
-            "contract": contracts,
-        },
+        "raw_data": raw_data,
         "signature": tx.signature.iter().map(|s| hex_bytes(s)).collect::<Vec<_>>(),
         "ret": tx.ret.iter().map(|r| json!({
             "fee": r.fee,

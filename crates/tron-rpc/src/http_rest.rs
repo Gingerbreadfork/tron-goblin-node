@@ -1245,7 +1245,7 @@ fn format_block_for_http(id: &tron_types::BlockId, block: &tron_proto::Block) ->
     })
 }
 
-fn format_raw_data_for_http(raw: &tron_proto::transaction::Raw) -> Value {
+pub(crate) fn format_raw_data_for_http(raw: &tron_proto::transaction::Raw) -> Value {
     use serde_json::Map;
     let contracts: Vec<Value> = raw
         .contract
