@@ -1161,7 +1161,13 @@ fn run_start(args: &[String]) -> ExitCode {
     });
 
     let result: Result<(), RunError> = rt.block_on(run(config, shutdown));
-    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    // `run` already drained every durable-state task in its grace window, so
+    // only non-durable network/sampler stragglers remain. Drop them outright
+    // rather than polling them: `shutdown_timeout` keeps leftover tasks running
+    // long enough to re-arm a timer against the closing runtime, panicking the
+    // worker ("a Tokio 1.x context was found, but it is being shutdown");
+    // dropping at the await point deregisters their timers cleanly.
+    rt.shutdown_background();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

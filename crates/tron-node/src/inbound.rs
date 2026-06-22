@@ -218,11 +218,23 @@ pub(crate) async fn accept_loop(
 
         let _ = stream.set_nodelay(true);
         let server = server.clone();
+        let mut conn_shutdown = shutdown.resubscribe();
         tokio::spawn(async move {
             server.inbound.fetch_add(1, Ordering::Relaxed);
             server.set_peer_gauge();
-            if let Err(e) = serve_inbound_peer(&server, stream, &peer_addr.to_string()).await {
-                debug!(%peer_addr, error = %e, "inbound peer ended");
+            // Race the serve loop against shutdown. This task holds keepalive
+            // timers and is not in the runtime's drained handle set, so without
+            // a shutdown branch it would run into teardown and re-arm a timer
+            // against the closing runtime. Observing the broadcast lets it exit
+            // inside the drain window instead.
+            let peer_addr_str = peer_addr.to_string();
+            tokio::select! {
+                _ = conn_shutdown.recv() => {}
+                r = serve_inbound_peer(&server, stream, &peer_addr_str) => {
+                    if let Err(e) = r {
+                        debug!(%peer_addr, error = %e, "inbound peer ended");
+                    }
+                }
             }
             server.inbound.fetch_sub(1, Ordering::Relaxed);
             server.set_peer_gauge();
