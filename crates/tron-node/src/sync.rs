@@ -7830,7 +7830,7 @@ mod solidify_tests {
         const N: usize = 27;
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone(), mem());
+        let driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         // Steady-state: a full clean rotation has every witness produce once,
@@ -7864,7 +7864,7 @@ mod solidify_tests {
         const N: usize = 27;
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone(), mem());
+        let driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         // Assign witness i a latest of (i+1)*10 — sorted ascending is
@@ -7884,7 +7884,7 @@ mod solidify_tests {
         const N: usize = 27;
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone(), mem());
+        let driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         let pos = solid_position(N); // 8
@@ -7910,7 +7910,7 @@ mod solidify_tests {
         const N: usize = 27;
         let state = mem_state();
         seed_witnesses(&state, N);
-        let mut driver = driver_with(state.clone(), mem());
+        let driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         // A higher solid is already on disk (e.g. from PBFT finality).
@@ -7933,7 +7933,7 @@ mod solidify_tests {
         // No active list seeded → java would throw on the empty get(position);
         // we leave the pointer untouched rather than guess (pre-genesis).
         let state = mem_state();
-        let mut driver = driver_with(state.clone(), mem());
+        let driver = driver_with(state.clone(), mem());
         let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
 
         driver.update_solidified();
