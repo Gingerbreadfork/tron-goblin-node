@@ -250,8 +250,10 @@ fn execute_swaps_trx_for_asset_at_configured_ratio() {
     let issuer = ctx.accounts.get(&addr(ISSUER)).unwrap().unwrap();
     assert_eq!(owner.balance, 1_000_000 - 100);
     assert_eq!(issuer.balance, 100);
-    assert_eq!(*owner.asset_v2.get("TestCoin").unwrap(), 1000);
-    assert_eq!(*issuer.asset_v2.get("TestCoin").unwrap(), 1_000_000 - 1000);
+    // flag=0: balances move in the V1 name-keyed `asset` map (java reduce/add
+    // AssetAmountV2 select `asset` until ALLOW_SAME_TOKEN_NAME is on).
+    assert_eq!(*owner.asset.get("TestCoin").unwrap(), 1000);
+    assert_eq!(*issuer.asset.get("TestCoin").unwrap(), 1_000_000 - 1000);
 }
 
 #[test]
@@ -337,9 +339,9 @@ fn execute_chains_multiple_participates_correctly() {
     assert_eq!(owner.balance, 10_000_000 - 3 * 1000);
     assert_eq!(issuer.balance, 3 * 1000);
     // 3 × 1000 sun × 5/1 = 15_000 asset units total.
-    assert_eq!(*owner.asset_v2.get("TestCoin").unwrap(), 3 * 5000);
+    assert_eq!(*owner.asset.get("TestCoin").unwrap(), 3 * 5000);
     assert_eq!(
-        *issuer.asset_v2.get("TestCoin").unwrap(),
+        *issuer.asset.get("TestCoin").unwrap(),
         10_000_000 - 3 * 5000
     );
 }

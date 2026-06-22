@@ -686,22 +686,21 @@ fn asset_issue_then_transfer() {
     asset::execute_asset_issue(&accounts, &v1, &v2, &dp, &issue).unwrap();
     assert!(v1.get(b"TestToken").unwrap().is_some());
 
-    // Now Alice transfers some asset to Bob.
+    // Now Alice transfers some asset to Bob. At ALLOW_SAME_TOKEN_NAME=0 the
+    // balance is keyed by token *name* in the V1 `asset` map (java
+    // addAsset/addAssetAmountV2), so the transfer names the token and the moved
+    // units land in `asset`, not the id-keyed `asset_v2`.
     put_account(&accounts, BOB, 0);
-    let token_id = format!(
-        "{}",
-        dp.get_long(b"TOKEN_ID_NUM").unwrap_or(1_000_001)
-    );
     let xfer = tron_proto::TransferAssetContract {
         owner_address: ALICE.to_vec(),
         to_address: BOB.to_vec(),
-        asset_name: token_id.as_bytes().to_vec(),
+        asset_name: b"TestToken".to_vec(),
         amount: 100,
     };
     asset::validate_transfer_asset(&accounts, &dp, &xfer).unwrap();
     asset::execute_transfer_asset(&accounts, &dp, &xfer).unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
-    assert_eq!(bob.asset_v2.get(&token_id).copied().unwrap_or(0), 100);
+    assert_eq!(bob.asset.get("TestToken").copied().unwrap_or(0), 100);
 }
 
 // =============================================================================

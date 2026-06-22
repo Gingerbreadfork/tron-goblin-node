@@ -471,9 +471,13 @@ fn transfer_asset_from_optimized_account_sees_store_balance() {
         amount: 300,
     };
     // validate must see the store balance (1000), not the empty inline 0.
-    asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+    // Asset-optimization + id-keyed asset_v2 is the post-ALLOW_SAME_TOKEN_NAME
+    // (flag=1) regime, where balances are keyed by token id in asset_v2.
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_same_token_name(1);
+    asset::validate_transfer_asset(&accounts, &dp, &c)
         .expect("validate sees store balance");
-    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c)
+    asset::execute_transfer_asset(&accounts, &dp, &c)
         .expect("execute");
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -599,8 +603,11 @@ fn transfer_asset_creates_recipient_account_if_missing() {
         asset_name: b"1000001".to_vec(),
         amount: 250,
     };
-    asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
-    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
+    // id-keyed asset_v2 == post-ALLOW_SAME_TOKEN_NAME (flag=1) regime.
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_same_token_name(1);
+    asset::validate_transfer_asset(&accounts, &dp, &c).unwrap();
+    asset::execute_transfer_asset(&accounts, &dp, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 750);
@@ -617,6 +624,7 @@ fn transfer_asset_new_recipient_charges_and_burns_create_fee() {
     const FEE: i64 = 100_000;
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_same_token_name(1); // id-keyed asset_v2 == flag=1 regime
     dp.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", FEE);
     accounts
         .put(
@@ -710,8 +718,10 @@ fn transfer_asset_preserves_balance_invariant_under_split_transfers() {
         asset_name: b"1000001".to_vec(),
         amount: 250,
     };
-    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c1).unwrap();
-    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c2).unwrap();
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.save_allow_same_token_name(1); // id-keyed asset_v2 == flag=1 regime
+    asset::execute_transfer_asset(&accounts, &dp, &c1).unwrap();
+    asset::execute_transfer_asset(&accounts, &dp, &c2).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     let total = alice.asset_v2.get("1000001").copied().unwrap_or(0)
@@ -744,8 +754,8 @@ fn transfer_asset_v1_fallback_works_when_only_v1_entry_exists() {
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     // V1 slot decremented.
     assert_eq!(*alice.asset.get("LegacyCoin").unwrap(), 900);
-    // Bob receives via V2 (credit_asset writes to v2 unconditionally).
-    assert_eq!(*bob.asset_v2.get("LegacyCoin").unwrap(), 100);
+    // Bob receives into the V1 name-keyed `asset` map (flag=0, java addAsset).
+    assert_eq!(*bob.asset.get("LegacyCoin").unwrap(), 100);
 }
 
 // Reference the unused Frozen import (suppresses warning if any later
