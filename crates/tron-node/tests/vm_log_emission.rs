@@ -351,16 +351,21 @@ async fn contract_event_with_abi_decoded_via_bus() {
     let mut saw_block = false;
     let mut saw_transaction = false;
     let mut saw_event: Option<tron_eventer::ContractEvent> = None;
-    for _ in 0..4 {
-        match rx.recv().await {
-            Some(TriggerMessage::Block(_)) => saw_block = true,
-            Some(TriggerMessage::Transaction(_)) => saw_transaction = true,
-            Some(TriggerMessage::ContractEvent(ev)) => saw_event = Some(ev),
+    // Triggers are emitted synchronously during `accept_block` (the bus
+    // uses `try_send`), so by the time it returns they are all buffered.
+    // Drain with `try_recv` — a fixed-count `recv().await` loop blocks
+    // forever on the surplus read whenever fewer triggers fire than the
+    // count expects.
+    loop {
+        match rx.try_recv() {
+            Ok(TriggerMessage::Block(_)) => saw_block = true,
+            Ok(TriggerMessage::Transaction(_)) => saw_transaction = true,
+            Ok(TriggerMessage::ContractEvent(ev)) => saw_event = Some(ev),
             // The solidified pointer advances during apply — its
             // trigger interleaves with the block/tx/event ones.
-            Some(TriggerMessage::SolidifiedBlock(_)) => {}
-            Some(other) => panic!("unexpected trigger: {other:?}"),
-            None => break,
+            Ok(TriggerMessage::SolidifiedBlock(_)) => {}
+            Ok(other) => panic!("unexpected trigger: {other:?}"),
+            Err(_) => break, // Empty (drained) or Disconnected → done
         }
     }
     assert!(saw_block, "Block trigger missing");
@@ -368,22 +373,27 @@ async fn contract_event_with_abi_decoded_via_bus() {
 
     let ev = saw_event.expect("ContractEvent missing");
     assert_eq!(ev.event_name, "Transfer");
-    assert_eq!(ev.event_signature, hex::encode(TRANSFER_TOPIC0));
+    // java's `eventSignature` is the canonical signature STRING (not the
+    // topic0 hash); `eventSignatureFull` carries the param names too.
+    assert_eq!(ev.event_signature, "Transfer(address,address,uint256)");
     assert!(
         ev.event_signature_full.contains("address")
             && ev.event_signature_full.contains("uint256"),
         "event_signature_full should expose param types, got: {}",
         ev.event_signature_full
     );
+    // java keys each param under BOTH its absolute input index and its
+    // name, so the 2 indexed params surface as {"0","from","1","to"}...
     assert_eq!(
         ev.topic_map.len(),
-        2,
-        "Transfer has 2 indexed params (from, to), got: {:?}",
+        4,
+        "Transfer's 2 indexed params are dual-keyed (index + name), got: {:?}",
         ev.topic_map
     );
     assert!(ev.topic_map.contains_key("from"));
     assert!(ev.topic_map.contains_key("to"));
-    assert_eq!(ev.data_map.len(), 1, "Transfer has 1 data param (value)");
+    // ...and the single data param as {"2","value"}.
+    assert_eq!(ev.data_map.len(), 2, "Transfer's data param is dual-keyed (index + name)");
     assert!(ev.data_map.contains_key("value"));
 
     // Addresses are base58check — what java-tron's event plugin posts.
@@ -434,14 +444,16 @@ async fn contract_log_falls_back_when_no_abi_registered() {
 
     let mut saw_log: Option<tron_eventer::ContractLogEvent> = None;
     let mut saw_event_unexpected = false;
-    for _ in 0..4 {
-        match rx.recv().await {
-            Some(TriggerMessage::Block(_)) => {}
-            Some(TriggerMessage::Transaction(_)) => {}
-            Some(TriggerMessage::ContractLog(log)) => saw_log = Some(log),
-            Some(TriggerMessage::ContractEvent(_)) => saw_event_unexpected = true,
-            Some(TriggerMessage::SolidifiedBlock(_)) => {}
-            None => break,
+    // Drain with `try_recv` (triggers are already buffered after the
+    // synchronous `accept_block`) instead of a fixed-count blocking loop.
+    loop {
+        match rx.try_recv() {
+            Ok(TriggerMessage::Block(_)) => {}
+            Ok(TriggerMessage::Transaction(_)) => {}
+            Ok(TriggerMessage::ContractLog(log)) => saw_log = Some(log),
+            Ok(TriggerMessage::ContractEvent(_)) => saw_event_unexpected = true,
+            Ok(TriggerMessage::SolidifiedBlock(_)) => {}
+            Err(_) => break, // Empty (drained) or Disconnected → done
         }
     }
     assert!(
