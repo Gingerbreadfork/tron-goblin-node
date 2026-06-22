@@ -454,7 +454,12 @@ fn rpc_by_id_fallbacks_resolve_through_hook_written_stores() {
     assert!(tx_json.get("status").is_none(), "full body, not the stub: {tx_json}");
     assert_eq!(
         tx_json["raw_data"]["contract"][0]["type"],
-        json!(ContractType::TriggerSmartContract as i32)
+        json!(ContractType::TriggerSmartContract.as_str_name())
+    );
+    // Contract is decoded to the full java/TronGrid shape, not a lossy summary.
+    assert!(
+        tx_json["raw_data"]["contract"][0]["parameter"]["value"].is_object(),
+        "decoded parameter.value present: {tx_json}"
     );
     assert!(!tx_json["signature"].as_array().unwrap().is_empty());
 
