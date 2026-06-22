@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,21 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+          sudo apt-get install -y clang libclang-dev llvm-dev
+
+      - name: Install protoc
+        # ubuntu-22.04's apt protoc (3.12) predates stable proto3-optional
+        # support, which the vendored protos rely on; install a current
+        # release explicitly so the build does not depend on the runner's
+        # system protoc.
+        run: |
+          PROTOC_VERSION=28.3
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -oq /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --release --bin tron-node
