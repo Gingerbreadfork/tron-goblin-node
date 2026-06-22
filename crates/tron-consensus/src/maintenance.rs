@@ -96,7 +96,8 @@ pub struct MaintenanceReport {
 ///   witness when votes move away or are cut by an unstake.
 /// * Add those deltas to each `WitnessCapsule.vote_count` (accumulate;
 ///   do not replace).
-/// * Sort by `vote_count desc`, take the top 27.
+/// * Sort by `vote_count desc`, breaking ties by java's `isSortOpt`-gated
+///   rule (`allow_consensus_logic_optimization`), and take the top 27.
 /// * Persist the new list as `WitnessScheduleStore::active_witnesses`.
 ///
 /// **Returns:** [`MaintenanceReport`] summarising the changes.
@@ -117,6 +118,7 @@ pub fn update_active_witnesses(
     schedule: &WitnessScheduleStore,
     voters: &[Address],
     candidate_witnesses: &[Address],
+    allow_consensus_logic_optimization: bool,
 ) -> Result<MaintenanceReport, tron_chainbase::StoreError> {
     // 1. Tally NET vote deltas: `new_votes − old_votes` per voter record
     //    (java-tron's `countVote`). The old list is the voter's votes at
@@ -161,15 +163,26 @@ pub fn update_active_witnesses(
         ranked.push((*addr, witness.vote_count));
     }
 
-    // 3. Sort by vote_count desc; on a tie, java `WitnessStore.sortWitness`
-    //    orders by `createReadableString` (hex of the address) DESCENDING when
-    //    `allowWitnessSortOptimization` (= `allowConsensusLogicOptimization`) is
-    //    active — which it has been on mainnet for years. Hex-string DESC is
-    //    identical to address-bytes DESCENDING. (The pre-proposal
-    //    `ByteString.hashCode` tie-break is unreachable for a node syncing from
-    //    a post-proposal snapshot.) We previously sorted bytes ASCENDING, which
-    //    would pick the wrong producer on an exact vote tie at the top-27 cutoff.
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
+    // 3. Sort by vote_count desc, breaking ties exactly as java
+    //    `WitnessStore.sortWitnesses(list, isSortOpt)`, where `isSortOpt` is
+    //    `allowConsensusLogicOptimization` (proposal #88):
+    //      * flag ON  — `createReadableString().reversed()`: the hex of the
+    //        address DESCENDING, identical to address-bytes DESCENDING.
+    //      * flag OFF — `ByteString.hashCode()` DESCENDING over the 21-byte
+    //        address (see [`bytestring_hash_code`]).
+    //    A snapshot taken after #88 only ever exercises the first arm, but a
+    //    sync from genesis runs the second until #88 activates mid-chain — the
+    //    two orderings disagree, so getting the gate right is what keeps the
+    //    early-chain witness schedule in step with the network.
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            if allow_consensus_logic_optimization {
+                b.0.as_bytes().cmp(a.0.as_bytes())
+            } else {
+                bytestring_hash_code(b.0.as_bytes()).cmp(&bytestring_hash_code(a.0.as_bytes()))
+            }
+        })
+    });
     let new_active: Vec<Address> = ranked
         .iter()
         .take(MAX_ACTIVE_WITNESS_NUM)
@@ -190,6 +203,24 @@ pub fn update_active_witnesses(
         changed,
         vote_deltas,
     })
+}
+
+/// Java protobuf `ByteString.hashCode()` over `bytes`, reproducing the
+/// pre-`CONSENSUS_LOGIC_OPTIMIZATION` witness tie-break. Protobuf seeds the
+/// accumulator with the byte length, folds in each byte as a *signed* `i8`
+/// under 32-bit `int` wraparound (`h = h * 31 + b`), and maps a zero result to
+/// `1`. The witness address is hashed in its 21-byte `0x41`-prefixed form, the
+/// same bytes java's `WitnessCapsule.getAddress()` carries.
+fn bytestring_hash_code(bytes: &[u8]) -> i32 {
+    let mut h = bytes.len() as i32;
+    for &b in bytes {
+        h = h.wrapping_mul(31).wrapping_add(b as i8 as i32);
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
 }
 
 // =============================================================================
@@ -326,7 +357,14 @@ pub fn apply_maintenance(
             vote_deltas: Vec::new(),
         }
     } else {
-        update_active_witnesses(witnesses, votes, schedule, &voters, &candidate_witnesses)?
+        update_active_witnesses(
+            witnesses,
+            votes,
+            schedule,
+            &voters,
+            &candidate_witnesses,
+            dyn_props.allow_consensus_logic_optimization(),
+        )?
     };
     // Clear the votes store so the next cycle starts fresh. java-tron clears
     // unconditionally — `countVote`'s iterator deletes every record as it

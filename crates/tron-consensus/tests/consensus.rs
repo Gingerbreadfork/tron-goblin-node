@@ -462,6 +462,7 @@ fn update_active_witnesses_promotes_top_by_vote_count() {
         &schedule,
         &[voter1, voter2],
         &candidates,
+        true,
     )
     .unwrap();
 
@@ -557,6 +558,7 @@ fn update_active_witnesses_nets_old_votes_against_new() {
         &schedule,
         &[voter1, voter2, voter3],
         &candidates,
+        true,
     )
     .unwrap();
 
@@ -590,7 +592,7 @@ fn update_active_witnesses_caps_at_27() {
         ).unwrap();
     }
     let report =
-        update_active_witnesses(&witnesses, &votes, &schedule, &[], &candidates).unwrap();
+        update_active_witnesses(&witnesses, &votes, &schedule, &[], &candidates, true).unwrap();
     assert_eq!(report.new_active.len(), MAX_ACTIVE_WITNESS_NUM); // capped
     // Highest 27 by vote_count: indices 3..30 (vote_count 3..29).
     assert_eq!(report.new_active[0], candidates[29]);
@@ -625,11 +627,62 @@ fn update_active_witnesses_breaks_vote_tie_by_address_bytes_desc() {
     }
 
     let report =
-        update_active_witnesses(&witnesses, &votes, &schedule, &[], &[low, high]).unwrap();
+        update_active_witnesses(&witnesses, &votes, &schedule, &[], &[low, high], true).unwrap();
 
     // Equal votes → higher address bytes ranks first (DESC tie-break).
     assert_eq!(report.new_active[0], high);
     assert_eq!(report.new_active[1], low);
+}
+
+#[test]
+fn update_active_witnesses_breaks_vote_tie_by_bytestring_hashcode_pre_proposal() {
+    // Before proposal #88 (CONSENSUS_LOGIC_OPTIMIZATION), java
+    // `WitnessStore.sortWitnesses` with `isSortOpt = false` breaks an equal-vote
+    // tie by `ByteString.hashCode()` DESCENDING, not by address bytes; a sync
+    // from genesis replays that era. These two real mainnet SRs are a case where
+    // the orderings disagree:
+    //   hashCode(..7e64cc) = 554_765_528  >  hashCode(..da689) = 13_794_552
+    // so hashCode-DESC ranks ..7e64cc first, while bytes-DESC (0x411d.. > 0x4111..)
+    // ranks ..da689 first.
+    let witnesses = WitnessStore::new(mem());
+    let votes = VotesStore::new(mem());
+    let schedule = WitnessScheduleStore::new(mem());
+
+    let a_da689 = Address::from_raw([
+        0x41, 0x1d, 0x7a, 0xba, 0x13, 0xea, 0x19, 0x9a, 0x63, 0xd1, 0x64, 0x7e, 0x58, 0xe3, 0x9c,
+        0x16, 0xa9, 0xbb, 0x9d, 0xa6, 0x89,
+    ]);
+    let b_7e64cc = Address::from_raw([
+        0x41, 0x11, 0x55, 0xd1, 0x04, 0x15, 0xfa, 0xc1, 0x6a, 0x8f, 0x4c, 0xb2, 0xf3, 0x82, 0xce,
+        0x0e, 0x0f, 0x0a, 0x7e, 0x64, 0xcc,
+    ]);
+    for a in [a_da689, b_7e64cc] {
+        witnesses
+            .put(
+                &a,
+                &Witness {
+                    address: a.as_bytes().to_vec(),
+                    vote_count: 500,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    // Pre-proposal (isSortOpt = false): ByteString.hashCode DESC → ..7e64cc first.
+    let pre =
+        update_active_witnesses(&witnesses, &votes, &schedule, &[], &[a_da689, b_7e64cc], false)
+            .unwrap();
+    assert_eq!(pre.new_active[0], b_7e64cc, "pre-#88 tie-break is hashCode DESC");
+    assert_eq!(pre.new_active[1], a_da689);
+
+    // Post-proposal (isSortOpt = true): address-bytes DESC → ..da689 first, the
+    // opposite order — proving the gate actually selects the regime.
+    let post =
+        update_active_witnesses(&witnesses, &votes, &schedule, &[], &[a_da689, b_7e64cc], true)
+            .unwrap();
+    assert_eq!(post.new_active[0], a_da689, "post-#88 tie-break is bytes DESC");
+    assert_eq!(post.new_active[1], b_7e64cc);
 }
 
 #[test]
