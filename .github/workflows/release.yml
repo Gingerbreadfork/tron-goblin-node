@@ -51,15 +51,28 @@ jobs:
           protoc --version
           echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
 
-      - name: Build release binary
-        run: cargo build --release --bin tron-node
+      - name: Build release binaries
+        run: |
+          cargo build --release \
+            --bin tron-node --bin tron-wallet --bin tron-replay --bin tron-state-diff \
+            --bin tron-firehose-postgres --bin tron-firehose-nats --bin tron-firehose-clickhouse
 
-      - name: Package binary
+      - name: Package release bundle
         run: |
           PKG="tron-node-${GITHUB_REF_NAME}-linux-x86_64"
-          strip target/release/tron-node
-          mkdir -p "dist/${PKG}"
-          cp target/release/tron-node README.md LICENSE "dist/${PKG}/"
+          mkdir -p "dist/${PKG}/scripts" "dist/${PKG}/docs"
+          # Binaries (stripped). tron-node sits at the bundle root so the
+          # bundled try.sh finds it with no build step.
+          for b in tron-node tron-wallet tron-replay tron-state-diff \
+                   tron-firehose-postgres tron-firehose-nats tron-firehose-clickhouse; do
+            strip "target/release/${b}"
+            cp "target/release/${b}" "dist/${PKG}/"
+          done
+          # Demo launcher, example config, logo, docs, license, readme.
+          cp try.sh config.example.toml goblin.svg README.md LICENSE "dist/${PKG}/"
+          cp scripts/*.sh "dist/${PKG}/scripts/"
+          cp -r docs/. "dist/${PKG}/docs/"
+          chmod +x "dist/${PKG}/try.sh" "dist/${PKG}/scripts/"*.sh
           tar -C dist -czf "${PKG}.tar.gz" "${PKG}"
           sha256sum "${PKG}.tar.gz" | tee "${PKG}.tar.gz.sha256"
 
