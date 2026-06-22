@@ -1725,7 +1725,7 @@ fn state_deltas_capture_pre_and_post_images_on_both_commit_paths() {
                 .as_nanos()
         ));
         let cp = tron_chainbase::CheckPointV2::new(&cp_root);
-        tron_executor::execute_block_with_undo_checkpoint_and_config(
+        let out = tron_executor::execute_block_with_undo_checkpoint_and_config(
             &state.backends(),
             &block,
             None,
@@ -1733,7 +1733,11 @@ fn state_deltas_capture_pre_and_post_images_on_both_commit_paths() {
             &cp,
             &cfg,
         )
-        .unwrap()
+        .unwrap();
+        // Don't leave the checkpoint staging dir behind under the system temp dir.
+        drop(cp);
+        let _ = std::fs::remove_dir_all(&cp_root);
+        out
     };
 
     let plain = run_plain().state_deltas.expect("captured on plain path");
