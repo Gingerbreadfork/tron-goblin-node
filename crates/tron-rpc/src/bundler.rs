@@ -344,16 +344,16 @@ fn tron_addr_21(evm: Address) -> Vec<u8> {
     v
 }
 
-/// Simulate a call to the EntryPoint from the bundler's address through the
-/// constant-call VM (the session is never committed — read-only, like
-/// `eth_call`). Returns the call's return data, or an error carrying the decoded
-/// `FailedOp` reason on revert.
-fn sim_entrypoint(
+/// Simulate a call from `owner` (21-byte `0x41` TRON address) to `contract`
+/// (20-byte EVM) through the constant-call VM (the session is never committed —
+/// read-only, like `eth_call`). Returns `(return data, energy used)`, or an error
+/// carrying the decoded `FailedOp` reason on revert.
+fn sim_call(
     s: &RpcState,
-    bundler: &BundlerState,
-    entry_point: Address,
+    owner: Vec<u8>,
+    contract: Address,
     calldata: Vec<u8>,
-) -> Result<Vec<u8>, RpcError> {
+) -> Result<(Vec<u8>, u64), RpcError> {
     let Some(b) = &s.eth_call_backends else {
         return Err(RpcError::internal("bundler: server built without EVM call backends"));
     };
@@ -363,8 +363,8 @@ fn sim_entrypoint(
         block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
     };
     let trigger = TriggerSmartContract {
-        owner_address: bundler.bundler_address.to_vec(),
-        contract_address: tron_addr_21(entry_point),
+        owner_address: owner,
+        contract_address: tron_addr_21(contract),
         call_value: 0,
         data: calldata,
         call_token_value: 0,
@@ -373,7 +373,7 @@ fn sim_entrypoint(
     let (outcome, _penalty) =
         dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, s.eth_call_gas_cap);
     match outcome {
-        VmOutcome::Success { return_data, .. } => Ok(return_data),
+        VmOutcome::Success { return_data, energy_used, .. } => Ok((return_data, energy_used)),
         VmOutcome::Revert { return_data, .. } => {
             let reason = decode_failed_op(&return_data)
                 .unwrap_or_else(|| format!("execution reverted: 0x{}", hex::encode(&return_data)));
@@ -416,9 +416,9 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     let packed = op.pack();
 
     // userOpHash from the EntryPoint itself — version-agnostic, binds chainId.
-    let hash_ret = sim_entrypoint(
+    let (hash_ret, _) = sim_call(
         s,
-        bundler,
+        bundler.bundler_address.to_vec(),
         entry_point,
         getUserOpHashCall { userOp: packed.clone() }.abi_encode(),
     )?;
@@ -430,7 +430,7 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     // Validate: simulate handleOps; reject (with reason) if it reverts.
     let handle_data =
         handleOpsCall { ops: vec![packed], beneficiary: bundler.beneficiary }.abi_encode();
-    sim_entrypoint(s, bundler, entry_point, handle_data.clone())?;
+    sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data.clone())?;
 
     // Bundle: sign the handleOps tx and submit it (the mempool auto-relays).
     let Some(mempool) = &s.mempool else {
@@ -599,6 +599,78 @@ pub fn eth_get_user_operation_receipt(p: &Value, s: &RpcState) -> Result<Value, 
     }))
 }
 
+// Generous gas headroom used when SIMULATING a UserOp for estimation, so
+// validation/execution don't run out before we can measure actual usage.
+const SIM_VERIFICATION_GAS: u64 = 3_000_000;
+const SIM_CALL_GAS: u64 = 10_000_000;
+const SIM_PREVERIFICATION_GAS: u64 = 1_000_000;
+
+/// `eth_estimateUserOperationGas(userOp, entryPoint)` — estimate the op's gas
+/// fields by simulating it. Coarse-but-safe heuristic for the MVP: simulate
+/// `handleOps` (with generous limits) for the total, separately simulate the
+/// inner `callData` for the execution share, and split `verificationGasLimit =
+/// total - call`. `preVerificationGas` is a calldata-size formula. Precise
+/// per-phase tracing + binary-search refinement is a follow-up.
+pub fn eth_estimate_user_operation_gas(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let Some(bundler) = &s.bundler else {
+        return Err(RpcError::invalid_request(
+            "bundler not enabled on this node (set [bundler] enable = true)",
+        ));
+    };
+    let obj = p
+        .get(0)
+        .and_then(Value::as_object)
+        .ok_or_else(|| RpcError::invalid_params("missing UserOperation object (params[0])"))?;
+    let ep_str = p
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing entryPoint address (params[1])"))?;
+    let entry_point = parse_addr_evm(ep_str)?;
+    if !bundler.supports(&entry_point) {
+        return Err(RpcError::invalid_params(format!(
+            "unsupported entryPoint 0x{} (see eth_supportedEntryPoints)",
+            hex::encode(entry_point.as_slice())
+        )));
+    }
+    let op = parse_user_op(obj)?;
+
+    // Simulate handleOps with generous headroom; measure the total energy.
+    let mut sim_op = op.clone();
+    sim_op.verification_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+    sim_op.call_gas_limit = U256::from(SIM_CALL_GAS);
+    sim_op.pre_verification_gas = U256::from(SIM_PREVERIFICATION_GAS);
+    if sim_op.paymaster.is_some() {
+        sim_op.paymaster_verification_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+        sim_op.paymaster_post_op_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+    }
+    let handle_data =
+        handleOpsCall { ops: vec![sim_op.pack()], beneficiary: bundler.beneficiary }.abi_encode();
+    let (_, total_energy) =
+        sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data.clone())?;
+
+    // Execution share: simulate the account's callData from the EntryPoint.
+    // Best-effort — falls back to half the total when the account isn't deployed
+    // yet (initCode) or the bare call reverts outside handleOps' context.
+    let call_energy = sim_call(s, tron_addr_21(entry_point), op.sender, op.call_data.to_vec())
+        .map(|(_, e)| e)
+        .unwrap_or(total_energy / 2);
+
+    let pad = |e: u64| e + e / 10 + 5_000; // +10% and a 5k floor
+    let call_gas = pad(call_energy);
+    let verification_gas = pad(total_energy.saturating_sub(call_energy));
+    let pre_verification = 21_000u64 + (handle_data.len() as u64) * 8;
+    let (pm_ver, pm_post) =
+        if op.paymaster.is_some() { (pad(verification_gas / 2), 20_000u64) } else { (0, 0) };
+
+    Ok(json!({
+        "preVerificationGas": format!("0x{pre_verification:x}"),
+        "verificationGasLimit": format!("0x{verification_gas:x}"),
+        "callGasLimit": format!("0x{call_gas:x}"),
+        "paymasterVerificationGasLimit": format!("0x{pm_ver:x}"),
+        "paymasterPostOpGasLimit": format!("0x{pm_post:x}"),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +833,15 @@ mod tests {
             .contains("unsupported entryPoint"));
         // supportedEntryPoints reflects the config
         assert_eq!(eth_supported_entry_points(&s).unwrap().as_array().unwrap().len(), 1);
+        // estimate shares the same gating
+        assert!(eth_estimate_user_operation_gas(&p, &base())
+            .unwrap_err()
+            .message
+            .contains("bundler not enabled"));
+        assert!(eth_estimate_user_operation_gas(&p, &s)
+            .unwrap_err()
+            .message
+            .contains("unsupported entryPoint"));
     }
 
     #[test]

@@ -245,6 +245,7 @@ fn dispatch(method: &str, params: &Value, state: &RpcState) -> Result<Value, Rpc
         "eth_sendUserOperation" => crate::bundler::eth_send_user_operation(params, state),
         "eth_getUserOperationByHash" => crate::bundler::eth_get_user_operation_by_hash(params, state),
         "eth_getUserOperationReceipt" => crate::bundler::eth_get_user_operation_receipt(params, state),
+        "eth_estimateUserOperationGas" => crate::bundler::eth_estimate_user_operation_gas(params, state),
         "eth_estimateGas" => eth_estimate_gas(params, state),
         "eth_getTransactionReceipt" => eth_get_transaction_receipt(params, state),
         "eth_getLogs" => eth_get_logs(params, state),
