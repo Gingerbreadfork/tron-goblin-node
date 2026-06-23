@@ -99,6 +99,10 @@ pub struct RpcState {
     /// Optional metrics sink. When attached, [`crate::server::dispatch`]
     /// records per-method request/error counters into it.
     pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// ERC-4337 bundler state (config + signing key + UserOp tracking). Present
+    /// only when `[bundler] enable = true`; gates the `eth_*UserOperation`
+    /// methods and `eth_supportedEntryPoints`.
+    pub bundler: Option<Arc<crate::bundler::BundlerState>>,
     /// Shared filter registry for the `eth_newFilter` family. Built
     /// once at server start; each handler reads/mutates through `Arc`.
     pub filters: Arc<crate::filters::FilterRegistry>,
@@ -263,6 +267,7 @@ impl RpcState {
             market_pair_price_to_order: None,
             balance_trace: None,
             metrics: None,
+            bundler: None,
         }
     }
 
@@ -270,6 +275,12 @@ impl RpcState {
     /// records per-method request and error counts into it.
     pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Enable the ERC-4337 bundler with resolved `[bundler]` config + signing key.
+    pub fn with_bundler(mut self, bundler: Arc<crate::bundler::BundlerState>) -> Self {
+        self.bundler = Some(bundler);
         self
     }
 

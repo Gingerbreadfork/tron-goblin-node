@@ -13,6 +13,7 @@
 pub mod abi;
 pub mod blocking;
 pub mod builder;
+pub mod bundler;
 pub mod eth_simulate;
 pub mod filters;
 pub mod http_rest;
