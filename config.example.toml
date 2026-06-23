@@ -489,8 +489,12 @@ max_lag_blocks = 256
 # (component = "jsonrpc" / "JsonRpcServlet"), and gRPC methods
 # (component = "protocol.Wallet/GetAccount"). Strategies:
 # QpsRateLimiterAdapter (params "qps=N"), IPQPSRateLimiterAdapter
-# ("qps=N" per source IP), GlobalPreemptibleAdapter ("permit=N"
-# concurrent calls). Overruns answer HTTP 429 / gRPC RESOURCE_EXHAUSTED.
+# ("qps=N" per source IP), CIDRQPSRateLimiterAdapter ("qps=N" per source CIDR
+# block, "prefix4=24,prefix6=48" default — a whole subnet shares one bucket so
+# a flood can't be spread across IPs in one allocation to dodge a per-IP limit;
+# prefix4=32,prefix6=128 degrades to exact per-IP), GlobalPreemptibleAdapter
+# ("permit=N" concurrent calls). Overruns answer HTTP 429 / gRPC
+# RESOURCE_EXHAUSTED.
 # -----------------------------------------------------------------------------
 [rate_limiter]
 # Node-wide ceilings applied after any per-component limit (0 disables).
@@ -507,6 +511,11 @@ global_ip_qps = 10000
 # component = "protocol.Wallet/GetAccount"
 # strategy = "QpsRateLimiterAdapter"
 # params = "qps=100"
+#
+# [[rate_limiter.http]]                 # per-/24 (and per-/48 v6) limit
+# component = "jsonrpc"
+# strategy = "CIDRQPSRateLimiterAdapter"
+# params = "qps=200,prefix4=24,prefix6=48"
 
 # -----------------------------------------------------------------------------
 # [event] — event.subscribe.* plugin loader (java-tron eventplugin parity).

@@ -111,37 +111,80 @@ impl QpsBucket {
     }
 }
 
-/// Per-source-IP QPS limiter. Each IP gets its own bucket; the inner
-/// map is bounded — when full, the oldest IP entry is evicted.
+/// Per-source-IP QPS limiter, optionally aggregating by CIDR block. Each
+/// distinct key (the source IP, masked to `/prefix4` for v4 or `/prefix6` for
+/// v6) gets its own bucket; the inner map is bounded — when full, an entry is
+/// evicted. `prefix4 = 32` / `prefix6 = 128` is exact per-IP; shorter prefixes
+/// make a whole subnet share one bucket, which stops an attacker spreading a
+/// flood across many IPs in one allocation to slip under a per-IP limit.
 #[derive(Debug)]
 pub struct IpQpsBuckets {
     qps: f64,
+    prefix4: u8,
+    prefix6: u8,
     inner: Mutex<HashMap<IpAddr, QpsBucket>>,
     cap: usize,
 }
 
 impl IpQpsBuckets {
+    /// Per-IP buckets (`/32`, `/128`).
     pub fn new(qps: f64) -> Self {
+        Self::new_cidr(qps, 32, 128)
+    }
+
+    /// CIDR-aggregated buckets: source IPs are masked to `/prefix4` (v4) or
+    /// `/prefix6` (v6) before bucketing.
+    pub fn new_cidr(qps: f64, prefix4: u8, prefix6: u8) -> Self {
         Self {
             qps,
+            prefix4: prefix4.min(32),
+            prefix6: prefix6.min(128),
             inner: Mutex::new(HashMap::new()),
             cap: 10_000,
         }
     }
 
     pub fn try_acquire(&self, ip: IpAddr) -> bool {
+        let key = mask_ip(ip, self.prefix4, self.prefix6);
         let mut g = self.inner.lock().unwrap();
         // Cheap upper bound — when over cap, drop ONE entry chosen
         // arbitrarily (HashMap iteration order). Acceptable because
-        // a flood from many distinct IPs is the only way to hit
-        // cap, and at that point every IP is suspect anyway.
+        // a flood from many distinct keys is the only way to hit
+        // cap, and at that point every source is suspect anyway.
         if g.len() >= self.cap {
             if let Some(k) = g.keys().next().copied() {
                 g.remove(&k);
             }
         }
-        let bucket = g.entry(ip).or_insert_with(|| QpsBucket::new(self.qps));
+        let bucket = g.entry(key).or_insert_with(|| QpsBucket::new(self.qps));
         bucket.try_acquire()
+    }
+}
+
+/// Mask an IP to its network address for the given prefix lengths, so a whole
+/// CIDR block keys to one rate-limit bucket. `prefix4 >= 32` / `prefix6 >= 128`
+/// leaves the address unchanged (per-IP); `0` collapses the whole family to one
+/// bucket.
+fn mask_ip(ip: IpAddr, prefix4: u8, prefix6: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let masked = match prefix4 {
+                0 => 0,
+                p if p >= 32 => bits,
+                p => bits & (u32::MAX << (32 - p)),
+            };
+            IpAddr::V4(std::net::Ipv4Addr::from(masked))
+        }
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6);
+            let masked = match prefix6 {
+                0 => 0,
+                p if p >= 128 => bits,
+                p => bits & (u128::MAX << (128 - p)),
+            };
+            IpAddr::V6(std::net::Ipv6Addr::from(masked))
+        }
     }
 }
 
@@ -257,6 +300,15 @@ pub fn build_rate_limit(strategy: &str, params: &str) -> Option<RateLimit> {
         "IPQPSRateLimiterAdapter" => {
             let qps = map.get("qps").and_then(|s| s.parse().ok()).unwrap_or(1000.0);
             Some(RateLimit::IpQps(IpQpsBuckets::new(qps)))
+        }
+        // CIDR-aggregated per-source limiter: all IPs in the same block share a
+        // bucket. Default /24 (v4) and /48 (v6) — common abuse-mitigation
+        // allocations; `prefix4=32,prefix6=128` degrades to exact per-IP.
+        "CIDRQPSRateLimiterAdapter" => {
+            let qps = map.get("qps").and_then(|s| s.parse().ok()).unwrap_or(1000.0);
+            let prefix4 = map.get("prefix4").and_then(|s| s.parse().ok()).unwrap_or(24);
+            let prefix6 = map.get("prefix6").and_then(|s| s.parse().ok()).unwrap_or(48);
+            Some(RateLimit::IpQps(IpQpsBuckets::new_cidr(qps, prefix4, prefix6)))
         }
         "GlobalPreemptibleAdapter" => {
             let permit = map
@@ -400,6 +452,53 @@ mod tests {
         assert!(!b.try_acquire(a));
         // Re-using `z` again also fails — its bucket is also drained.
         assert!(!b.try_acquire(z));
+    }
+
+    #[test]
+    fn mask_ip_masks_to_prefix() {
+        let v4 = |s: &str| IpAddr::V4(s.parse().unwrap());
+        assert_eq!(mask_ip(v4("1.2.3.4"), 24, 128), v4("1.2.3.0"), "/24 zeroes last octet");
+        assert_eq!(mask_ip(v4("1.2.3.4"), 32, 128), v4("1.2.3.4"), "/32 is per-IP");
+        assert_eq!(mask_ip(v4("1.2.3.4"), 16, 128), v4("1.2.0.0"), "/16");
+        assert_eq!(mask_ip(v4("1.2.3.4"), 0, 128), v4("0.0.0.0"), "/0 collapses the family");
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        assert_eq!(
+            mask_ip(v6("2001:db8:abcd:1234::1"), 32, 48),
+            v6("2001:db8:abcd::"),
+            "/48 keeps the first three hextets"
+        );
+        assert_eq!(
+            mask_ip(v6("2001:db8:abcd:1234::1"), 32, 128),
+            v6("2001:db8:abcd:1234::1"),
+            "/128 is per-IP"
+        );
+    }
+
+    #[test]
+    fn cidr_qps_aggregates_a_subnet() {
+        // qps=1, /24 aggregation: two DIFFERENT IPs in the same /24 share ONE
+        // bucket, so the second is throttled — defeating subnet-spread evasion.
+        let b = IpQpsBuckets::new_cidr(1.0, 24, 48);
+        let a1 = IpAddr::V4("1.2.3.4".parse().unwrap());
+        let a2 = IpAddr::V4("1.2.3.250".parse().unwrap()); // same /24 as a1
+        let other = IpAddr::V4("1.2.4.1".parse().unwrap()); // different /24
+        assert!(b.try_acquire(a1), "first in /24 admitted");
+        assert!(!b.try_acquire(a2), "second IP in the same /24 shares the bucket -> throttled");
+        assert!(b.try_acquire(other), "a different /24 has its own bucket");
+    }
+
+    #[test]
+    fn build_cidr_strategy_from_config() {
+        let rl = build_rate_limit("CIDRQPSRateLimiterAdapter", "qps=1,prefix4=24").unwrap();
+        match rl {
+            RateLimit::IpQps(b) => {
+                let a1 = IpAddr::V4("9.9.9.1".parse().unwrap());
+                let a2 = IpAddr::V4("9.9.9.2".parse().unwrap()); // same /24
+                assert!(b.try_acquire(a1));
+                assert!(!b.try_acquire(a2), "config /24 aggregation throttles the subnet");
+            }
+            other => panic!("expected IpQps, got {other:?}"),
+        }
     }
 
     #[test]
