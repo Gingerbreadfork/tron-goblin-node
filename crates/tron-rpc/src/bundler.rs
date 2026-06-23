@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
-use alloy_sol_types::{sol, SolCall, SolError};
+use alloy_sol_types::{sol, SolCall, SolError, SolEvent};
 use prost::Message;
 use serde_json::{json, Map, Value};
 use tron_proto::TriggerSmartContract;
@@ -122,6 +122,38 @@ impl UserOperation {
             signature: self.signature.clone(),
         }
     }
+
+    /// The unpacked v0.7 JSON shape `eth_getUserOperationByHash` echoes back —
+    /// every field `0x…`, the factory/paymaster groups omitted when unset.
+    pub fn to_json(&self) -> Value {
+        let addr = |a: Address| format!("0x{}", hex::encode(a.as_slice()));
+        let q = |v: U256| format!("0x{v:x}");
+        let b = |x: &Bytes| format!("0x{}", hex::encode(x));
+        let mut o = Map::new();
+        o.insert("sender".into(), json!(addr(self.sender)));
+        o.insert("nonce".into(), json!(q(self.nonce)));
+        if let Some(f) = self.factory {
+            o.insert("factory".into(), json!(addr(f)));
+            o.insert("factoryData".into(), json!(b(&self.factory_data)));
+        }
+        o.insert("callData".into(), json!(b(&self.call_data)));
+        o.insert("callGasLimit".into(), json!(q(self.call_gas_limit)));
+        o.insert("verificationGasLimit".into(), json!(q(self.verification_gas_limit)));
+        o.insert("preVerificationGas".into(), json!(q(self.pre_verification_gas)));
+        o.insert("maxFeePerGas".into(), json!(q(self.max_fee_per_gas)));
+        o.insert("maxPriorityFeePerGas".into(), json!(q(self.max_priority_fee_per_gas)));
+        if let Some(pm) = self.paymaster {
+            o.insert("paymaster".into(), json!(addr(pm)));
+            o.insert(
+                "paymasterVerificationGasLimit".into(),
+                json!(q(self.paymaster_verification_gas_limit)),
+            );
+            o.insert("paymasterPostOpGasLimit".into(), json!(q(self.paymaster_post_op_gas_limit)));
+            o.insert("paymasterData".into(), json!(b(&self.paymaster_data)));
+        }
+        o.insert("signature".into(), json!(b(&self.signature)));
+        Value::Object(o)
+    }
 }
 
 /// Big-endian low 16 bytes of a `U256`. The EntryPoint packs these fields as
@@ -170,9 +202,8 @@ pub struct BundlerState {
 /// A UserOperation the bundler has accepted, with its on-chain submission.
 #[derive(Clone, Debug)]
 pub struct TrackedUserOp {
+    pub user_op: UserOperation,
     pub entry_point: Address,
-    pub sender: Address,
-    pub nonce: U256,
     /// The `handleOps` tx id this op was submitted in (`None` until submitted).
     pub tx_id: Option<[u8; 32]>,
 }
@@ -435,10 +466,137 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     if let Ok(mut tracked) = bundler.tracked.lock() {
         tracked.insert(
             user_op_hash,
-            TrackedUserOp { entry_point, sender: op.sender, nonce: op.nonce, tx_id: Some(tx_id) },
+            TrackedUserOp { user_op: op, entry_point, tx_id: Some(tx_id) },
         );
     }
     Ok(Value::String(format!("0x{}", hex::encode(user_op_hash.as_slice()))))
+}
+
+/// Parse a 32-byte `0x…` hash into a [`B256`].
+fn parse_b256(s: &str) -> Result<B256, RpcError> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped)
+        .map_err(|e| RpcError::invalid_params(format!("invalid hash `{s}`: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(RpcError::invalid_params("userOpHash must be 32 bytes"));
+    }
+    Ok(B256::from_slice(&bytes))
+}
+
+/// Find the `UserOperationEvent` for `hash` in a receipt's logs and decode it
+/// into `(success, actualGasCost, actualGasUsed, paymaster)`. The event data is
+/// `abi(nonce, success, actualGasCost, actualGasUsed)`; topic[3] is the paymaster.
+fn find_user_op_event(logs: &[Value], hash: &B256) -> Option<(bool, String, String, Value)> {
+    let sig_hex = format!("0x{}", hex::encode(UserOperationEvent::SIGNATURE_HASH.as_slice()));
+    let hash_hex = format!("0x{}", hex::encode(hash.as_slice()));
+    for log in logs {
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else { continue };
+        if topics.len() < 4 {
+            continue;
+        }
+        let t0 = topics[0].as_str().unwrap_or_default();
+        let t1 = topics[1].as_str().unwrap_or_default();
+        if !t0.eq_ignore_ascii_case(&sig_hex) || !t1.eq_ignore_ascii_case(&hash_hex) {
+            continue;
+        }
+        let paymaster = topics[3]
+            .as_str()
+            .filter(|s| s.len() >= 40)
+            .map(|s| json!(format!("0x{}", &s[s.len() - 40..])))
+            .unwrap_or(Value::Null);
+        let data_hex = log.get("data").and_then(Value::as_str).unwrap_or("0x");
+        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
+        if data.len() < 128 {
+            return Some((false, "0x0".into(), "0x0".into(), paymaster));
+        }
+        let success = data[63] != 0;
+        let cost = U256::from_be_slice(&data[64..96]);
+        let used = U256::from_be_slice(&data[96..128]);
+        return Some((success, format!("0x{cost:x}"), format!("0x{used:x}"), paymaster));
+    }
+    None
+}
+
+/// `eth_getUserOperationByHash(userOpHash)` — the tracked op + its on-chain
+/// location, or `null` if the bundler never saw it.
+pub fn eth_get_user_operation_by_hash(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let Some(bundler) = &s.bundler else {
+        return Ok(Value::Null);
+    };
+    let hash = parse_b256(
+        p.get(0)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing userOpHash"))?,
+    )?;
+    let Some(tracked) = bundler.tracked.lock().ok().and_then(|t| t.get(&hash).cloned()) else {
+        return Ok(Value::Null);
+    };
+    let (tx_hash, block_number, block_hash) = match tracked.tx_id {
+        Some(id) => {
+            let receipt = crate::methods::eth_get_transaction_receipt(
+                &json!([format!("0x{}", hex::encode(id))]),
+                s,
+            )
+            .unwrap_or(Value::Null);
+            (
+                json!(format!("0x{}", hex::encode(id))),
+                receipt.get("blockNumber").cloned().unwrap_or(Value::Null),
+                receipt.get("blockHash").cloned().unwrap_or(Value::Null),
+            )
+        }
+        None => (Value::Null, Value::Null, Value::Null),
+    };
+    Ok(json!({
+        "userOperation": tracked.user_op.to_json(),
+        "entryPoint": format!("0x{}", hex::encode(tracked.entry_point.as_slice())),
+        "transactionHash": tx_hash,
+        "blockNumber": block_number,
+        "blockHash": block_hash,
+    }))
+}
+
+/// `eth_getUserOperationReceipt(userOpHash)` — the ERC-4337 receipt (success +
+/// actual gas from the `UserOperationEvent`, plus the inner tx receipt), or
+/// `null` while the op is unknown or not yet mined.
+pub fn eth_get_user_operation_receipt(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let Some(bundler) = &s.bundler else {
+        return Ok(Value::Null);
+    };
+    let hash = parse_b256(
+        p.get(0)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing userOpHash"))?,
+    )?;
+    let Some(tracked) = bundler.tracked.lock().ok().and_then(|t| t.get(&hash).cloned()) else {
+        return Ok(Value::Null);
+    };
+    let Some(tx_id) = tracked.tx_id else {
+        return Ok(Value::Null);
+    };
+    let receipt =
+        crate::methods::eth_get_transaction_receipt(&json!([format!("0x{}", hex::encode(tx_id))]), s)?;
+    if receipt.is_null() {
+        return Ok(Value::Null); // submitted but not yet mined
+    }
+    let logs = receipt.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let (success, actual_gas_cost, actual_gas_used, paymaster) =
+        find_user_op_event(&logs, &hash).unwrap_or_else(|| {
+            // No UserOperationEvent (bundle reverted) — fall back to tx status.
+            let ok = receipt.get("status").and_then(Value::as_str) == Some("0x1");
+            (ok, "0x0".to_string(), "0x0".to_string(), Value::Null)
+        });
+    Ok(json!({
+        "userOpHash": format!("0x{}", hex::encode(hash.as_slice())),
+        "entryPoint": format!("0x{}", hex::encode(tracked.entry_point.as_slice())),
+        "sender": format!("0x{}", hex::encode(tracked.user_op.sender.as_slice())),
+        "nonce": format!("0x{:x}", tracked.user_op.nonce),
+        "paymaster": paymaster,
+        "success": success,
+        "actualGasCost": actual_gas_cost,
+        "actualGasUsed": actual_gas_used,
+        "logs": logs,
+        "receipt": receipt,
+    }))
 }
 
 #[cfg(test)]
@@ -603,5 +761,72 @@ mod tests {
             .contains("unsupported entryPoint"));
         // supportedEntryPoints reflects the config
         assert_eq!(eth_supported_entry_points(&s).unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_op_to_json_echoes() {
+        let j = sample(None, None).to_json();
+        assert_eq!(j["sender"], format!("0x{}", hex::encode(Address::repeat_byte(0x11).as_slice())));
+        assert_eq!(j["nonce"], "0x7");
+        assert_eq!(j["callGasLimit"], "0x1111");
+        assert_eq!(j["callData"], "0xdead");
+        assert!(j.get("factory").is_none() && j.get("paymaster").is_none(), "omitted when unset");
+        let jp = sample(None, Some(Address::repeat_byte(0x33))).to_json();
+        assert_eq!(jp["paymaster"], format!("0x{}", hex::encode(Address::repeat_byte(0x33).as_slice())));
+    }
+
+    #[test]
+    fn user_op_event_decode() {
+        let hash = B256::repeat_byte(0xab);
+        let pm = Address::repeat_byte(0xcd);
+        let sig = format!("0x{}", hex::encode(UserOperationEvent::SIGNATURE_HASH.as_slice()));
+        let hash_t = format!("0x{}", hex::encode(hash.as_slice()));
+        let pm_topic = format!("0x{}{}", "0".repeat(24), hex::encode(pm.as_slice()));
+        // data words: nonce=0, success=1, actualGasCost=0x111, actualGasUsed=0x222
+        let mut data = vec![0u8; 32];
+        let mut succ = vec![0u8; 32];
+        succ[31] = 1;
+        let mut cost = vec![0u8; 32];
+        cost[30] = 0x01;
+        cost[31] = 0x11;
+        let mut used = vec![0u8; 32];
+        used[30] = 0x02;
+        used[31] = 0x22;
+        data.extend_from_slice(&succ);
+        data.extend_from_slice(&cost);
+        data.extend_from_slice(&used);
+        let log = json!({
+            "topics": [sig, hash_t, format!("0x{}", "0".repeat(64)), pm_topic],
+            "data": format!("0x{}", hex::encode(&data)),
+        });
+        let (success, gas_cost, gas_used, paymaster) = find_user_op_event(&[log], &hash).unwrap();
+        assert!(success);
+        assert_eq!(gas_cost, "0x111");
+        assert_eq!(gas_used, "0x222");
+        assert_eq!(paymaster, json!(format!("0x{}", hex::encode(pm.as_slice()))));
+        // non-matching log -> None
+        assert!(find_user_op_event(&[json!({ "topics": [], "data": "0x" })], &hash).is_none());
+    }
+
+    #[test]
+    fn by_hash_and_receipt_null_when_unknown() {
+        use std::sync::Arc;
+        use tron_chainbase::{KvBackend, MemBackend};
+        let mem = || Arc::new(MemBackend::new()) as Arc<dyn KvBackend>;
+        let p = json!([format!("0x{}", "ab".repeat(32))]);
+        // bundler disabled -> null
+        let s = RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111);
+        assert!(eth_get_user_operation_by_hash(&p, &s).unwrap().is_null());
+        assert!(eth_get_user_operation_receipt(&p, &s).unwrap().is_null());
+        // enabled but hash not tracked -> null
+        let s = s.with_bundler(Arc::new(BundlerState::new(
+            vec![],
+            [0u8; 32],
+            [0x41u8; 21],
+            Address::repeat_byte(0),
+            0,
+        )));
+        assert!(eth_get_user_operation_by_hash(&p, &s).unwrap().is_null());
+        assert!(eth_get_user_operation_receipt(&p, &s).unwrap().is_null());
     }
 }
