@@ -240,6 +240,7 @@ fn dispatch(method: &str, params: &Value, state: &RpcState) -> Result<Value, Rpc
 
         // TVM read-only execution.
         "eth_call" => eth_call(params, state),
+        "eth_simulateV1" => crate::eth_simulate::eth_simulate_v1(params, state),
         "eth_estimateGas" => eth_estimate_gas(params, state),
         "eth_getTransactionReceipt" => eth_get_transaction_receipt(params, state),
         "eth_getLogs" => eth_get_logs(params, state),
