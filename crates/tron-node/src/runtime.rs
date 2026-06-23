@@ -845,6 +845,54 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // shared across the JSON-RPC / gRPC / REST RpcStates below.
     let bundler_state = build_bundler_state(config.bundler.as_ref())?;
 
+    // ERC-4337 auto bundling loop: in `auto` mode, drains the bundler mempool
+    // into `handleOps` bundles on the configured cadence (manual mode bundles
+    // only via `debug_bundler_sendBundleNow`). Shares the same Arc<BundlerState>
+    // as the RPC states, so ops accepted over RPC land in the mempool this loop
+    // drains. Runs regardless of whether the public RPC is served.
+    if let Some(bundler) = bundler_state.clone() {
+        let interval = bundler.bundle_interval;
+        let loop_state = stores
+            .to_rpc_state(config.rpc.chain_id)
+            .with_bundler_opt(Some(bundler))
+            .with_mempool(mempool.clone())
+            .with_eth_call_gas_cap(eth_call_gas_cap)
+            .with_constant_call_budget(
+                constant_call_energy_limit,
+                constant_energy_fee,
+                constant_max_fee_limit,
+            )
+            .with_constant_call_timeout_ms(constant_call_timeout_ms);
+        let mut sd = shutdown.subscribe();
+        handles.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let is_auto = loop_state.bundler.as_ref().map(|b| b.mode())
+                            == Some(tron_rpc::bundler::BundlingMode::Auto);
+                        if !is_auto {
+                            continue;
+                        }
+                        let st = loop_state.clone();
+                        match tokio::task::spawn_blocking(move || tron_rpc::bundler::try_bundle(&st)).await {
+                            Ok(bundles) if !bundles.is_empty() => {
+                                info!(bundles = bundles.len(), "ERC-4337 auto-bundled ops")
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(error = %e, "ERC-4337 bundling task panicked"),
+                        }
+                    }
+                    _ = sd.recv() => {
+                        info!("ERC-4337 bundling loop shutting down");
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+
     // === RPC server ===
     if !config.rpc.disabled {
         let rpc_state = stores
@@ -2222,6 +2270,12 @@ fn build_bundler_state(
         .map_err(|e| RunError::Rpc(format!("[bundler] derive address: {e}")))?;
     let mut addr21 = [0u8; 21];
     addr21.copy_from_slice(address.as_bytes());
+    let mode = tron_rpc::bundler::BundlingMode::parse(&cfg.bundling_mode).ok_or_else(|| {
+        RunError::Rpc(format!(
+            "[bundler] bundling_mode must be \"auto\" or \"manual\", got `{}`",
+            cfg.bundling_mode
+        ))
+    })?;
     let state = tron_rpc::bundler::BundlerState::from_config(
         &cfg.entry_points,
         priv_key,
@@ -2229,10 +2283,18 @@ fn build_bundler_state(
         cfg.beneficiary.as_deref(),
         cfg.fee_limit_sun,
     )
-    .map_err(RunError::Rpc)?;
+    .map_err(RunError::Rpc)?
+    .with_bundling(
+        mode,
+        cfg.max_bundle_size,
+        std::time::Duration::from_millis(cfg.bundle_interval_ms),
+    );
     tracing::info!(
         entry_points = cfg.entry_points.len(),
         bundler = %hex::encode(addr21),
+        mode = cfg.bundling_mode,
+        interval_ms = cfg.bundle_interval_ms,
+        max_bundle = cfg.max_bundle_size,
         "ERC-4337 bundler enabled"
     );
     Ok(Some(Arc::new(state)))

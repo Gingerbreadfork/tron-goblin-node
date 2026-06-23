@@ -415,10 +415,32 @@ pub struct BundlerConfig {
     /// Per-bundle TRX fee cap, in sun. Default 1e9 (1000 TRX).
     #[serde(default = "default_bundler_fee_limit")]
     pub fee_limit_sun: i64,
+    /// Bundling mode: `auto` submits pending ops on the interval; `manual` holds
+    /// them until `debug_bundler_sendBundleNow`. Default `auto`.
+    #[serde(default = "default_bundling_mode")]
+    pub bundling_mode: String,
+    /// Auto-mode bundling cadence, in milliseconds. Default 2000.
+    #[serde(default = "default_bundle_interval_ms")]
+    pub bundle_interval_ms: u64,
+    /// Max UserOps packed into one `handleOps` bundle. Default 50.
+    #[serde(default = "default_max_bundle_size")]
+    pub max_bundle_size: usize,
 }
 
 fn default_bundler_fee_limit() -> i64 {
     1_000_000_000
+}
+
+fn default_bundling_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_bundle_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_max_bundle_size() -> usize {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

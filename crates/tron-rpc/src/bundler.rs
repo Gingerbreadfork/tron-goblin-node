@@ -20,6 +20,7 @@
 //! the v0.7 `PackedUserOperation` ABI.
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
 use alloy_sol_types::{sol, SolCall, SolError, SolEvent};
@@ -181,6 +182,49 @@ fn concat_bytes(a: &[u8], b: &[u8]) -> Bytes {
     Bytes::from(v)
 }
 
+/// Default cap on UserOps packed into one `handleOps` bundle.
+pub const DEFAULT_MAX_BUNDLE_SIZE: usize = 50;
+/// Default auto-mode bundling cadence, in milliseconds.
+pub const DEFAULT_BUNDLE_INTERVAL_MS: u64 = 2_000;
+
+/// How the bundler decides when to submit pending ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BundlingMode {
+    /// Bundle + submit automatically on the configured interval (default).
+    #[default]
+    Auto,
+    /// Hold ops in the mempool; only bundle on `debug_bundler_sendBundleNow`.
+    Manual,
+}
+
+impl BundlingMode {
+    /// Parse the `auto` / `manual` strings the config and the
+    /// `debug_bundler_setBundlingMode` RPC accept.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// A validated UserOperation waiting in the mempool to be bundled, in arrival
+/// order. Its `user_op_hash` was computed by the EntryPoint at accept time.
+#[derive(Clone, Debug)]
+pub struct PendingUserOp {
+    pub user_op: UserOperation,
+    pub entry_point: Address,
+    pub user_op_hash: B256,
+}
+
 /// Resolved `[bundler]` config plus in-flight UserOp tracking, held in
 /// [`RpcState`]. Present only when the node is configured as a bundler.
 pub struct BundlerState {
@@ -199,6 +243,15 @@ pub struct BundlerState {
     /// Bounded (FIFO eviction past [`MAX_TRACKED`]) so a long-running bundler's
     /// memory doesn't grow without limit as ops accumulate.
     pub tracked: Mutex<TrackedOps>,
+    /// Validated UserOps awaiting bundling, in arrival order. Drained by the
+    /// background bundling loop and by `debug_bundler_sendBundleNow`.
+    pub mempool: Mutex<Vec<PendingUserOp>>,
+    /// Current bundling mode; runtime-switchable via `debug_bundler_setBundlingMode`.
+    pub bundling_mode: Mutex<BundlingMode>,
+    /// Max UserOps packed into a single `handleOps` bundle (overflow re-queues).
+    pub max_bundle_size: usize,
+    /// Auto-mode bundling cadence.
+    pub bundle_interval: Duration,
 }
 
 /// Upper bound on tracked UserOps held in memory for the by-hash / receipt
@@ -267,7 +320,30 @@ impl BundlerState {
             beneficiary,
             fee_limit,
             tracked: Mutex::new(TrackedOps::default()),
+            mempool: Mutex::new(Vec::new()),
+            bundling_mode: Mutex::new(BundlingMode::Auto),
+            max_bundle_size: DEFAULT_MAX_BUNDLE_SIZE,
+            bundle_interval: Duration::from_millis(DEFAULT_BUNDLE_INTERVAL_MS),
         }
+    }
+
+    /// Configure bundling behaviour (mode / bundle size / cadence). Chained off
+    /// [`Self::new`] or [`Self::from_config`] by the runtime.
+    pub fn with_bundling(
+        mut self,
+        mode: BundlingMode,
+        max_bundle_size: usize,
+        bundle_interval: Duration,
+    ) -> Self {
+        *self.bundling_mode.get_mut().expect("fresh mutex") = mode;
+        self.max_bundle_size = max_bundle_size.max(1);
+        self.bundle_interval = bundle_interval;
+        self
+    }
+
+    /// The current bundling mode.
+    pub fn mode(&self) -> BundlingMode {
+        self.bundling_mode.lock().map(|m| *m).unwrap_or_default()
     }
 
     /// Whether `addr` (20-byte EVM form) is a configured EntryPoint.
@@ -417,18 +493,29 @@ fn tron_addr_21(evm: Address) -> Vec<u8> {
     v
 }
 
+/// Raw outcome of a constant-call simulation. The bundler branches on
+/// [`SimResult::Revert`] to decode the EntryPoint's `FailedOp` opIndex and drop
+/// the offending op from a bundle, which [`sim_call`]'s flattened `Result` form
+/// can't express.
+enum SimResult {
+    Ok { return_data: Vec<u8>, energy_used: u64 },
+    Revert(Vec<u8>),
+    Failed(RpcError),
+}
+
 /// Simulate a call from `owner` (21-byte `0x41` TRON address) to `contract`
 /// (20-byte EVM) through the constant-call VM (the session is never committed —
-/// read-only, like `eth_call`). Returns `(return data, energy used)`, or an error
-/// carrying the decoded `FailedOp` reason on revert.
-fn sim_call(
+/// read-only, like `eth_call`), returning the raw outcome.
+fn sim_call_outcome(
     s: &RpcState,
     owner: Vec<u8>,
     contract: Address,
     calldata: Vec<u8>,
-) -> Result<(Vec<u8>, u64), RpcError> {
+) -> SimResult {
     let Some(b) = &s.eth_call_backends else {
-        return Err(RpcError::internal("bundler: server built without EVM call backends"));
+        return SimResult::Failed(RpcError::internal(
+            "bundler: server built without EVM call backends",
+        ));
     };
     let vm_stores = build_call_vm_stores(b);
     let block_env = VmBlockEnv {
@@ -446,24 +533,43 @@ fn sim_call(
     let (outcome, _penalty) =
         dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, s.eth_call_gas_cap);
     match outcome {
-        VmOutcome::Success { return_data, energy_used, .. } => Ok((return_data, energy_used)),
-        VmOutcome::Revert { return_data, .. } => {
-            let reason = decode_failed_op(&return_data)
-                .unwrap_or_else(|| format!("execution reverted: 0x{}", hex::encode(&return_data)));
+        VmOutcome::Success { return_data, energy_used, .. } => {
+            SimResult::Ok { return_data, energy_used }
+        }
+        VmOutcome::Revert { return_data, .. } => SimResult::Revert(return_data),
+        VmOutcome::Halt { reason, .. } => {
+            SimResult::Failed(RpcError::server_error(format!("entrypoint call halted: {reason}")))
+        }
+        _ => SimResult::Failed(RpcError::server_error("entrypoint call did not complete")),
+    }
+}
+
+/// As [`sim_call_outcome`] but flattened to a `Result`, with a revert decoded
+/// to its `FailedOp` reason (e.g. "op 0: AA24 signature error").
+fn sim_call(
+    s: &RpcState,
+    owner: Vec<u8>,
+    contract: Address,
+    calldata: Vec<u8>,
+) -> Result<(Vec<u8>, u64), RpcError> {
+    match sim_call_outcome(s, owner, contract, calldata) {
+        SimResult::Ok { return_data, energy_used } => Ok((return_data, energy_used)),
+        SimResult::Revert(data) => {
+            let reason = decode_failed_op(&data)
+                .unwrap_or_else(|| format!("execution reverted: 0x{}", hex::encode(&data)));
             Err(RpcError::invalid_request(reason))
         }
-        VmOutcome::Halt { reason, .. } => {
-            Err(RpcError::server_error(format!("entrypoint call halted: {reason}")))
-        }
-        _ => Err(RpcError::server_error("entrypoint call did not complete")),
+        SimResult::Failed(e) => Err(e),
     }
 }
 
 /// `eth_sendUserOperation(userOp, entryPoint)` — validate the op by simulating
 /// `EntryPoint.handleOps` (reject on revert, surfacing the `FailedOp` reason),
-/// then bundle it into a signed `handleOps` transaction and submit it to the
-/// mempool (which auto-relays to peers). Returns the userOpHash, computed by the
-/// EntryPoint itself so it matches whatever EntryPoint version is deployed.
+/// then accept it into the bundler's mempool. The background bundling loop
+/// (auto mode) or `debug_bundler_sendBundleNow` (manual mode) packs it together
+/// with other pending ops into one signed `handleOps` transaction and submits
+/// it (the mempool auto-relays to peers). Returns the userOpHash, computed by
+/// the EntryPoint itself so it matches whatever EntryPoint version is deployed.
 pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(bundler) = &s.bundler else {
         return Err(RpcError::invalid_request(
@@ -500,12 +606,68 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     }
     let user_op_hash = B256::from_slice(&hash_ret[..32]);
 
-    // Validate: simulate handleOps; reject (with reason) if it reverts.
+    // Validate: simulate handleOps([op]); reject (with the decoded FailedOp
+    // reason) if it reverts, so a bad op never enters the mempool.
     let handle_data =
         handleOpsCall { ops: vec![packed], beneficiary: bundler.beneficiary }.abi_encode();
-    sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data.clone())?;
+    sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data)?;
 
-    // Bundle: sign the handleOps tx and submit it (the mempool auto-relays).
+    // Accept into the mempool; the bundling loop (auto) or
+    // debug_bundler_sendBundleNow (manual) submits it bundled with other ops.
+    if let Ok(mut mp) = bundler.mempool.lock() {
+        mp.push(PendingUserOp { user_op: op.clone(), entry_point, user_op_hash });
+    }
+    if let Ok(mut tracked) = bundler.tracked.lock() {
+        tracked.insert(user_op_hash, TrackedUserOp { user_op: op, entry_point, tx_id: None });
+    }
+    Ok(Value::String(format!("0x{}", hex::encode(user_op_hash.as_slice()))))
+}
+
+// =============================================================================
+// Bundling: drain the mempool into handleOps transactions
+// =============================================================================
+
+/// `&BundlerState` if the node is configured as a bundler, else the standard
+/// "not enabled" error.
+fn require_bundler(s: &RpcState) -> Result<&BundlerState, RpcError> {
+    s.bundler.as_deref().ok_or_else(|| {
+        RpcError::invalid_request("bundler not enabled on this node (set [bundler] enable = true)")
+    })
+}
+
+/// The `opIndex` carried by a `FailedOp` / `FailedOpWithRevert` revert, so a
+/// single failing op can be dropped from a bundle and the rest still submitted.
+fn failed_op_index(revert_data: &[u8]) -> Option<usize> {
+    let idx = if let Ok(e) = FailedOp::abi_decode(revert_data) {
+        e.opIndex
+    } else if let Ok(e) = FailedOpWithRevert::abi_decode(revert_data) {
+        e.opIndex
+    } else {
+        return None;
+    };
+    u256_to_usize(idx)
+}
+
+/// A `U256` as `usize`, or `None` if it doesn't fit (defensive — opIndex is a
+/// small bundle position).
+fn u256_to_usize(v: U256) -> Option<usize> {
+    let be = v.to_be_bytes::<32>();
+    if be[..24].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut low = [0u8; 8];
+    low.copy_from_slice(&be[24..32]);
+    usize::try_from(u64::from_be_bytes(low)).ok()
+}
+
+/// Sign and submit a `handleOps` transaction to the mempool (which auto-relays
+/// to peers); returns the tx id.
+fn submit_handle_ops(
+    s: &RpcState,
+    bundler: &BundlerState,
+    entry_point: Address,
+    handle_data: Vec<u8>,
+) -> Result<[u8; 32], RpcError> {
     let Some(mempool) = &s.mempool else {
         return Err(RpcError::internal("bundler: no mempool attached to submit the bundle"));
     };
@@ -525,24 +687,235 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     let mut tx = crate::builder::build_unsigned_tx(s, contract, bundler.fee_limit)?;
     tron_types::tx_sign::sign_transaction(&mut tx, &bundler.signing_key)
         .map_err(|e| RpcError::internal(format!("bundler tx sign failed: {e:?}")))?;
-    let tx_id = match mempool.submit_tron(&tx.encode_to_vec()) {
-        crate::mempool::SubmitOutcome::Accepted(id) => id,
+    match mempool.submit_tron(&tx.encode_to_vec()) {
+        crate::mempool::SubmitOutcome::Accepted(id) => Ok(id),
         crate::mempool::SubmitOutcome::Rejected(reason) => {
-            return Err(RpcError::server_error(format!("bundle tx rejected: {reason}")))
+            Err(RpcError::server_error(format!("bundle tx rejected: {reason}")))
         }
         crate::mempool::SubmitOutcome::Unsupported => {
-            return Err(RpcError::internal("bundle tx submission unsupported by mempool"))
+            Err(RpcError::internal("bundle tx submission unsupported by mempool"))
         }
-    };
-
-    // Track for eth_getUserOperationByHash / Receipt.
-    if let Ok(mut tracked) = bundler.tracked.lock() {
-        tracked.insert(
-            user_op_hash,
-            TrackedUserOp { user_op: op, entry_point, tx_id: Some(tx_id) },
-        );
     }
-    Ok(Value::String(format!("0x{}", hex::encode(user_op_hash.as_slice()))))
+}
+
+/// Outcome of submitting one EntryPoint's bundle.
+struct BundleOutcome {
+    tx_id: [u8; 32],
+    included: Vec<B256>,
+}
+
+/// Build a `handleOps` bundle from `ops` for one EntryPoint: re-simulate the
+/// whole bundle and, if the EntryPoint rejects an op (`FailedOp` opIndex), drop
+/// that op and retry, so one bad op can't wedge the rest. Sign + submit the
+/// surviving bundle. Ops that drop out (or a whole-bundle submit failure) are
+/// recorded in `dropped` as `(userOpHash, reason)`.
+fn build_and_submit_bundle(
+    s: &RpcState,
+    bundler: &BundlerState,
+    entry_point: Address,
+    mut ops: Vec<PendingUserOp>,
+    dropped: &mut Vec<(B256, String)>,
+) -> Option<BundleOutcome> {
+    loop {
+        if ops.is_empty() {
+            return None;
+        }
+        let packed: Vec<PackedUserOperation> = ops.iter().map(|o| o.user_op.pack()).collect();
+        let handle_data =
+            handleOpsCall { ops: packed, beneficiary: bundler.beneficiary }.abi_encode();
+        match sim_call_outcome(
+            s,
+            bundler.bundler_address.to_vec(),
+            entry_point,
+            handle_data.clone(),
+        ) {
+            SimResult::Ok { .. } => match submit_handle_ops(s, bundler, entry_point, handle_data) {
+                Ok(tx_id) => {
+                    let included: Vec<B256> = ops.iter().map(|o| o.user_op_hash).collect();
+                    if let Ok(mut tracked) = bundler.tracked.lock() {
+                        for o in &ops {
+                            tracked.insert(
+                                o.user_op_hash,
+                                TrackedUserOp {
+                                    user_op: o.user_op.clone(),
+                                    entry_point,
+                                    tx_id: Some(tx_id),
+                                },
+                            );
+                        }
+                    }
+                    return Some(BundleOutcome { tx_id, included });
+                }
+                Err(e) => {
+                    for o in &ops {
+                        dropped.push((o.user_op_hash, e.message.clone()));
+                    }
+                    return None;
+                }
+            },
+            SimResult::Revert(data) => {
+                let reason =
+                    decode_failed_op(&data).unwrap_or_else(|| format!("0x{}", hex::encode(&data)));
+                match failed_op_index(&data) {
+                    Some(idx) if idx < ops.len() => {
+                        let bad = ops.remove(idx);
+                        dropped.push((bad.user_op_hash, reason));
+                        // retry the bundle without the offending op
+                    }
+                    _ => {
+                        for o in &ops {
+                            dropped.push((o.user_op_hash, reason.clone()));
+                        }
+                        return None;
+                    }
+                }
+            }
+            SimResult::Failed(e) => {
+                for o in &ops {
+                    dropped.push((o.user_op_hash, e.message.clone()));
+                }
+                return None;
+            }
+        }
+    }
+}
+
+/// `[{userOpHash, reason}]` JSON for a list of dropped ops.
+fn dropped_json(dropped: &[(B256, String)]) -> Vec<Value> {
+    dropped
+        .iter()
+        .map(|(h, why)| {
+            json!({ "userOpHash": format!("0x{}", hex::encode(h.as_slice())), "reason": why })
+        })
+        .collect()
+}
+
+/// Drain the mempool and submit ready ops as bundled `handleOps` transactions —
+/// one per EntryPoint, capped at `max_bundle_size` (overflow re-queues). Returns
+/// a JSON summary per EntryPoint touched. Safe to call from the auto loop or
+/// `debug_bundler_sendBundleNow`; a no-op when the mempool is empty.
+pub fn try_bundle(s: &RpcState) -> Vec<Value> {
+    let Some(bundler) = &s.bundler else {
+        return Vec::new();
+    };
+    let drained: Vec<PendingUserOp> = match bundler.mempool.lock() {
+        Ok(mut mp) => std::mem::take(&mut *mp),
+        Err(_) => return Vec::new(),
+    };
+    if drained.is_empty() {
+        return Vec::new();
+    }
+    // Group by EntryPoint, preserving arrival order (and first-seen EP order).
+    let mut by_ep: HashMap<Address, Vec<PendingUserOp>> = HashMap::new();
+    let mut ep_order: Vec<Address> = Vec::new();
+    for op in drained {
+        let bucket = by_ep.entry(op.entry_point).or_default();
+        if bucket.is_empty() {
+            ep_order.push(op.entry_point);
+        }
+        bucket.push(op);
+    }
+    let mut results = Vec::new();
+    let mut requeue: Vec<PendingUserOp> = Vec::new();
+    for ep in ep_order {
+        let mut ops = by_ep.remove(&ep).unwrap_or_default();
+        if ops.len() > bundler.max_bundle_size {
+            requeue.extend(ops.split_off(bundler.max_bundle_size));
+        }
+        let mut dropped: Vec<(B256, String)> = Vec::new();
+        let outcome = build_and_submit_bundle(s, bundler, ep, ops, &mut dropped);
+        let ep_hex = format!("0x{}", hex::encode(ep.as_slice()));
+        match outcome {
+            Some(BundleOutcome { tx_id, included }) => results.push(json!({
+                "entryPoint": ep_hex,
+                "transactionHash": format!("0x{}", hex::encode(tx_id)),
+                "userOpHashes": included
+                    .iter()
+                    .map(|h| format!("0x{}", hex::encode(h.as_slice())))
+                    .collect::<Vec<_>>(),
+                "dropped": dropped_json(&dropped),
+            })),
+            None if !dropped.is_empty() => results.push(json!({
+                "entryPoint": ep_hex,
+                "transactionHash": Value::Null,
+                "userOpHashes": Vec::<String>::new(),
+                "dropped": dropped_json(&dropped),
+            })),
+            None => {}
+        }
+    }
+    // Re-queue overflow ahead of anything that arrived mid-bundle, FIFO-fair.
+    if !requeue.is_empty() {
+        if let Ok(mut mp) = bundler.mempool.lock() {
+            requeue.append(&mut mp);
+            *mp = requeue;
+        }
+        // (overflow re-queued ahead of mid-bundle arrivals, FIFO-fair)
+    }
+    results
+}
+
+/// `debug_bundler_sendBundleNow` — force an immediate bundling pass and return
+/// the submitted bundles (with any dropped ops). Drives manual mode and tests.
+pub fn debug_bundler_send_bundle_now(s: &RpcState) -> Result<Value, RpcError> {
+    require_bundler(s)?;
+    Ok(json!(try_bundle(s)))
+}
+
+/// `debug_bundler_setBundlingMode("auto" | "manual")`.
+pub fn debug_bundler_set_bundling_mode(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    let mode_str = p
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing mode (\"auto\" | \"manual\")"))?;
+    let mode = BundlingMode::parse(mode_str)
+        .ok_or_else(|| RpcError::invalid_params("mode must be \"auto\" or \"manual\""))?;
+    if let Ok(mut m) = bundler.bundling_mode.lock() {
+        *m = mode;
+    }
+    Ok(json!(mode.as_str()))
+}
+
+/// `debug_bundler_dumpMempool([entryPoint])` — the pending (un-bundled) UserOps,
+/// oldest first, optionally filtered to one EntryPoint.
+pub fn debug_bundler_dump_mempool(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    let ep = match p.get(0).and_then(Value::as_str) {
+        Some(addr) => Some(parse_addr_evm(addr)?),
+        None => None,
+    };
+    let mp = bundler
+        .mempool
+        .lock()
+        .map_err(|_| RpcError::internal("bundler mempool lock poisoned"))?;
+    let ops: Vec<Value> = mp
+        .iter()
+        .filter(|o| ep.map_or(true, |e| o.entry_point == e))
+        .map(|o| o.user_op.to_json())
+        .collect();
+    Ok(json!(ops))
+}
+
+/// `debug_bundler_clearMempool` — drop all pending (un-bundled) ops.
+pub fn debug_bundler_clear_mempool(s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    if let Ok(mut mp) = bundler.mempool.lock() {
+        mp.clear();
+    }
+    Ok(json!("ok"))
+}
+
+/// `debug_bundler_clearState` — drop the mempool AND the tracked-op history.
+pub fn debug_bundler_clear_state(s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    if let Ok(mut mp) = bundler.mempool.lock() {
+        mp.clear();
+    }
+    if let Ok(mut t) = bundler.tracked.lock() {
+        *t = TrackedOps::default();
+    }
+    Ok(json!("ok"))
 }
 
 /// Parse a 32-byte `0x…` hash into a [`B256`].
@@ -1034,5 +1407,109 @@ mod tests {
             Address::repeat_byte(0x22),
             "re-insert overwrites the value"
         );
+    }
+
+    #[test]
+    fn bundling_mode_parse_and_default() {
+        assert_eq!(BundlingMode::parse("auto"), Some(BundlingMode::Auto));
+        assert_eq!(BundlingMode::parse("MANUAL"), Some(BundlingMode::Manual));
+        assert_eq!(BundlingMode::parse("  Manual "), Some(BundlingMode::Manual));
+        assert_eq!(BundlingMode::parse("nope"), None);
+        assert_eq!(BundlingMode::default(), BundlingMode::Auto);
+        assert_eq!(BundlingMode::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn with_bundling_configures_state() {
+        let st = BundlerState::new(
+            vec![Address::repeat_byte(1)],
+            [0u8; 32],
+            [0x41u8; 21],
+            Address::repeat_byte(2),
+            1,
+        )
+        .with_bundling(BundlingMode::Manual, 7, Duration::from_millis(500));
+        assert_eq!(st.mode(), BundlingMode::Manual);
+        assert_eq!(st.max_bundle_size, 7);
+        assert_eq!(st.bundle_interval, Duration::from_millis(500));
+        // max_bundle_size floors at 1 so a bundle can always make progress
+        let st2 = BundlerState::new(vec![], [0u8; 32], [0x41u8; 21], Address::repeat_byte(2), 1)
+            .with_bundling(BundlingMode::Auto, 0, Duration::from_millis(1));
+        assert_eq!(st2.max_bundle_size, 1);
+    }
+
+    #[test]
+    fn failed_op_index_and_u256() {
+        let enc = FailedOp { opIndex: U256::from(3u64), reason: "x".into() }.abi_encode();
+        assert_eq!(failed_op_index(&enc), Some(3));
+        assert_eq!(failed_op_index(&[0x00]), None);
+        assert_eq!(u256_to_usize(U256::from(42u64)), Some(42));
+        assert_eq!(u256_to_usize(U256::MAX), None);
+    }
+
+    fn enabled_state() -> (std::sync::Arc<BundlerState>, RpcState) {
+        use std::sync::Arc;
+        use tron_chainbase::{KvBackend, MemBackend};
+        let mem = || Arc::new(MemBackend::new()) as Arc<dyn KvBackend>;
+        let bundler = Arc::new(BundlerState::new(
+            vec![Address::repeat_byte(0x11)],
+            [7u8; 32],
+            [0x41u8; 21],
+            Address::repeat_byte(0xcc),
+            1_000_000_000,
+        ));
+        let s = RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111).with_bundler(bundler.clone());
+        (bundler, s)
+    }
+
+    fn pending(ep: u8, h: u8) -> PendingUserOp {
+        PendingUserOp {
+            user_op: sample(None, None),
+            entry_point: Address::repeat_byte(ep),
+            user_op_hash: B256::repeat_byte(h),
+        }
+    }
+
+    #[test]
+    fn debug_bundler_dump_clear_and_mode() {
+        let (bundler, s) = enabled_state();
+        bundler.mempool.lock().unwrap().extend([pending(0x11, 1), pending(0x11, 2)]);
+        // dumpMempool (no filter) returns both pending ops
+        assert_eq!(debug_bundler_dump_mempool(&json!([]), &s).unwrap().as_array().unwrap().len(), 2);
+        // filtered to a different EntryPoint -> none
+        let other = json!(["0x9999999999999999999999999999999999999999"]);
+        assert_eq!(debug_bundler_dump_mempool(&other, &s).unwrap().as_array().unwrap().len(), 0);
+        // setBundlingMode flips the runtime mode
+        assert_eq!(debug_bundler_set_bundling_mode(&json!(["manual"]), &s).unwrap(), json!("manual"));
+        assert_eq!(bundler.mode(), BundlingMode::Manual);
+        assert!(debug_bundler_set_bundling_mode(&json!(["bogus"]), &s).is_err());
+        // clearMempool empties it
+        debug_bundler_clear_mempool(&s).unwrap();
+        assert!(bundler.mempool.lock().unwrap().is_empty());
+        // all debug methods gate on the bundler being enabled
+        use std::sync::Arc;
+        use tron_chainbase::{KvBackend, MemBackend};
+        let mem = || Arc::new(MemBackend::new()) as Arc<dyn KvBackend>;
+        let bare = RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111);
+        assert!(debug_bundler_send_bundle_now(&bare).is_err());
+        assert!(debug_bundler_dump_mempool(&json!([]), &bare).is_err());
+        assert!(debug_bundler_clear_state(&bare).is_err());
+    }
+
+    #[test]
+    fn send_bundle_now_drains_and_reports() {
+        let (bundler, s) = enabled_state();
+        // Empty mempool -> empty result, no work.
+        assert_eq!(debug_bundler_send_bundle_now(&s).unwrap().as_array().unwrap().len(), 0);
+        // One pending op: with no EVM backends attached the bundle sim fails, so
+        // the op is dropped (reported) and the mempool drained — exercises the
+        // drain + drop path without a deployed EntryPoint.
+        bundler.mempool.lock().unwrap().push(pending(0x11, 9));
+        let res = debug_bundler_send_bundle_now(&s).unwrap();
+        let arr = res.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0]["transactionHash"].is_null());
+        assert_eq!(arr[0]["dropped"].as_array().unwrap().len(), 1);
+        assert!(bundler.mempool.lock().unwrap().is_empty(), "mempool drained");
     }
 }

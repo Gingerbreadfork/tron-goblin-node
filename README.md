@@ -296,9 +296,12 @@ java-tron doesn't have. What works today, by area:
   `eth_estimateUserOperationGas`, `eth_getUserOperationByHash`,
   `eth_getUserOperationReceipt`, `eth_supportedEntryPoints`), the smart-account
   / gasless-UX infrastructure layer TRON otherwise lacks. Each UserOperation is
-  validated against live state through the constant-call VM, then bundled into a
-  signed `EntryPoint.handleOps` transaction the node submits (auto-relayed by the
-  mempool) and tracks for the by-hash / receipt queries. **Off-protocol** — a
+  validated against live state through the constant-call VM, accepted into an
+  in-memory mempool, and **batched** — many ops per `handleOps` — by a background
+  loop (`auto` mode) or on demand (`manual` mode via the `debug_bundler_*`
+  control methods); the node signs, submits (auto-relayed by the mempool), and
+  tracks each for the by-hash / receipt queries. A bad op is dropped from a
+  bundle by its `FailedOp` index so it can't wedge the rest. **Off-protocol** — a
   bundled op is an ordinary contract call on the same byte-exact TVM, so it adds
   zero consensus risk (additive, like `eth_simulateV1`). userOpHash, validation,
   and gas estimation are all delegated to the *deployed* EntryPoint via

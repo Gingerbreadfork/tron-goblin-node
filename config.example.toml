@@ -221,12 +221,14 @@ disabled = false
 # When enabled with a signing key, the node serves the bundler RPC namespace
 # (eth_sendUserOperation / eth_estimateUserOperationGas / eth_getUserOperation-
 # ByHash / eth_getUserOperationReceipt / eth_supportedEntryPoints): it validates
-# UserOperations against live state via the constant-call VM, then signs and
-# submits handleOps transactions with the key below. Off-protocol — a bundled op
-# is an ordinary EntryPoint contract call, so NO consensus effect. Requires an
-# operator-deployed EntryPoint (TRON has no canonical one yet); deploy the
-# standard v0.7 EntryPoint via CREATE2. The signing account must hold TRX/energy
-# to pay for the handleOps transactions.
+# UserOperations against live state via the constant-call VM, accepts them into
+# an in-memory mempool, and batches pending ops into signed handleOps
+# transactions submitted with the key below. The debug_bundler_* control
+# namespace (sendBundleNow / setBundlingMode / dumpMempool / clearMempool /
+# clearState) is also served. Off-protocol — a bundled op is an ordinary
+# EntryPoint contract call, so NO consensus effect. Requires an operator-deployed
+# EntryPoint (TRON has no canonical one yet); deploy the standard v0.7 EntryPoint
+# via CREATE2. The signing account must hold TRX/energy for the handleOps txs.
 #
 # [bundler]
 # enable = true
@@ -234,6 +236,9 @@ disabled = false
 # key_env = "TRON_BUNDLER_KEY"            # signing key (or key_hex / keystore, as [witness])
 # # beneficiary = "T..."                  # gas-fee recipient (default: bundler address)
 # # fee_limit_sun = 1000000000            # per-bundle TRX fee cap, in sun
+# # bundling_mode = "auto"                # auto (submit on interval) | manual (debug_bundler_sendBundleNow)
+# # bundle_interval_ms = 2000             # auto-mode bundling cadence
+# # max_bundle_size = 50                  # max UserOps packed into one handleOps
 
 
 # -----------------------------------------------------------------------------

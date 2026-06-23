@@ -219,6 +219,14 @@ operator deploys the standard v0.7 EntryPoint (e.g. via CREATE2) and lists it in
 delegated to that deployed EntryPoint via the constant-call VM, so the bundler is
 version-agnostic.
 
+Accepted ops enter an in-memory **mempool** and are **batched** — multiple ops
+per `handleOps` — by a background loop (`auto` mode, on `bundle_interval_ms`) or
+on demand (`manual` mode). If the EntryPoint rejects an op while building a
+bundle, that op is dropped by its `FailedOp` opIndex and the rest still submit,
+so one bad op can't wedge the queue. The `debug_bundler_*` control namespace —
+`sendBundleNow`, `setBundlingMode`, `dumpMempool`, `clearMempool`, `clearState` —
+drives manual bundling and inspection (and the ERC-4337 bundler-spec test suite).
+
 Example — discover the EntryPoint, then submit a UserOperation (the canonical
 v0.7 EntryPoint address is shown; long fields are abbreviated with `…`):
 
@@ -254,10 +262,7 @@ curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
 
 A rejected `eth_sendUserOperation` returns the EntryPoint's decoded `FailedOp`
 reason (e.g. `op 0: AA24 signature error`) rather than a bare revert, so callers
-see *why* validation failed. Scope note: this is an MVP bundler — gas estimation
-is a coarse-but-safe simulation heuristic, and alt-mempool reputation /
-opcode-banning and ERC-7710/7715 delegation helpers are follow-ups; the five RPC
-methods, validation, signing, submission, and tracking are complete.
+see *why* validation failed.
 
 ## TRON REST Wallet API
 
