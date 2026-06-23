@@ -1425,7 +1425,9 @@ async fn get_total_transaction_returns_zero_matches_java_tron() {
         json!({"jsonrpc":"2.0","method":"getTotalTransaction","params":[],"id":1}),
     )
     .await;
-    assert_eq!(resp["result"]["num"], 0);
+    // java deprecated the count (returns 0); protobuf-JSON omits the default-0
+    // `num`, so a stock FullNode and TronGrid return an empty `{}`.
+    assert_eq!(resp["result"], json!({}));
 }
 
 #[tokio::test]
