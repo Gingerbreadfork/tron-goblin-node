@@ -395,7 +395,7 @@ fn dispatch_ws_request(
             Err(err) => json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": {"code": err.code, "message": err.message},
+                "error": err.to_error_object(),
             })
             .to_string(),
         },
@@ -443,7 +443,7 @@ fn dispatch_ws_request(
                 Err(err) => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "error": {"code": err.code, "message": err.message},
+                    "error": err.to_error_object(),
                 })
                 .to_string(),
             }

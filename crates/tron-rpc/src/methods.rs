@@ -11,31 +11,76 @@ use tron_crypto::hash::keccak256;
 
 use crate::state::RpcState;
 
-/// JSON-RPC 2.0 error per the spec.
+/// JSON-RPC 2.0 error per the spec. `data` carries the optional member the spec
+/// allows; for EVM reverts it is the `0x`-prefixed return data, which is where
+/// ethers/web3 look to decode the revert reason (NOT the message).
 #[derive(Debug, Clone)]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
+    pub data: Option<String>,
 }
 
 impl RpcError {
     pub fn parse_error(msg: impl Into<String>) -> Self {
-        Self { code: -32700, message: msg.into() }
+        Self { code: -32700, message: msg.into(), data: None }
     }
     pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self { code: -32602, message: msg.into() }
+        Self { code: -32602, message: msg.into(), data: None }
     }
     pub fn method_not_found(name: &str) -> Self {
-        Self { code: -32601, message: format!("Method not found: {name}") }
+        Self { code: -32601, message: format!("Method not found: {name}"), data: None }
     }
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { code: -32603, message: msg.into() }
+        Self { code: -32603, message: msg.into(), data: None }
     }
     /// JSON-RPC "invalid request" (`-32600`). Used by gated methods
     /// when the surrounding config disables the operation.
     pub fn invalid_request(msg: impl Into<String>) -> Self {
-        Self { code: -32600, message: msg.into() }
+        Self { code: -32600, message: msg.into(), data: None }
     }
+    /// EVM execution revert (`eth_call`/`eth_estimateGas` convention): code `3`,
+    /// the raw revert return data in `data` as `0x…`, and — when the data is a
+    /// Solidity `Error(string)` — the decoded reason appended to the message, so
+    /// both reason-aware and raw-data-decoding clients work.
+    pub fn revert(return_data: &[u8]) -> Self {
+        let message = match decode_revert_reason(return_data) {
+            Some(reason) => format!("execution reverted: {reason}"),
+            None => "execution reverted".to_string(),
+        };
+        Self { code: 3, message, data: Some(format!("0x{}", hex::encode(return_data))) }
+    }
+
+    /// Render the JSON-RPC `error` member: `{code, message}` plus the optional
+    /// `data` when present. Shared by the HTTP and WebSocket response paths so
+    /// both surface revert data identically.
+    pub fn to_error_object(&self) -> Value {
+        let mut o = json!({ "code": self.code, "message": self.message });
+        if let Some(data) = &self.data {
+            o["data"] = json!(data);
+        }
+        o
+    }
+}
+
+/// Decode a Solidity `Error(string)` revert payload: selector `0x08c379a0`,
+/// then ABI head (offset) + length + UTF-8 bytes. Returns `None` for empty
+/// reverts, custom errors, `Panic(uint256)`, or malformed data.
+fn decode_revert_reason(data: &[u8]) -> Option<String> {
+    const ERROR_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+    if data.len() < 4 + 32 + 32 || data[..4] != ERROR_SELECTOR {
+        return None;
+    }
+    // String length lives in the second 32-byte word (after the offset word).
+    // Lengths beyond a few KB are implausible for a revert string; bound it.
+    let len_word = &data[36..68];
+    if len_word[..28].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let len = u32::from_be_bytes(len_word[28..32].try_into().ok()?) as usize;
+    let start: usize = 4 + 32 + 32;
+    let bytes = data.get(start..start.checked_add(len)?)?;
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
 impl From<tron_chainbase::StoreError> for RpcError {
@@ -2125,10 +2170,7 @@ pub fn eth_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         tron_tvm::execute::VmOutcome::Revert { return_data, .. } => {
             // Per eth_call convention, revert returns an error object
             // with the revert data so wallets can decode `Error(string)`.
-            Err(RpcError {
-                code: 3,
-                message: format!("execution reverted: 0x{}", hex::encode(&return_data)),
-            })
+            Err(RpcError::revert(&return_data))
         }
         tron_tvm::execute::VmOutcome::TransferFailed { .. } => {
             // A value-transfer validation failure (`TransferException`); no
@@ -2136,6 +2178,7 @@ pub fn eth_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             Err(RpcError {
                 code: 3,
                 message: "execution reverted: transfer failed".to_string(),
+                data: None,
             })
         }
         tron_tvm::execute::VmOutcome::Halt { reason, .. } => Err(RpcError::internal(format!(
@@ -3778,6 +3821,7 @@ pub fn eth_get_filter_changes(p: &Value, s: &RpcState) -> Result<Value, RpcError
         return Err(RpcError {
             code: -32000,
             message: "filter not found".into(),
+            data: None,
         });
     };
     match kind {
@@ -3819,6 +3863,7 @@ pub fn eth_get_filter_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         return Err(RpcError {
             code: -32000,
             message: "filter not found".into(),
+            data: None,
         });
     };
     let head = s.dyn_props.latest_block_header_number().unwrap_or(0);
@@ -3907,6 +3952,7 @@ pub fn eth_send_raw_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, Rpc
         return Err(RpcError {
             code: -32004,
             message: "eth_sendRawTransaction: no mempool attached on this node".into(),
+            data: None,
         });
     };
     let hex_str = p
@@ -3922,6 +3968,7 @@ pub fn eth_send_raw_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, Rpc
         crate::mempool::SubmitOutcome::Unsupported => Err(RpcError {
             code: -32004,
             message: "mempool rejected: unsupported tx type".into(),
+            data: None,
         }),
     }
 }
@@ -8364,6 +8411,34 @@ mod constant_call_tests {
 #[cfg(test)]
 mod eth_encoding_tests {
     use super::*;
+
+    #[test]
+    fn revert_error_carries_data_and_decodes_error_string() {
+        // Solidity revert("boom") -> Error(string): selector + offset + len + bytes.
+        let mut data = vec![0x08, 0xc3, 0x79, 0xa0];
+        data.extend_from_slice(&[0u8; 31]);
+        data.push(0x20); // ABI head: string offset = 0x20
+        data.extend_from_slice(&[0u8; 31]);
+        data.push(0x04); // string length = 4
+        data.extend_from_slice(b"boom");
+        data.extend_from_slice(&[0u8; 28]); // pad to a full 32-byte word
+
+        let err = RpcError::revert(&data);
+        assert_eq!(err.code, 3);
+        assert_eq!(err.message, "execution reverted: boom", "Error(string) reason decoded");
+        assert_eq!(err.data, Some(format!("0x{}", hex::encode(&data))), "raw revert data in `data`");
+        assert_eq!(err.to_error_object()["data"], json!(format!("0x{}", hex::encode(&data))));
+
+        // Empty / non-Error(string) revert: code 3, generic message, data "0x".
+        let bare = RpcError::revert(&[]);
+        assert_eq!(bare.message, "execution reverted");
+        assert_eq!(bare.data.as_deref(), Some("0x"));
+        // Truncated Error(string) (selector only) must NOT decode.
+        assert_eq!(RpcError::revert(&[0x08, 0xc3, 0x79, 0xa0]).message, "execution reverted");
+
+        // A plain constructor error omits the `data` member entirely.
+        assert!(RpcError::invalid_params("x").to_error_object().get("data").is_none());
+    }
 
     fn log(address: Vec<u8>, topics: Vec<Vec<u8>>, data: Vec<u8>) -> tron_proto::transaction_info::Log {
         tron_proto::transaction_info::Log { address, topics, data }

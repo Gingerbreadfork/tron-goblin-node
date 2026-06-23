@@ -143,7 +143,7 @@ async fn handle(
         })),
         Err(err) => Json(json!({
             "jsonrpc": "2.0",
-            "error": { "code": err.code, "message": err.message },
+            "error": err.to_error_object(),
             "id": id,
         })),
     }
