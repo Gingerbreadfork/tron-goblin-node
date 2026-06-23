@@ -4,22 +4,99 @@
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend, VotesStore,
-    WitnessScheduleStore, WitnessStore,
+    AccountStore, AssetIssueStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend,
+    VotesStore, WitnessScheduleStore, WitnessStore,
 };
 use tron_consensus::{
     ab_slot, apply_maintenance, best_head, compute_next_maintenance_time, is_maintenance_boundary,
-    scheduled_witness, scheduled_witness_index, slot_from_head, slot_time_ms,
-    update_active_witnesses, validate_block_consensus, verify_block_witness, ConsensusError,
-    ForkChoice, BLOCK_PRODUCED_INTERVAL_MS, MAINTENANCE_SKIP_SLOTS, MAX_ACTIVE_WITNESS_NUM,
+    rebuild_asset_v2_from_v1, scheduled_witness, scheduled_witness_index, slot_from_head,
+    slot_time_ms, update_active_witnesses, validate_block_consensus, verify_block_witness,
+    ConsensusError, ForkChoice, BLOCK_PRODUCED_INTERVAL_MS, MAINTENANCE_SKIP_SLOTS,
+    MAX_ACTIVE_WITNESS_NUM,
 };
 use tron_crypto::address::Address;
 use tron_proto::block_header::Raw as BlockHeaderRaw;
-use tron_proto::{Account, Block, BlockHeader, Vote as AccountVote, Votes, Witness};
+use tron_proto::{
+    Account, AssetIssueContract, Block, BlockHeader, Vote as AccountVote, Votes, Witness,
+};
 use tron_types::BlockId;
 
 fn mem() -> Arc<dyn KvBackend> {
     Arc::new(MemBackend::new())
+}
+
+#[test]
+fn rebuild_asset_v2_from_v1_reconstructs_and_is_idempotent() {
+    use std::collections::BTreeMap;
+    let accounts = AccountStore::new(mem());
+    let v1 = AssetIssueStore::new(mem());
+    // FOO -> id 1000001, BAR -> id 1000002.
+    v1.put(
+        b"FOO",
+        &AssetIssueContract { name: b"FOO".to_vec(), id: "1000001".into(), ..Default::default() },
+    )
+    .unwrap();
+    v1.put(
+        b"BAR",
+        &AssetIssueContract { name: b"BAR".to_vec(), id: "1000002".into(), ..Default::default() },
+    )
+    .unwrap();
+
+    let alice = Address::from_raw([0x41u8; 21]);
+    let mut b = [0x41u8; 21];
+    b[20] = 0xBB;
+    let bob = Address::from_raw(b);
+    let mut c = [0x41u8; 21];
+    c[20] = 0xCC;
+    let carol = Address::from_raw(c);
+
+    // ALICE: V1 FOO=100, BAR=50; asset_v2 DRIFTED (stale/wrong).
+    accounts
+        .put(
+            &alice,
+            &Account {
+                address: alice.as_bytes().to_vec(),
+                asset: BTreeMap::from([("FOO".into(), 100i64), ("BAR".into(), 50i64)]),
+                asset_v2: BTreeMap::from([("1000001".into(), 999i64)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // BOB: V1 FOO=30; asset_v2 empty (never dual-written).
+    accounts
+        .put(
+            &bob,
+            &Account {
+                address: bob.as_bytes().to_vec(),
+                asset: BTreeMap::from([("FOO".into(), 30i64)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // CAROL: no TRC-10 holdings — must be skipped untouched.
+    accounts
+        .put(
+            &carol,
+            &Account { address: carol.as_bytes().to_vec(), balance: 5, ..Default::default() },
+        )
+        .unwrap();
+
+    let n = rebuild_asset_v2_from_v1(&accounts, &v1).unwrap();
+    assert_eq!(n, 2, "alice + bob rewritten, carol skipped");
+
+    let alice_a = accounts.get(&alice).unwrap().unwrap();
+    assert_eq!(
+        alice_a.asset_v2,
+        BTreeMap::from([("1000001".into(), 100i64), ("1000002".into(), 50i64)]),
+        "alice asset_v2 reconstructed from asset (drift overwritten)"
+    );
+    let bob_a = accounts.get(&bob).unwrap().unwrap();
+    assert_eq!(bob_a.asset_v2, BTreeMap::from([("1000001".into(), 30i64)]), "bob asset_v2 populated");
+    assert!(accounts.get(&carol).unwrap().unwrap().asset_v2.is_empty(), "carol untouched");
+
+    // Idempotent: a second pass (as a fresh sync that dual-wrote all along would
+    // present) rewrites nothing.
+    assert_eq!(rebuild_asset_v2_from_v1(&accounts, &v1).unwrap(), 0, "second pass is a no-op");
 }
 
 fn addr(seed: u8) -> Address {

@@ -53,7 +53,7 @@ pub use pbft::{
 };
 pub use maintenance::{
     apply_maintenance, compute_next_maintenance_time, is_maintenance_boundary,
-    update_active_witnesses, MaintenanceOutcome, MaintenanceReport,
+    rebuild_asset_v2_from_v1, update_active_witnesses, MaintenanceOutcome, MaintenanceReport,
     DEFAULT_MAINTENANCE_INTERVAL_MS,
 };
 pub use slot::{

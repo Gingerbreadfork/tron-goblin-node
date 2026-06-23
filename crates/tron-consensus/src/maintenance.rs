@@ -23,11 +23,11 @@
 //! coordinator at a higher layer) is responsible for tracking those.
 //! This trade-off is documented at the call site.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tron_chainbase::{
-    AccountStore, DelegationStore, DynamicPropertiesStore, VotesStore, WitnessScheduleStore,
-    WitnessStore,
+    AccountStore, AssetIssueStore, DelegationStore, DynamicPropertiesStore, VotesStore,
+    WitnessScheduleStore, WitnessStore,
 };
 use tron_crypto::address::Address;
 
@@ -523,6 +523,51 @@ fn try_remove_the_power_of_the_gr(
     }
     dyn_props.put_long(REMOVE_THE_POWER_OF_THE_GR, -1);
     Ok(())
+}
+
+/// Reconstruct every account's id-keyed `asset_v2` map from its name-keyed
+/// `asset` map at the `ALLOW_SAME_TOKEN_NAME` activation.
+///
+/// At `ALLOW_SAME_TOKEN_NAME == 0` java keeps `asset_v2[id] == asset[name]`: its
+/// TRC-10 actuators dual-write the same V1-derived total to both maps. The flip
+/// then switches balance reads from `asset[name]` to `asset_v2[id]`
+/// (`AccountCapsule.getAsset`). java carries no migration here — it relies on the
+/// V2 map having been kept in lock-step all along.
+///
+/// Rebuilding the V2 view from the consensus-correct V1 balances yields the exact
+/// map java holds at the flip, so a node whose flag=0 `asset_v2` drifted — e.g. an
+/// existing sync built before the dual-write was added — reaches the activation
+/// byte-identical to java without re-syncing from genesis. It is **idempotent**:
+/// a node that dual-wrote every flag=0 op already matches the reconstruction and
+/// rewrites nothing. The caller runs it once, in the same maintenance pass that
+/// sets the flag, before any flag=1 balance read. Returns the accounts rewritten.
+///
+/// `asset_v1` (the name-keyed `AssetIssueStore`) resolves each token name to its
+/// id; at flag=0 names are unique, so the mapping is unambiguous.
+pub fn rebuild_asset_v2_from_v1(
+    accounts: &AccountStore,
+    asset_v1: &AssetIssueStore,
+) -> Result<usize, tron_chainbase::StoreError> {
+    let mut rewritten = 0usize;
+    for (addr, mut account) in accounts.all()? {
+        if account.asset.is_empty() {
+            continue;
+        }
+        let mut v2 = BTreeMap::new();
+        for (name, &balance) in &account.asset {
+            if let Some(c) = asset_v1.get(name.as_bytes())? {
+                if !c.id.is_empty() {
+                    v2.insert(c.id, balance);
+                }
+            }
+        }
+        if account.asset_v2 != v2 {
+            account.asset_v2 = v2;
+            accounts.put(&addr, &account)?;
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
 }
 
 // =============================================================================

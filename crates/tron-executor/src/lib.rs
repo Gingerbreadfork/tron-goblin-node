@@ -2844,6 +2844,7 @@ fn execute_block_logic(
         // cycle's maintenance and the interval advance below then read. `now_ms`
         // is the PRE-bump `next_maintenance` (java tests
         // `hasExpired(getNextMaintenanceTime())` before updateNextMaintenanceTime).
+        let same_token_name_before = dp.allow_same_token_name().unwrap_or(0);
         if let Some(sched_be) = state.witness_schedule.clone() {
             let schedule = tron_chainbase::WitnessScheduleStore::new(sched_be);
             if let Ok(Some(active)) = schedule.load_active() {
@@ -2854,6 +2855,26 @@ fn execute_block_logic(
                     next_maintenance,
                     &active,
                 );
+            }
+        }
+        // If the ALLOW_SAME_TOKEN_NAME proposal just activated, reconstruct each
+        // account's id-keyed `asset_v2` map from its name-keyed `asset` map
+        // before any flag=1 balance read (next block). java keeps the two maps
+        // in lock-step at flag=0 and carries no migration; rebuilding from the
+        // consensus-correct V1 balances reproduces the exact `asset_v2` it holds
+        // at the flip — making an existing sync that did not dual-write every
+        // flag=0 op correct without a re-sync. One-time, same maintenance pass.
+        if same_token_name_before == 0 && dp.allow_same_token_name().unwrap_or(0) == 1 {
+            let accts = AccountStore::new(state.accounts.clone());
+            let av1 = AssetIssueStore::new(state.asset_v1.clone());
+            match tron_consensus::rebuild_asset_v2_from_v1(&accts, &av1) {
+                Ok(n) => tracing::info!(
+                    accounts_rewritten = n,
+                    "ALLOW_SAME_TOKEN_NAME activated: rebuilt asset_v2 from asset"
+                ),
+                Err(e) => {
+                    tracing::error!("asset_v2 rebuild at ALLOW_SAME_TOKEN_NAME failed: {e}")
+                }
             }
         }
         // Run doMaintenance for every block EXCEPT genesis. Java-tron's

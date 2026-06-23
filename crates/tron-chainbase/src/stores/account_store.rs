@@ -59,6 +59,26 @@ impl AccountStore {
         Ok(self.backend.contains(address.as_bytes())?)
     }
 
+    /// Every account as `(Address, Account)`. Used by one-shot consensus
+    /// migrations that must touch the whole account set (e.g. the
+    /// `ALLOW_SAME_TOKEN_NAME` asset_v2 rebuild). Errors on a malformed key or
+    /// undecodable value rather than silently skipping a row.
+    pub fn all(&self) -> Result<Vec<(Address, Account)>, StoreError> {
+        let mut out = Vec::new();
+        for (k, v) in self.backend.scan_all()? {
+            if k.len() != ADDRESS_LENGTH {
+                return Err(StoreError::InvalidKeyLength {
+                    got: k.len(),
+                    expected: ADDRESS_LENGTH,
+                });
+            }
+            let mut addr = [0u8; ADDRESS_LENGTH];
+            addr.copy_from_slice(&k);
+            out.push((Address::from_raw(addr), Account::decode(v.as_slice())?));
+        }
+        Ok(out)
+    }
+
     pub fn delete(&self, address: &Address) -> Result<(), StoreError> {
         self.backend.delete(address.as_bytes())?;
         Ok(())
