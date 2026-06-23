@@ -26,7 +26,16 @@ export LIBCLANG_PATH=/path/to/dir/containing/libclang
 
 Each chainbase store is its own RocksDB instance. The effective descriptor
 pressure is roughly `[storage].max_open_files` multiplied by the number of
-stores. Lower the config value or raise the process file descriptor limit.
+stores. Lower the config value or raise the process file descriptor limit:
+
+```sh
+ulimit -n 1048576          # raise the FD limit for this shell before starting
+```
+
+```toml
+[storage]
+max_open_files = 512       # or lower the per-store cap (default 1024)
+```
 
 ## Imported Snapshot Fails With RocksDB/LevelDB Errors
 
@@ -73,6 +82,13 @@ Check:
 - Firewall/NAT forwards TCP `18888`.
 - `listen_host` is not restricted to localhost for public serving.
 
+```toml
+[p2p]
+listen = true
+listen_host = "0.0.0.0"    # not 127.0.0.1, or only local peers can reach you
+advertise_port = 18888     # announced in handshakes; must be reachable
+```
+
 ## RPC, REST, gRPC, or Metrics Calls Fail From Another Machine
 
 The default bind host for these services is `127.0.0.1`. Set the relevant
@@ -95,9 +111,13 @@ host = "0.0.0.0"
 
 ## Constant Calls Fail
 
-Set `[vm] support_constant = true`. Both the Rust node and the java-tron
-reference node need constant-call support when using
-`tron-state-diff --constant`.
+```toml
+[vm]
+support_constant = true
+```
+
+Both the Rust node and the java-tron reference node need constant-call support
+when using `tron-state-diff --constant`.
 
 If calls run but are cut off, review `[vm] max_energy_limit_for_constant` and
 `constant_call_timeout_ms`.

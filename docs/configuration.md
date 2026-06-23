@@ -117,6 +117,18 @@ for heights before capture was enabled.
 Configures Super Representative block production. Without this section the node
 is sync-only. Prefer `key_env` or a keystore over inline private keys.
 
+```toml
+[witness]
+key_env = "TRON_WITNESS_KEY"           # env var holding the raw private-key hex
+# keystore = "/path/to/keystore.json"  # alternative: java-tron-compatible v3 keystore
+# keystore_password_env = "TRON_KEYSTORE_PASSWORD"
+max_txs_per_block = 1000               # mempool txs pulled per produced block
+```
+
+Provide the signing key by exactly one method. See
+[Security and Production Readiness](security-production.md#key-management) for
+key-handling guidance.
+
 ### Event Subscription
 
 The event subscription config mirrors java-tron logsfilter concepts and can

@@ -15,11 +15,29 @@ Important config:
   estimation paths.
 - `[vm] support_constant`: required for read-only smart-contract calls.
 
+JSON-RPC is a single `POST /` on the RPC port. A standard read — call a
+contract (here USDT's `decimals()`) against the latest state, and fetch the
+head number:
+
+```sh
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
+        {"to":"0xa614f803b6fd780986a42c78ec9c7f77e6ded13c","data":"0x313ce567"},
+        "latest"]}'
+# → {"jsonrpc":"2.0","id":1,"result":"0x0000…0006"}   (6 decimals)
+
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+```
+
+Addresses accept eth `0x…` (20-byte), TRON `41…`, or base58 `T…` form.
+
 ### Developer and debug methods
 
 Beyond the standard `eth_*` reads, the JSON-RPC surface exposes three
-developer tools java-tron does not provide. All three require
-`[vm] support_constant = true` (they re-execute through the TVM).
+developer tools java-tron does not provide. All three re-execute through the
+TVM, so all require `[vm] support_constant = true`; `estimateEnergy`
+additionally requires `[vm] estimateEnergy = true`.
 
 - **`debug_traceTransaction`** (and `debug_traceBlockByNumber` /
   `debug_traceBlockByHash`, which trace each contained transaction):
@@ -55,6 +73,72 @@ developer tools java-tron does not provide. All three require
   `validation`, `traceTransfers`, the `code`/`state`/`stateDiff`/`nonce`
   state overrides, contract-creation calls (omitted `to`), and non-`latest`
   base blocks.
+
+#### `debug_traceTransaction` example
+
+The hash must be `0x`-prefixed — the REST API returns txIDs *without* it, so
+prepend `0x`. Only contract (`TriggerSmartContract`) transactions can be
+traced; anything else returns `-32603 cannot trace non-VM contract type …`.
+The optional second param carries the standard tracer options:
+
+```sh
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"debug_traceTransaction","params":[
+        "0x<contract-tx-hash>",
+        {"disableMemory":true,"disableStorage":true}]}'
+```
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1,
+  "result": {
+    "gas": 31895, "failed": false, "returnValue": "",
+    "structLogs": [
+      { "pc": 0, "op": "PUSH1", "gas": 13945000, "gasCost": 3, "depth": 1, "stack": [] }
+    ],
+    "tracedAtHeight": 64238117
+  }
+}
+```
+
+`tracer: "callTracer"` returns the CALL/CREATE frame tree instead of opcode
+logs. `tracedAtHeight` is the archive height the trace ran against, or `null`
+when current state was used (no archive, height not covered, or non-VM).
+
+#### `estimateEnergy` example
+
+Requires **both** `[vm] estimateEnergy = true` and `[vm] support_constant =
+true`; otherwise it returns `-32600` naming the missing switch. Same call shape
+as `eth_call` (eth-style `to`/`from` or TRON-style
+`contract_address`/`owner_address` are both accepted):
+
+```sh
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"estimateEnergy","params":[
+        {"to":"0x<contract>","data":"0x<selector+args>"}]}'
+```
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1,
+  "result": {
+    "result": { "result": true },
+    "energy_required": 31895,
+    "energy_breakdown": {
+      "ops_executed": 412,
+      "total_unique_opcodes": 23,
+      "by_opcode": [ { "op": "SSTORE", "count": 2, "energy": 40000 } ],
+      "call_frames": [ { "type": "CALL", "depth": 0, "to": "0x<contract>", "energy_used": 28931, "error": null } ],
+      "halt": null
+    }
+  }
+}
+```
+
+`by_opcode` is capped at the 15 highest-energy opcodes (`total_unique_opcodes`
+flags truncation); `halt` is non-null (`op` + `reason`) when the call would
+fail. The breakdown is best-effort — if the tracer cannot run, `energy_required`
+is still returned.
 
 #### `eth_simulateV1` example
 
@@ -131,6 +215,21 @@ Network services on the java-tron-compatible gRPC API. Default bind:
 The implementation wraps the same underlying RPC and chainbase handlers used by
 the HTTP surfaces where practical.
 
+Any java-tron gRPC client or generated stub works unchanged — the wire contract
+is the standard `protocol` package (service `Wallet`, methods like
+`GetNowBlock`), vendored at
+`crates/tron-proto/vendored/java-tron/api/api.proto`. Server reflection is not
+enabled, so an ad-hoc client must supply that proto tree (and its `google/api`
+imports) as the import path — e.g. with
+[`grpcurl`](https://github.com/fullstorydev/grpcurl):
+
+```sh
+grpcurl -plaintext \
+  -import-path crates/tron-proto/vendored/java-tron \
+  -proto api/api.proto \
+  -d '{}' 127.0.0.1:50051 protocol.Wallet/GetNowBlock
+```
+
 ## Built-In TronGrid-Compatible Index
 
 Enable:
@@ -154,6 +253,24 @@ GET /v1/contracts/{address}/events
 Common query parameters mirror TronGrid, including `limit`, `fingerprint`,
 `only_from`, `only_to`, `only_confirmed`, `only_unconfirmed`,
 `min_timestamp`, `max_timestamp`, `order_by`, and `contract_address`.
+
+For example, the two most recent confirmed USDT transfers for an account:
+
+```sh
+curl -s 'http://127.0.0.1:8090/v1/accounts/<T-address>/transactions/trc20?limit=2&only_confirmed=true&contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'
+```
+
+```json
+{
+  "data": [ /* TronGrid-shaped TRC-20 transfer records */ ],
+  "meta": { "at": 1782191730710, "page_size": 2,
+            "backfill": { "complete": true, "indexed_from": 0 } },
+  "success": true
+}
+```
+
+`meta.backfill.complete` is `false` while history is still being indexed
+head-first; results stream in within seconds and fill in as backfill catches up.
 
 The index backfills automatically from existing block stores and follows live
 head after catching up. It is reorg-aware and can resume after restart. If the
