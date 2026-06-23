@@ -22,10 +22,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
-use alloy_sol_types::sol;
-use serde_json::{json, Value};
+use alloy_sol_types::{sol, SolCall, SolError};
+use prost::Message;
+use serde_json::{json, Map, Value};
+use tron_proto::TriggerSmartContract;
+use tron_tvm::execute::{VmBlockEnv, VmOutcome};
 
-use crate::methods::RpcError;
+use crate::methods::{build_call_vm_stores, dispatch_constant_trigger, RpcError};
 use crate::state::RpcState;
 
 sol! {
@@ -217,10 +220,230 @@ pub fn eth_supported_entry_points(s: &RpcState) -> Result<Value, RpcError> {
     }
 }
 
+/// Parse a 20-byte EVM `Address` from any accepted form (`0x…`, TRON `41…`,
+/// base58 `T…`) by reusing the node's robust address parser and dropping the
+/// `0x41` TRON prefix.
+fn parse_addr_evm(s: &str) -> Result<Address, RpcError> {
+    let tron = crate::methods::parse_eth_address(s)?;
+    Ok(Address::from_slice(&tron.as_bytes()[1..]))
+}
+
+fn parse_u256(s: &str) -> Result<U256, RpcError> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    U256::from_str_radix(stripped, 16)
+        .map_err(|e| RpcError::invalid_params(format!("invalid uint256 `{s}`: {e}")))
+}
+
+fn parse_bytes(s: &str) -> Result<Bytes, RpcError> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(stripped)
+        .map(Bytes::from)
+        .map_err(|e| RpcError::invalid_params(format!("invalid hex bytes `{s}`: {e}")))
+}
+
+/// Parse the unpacked v0.7 [`UserOperation`] JSON object an `eth_sendUserOperation`
+/// / `eth_estimateUserOperationGas` request carries. Absent optional gas/bytes
+/// fields default to `0`/empty; `sender` and `nonce` are required.
+fn parse_user_op(obj: &Map<String, Value>) -> Result<UserOperation, RpcError> {
+    fn req<'a>(obj: &'a Map<String, Value>, k: &str) -> Result<&'a str, RpcError> {
+        obj.get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params(format!("UserOperation missing `{k}`")))
+    }
+    fn u256_or_zero(obj: &Map<String, Value>, k: &str) -> Result<U256, RpcError> {
+        match obj.get(k).and_then(Value::as_str) {
+            Some(s) => parse_u256(s),
+            None => Ok(U256::ZERO),
+        }
+    }
+    fn bytes_or_empty(obj: &Map<String, Value>, k: &str) -> Result<Bytes, RpcError> {
+        match obj.get(k).and_then(Value::as_str) {
+            Some(s) => parse_bytes(s),
+            None => Ok(Bytes::new()),
+        }
+    }
+    let opt_addr = |k: &str| -> Result<Option<Address>, RpcError> {
+        match obj.get(k).and_then(Value::as_str) {
+            Some(s) => Ok(Some(parse_addr_evm(s)?)),
+            None => Ok(None),
+        }
+    };
+    Ok(UserOperation {
+        sender: parse_addr_evm(req(obj, "sender")?)?,
+        nonce: parse_u256(req(obj, "nonce")?)?,
+        factory: opt_addr("factory")?,
+        factory_data: bytes_or_empty(obj, "factoryData")?,
+        call_data: bytes_or_empty(obj, "callData")?,
+        call_gas_limit: u256_or_zero(obj, "callGasLimit")?,
+        verification_gas_limit: u256_or_zero(obj, "verificationGasLimit")?,
+        pre_verification_gas: u256_or_zero(obj, "preVerificationGas")?,
+        max_fee_per_gas: u256_or_zero(obj, "maxFeePerGas")?,
+        max_priority_fee_per_gas: u256_or_zero(obj, "maxPriorityFeePerGas")?,
+        paymaster: opt_addr("paymaster")?,
+        paymaster_verification_gas_limit: u256_or_zero(obj, "paymasterVerificationGasLimit")?,
+        paymaster_post_op_gas_limit: u256_or_zero(obj, "paymasterPostOpGasLimit")?,
+        paymaster_data: bytes_or_empty(obj, "paymasterData")?,
+        signature: bytes_or_empty(obj, "signature")?,
+    })
+}
+
+/// Decode the EntryPoint's `FailedOp` / `FailedOpWithRevert` revert into a human
+/// reason, so a rejected `eth_sendUserOperation` tells the caller *why* (e.g.
+/// "AA24 signature error"). Returns `None` for non-FailedOp revert data.
+fn decode_failed_op(revert_data: &[u8]) -> Option<String> {
+    if let Ok(e) = FailedOp::abi_decode(revert_data) {
+        return Some(format!("op {}: {}", e.opIndex, e.reason));
+    }
+    if let Ok(e) = FailedOpWithRevert::abi_decode(revert_data) {
+        return Some(format!(
+            "op {}: {} (inner revert 0x{})",
+            e.opIndex,
+            e.reason,
+            hex::encode(&e.inner)
+        ));
+    }
+    None
+}
+
+/// `0x41`-prefixed 21-byte TRON address for a 20-byte EVM `Address`.
+fn tron_addr_21(evm: Address) -> Vec<u8> {
+    let mut v = Vec::with_capacity(21);
+    v.push(0x41);
+    v.extend_from_slice(evm.as_slice());
+    v
+}
+
+/// Simulate a call to the EntryPoint from the bundler's address through the
+/// constant-call VM (the session is never committed — read-only, like
+/// `eth_call`). Returns the call's return data, or an error carrying the decoded
+/// `FailedOp` reason on revert.
+fn sim_entrypoint(
+    s: &RpcState,
+    bundler: &BundlerState,
+    entry_point: Address,
+    calldata: Vec<u8>,
+) -> Result<Vec<u8>, RpcError> {
+    let Some(b) = &s.eth_call_backends else {
+        return Err(RpcError::internal("bundler: server built without EVM call backends"));
+    };
+    let vm_stores = build_call_vm_stores(b);
+    let block_env = VmBlockEnv {
+        block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+    };
+    let trigger = TriggerSmartContract {
+        owner_address: bundler.bundler_address.to_vec(),
+        contract_address: tron_addr_21(entry_point),
+        call_value: 0,
+        data: calldata,
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let (outcome, _penalty) =
+        dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, s.eth_call_gas_cap);
+    match outcome {
+        VmOutcome::Success { return_data, .. } => Ok(return_data),
+        VmOutcome::Revert { return_data, .. } => {
+            let reason = decode_failed_op(&return_data)
+                .unwrap_or_else(|| format!("execution reverted: 0x{}", hex::encode(&return_data)));
+            Err(RpcError::invalid_request(reason))
+        }
+        VmOutcome::Halt { reason, .. } => {
+            Err(RpcError::server_error(format!("entrypoint call halted: {reason}")))
+        }
+        _ => Err(RpcError::server_error("entrypoint call did not complete")),
+    }
+}
+
+/// `eth_sendUserOperation(userOp, entryPoint)` — validate the op by simulating
+/// `EntryPoint.handleOps` (reject on revert, surfacing the `FailedOp` reason),
+/// then bundle it into a signed `handleOps` transaction and submit it to the
+/// mempool (which auto-relays to peers). Returns the userOpHash, computed by the
+/// EntryPoint itself so it matches whatever EntryPoint version is deployed.
+pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let Some(bundler) = &s.bundler else {
+        return Err(RpcError::invalid_request(
+            "bundler not enabled on this node (set [bundler] enable = true)",
+        ));
+    };
+    let obj = p
+        .get(0)
+        .and_then(Value::as_object)
+        .ok_or_else(|| RpcError::invalid_params("missing UserOperation object (params[0])"))?;
+    let ep_str = p
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing entryPoint address (params[1])"))?;
+    let entry_point = parse_addr_evm(ep_str)?;
+    if !bundler.supports(&entry_point) {
+        return Err(RpcError::invalid_params(format!(
+            "unsupported entryPoint 0x{} (see eth_supportedEntryPoints)",
+            hex::encode(entry_point.as_slice())
+        )));
+    }
+    let op = parse_user_op(obj)?;
+    let packed = op.pack();
+
+    // userOpHash from the EntryPoint itself — version-agnostic, binds chainId.
+    let hash_ret = sim_entrypoint(
+        s,
+        bundler,
+        entry_point,
+        getUserOpHashCall { userOp: packed.clone() }.abi_encode(),
+    )?;
+    if hash_ret.len() < 32 {
+        return Err(RpcError::internal("EntryPoint.getUserOpHash returned < 32 bytes"));
+    }
+    let user_op_hash = B256::from_slice(&hash_ret[..32]);
+
+    // Validate: simulate handleOps; reject (with reason) if it reverts.
+    let handle_data =
+        handleOpsCall { ops: vec![packed], beneficiary: bundler.beneficiary }.abi_encode();
+    sim_entrypoint(s, bundler, entry_point, handle_data.clone())?;
+
+    // Bundle: sign the handleOps tx and submit it (the mempool auto-relays).
+    let Some(mempool) = &s.mempool else {
+        return Err(RpcError::internal("bundler: no mempool attached to submit the bundle"));
+    };
+    let trigger = TriggerSmartContract {
+        owner_address: bundler.bundler_address.to_vec(),
+        contract_address: tron_addr_21(entry_point),
+        call_value: 0,
+        data: handle_data,
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let contract = crate::builder::wrap_contract(
+        tron_proto::transaction::contract::ContractType::TriggerSmartContract,
+        &trigger,
+        0,
+    );
+    let mut tx = crate::builder::build_unsigned_tx(s, contract, bundler.fee_limit)?;
+    tron_types::tx_sign::sign_transaction(&mut tx, &bundler.signing_key)
+        .map_err(|e| RpcError::internal(format!("bundler tx sign failed: {e:?}")))?;
+    let tx_id = match mempool.submit_tron(&tx.encode_to_vec()) {
+        crate::mempool::SubmitOutcome::Accepted(id) => id,
+        crate::mempool::SubmitOutcome::Rejected(reason) => {
+            return Err(RpcError::server_error(format!("bundle tx rejected: {reason}")))
+        }
+        crate::mempool::SubmitOutcome::Unsupported => {
+            return Err(RpcError::internal("bundle tx submission unsupported by mempool"))
+        }
+    };
+
+    // Track for eth_getUserOperationByHash / Receipt.
+    if let Ok(mut tracked) = bundler.tracked.lock() {
+        tracked.insert(
+            user_op_hash,
+            TrackedUserOp { entry_point, sender: op.sender, nonce: op.nonce, tx_id: Some(tx_id) },
+        );
+    }
+    Ok(Value::String(format!("0x{}", hex::encode(user_op_hash.as_slice()))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_sol_types::SolCall;
 
     fn u(n: u64) -> U256 {
         U256::from(n)
@@ -305,5 +528,80 @@ mod tests {
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0], format!("0x{}", hex::encode(ep1.as_slice())));
+    }
+
+    #[test]
+    fn parse_user_op_round_trips() {
+        let obj = json!({
+            "sender": "0x1111111111111111111111111111111111111111",
+            "nonce": "0x7",
+            "callData": "0xdead",
+            "callGasLimit": "0x1111",
+            "verificationGasLimit": "0x2222",
+            "preVerificationGas": "0x3333",
+            "maxFeePerGas": "0x4444",
+            "maxPriorityFeePerGas": "0x5555",
+            "signature": "0x0102"
+        });
+        let op = parse_user_op(obj.as_object().unwrap()).unwrap();
+        assert_eq!(op.sender, Address::repeat_byte(0x11));
+        assert_eq!(op.nonce, U256::from(7));
+        assert_eq!(op.call_gas_limit, U256::from(0x1111));
+        assert!(op.factory.is_none() && op.paymaster.is_none());
+        // absent optional fields default to empty/zero
+        assert!(op.factory_data.is_empty());
+        assert_eq!(op.pre_verification_gas, U256::from(0x3333));
+        // packs cleanly: no factory/paymaster -> empty initCode/paymasterAndData
+        let p = op.pack();
+        assert!(p.initCode.is_empty() && p.paymasterAndData.is_empty());
+        assert_eq!(&p.callData[..], &[0xde, 0xad]);
+    }
+
+    #[test]
+    fn parse_user_op_rejects_missing_sender() {
+        let err = parse_user_op(json!({ "nonce": "0x1" }).as_object().unwrap()).unwrap_err();
+        assert!(err.message.contains("missing `sender`"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn decode_failed_op_reason() {
+        let enc = FailedOp { opIndex: U256::from(0u64), reason: "AA24 signature error".to_string() }
+            .abi_encode();
+        assert_eq!(decode_failed_op(&enc).as_deref(), Some("op 0: AA24 signature error"));
+        assert!(decode_failed_op(&[0x12, 0x34]).is_none(), "non-FailedOp data must not decode");
+    }
+
+    #[test]
+    fn send_user_operation_gating() {
+        use std::sync::Arc;
+        use tron_chainbase::{KvBackend, MemBackend};
+        let mem = || Arc::new(MemBackend::new()) as Arc<dyn KvBackend>;
+        let base = || RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111);
+        let bundler = || {
+            Arc::new(BundlerState::new(
+                vec![Address::repeat_byte(0x11)],
+                [7u8; 32],
+                [0x41u8; 21],
+                Address::repeat_byte(0xcc),
+                1_000_000_000,
+            ))
+        };
+        let p = json!([
+            { "sender": "0x1111111111111111111111111111111111111111", "nonce": "0x0" },
+            "0xabababababababababababababababababababab"
+        ]);
+        // bundler disabled -> error
+        assert!(eth_send_user_operation(&p, &base())
+            .unwrap_err()
+            .message
+            .contains("bundler not enabled"));
+        // enabled but unsupported entryPoint -> error, before any VM work
+        let s = base().with_bundler(bundler());
+        assert!(eth_send_user_operation(&p, &s)
+            .unwrap_err()
+            .message
+            .contains("unsupported entryPoint"));
+        // supportedEntryPoints reflects the config
+        assert_eq!(eth_supported_entry_points(&s).unwrap().as_array().unwrap().len(), 1);
     }
 }
