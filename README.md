@@ -301,7 +301,9 @@ java-tron doesn't have. What works today, by area:
   loop (`auto` mode) or on demand (`manual` mode via the `debug_bundler_*`
   control methods); the node signs, submits (auto-relayed by the mempool), and
   tracks each for the by-hash / receipt queries. A bad op is dropped from a
-  bundle by its `FailedOp` index so it can't wedge the rest. **Off-protocol** — a
+  bundle by its `FailedOp` index so it can't wedge the rest. **ERC-7562
+  reputation** throttles then bans accounts / factories / paymasters that flood
+  the mempool with ops that never get included. **Off-protocol** — a
   bundled op is an ordinary contract call on the same byte-exact TVM, so it adds
   zero consensus risk (additive, like `eth_simulateV1`). userOpHash, validation,
   and gas estimation are all delegated to the *deployed* EntryPoint via

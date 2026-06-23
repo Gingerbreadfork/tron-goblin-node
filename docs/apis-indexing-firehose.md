@@ -225,9 +225,19 @@ Accepted ops enter an in-memory **mempool** and are **batched** — multiple ops
 per `handleOps` — by a background loop (`auto` mode, on `bundle_interval_ms`) or
 on demand (`manual` mode). If the EntryPoint rejects an op while building a
 bundle, that op is dropped by its `FailedOp` opIndex and the rest still submit,
-so one bad op can't wedge the queue. The `debug_bundler_*` control namespace —
-`sendBundleNow`, `setBundlingMode`, `dumpMempool`, `clearMempool`, `clearState` —
-drives manual bundling and inspection (and the ERC-4337 bundler-spec test suite).
+so one bad op can't wedge the queue.
+
+**ERC-7562 reputation / throttling.** Each entity (account / factory /
+paymaster) is tracked by ops *seen* vs ops *included*; one that floods the
+mempool with ops that never get included is **throttled** (capped mempool
+presence) and then **banned** (`eth_sendUserOperation` rejected) — the standard
+`opsSeen / 10` inclusion-rate rule. `debug_bundler_getStakeStatus` reports an
+entity's stake in the EntryPoint (`getDepositInfo`).
+
+The `debug_bundler_*` control namespace — `sendBundleNow`, `setBundlingMode`,
+`dumpMempool`, `clearMempool`, `clearState`, `dumpReputation`, `setReputation`,
+`clearReputation`, `getStakeStatus` — drives manual bundling, inspection, and
+reputation control (and the ERC-4337 bundler-spec test suite).
 
 Example — discover the EntryPoint, then submit a UserOperation (the canonical
 v0.7 EntryPoint address is shown; long fields are abbreviated with `…`):

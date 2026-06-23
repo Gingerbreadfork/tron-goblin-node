@@ -47,10 +47,20 @@ sol! {
         bytes signature;
     }
 
+    /// EntryPoint StakeManager deposit/stake record for an entity.
+    struct DepositInfo {
+        uint256 deposit;
+        bool staked;
+        uint112 stake;
+        uint32 unstakeDelaySec;
+        uint48 withdrawTime;
+    }
+
     /// EntryPoint methods the bundler encodes/decodes via alloy.
     function handleOps(PackedUserOperation[] ops, address beneficiary) external;
     function getUserOpHash(PackedUserOperation userOp) external view returns (bytes32);
     function getNonce(address sender, uint192 key) external view returns (uint256 nonce);
+    function getDepositInfo(address account) external view returns (DepositInfo info);
 
     /// Reverts the EntryPoint raises when a UserOp fails validation — the
     /// `reason` is surfaced to the caller so they can see *why* it was rejected.
@@ -225,6 +235,107 @@ pub struct PendingUserOp {
     pub user_op_hash: B256,
 }
 
+// ── ERC-7562 reputation / throttling (mempool DoS protection) ────────────────
+//
+// Each entity (account / factory / paymaster) that appears in a UserOp is
+// tracked by how many of its ops the bundler has SEEN versus how many reached a
+// submitted bundle (INCLUDED). An entity that floods the mempool with ops that
+// never get included loses reputation: it is THROTTLED (only a minimal mempool
+// presence admitted) and eventually BANNED, by the reference-bundler rule:
+//
+//   minExpectedIncluded = opsSeen / MIN_INCLUSION_RATE_DENOMINATOR
+//   OK        if opsSeen <= THROTTLING_SLACK
+//             or minExpectedIncluded <= opsIncluded + THROTTLING_SLACK
+//   THROTTLED if minExpectedIncluded <= opsIncluded + BAN_SLACK
+//   BANNED    otherwise
+
+/// Below this many seen ops an entity is always OK (warm-up slack).
+const THROTTLING_SLACK: u64 = 10;
+/// Extra inclusion slack before an entity is banned outright.
+const BAN_SLACK: u64 = 50;
+/// 1-in-N expected inclusion rate; below it an entity loses reputation.
+const MIN_INCLUSION_RATE_DENOMINATOR: u64 = 10;
+/// A throttled entity may keep at most this many ops in the mempool at once.
+const THROTTLED_ENTITY_MEMPOOL_COUNT: usize = 1;
+
+/// Reputation verdict for an entity, per ERC-7562.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReputationStatus {
+    Ok,
+    Throttled,
+    Banned,
+}
+
+impl ReputationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Throttled => "throttled",
+            Self::Banned => "banned",
+        }
+    }
+}
+
+/// Per-entity seen/included counters.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReputationEntry {
+    pub ops_seen: u64,
+    pub ops_included: u64,
+}
+
+impl ReputationEntry {
+    fn status(&self) -> ReputationStatus {
+        if self.ops_seen <= THROTTLING_SLACK {
+            return ReputationStatus::Ok;
+        }
+        let min_expected = self.ops_seen / MIN_INCLUSION_RATE_DENOMINATOR;
+        if min_expected <= self.ops_included + THROTTLING_SLACK {
+            ReputationStatus::Ok
+        } else if min_expected <= self.ops_included + BAN_SLACK {
+            ReputationStatus::Throttled
+        } else {
+            ReputationStatus::Banned
+        }
+    }
+}
+
+/// Reputation for every entity the bundler has seen.
+#[derive(Default)]
+pub struct ReputationManager {
+    entries: HashMap<Address, ReputationEntry>,
+}
+
+impl ReputationManager {
+    fn status(&self, addr: &Address) -> ReputationStatus {
+        self.entries.get(addr).map(ReputationEntry::status).unwrap_or(ReputationStatus::Ok)
+    }
+
+    fn bump_seen(&mut self, addr: Address) {
+        self.entries.entry(addr).or_default().ops_seen += 1;
+    }
+
+    fn bump_included(&mut self, addr: Address) {
+        self.entries.entry(addr).or_default().ops_included += 1;
+    }
+
+    fn set(&mut self, addr: Address, ops_seen: u64, ops_included: u64) {
+        self.entries.insert(addr, ReputationEntry { ops_seen, ops_included });
+    }
+}
+
+/// The reputation-tracked entities for an op: its account (sender), plus the
+/// factory and paymaster when present.
+fn op_entities(op: &UserOperation) -> Vec<Address> {
+    let mut v = vec![op.sender];
+    if let Some(f) = op.factory {
+        v.push(f);
+    }
+    if let Some(pm) = op.paymaster {
+        v.push(pm);
+    }
+    v
+}
+
 /// Resolved `[bundler]` config plus in-flight UserOp tracking, held in
 /// [`RpcState`]. Present only when the node is configured as a bundler.
 pub struct BundlerState {
@@ -252,6 +363,8 @@ pub struct BundlerState {
     pub max_bundle_size: usize,
     /// Auto-mode bundling cadence.
     pub bundle_interval: Duration,
+    /// ERC-7562 per-entity reputation (factory / paymaster / account throttling).
+    pub reputation: Mutex<ReputationManager>,
 }
 
 /// Upper bound on tracked UserOps held in memory for the by-hash / receipt
@@ -324,6 +437,7 @@ impl BundlerState {
             bundling_mode: Mutex::new(BundlingMode::Auto),
             max_bundle_size: DEFAULT_MAX_BUNDLE_SIZE,
             bundle_interval: Duration::from_millis(DEFAULT_BUNDLE_INTERVAL_MS),
+            reputation: Mutex::new(ReputationManager::default()),
         }
     }
 
@@ -612,6 +726,48 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
         handleOpsCall { ops: vec![packed], beneficiary: bundler.beneficiary }.abi_encode();
     sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data)?;
 
+    // ERC-7562 reputation: reject ops whose account / factory / paymaster is
+    // BANNED, cap a THROTTLED entity's mempool presence, and bump opsSeen.
+    let entities = op_entities(&op);
+    let present: HashMap<Address, usize> = {
+        let mp = bundler
+            .mempool
+            .lock()
+            .map_err(|_| RpcError::internal("bundler mempool lock poisoned"))?;
+        entities
+            .iter()
+            .map(|e| (*e, mp.iter().filter(|o| op_entities(&o.user_op).contains(e)).count()))
+            .collect()
+    };
+    {
+        let mut rep = bundler
+            .reputation
+            .lock()
+            .map_err(|_| RpcError::internal("bundler reputation lock poisoned"))?;
+        for e in &entities {
+            match rep.status(e) {
+                ReputationStatus::Banned => {
+                    return Err(RpcError::invalid_request(format!(
+                        "entity 0x{} is banned (too many UserOps never included)",
+                        hex::encode(e.as_slice())
+                    )));
+                }
+                ReputationStatus::Throttled
+                    if present.get(e).copied().unwrap_or(0) >= THROTTLED_ENTITY_MEMPOOL_COUNT =>
+                {
+                    return Err(RpcError::invalid_request(format!(
+                        "entity 0x{} is throttled and already has a pending op",
+                        hex::encode(e.as_slice())
+                    )));
+                }
+                _ => {}
+            }
+        }
+        for e in &entities {
+            rep.bump_seen(*e);
+        }
+    }
+
     // Accept into the mempool; the bundling loop (auto) or
     // debug_bundler_sendBundleNow (manual) submits it bundled with other ops.
     if let Ok(mut mp) = bundler.mempool.lock() {
@@ -742,6 +898,14 @@ fn build_and_submit_bundle(
                                     tx_id: Some(tx_id),
                                 },
                             );
+                        }
+                    }
+                    // ERC-7562: credit opsIncluded to each included op's entities.
+                    if let Ok(mut rep) = bundler.reputation.lock() {
+                        for o in &ops {
+                            for e in op_entities(&o.user_op) {
+                                rep.bump_included(e);
+                            }
                         }
                     }
                     return Some(BundleOutcome { tx_id, included });
@@ -906,7 +1070,8 @@ pub fn debug_bundler_clear_mempool(s: &RpcState) -> Result<Value, RpcError> {
     Ok(json!("ok"))
 }
 
-/// `debug_bundler_clearState` — drop the mempool AND the tracked-op history.
+/// `debug_bundler_clearState` — drop the mempool, tracked-op history, AND
+/// reputation.
 pub fn debug_bundler_clear_state(s: &RpcState) -> Result<Value, RpcError> {
     let bundler = require_bundler(s)?;
     if let Ok(mut mp) = bundler.mempool.lock() {
@@ -915,7 +1080,132 @@ pub fn debug_bundler_clear_state(s: &RpcState) -> Result<Value, RpcError> {
     if let Ok(mut t) = bundler.tracked.lock() {
         *t = TrackedOps::default();
     }
+    if let Ok(mut rep) = bundler.reputation.lock() {
+        *rep = ReputationManager::default();
+    }
     Ok(json!("ok"))
+}
+
+/// A reputation count from a JSON number or `0x…` / decimal string.
+fn json_count(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    let s = v.as_str()?;
+    match s.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => s.parse::<u64>().ok(),
+    }
+}
+
+/// `debug_bundler_dumpReputation([entryPoint])` — every tracked entity with its
+/// opsSeen / opsIncluded and derived status, sorted by address.
+pub fn debug_bundler_dump_reputation(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    let rep = bundler
+        .reputation
+        .lock()
+        .map_err(|_| RpcError::internal("bundler reputation lock poisoned"))?;
+    let mut out: Vec<Value> = rep
+        .entries
+        .iter()
+        .map(|(addr, e)| {
+            json!({
+                "address": format!("0x{}", hex::encode(addr.as_slice())),
+                "opsSeen": e.ops_seen,
+                "opsIncluded": e.ops_included,
+                "status": e.status().as_str(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a["address"].as_str().cmp(&b["address"].as_str()));
+    Ok(json!(out))
+}
+
+/// `debug_bundler_setReputation([{address, opsSeen, opsIncluded}], entryPoint)`
+/// — overwrite reputation entries (test / admin).
+pub fn debug_bundler_set_reputation(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    let arr = p
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid_params("missing reputation array (params[0])"))?;
+    let mut rep = bundler
+        .reputation
+        .lock()
+        .map_err(|_| RpcError::internal("bundler reputation lock poisoned"))?;
+    for entry in arr {
+        let addr = parse_addr_evm(
+            entry
+                .get("address")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::invalid_params("reputation entry missing `address`"))?,
+        )?;
+        let seen = entry.get("opsSeen").and_then(json_count).unwrap_or(0);
+        let included = entry.get("opsIncluded").and_then(json_count).unwrap_or(0);
+        rep.set(addr, seen, included);
+    }
+    Ok(json!("ok"))
+}
+
+/// `debug_bundler_clearReputation` — reset all entity reputation.
+pub fn debug_bundler_clear_reputation(s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    if let Ok(mut rep) = bundler.reputation.lock() {
+        *rep = ReputationManager::default();
+    }
+    Ok(json!("ok"))
+}
+
+/// EntryPoint stake/deposit status for `addr`, decoded from `getDepositInfo`.
+fn stake_status(
+    s: &RpcState,
+    bundler: &BundlerState,
+    entry_point: Address,
+    addr: Address,
+) -> Result<Value, RpcError> {
+    let data = getDepositInfoCall { account: addr }.abi_encode();
+    let (ret, _) = sim_call(s, bundler.bundler_address.to_vec(), entry_point, data)?;
+    // DepositInfo = (uint256 deposit, bool staked, uint112 stake,
+    // uint32 unstakeDelaySec, uint48 withdrawTime) — all static 32-byte slots.
+    if ret.len() < 160 {
+        return Err(RpcError::internal("EntryPoint.getDepositInfo returned too few bytes"));
+    }
+    let staked = ret[63] != 0;
+    let stake = U256::from_be_slice(&ret[64..96]);
+    let unstake_delay = U256::from_be_slice(&ret[96..128]);
+    Ok(json!({
+        "stakeInfo": {
+            "addr": format!("0x{}", hex::encode(addr.as_slice())),
+            "stake": format!("0x{stake:x}"),
+            "unstakeDelaySec": format!("0x{unstake_delay:x}"),
+        },
+        "isStaked": staked,
+    }))
+}
+
+/// `debug_bundler_getStakeStatus(address[, entryPoint])` — the entity's stake in
+/// the EntryPoint and whether it qualifies as staked.
+pub fn debug_bundler_get_stake_status(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let bundler = require_bundler(s)?;
+    let addr = parse_addr_evm(
+        p.get(0)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("missing address (params[0])"))?,
+    )?;
+    let entry_point = match p.get(1).and_then(Value::as_str) {
+        Some(ep) => parse_addr_evm(ep)?,
+        None => *bundler
+            .entry_points
+            .first()
+            .ok_or_else(|| RpcError::internal("bundler has no configured EntryPoint"))?,
+    };
+    if !bundler.supports(&entry_point) {
+        return Err(RpcError::invalid_params(
+            "unsupported entryPoint (see eth_supportedEntryPoints)",
+        ));
+    }
+    stake_status(s, bundler, entry_point, addr)
 }
 
 /// Parse a 32-byte `0x…` hash into a [`B256`].
@@ -1639,5 +1929,69 @@ mod tests {
         assert_eq!(user_op_event_success(&[other], &hash), None);
         // no logs at all -> None
         assert_eq!(user_op_event_success(&[], &hash), None);
+    }
+
+    #[test]
+    fn reputation_status_thresholds() {
+        let st = |seen, incl| ReputationEntry { ops_seen: seen, ops_included: incl }.status();
+        // warm-up slack: <= THROTTLING_SLACK seen is always OK
+        assert_eq!(st(10, 0), ReputationStatus::Ok);
+        assert_eq!(st(100, 0), ReputationStatus::Ok); // min_expected 10 <= 0+10
+        // 1000 seen -> min_expected 100
+        assert_eq!(st(1000, 90), ReputationStatus::Ok); // 100 <= 90+10
+        assert_eq!(st(1000, 50), ReputationStatus::Throttled); // 100 <= 50+50, not 50+10
+        assert_eq!(st(1000, 49), ReputationStatus::Banned); // 100 > 49+50
+    }
+
+    #[test]
+    fn reputation_manager_counts_and_resets() {
+        let mut m = ReputationManager::default();
+        let a = Address::repeat_byte(1);
+        assert_eq!(m.status(&a), ReputationStatus::Ok); // unknown entity -> OK
+        for _ in 0..1000 {
+            m.bump_seen(a);
+        }
+        for _ in 0..40 {
+            m.bump_included(a);
+        }
+        assert_eq!(m.status(&a), ReputationStatus::Banned);
+        m.set(a, 0, 0);
+        assert_eq!(m.status(&a), ReputationStatus::Ok);
+    }
+
+    #[test]
+    fn op_entities_collects_account_factory_paymaster() {
+        let mut op = sample(Some(Address::repeat_byte(2)), Some(Address::repeat_byte(3)));
+        op.sender = Address::repeat_byte(1);
+        assert_eq!(
+            op_entities(&op),
+            vec![Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3)]
+        );
+        assert_eq!(op_entities(&sample(None, None)), vec![Address::repeat_byte(0x11)]);
+    }
+
+    #[test]
+    fn debug_bundler_reputation_methods() {
+        let (_bundler, s) = enabled_state();
+        let a = "0x1111111111111111111111111111111111111111";
+        // setReputation([{address, opsSeen, opsIncluded}], entryPoint)
+        let set = json!([[{ "address": a, "opsSeen": 1000, "opsIncluded": 40 }], "0x00"]);
+        debug_bundler_set_reputation(&set, &s).unwrap();
+        // dumpReputation reflects counts + derived status
+        let dump = debug_bundler_dump_reputation(&json!([]), &s).unwrap();
+        let arr = dump.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["opsSeen"].as_u64(), Some(1000));
+        assert_eq!(arr[0]["status"], "banned");
+        // clearReputation empties the table
+        debug_bundler_clear_reputation(&s).unwrap();
+        assert_eq!(debug_bundler_dump_reputation(&json!([]), &s).unwrap().as_array().unwrap().len(), 0);
+        // gates on the bundler being enabled
+        use std::sync::Arc;
+        use tron_chainbase::{KvBackend, MemBackend};
+        let mem = || Arc::new(MemBackend::new()) as Arc<dyn KvBackend>;
+        let bare = RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111);
+        assert!(debug_bundler_dump_reputation(&json!([]), &bare).is_err());
+        assert!(debug_bundler_get_stake_status(&json!([a]), &bare).is_err());
     }
 }
