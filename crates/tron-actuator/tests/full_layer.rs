@@ -698,7 +698,7 @@ fn asset_issue_then_transfer() {
         amount: 100,
     };
     asset::validate_transfer_asset(&accounts, &dp, &xfer).unwrap();
-    asset::execute_transfer_asset(&accounts, &dp, &xfer).unwrap();
+    asset::execute_transfer_asset(&accounts, &dp, &v1, &xfer).unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(bob.asset.get("TestToken").copied().unwrap_or(0), 100);
 }

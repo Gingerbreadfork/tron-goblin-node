@@ -475,9 +475,10 @@ fn transfer_asset_from_optimized_account_sees_store_balance() {
     // (flag=1) regime, where balances are keyed by token id in asset_v2.
     let dp = DynamicPropertiesStore::new(mem());
     dp.save_allow_same_token_name(1);
+    let v1 = AssetIssueStore::new(mem());
     asset::validate_transfer_asset(&accounts, &dp, &c)
         .expect("validate sees store balance");
-    asset::execute_transfer_asset(&accounts, &dp, &c)
+    asset::execute_transfer_asset(&accounts, &dp, &v1, &c)
         .expect("execute");
 
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -606,8 +607,9 @@ fn transfer_asset_creates_recipient_account_if_missing() {
     // id-keyed asset_v2 == post-ALLOW_SAME_TOKEN_NAME (flag=1) regime.
     let dp = DynamicPropertiesStore::new(mem());
     dp.save_allow_same_token_name(1);
+    let v1 = AssetIssueStore::new(mem());
     asset::validate_transfer_asset(&accounts, &dp, &c).unwrap();
-    asset::execute_transfer_asset(&accounts, &dp, &c).unwrap();
+    asset::execute_transfer_asset(&accounts, &dp, &v1, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 750);
@@ -644,8 +646,9 @@ fn transfer_asset_new_recipient_charges_and_burns_create_fee() {
         asset_name: b"1000001".to_vec(),
         amount: 250,
     };
+    let v1 = AssetIssueStore::new(mem());
     asset::validate_transfer_asset(&accounts, &dp, &c).unwrap();
-    let result = asset::execute_transfer_asset(&accounts, &dp, &c).unwrap();
+    let result = asset::execute_transfer_asset(&accounts, &dp, &v1, &c).unwrap();
 
     // Fee surfaced for TransactionInfo.fee.
     assert_eq!(result.fee, FEE, "result fee == create-new-account fee");
@@ -720,8 +723,9 @@ fn transfer_asset_preserves_balance_invariant_under_split_transfers() {
     };
     let dp = DynamicPropertiesStore::new(mem());
     dp.save_allow_same_token_name(1); // id-keyed asset_v2 == flag=1 regime
-    asset::execute_transfer_asset(&accounts, &dp, &c1).unwrap();
-    asset::execute_transfer_asset(&accounts, &dp, &c2).unwrap();
+    let v1 = AssetIssueStore::new(mem());
+    asset::execute_transfer_asset(&accounts, &dp, &v1, &c1).unwrap();
+    asset::execute_transfer_asset(&accounts, &dp, &v1, &c2).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     let total = alice.asset_v2.get("1000001").copied().unwrap_or(0)
@@ -748,14 +752,62 @@ fn transfer_asset_v1_fallback_works_when_only_v1_entry_exists() {
         asset_name: b"LegacyCoin".to_vec(),
         amount: 100,
     };
+    let v1 = AssetIssueStore::new(mem());
     asset::validate_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
-    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &c).unwrap();
+    asset::execute_transfer_asset(&accounts, &DynamicPropertiesStore::new(mem()), &v1, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
     // V1 slot decremented.
     assert_eq!(*alice.asset.get("LegacyCoin").unwrap(), 900);
     // Bob receives into the V1 name-keyed `asset` map (flag=0, java addAsset).
     assert_eq!(*bob.asset.get("LegacyCoin").unwrap(), 100);
+}
+
+#[test]
+fn transfer_asset_flag0_dual_writes_asset_v2() {
+    // At ALLOW_SAME_TOKEN_NAME == 0, java's reduce/addAssetAmountV2 write the
+    // same V1-derived total to BOTH the V1 `asset` (name) map and the V2
+    // `asset_v2` (id) map, so the V2 view is already correct when the proposal
+    // flips. A flag=0 transfer of a registered token must mirror into asset_v2.
+    let accounts = AccountStore::new(mem());
+    let v1 = AssetIssueStore::new(mem());
+    v1.put(
+        b"DualCoin",
+        &AssetIssueContract {
+            owner_address: ALICE.to_vec(),
+            name: b"DualCoin".to_vec(),
+            id: "1000077".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // ALICE starts with both maps consistent, as java keeps them at flag=0.
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                asset: BTreeMap::from([("DualCoin".to_string(), 1000i64)]),
+                asset_v2: BTreeMap::from([("1000077".to_string(), 1000i64)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let dp = DynamicPropertiesStore::new(mem()); // flag=0 (default)
+    let c = TransferAssetContract {
+        owner_address: ALICE.to_vec(),
+        to_address: BOB.to_vec(),
+        asset_name: b"DualCoin".to_vec(),
+        amount: 100,
+    };
+    asset::execute_transfer_asset(&accounts, &dp, &v1, &c).unwrap();
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    let bob = accounts.get(&addr(BOB)).unwrap().unwrap();
+    // Sender debited in BOTH maps; recipient credited in BOTH maps.
+    assert_eq!(*alice.asset.get("DualCoin").unwrap(), 900, "alice V1");
+    assert_eq!(*alice.asset_v2.get("1000077").unwrap(), 900, "alice V2 dual-write");
+    assert_eq!(*bob.asset.get("DualCoin").unwrap(), 100, "bob V1");
+    assert_eq!(*bob.asset_v2.get("1000077").unwrap(), 100, "bob V2 dual-write");
 }
 
 // Reference the unused Frozen import (suppresses warning if any later

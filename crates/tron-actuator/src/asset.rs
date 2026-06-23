@@ -139,6 +139,7 @@ pub fn validate_transfer_asset(
 pub fn execute_transfer_asset(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    v1: &AssetIssueStore,
     contract: &TransferAssetContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -189,8 +190,8 @@ pub fn execute_transfer_asset(
     tron_chainbase::import_all_asset(&mut owner_account);
     tron_chainbase::import_all_asset(&mut to_account);
 
-    debit_asset(&mut owner_account, dyn_props, &key, contract.amount)?;
-    credit_asset(&mut to_account, dyn_props, &key, contract.amount)?;
+    debit_asset(&mut owner_account, dyn_props, v1, &key, contract.amount)?;
+    credit_asset(&mut to_account, dyn_props, v1, &key, contract.amount)?;
 
     // java: adjustBalance(owner, -fee) then burnTrx(fee) on the
     // supportBlackHoleOptimization path (mainnet); the legacy else-branch
@@ -698,8 +699,8 @@ pub fn execute_participate_asset_issue(
     tron_chainbase::import_all_asset(&mut to_account);
     tron_chainbase::import_all_asset(&mut owner_account);
     let key = String::from_utf8_lossy(&contract.asset_name).into_owned();
-    debit_asset(&mut to_account, dyn_props, &key, exchange_amount)?;
-    credit_asset(&mut owner_account, dyn_props, &key, exchange_amount)?;
+    debit_asset(&mut to_account, dyn_props, v1, &key, exchange_amount)?;
+    credit_asset(&mut owner_account, dyn_props, v1, &key, exchange_amount)?;
 
     accounts.put(&owner, &owner_account)?;
     accounts.put(&to, &to_account)?;
@@ -773,7 +774,7 @@ pub fn execute_unfreeze_asset(
     } else {
         // Mainnet: key is the V2 issued *id*; only the V2 map is written.
         let id_key = String::from_utf8_lossy(&account.asset_issued_id).into_owned();
-        credit_asset(&mut account, dyn_props, &id_key, unlocked)?;
+        credit_asset(&mut account, dyn_props, v1, &id_key, unlocked)?;
     }
     accounts.put(&owner, &account)?;
     Ok(ExecutionResult::default())
@@ -837,6 +838,7 @@ fn lookup_asset_balance_final(
 fn debit_asset(
     account: &mut tron_proto::Account,
     dyn_props: &DynamicPropertiesStore,
+    v1: &AssetIssueStore,
     key: &str,
     amount: i64,
 ) -> Result<(), ActuatorError> {
@@ -847,44 +849,77 @@ fn debit_asset(
     // lives in the V1 `asset` map (keyed by token name); once the proposal is
     // active it lives in the V2 `asset_v2` map (keyed by token id). The caller
     // passes the name at flag=0 and the id at flag=1 to match.
-    let map = if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
-        &mut account.asset
-    } else {
-        &mut account.asset_v2
-    };
-    match map.get_mut(key) {
+    let flag0 = dyn_props.allow_same_token_name().unwrap_or(0) == 0;
+    let map = if flag0 { &mut account.asset } else { &mut account.asset_v2 };
+    let updated = match map.get_mut(key) {
         Some(slot) if *slot >= amount => {
             *slot = check_sub(*slot, amount)?;
-            Ok(())
+            *slot
         }
-        Some(slot) => Err(ActuatorError::InsufficientAssetBalance {
-            has: *slot,
-            needs: amount,
-        }),
-        None => Err(ActuatorError::InsufficientAssetBalance {
-            has: 0,
-            needs: amount,
-        }),
+        Some(slot) => {
+            return Err(ActuatorError::InsufficientAssetBalance {
+                has: *slot,
+                needs: amount,
+            })
+        }
+        None => {
+            return Err(ActuatorError::InsufficientAssetBalance {
+                has: 0,
+                needs: amount,
+            })
+        }
+    };
+    // flag=0 java parity: `reduceAssetAmountV2` writes the same V1-derived total
+    // to BOTH the V1 `asset` (name) map and the V2 `asset_v2` (id) map, so the V2
+    // view stays correct for the eventual `ALLOW_SAME_TOKEN_NAME` switch. `key`
+    // is the token name here; resolve it to the token id to mirror the write.
+    if flag0 {
+        if let Some(id) = token_id_for_name(v1, key)? {
+            account.asset_v2.insert(id, updated);
+        }
     }
+    Ok(())
 }
 
 fn credit_asset(
     account: &mut tron_proto::Account,
     dyn_props: &DynamicPropertiesStore,
+    v1: &AssetIssueStore,
     key: &str,
     amount: i64,
 ) -> Result<(), ActuatorError> {
     // Mirror [`debit_asset`]: java `addAssetAmountV2` writes the V1 `asset`
     // (name-keyed) map before the proposal and the V2 `asset_v2` (id-keyed) map
     // after it.
-    let map = if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
-        &mut account.asset
-    } else {
-        &mut account.asset_v2
-    };
+    let flag0 = dyn_props.allow_same_token_name().unwrap_or(0) == 0;
+    let map = if flag0 { &mut account.asset } else { &mut account.asset_v2 };
     let slot = map.entry(key.to_string()).or_insert(0);
     *slot = check_add(*slot, amount)?;
+    let updated = *slot;
+    // flag=0 java parity: `addAssetAmountV2` writes the same V1-derived total to
+    // BOTH the V1 `asset` (name) map and the V2 `asset_v2` (id) map. `key` is the
+    // token name here; resolve it to the token id to mirror the write.
+    if flag0 {
+        if let Some(id) = token_id_for_name(v1, key)? {
+            account.asset_v2.insert(id, updated);
+        }
+    }
     Ok(())
+}
+
+/// Resolve a TRC-10 token *name* to its numeric token-id string via the V1
+/// `AssetIssueStore`, for the flag=0 `asset_v2` dual-write. At
+/// `ALLOW_SAME_TOKEN_NAME == 0` names are unique, so the lookup is unambiguous.
+/// Returns `None` when the asset is absent or carries no id (defensive: the
+/// caller's validation has already confirmed the asset exists for real txs).
+fn token_id_for_name(
+    v1: &AssetIssueStore,
+    name: &str,
+) -> Result<Option<String>, ActuatorError> {
+    Ok(v1
+        .get(name.as_bytes())?
+        .map(|c| c.id)
+        .filter(|id| !id.is_empty()))
 }
 
 #[allow(dead_code)]
