@@ -227,8 +227,18 @@ on demand (`manual` mode). If the EntryPoint rejects an op while building a
 bundle, that op is dropped by its `FailedOp` opIndex and the rest still submit,
 so one bad op can't wedge the queue.
 
+**ERC-7562 validation rules.** On accept, the op's validation phase is re-run
+under a validation tracer; if any entity (account / factory / paymaster) uses a
+**banned opcode** while inside its validation subtree — non-deterministic block
+context (`TIMESTAMP`, `NUMBER`, `COINBASE`, `BLOCKHASH`, `GASLIMIT`, `BASEFEE`,
+`PREVRANDAO`, blob ops), cross-account `BALANCE`/`SELFBALANCE`, `ORIGIN`,
+`GASPRICE`, raw `CREATE`, or `SELFDESTRUCT` — the op is rejected. This blocks ops
+that pass a one-shot simulation but could behave differently (or fail) when
+actually mined. Toggle with `[bundler] enforce_validation_rules` (default on);
+the tracer only runs the validation phase and is non-committing.
+
 **ERC-7562 reputation / throttling.** Each entity (account / factory /
-paymaster) is tracked by ops *seen* vs ops *included*; one that floods the
+paymaster) is also tracked by ops *seen* vs ops *included*; one that floods the
 mempool with ops that never get included is **throttled** (capped mempool
 presence) and then **banned** (`eth_sendUserOperation` rejected) — the standard
 `opsSeen / 10` inclusion-rate rule. `debug_bundler_getStakeStatus` reports an

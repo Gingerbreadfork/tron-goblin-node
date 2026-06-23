@@ -27,7 +27,8 @@ use alloy_sol_types::{sol, SolCall, SolError, SolEvent};
 use prost::Message;
 use serde_json::{json, Map, Value};
 use tron_proto::TriggerSmartContract;
-use tron_tvm::execute::{VmBlockEnv, VmLog, VmOutcome};
+use tron_tvm::execute::{execute_trigger_with_tracer, VmBlockEnv, VmLog, VmOutcome};
+use tron_tvm::tracer::{StructLogTracer, TracerOptions, ValidationCollect};
 
 use crate::methods::{build_call_vm_stores, dispatch_constant_trigger, RpcError};
 use crate::state::RpcState;
@@ -365,6 +366,8 @@ pub struct BundlerState {
     pub bundle_interval: Duration,
     /// ERC-7562 per-entity reputation (factory / paymaster / account throttling).
     pub reputation: Mutex<ReputationManager>,
+    /// Enforce ERC-7562 opcode/storage validation rules on accept (default on).
+    pub enforce_validation_rules: bool,
 }
 
 /// Upper bound on tracked UserOps held in memory for the by-hash / receipt
@@ -438,7 +441,14 @@ impl BundlerState {
             max_bundle_size: DEFAULT_MAX_BUNDLE_SIZE,
             bundle_interval: Duration::from_millis(DEFAULT_BUNDLE_INTERVAL_MS),
             reputation: Mutex::new(ReputationManager::default()),
+            enforce_validation_rules: true,
         }
+    }
+
+    /// Toggle ERC-7562 opcode/storage validation-rule enforcement.
+    pub fn with_validation_rules(mut self, on: bool) -> Self {
+        self.enforce_validation_rules = on;
+        self
     }
 
     /// Configure bundling behaviour (mode / bundle size / cadence). Chained off
@@ -677,6 +687,100 @@ fn sim_call(
     }
 }
 
+/// ERC-7562 opcodes an entity may NOT use during UserOp validation —
+/// non-deterministic block context / environment reads, cross-account balance,
+/// origin, and unsafe state ops. (GAS is permitted; CREATE2 is permitted for
+/// the factory, so only raw CREATE is banned here.)
+const BANNED_VALIDATION_OPCODES: &[(u8, &str)] = &[
+    (0x31, "BALANCE"),
+    (0x32, "ORIGIN"),
+    (0x3a, "GASPRICE"),
+    (0x40, "BLOCKHASH"),
+    (0x41, "COINBASE"),
+    (0x42, "TIMESTAMP"),
+    (0x43, "NUMBER"),
+    (0x44, "PREVRANDAO"),
+    (0x45, "GASLIMIT"),
+    (0x47, "SELFBALANCE"),
+    (0x48, "BASEFEE"),
+    (0x49, "BLOBHASH"),
+    (0x4a, "BLOBBASEFEE"),
+    (0xf0, "CREATE"),
+    (0xff, "SELFDESTRUCT"),
+];
+
+/// A 20-byte EVM `Address` as its raw `[u8; 20]`.
+fn addr20(a: Address) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out.copy_from_slice(a.as_slice());
+    out
+}
+
+/// ERC-7562 validation-rule check: re-run the op's validation phase under the
+/// validation tracer (a non-committing simulation of `handleOps` with generous
+/// gas) and reject the op if any entity (account / factory / paymaster) uses a
+/// banned opcode while inside its validation subtree. Returns `Ok(())` for a
+/// clean op, or when no EVM backends are attached to trace through.
+fn check_validation_rules(
+    s: &RpcState,
+    bundler: &BundlerState,
+    op: &UserOperation,
+    entry_point: Address,
+) -> Result<(), RpcError> {
+    let Some(b) = &s.eth_call_backends else {
+        return Ok(());
+    };
+    let vm_stores = build_call_vm_stores(b);
+    let block_env = VmBlockEnv {
+        block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+    };
+    // Generous gas so validation runs to completion (execution isn't inspected).
+    let mut sim_op = op.clone();
+    sim_op.verification_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+    sim_op.call_gas_limit = U256::from(SIM_CALL_GAS);
+    if sim_op.paymaster.is_some() {
+        sim_op.paymaster_verification_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+        sim_op.paymaster_post_op_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+    }
+    let handle_data =
+        handleOpsCall { ops: vec![sim_op.pack()], beneficiary: bundler.beneficiary }.abi_encode();
+    let trigger = TriggerSmartContract {
+        owner_address: bundler.bundler_address.to_vec(),
+        contract_address: tron_addr_21(entry_point),
+        call_value: 0,
+        data: handle_data,
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let collect = ValidationCollect::new(addr20(entry_point), op.factory.map(addr20));
+    let tracer = StructLogTracer::new(TracerOptions { call_tracer_only: true, ..Default::default() })
+        .with_validation(collect);
+    let (_outcome, _internal, mut tracer) = execute_trigger_with_tracer(
+        &vm_stores,
+        block_env,
+        &trigger,
+        s.eth_call_gas_cap,
+        s.eth_call_gas_cap,
+        tracer,
+    );
+    let Some(vc) = tracer.take_validation() else {
+        return Ok(());
+    };
+    let banned: HashMap<u8, &str> = BANNED_VALIDATION_OPCODES.iter().copied().collect();
+    for (addr, opcodes) in &vc.opcodes {
+        if let Some((code, name)) = opcodes.iter().find_map(|c| banned.get(c).map(|n| (*c, *n))) {
+            return Err(RpcError::invalid_request(format!(
+                "ERC-7562 validation rule: entity 0x{} uses banned opcode {} (0x{:02x}) during validation",
+                hex::encode(addr),
+                name,
+                code
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `eth_sendUserOperation(userOp, entryPoint)` — validate the op by simulating
 /// `EntryPoint.handleOps` (reject on revert, surfacing the `FailedOp` reason),
 /// then accept it into the bundler's mempool. The background bundling loop
@@ -725,6 +829,12 @@ pub fn eth_send_user_operation(p: &Value, s: &RpcState) -> Result<Value, RpcErro
     let handle_data =
         handleOpsCall { ops: vec![packed], beneficiary: bundler.beneficiary }.abi_encode();
     sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data)?;
+
+    // ERC-7562 opcode/storage validation rules — reject ops that use a banned
+    // opcode during validation (toggleable, on by default).
+    if bundler.enforce_validation_rules {
+        check_validation_rules(s, bundler, &op, entry_point)?;
+    }
 
     // ERC-7562 reputation: reject ops whose account / factory / paymaster is
     // BANNED, cap a THROTTLED entity's mempool presence, and bump opsSeen.
@@ -1993,5 +2103,30 @@ mod tests {
         let bare = RpcState::new(mem(), mem(), mem(), mem(), mem(), 11_111);
         assert!(debug_bundler_dump_reputation(&json!([]), &bare).is_err());
         assert!(debug_bundler_get_stake_status(&json!([a]), &bare).is_err());
+    }
+
+    #[test]
+    fn validation_rules_config_and_skip() {
+        // Enforcement defaults on; toggle off.
+        let st = BundlerState::new(
+            vec![Address::repeat_byte(1)],
+            [0u8; 32],
+            [0x41u8; 21],
+            Address::repeat_byte(2),
+            1,
+        );
+        assert!(st.enforce_validation_rules);
+        assert!(!st.with_validation_rules(false).enforce_validation_rules);
+        // Banned-opcode set covers the block-context / env / unsafe ops.
+        let banned: std::collections::HashMap<u8, &str> =
+            BANNED_VALIDATION_OPCODES.iter().copied().collect();
+        assert_eq!(banned.get(&0x42), Some(&"TIMESTAMP"));
+        assert_eq!(banned.get(&0xff), Some(&"SELFDESTRUCT"));
+        assert_eq!(banned.get(&0x32), Some(&"ORIGIN"));
+        assert!(banned.get(&0x01).is_none(), "ADD is not banned");
+        // With no EVM backends attached, the check is a no-op Ok (nothing to trace).
+        let (bundler, s) = enabled_state();
+        assert!(check_validation_rules(&s, &bundler, &sample(None, None), Address::repeat_byte(0x11))
+            .is_ok());
     }
 }

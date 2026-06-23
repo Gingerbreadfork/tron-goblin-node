@@ -114,6 +114,10 @@ pub struct StructLogTracer {
     /// Gas remaining captured at the start of the current opcode.
     /// Used in `step_end` to compute the per-opcode cost.
     last_step_gas: Option<u64>,
+    /// Optional ERC-7562 validation-rule collector (bundler use). When set, the
+    /// tracer records per-entity opcodes / storage touched inside UserOp
+    /// validation subtrees. `None` for the debug-trace path (no behaviour change).
+    validation: Option<ValidationCollect>,
 }
 
 impl StructLogTracer {
@@ -125,16 +129,109 @@ impl StructLogTracer {
             open_frames: Vec::new(),
             completed: Vec::new(),
             last_step_gas: None,
+            validation: None,
         }
     }
 
     pub fn into_outputs(self) -> (Vec<StructLog>, Vec<CallFrame>) {
         (self.logs, self.completed)
     }
+
+    /// Attach an ERC-7562 validation collector. Pair with
+    /// `TracerOptions { call_tracer_only: true, .. }` to skip the heavy struct
+    /// logs — only the validation collection runs.
+    pub fn with_validation(mut self, collect: ValidationCollect) -> Self {
+        self.validation = Some(collect);
+        self
+    }
+
+    /// Take the validation collector after a run (the collected opcodes/storage).
+    pub fn take_validation(&mut self) -> Option<ValidationCollect> {
+        self.validation.take()
+    }
+}
+
+/// EntryPoint `validateUserOp(...)` selector (`0x19822f7c`).
+const SEL_VALIDATE_USER_OP: [u8; 4] = [0x19, 0x82, 0x2f, 0x7c];
+/// EntryPoint `validatePaymasterUserOp(...)` selector (`0x52b7512c`).
+const SEL_VALIDATE_PAYMASTER: [u8; 4] = [0x52, 0xb7, 0x51, 0x2c];
+
+/// Per-entity opcodes + storage slots touched while inside a UserOp VALIDATION
+/// subtree, for ERC-7562 rule checking by the bundler. A subtree is "validation"
+/// when the EntryPoint calls an entity's `validateUserOp` / `validatePaymaster-
+/// UserOp`, or calls the configured account factory; everything nested under
+/// such a call (the execution phase excepted) is recorded.
+#[derive(Clone, Debug, Default)]
+pub struct ValidationCollect {
+    entry_point: [u8; 20],
+    factory: Option<[u8; 20]>,
+    /// Opcodes seen per executing contract address, validation frames only.
+    pub opcodes: std::collections::HashMap<[u8; 20], std::collections::BTreeSet<u8>>,
+    /// Storage slots (SLOAD/SSTORE) per address, validation frames only.
+    pub storage: std::collections::HashMap<[u8; 20], std::collections::BTreeSet<[u8; 32]>>,
+    /// Parallel to the open-frame stack: is this frame inside a validation subtree?
+    in_validation: Vec<bool>,
+    /// Parallel to the open-frame stack: the executing contract for each frame.
+    addr_stack: Vec<[u8; 20]>,
+}
+
+impl ValidationCollect {
+    pub fn new(entry_point: [u8; 20], factory: Option<[u8; 20]>) -> Self {
+        Self { entry_point, factory, ..Default::default() }
+    }
+
+    fn is_validation_root(&self, caller: &[u8; 20], target: &[u8; 20], input: &[u8]) -> bool {
+        if caller != &self.entry_point {
+            return false;
+        }
+        if Some(*target) == self.factory {
+            return true;
+        }
+        let sel = input.get(0..4);
+        sel == Some(&SEL_VALIDATE_USER_OP[..]) || sel == Some(&SEL_VALIDATE_PAYMASTER[..])
+    }
+
+    /// A CALL/CREATE entered a frame. `input` is the calldata (empty for CREATE).
+    fn on_frame_enter(&mut self, caller: [u8; 20], target: [u8; 20], input: &[u8]) {
+        let parent = self.in_validation.last().copied().unwrap_or(false);
+        let inside = parent || self.is_validation_root(&caller, &target, input);
+        self.in_validation.push(inside);
+        self.addr_stack.push(target);
+    }
+
+    fn on_frame_exit(&mut self) {
+        self.in_validation.pop();
+        self.addr_stack.pop();
+    }
+
+    /// One opcode executed. `slot` is `Some` for SLOAD/SSTORE.
+    fn on_step(&mut self, op: u8, slot: Option<[u8; 32]>) {
+        if self.in_validation.last().copied() != Some(true) {
+            return;
+        }
+        let Some(&addr) = self.addr_stack.last() else { return };
+        self.opcodes.entry(addr).or_default().insert(op);
+        if let Some(s) = slot {
+            self.storage.entry(addr).or_default().insert(s);
+        }
+    }
 }
 
 impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {
+        // ERC-7562 validation collector runs regardless of struct-log options.
+        if self.validation.is_some() {
+            let op = interp.bytecode.opcode();
+            // SLOAD (0x54) / SSTORE (0x55) put the slot on the stack top.
+            let slot = if op == 0x54 || op == 0x55 {
+                interp.stack.data().last().map(|w| w.to_be_bytes::<32>())
+            } else {
+                None
+            };
+            if let Some(vc) = &mut self.validation {
+                vc.on_step(op, slot);
+            }
+        }
         if self.options.call_tracer_only {
             return;
         }
@@ -188,10 +285,15 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
             revm::interpreter::CallInput::Bytes(b) => b.to_vec(),
             revm::interpreter::CallInput::SharedBuffer(_) => Vec::new(),
         };
+        let caller = evm_addr_bytes(&inputs.caller);
+        let target = evm_addr_bytes(&inputs.target_address);
+        if let Some(vc) = &mut self.validation {
+            vc.on_frame_enter(caller, target, &input);
+        }
         self.open_frames.push(CallFrame {
             call_type,
-            from: evm_addr_bytes(&inputs.caller),
-            to: Some(evm_addr_bytes(&inputs.target_address)),
+            from: caller,
+            to: Some(target),
             value,
             input,
             output: Vec::new(),
@@ -210,6 +312,9 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
         _inputs: &CallInputs,
         outcome: &mut CallOutcome,
     ) {
+        if let Some(vc) = &mut self.validation {
+            vc.on_frame_exit();
+        }
         if let Some(mut frame) = self.open_frames.pop() {
             frame.gas_used = frame.gas.saturating_sub(outcome.result.gas.remaining());
             frame.output = outcome.result.output.to_vec();
@@ -231,9 +336,16 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
             revm::interpreter::CreateScheme::Create2 { .. } => "CREATE2",
             _ => "CREATE",
         };
+        // New contract address is unknown until create_end; attribute the
+        // constructor's opcodes to the deployer (carries the parent's
+        // validation flag, so a factory's CREATE is collected).
+        let caller = evm_addr_bytes(&inputs.caller());
+        if let Some(vc) = &mut self.validation {
+            vc.on_frame_enter(caller, caller, &[]);
+        }
         self.open_frames.push(CallFrame {
             call_type,
-            from: evm_addr_bytes(&inputs.caller()),
+            from: caller,
             to: None,
             value: inputs.value(),
             input: inputs.init_code().to_vec(),
@@ -253,6 +365,9 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
+        if let Some(vc) = &mut self.validation {
+            vc.on_frame_exit();
+        }
         if let Some(mut frame) = self.open_frames.pop() {
             frame.gas_used = frame.gas.saturating_sub(outcome.result.gas.remaining());
             if let Some(addr) = outcome.address {
@@ -409,5 +524,65 @@ fn opcode_name(op: u8) -> &'static str {
         0xfe => "INVALID",
         0xff => "SELFDESTRUCT",
         _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn collects_only_inside_validation_subtree() {
+        let ep = [0xee; 20];
+        let factory = [0xfa; 20];
+        let acct = [0xac; 20];
+        let mut vc = ValidationCollect::new(ep, Some(factory));
+        // top-level EntryPoint frame (caller != EntryPoint -> not validation)
+        vc.on_frame_enter([0x00; 20], ep, &[]);
+        vc.on_step(0x42, None); // TIMESTAMP in EntryPoint itself -> NOT collected
+        // EntryPoint -> account.validateUserOp (validation root by selector)
+        vc.on_frame_enter(ep, acct, &SEL_VALIDATE_USER_OP[..]);
+        vc.on_step(0x42, None); // TIMESTAMP during validation -> collected
+        vc.on_step(0x54, Some([0x11; 32])); // SLOAD slot
+        vc.on_frame_exit();
+        // EntryPoint -> account execution (non-validation selector)
+        vc.on_frame_enter(ep, acct, &[0xab, 0xcd, 0xef, 0x01]);
+        vc.on_step(0x44, None); // PREVRANDAO during EXECUTION -> NOT collected
+        vc.on_frame_exit();
+        vc.on_frame_exit();
+
+        assert!(vc.opcodes.get(&acct).unwrap().contains(&0x42), "validation op collected");
+        assert!(!vc.opcodes.get(&acct).unwrap().contains(&0x44), "execution op excluded");
+        assert!(vc.opcodes.get(&ep).is_none(), "EntryPoint's own op not collected");
+        assert!(vc.storage.get(&acct).unwrap().contains(&[0x11; 32]), "SLOAD slot collected");
+    }
+
+    #[test]
+    fn factory_subtree_is_validation() {
+        let ep = [0xee; 20];
+        let factory = [0xfa; 20];
+        let mut vc = ValidationCollect::new(ep, Some(factory));
+        vc.on_frame_enter([0; 20], ep, &[]); // EntryPoint
+        vc.on_frame_enter(ep, factory, &[0x12, 0x34, 0x56, 0x78]); // root: target == factory
+        vc.on_step(0xf0, None); // CREATE inside factory -> collected
+        vc.on_frame_exit();
+        vc.on_frame_exit();
+        assert!(vc.opcodes.get(&factory).unwrap().contains(&0xf0));
+    }
+
+    #[test]
+    fn nested_frame_inherits_validation_flag() {
+        let ep = [0xee; 20];
+        let acct = [0xac; 20];
+        let helper = [0x77; 20];
+        let mut vc = ValidationCollect::new(ep, None);
+        vc.on_frame_enter([0; 20], ep, &[]);
+        vc.on_frame_enter(ep, acct, &SEL_VALIDATE_PAYMASTER[..]); // validation root
+        vc.on_frame_enter(acct, helper, &[0x00, 0x00, 0x00, 0x00]); // nested call by acct
+        vc.on_step(0x32, None); // ORIGIN in a helper CALLED during validation -> collected
+        vc.on_frame_exit();
+        vc.on_frame_exit();
+        vc.on_frame_exit();
+        assert!(vc.opcodes.get(&helper).unwrap().contains(&0x32), "nested validation op collected");
     }
 }

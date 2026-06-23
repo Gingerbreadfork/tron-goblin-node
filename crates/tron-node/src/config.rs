@@ -425,6 +425,13 @@ pub struct BundlerConfig {
     /// Max UserOps packed into one `handleOps` bundle. Default 50.
     #[serde(default = "default_max_bundle_size")]
     pub max_bundle_size: usize,
+    /// Enforce ERC-7562 opcode/storage validation rules on accept. Default true.
+    #[serde(default = "default_enforce_validation_rules")]
+    pub enforce_validation_rules: bool,
+}
+
+fn default_enforce_validation_rules() -> bool {
+    true
 }
 
 fn default_bundler_fee_limit() -> i64 {

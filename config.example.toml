@@ -239,6 +239,7 @@ disabled = false
 # # bundling_mode = "auto"                # auto (submit on interval) | manual (debug_bundler_sendBundleNow)
 # # bundle_interval_ms = 2000             # auto-mode bundling cadence
 # # max_bundle_size = 50                  # max UserOps packed into one handleOps
+# # enforce_validation_rules = true       # reject ops using ERC-7562 banned opcodes during validation
 
 
 # -----------------------------------------------------------------------------

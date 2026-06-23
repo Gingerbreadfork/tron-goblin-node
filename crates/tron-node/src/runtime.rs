@@ -2288,7 +2288,8 @@ fn build_bundler_state(
         mode,
         cfg.max_bundle_size,
         std::time::Duration::from_millis(cfg.bundle_interval_ms),
-    );
+    )
+    .with_validation_rules(cfg.enforce_validation_rules);
     tracing::info!(
         entry_points = cfg.entry_points.len(),
         bundler = %hex::encode(addr21),
