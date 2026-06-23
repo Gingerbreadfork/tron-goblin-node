@@ -115,6 +115,7 @@ fn fixture() -> RpcState {
         balance_trace: None,
         chain_id: 1,
         metrics: None,
+        bundler: None,
         mempool: None,
         filters: Arc::new(tron_rpc::FilterRegistry::default()),
         assets_v1: None,
