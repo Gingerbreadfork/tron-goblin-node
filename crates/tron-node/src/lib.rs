@@ -41,10 +41,10 @@ pub use admin::{
     DEFAULT_LITE_RECENT_BLOCKS,
 };
 pub use config::{
-    CommitteeConfig, ConfigError, DbSettingsConfig, EventFilterConfig, EventSubscribeConfig,
-    EventTopicConfig, FilterQuery, LocalWitnessConfig, LocalWitnessSource, MetricsConfig,
-    NodeBackupConfig, NodeConfig, P2pConfig, RateLimiterConfig, RateLimiterItem, RpcConfig,
-    StorageConfig, TxCacheConfig, VmConfig, WitnessConfig,
+    BundlerConfig, CommitteeConfig, ConfigError, DbSettingsConfig, EventFilterConfig,
+    EventSubscribeConfig, EventTopicConfig, FilterQuery, LocalWitnessConfig, LocalWitnessSource,
+    MetricsConfig, NodeBackupConfig, NodeConfig, P2pConfig, RateLimiterConfig, RateLimiterItem,
+    RpcConfig, StorageConfig, TxCacheConfig, VmConfig, WitnessConfig,
 };
 pub use pbft_runtime::{PbftChannels, PbftRuntime, PbftRuntimeError};
 pub use peer_state::PeerState;

@@ -190,6 +190,35 @@ The result is one object per simulated block — the block env it ran under plus
 A reverted call instead reports `"status": "0x0"` with an `error` object
 carrying the revert reason.
 
+### ERC-4337 bundler
+
+With `[bundler] enable = true` (plus a signing key and at least one
+`entry_points` address — see `config.example.toml`), the node is an ERC-4337
+**bundler**: it serves the standard bundler RPC namespace and submits `handleOps`
+transactions itself.
+
+- **`eth_supportedEntryPoints`** → the configured EntryPoint addresses.
+- **`eth_sendUserOperation(userOp, entryPoint)`** → validate by simulating
+  `handleOps` (rejecting, with the decoded `FailedOp` reason, if it reverts),
+  then sign + submit; returns the `userOpHash` (computed by the EntryPoint, so it
+  matches whatever EntryPoint version is deployed).
+- **`eth_estimateUserOperationGas(userOp, entryPoint)`** →
+  `{preVerificationGas, verificationGasLimit, callGasLimit,
+  paymasterVerificationGasLimit, paymasterPostOpGasLimit}` (heuristic estimate
+  via simulation).
+- **`eth_getUserOperationByHash(hash)`** → the op + its on-chain location, or `null`.
+- **`eth_getUserOperationReceipt(hash)`** → success + actual gas (from the
+  `UserOperationEvent`) + the inner tx receipt, or `null` until mined.
+
+It is **off-protocol** — a bundled op is an ordinary `EntryPoint` contract call
+executed by the same TVM, so the bundler has zero consensus effect (the namespace
+is additive, like `eth_simulateV1`). TRON has no canonical EntryPoint yet, so the
+operator deploys the standard v0.7 EntryPoint (e.g. via CREATE2) and lists it in
+`[bundler] entry_points`; the signing account must hold TRX/energy to pay for the
+`handleOps` transactions. Validation, gas estimation, and `getUserOpHash` are all
+delegated to that deployed EntryPoint via the constant-call VM, so the bundler is
+version-agnostic.
+
 ## TRON REST Wallet API
 
 The HTTP REST surface provides java-tron-compatible `/wallet/*` endpoints used

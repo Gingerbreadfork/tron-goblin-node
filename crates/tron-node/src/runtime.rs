@@ -841,10 +841,15 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }));
     }
 
+    // ERC-4337 bundler (off unless `[bundler] enable = true`). Built once and
+    // shared across the JSON-RPC / gRPC / REST RpcStates below.
+    let bundler_state = build_bundler_state(config.bundler.as_ref())?;
+
     // === RPC server ===
     if !config.rpc.disabled {
         let rpc_state = stores
             .to_rpc_state(config.rpc.chain_id)
+            .with_bundler_opt(bundler_state.clone())
             .with_metrics(metrics.clone())
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
@@ -917,6 +922,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     if !config.grpc.disabled {
         let mut grpc_state = stores
             .to_rpc_state(config.rpc.chain_id)
+            .with_bundler_opt(bundler_state.clone())
             .with_metrics(metrics.clone())
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
@@ -975,6 +981,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     if !config.http.disabled {
         let mut http_state = stores
             .to_rpc_state(config.rpc.chain_id)
+            .with_bundler_opt(bundler_state.clone())
             .with_metrics(metrics.clone())
             .with_mempool(mempool.clone())
             .with_eth_call_gas_cap(eth_call_gas_cap)
@@ -2200,6 +2207,67 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
 /// Strategy names that don't match a known adapter are logged and
 /// skipped — the request passes through unlimited rather than failing
 /// to start.
+/// Resolve `[bundler]` config into the optional shared [`BundlerState`]. Returns
+/// `Ok(None)` when the section is absent or `enable = false`; otherwise resolves
+/// the signing key, derives the bundler's address, and parses the EntryPoint /
+/// beneficiary addresses.
+fn build_bundler_state(
+    cfg: Option<&crate::config::BundlerConfig>,
+) -> Result<Option<Arc<tron_rpc::bundler::BundlerState>>, RunError> {
+    let Some(cfg) = cfg.filter(|c| c.enable) else {
+        return Ok(None);
+    };
+    let priv_key = resolve_bundler_key(cfg)?;
+    let address = tron_wallet::address_from_private(&priv_key)
+        .map_err(|e| RunError::Rpc(format!("[bundler] derive address: {e}")))?;
+    let mut addr21 = [0u8; 21];
+    addr21.copy_from_slice(address.as_bytes());
+    let state = tron_rpc::bundler::BundlerState::from_config(
+        &cfg.entry_points,
+        priv_key,
+        addr21,
+        cfg.beneficiary.as_deref(),
+        cfg.fee_limit_sun,
+    )
+    .map_err(RunError::Rpc)?;
+    tracing::info!(
+        entry_points = cfg.entry_points.len(),
+        bundler = %hex::encode(addr21),
+        "ERC-4337 bundler enabled"
+    );
+    Ok(Some(Arc::new(state)))
+}
+
+/// Resolve the bundler's signing key from `keystore` / `key_env` / `key_hex`
+/// (same precedence and sources as `[witness]`).
+fn resolve_bundler_key(cfg: &crate::config::BundlerConfig) -> Result<[u8; 32], RunError> {
+    if let Some(ks_path) = &cfg.keystore {
+        let pw_env = cfg.keystore_password_env.as_ref().ok_or_else(|| {
+            RunError::Rpc("[bundler] keystore_password_env required when keystore is set".into())
+        })?;
+        let pw = std::env::var(pw_env)
+            .map_err(|_| RunError::Rpc(format!("[bundler] env var '{pw_env}' not set")))?;
+        let ks = tron_wallet::Keystore::load_from_file(ks_path)
+            .map_err(|e| RunError::Rpc(format!("[bundler] load keystore: {e}")))?;
+        ks.decrypt(&pw)
+            .map_err(|e| RunError::Rpc(format!("[bundler] decrypt keystore: {e}")))
+    } else if let Some(env_name) = &cfg.key_env {
+        let hex = std::env::var(env_name)
+            .map_err(|_| RunError::Rpc(format!("[bundler] env var '{env_name}' not set")))?;
+        parse_bundler_key_hex(&hex)
+    } else if let Some(hex) = &cfg.key_hex {
+        parse_bundler_key_hex(hex)
+    } else {
+        Err(RunError::Rpc("[bundler] requires one of: keystore, key_env, key_hex".into()))
+    }
+}
+
+fn parse_bundler_key_hex(s: &str) -> Result<[u8; 32], RunError> {
+    let s = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+    let v = hex::decode(s).map_err(|e| RunError::Rpc(format!("[bundler] key hex: {e}")))?;
+    v.try_into().map_err(|_| RunError::Rpc("[bundler] key must be 32 bytes".into()))
+}
+
 fn build_rate_limit_registry(
     items: &[crate::config::RateLimiterItem],
 ) -> tron_rpc::RateLimitRegistry {

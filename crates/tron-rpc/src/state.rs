@@ -284,6 +284,12 @@ impl RpcState {
         self
     }
 
+    /// Optional variant for the runtime builder chains — no-op when `None`.
+    pub fn with_bundler_opt(mut self, bundler: Option<Arc<crate::bundler::BundlerState>>) -> Self {
+        self.bundler = bundler;
+        self
+    }
+
     pub fn with_mempool(mut self, mempool: Arc<dyn crate::mempool::Mempool>) -> Self {
         self.mempool = Some(mempool);
         self

@@ -239,6 +239,35 @@ impl BundlerState {
             .map(|a| format!("0x{}", hex::encode(a.as_slice())))
             .collect::<Vec<_>>())
     }
+
+    /// Build from resolved `[bundler]` config. `entry_points`/`beneficiary` are
+    /// parsed from their string forms (`0x…`/TRON/base58); the caller resolves
+    /// `signing_key`/`bundler_address` from the configured key source.
+    /// `beneficiary` defaults to the bundler's own address.
+    pub fn from_config(
+        entry_points: &[String],
+        signing_key: [u8; 32],
+        bundler_address: [u8; 21],
+        beneficiary: Option<&str>,
+        fee_limit: i64,
+    ) -> Result<Self, String> {
+        let eps = entry_points
+            .iter()
+            .map(|s| {
+                parse_addr_evm(s).map_err(|e| format!("[bundler] entry_point `{s}`: {}", e.message))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if eps.is_empty() {
+            return Err("[bundler] entry_points must list at least one EntryPoint".into());
+        }
+        let benef = match beneficiary {
+            Some(b) => {
+                parse_addr_evm(b).map_err(|e| format!("[bundler] beneficiary: {}", e.message))?
+            }
+            None => Address::from_slice(&bundler_address[1..]),
+        };
+        Ok(Self::new(eps, signing_key, bundler_address, benef, fee_limit))
+    }
 }
 
 /// `eth_supportedEntryPoints` — the EntryPoint addresses this bundler accepts.
@@ -758,6 +787,31 @@ mod tests {
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0], format!("0x{}", hex::encode(ep1.as_slice())));
+    }
+
+    #[test]
+    fn from_config_parses_and_validates() {
+        let st = BundlerState::from_config(
+            &["0xabababababababababababababababababababab".to_string()],
+            [9u8; 32],
+            [0x41u8; 21],
+            None,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(st.entry_points.len(), 1);
+        // beneficiary defaults to the bundler's own 20-byte address
+        assert_eq!(st.beneficiary, Address::from_slice(&[0x41u8; 21][1..]));
+        // empty entry_points and bad addresses are rejected
+        assert!(BundlerState::from_config(&[], [0u8; 32], [0x41u8; 21], None, 0).is_err());
+        assert!(BundlerState::from_config(
+            &["nothex".to_string()],
+            [0u8; 32],
+            [0x41u8; 21],
+            None,
+            0
+        )
+        .is_err());
     }
 
     #[test]

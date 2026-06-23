@@ -42,6 +42,9 @@ pub struct NodeConfig {
     /// produces+broadcasts a block when we do.
     #[serde(default)]
     pub witness: Option<WitnessConfig>,
+    /// `[bundler]` — optional ERC-4337 bundler. Off unless `enable = true`.
+    #[serde(default)]
+    pub bundler: Option<BundlerConfig>,
     /// java-tron `node.openHistoryQueryWhenLiteFN`: when the node runs
     /// on a LITE dataset (history pruned), the history-query APIs are
     /// closed with java's "this API is closed because this node is a
@@ -383,6 +386,39 @@ pub struct WitnessConfig {
 
 fn default_max_txs_per_block() -> usize {
     1000
+}
+
+/// `[bundler]` — ERC-4337 account-abstraction bundler. When `enable = true` with
+/// a signing key, the node exposes the bundler RPC namespace
+/// (`eth_sendUserOperation` etc.) and submits `handleOps` transactions signed
+/// with this key. Exactly one of `key_hex`/`key_env`/`keystore` must be set
+/// (same key sources as `[witness]`). Off-protocol — no consensus effect.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BundlerConfig {
+    /// Master switch. The bundler stays off unless this is `true`.
+    #[serde(default)]
+    pub enable: bool,
+    /// EntryPoint contract addresses this bundler accepts (operator-deployed;
+    /// `0x…` 20-byte EVM, TRON `41…`, or base58 `T…`).
+    #[serde(default)]
+    pub entry_points: Vec<String>,
+    /// Optional raw private key hex for signing handleOps txs. DISCOURAGED.
+    pub key_hex: Option<String>,
+    /// Environment variable name holding the raw private key hex.
+    pub key_env: Option<String>,
+    /// Path to a v3 keystore JSON file (java-tron compatible).
+    pub keystore: Option<std::path::PathBuf>,
+    /// Environment variable holding the keystore password (required with `keystore`).
+    pub keystore_password_env: Option<String>,
+    /// Gas-fee beneficiary passed to `handleOps`. Defaults to the bundler's address.
+    pub beneficiary: Option<String>,
+    /// Per-bundle TRX fee cap, in sun. Default 1e9 (1000 TRX).
+    #[serde(default = "default_bundler_fee_limit")]
+    pub fee_limit_sun: i64,
+}
+
+fn default_bundler_fee_limit() -> i64 {
+    1_000_000_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1132,6 +1168,7 @@ impl Default for NodeConfig {
             grpc: GrpcConfig::default(),
             http: HttpRestConfig::default(),
             witness: None,
+            bundler: None,
             storage: StorageConfig::default(),
             event: None,
             node_backup: NodeBackupConfig::default(),

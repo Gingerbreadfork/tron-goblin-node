@@ -215,6 +215,26 @@ disabled = false
 # # keystore_password_env = "TRON_KEYSTORE_PASSWORD"
 # max_txs_per_block = 1000                # mempool txs pulled per produced block
 
+# -----------------------------------------------------------------------------
+# [bundler] — ERC-4337 account-abstraction bundler (OPTIONAL, off by default).
+# -----------------------------------------------------------------------------
+# When enabled with a signing key, the node serves the bundler RPC namespace
+# (eth_sendUserOperation / eth_estimateUserOperationGas / eth_getUserOperation-
+# ByHash / eth_getUserOperationReceipt / eth_supportedEntryPoints): it validates
+# UserOperations against live state via the constant-call VM, then signs and
+# submits handleOps transactions with the key below. Off-protocol — a bundled op
+# is an ordinary EntryPoint contract call, so NO consensus effect. Requires an
+# operator-deployed EntryPoint (TRON has no canonical one yet); deploy the
+# standard v0.7 EntryPoint via CREATE2. The signing account must hold TRX/energy
+# to pay for the handleOps transactions.
+#
+# [bundler]
+# enable = true
+# entry_points = ["0x0000000071727De22E5E9d8BAf0edAc6f37da032"]  # your EntryPoint
+# key_env = "TRON_BUNDLER_KEY"            # signing key (or key_hex / keystore, as [witness])
+# # beneficiary = "T..."                  # gas-fee recipient (default: bundler address)
+# # fee_limit_sun = 1000000000            # per-bundle TRX fee cap, in sun
+
 
 # -----------------------------------------------------------------------------
 # [vm] — TVM knobs. Keys accept snake_case and java-tron's camelCase aliases
