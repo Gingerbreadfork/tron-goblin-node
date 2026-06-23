@@ -773,3 +773,74 @@ fn flag0_exchange_transaction_credit_dual_writes_v1() {
     assert!(v1_bal > 5_000_000, "bought BTT credited to authoritative V1 asset[name]");
     assert_eq!(v1_bal, v2_bal, "V1 and dual-written asset_v2[id] hold the same total");
 }
+
+#[test]
+fn flag0_exchange_create_reads_v1_balance_and_dual_writes() {
+    let accounts = AccountStore::new(mem());
+    let v1 = ExchangeStore::new(mem());
+    let v2 = ExchangeV2Store::new(mem());
+    let dp = DynamicPropertiesStore::new(mem()); // flag=0
+    let av1 = AssetIssueStore::new(mem());
+    dp.put_long(b"EXCHANGE_CREATE_FEE", 0);
+    av1.put(
+        b"BTT",
+        &tron_proto::AssetIssueContract {
+            name: b"BTT".to_vec(),
+            id: "1000001".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Alice holds BTT in V1 ONLY (asset_v2 empty): the create balance check must
+    // read V1 to ACCEPT — an asset_v2-only check would wrongly reject.
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 10_000_000_000,
+                r#type: AccountType::Normal as i32,
+                asset: BTreeMap::from([("BTT".to_string(), 1_000_000_000)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let c = ExchangeCreateContract {
+        owner_address: ALICE.to_vec(),
+        first_token_id: b"_".to_vec(),
+        first_token_balance: 5_000_000_000,
+        second_token_id: b"BTT".to_vec(),
+        second_token_balance: 500_000_000,
+    };
+    // READ side: validate ACCEPTS reading V1 (regression guard for the new check).
+    exchange::validate_exchange_create(&accounts, &dp, &c).unwrap();
+    exchange::execute_exchange_create(&accounts, &v1, &v2, &dp, &av1, &c).unwrap();
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(*alice.asset.get("BTT").unwrap(), 500_000_000, "V1 asset[name] debited");
+    assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 500_000_000, "asset_v2[id] dual-write");
+
+    // The new check REJECTS an underfunded create (previously a no-op pass that
+    // deferred to execute) — now matching java's validate.
+    let poor = AccountStore::new(mem());
+    poor.put(
+        &addr(BOB),
+        &Account {
+            address: BOB.to_vec(),
+            balance: 10_000_000_000,
+            r#type: AccountType::Normal as i32, // holds NO BTT
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let c2 = ExchangeCreateContract {
+        owner_address: BOB.to_vec(),
+        first_token_id: b"_".to_vec(),
+        first_token_balance: 5_000_000_000,
+        second_token_id: b"BTT".to_vec(),
+        second_token_balance: 500_000_000,
+    };
+    assert!(
+        exchange::validate_exchange_create(&poor, &dp, &c2).is_err(),
+        "underfunded create now rejected at validate (java parity)"
+    );
+}

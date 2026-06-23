@@ -60,6 +60,28 @@ pub fn validate_exchange_create(
     if contract.first_token_balance > limit || contract.second_token_balance > limit {
         return Err(ActuatorError::ExchangeBalanceLimitExceeded);
     }
+    // java ExchangeCreateActuator.validate (lines 66-82): the owner must hold
+    // enough of each seeded side. A TRX side must cover its seed amount PLUS the
+    // create fee; a token side checks the trader's TRC-10 balance flag-aware
+    // (V1 `asset[name]` at flag=0, `asset_v2[id]` at flag=1 — java
+    // `assetBalanceEnoughV2`). In-block creates are always funded, so this never
+    // changes a replay outcome, but it brings the validate to java parity.
+    for (token_id, token_balance) in [
+        (contract.first_token_id.as_slice(), contract.first_token_balance),
+        (contract.second_token_id.as_slice(), contract.second_token_balance),
+    ] {
+        if token_id == TRX_TOKEN_ID {
+            let needed = token_balance.saturating_add(fee);
+            if account.balance < needed {
+                return Err(ActuatorError::InsufficientBalance { balance: account.balance, needed });
+            }
+        } else if !exchange_balance_enough(&account, dyn_props, token_id, token_balance) {
+            return Err(ActuatorError::InsufficientAssetBalance {
+                has: exchange_token_balance(&account, dyn_props, token_id),
+                needs: token_balance,
+            });
+        }
+    }
     Ok(())
 }
 
