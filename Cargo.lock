@@ -6143,6 +6143,7 @@ version = "0.0.1"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-sol-types",
  "axum",
  "blake2s_simd",
  "futures-util",

@@ -219,6 +219,46 @@ operator deploys the standard v0.7 EntryPoint (e.g. via CREATE2) and lists it in
 delegated to that deployed EntryPoint via the constant-call VM, so the bundler is
 version-agnostic.
 
+Example — discover the EntryPoint, then submit a UserOperation (the canonical
+v0.7 EntryPoint address is shown; long fields are abbreviated with `…`):
+
+```sh
+# Which EntryPoints this bundler accepts:
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_supportedEntryPoints","params":[]}'
+# → {"jsonrpc":"2.0","id":1,"result":["0x0000000071727de22e5e9d8baf0edac6f37da032"]}
+
+# Submit a UserOperation (unpacked v0.7 shape); the result is the userOpHash,
+# computed by the EntryPoint itself so it matches the deployed version:
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_sendUserOperation","params":[
+        {
+          "sender":               "0x1234…",
+          "nonce":                "0x0",
+          "callData":             "0xb61d27f6…",
+          "callGasLimit":         "0x88b8",
+          "verificationGasLimit": "0x186a0",
+          "preVerificationGas":   "0xc350",
+          "maxFeePerGas":         "0x3b9aca00",
+          "maxPriorityFeePerGas": "0x3b9aca00",
+          "signature":            "0x…"
+        },
+        "0x0000000071727de22e5e9d8baf0edac6f37da032"
+      ]}'
+# → {"jsonrpc":"2.0","id":1,"result":"0xefbc1a…"}
+
+# Poll the receipt with that userOpHash once the bundle is mined (null until then):
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getUserOperationReceipt","params":["0xefbc1a…"]}'
+```
+
+A rejected `eth_sendUserOperation` returns the EntryPoint's decoded `FailedOp`
+reason (e.g. `op 0: AA24 signature error`) rather than a bare revert, so callers
+see *why* validation failed. Scope note: this is an MVP bundler — gas estimation
+is a coarse-but-safe simulation heuristic, and alt-mempool reputation /
+opcode-banning and ERC-7710/7715 delegation helpers are follow-ups; the five RPC
+methods, validation, signing, submission, and tracking are complete.
+
 ## TRON REST Wallet API
 
 The HTTP REST surface provides java-tron-compatible `/wallet/*` endpoints used

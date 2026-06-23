@@ -18,7 +18,7 @@
 //! `handleOps`), so the bundler stays correct against whatever EntryPoint
 //! (v0.6/v0.7/v0.8) the operator deployed. The on-chain encoding below targets
 //! the v0.7 `PackedUserOperation` ABI.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
@@ -196,7 +196,51 @@ pub struct BundlerState {
     /// Per-bundle TRX fee cap, in sun.
     pub fee_limit: i64,
     /// Accepted UserOps keyed by userOpHash, for the by-hash / receipt RPCs.
-    pub tracked: Mutex<HashMap<B256, TrackedUserOp>>,
+    /// Bounded (FIFO eviction past [`MAX_TRACKED`]) so a long-running bundler's
+    /// memory doesn't grow without limit as ops accumulate.
+    pub tracked: Mutex<TrackedOps>,
+}
+
+/// Upper bound on tracked UserOps held in memory for the by-hash / receipt
+/// RPCs. Once exceeded, the oldest entry is evicted as each new op arrives, so
+/// only the most recent ~`MAX_TRACKED` ops remain queryable — ample for live
+/// clients polling a freshly-submitted op, while capping memory.
+const MAX_TRACKED: usize = 100_000;
+
+/// Insertion-ordered, size-bounded store of accepted UserOps. Keeps a FIFO
+/// `order` queue alongside the hash map so eviction is O(1) and the two stay
+/// consistent under the single [`BundlerState::tracked`] mutex.
+#[derive(Default)]
+pub struct TrackedOps {
+    by_hash: HashMap<B256, TrackedUserOp>,
+    order: VecDeque<B256>,
+}
+
+impl TrackedOps {
+    /// Record (or replace) an op. New hashes extend the FIFO queue and evict
+    /// the oldest entries once the map exceeds [`MAX_TRACKED`]; re-inserting an
+    /// existing hash updates it in place without disturbing eviction order.
+    fn insert(&mut self, hash: B256, op: TrackedUserOp) {
+        if self.by_hash.insert(hash, op).is_none() {
+            self.order.push_back(hash);
+            while self.order.len() > MAX_TRACKED {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.by_hash.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    /// A clone of the tracked op, if still retained (not evicted).
+    fn get(&self, hash: &B256) -> Option<TrackedUserOp> {
+        self.by_hash.get(hash).cloned()
+    }
+
+    /// Number of currently-tracked ops (test/observability).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_hash.len()
+    }
 }
 
 /// A UserOperation the bundler has accepted, with its on-chain submission.
@@ -222,7 +266,7 @@ impl BundlerState {
             bundler_address,
             beneficiary,
             fee_limit,
-            tracked: Mutex::new(HashMap::new()),
+            tracked: Mutex::new(TrackedOps::default()),
         }
     }
 
@@ -557,7 +601,7 @@ pub fn eth_get_user_operation_by_hash(p: &Value, s: &RpcState) -> Result<Value, 
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("missing userOpHash"))?,
     )?;
-    let Some(tracked) = bundler.tracked.lock().ok().and_then(|t| t.get(&hash).cloned()) else {
+    let Some(tracked) = bundler.tracked.lock().ok().and_then(|t| t.get(&hash)) else {
         return Ok(Value::Null);
     };
     let (tx_hash, block_number, block_hash) = match tracked.tx_id {
@@ -596,7 +640,7 @@ pub fn eth_get_user_operation_receipt(p: &Value, s: &RpcState) -> Result<Value, 
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("missing userOpHash"))?,
     )?;
-    let Some(tracked) = bundler.tracked.lock().ok().and_then(|t| t.get(&hash).cloned()) else {
+    let Some(tracked) = bundler.tracked.lock().ok().and_then(|t| t.get(&hash)) else {
         return Ok(Value::Null);
     };
     let Some(tx_id) = tracked.tx_id else {
@@ -963,5 +1007,32 @@ mod tests {
         )));
         assert!(eth_get_user_operation_by_hash(&p, &s).unwrap().is_null());
         assert!(eth_get_user_operation_receipt(&p, &s).unwrap().is_null());
+    }
+
+    #[test]
+    fn tracked_ops_bounded_fifo_eviction() {
+        let mut t = TrackedOps::default();
+        let op = |b: u8| TrackedUserOp {
+            user_op: sample(None, None),
+            entry_point: Address::repeat_byte(b),
+            tx_id: None,
+        };
+        let h = |i: u64| B256::from(U256::from(i).to_be_bytes::<32>());
+        // Overflow the cap by a few entries.
+        for i in 0..(MAX_TRACKED as u64 + 5) {
+            t.insert(h(i), op(0x11));
+        }
+        assert_eq!(t.len(), MAX_TRACKED, "map stays bounded at the cap");
+        assert!(t.get(&h(0)).is_none(), "oldest entries evicted (FIFO)");
+        assert!(t.get(&h(MAX_TRACKED as u64 + 4)).is_some(), "newest retained");
+        // Re-inserting an existing hash updates in place without growing/reordering.
+        let len_before = t.len();
+        t.insert(h(MAX_TRACKED as u64 + 4), op(0x22));
+        assert_eq!(t.len(), len_before, "re-insert of a tracked hash is in-place");
+        assert_eq!(
+            t.get(&h(MAX_TRACKED as u64 + 4)).unwrap().entry_point,
+            Address::repeat_byte(0x22),
+            "re-insert overwrites the value"
+        );
     }
 }

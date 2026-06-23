@@ -291,6 +291,20 @@ java-tron doesn't have. What works today, by area:
   side-effect-free as `eth_call`, never touching canonical state.
   Unsupported override modes are rejected with an explicit error rather
   than silently mis-simulated.
+- **ERC-4337 account-abstraction bundler** (`[bundler]`) — the standard
+  bundler RPC namespace (`eth_sendUserOperation`,
+  `eth_estimateUserOperationGas`, `eth_getUserOperationByHash`,
+  `eth_getUserOperationReceipt`, `eth_supportedEntryPoints`), the smart-account
+  / gasless-UX infrastructure layer TRON otherwise lacks. Each UserOperation is
+  validated against live state through the constant-call VM, then bundled into a
+  signed `EntryPoint.handleOps` transaction the node submits (auto-relayed by the
+  mempool) and tracks for the by-hash / receipt queries. **Off-protocol** — a
+  bundled op is an ordinary contract call on the same byte-exact TVM, so it adds
+  zero consensus risk (additive, like `eth_simulateV1`). userOpHash, validation,
+  and gas estimation are all delegated to the *deployed* EntryPoint via
+  simulation, so it stays version-agnostic (v0.6 / v0.7 / v0.8). java-tron has no
+  bundler. See
+  [docs/apis-indexing-firehose.md](docs/apis-indexing-firehose.md#erc-4337-bundler).
 - **Firehose** (`[index.firehose]`) — a durable, append-only stream of
   applied blocks (decoded transfer facts, TRC20 logs, internal txs) with
   explicit `UNWIND` entries for reorgs and crash recovery, tailed over gRPC
