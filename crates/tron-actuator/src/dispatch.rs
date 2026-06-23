@@ -584,6 +584,7 @@ pub fn dispatch_execute(
                 stores.exchange_v1,
                 stores.exchange_v2,
                 stores.dyn_props,
+                stores.asset_v1,
                 &c,
             )
         }
@@ -593,6 +594,8 @@ pub fn dispatch_execute(
                 stores.accounts,
                 stores.exchange_v1,
                 stores.exchange_v2,
+                stores.dyn_props,
+                stores.asset_v1,
                 &c,
             )
         }
@@ -602,6 +605,8 @@ pub fn dispatch_execute(
                 stores.accounts,
                 stores.exchange_v1,
                 stores.exchange_v2,
+                stores.dyn_props,
+                stores.asset_v1,
                 &c,
             )
         }
@@ -612,6 +617,7 @@ pub fn dispatch_execute(
                 stores.exchange_v1,
                 stores.exchange_v2,
                 stores.dyn_props,
+                stores.asset_v1,
                 &c,
             )
         }

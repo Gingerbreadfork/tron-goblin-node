@@ -835,7 +835,7 @@ fn lookup_asset_balance_final(
     }
 }
 
-fn debit_asset(
+pub(crate) fn debit_asset(
     account: &mut tron_proto::Account,
     dyn_props: &DynamicPropertiesStore,
     v1: &AssetIssueStore,
@@ -881,7 +881,7 @@ fn debit_asset(
     Ok(())
 }
 
-fn credit_asset(
+pub(crate) fn credit_asset(
     account: &mut tron_proto::Account,
     dyn_props: &DynamicPropertiesStore,
     v1: &AssetIssueStore,

@@ -13,7 +13,7 @@
 //! integer (i128) ratio math.
 
 use tron_chainbase::{
-    AccountStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
+    AccountStore, AssetIssueStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
 };
 use tron_proto::{
     Exchange, ExchangeCreateContract, ExchangeInjectContract, ExchangeTransactionContract,
@@ -68,6 +68,7 @@ pub fn execute_exchange_create(
     v1: &ExchangeStore,
     v2: &ExchangeV2Store,
     dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
     contract: &ExchangeCreateContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -81,13 +82,17 @@ pub fn execute_exchange_create(
     dyn_props.burn_trx(fee);
 
     // Debit owner's TRX or asset balance for each side.
-    debit_token(
+    debit_exchange_token(
         &mut account,
+        dyn_props,
+        asset_v1,
         &contract.first_token_id,
         contract.first_token_balance,
     )?;
-    debit_token(
+    debit_exchange_token(
         &mut account,
+        dyn_props,
+        asset_v1,
         &contract.second_token_id,
         contract.second_token_balance,
     )?;
@@ -232,9 +237,9 @@ pub fn validate_exchange_inject(
                 needed: token_quant,
             });
         }
-    } else if !asset_balance_enough_v2(&account, token_id, token_quant) {
+    } else if !exchange_balance_enough(&account, dyn_props,token_id, token_quant) {
         return Err(ActuatorError::InsufficientAssetBalance {
-            has: asset_v2_balance(&account, token_id),
+            has: exchange_token_balance(&account, dyn_props,token_id),
             needs: token_quant,
         });
     }
@@ -246,9 +251,9 @@ pub fn validate_exchange_inject(
                 needed: another_token_quant,
             });
         }
-    } else if !asset_balance_enough_v2(&account, another_id, another_token_quant) {
+    } else if !exchange_balance_enough(&account, dyn_props,another_id, another_token_quant) {
         return Err(ActuatorError::InsufficientAssetBalance {
-            has: asset_v2_balance(&account, another_id),
+            has: exchange_token_balance(&account, dyn_props,another_id),
             needs: another_token_quant,
         });
     }
@@ -260,6 +265,8 @@ pub fn execute_exchange_inject(
     accounts: &AccountStore,
     v1: &ExchangeStore,
     v2: &ExchangeV2Store,
+    dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
     contract: &ExchangeInjectContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -297,8 +304,8 @@ pub fn execute_exchange_inject(
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    debit_token(&mut account, &my_id, contract.quant)?;
-    debit_token(&mut account, &other_id, other_quant)?;
+    debit_exchange_token(&mut account, dyn_props, asset_v1, &my_id, contract.quant)?;
+    debit_exchange_token(&mut account, dyn_props, asset_v1, &other_id, other_quant)?;
     accounts.put(&owner, &account)?;
 
     if contract.token_id == exchange.first_token_id {
@@ -426,6 +433,8 @@ pub fn execute_exchange_withdraw(
     accounts: &AccountStore,
     v1: &ExchangeStore,
     v2: &ExchangeV2Store,
+    dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
     contract: &ExchangeWithdrawContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
@@ -461,8 +470,8 @@ pub fn execute_exchange_withdraw(
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    credit_token(&mut account, &my_id, contract.quant)?;
-    credit_token(&mut account, &other_id, other_quant)?;
+    credit_exchange_token(&mut account, dyn_props, asset_v1, &my_id, contract.quant)?;
+    credit_exchange_token(&mut account, dyn_props, asset_v1, &other_id, other_quant)?;
     accounts.put(&owner, &account)?;
 
     if contract.token_id == exchange.first_token_id {
@@ -569,9 +578,9 @@ pub fn validate_exchange_transaction(
     } else {
         let mut acct = account.clone();
         tron_chainbase::import_all_asset(&mut acct);
-        if !asset_balance_enough_v2(&acct, token_id, token_quant) {
+        if !exchange_balance_enough(&acct, dyn_props, token_id, token_quant) {
             return Err(ActuatorError::InsufficientAssetBalance {
-                has: asset_v2_balance(&acct, token_id),
+                has: exchange_token_balance(&acct, dyn_props, token_id),
                 needs: token_quant,
             });
         }
@@ -625,6 +634,7 @@ pub fn execute_exchange_transaction(
     v1: &ExchangeStore,
     v2: &ExchangeV2Store,
     dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
     contract: &ExchangeTransactionContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let use_strict_math = dyn_props.allow_strict_math();
@@ -673,8 +683,8 @@ pub fn execute_exchange_transaction(
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
-    debit_token(&mut account, &my_id, contract.quant)?;
-    credit_token(&mut account, &other_id, output)?;
+    debit_exchange_token(&mut account, dyn_props, asset_v1, &my_id, contract.quant)?;
+    credit_exchange_token(&mut account, dyn_props, asset_v1, &other_id, output)?;
     accounts.put(&owner, &account)?;
 
     if contract.token_id == exchange.first_token_id {
@@ -734,6 +744,39 @@ fn asset_balance_enough_v2(account: &tron_proto::Account, token_id: &[u8], amoun
 fn asset_v2_balance(account: &tron_proto::Account, token_id: &[u8]) -> i64 {
     let key = String::from_utf8_lossy(token_id).into_owned();
     account.asset_v2.get(&key).copied().unwrap_or(0)
+}
+
+// Flag-aware versions of the two reads above, for the exchange validates. java's
+// `AccountCapsule.assetBalanceEnoughV2` reads the name-keyed V1 `asset` map at
+// `ALLOW_SAME_TOKEN_NAME == 0` (AccountCapsule.java:701-718) and the id-keyed
+// `asset_v2` map at flag=1; the asset_v2-only versions above match only flag=1.
+// Without these, a flag=0 exchange whose trader balance lives in V1 would read 0
+// and be REJECTED while java accepts it — a flag=0 consensus divergence. (`token_id`
+// is the exchange's token id: the token name at flag=0, the numeric id at flag=1.
+// `market` keeps the asset_v2-only `_impl` reads — it is always flag=1.)
+fn exchange_token_balance(
+    account: &tron_proto::Account,
+    dyn_props: &DynamicPropertiesStore,
+    token_id: &[u8],
+) -> i64 {
+    let key = String::from_utf8_lossy(token_id).into_owned();
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
+        account.asset.get(&key).copied().unwrap_or(0)
+    } else {
+        account.asset_v2.get(&key).copied().unwrap_or(0)
+    }
+}
+
+fn exchange_balance_enough(
+    account: &tron_proto::Account,
+    dyn_props: &DynamicPropertiesStore,
+    token_id: &[u8],
+    amount: i64,
+) -> bool {
+    if amount <= 0 {
+        return false;
+    }
+    exchange_token_balance(account, dyn_props, token_id) >= amount
 }
 
 /// Mirrors java `BigDecimal(numer).divide(BigDecimal(denom), 4,
@@ -844,4 +887,54 @@ fn credit_token(
     let slot = account.asset_v2.entry(key).or_insert(0);
     *slot = check_add(*slot, amount)?;
     Ok(())
+}
+
+// The Bancor-exchange actuators mutate a trader's TRC-10 balance; java does it
+// through `reduceAssetAmountV2` / `addAssetAmountV2`, which at
+// `ALLOW_SAME_TOKEN_NAME == 0` write the name-keyed V1 `asset` map AND dual-write
+// the id-keyed `asset_v2` map (and at flag=1 write only `asset_v2` by id). The
+// asset_v2-only `debit_token`/`credit_token` above match only the flag=1 case;
+// these flag-aware variants route the non-TRX branch through the shared
+// `crate::asset` helpers so a flag=0 exchange keeps V1 (the authoritative map
+// pre-activation) correct — and therefore the asset_v2 the rebuild reconstructs
+// from it at activation. (`market` is always flag=1, so it keeps the simpler
+// helpers.) `token_id` is the exchange's token id: the token name at flag=0, the
+// numeric id at flag=1.
+fn debit_exchange_token(
+    account: &mut tron_proto::Account,
+    dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
+    token_id: &[u8],
+    amount: i64,
+) -> Result<(), ActuatorError> {
+    if amount < 0 {
+        return Err(ActuatorError::NonPositiveTokenQuant);
+    }
+    if token_id == TRX_TOKEN_ID {
+        if account.balance < amount {
+            return Err(ActuatorError::InsufficientBalance {
+                balance: account.balance,
+                needed: amount,
+            });
+        }
+        account.balance = check_sub(account.balance, amount)?;
+        return Ok(());
+    }
+    let key = String::from_utf8_lossy(token_id).into_owned();
+    crate::asset::debit_asset(account, dyn_props, asset_v1, &key, amount)
+}
+
+fn credit_exchange_token(
+    account: &mut tron_proto::Account,
+    dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
+    token_id: &[u8],
+    amount: i64,
+) -> Result<(), ActuatorError> {
+    if token_id == TRX_TOKEN_ID {
+        account.balance = check_add(account.balance, amount)?;
+        return Ok(());
+    }
+    let key = String::from_utf8_lossy(token_id).into_owned();
+    crate::asset::credit_asset(account, dyn_props, asset_v1, &key, amount)
 }

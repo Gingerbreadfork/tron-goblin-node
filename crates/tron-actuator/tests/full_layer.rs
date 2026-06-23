@@ -565,8 +565,11 @@ fn exchange_create_round_trip() {
         second_token_id: b"1000001".to_vec(),
         second_token_balance: 500_000_000,
     };
+    // numeric token id + asset_v2 layout => mainnet flag=1
+    dp.put_long(b" ALLOW_SAME_TOKEN_NAME", 1);
+    let av1 = tron_chainbase::AssetIssueStore::new(mem());
     exchange::validate_exchange_create(&accounts, &dp, &c).unwrap();
-    exchange::execute_exchange_create(&accounts, &v1, &v2, &dp, &c).unwrap();
+    exchange::execute_exchange_create(&accounts, &v1, &v2, &dp, &av1, &c).unwrap();
     assert!(v2.get(1).unwrap().is_some());
 }
 

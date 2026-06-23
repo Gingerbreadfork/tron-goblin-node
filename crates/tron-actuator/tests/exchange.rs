@@ -16,7 +16,8 @@ use std::sync::Arc;
 use hex_literal::hex;
 use tron_actuator::{exchange, ActuatorError};
 use tron_chainbase::{
-    AccountStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store, KvBackend, MemBackend,
+    AccountStore, AssetIssueStore, DynamicPropertiesStore, ExchangeStore, ExchangeV2Store,
+    KvBackend, MemBackend,
 };
 use tron_crypto::address::Address;
 use tron_proto::{
@@ -42,6 +43,7 @@ struct Ctx {
     v1: ExchangeStore,
     v2: ExchangeV2Store,
     dp: DynamicPropertiesStore,
+    av1: AssetIssueStore,
 }
 
 fn ctx_with_alice(trx_balance: i64, asset_balance: i64, fee: i64) -> Ctx {
@@ -50,7 +52,10 @@ fn ctx_with_alice(trx_balance: i64, asset_balance: i64, fee: i64) -> Ctx {
         v1: ExchangeStore::new(mem()),
         v2: ExchangeV2Store::new(mem()),
         dp: DynamicPropertiesStore::new(mem()),
+        av1: AssetIssueStore::new(mem()),
     };
+    // These tests use numeric token ids + the asset_v2 layout (mainnet, flag=1).
+    ctx.dp.put_long(b" ALLOW_SAME_TOKEN_NAME", 1);
     ctx.accounts.put(
         &addr(ALICE),
         &Account {
@@ -191,7 +196,7 @@ fn create_execute_assigns_sequential_ids_and_charges_fee() {
         second_token_balance: 500_000_000,
     };
     exchange::validate_exchange_create(&ctx.accounts, &ctx.dp, &c).unwrap();
-    exchange::execute_exchange_create(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    exchange::execute_exchange_create(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c).unwrap();
     // First exchange ID == 1.
     let ex = ctx.v2.get(1).unwrap().expect("exchange exists");
     assert_eq!(ex.first_token_balance, 5_000_000_000);
@@ -210,7 +215,7 @@ fn create_execute_assigns_sequential_ids_and_charges_fee() {
         second_token_balance: 1_000,
     };
     exchange::validate_exchange_create(&ctx.accounts, &ctx.dp, &c2).unwrap();
-    exchange::execute_exchange_create(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c2).unwrap();
+    exchange::execute_exchange_create(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c2).unwrap();
     assert!(ctx.v2.get(2).unwrap().is_some());
 }
 
@@ -300,7 +305,8 @@ fn inject_maintains_pool_ratio_and_debits_both_sides() {
         quant: 100_000_000,
     };
     exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
-    exchange::execute_exchange_inject(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
+    exchange::execute_exchange_inject(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
+        .unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 10_000_000_000 - 100_000_000);
     assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 1_000_000_000 - 10_000_000);
@@ -374,7 +380,8 @@ fn withdraw_returns_both_sides_proportionally() {
         quant: 100_000_000,
     };
     exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
-    exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
+    exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
+        .unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert_eq!(alice.balance, 1_000_000_000 + 100_000_000);
     assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 10_000_000);
@@ -402,7 +409,8 @@ fn withdraw_below_proportional_minimum_returns_zero_other_side_and_errors() {
     exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
     // Execute: 1 * 1e12 / 1 = 1e12 which is < i64::MAX, so credit_token
     // happens; check the result against expectations.
-    exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &c).unwrap();
+    exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
+        .unwrap();
     // Pool: 0 TRX, 0 of asset (just drained).
     let ex = ctx.v2.get(1).unwrap().unwrap();
     assert_eq!(ex.first_token_balance, 0);
@@ -509,7 +517,7 @@ fn transaction_applies_bancor_pricing() {
         expected: 90_000_000, // accept slippage
     };
     exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap();
-    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // First side grew by the swapped 100_000_000; second shrank by the exact
     // Bancor output.
@@ -533,7 +541,7 @@ fn transaction_rejects_output_below_expected_slippage() {
         expected: 99_999_999_999, // wildly optimistic
     };
     let err =
-        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::ExchangeOutputBelowExpected),
         "got: {err:?}"
@@ -635,11 +643,133 @@ fn transaction_with_swap_in_opposite_direction_also_works() {
         expected: 1,
     };
     exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap();
-    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // Asset side grew, TRX side shrank.
     assert_eq!(ex.second_token_balance, 1_100_000_000);
     assert!(ex.first_token_balance < 1_000_000_000);
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
     assert!(alice.balance > 10_000_000_000); // received TRX
+}
+
+// ── flag=0 (ALLOW_SAME_TOKEN_NAME == 0) dual-write regression tests ──────────
+// Pre-activation, a trader's TRC-10 balance lives in the name-keyed V1 `asset`
+// map and the exchange's token id IS the token name. java reads/writes V1 and
+// dual-writes id-keyed `asset_v2`; these guard that the exchange does the same
+// (the validate `.unwrap()` is the read-side guard, the asserts the write-side).
+
+#[test]
+fn flag0_exchange_inject_reads_and_dual_writes_v1() {
+    let accounts = AccountStore::new(mem());
+    let v1 = ExchangeStore::new(mem());
+    let v2 = ExchangeV2Store::new(mem());
+    let dp = DynamicPropertiesStore::new(mem()); // flag=0: ALLOW_SAME_TOKEN_NAME unset
+    let av1 = AssetIssueStore::new(mem());
+    // V1 asset-issue row so token_id_for_name("BTT") -> "1000001".
+    av1.put(
+        b"BTT",
+        &tron_proto::AssetIssueContract {
+            name: b"BTT".to_vec(),
+            id: "1000001".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Alice holds the asset in the AUTHORITATIVE name-keyed V1 map; asset_v2 empty
+    // (proves both the read and the write are flag-aware, not asset_v2-only).
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 10_000_000_000,
+                r#type: AccountType::Normal as i32,
+                asset: BTreeMap::from([("BTT".to_string(), 1_000_000_000)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Exchange keyed by NAME (flag=0 layout): 1e9 TRX : 1e8 BTT.
+    let ex = Exchange {
+        exchange_id: 1,
+        creator_address: ALICE.to_vec(),
+        first_token_id: b"_".to_vec(),
+        first_token_balance: 1_000_000_000,
+        second_token_id: b"BTT".to_vec(),
+        second_token_balance: 100_000_000,
+        ..Default::default()
+    };
+    v1.put(1, &ex).unwrap();
+    v2.put(1, &ex).unwrap();
+    // Inject 1e8 TRX -> proportional 1e7 BTT (ratio 1e8/1e9).
+    let c = ExchangeInjectContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(),
+        quant: 100_000_000,
+    };
+    // READ side: validate must ACCEPT at flag=0 (reads V1). Fails on asset_v2-only code.
+    exchange::validate_exchange_inject(&accounts, &dp, &v2, &c).unwrap();
+    // WRITE side: execute debits the proportional 1e7 BTT.
+    exchange::execute_exchange_inject(&accounts, &v1, &v2, &dp, &av1, &c).unwrap();
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    let expected = 1_000_000_000 - 10_000_000;
+    assert_eq!(*alice.asset.get("BTT").unwrap(), expected, "authoritative V1 asset[name]");
+    assert_eq!(*alice.asset_v2.get("1000001").unwrap(), expected, "dual-written asset_v2[id]");
+}
+
+#[test]
+fn flag0_exchange_transaction_credit_dual_writes_v1() {
+    let accounts = AccountStore::new(mem());
+    let v1 = ExchangeStore::new(mem());
+    let v2 = ExchangeV2Store::new(mem());
+    let dp = DynamicPropertiesStore::new(mem()); // flag=0
+    let av1 = AssetIssueStore::new(mem());
+    av1.put(
+        b"BTT",
+        &tron_proto::AssetIssueContract {
+            name: b"BTT".to_vec(),
+            id: "1000001".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // Alice sells TRX, buys BTT; she already holds some BTT in V1 (credit must ADD).
+    accounts
+        .put(
+            &addr(ALICE),
+            &Account {
+                address: ALICE.to_vec(),
+                balance: 10_000_000_000,
+                r#type: AccountType::Normal as i32,
+                asset: BTreeMap::from([("BTT".to_string(), 5_000_000)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ex = Exchange {
+        exchange_id: 1,
+        creator_address: ALICE.to_vec(),
+        first_token_id: b"_".to_vec(),
+        first_token_balance: 1_000_000_000,
+        second_token_id: b"BTT".to_vec(),
+        second_token_balance: 100_000_000,
+        ..Default::default()
+    };
+    v1.put(1, &ex).unwrap();
+    v2.put(1, &ex).unwrap();
+    let c = ExchangeTransactionContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(), // sell TRX -> buy BTT
+        quant: 100_000_000,
+        expected: 1,
+    };
+    exchange::validate_exchange_transaction(&accounts, &v2, &dp, &c).unwrap();
+    exchange::execute_exchange_transaction(&accounts, &v1, &v2, &dp, &av1, &c).unwrap();
+    let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
+    let v1_bal = *alice.asset.get("BTT").unwrap();
+    let v2_bal = *alice.asset_v2.get("1000001").unwrap();
+    assert!(v1_bal > 5_000_000, "bought BTT credited to authoritative V1 asset[name]");
+    assert_eq!(v1_bal, v2_bal, "V1 and dual-written asset_v2[id] hold the same total");
 }
