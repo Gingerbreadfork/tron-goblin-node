@@ -5805,7 +5805,12 @@ pub fn get_can_delegated_max_size(p: &Value, s: &RpcState) -> Result<Value, RpcE
 }
 
 pub fn get_total_transaction(_p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
-    Ok(json!({ "num": 0_i64 }))
+    // java `Wallet.totalTransaction()` builds NumberMessage{num:0} — the count is
+    // deprecated (TransactionStore.getTotalTransactions returns 0). Serialized to
+    // JSON, protobuf omits the default-0 `num`, so a stock FullNode and TronGrid
+    // return `{}` for the REST endpoint (not `{"num":0}`). The gRPC path returns
+    // the NumberMessage, whose `num` decodes to 0.
+    Ok(json!({}))
 }
 
 /// `getMemoFee` — fee charged for TRX transfers with a non-empty memo
