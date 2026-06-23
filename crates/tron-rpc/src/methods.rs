@@ -39,6 +39,13 @@ impl RpcError {
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self { code: -32600, message: msg.into(), data: None }
     }
+    /// JSON-RPC server-defined error (`-32000`): an execution-level failure that
+    /// is not a revert — out-of-energy, a VM halt, a timeout. Distinct from
+    /// `-32603` "internal error", which the spec reserves for a node-side bug,
+    /// and from `3` (revert). Matches geth's use of `-32000` for these.
+    pub fn server_error(msg: impl Into<String>) -> Self {
+        Self { code: -32000, message: msg.into(), data: None }
+    }
     /// EVM execution revert (`eth_call`/`eth_estimateGas` convention): code `3`,
     /// the raw revert return data in `data` as `0x…`, and — when the data is a
     /// Solidity `Error(string)` — the decoded reason appended to the message, so
@@ -2225,18 +2232,23 @@ pub fn eth_estimate_gas(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let (outcome, _energy_penalty) = dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, req.gas);
     let used = match outcome {
         tron_tvm::execute::VmOutcome::Success { energy_used, .. } => energy_used,
-        tron_tvm::execute::VmOutcome::Revert { energy_used, .. }
-        | tron_tvm::execute::VmOutcome::Halt { energy_used, .. } => {
-            return Err(RpcError::internal(format!(
-                "estimate failed (consumed {energy_used} energy)"
+        // A reverting call returns the eth-standard revert error (code 3 + the
+        // 0x return data in `data`), exactly like eth_call — so clients see the
+        // revert reason rather than a generic "estimate failed".
+        tron_tvm::execute::VmOutcome::Revert { return_data, .. } => {
+            return Err(RpcError::revert(&return_data));
+        }
+        tron_tvm::execute::VmOutcome::Halt { reason, energy_used, .. } => {
+            return Err(RpcError::server_error(format!(
+                "estimate failed: execution halted ({reason}), consumed {energy_used} energy"
             )));
         }
         tron_tvm::execute::VmOutcome::Timeout { deadline_ms, .. } => {
-            return Err(RpcError::internal(format!(
+            return Err(RpcError::server_error(format!(
                 "estimate failed: constant call timed out after {deadline_ms}ms"
             )));
         }
-        _ => return Err(RpcError::internal("estimate failed")),
+        _ => return Err(RpcError::server_error("estimate failed")),
     };
     let padded = used.saturating_add(used / 10); // 10% padding.
     Ok(Value::String(hex_u64(padded.max(21_000))))

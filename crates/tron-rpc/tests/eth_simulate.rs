@@ -188,3 +188,18 @@ fn rejects_unsupported_modes() {
         );
     }
 }
+
+#[test]
+fn eth_estimate_gas_revert_returns_code_3_with_data() {
+    // A contract that always reverts (PUSH1 0; PUSH1 0; REVERT). eth_estimateGas
+    // on a reverting call must return the eth-standard revert error (code 3 with
+    // the return data in `data`), like eth_call — not a generic -32603 internal.
+    let bytecode = vec![0x60, 0x00, 0x60, 0x00, 0xfd];
+    let contract = tron_addr(0x44);
+    let caller = tron_addr(0x11);
+    let s = state_with_contract(contract, bytecode, caller);
+    let p = json!([{ "from": hex_addr(caller), "to": hex_addr(contract), "data": "0x" }]);
+    let err = tron_rpc::methods::eth_estimate_gas(&p, &s).unwrap_err();
+    assert_eq!(err.code, 3, "revert -> eth standard code 3, not -32603 internal");
+    assert_eq!(err.data.as_deref(), Some("0x"), "revert return data surfaced in `data`");
+}
