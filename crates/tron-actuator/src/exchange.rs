@@ -50,6 +50,21 @@ pub fn validate_exchange_create(
             needed: fee,
         });
     }
+    // java ExchangeCreateActuator.validate (lines 44-50): at ALLOW_SAME_TOKEN_NAME
+    // == 1 a non-TRX token id must be a valid numeric token id. The other three
+    // exchange validates already enforce this; create was the omission.
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 1 {
+        if contract.first_token_id.as_slice() != TRX_TOKEN_ID
+            && !is_number(contract.first_token_id.as_slice())
+        {
+            return Err(ActuatorError::Validate("first token id is not a valid number"));
+        }
+        if contract.second_token_id.as_slice() != TRX_TOKEN_ID
+            && !is_number(contract.second_token_id.as_slice())
+        {
+            return Err(ActuatorError::Validate("second token id is not a valid number"));
+        }
+    }
     if contract.first_token_id == contract.second_token_id {
         return Err(ActuatorError::MarketSameTokens);
     }

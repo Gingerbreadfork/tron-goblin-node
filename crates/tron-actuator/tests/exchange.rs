@@ -844,3 +844,30 @@ fn flag0_exchange_create_reads_v1_balance_and_dual_writes() {
         "underfunded create now rejected at validate (java parity)"
     );
 }
+
+#[test]
+fn flag1_exchange_create_rejects_non_numeric_token_id() {
+    // java ExchangeCreateActuator.validate (44-50): at ALLOW_SAME_TOKEN_NAME == 1
+    // a non-TRX token id must be numeric. ctx_with_alice runs at flag=1.
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
+    let bad = ExchangeCreateContract {
+        owner_address: ALICE.to_vec(),
+        first_token_id: b"_".to_vec(),
+        first_token_balance: 5_000_000_000,
+        second_token_id: b"NOTNUM".to_vec(), // non-numeric -> rejected at flag=1
+        second_token_balance: 500_000_000,
+    };
+    assert!(
+        exchange::validate_exchange_create(&ctx.accounts, &ctx.dp, &bad).is_err(),
+        "non-numeric token id rejected at flag=1"
+    );
+    // A numeric id on the happy path is still accepted.
+    let ok = ExchangeCreateContract {
+        owner_address: ALICE.to_vec(),
+        first_token_id: b"_".to_vec(),
+        first_token_balance: 5_000_000_000,
+        second_token_id: b"1000001".to_vec(),
+        second_token_balance: 500_000_000,
+    };
+    exchange::validate_exchange_create(&ctx.accounts, &ctx.dp, &ok).unwrap();
+}
