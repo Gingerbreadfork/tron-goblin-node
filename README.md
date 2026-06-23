@@ -282,6 +282,15 @@ java-tron doesn't have. What works today, by area:
   per-frame energy, and the exact halting op + reason when a call would run
   out — "why it costs X / why it would OOG", which java-tron's bare number
   omits.
+- **Batch transaction simulation** — `eth_simulateV1`, go-ethereum's
+  multi-block simulation API and java-tron's single most-requested missing
+  method, runs sequences of calls across one or more synthetic blocks with
+  optional balance and block (`number` / `time`) overrides, returning each
+  call's status / return data / gas / logs. State **accumulates** across
+  calls and blocks against an overlay that is never committed — as
+  side-effect-free as `eth_call`, never touching canonical state.
+  Unsupported override modes are rejected with an explicit error rather
+  than silently mis-simulated.
 - **Firehose** (`[index.firehose]`) — a durable, append-only stream of
   applied blocks (decoded transfer facts, TRC20 logs, internal txs) with
   explicit `UNWIND` entries for reorgs and crash recovery, tailed over gRPC

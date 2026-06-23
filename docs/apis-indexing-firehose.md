@@ -11,13 +11,14 @@ Default bind: `127.0.0.1:8545`.
 Important config:
 
 - `[rpc] chain_id`: returned by `eth_chainId` and `net_version`.
-- `[rpc] eth_call_gas_cap`: maximum gas for `eth_call` and estimation paths.
+- `[rpc] eth_call_gas_cap`: maximum gas for `eth_call`, `eth_simulateV1`, and
+  estimation paths.
 - `[vm] support_constant`: required for read-only smart-contract calls.
 
 ### Developer and debug methods
 
-Beyond the standard `eth_*` reads, the JSON-RPC surface exposes two
-developer tools java-tron does not provide. Both require
+Beyond the standard `eth_*` reads, the JSON-RPC surface exposes three
+developer tools java-tron does not provide. All three require
 `[vm] support_constant = true` (they re-execute through the TVM).
 
 - **`debug_traceTransaction`** (and `debug_traceBlockByNumber` /
@@ -39,6 +40,71 @@ developer tools java-tron does not provide. Both require
   (top 15), the call-frame tree with per-frame energy, and, if the call
   would fail, the halting opcode and reason. The breakdown is best-effort:
   if the tracer cannot run, the total estimate is still returned.
+- **`eth_simulateV1`**: go-ethereum-style batch simulation. The payload is
+  one or more synthetic blocks, each `{ calls, blockOverrides,
+  stateOverrides }`; every call returns its `status`, `returnData`,
+  `gasUsed`, and `logs`. Unlike `eth_call` (single, stateless), all calls
+  run against **one** in-memory overlay reused across every call and block,
+  so state **accumulates** — a later call sees an earlier call's writes,
+  and block N+1 sees block N's. That overlay is never committed, so this is
+  exactly as side-effect-free as `eth_call`: it never touches canonical
+  state. Supported overrides are `blockOverrides.{number,time}` and
+  `stateOverrides.<addr>.balance`; per-call gas is capped by
+  `[rpc] eth_call_gas_cap`. Modes that would otherwise be mis-simulated are
+  **rejected with an explicit error** rather than silently ignored —
+  `validation`, `traceTransfers`, the `code`/`state`/`stateDiff`/`nonce`
+  state overrides, contract-creation calls (omitted `to`), and non-`latest`
+  base blocks.
+
+#### `eth_simulateV1` example
+
+JSON-RPC is a single `POST /` on the RPC port (`8545` by default). This request
+overrides one address's balance and then runs two calls in one synthetic block,
+so the second call observes the first's writes — the accumulating behaviour
+`eth_call` cannot express. `params` is `[<simulation>, "latest"]`. Addresses may
+be eth `0x…` (20-byte), TRON `41…`, or base58 `T…`; `balance` is in **sun**
+(no wei scaling).
+
+```sh
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+  -d '{
+    "jsonrpc": "2.0", "id": 1, "method": "eth_simulateV1",
+    "params": [
+      { "blockStateCalls": [ {
+          "stateOverrides": {
+            "0x1111111111111111111111111111111111111111": { "balance": "0x3b9aca00" }
+          },
+          "calls": [
+            { "from": "0x1111111111111111111111111111111111111111",
+              "to":   "0x2222222222222222222222222222222222222222", "data": "0x" },
+            { "from": "0x1111111111111111111111111111111111111111",
+              "to":   "0x2222222222222222222222222222222222222222", "data": "0x" }
+          ]
+      } ] },
+      "latest"
+    ]
+  }'
+```
+
+The result is one object per simulated block — the block env it ran under plus a
+`calls` array with one entry per call:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1,
+  "result": [ {
+    "number": "0x...", "timestamp": "0x...", "gasLimit": "0x...",
+    "gasUsed": "0x...", "baseFeePerGas": "0x0",
+    "calls": [
+      { "status": "0x1", "returnData": "0x...", "gasUsed": "0x...", "logs": [] },
+      { "status": "0x1", "returnData": "0x...", "gasUsed": "0x...", "logs": [] }
+    ]
+  } ]
+}
+```
+
+A reverted call instead reports `"status": "0x0"` with an `error` object
+carrying the revert reason.
 
 ## TRON REST Wallet API
 
