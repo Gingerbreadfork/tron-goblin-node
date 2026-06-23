@@ -27,7 +27,7 @@ use alloy_sol_types::{sol, SolCall, SolError, SolEvent};
 use prost::Message;
 use serde_json::{json, Map, Value};
 use tron_proto::TriggerSmartContract;
-use tron_tvm::execute::{VmBlockEnv, VmOutcome};
+use tron_tvm::execute::{VmBlockEnv, VmLog, VmOutcome};
 
 use crate::methods::{build_call_vm_stores, dispatch_constant_trigger, RpcError};
 use crate::state::RpcState;
@@ -498,7 +498,7 @@ fn tron_addr_21(evm: Address) -> Vec<u8> {
 /// the offending op from a bundle, which [`sim_call`]'s flattened `Result` form
 /// can't express.
 enum SimResult {
-    Ok { return_data: Vec<u8>, energy_used: u64 },
+    Ok { return_data: Vec<u8>, energy_used: u64, logs: Vec<VmLog> },
     Revert(Vec<u8>),
     Failed(RpcError),
 }
@@ -533,8 +533,8 @@ fn sim_call_outcome(
     let (outcome, _penalty) =
         dispatch_constant_trigger(s, &vm_stores, block_env, &trigger, s.eth_call_gas_cap);
     match outcome {
-        VmOutcome::Success { return_data, energy_used, .. } => {
-            SimResult::Ok { return_data, energy_used }
+        VmOutcome::Success { return_data, energy_used, logs } => {
+            SimResult::Ok { return_data, energy_used, logs }
         }
         VmOutcome::Revert { return_data, .. } => SimResult::Revert(return_data),
         VmOutcome::Halt { reason, .. } => {
@@ -553,7 +553,7 @@ fn sim_call(
     calldata: Vec<u8>,
 ) -> Result<(Vec<u8>, u64), RpcError> {
     match sim_call_outcome(s, owner, contract, calldata) {
-        SimResult::Ok { return_data, energy_used } => Ok((return_data, energy_used)),
+        SimResult::Ok { return_data, energy_used, .. } => Ok((return_data, energy_used)),
         SimResult::Revert(data) => {
             let reason = decode_failed_op(&data)
                 .unwrap_or_else(|| format!("execution reverted: 0x{}", hex::encode(&data)));
@@ -1045,18 +1045,53 @@ pub fn eth_get_user_operation_receipt(p: &Value, s: &RpcState) -> Result<Value, 
     }))
 }
 
-// Generous gas headroom used when SIMULATING a UserOp for estimation, so
-// validation/execution don't run out before we can measure actual usage.
+// Generous ceilings the gas binary-search starts from; each search narrows to
+// the minimum value at which the op still simulates successfully.
 const SIM_VERIFICATION_GAS: u64 = 3_000_000;
 const SIM_CALL_GAS: u64 = 10_000_000;
-const SIM_PREVERIFICATION_GAS: u64 = 1_000_000;
+/// The gas search stops once its window is this narrow and returns the upper
+/// bound — caps each search at ~log2(ceiling / STEP) simulations.
+const GAS_SEARCH_STEP: u64 = 1_000;
+
+/// Smallest `x` in `[lo, hi]` for which `pred(x)` holds, assuming `pred` is
+/// monotone (false below a threshold, true at/above it) and `pred(hi)` holds.
+/// Narrows to within [`GAS_SEARCH_STEP`] and returns the known-good upper bound.
+fn search_min_gas(mut lo: u64, mut hi: u64, pred: impl Fn(u64) -> bool) -> u64 {
+    while hi - lo > GAS_SEARCH_STEP {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    hi
+}
+
+/// The `success` flag of the `UserOperationEvent` for `hash` among simulation
+/// `logs` (the 2nd ABI word of the event data), or `None` if absent.
+fn user_op_event_success(logs: &[VmLog], hash: &B256) -> Option<bool> {
+    let sig = UserOperationEvent::SIGNATURE_HASH;
+    for log in logs {
+        if log.topics.len() < 2 || log.topics[0] != sig.0 || log.topics[1] != hash.0 {
+            continue;
+        }
+        // data = abi(nonce, success, actualGasCost, actualGasUsed)
+        if log.data.len() < 64 {
+            return Some(false);
+        }
+        return Some(log.data[63] != 0);
+    }
+    None
+}
 
 /// `eth_estimateUserOperationGas(userOp, entryPoint)` — estimate the op's gas
-/// fields by simulating it. Coarse-but-safe heuristic for the MVP: simulate
-/// `handleOps` (with generous limits) for the total, separately simulate the
-/// inner `callData` for the execution share, and split `verificationGasLimit =
-/// total - call`. `preVerificationGas` is a calldata-size formula. Precise
-/// per-phase tracing + binary-search refinement is a follow-up.
+/// fields by binary-searching each limit against `handleOps` simulations: the
+/// smallest `verificationGasLimit` (and `paymasterVerificationGasLimit`) at
+/// which the bundle doesn't revert, and the smallest `callGasLimit` at which the
+/// op's `UserOperationEvent` reports success. `preVerificationGas` is the
+/// calldata-size overhead. A small safety margin is added so a state shift
+/// before inclusion can't push the real cost over the estimate.
 pub fn eth_estimate_user_operation_gas(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(bundler) = &s.bundler else {
         return Err(RpcError::invalid_request(
@@ -1079,40 +1114,97 @@ pub fn eth_estimate_user_operation_gas(p: &Value, s: &RpcState) -> Result<Value,
         )));
     }
     let op = parse_user_op(obj)?;
+    let has_paymaster = op.paymaster.is_some();
 
-    // Simulate handleOps with generous headroom; measure the total energy.
-    let mut sim_op = op.clone();
-    sim_op.verification_gas_limit = U256::from(SIM_VERIFICATION_GAS);
-    sim_op.call_gas_limit = U256::from(SIM_CALL_GAS);
-    sim_op.pre_verification_gas = U256::from(SIM_PREVERIFICATION_GAS);
-    if sim_op.paymaster.is_some() {
-        sim_op.paymaster_verification_gas_limit = U256::from(SIM_VERIFICATION_GAS);
-        sim_op.paymaster_post_op_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+    // userOpHash from the EntryPoint, to match this op's UserOperationEvent in
+    // the simulation logs.
+    let (hash_ret, _) = sim_call(
+        s,
+        bundler.bundler_address.to_vec(),
+        entry_point,
+        getUserOpHashCall { userOp: op.pack() }.abi_encode(),
+    )?;
+    if hash_ret.len() < 32 {
+        return Err(RpcError::internal("EntryPoint.getUserOpHash returned < 32 bytes"));
     }
-    let handle_data =
-        handleOpsCall { ops: vec![sim_op.pack()], beneficiary: bundler.beneficiary }.abi_encode();
-    let (_, total_energy) =
-        sim_call(s, bundler.bundler_address.to_vec(), entry_point, handle_data.clone())?;
+    let user_op_hash = B256::from_slice(&hash_ret[..32]);
 
-    // Execution share: simulate the account's callData from the EntryPoint.
-    // Best-effort — falls back to half the total when the account isn't deployed
-    // yet (initCode) or the bare call reverts outside handleOps' context.
-    let call_energy = sim_call(s, tron_addr_21(entry_point), op.sender, op.call_data.to_vec())
-        .map(|(_, e)| e)
-        .unwrap_or(total_energy / 2);
+    // One handleOps simulation of `op` with the given gas limits (paymaster
+    // post-op kept generous; preVerificationGas left as the caller set it).
+    let sim_with = |vgl: u64, cgl: u64, pm_vgl: u64| -> SimResult {
+        let mut o = op.clone();
+        o.verification_gas_limit = U256::from(vgl);
+        o.call_gas_limit = U256::from(cgl);
+        if has_paymaster {
+            o.paymaster_verification_gas_limit = U256::from(pm_vgl);
+            o.paymaster_post_op_gas_limit = U256::from(SIM_VERIFICATION_GAS);
+        }
+        let data =
+            handleOpsCall { ops: vec![o.pack()], beneficiary: bundler.beneficiary }.abi_encode();
+        sim_call_outcome(s, bundler.bundler_address.to_vec(), entry_point, data)
+    };
+    let not_reverted = |r: &SimResult| matches!(r, SimResult::Ok { .. });
+    let executed_ok = |r: &SimResult| {
+        matches!(r, SimResult::Ok { logs, .. } if user_op_event_success(logs, &user_op_hash) == Some(true))
+    };
 
-    let pad = |e: u64| e + e / 10 + 5_000; // +10% and a 5k floor
-    let call_gas = pad(call_energy);
-    let verification_gas = pad(total_energy.saturating_sub(call_energy));
-    let pre_verification = 21_000u64 + (handle_data.len() as u64) * 8;
-    let (pm_ver, pm_post) =
-        if op.paymaster.is_some() { (pad(verification_gas / 2), 20_000u64) } else { (0, 0) };
+    // Probe at generous limits: a revert means validation fails outright (bad
+    // signature / nonce / prefund) — surface why; a non-success at generous gas
+    // means execution reverts for a non-gas reason. Either way, can't estimate.
+    let probe = sim_with(SIM_VERIFICATION_GAS, SIM_CALL_GAS, SIM_VERIFICATION_GAS);
+    match &probe {
+        SimResult::Revert(data) => {
+            let reason =
+                decode_failed_op(data).unwrap_or_else(|| format!("0x{}", hex::encode(data)));
+            return Err(RpcError::invalid_request(reason));
+        }
+        SimResult::Failed(e) => return Err(RpcError::internal(e.message.clone())),
+        SimResult::Ok { logs, .. } => {
+            if user_op_event_success(logs, &user_op_hash) != Some(true) {
+                return Err(RpcError::invalid_request(
+                    "UserOperation execution reverts even at generous gas — not a gas-limit issue",
+                ));
+            }
+        }
+    }
+
+    // verificationGasLimit: least account-verification gas the bundle tolerates.
+    let verification_gas = search_min_gas(0, SIM_VERIFICATION_GAS, |v| {
+        not_reverted(&sim_with(v, SIM_CALL_GAS, SIM_VERIFICATION_GAS))
+    });
+    // paymasterVerificationGasLimit, when a paymaster is set.
+    let pm_verification_gas = if has_paymaster {
+        search_min_gas(0, SIM_VERIFICATION_GAS, |pv| {
+            not_reverted(&sim_with(verification_gas, SIM_CALL_GAS, pv))
+        })
+    } else {
+        0
+    };
+    // callGasLimit: least execution gas at which the op succeeds, holding the
+    // verification limits found above.
+    let call_gas = search_min_gas(0, SIM_CALL_GAS, |c| {
+        executed_ok(&sim_with(verification_gas, c, pm_verification_gas))
+    });
+
+    // +12.5% margin against pre-inclusion state drift.
+    let pad = |g: u64| g + g / 8;
+    let packed_len = handleOpsCall { ops: vec![op.pack()], beneficiary: bundler.beneficiary }
+        .abi_encode()
+        .len() as u64;
+    let pre_verification = 21_000u64 + packed_len * 8;
+    // postOp: honour the op's own limit when set, else a conservative floor (the
+    // EntryPoint requires a non-zero postOp budget whenever a paymaster is used).
+    let pm_post = if has_paymaster {
+        (u256_to_usize(op.paymaster_post_op_gas_limit).unwrap_or(0) as u64).max(40_000)
+    } else {
+        0
+    };
 
     Ok(json!({
         "preVerificationGas": format!("0x{pre_verification:x}"),
-        "verificationGasLimit": format!("0x{verification_gas:x}"),
-        "callGasLimit": format!("0x{call_gas:x}"),
-        "paymasterVerificationGasLimit": format!("0x{pm_ver:x}"),
+        "verificationGasLimit": format!("0x{:x}", pad(verification_gas)),
+        "callGasLimit": format!("0x{:x}", pad(call_gas)),
+        "paymasterVerificationGasLimit": format!("0x{:x}", pad(pm_verification_gas)),
         "paymasterPostOpGasLimit": format!("0x{pm_post:x}"),
     }))
 }
@@ -1511,5 +1603,41 @@ mod tests {
         assert!(arr[0]["transactionHash"].is_null());
         assert_eq!(arr[0]["dropped"].as_array().unwrap().len(), 1);
         assert!(bundler.mempool.lock().unwrap().is_empty(), "mempool drained");
+    }
+
+    #[test]
+    fn search_min_gas_finds_threshold() {
+        // pred turns true at/above 50_000; result is the upper bound within STEP.
+        let r = search_min_gas(0, 10_000_000, |x| x >= 50_000);
+        assert!(r >= 50_000 && r <= 50_000 + GAS_SEARCH_STEP, "got {r}");
+        // true everywhere -> converges at the low end
+        assert!(search_min_gas(0, 1_000_000, |_| true) <= GAS_SEARCH_STEP);
+    }
+
+    #[test]
+    fn user_op_event_success_decodes() {
+        let hash = B256::repeat_byte(0xab);
+        let sig = UserOperationEvent::SIGNATURE_HASH;
+        // data = nonce(32) ++ success(32) ++ cost(32) ++ used(32)
+        let mut ok_data = vec![0u8; 128];
+        ok_data[63] = 1; // success word, low byte
+        let ok = VmLog {
+            address: [0u8; 20],
+            topics: vec![sig.0, hash.0, [0u8; 32], [0u8; 32]],
+            data: ok_data,
+        };
+        assert_eq!(user_op_event_success(&[ok], &hash), Some(true));
+        // success word zero -> false
+        let failed = VmLog { address: [0u8; 20], topics: vec![sig.0, hash.0], data: vec![0u8; 128] };
+        assert_eq!(user_op_event_success(&[failed], &hash), Some(false));
+        // different userOpHash in topic[1] -> not this op's event
+        let other = VmLog {
+            address: [0u8; 20],
+            topics: vec![sig.0, B256::repeat_byte(1).0],
+            data: vec![0u8; 128],
+        };
+        assert_eq!(user_op_event_success(&[other], &hash), None);
+        // no logs at all -> None
+        assert_eq!(user_op_event_success(&[], &hash), None);
     }
 }

@@ -204,8 +204,10 @@ transactions itself.
   matches whatever EntryPoint version is deployed).
 - **`eth_estimateUserOperationGas(userOp, entryPoint)`** →
   `{preVerificationGas, verificationGasLimit, callGasLimit,
-  paymasterVerificationGasLimit, paymasterPostOpGasLimit}` (heuristic estimate
-  via simulation).
+  paymasterVerificationGasLimit, paymasterPostOpGasLimit}`. Each limit is
+  binary-searched against `handleOps` simulations (the least value at which the
+  bundle doesn't revert / the op's `UserOperationEvent` reports success), with a
+  small safety margin — not a heuristic.
 - **`eth_getUserOperationByHash(hash)`** → the op + its on-chain location, or `null`.
 - **`eth_getUserOperationReceipt(hash)`** → success + actual gas (from the
   `UserOperationEvent`) + the inner tx receipt, or `null` until mined.
