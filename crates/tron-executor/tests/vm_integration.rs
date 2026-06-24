@@ -356,6 +356,11 @@ fn block_recorded_out_of_time_discards_vm_state_but_charges_energy() {
 #[test]
 fn executor_top_level_calltoken_trigger_runs_with_trc10_transfer() {
     let state = build_state();
+    // Post-#15 (ALLOW_TVM_TRANSFER_TRC10): a top-level CALLTOKEN actually
+    // transfers the TRC-10 amount. Pre-#15 the token fields are ignored (no
+    // transfer) — that gate is verified by the tron-tvm CALLTOKEN unit tests.
+    tron_chainbase::DynamicPropertiesStore::new(state.dyn_props.clone())
+        .put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
     let (caller_priv, caller_bytes) = caller_keypair(0xa2);
     let contract_bytes = addr_with_byte(0xc2);
 

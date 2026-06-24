@@ -114,9 +114,10 @@ pub fn execute_exchange_create(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let fee = dyn_props.get_long(b"EXCHANGE_CREATE_FEE").unwrap_or(1_024_000_000);
     account.balance = check_sub(account.balance, fee)?;
-    // java ExchangeCreateActuator: burn the fee after debiting the owner
-    // (supportBlackHoleOptimization → burnTrx) to keep BURN_TRX_AMOUNT in sync.
-    dyn_props.burn_trx(fee);
+    // java ExchangeCreateActuator: dispose the fee after debiting the owner —
+    // burnTrx once supportBlackHoleOptimization is on, else credit the blackhole
+    // account (the from-genesis arm).
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
 
     // Debit owner's TRX or asset balance for each side.
     debit_exchange_token(
@@ -148,8 +149,7 @@ pub fn execute_exchange_create(
         second_token_id: contract.second_token_id.clone(),
         second_token_balance: contract.second_token_balance,
     };
-    v1.put(next_id, &exchange)?;
-    v2.put(next_id, &exchange)?;
+    put_exchange_final(v1, v2, dyn_props, asset_v1, &exchange)?;
     dyn_props.put_long(
         tron_chainbase::dynamic_properties_keys::LATEST_EXCHANGE_NUM,
         next_id,
@@ -175,6 +175,7 @@ pub fn execute_exchange_create(
 pub fn validate_exchange_inject(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    v1: &ExchangeStore,
     v2: &ExchangeV2Store,
     contract: &ExchangeInjectContract,
 ) -> Result<(), ActuatorError> {
@@ -188,9 +189,7 @@ pub fn validate_exchange_inject(
     // getAssetMapV2 reports (the transfer path does the same).
     tron_chainbase::import_all_asset(&mut account);
     // calcFee() == 0 for exchange inject; the fee balance check is a no-op.
-    let exchange = v2
-        .get(contract.exchange_id)?
-        .ok_or(ActuatorError::ExchangeMissing)?;
+    let exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
     if exchange.creator_address != owner.as_bytes() {
         return Err(ActuatorError::NotExchangeOwner);
     }
@@ -307,9 +306,9 @@ pub fn execute_exchange_inject(
     contract: &ExchangeInjectContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
-    let mut exchange = v2
-        .get(contract.exchange_id)?
-        .ok_or(ActuatorError::ExchangeMissing)?;
+    // java reads the authoritative store: V1 (name-bearing ids) at flag=0,
+    // V2 (numeric ids) at flag=1 — `Commons.getExchangeStoreFinal`.
+    let mut exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
 
     let (my_balance, my_id, other_balance, other_id) =
         if contract.token_id == exchange.first_token_id {
@@ -352,8 +351,7 @@ pub fn execute_exchange_inject(
         exchange.second_token_balance = check_add(exchange.second_token_balance, contract.quant)?;
         exchange.first_token_balance = check_add(exchange.first_token_balance, other_quant)?;
     }
-    v1.put(exchange.exchange_id, &exchange)?;
-    v2.put(exchange.exchange_id, &exchange)?;
+    put_exchange_final(v1, v2, dyn_props, asset_v1, &exchange)?;
 
     // java `ExchangeInjectActuator.execute` sets
     // `ret.setExchangeInjectAnotherAmount(anotherTokenQuant)`
@@ -376,6 +374,7 @@ pub fn execute_exchange_inject(
 pub fn validate_exchange_withdraw(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
+    v1: &ExchangeStore,
     v2: &ExchangeV2Store,
     contract: &ExchangeWithdrawContract,
 ) -> Result<(), ActuatorError> {
@@ -385,9 +384,7 @@ pub fn validate_exchange_withdraw(
         return Err(ActuatorError::OwnerAccountMissing);
     }
     // calcFee() == 0 for exchange withdraw; the fee balance check is a no-op.
-    let exchange = v2
-        .get(contract.exchange_id)?
-        .ok_or(ActuatorError::ExchangeMissing)?;
+    let exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
     if exchange.creator_address != owner.as_bytes() {
         return Err(ActuatorError::NotExchangeOwner);
     }
@@ -475,9 +472,7 @@ pub fn execute_exchange_withdraw(
     contract: &ExchangeWithdrawContract,
 ) -> Result<ExecutionResult, ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
-    let mut exchange = v2
-        .get(contract.exchange_id)?
-        .ok_or(ActuatorError::ExchangeMissing)?;
+    let mut exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
 
     let (my_balance, my_id, other_balance, other_id) =
         if contract.token_id == exchange.first_token_id {
@@ -518,8 +513,7 @@ pub fn execute_exchange_withdraw(
         exchange.second_token_balance = check_sub(exchange.second_token_balance, contract.quant)?;
         exchange.first_token_balance = check_sub(exchange.first_token_balance, other_quant)?;
     }
-    v1.put(exchange.exchange_id, &exchange)?;
-    v2.put(exchange.exchange_id, &exchange)?;
+    put_exchange_final(v1, v2, dyn_props, asset_v1, &exchange)?;
 
     // java `ExchangeWithdrawActuator.execute` sets
     // `ret.setExchangeWithdrawAnotherAmount(anotherTokenQuant)`
@@ -541,6 +535,7 @@ pub fn execute_exchange_withdraw(
 
 pub fn validate_exchange_transaction(
     accounts: &AccountStore,
+    v1: &ExchangeStore,
     v2: &ExchangeV2Store,
     dyn_props: &DynamicPropertiesStore,
     contract: &ExchangeTransactionContract,
@@ -556,9 +551,7 @@ pub fn validate_exchange_transaction(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
 
-    let exchange = v2
-        .get(contract.exchange_id)?
-        .ok_or(ActuatorError::ExchangeMissing)?;
+    let exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
 
     let token_id = &contract.token_id;
     let token_quant = contract.quant;
@@ -676,9 +669,7 @@ pub fn execute_exchange_transaction(
 ) -> Result<ExecutionResult, ActuatorError> {
     let use_strict_math = dyn_props.allow_strict_math();
     let owner = require_owner(&contract.owner_address)?;
-    let mut exchange = v2
-        .get(contract.exchange_id)?
-        .ok_or(ActuatorError::ExchangeMissing)?;
+    let mut exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
 
     let (my_balance_before, my_id, other_balance_before, other_id) =
         if contract.token_id == exchange.first_token_id {
@@ -731,8 +722,7 @@ pub fn execute_exchange_transaction(
         exchange.second_token_balance = check_add(exchange.second_token_balance, contract.quant)?;
         exchange.first_token_balance = check_sub(exchange.first_token_balance, output)?;
     }
-    v1.put(exchange.exchange_id, &exchange)?;
-    v2.put(exchange.exchange_id, &exchange)?;
+    put_exchange_final(v1, v2, dyn_props, asset_v1, &exchange)?;
 
     // java `ExchangeTransactionActuator.execute` sets
     // `ret.setExchangeReceivedAmount(anotherTokenQuant)`
@@ -751,6 +741,79 @@ pub fn execute_exchange_transaction(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Build the V2-store copy of an exchange capsule, mirroring java
+/// `Commons.putExchangeCapsule` + `ExchangeCapsule.resetTokenWithID`. At
+/// `ALLOW_SAME_TOKEN_NAME == 0` java's V1 store holds the name-bearing token ids
+/// while its V2 store holds the *numeric* token ids (each non-TRX name resolved
+/// via `assetIssueStore.get(name).getId()`), so that the V2 view is already
+/// correct for the eventual flag flip. At flag == 1 the capsule already carries
+/// numeric ids, so the V2 copy is identical to the V1 copy. Pre-activation
+/// exchanges created/updated by a from-genesis sync would otherwise store
+/// name-bearing ids in V2, which java never does — diverging post-activation
+/// when reads switch to V2 and `token_id` comparisons no longer match.
+fn exchange_v2_copy(
+    exchange: &Exchange,
+    dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
+) -> Result<Exchange, ActuatorError> {
+    if dyn_props.allow_same_token_name().unwrap_or(0) != 0 {
+        return Ok(exchange.clone());
+    }
+    let reset = |token_id: &[u8]| -> Result<Vec<u8>, ActuatorError> {
+        if token_id == TRX_TOKEN_ID {
+            return Ok(token_id.to_vec());
+        }
+        let name = String::from_utf8_lossy(token_id);
+        match crate::asset::token_id_for_name(asset_v1, &name)? {
+            Some(id) => Ok(id.into_bytes()),
+            None => Ok(token_id.to_vec()),
+        }
+    };
+    let mut v2 = exchange.clone();
+    v2.first_token_id = reset(&exchange.first_token_id)?;
+    v2.second_token_id = reset(&exchange.second_token_id)?;
+    Ok(v2)
+}
+
+/// Read an exchange capsule from the authoritative store, mirroring java
+/// `Commons.getExchangeStoreFinal`: the V1 `ExchangeStore` (name-bearing token
+/// ids) at `ALLOW_SAME_TOKEN_NAME == 0`, the V2 `ExchangeV2Store` (numeric token
+/// ids) at flag == 1. Selecting the right store is essential at flag == 0: the
+/// contract's `token_id` is the token *name* there, so it must be compared
+/// against the V1 capsule's name-bearing ids — reading V2 (numeric ids) would
+/// fail the `token_id in exchange` comparison and wrongly reject.
+fn read_exchange_final(
+    v1: &ExchangeStore,
+    v2: &ExchangeV2Store,
+    dyn_props: &DynamicPropertiesStore,
+    exchange_id: i64,
+) -> Result<Exchange, ActuatorError> {
+    let row = if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
+        v1.get(exchange_id)?
+    } else {
+        v2.get(exchange_id)?
+    };
+    row.ok_or(ActuatorError::ExchangeMissing)
+}
+
+/// Persist an exchange capsule to both stores, mirroring java
+/// `Commons.putExchangeCapsule`: at flag == 0 write the name-bearing capsule to
+/// V1 and the `resetTokenWithID` (numeric-id) copy to V2; at flag == 1 java
+/// writes only V2 (V1 untouched), which a numeric-id capsule satisfies for both.
+fn put_exchange_final(
+    v1: &ExchangeStore,
+    v2: &ExchangeV2Store,
+    dyn_props: &DynamicPropertiesStore,
+    asset_v1: &AssetIssueStore,
+    exchange: &Exchange,
+) -> Result<(), ActuatorError> {
+    if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
+        v1.put(exchange.exchange_id, exchange)?;
+    }
+    v2.put(exchange.exchange_id, &exchange_v2_copy(exchange, dyn_props, asset_v1)?)?;
+    Ok(())
+}
 
 /// Mirrors java `TransactionUtil.isNumber`: a non-empty id whose bytes are all
 /// ASCII digits, with no leading zero when the id has more than one digit.

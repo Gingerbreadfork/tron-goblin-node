@@ -146,6 +146,21 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
         context.interpreter.gas.reservoir(),
     );
     create_inputs.set_tron_contract_version(context.interpreter.input.tron_contract_version());
+    // TRON fork: pre-`ALLOW_TVM_ISTANBUL` (#41), CREATE2 derives the new
+    // address from the CALLER of the executing frame, not the executing
+    // contract — java `Program.createContract2`:
+    // `senderAddress = allowTvmIstanbul() ? getContextAddress() : getCallerAddress()`.
+    // Only the address changes (value/nonce stay on the caller field). CREATE2
+    // exists only from Constantinople, so the affected window is #26..#41.
+    if matches!(create_inputs.scheme(), CreateScheme::Create2 { .. })
+        && !context
+            .interpreter
+            .runtime_flag
+            .spec_id()
+            .is_enabled_in(SpecId::ISTANBUL)
+    {
+        create_inputs.set_tron_create2_sender(Some(context.interpreter.input.caller_address()));
+    }
     context
         .interpreter
         .bytecode

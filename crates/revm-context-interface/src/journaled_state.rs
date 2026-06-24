@@ -145,6 +145,21 @@ pub trait JournalTr {
         false
     }
 
+    /// TRON fork: should SELFDESTRUCT charge the dead-beneficiary `NEW_ACCT_CALL`
+    /// (25000) energy top-up? java adds it only from `ALLOW_ENERGY_ADJUSTMENT`
+    /// (#81); pre-#81 there is no top-up. Default `true` preserves upstream
+    /// (always-charge) behavior for journals that don't carry the override.
+    fn tron_allow_energy_adjustment_effective(&self) -> bool {
+        true
+    }
+
+    /// TRON fork: the full 256-bit value the `CHAINID` opcode must push when set
+    /// (the genesis block id, full 32 bytes pre-#60/#71, truncated after). `None`
+    /// → fall back to the `CfgEnv` chain id. See `tron_chain_id_word` cfg field.
+    fn tron_chain_id_word(&self) -> Option<U256> {
+        None
+    }
+
     /// TRON fork: was `address` created in the current transaction?
     fn tron_account_created_locally(&self, _address: Address) -> bool {
         false
@@ -165,14 +180,19 @@ pub trait JournalTr {
     }
 
     /// TRON fork: set the journal's SELFDESTRUCT overrides (restriction
-    /// gate + burn-account redirect). Default no-op for journals that
-    /// don't carry the TRON cfg.
+    /// gate + burn-account redirect + the #81 energy-adjustment top-up gate).
+    /// Default no-op for journals that don't carry the TRON cfg.
     fn set_tron_selfdestruct_overrides(
         &mut self,
         _restriction: Option<bool>,
         _blackhole: Option<Address>,
+        _energy_adjustment: Option<bool>,
     ) {
     }
+
+    /// TRON fork: set the full 256-bit `CHAINID` value (see
+    /// [`Self::tron_chain_id_word`]). Default no-op.
+    fn set_tron_chain_id_word(&mut self, _word: Option<U256>) {}
 
     /// Sets EIP-7708 configuration flags.
     ///

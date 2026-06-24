@@ -84,3 +84,56 @@ pub fn apply_default_account_permissions(account: &mut Account, dyn_props: &Dyna
         account.active_permission = actives;
     }
 }
+
+/// java `AccountCapsule.setDefaultWitnessPermission` (AccountCapsule.java:304-316),
+/// called by `WitnessCreateActuator.createWitness` ONLY when `ALLOW_MULTI_SIGN`
+/// (proposal #18) is on. Attaches a default witness permission (id=1) and, when
+/// the account lacks them, a default owner (id=0) / active (id=2) permission.
+/// No-op pre-activation, so a from-genesis sync serializes early witness
+/// accounts without permission rows exactly as java does; post-activation it
+/// reproduces java's serialized witness account byte-for-byte. The owner/active
+/// rows are added only when absent (java `if (!hasOwnerPermission)` /
+/// `if (getActivePermissionCount()==0)`), so a pre-existing permission table is
+/// not clobbered. The account's `address` must already be set.
+pub fn set_default_witness_permission(account: &mut Account, dyn_props: &DynamicPropertiesStore) {
+    if dyn_props.get_long(b"ALLOW_MULTI_SIGN").unwrap_or(0) != 1 {
+        return;
+    }
+    let key = Key {
+        address: account.address.clone(),
+        weight: 1,
+    };
+    if account.owner_permission.is_none() {
+        account.owner_permission = Some(Permission {
+            r#type: PermissionType::Owner as i32,
+            id: 0,
+            permission_name: "owner".to_string(),
+            threshold: 1,
+            parent_id: 0,
+            operations: Vec::new(),
+            keys: vec![key.clone()],
+        });
+    }
+    if account.active_permission.is_empty() {
+        account.active_permission.push(Permission {
+            r#type: PermissionType::Active as i32,
+            id: 2,
+            permission_name: "active".to_string(),
+            threshold: 1,
+            parent_id: 0,
+            operations: dyn_props
+                .get_bytes(b"ACTIVE_DEFAULT_OPERATIONS")
+                .unwrap_or_else(default_active_operations),
+            keys: vec![key.clone()],
+        });
+    }
+    account.witness_permission = Some(Permission {
+        r#type: PermissionType::Witness as i32,
+        id: 1,
+        permission_name: "witness".to_string(),
+        threshold: 1,
+        parent_id: 0,
+        operations: Vec::new(),
+        keys: vec![key],
+    });
+}

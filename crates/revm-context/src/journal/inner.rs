@@ -46,12 +46,25 @@ pub struct JournalCfg {
     /// the Cancun opcode spec (which TRON activates separately for
     /// TLOAD/TSTORE/MCOPY). `None` keeps upstream behavior.
     pub tron_selfdestruct_restriction: Option<bool>,
+    /// TRON fork: when `Some`, overrides whether SELFDESTRUCT charges the
+    /// dead-beneficiary `NEW_ACCT_CALL` (25000) energy top-up — java adds it
+    /// only once `ALLOW_ENERGY_ADJUSTMENT` (#81) is active (`getSuicideCost2` /
+    /// `getSuicideCost3`); pre-#81 there is no top-up. `None` keeps upstream
+    /// (always-charge) behavior for non-TRON execution.
+    pub tron_allow_energy_adjustment: Option<bool>,
     /// TRON fork: when `Some`, a destroying SELFDESTRUCT whose
     /// beneficiary is the contract itself credits this address (TRON's
     /// black-hole / burn account) instead of silently zeroing the
     /// balance -- java-tron `Program.suicide` under
     /// `allowTvmTransferTrc10`. `None` keeps upstream burn-by-zeroing.
     pub tron_blackhole: Option<Address>,
+    /// TRON fork: when `Some`, the full 256-bit value the `CHAINID` opcode must
+    /// push. java `Program.getChainId` returns the genesis block id truncated to
+    /// its last 4 bytes once `ALLOW_TVM_COMPATIBLE_EVM` (#60) or
+    /// `ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID` (#71) is active, but the FULL
+    /// 32-byte genesis id in the Istanbul(#41)..#60 window. `None` falls back to
+    /// the `CfgEnv` `chain_id` (upstream EVM behavior).
+    pub tron_chain_id_word: Option<U256>,
     /// Whether EIP-7708 (ETH transfers emit logs) is disabled.
     pub eip7708_disabled: bool,
     /// Whether EIP-7708 delayed burn logging is disabled.

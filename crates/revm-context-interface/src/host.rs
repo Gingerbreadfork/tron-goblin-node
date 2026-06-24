@@ -238,6 +238,25 @@ pub trait Host {
         false
     }
 
+    #[inline]
+    /// TRON fork: should SELFDESTRUCT charge the dead-beneficiary `NEW_ACCT_CALL`
+    /// (25000) energy top-up? Gated on `ALLOW_ENERGY_ADJUSTMENT` (#81): java's
+    /// `getSuicideCost` has no top-up pre-#81, `getSuicideCost2`/`3` add it
+    /// after. Default `true` preserves upstream (always-charge) behavior.
+    fn tron_allow_energy_adjustment(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    /// TRON fork: the value the `CHAINID` opcode pushes. java `Program.getChainId`
+    /// returns the genesis block id truncated to its last 4 bytes once
+    /// `ALLOW_TVM_COMPATIBLE_EVM` (#60) / `ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID`
+    /// (#71) is active, but the FULL 32-byte genesis id in the Istanbul..#60
+    /// window. Defaults to the standard `chain_id()` for non-TRON hosts.
+    fn tron_chain_id_word(&self) -> U256 {
+        self.chain_id()
+    }
+
     /// TRON fork: was `address` created in the CURRENT transaction
     /// (java-tron `Repository.isNewContract`)? Used by the SELFDESTRUCT
     /// restriction to decide destroy-vs-transfer.

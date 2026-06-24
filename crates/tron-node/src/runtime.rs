@@ -3304,6 +3304,35 @@ fn seed_committee_initial_values(
         b"DYNAMIC_ENERGY_MAX_FACTOR",
         cfg.dynamic_energy_max_factor,
     );
+
+    // java `DynamicPropertiesStore.init()` seeds the global energy resource pool
+    // at genesis (chainbase DynamicPropertiesStore.java:455/736/742). A fresh
+    // chain MUST start with a non-zero limit: otherwise `total_energy_limit()`
+    // reads 0, every account's frozen-energy quota computes to 0, and every
+    // contract tx wrongly pays the full energy fee instead of drawing its quota
+    // — a silent state divergence vs java from the block the VM goes live. The
+    // 83M snapshot import already carries the live values, so this fresh-genesis
+    // path is the only place we seed them. TARGET = limit/14400 (init():742).
+    dp.save_total_energy_limit(50_000_000_000);
+    dp.save_total_energy_current_limit(50_000_000_000);
+    dp.save_total_energy_target_limit(50_000_000_000 / 14_400);
+
+    // java `init()` also seeds the contract-type / default-active-operations
+    // bitmaps (DynamicPropertiesStore.java:661-675). These EVOLVE as proposals
+    // activate — `addSystemContractAndSetPermission(id)` OR-sets bit `id` in BOTH
+    // bitmaps for each newly-enabled contract type (see proposals.rs). Without
+    // the genesis seed + the evolution, every account auto-created in the
+    // from-genesis window is serialized with the wrong ACTIVE_DEFAULT_OPERATIONS
+    // (the modern value instead of the era-appropriate one), forking the state
+    // root once ALLOW_MULTI_SIGN activates. 32-byte values, java-exact:
+    // AVAILABLE = 7fff1fc0037e0000…, ACTIVE = 7fff1fc0033e0000… (rest zero).
+    let mut available_contract_type = [0u8; 32];
+    available_contract_type[..6].copy_from_slice(&[0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x7e]);
+    dp.put_bytes(b"AVAILABLE_CONTRACT_TYPE", &available_contract_type);
+    let mut active_default_operations = [0u8; 32];
+    active_default_operations[..6].copy_from_slice(&[0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x3e]);
+    dp.put_bytes(b"ACTIVE_DEFAULT_OPERATIONS", &active_default_operations);
+
     info!("🏛 seeded committee.* governance flags into DynamicPropertiesStore");
 }
 

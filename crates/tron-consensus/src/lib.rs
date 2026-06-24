@@ -52,9 +52,9 @@ pub use pbft::{
     recover_signer, sign_pbft_raw, BlockVoteTally, PbftVoteTally,
 };
 pub use maintenance::{
-    apply_maintenance, compute_next_maintenance_time, is_maintenance_boundary,
-    rebuild_asset_v2_from_v1, update_active_witnesses, MaintenanceOutcome, MaintenanceReport,
-    DEFAULT_MAINTENANCE_INTERVAL_MS,
+    apply_maintenance, bytestring_hash_code, compute_next_maintenance_time,
+    is_maintenance_boundary, rebuild_asset_v2_from_v1, update_active_witnesses, MaintenanceOutcome,
+    MaintenanceReport, DEFAULT_MAINTENANCE_INTERVAL_MS,
 };
 pub use slot::{
     ab_slot, scheduled_witness, scheduled_witness_index, slot_from_head, slot_time_ms,

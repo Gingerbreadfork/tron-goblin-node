@@ -320,6 +320,47 @@ fn restriction_suicide_absent_heir_charges_new_acct_topup() {
     );
 }
 
+/// VM-4 / #81 isolation: with the SELFDESTRUCT restriction (#94) OFF, the
+/// dead-beneficiary NEW_ACCT_CALL (25000) top-up is gated SOLELY on
+/// `ALLOW_ENERGY_ADJUSTMENT` (#81). java `getSuicideCost` (pre-#81) charges no
+/// top-up; `getSuicideCost2` (#81) adds 25000 for a dead heir. The SUICIDE base
+/// is 0 without the restriction (no SUICIDE_V2 = 5000).
+#[test]
+fn absent_heir_topup_gated_on_energy_adjustment_without_restriction() {
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xac);
+    let heir = tron_addr(0xad); // never installed → dead account
+
+    // #81 ON: PUSH20 (3) + SUICIDE (0) + NEW_ACCT_CALL (25000).
+    let stores = fresh_stores(false);
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_ENERGY_ADJUSTMENT", 1);
+    install_caller(&stores, caller, 1_000_000);
+    install_contract(&stores, contract, suicide_bytecode(heir), 0);
+    let out = run(&stores, caller, contract);
+    let VmOutcome::Success { energy_used, .. } = out else {
+        panic!("expected success, got {out:?}");
+    };
+    assert_eq!(
+        energy_used, 25003,
+        "#81 on, restriction off: PUSH20 (3) + NEW_ACCT_CALL (25000)"
+    );
+
+    // #81 OFF (pre-#81): no top-up — PUSH20 (3) + SUICIDE (0) only.
+    let stores0 = fresh_stores(false);
+    install_caller(&stores0, caller, 1_000_000);
+    install_contract(&stores0, contract, suicide_bytecode(heir), 0);
+    let out0 = run(&stores0, caller, contract);
+    let VmOutcome::Success { energy_used, .. } = out0 else {
+        panic!("expected success, got {out0:?}");
+    };
+    assert_eq!(
+        energy_used, 3,
+        "pre-#81: no NEW_ACCT_CALL top-up for a dead beneficiary"
+    );
+}
+
 /// The GasFree-withdrawal shape (mainnet block 83,324,067, tx 73b9ba50…):
 /// an `asset_optimized` deposit shell whose TRC-10 holdings live ONLY in the
 /// separate account-asset store (empty inline `asset_v2`) SELFDESTRUCTs with a

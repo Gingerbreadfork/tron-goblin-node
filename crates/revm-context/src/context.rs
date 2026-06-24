@@ -720,6 +720,16 @@ impl<
         self.journaled_state.tron_selfdestruct_restriction_effective()
     }
 
+    fn tron_allow_energy_adjustment(&self) -> bool {
+        self.journaled_state.tron_allow_energy_adjustment_effective()
+    }
+
+    fn tron_chain_id_word(&self) -> U256 {
+        self.journaled_state
+            .tron_chain_id_word()
+            .unwrap_or_else(|| self.chain_id())
+    }
+
     fn tron_account_created_locally(&self, address: Address) -> bool {
         self.journaled_state.tron_account_created_locally(address)
     }

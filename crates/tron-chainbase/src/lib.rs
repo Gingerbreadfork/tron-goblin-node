@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod blockstm;
 pub mod checkpoint_v2;
+pub mod fee;
 pub mod java_checkpoint;
 pub mod pending_overlay;
 pub mod permissions;
@@ -30,8 +31,11 @@ pub use java_checkpoint::{
     has_pending_java_checkpoint, replay_java_checkpoint, JavaCheckpointError,
     JAVA_CHECKPOINT_V1_DIR, JAVA_CHECKPOINT_V2_DIR,
 };
+pub use fee::dispose_fee_to_blackhole;
 pub use pending_overlay::PendingOverlay;
-pub use permissions::{apply_default_account_permissions, default_account_permissions};
+pub use permissions::{
+    apply_default_account_permissions, default_account_permissions, set_default_witness_permission,
+};
 pub use rocksdb_backend::{
     rocksdb_tuning, set_block_cache_bytes, RocksDbBackend, RocksDbError, RocksdbTuning,
 };

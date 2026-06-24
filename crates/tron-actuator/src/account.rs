@@ -87,12 +87,10 @@ pub fn execute_create_account(
     // java CreateAccountActuator.execute: after debiting the owner it sends
     // `fee` to the blackhole — `burnTrx(fee)` when
     // `supportBlackHoleOptimization()` is on, else crediting the blackhole
-    // *account*. Mainnet runs with the optimization active (the legacy
-    // account-credit is approximated as a burn, matching the bandwidth/energy
-    // fee paths). The fee is 0 on mainnet, so this is inert in practice, but it
-    // keeps BURN_TRX_AMOUNT exact if CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT
-    // is ever raised by proposal.
-    dyn_props.burn_trx(fee);
+    // *account* (the from-genesis arm); `dispose_fee_to_blackhole` does both.
+    // The fee is 0 on mainnet, so this is inert in practice, but stays exact if
+    // CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT is ever raised by proposal.
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
 
     let mut new_account = Account {
         address: new_addr.as_bytes().to_vec(),
@@ -438,10 +436,10 @@ pub fn execute_account_permission_update(
     // java AccountPermissionUpdateActuator.execute: after debiting the fee it
     // routes `fee` to the blackhole — `burnTrx(fee)` when
     // `supportBlackHoleOptimization()` is on, else crediting the blackhole
-    // *account*. Mainnet runs the optimization (legacy account-credit
-    // approximated as a burn, like the bandwidth/energy fee paths), so
-    // BURN_TRX_AMOUNT must include the 100-TRX permission-update fee.
-    dyn_props.burn_trx(fee);
+    // *account* (the from-genesis arm); `dispose_fee_to_blackhole` does both.
+    // Post-#49 the burn keeps BURN_TRX_AMOUNT inclusive of the 100-TRX
+    // permission-update fee; before it, the blackhole account is credited.
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
     // java `AccountCapsule.updatePermissions`: the stored ids are FORCED —
     // owner→0, witness→1 (only when the account is a witness), actives→2+index
     // — regardless of what the contract supplied.

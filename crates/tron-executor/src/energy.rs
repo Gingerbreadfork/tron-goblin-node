@@ -110,6 +110,27 @@ fn pre_tx_energy_quota_for(addr: &Address) -> Option<i64> {
     PRE_TX_ENERGY.with(|m| m.borrow().get(key).map(|c| c.left))
 }
 
+thread_local! {
+    /// The current VM-tx's OUT_OF_TIME status, set once per tx by the executor
+    /// immediately before [`pay_energy_bill`] (the sole production caller of the
+    /// energy charge path). [`pay_energy_fee`] reads it to mirror java's
+    /// `ReceiptCapsule.payEnergyBill` fee-pool guard
+    /// (`!contractResult.equals(OUT_OF_TIME)`) without threading the contract
+    /// result through the per-account charge primitives. Defaults `false`
+    /// (non-OUT_OF_TIME) for any path that does not set it.
+    static TX_OUT_OF_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record the current VM-tx's OUT_OF_TIME status. The executor calls this once
+/// per tx, just before [`pay_energy_bill`].
+pub fn set_tx_out_of_time(is_out_of_time: bool) {
+    TX_OUT_OF_TIME.with(|c| c.set(is_out_of_time));
+}
+
+fn tx_out_of_time() -> bool {
+    TX_OUT_OF_TIME.with(std::cell::Cell::get)
+}
+
 /// java `VMActuator.getAccountEnergyLimitWithFixRatio` (the pre-consume block,
 /// VMActuator.java:574-591) and the identical origin block in
 /// `getTotalEnergyLimitWithFixRatio` (:757-773): BUDGET-TIME pre-consume of
@@ -470,7 +491,7 @@ pub fn consume_energy(
     // Apply the TRX fee slice, if any.
     if energy_remainder > 0 {
         account.balance -= fee;
-        pay_energy_fee(dyn_props, fee);
+        pay_energy_fee(accounts, dyn_props, fee)?;
     }
     account.latest_opration_time = head_block_timestamp(dyn_props);
     accounts.put(caller, &account)?;
@@ -736,6 +757,93 @@ pub fn account_energy_limit_with_fix_ratio(
     available.min(energy_from_fee_limit)
 }
 
+/// `ENERGY_LIMIT_HARD_FORK` activation block (java `ForkController.
+/// checkForEnergyLimit`, mainnet 4,727,890). At or after it the VM energy budget
+/// uses the FIX ratio; before it, the FLOAT ratio.
+pub const ENERGY_LIMIT_HARD_FORK_BLOCK: i64 = 4_727_890;
+
+/// java `VMActuator.getEnergyFee` (VMActuator.java:105-112): the frozen-balance
+/// slice corresponding to `frozen` energy out of `total` energy backed by
+/// `usage` balance — `frozen * usage / total` (0 when `total <= 0`). Widened to
+/// i128 to match java's `BigInteger` intermediate.
+fn get_energy_fee(usage: i64, frozen: i64, total: i64) -> i64 {
+    if total <= 0 {
+        return 0;
+    }
+    ((frozen as i128 * usage as i128) / total as i128) as i64
+}
+
+/// java `VMActuator.getAccountEnergyLimitWithFloatRatio` — the caller budget
+/// PRE-`ENERGY_LIMIT_HARD_FORK` (block 4,727,890). Differs from the fix-ratio
+/// variant only in `energyFromFeeLimit`: when the account holds frozen energy
+/// the fee-limit headroom is the PROPORTIONAL `totalEnergy * feeLimit /
+/// totalBalance` (when the left-frozen balance covers the fee) or
+/// `leftFrozen + (feeLimit - leftBalance) / sunPerEnergy` (otherwise), rather
+/// than the flat `feeLimit / sunPerEnergy`.
+pub fn account_energy_limit_with_float_ratio(
+    caller: &Account,
+    dyn_props: &DynamicPropertiesStore,
+    fee_limit: i64,
+    call_value: i64,
+    now_slot: i64,
+) -> i64 {
+    let spe = sun_per_energy(dyn_props);
+    let left_frozen = account_left_energy_from_freeze(caller, dyn_props, now_slot);
+    let call_value = call_value.max(0);
+    let energy_from_balance = caller.balance.saturating_sub(call_value).max(0) / spe;
+
+    let total_balance = all_frozen_balance_for_energy(caller);
+    let energy_from_fee_limit = if total_balance == 0 {
+        fee_limit / spe
+    } else {
+        let total_energy = calculate_global_energy_limit(caller, dyn_props);
+        let left_balance = get_energy_fee(total_balance, left_frozen, total_energy);
+        if left_balance >= fee_limit {
+            ((total_energy as i128 * fee_limit as i128) / total_balance as i128) as i64
+        } else {
+            left_frozen.saturating_add((fee_limit - left_balance) / spe)
+        }
+    };
+    left_frozen
+        .saturating_add(energy_from_balance)
+        .min(energy_from_fee_limit)
+}
+
+/// java `VMActuator.getTotalEnergyLimitWithFloatRatio` — the PRE-fork
+/// TriggerSmartContract budget (caller + creator split). Simpler than the
+/// fix-ratio variant: no per-origin BigInteger cap, just the
+/// `caller * 100 / percent` vs `caller + creatorLeftFrozen` branch.
+pub fn total_energy_limit_with_float_ratio(
+    creator: &Account,
+    caller: &Account,
+    dyn_props: &DynamicPropertiesStore,
+    consume_user_resource_percent: i64,
+    fee_limit: i64,
+    call_value: i64,
+    now_slot: i64,
+) -> i64 {
+    let caller_energy_limit =
+        account_energy_limit_with_float_ratio(caller, dyn_props, fee_limit, call_value, now_slot);
+    if creator.address == caller.address {
+        return caller_energy_limit;
+    }
+    let creator_energy_limit = account_left_energy_from_freeze(creator, dyn_props, now_slot);
+    // java always passes the clamped `getConsumeUserResourcePercent()` ([0,100],
+    // and CREATE-by-contract forces 100); clamp here for parity + safety, as the
+    // fix-ratio path does.
+    let percent = consume_user_resource_percent.clamp(0, 100);
+    // java compares with plain longs; widen to i128 so large frozen-energy values
+    // can't overflow (the result fits i64 for any realistic budget). The division
+    // only runs when the condition holds, which requires `percent > 0`.
+    if creator_energy_limit as i128 * percent as i128
+        > (100 - percent) as i128 * caller_energy_limit as i128
+    {
+        ((caller_energy_limit as i128 * 100) / percent.max(1) as i128) as i64
+    } else {
+        caller_energy_limit.saturating_add(creator_energy_limit)
+    }
+}
+
 /// java `TransactionTrace.pay`'s SUCCESS-path reset (TransactionTrace.java:261-279):
 /// REMOVE the budget-time pre-consumed frozen energy from the ORIGIN (first) and
 /// the CALLER, restoring the post-decay usage so `pay_energy_bill` charges off
@@ -836,6 +944,34 @@ pub fn vm_energy_budget_trigger(
     call_value: i64,
     now_slot: i64,
 ) -> i64 {
+    // ENERGY_LIMIT_HARD_FORK (block 4,727,890): pre-fork java computes the
+    // TriggerSmartContract budget with the FLOAT ratio
+    // (`getTotalEnergyLimitWithFloatRatio`), post-fork with the fix ratio.
+    // Pre-fork `allowTvmFreezeV2` is always off, so only the legacy read-only
+    // pre-consume capture (the pay-time split clamp) applies.
+    if dyn_props.latest_block_header_number().unwrap_or(0) < ENERGY_LIMIT_HARD_FORK_BLOCK {
+        set_pre_tx_energy(
+            caller_addr.as_bytes(),
+            EnergyPreConsume {
+                left: caller_energy_quota_left(caller, dyn_props, now_slot),
+                ..Default::default()
+            },
+        );
+        return match creator {
+            Some((_, creator)) => total_energy_limit_with_float_ratio(
+                creator,
+                caller,
+                dyn_props,
+                consume_user_resource_percent,
+                fee_limit,
+                call_value,
+                now_slot,
+            ),
+            None => {
+                account_energy_limit_with_float_ratio(caller, dyn_props, fee_limit, call_value, now_slot)
+            }
+        };
+    }
     let spe = sun_per_energy(dyn_props);
     let energy_from_fee_limit = fee_limit / spe;
     // CALLER term — java `getAccountEnergyLimitWithFixRatio`. `left_frozen` is
@@ -919,6 +1055,22 @@ pub fn vm_energy_budget_create(
     call_value: i64,
     now_slot: i64,
 ) -> i64 {
+    // ENERGY_LIMIT_HARD_FORK (block 4,727,890): pre-fork java computes the
+    // CreateSmartContract budget with the FLOAT ratio
+    // (`getAccountEnergyLimitWithFloatRatio`), post-fork with the fix ratio.
+    // Pre-fork `allowTvmFreezeV2` is off → legacy read-only pre-consume capture.
+    if dyn_props.latest_block_header_number().unwrap_or(0) < ENERGY_LIMIT_HARD_FORK_BLOCK {
+        set_pre_tx_energy(
+            caller_addr.as_bytes(),
+            EnergyPreConsume {
+                left: caller_energy_quota_left(caller, dyn_props, now_slot),
+                ..Default::default()
+            },
+        );
+        return account_energy_limit_with_float_ratio(
+            caller, dyn_props, fee_limit, call_value, now_slot,
+        );
+    }
     let spe = sun_per_energy(dyn_props);
     let energy_from_fee_limit = fee_limit / spe;
     let left_frozen = account_left_energy_from_freeze(caller, dyn_props, now_slot);
@@ -1040,17 +1192,28 @@ pub fn pay_energy_bill(
     })
 }
 
-/// Pay the energy-side fee (matches `BandwidthProcessor.consumeFeeForBandwidth`
-/// behavior — pool, burn, or blackhole). Energy fees also bump
-/// `TOTAL_TRANSACTION_COST` since java-tron sweeps both into the same
-/// counter.
-fn pay_energy_fee(dyn_props: &DynamicPropertiesStore, fee: i64) {
-    dyn_props.add_total_transaction_cost(fee);
-    if dyn_props.support_transaction_fee_pool() {
+/// Pay the energy-side fee (java `ReceiptCapsule.payEnergyBill`, lines 341-351:
+/// fee pool, burn, or blackhole). Unlike the bandwidth path this does NOT bump
+/// `TOTAL_TRANSACTION_COST` — java calls `addTotalTransactionCost` ONLY in
+/// `BandwidthProcessor.useTransactionFee` (BandwidthProcessor.java:207), never
+/// for energy; bumping it here over-counted the counter by every energy fee.
+///
+/// An OUT_OF_TIME tx's energy fee is excluded from the transaction-fee pool
+/// (java's `supportTransactionFeePool() && !contractResult.equals(OUT_OF_TIME)`)
+/// — it burns / blackholes instead. The status comes from the per-tx
+/// [`TX_OUT_OF_TIME`] flag the executor sets just before `pay_energy_bill`.
+fn pay_energy_fee(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    fee: i64,
+) -> Result<(), StoreError> {
+    if dyn_props.support_transaction_fee_pool() && !tx_out_of_time() {
         dyn_props.add_transaction_fee_pool(fee);
-    } else if dyn_props.support_blackhole_optimization() {
-        dyn_props.burn_trx(fee);
+        Ok(())
     } else {
-        dyn_props.burn_trx(fee);
+        // burnTrx once ALLOW_BLACKHOLE_OPTIMIZATION (#49) is active, else credit
+        // the blackhole ACCOUNT (the from-genesis arm) — java
+        // ReceiptCapsule.payEnergyBill:345-350.
+        tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)
     }
 }

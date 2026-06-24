@@ -2489,9 +2489,21 @@ fn execute_block_logic(
                 res.contract_type,
                 Some(ContractType::TriggerSmartContract | ContractType::CreateSmartContract)
             );
-            let Some(stored) = tx.ret.first() else {
-                continue; // no stored ret to compare against
-            };
+            // VM txs need the stored contract_ret to compare against, so a VM tx
+            // with no recorded ret is genuinely uncomparable — skip it. NON-VM
+            // txs are different: an honest block producer only includes a tx that
+            // passed validation, so a non-VM tx present in the canonical block
+            // executed to SUCCESS on-chain even when its tx-level `ret` is empty.
+            // Treating a missing ret as "nothing to compare" let a silently
+            // self-rejected non-VM tx (e.g. a vote/freeze our node refused for a
+            // diverged balance/power, whose mainnet ret happened to be empty)
+            // hide a real STATE divergence — exactly the 2,586,234 case. So for
+            // non-VM a missing ret means expected SUCCESS, and we MUST still
+            // compare.
+            let stored = tx.ret.first();
+            if is_vm && stored.is_none() {
+                continue;
+            }
             // Whether the tx succeeded on-chain (java) vs in our node. VM txs
             // compare the contractRet; non-VM txs (Transfer, AccountPermission-
             // Update, Freeze, …) compare the tx-level `ret` code — the old
@@ -2499,6 +2511,7 @@ fn execute_block_logic(
             // silently diverged balances/permissions and cascaded into the VM
             // reverts we then saw.
             let (expected, computed, expected_ok, computed_ok) = if is_vm {
+                let stored = stored.expect("VM tx without a stored ret is skipped above");
                 let expected = stored.contract_ret;
                 let computed = res.receipt.result;
                 if expected == computed || expected == OUT_OF_TIME || computed == OUT_OF_TIME {
@@ -2511,7 +2524,7 @@ fn execute_block_logic(
                     computed == SUCCESS,
                 )
             } else {
-                let expected_ok = stored.ret == RET_SUCCESS;
+                let expected_ok = stored.map_or(true, |s| s.ret == RET_SUCCESS);
                 let computed_ok = matches!(res.outcome, TxOutcome::Success);
                 (
                     format!("ret={}", if expected_ok { "SUCCESS" } else { "FAILED" }),
@@ -2591,6 +2604,45 @@ fn execute_block_logic(
                          (same success/failure; recorded code differs)",
                         raw.number, tx_hex, expected, computed, reason,
                     );
+                }
+            }
+        }
+    }
+
+    // Divergence-hunt instrument (env-gated, inert in production): when
+    // TRON_TRACE_ACCT names a `41…`-hex account, emit its balance / total
+    // frozen / allowance whenever they change, with the block number — to
+    // localize an upstream balance/stake divergence (e.g. the 2,586,234
+    // TZBABURn frozen gap) to the exact block where it first appears.
+    if let Some(hexaddr) = std::env::var_os("TRON_TRACE_ACCT") {
+        if let Some(raw_addr) = hexaddr.to_str().and_then(|s| hex::decode(s).ok()) {
+            if raw_addr.len() == 21 {
+                let mut a = [0u8; 21];
+                a.copy_from_slice(&raw_addr);
+                if let Ok(Some(acct)) =
+                    AccountStore::new(state.accounts.clone()).get(&Address::from_raw(a))
+                {
+                    let frozen: i64 = acct.frozen.iter().map(|f| f.frozen_balance).sum::<i64>()
+                        + acct
+                            .account_resource
+                            .as_ref()
+                            .and_then(|r| r.frozen_balance_for_energy.as_ref())
+                            .map(|f| f.frozen_balance)
+                            .unwrap_or(0);
+                    let cur = (acct.balance, frozen, acct.allowance);
+                    thread_local! {
+                        static TRACE_LAST: std::cell::Cell<Option<(i64, i64, i64)>> =
+                            const { std::cell::Cell::new(None) };
+                    }
+                    TRACE_LAST.with(|last| {
+                        if last.get() != Some(cur) {
+                            eprintln!(
+                                "ACCTTRACE block={} balance={} frozen={} allowance={}",
+                                raw.number, cur.0, cur.1, cur.2
+                            );
+                            last.set(Some(cur));
+                        }
+                    });
                 }
             }
         }
@@ -2781,6 +2833,7 @@ fn execute_block_logic(
             if let Ok(by_vote) = ws.all() {
                 let ranked = top_standby_witnesses(
                     by_vote.into_iter().map(|(a, w)| (a, w.vote_count)).collect(),
+                    dp.allow_consensus_logic_optimization(),
                 );
                 let _ =
                     tron_tvm::reward::pay_standby_witness(&accts, &dlg, &dp, &ranked);
@@ -2901,6 +2954,31 @@ fn execute_block_logic(
                         new_active: outcome.new_active,
                         before_maintenance_time_ms: next_maintenance,
                     });
+                    // Divergence-hunt instrument (env-gated, inert in
+                    // production): emit each TRON_VOTELOG_TARGET witness's
+                    // post-maintenance countVote with its block number, for a
+                    // direct timeline diff against java-tron's MaintenanceManager
+                    // log when a witness-schedule divergence is being chased.
+                    if std::env::var_os("TRON_MAINT_VOTELOG").is_some() {
+                        if let Ok(tgts) = std::env::var("TRON_VOTELOG_TARGET") {
+                            for h in tgts.split(',') {
+                                let h = h.trim();
+                                match hex::decode(h) {
+                                    Ok(b) if b.len() == 21 => {
+                                        let mut a = [0u8; 21];
+                                        a.copy_from_slice(&b);
+                                        if let Ok(Some(w)) = ws.get(&Address::from_raw(a)) {
+                                            eprintln!(
+                                                "MAINTVOTE block={} witness={} count={}",
+                                                raw.number, h, w.vote_count
+                                            );
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4152,6 +4230,10 @@ fn execute_vm_tx(
                 }
                 None => (None, 0, 0),
             };
+            // Mirror java's OUT_OF_TIME fee-pool exclusion: record the tx's
+            // result so `pay_energy_fee` routes an OUT_OF_TIME energy fee to the
+            // blackhole instead of the transaction-fee pool.
+            energy::set_tx_out_of_time(out_of_time_energy.is_some());
             match energy::pay_energy_bill(
                 &accounts,
                 &dp_store,
@@ -4528,7 +4610,7 @@ fn charge_flat_fee(
     }
     account.balance -= fee;
     accounts.put(&owner, &account).map_err(|e| e.to_string())?;
-    bandwidth::dispose_fee(dyn_props, fee);
+    bandwidth::dispose_fee(&accounts, dyn_props, fee).map_err(|e| e.to_string())?;
     Ok(fee)
 }
 
@@ -4652,23 +4734,38 @@ const STANDBY_WITNESS_COUNT: usize = 127;
 /// sorting the entire registered-witness candidate set (which can be
 /// thousands of entries) on every single block. Pinned equal to the naive
 /// sort in `standby_ranking_tests::top_standby_matches_full_sort`.
-fn top_standby_witnesses(mut ranked: Vec<(Address, i64)>) -> Vec<(Address, i64)> {
-    // vote_count desc; on a tie, address bytes DESCENDING — matching java
-    // `WitnessStore.sortWitnesses` whose `allowWitnessSortOptimization` (active
-    // on mainnet) tie-break is `createReadableString` (hex) reversed, which is
-    // identical to bytes DESC. (Pre-proposal ByteString.hashCode tie-break is
-    // unreachable for a post-proposal-snapshot node.) See the matching sort in
-    // tron-consensus `update_active_witnesses`.
+fn top_standby_witnesses(mut ranked: Vec<(Address, i64)>, sort_opt: bool) -> Vec<(Address, i64)> {
+    // vote_count desc, then a tie-break gated on java
+    // `allowWitnessSortOptimization()` (== `allowConsensusLogicOptimization()`,
+    // proposal #88), exactly as `WitnessStore.sortWitnesses(list, isSortOpt)`:
+    //   * flag ON  (post-#88) — `createReadableString` (hex) reversed, identical
+    //     to address-bytes DESC;
+    //   * flag OFF (pre-#88)  — `ByteString.hashCode()` DESC.
+    // This per-block standby reward runs once `allowChangeDelegation` (#30) is
+    // on, so a from-genesis sync exercises the OFF arm across the #30..#88
+    // window, while a post-#88 snapshot only ever hits the ON arm. Mirrors the
+    // gated active-SR sort in tron-consensus `update_active_witnesses` (shared
+    // `bytestring_hash_code`).
     let cmp = |a: &(Address, i64), b: &(Address, i64)| {
-        b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes()))
+        b.1.cmp(&a.1).then_with(|| {
+            if sort_opt {
+                b.0.as_bytes().cmp(a.0.as_bytes())
+            } else {
+                tron_consensus::bytestring_hash_code(b.0.as_bytes())
+                    .cmp(&tron_consensus::bytestring_hash_code(a.0.as_bytes()))
+            }
+        })
     };
-    if ranked.len() > STANDBY_WITNESS_COUNT {
-        // Partition so the top-127 occupy [0, 127) (in arbitrary order),
-        // drop the rest, then sort only those 127.
-        ranked.select_nth_unstable_by(STANDBY_WITNESS_COUNT - 1, cmp);
-        ranked.truncate(STANDBY_WITNESS_COUNT);
-    }
+    // STABLE sort over the address-ascending input, then take the top 127 —
+    // matching java's `Collections.sort` (TimSort) on the address-ordered
+    // `getAllWitnesses()` list followed by `subList(0, 127)`. On a full tie
+    // (vote_count AND the tie-break key both equal — possible only in the
+    // flag-off `bytestring_hash_code` arm, which is not injective) a stable sort
+    // keeps the lower-address witness ahead exactly as java does;
+    // `select_nth_unstable` could reorder such a tie group across the 127
+    // boundary and select a different subset.
     ranked.sort_by(cmp);
+    ranked.truncate(STANDBY_WITNESS_COUNT);
     // java `getWitnessStandby` trims `voteCount < 1` AFTER taking the top
     // WITNESS_STANDBY_LENGTH — a zero/negative-vote witness that made the
     // top-127 earns no standby reward and must not dilute the per-vote split.
@@ -4710,7 +4807,7 @@ mod standby_ranking_tests {
                 .map(|i| (addr(i), (i.wrapping_mul(2_654_435_761) % 37) as i64))
                 .collect();
             assert_eq!(
-                top_standby_witnesses(v.clone()),
+                top_standby_witnesses(v.clone(), true),
                 naive(v),
                 "partial selection diverged from the full sort at n={n}"
             );
@@ -4723,8 +4820,27 @@ mod standby_ranking_tests {
         // hex-string DESCENDING == address bytes DESCENDING, so the
         // higher-bytes address ranks first.
         let ranked = vec![(addr(1), 100i64), (addr(2), 100i64)];
-        let out = top_standby_witnesses(ranked);
+        let out = top_standby_witnesses(ranked, true);
         assert_eq!(out[0].0, addr(2), "higher address bytes must rank first on a tie");
         assert_eq!(out[1].0, addr(1));
+    }
+
+    #[test]
+    fn tie_break_pre_88_is_bytestring_hashcode_descending() {
+        // With the #88 sort flag OFF (the from-genesis #30..#88 window), the
+        // tie-break is java `ByteString.hashCode()` DESC, shared with
+        // tron-consensus `update_active_witnesses`. The standby set must order a
+        // vote_count tie the same way the active SR sort does.
+        let a1 = addr(1);
+        let a2 = addr(2);
+        let out = top_standby_witnesses(vec![(a1, 100i64), (a2, 100i64)], false);
+        let expected_first = if tron_consensus::bytestring_hash_code(a2.as_bytes())
+            >= tron_consensus::bytestring_hash_code(a1.as_bytes())
+        {
+            a2
+        } else {
+            a1
+        };
+        assert_eq!(out[0].0, expected_first, "flag-off tie-break must be hashCode DESC");
     }
 }

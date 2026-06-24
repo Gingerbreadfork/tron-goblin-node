@@ -1804,6 +1804,9 @@ fn second_signature_charges_the_multi_sign_fee() {
     };
 
     let state = StateBundle::fresh();
+    // Post-#49 mainnet era: the multi-sign fee is burned (pre-#49 blackhole-
+    // account credit is covered by chainbase's dispose_fee_to_blackhole tests).
+    state.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     // ALICE with a 2-of-2 owner permission (ALICE + DAVE) — the real
     // multi-sign shape; both signatures are required and the tx pays
     // the multi-sign fee for carrying more than one.
@@ -1941,6 +1944,9 @@ fn parallel_conflicting_create_account_burn_matches_serial() {
     const N: u16 = 8;
     let fund = |b: &StateBundle| {
         put_account(&b.accounts, sender, 1_000_000_000);
+        // Post-#49 mainnet era: create-account fees burn (the test asserts the
+        // burn counter moved and matches between serial and parallel).
+        b.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     };
     let txs = || {
         (0..N)

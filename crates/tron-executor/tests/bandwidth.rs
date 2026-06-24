@@ -217,6 +217,9 @@ fn free_quota_exhaustion_falls_back_to_trx_fee() {
     let env = Env::new();
     seed_recipient(&env);
     env.dyn_props.put_long(b"FREE_NET_LIMIT", 1);
+    // Post-#49 mainnet era: the bandwidth fee is burned (pre-#49 blackhole-
+    // account credit is covered by chainbase's fee unit tests).
+    env.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     put(
         &env.accounts,
         ALICE,
@@ -450,6 +453,9 @@ fn increase_adds_new_usage_immediately() {
 #[test]
 fn transfer_to_missing_account_burns_the_flat_create_fee() {
     let env = Env::new();
+    // Post-#49 mainnet era: the flat create fee is burned (pre-#49 blackhole-
+    // account credit is covered by chainbase's fee unit tests).
+    env.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     // BOB deliberately absent; ALICE has balance but no frozen net.
     put(
         &env.accounts,

@@ -259,10 +259,27 @@ fn validate_proposal_value(
             }
         }
         AllowMarketTransaction => {
-            // java rejects this code once VERSION_4_8_1 has passed (the param is
-            // removed in 4.8.1). On the post-4.8.1 window it is no longer
-            // proposable; reproduce the rejection (the fork is active).
-            return Err(bad());
+            // java: `if (!pass(VERSION_4_1) || pass(VERSION_4_8_1)) throw; if
+            // (value != 1) throw;` (ProposalUtil.java:358-369). VERSION_4_1 is
+            // long active across the whole replay window, so the only branch to
+            // distinguish is "has VERSION_4_8_1 passed?", after which the param
+            // is no longer proposable. We do not model forkController; the
+            // closest dynamic-property proxy is UNFREEZE_DELAY_DAYS (set by the
+            // Stake-2.0 governance path, fork VERSION_4_7). Stake-2.0 (~block
+            // 52.5M) actually PRECEDES VERSION_4_8_1, but the proxy is sound:
+            // mainnet set ALLOW_MARKET_TRANSACTION ~block 28M while
+            // UNFREEZE_DELAY_DAYS was still 0 (so the historical proposal is
+            // correctly ACCEPTED below), and an already-set governance parameter
+            // is never re-proposed — so the [Stake-2.0, VERSION_4_8_1] window
+            // where this proxy would over-reject is never exercised. Across the
+            // whole 83M+ validated range UNFREEZE_DELAY_DAYS is non-zero, so the
+            // rejection is preserved byte-identically.
+            if flag(b"UNFREEZE_DELAY_DAYS") != 0 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_MARKET_TRANSACTION"));
+            }
         }
         MarketSellFee | MarketCancelFee => {
             // java guards on `supportAllowMarketTransaction()`; on mainnet that

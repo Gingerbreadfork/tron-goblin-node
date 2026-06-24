@@ -195,14 +195,14 @@ pub fn execute_transfer_asset(
 
     // java: adjustBalance(owner, -fee) then burnTrx(fee) on the
     // supportBlackHoleOptimization path (mainnet); the legacy else-branch
-    // credits the blackhole account, which we approximate as a burn to match
-    // the other actuators. The fee debit lands on the same owner_account so it
-    // is written by the single put below and reverts atomically with the tx on
-    // failure. With the default-0 fee this is inert; it keeps the owner
-    // balance, TransactionInfo.fee, and BURN_TRX_AMOUNT exact if a proposal
-    // ever raises CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT.
+    // credits the blackhole account — `dispose_fee_to_blackhole` does both. The
+    // fee debit lands on the same owner_account so it is written by the single
+    // put below and reverts atomically with the tx on failure. With the
+    // default-0 fee this is inert; it keeps the owner balance,
+    // TransactionInfo.fee, and the blackhole/BURN_TRX_AMOUNT accounting exact if
+    // a proposal ever raises CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT.
     owner_account.balance = check_sub(owner_account.balance, fee)?;
-    dyn_props.burn_trx(fee);
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
 
     accounts.put(&owner, &owner_account)?;
     accounts.put(&to, &to_account)?;
@@ -393,11 +393,10 @@ pub fn execute_asset_issue(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let fee = dyn_props.get_long(b"ASSET_ISSUE_FEE").unwrap_or(1_024_000_000);
     owner_account.balance = check_sub(owner_account.balance, fee)?;
-    // java AssetIssueActuator: after debiting the owner, burn the fee
-    // (supportBlackHoleOptimization → burnTrx) so the chain-wide BURN_TRX_AMOUNT
-    // accounting matches. Balances already match without this; only the burn
-    // statistic would drift.
-    dyn_props.burn_trx(fee);
+    // java AssetIssueActuator: after debiting the owner, dispose the fee —
+    // burnTrx once supportBlackHoleOptimization is on, else credit the blackhole
+    // account (the from-genesis arm).
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
 
     let next_token_id = dyn_props.get_long(b"TOKEN_ID_NUM").unwrap_or(1_000_000) + 1;
     dyn_props.put_long(b"TOKEN_ID_NUM", next_token_id);
@@ -912,7 +911,7 @@ pub(crate) fn credit_asset(
 /// `ALLOW_SAME_TOKEN_NAME == 0` names are unique, so the lookup is unambiguous.
 /// Returns `None` when the asset is absent or carries no id (defensive: the
 /// caller's validation has already confirmed the asset exists for real txs).
-fn token_id_for_name(
+pub(crate) fn token_id_for_name(
     v1: &AssetIssueStore,
     name: &str,
 ) -> Result<Option<String>, ActuatorError> {

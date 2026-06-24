@@ -628,6 +628,9 @@ fn transfer_asset_new_recipient_charges_and_burns_create_fee() {
     let dp = DynamicPropertiesStore::new(mem());
     dp.save_allow_same_token_name(1); // id-keyed asset_v2 == flag=1 regime
     dp.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", FEE);
+    // Post-#49 mainnet era: the create fee is burned (pre-#49 blackhole-account
+    // credit is covered by chainbase's dispose_fee_to_blackhole unit tests).
+    dp.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
     accounts
         .put(
             &addr(ALICE),

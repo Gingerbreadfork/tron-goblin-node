@@ -16,13 +16,19 @@ fn mem() -> Arc<dyn KvBackend> {
 }
 
 fn fresh_stores() -> VmStores {
+    let dynamic_properties = Arc::new(DynamicPropertiesStore::new(mem()));
+    // Default to the post-ALLOW_TVM_TRANSFER_TRC10 (#15) mainnet era so a
+    // top-level CALLTOKEN actually moves the TRC-10 amount. Pre-#15 the token
+    // fields are ignored (no transfer) — that gate is verified by the dedicated
+    // CALLTOKEN unit tests. Inert for calls carrying no token value/id.
+    dynamic_properties.put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
     VmStores {
         accounts: Arc::new(AccountStore::new(mem())),
         code: Arc::new(CodeStore::new(mem())),
         storage: Arc::new(StorageRowStore::new(mem())),
         witnesses: Arc::new(WitnessStore::new(mem())),
         contract_state: Arc::new(ContractStateStore::new(mem())),
-        dynamic_properties: Arc::new(DynamicPropertiesStore::new(mem())),
+        dynamic_properties,
         delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
         delegated_resource_account_index: None,
         delegation: Arc::new(DelegationStore::new(mem())),

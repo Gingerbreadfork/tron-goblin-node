@@ -16,13 +16,20 @@ fn mem() -> Arc<dyn KvBackend> {
 }
 
 fn fresh_stores() -> VmStores {
+    let dynamic_properties = Arc::new(DynamicPropertiesStore::new(mem()));
+    // Default to the post-ALLOW_TVM_CONSTANTINOPLE (#26) mainnet era so a deploy
+    // stores the init-code RETURN value as its code. Pre-#26, java derives the
+    // stored code via the `ProgramPrecompile.getCode` heuristic instead (a
+    // 32-byte zero word for a typical constructor) — that path is exercised by
+    // the dedicated pre-Constantinople deploy test.
+    dynamic_properties.put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
     VmStores {
         accounts: Arc::new(AccountStore::new(mem())),
         code: Arc::new(CodeStore::new(mem())),
         storage: Arc::new(StorageRowStore::new(mem())),
         witnesses: Arc::new(WitnessStore::new(mem())),
         contract_state: Arc::new(ContractStateStore::new(mem())),
-        dynamic_properties: Arc::new(DynamicPropertiesStore::new(mem())),
+        dynamic_properties,
         delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
         delegated_resource_account_index: None,
         delegation: Arc::new(DelegationStore::new(mem())),
@@ -662,10 +669,16 @@ fn nested_create2_writes_contract_row_and_marks_account() {
     use tron_tvm::execute::execute_trigger_with_trace_tx_id;
 
     let stores = fresh_stores_with_contracts();
-    // CREATE2 (0xf5) needs the Petersburg spec → ALLOW_TVM_CONSTANTINOPLE.
+    // CREATE2 (0xf5) needs the Petersburg spec (ALLOW_TVM_CONSTANTINOPLE).
+    // ALLOW_TVM_ISTANBUL (#41) makes a nested CREATE2 derive its address from
+    // the executing contract (the standard EVM rule); pre-#41 it derives from
+    // the CALLER (covered by the create_inputs `tron_create2_sender` unit test).
     stores
         .dynamic_properties
         .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_ISTANBUL", 1);
 
     // Child init code: PUSH1 1, PUSH1 0, RETURN → returns mem[0..1] = [0x00].
     let child_init: [u8; 5] = [0x60, 0x01, 0x60, 0x00, 0xf3];
@@ -800,10 +813,16 @@ fn nested_create2_deploys_contract_larger_than_eip170_limit() {
     use tron_tvm::execute::execute_trigger_with_trace_tx_id;
 
     let stores = fresh_stores_with_contracts();
-    // CREATE2 (0xf5) needs the Petersburg spec → ALLOW_TVM_CONSTANTINOPLE.
+    // CREATE2 (0xf5) needs the Petersburg spec (ALLOW_TVM_CONSTANTINOPLE).
+    // ALLOW_TVM_ISTANBUL (#41) makes a nested CREATE2 derive its address from
+    // the executing contract (the standard EVM rule); pre-#41 it derives from
+    // the CALLER (covered by the create_inputs `tron_create2_sender` unit test).
     stores
         .dynamic_properties
         .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_ISTANBUL", 1);
 
     // Child init: PUSH2 40000 (0x9c40), PUSH1 0, RETURN → returns 40000 zero
     // bytes (an all-STOP runtime) as the deployed code. 40000 > 24576 (EIP-170)

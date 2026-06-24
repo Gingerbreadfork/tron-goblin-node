@@ -900,12 +900,16 @@ fn apply_maintenance_nonempty_vote_cycle_reranks_and_saves() {
 }
 
 #[test]
-fn apply_maintenance_legacy_reward_selects_first_127_by_address_not_vote() {
+fn apply_maintenance_legacy_reward_selects_top_127_by_vote_not_address() {
     // Legacy `IncentiveManager.reward` (allowChangeDelegation == 0, the default
-    // on a fresh store) pays the FIRST 127 witnesses in `getAllWitnesses()`
-    // DB-iteration order (address ascending) — NOT the top-127 by vote. With
-    // more than 127 registered witnesses these are different sets: the
-    // highest-address witness is excluded even if it holds the largest vote.
+    // on a fresh store): java `DposService.updateWitness` sorts the witness
+    // list IN-PLACE by vote_count DESC (#88-gated tie-break) and that SAME
+    // sorted list is handed to `incentiveManager.reward(...).subList(0,127)`.
+    // So the reward set is the TOP-127 BY VOTE_COUNT, not the DB-iteration
+    // (address-ascending) first-127. With >127 registered witnesses these
+    // differ: the highest-VOTE witness is included even if its address is
+    // largest, and the lowest-VOTE witness is dropped even if its address is
+    // smallest.
     let witnesses = WitnessStore::new(mem());
     let votes = VotesStore::new(mem());
     let schedule = WitnessScheduleStore::new(mem());
@@ -913,15 +917,15 @@ fn apply_maintenance_legacy_reward_selects_first_127_by_address_not_vote() {
     let delegation = DelegationStore::new(mem());
     let dyn_props = DynamicPropertiesStore::new(mem());
 
-    // 128 registered witnesses, addresses ascending by seed 1..=128.
-    // Give every witness a uniform vote of 100 EXCEPT the highest-address
-    // one (seed 128), which holds the largest vote (10_000). A vote-sorted
-    // top-127 would keep seed 128 and drop a uniform-vote witness; the
-    // DB-order first-127 keeps seeds 1..=127 and drops seed 128.
+    // 128 registered witnesses, addresses ascending by seed 1..=128, each with
+    // a DISTINCT vote equal to its seed. Vote-order top-127 keeps the 127
+    // highest votes = seeds 2..=128 and drops seed 1 (lowest vote); the old
+    // DB-order first-127 would instead keep seeds 1..=127 and drop seed 128
+    // (highest address). The two sets diverge precisely on seed 1 vs seed 128.
     const N: u8 = 128;
     for seed in 1..=N {
         let a = addr(seed);
-        let vote = if seed == N { 10_000 } else { 100 };
+        let vote = i64::from(seed);
         witnesses
             .put(
                 &a,
@@ -973,23 +977,26 @@ fn apply_maintenance_legacy_reward_selects_first_127_by_address_not_vote() {
     )
     .unwrap();
 
-    // The first-127 subset is seeds 1..=127 (all vote 100). voteSum = 127*100
-    // = 12_700, totalPay = 115_200_000_000 (default WITNESS_STANDBY_ALLOWANCE).
-    // Each is paid (long)(100 * (115_200_000_000 / 12_700)).
+    // The vote-sorted top-127 subset is seeds 2..=128. voteSum = Σ(2..=128) =
+    // 8_255, totalPay = 115_200_000_000 (default WITNESS_STANDBY_ALLOWANCE).
+    // Each included witness of vote v is paid (long)(v * (totalPay / voteSum)).
     let total_pay: i64 = dyn_props.witness_standby_allowance();
-    let vote_sum: i64 = 127 * 100;
+    let vote_sum: i64 = (2..=i64::from(N)).sum();
     let each_vote_pay = total_pay as f64 / vote_sum as f64;
-    let expected_pay = (100.0_f64 * each_vote_pay) as i64;
-    assert!(expected_pay > 0);
 
-    // An included low-address witness is paid the expected amount.
+    // Seed 128 (highest vote) IS in the top-127-by-vote and paid its share,
+    // even though it is the highest address — the old first-127-by-address would
+    // have wrongly excluded it.
+    let expected_top_pay = (i64::from(N) as f64 * each_vote_pay) as i64;
+    assert!(expected_top_pay > 0);
     assert_eq!(
-        accounts.get(&addr(1)).unwrap().unwrap().allowance,
-        expected_pay
+        accounts.get(&addr(N)).unwrap().unwrap().allowance,
+        expected_top_pay
     );
-    // The highest-address witness (seed 128) is OUTSIDE the first-127 even
-    // though it holds the largest vote — its allowance stays 0.
-    assert_eq!(accounts.get(&addr(N)).unwrap().unwrap().allowance, 0);
+    // Seed 1 (lowest vote) is OUTSIDE the top-127-by-vote, so its allowance
+    // stays 0 — even though it is the lowest address, which the old
+    // first-127-by-address would have included and paid.
+    assert_eq!(accounts.get(&addr(1)).unwrap().unwrap().allowance, 0);
 }
 
 #[test]

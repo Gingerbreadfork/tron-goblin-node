@@ -438,13 +438,18 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     if restriction {
         gas!(context.interpreter, 5000);
     }
+    // The dead-beneficiary NEW_ACCT_CALL (25000) top-up exists only from #81
+    // (`getSuicideCost2`) / #94 (`getSuicideCost3`); pre-#81 SUICIDE has no
+    // top-up (`getSuicideCost` = 0). #94 implies #81, so gate on either.
+    let charge_topup =
+        target_is_dead && (context.host.tron_allow_energy_adjustment() || restriction);
     let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
     gas!(
         context.interpreter,
         context
             .host
             .gas_params()
-            .selfdestruct_cost(target_is_dead, false)
+            .selfdestruct_cost(charge_topup, false)
     );
 
     let created_locally = context.host.tron_account_created_locally(owner);

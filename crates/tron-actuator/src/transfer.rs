@@ -208,13 +208,12 @@ pub fn execute_transfer(
 
     // java TransferActuator.execute (TransferActuator.java:60-65): after
     // debiting the owner it sends `fee` to the blackhole — `burnTrx(fee)` on
-    // the `supportBlackHoleOptimization()` path (mainnet), else crediting the
-    // blackhole *account*. The owner balance and TransactionInfo.fee already
-    // match without this; only the chain-wide BURN_TRX_AMOUNT accumulator
-    // would drift. The fee is the create-new-account fee, 0 on mainnet, so
-    // this is inert in practice but keeps BURN_TRX_AMOUNT exact if a proposal
-    // ever raises CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT.
-    dynamic_properties.burn_trx(fee);
+    // the `supportBlackHoleOptimization()` path, else crediting the blackhole
+    // *account* (the from-genesis arm); `dispose_fee_to_blackhole` does both.
+    // The fee is the create-new-account fee, 0 on mainnet, so this is inert in
+    // practice but stays exact if a proposal ever raises
+    // CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT.
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dynamic_properties, fee)?;
 
     // Credit amount to recipient.
     let mut to_acct = to_account.expect("filled in above");

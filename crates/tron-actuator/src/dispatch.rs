@@ -280,6 +280,7 @@ pub fn dispatch_validate(
             crate::exchange::validate_exchange_inject(
                 stores.accounts,
                 stores.dyn_props,
+                stores.exchange_v1,
                 stores.exchange_v2,
                 &c,
             )
@@ -289,6 +290,7 @@ pub fn dispatch_validate(
             crate::exchange::validate_exchange_withdraw(
                 stores.accounts,
                 stores.dyn_props,
+                stores.exchange_v1,
                 stores.exchange_v2,
                 &c,
             )
@@ -297,6 +299,7 @@ pub fn dispatch_validate(
             let c = unpack::<tron_proto::ExchangeTransactionContract>(parameter)?;
             crate::exchange::validate_exchange_transaction(
                 stores.accounts,
+                stores.exchange_v1,
                 stores.exchange_v2,
                 stores.dyn_props,
                 &c,

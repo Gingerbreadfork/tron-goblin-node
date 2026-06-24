@@ -407,6 +407,36 @@ fn tron_chain_id(stores: &VmStores) -> u64 {
         .unwrap_or(0)
 }
 
+/// The full 256-bit value the `CHAINID` opcode must push (VM-2). java
+/// `Program.getChainId`: the genesis block id, TRUNCATED to its last 4 bytes
+/// once `ALLOW_TVM_COMPATIBLE_EVM` (#60) or
+/// `ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID` (#71) is active, but the FULL
+/// 32-byte genesis id in the Istanbul(#41)..#60 window. Both flags are active on
+/// the 83M snapshot, so this reduces to the truncated `tron_chain_id` there.
+fn chain_id_word_from_genesis(genesis: &[u8; 32], truncate: bool) -> revm::primitives::U256 {
+    use revm::primitives::U256;
+    if truncate {
+        U256::from(u32::from_be_bytes([
+            genesis[28],
+            genesis[29],
+            genesis[30],
+            genesis[31],
+        ]))
+    } else {
+        U256::from_be_bytes(*genesis)
+    }
+}
+
+fn tron_chain_id_word(stores: &VmStores) -> revm::primitives::U256 {
+    let Some(genesis) = stores.block_index.as_ref().and_then(|bi| bi.get(0).ok()) else {
+        return revm::primitives::U256::ZERO;
+    };
+    let dp = &stores.dynamic_properties;
+    let truncate = dp.get_long(b"ALLOW_TVM_COMPATIBLE_EVM") == Some(1)
+        || dp.get_long(b"ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID") == Some(1);
+    chain_id_word_from_genesis(genesis.as_bytes(), truncate)
+}
+
 fn execute_trigger_inner(
     stores: &VmStores,
     block: VmBlockEnv,
@@ -428,8 +458,17 @@ fn execute_trigger_inner(
     // Top-level CALLTOKEN: perform the TRC-10 transfer (debit owner,
     // credit target) BEFORE the EVM runs. If the EVM later reverts /
     // halts, undo it. Mirrors java-tron's TVMContext setup.
+    // java VMActuator.call (lines 478-483, 548): the top-level token value/id
+    // are read and the TRC-10 transfer performed ONLY when
+    // allowTvmTransferTrc10() (proposal #15). Pre-activation the proto's token
+    // fields are ignored and no transfer occurs — a pre-#15 VM tx carrying a
+    // nonzero token must NOT be rejected or moved here. Matches the CREATE-path
+    // gate. (ProposalSet is re-read here cheaply; it is bound again downstream.)
     let top_level_token: Option<(i64, i64)> =
-        if contract.call_token_value != 0 || contract.token_id != 0 {
+        if crate::proposals::ProposalSet::from_store(&stores.dynamic_properties)
+            .allow_tvm_transfer_trc10
+            && (contract.call_token_value != 0 || contract.token_id != 0)
+        {
             if contract.token_id <= 0 || contract.call_token_value < 0 {
                 return (
                     VmOutcome::PreflightError(format!(
@@ -576,7 +615,8 @@ fn execute_trigger_inner(
     // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
     // MLOAD/MSTORE/MSTORE8 at base 1). Done before installing the TRON opcode
     // stubs so their gas entries (0xd0..0xd4) survive.
-    *instructions.gas_table_mut() = crate::tron_static_gas_table();
+    *instructions.gas_table_mut() =
+        crate::tron_static_gas_table(proposals.allow_higher_limit_for_max_cpu_time_of_one_tx);
     crate::evm::install_tron_opcode_stubs(&mut instructions, &proposals);
     let mut trc10_inspector = crate::trc10::Trc10Inspector::new(Arc::clone(&stores.accounts));
     if dynamic_energy_active(&stores.dynamic_properties) {
@@ -610,7 +650,10 @@ fn execute_trigger_inner(
             proposals
                 .allow_tvm_transfer_trc10
                 .then(|| EvmAddress::from_slice(&BLACKHOLE_EVM_ADDRESS)),
+            Some(proposals.allow_energy_adjustment),
         );
+        ctx.journaled_state
+            .set_tron_chain_id_word(Some(tron_chain_id_word(stores)));
     }
     let mut evm = Evm {
         ctx,
@@ -772,8 +815,17 @@ fn execute_trigger_inner_with_tracer(
         Ok(a) => a,
         Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), tracer),
     };
+    // java VMActuator.call (lines 478-483, 548): the top-level token value/id
+    // are read and the TRC-10 transfer performed ONLY when
+    // allowTvmTransferTrc10() (proposal #15). Pre-activation the proto's token
+    // fields are ignored and no transfer occurs — a pre-#15 VM tx carrying a
+    // nonzero token must NOT be rejected or moved here. Matches the CREATE-path
+    // gate. (ProposalSet is re-read here cheaply; it is bound again downstream.)
     let top_level_token: Option<(i64, i64)> =
-        if contract.call_token_value != 0 || contract.token_id != 0 {
+        if crate::proposals::ProposalSet::from_store(&stores.dynamic_properties)
+            .allow_tvm_transfer_trc10
+            && (contract.call_token_value != 0 || contract.token_id != 0)
+        {
             if contract.token_id <= 0 || contract.call_token_value < 0 {
                 return (
                     VmOutcome::PreflightError(format!(
@@ -920,7 +972,8 @@ fn execute_trigger_inner_with_tracer(
     // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
     // MLOAD/MSTORE/MSTORE8 at base 1). Done before installing the TRON opcode
     // stubs so their gas entries (0xd0..0xd4) survive.
-    *instructions.gas_table_mut() = crate::tron_static_gas_table();
+    *instructions.gas_table_mut() =
+        crate::tron_static_gas_table(proposals.allow_higher_limit_for_max_cpu_time_of_one_tx);
     crate::evm::install_tron_opcode_stubs(&mut instructions, &proposals);
     let mut trc10_inspector =
         crate::trc10::Trc10Inspector::new(Arc::clone(&stores.accounts)).with_tracer(tracer);
@@ -954,7 +1007,10 @@ fn execute_trigger_inner_with_tracer(
             proposals
                 .allow_tvm_transfer_trc10
                 .then(|| EvmAddress::from_slice(&BLACKHOLE_EVM_ADDRESS)),
+            Some(proposals.allow_energy_adjustment),
         );
+        ctx.journaled_state
+            .set_tron_chain_id_word(Some(tron_chain_id_word(stores)));
     }
     let mut evm = Evm {
         ctx,
@@ -1212,6 +1268,32 @@ pub fn execute_create(
     execute_create_with_trace(stores, block, contract, tx_id, energy_limit).0
 }
 
+/// java `ProgramPrecompile.getCode` (ProgramPrecompile.java:31-54) — the
+/// pre-`ALLOW_TVM_CONSTANTINOPLE` deploy-time deployed-code derivation. Walks
+/// the init bytecode skipping PUSH1..PUSH32 immediates; on the first
+/// `RETURN(0xf3)` immediately followed by `STOP(0x00)` it returns the bytes
+/// AFTER the STOP. With no such pair it falls back to a 32-byte zero word — the
+/// pre-Constantinople fallback (`new byte[DataWord.WORD_SIZE]`); java only ever
+/// calls this when `allowTvmConstantinople()` is false, so the post-fork empty
+/// fallback is unreachable here.
+fn program_precompile_get_code(ops: &[u8]) -> Vec<u8> {
+    let mut i = 0usize;
+    while i < ops.len() {
+        let op = ops[i];
+        // RETURN(0xf3) immediately followed by STOP(0x00): take everything after
+        // the STOP (java advances `i` to the STOP, then copies `ops[i+1..]`).
+        if op == 0xf3 && i + 1 < ops.len() && ops[i + 1] == 0x00 {
+            return ops.get(i + 2..).map(<[u8]>::to_vec).unwrap_or_default();
+        }
+        // PUSH1..PUSH32 carry 1..32 immediate bytes that must not be scanned.
+        if (0x60..=0x7f).contains(&op) {
+            i += (op - 0x60) as usize + 1;
+        }
+        i += 1;
+    }
+    vec![0u8; 32]
+}
+
 /// Same as [`execute_create`], but also returns internal-transaction
 /// traces captured by the inspector. The top-level frame is a CALL (we
 /// pre-install init code and call it), so every CREATE/CREATE2 entry
@@ -1451,7 +1533,8 @@ pub fn execute_create_with_trace(
     // energy table (Frontier base — SLOAD 50, CALL 40, EXP base 10 … — with
     // MLOAD/MSTORE/MSTORE8 at base 1). Done before installing the TRON opcode
     // stubs so their gas entries (0xd0..0xd4) survive.
-    *instructions.gas_table_mut() = crate::tron_static_gas_table();
+    *instructions.gas_table_mut() =
+        crate::tron_static_gas_table(proposals.allow_higher_limit_for_max_cpu_time_of_one_tx);
     crate::evm::install_tron_opcode_stubs(&mut instructions, &proposals);
     let mut trc10 = crate::trc10::Trc10Inspector::new(Arc::clone(&stores.accounts));
     if dynamic_energy_active(&stores.dynamic_properties) {
@@ -1485,7 +1568,10 @@ pub fn execute_create_with_trace(
             proposals
                 .allow_tvm_transfer_trc10
                 .then(|| EvmAddress::from_slice(&BLACKHOLE_EVM_ADDRESS)),
+            Some(proposals.allow_energy_adjustment),
         );
+        ctx.journaled_state
+            .set_tron_chain_id_word(Some(tron_chain_id_word(stores)));
     }
     let mut evm = Evm {
         ctx,
@@ -1587,20 +1673,35 @@ pub fn execute_create_with_trace(
                     energy_used: energy_limit,
                 }
             } else {
-                let runtime_hash = if runtime_code.is_empty() {
+                // java-tron derives the STORED deployed code differently across
+                // ALLOW_TVM_CONSTANTINOPLE (proposal #26, mainnet ~block 5.89M):
+                //  - post-Constantinople (VMActuator.java:219-221): the init-code
+                //    RETURN value (`getHReturn()`), saved post-execution.
+                //  - pre-Constantinople (VMActuator.java:433-435): the STATIC
+                //    `ProgramPrecompile.getCode(initCode)` computed at DEPLOY
+                //    time from the init bytecode (NOT the executed return).
+                // Energy (`runtime_code.len() * 200`) and the EF/OOG checks above
+                // always use the RETURN value in BOTH eras (matching java
+                // VMActuator.java:203,209) — only the STORED bytes branch here.
+                let stored_code: Vec<u8> = if proposals.allow_tvm_constantinople {
+                    runtime_code.clone()
+                } else {
+                    program_precompile_get_code(init_code)
+                };
+                let runtime_hash = if stored_code.is_empty() {
                     vec![]
                 } else {
-                    tron_crypto::hash::keccak256(&runtime_code).to_vec()
+                    tron_crypto::hash::keccak256(&stored_code).to_vec()
                 };
-                if !runtime_code.is_empty() {
-                    // Runtime code keyed by ADDRESS (overwrites the init code
+                if !stored_code.is_empty() {
+                    // Deployed code keyed by ADDRESS (overwrites the init code
                     // pre-installed at the same key), matching java-tron.
                     stores
                         .code
-                        .put(tron_contract_addr.as_bytes(), &runtime_code)
+                        .put(tron_contract_addr.as_bytes(), &stored_code)
                         .expect("db error in execute_create writing runtime code");
                 }
-                // Replace init code on the Account with the runtime code, and
+                // Replace init code on the Account with the deployed code, and
                 // mark it a contract account. java-tron VMActuator:
                 // `createAccount(addr, newSmartContract.getName(), Contract)` —
                 // the account carries the DECLARED contract name (not
@@ -1608,7 +1709,7 @@ pub fn execute_create_with_trace(
                 // `AccountType.Contract` (consensus-relevant: TransferActuator
                 // rejects plain TRX transfers to Contract-type accounts).
                 if let Ok(Some(mut acct)) = stores.accounts.get(&tron_contract_addr) {
-                    acct.code = runtime_code;
+                    acct.code = stored_code;
                     acct.code_hash = runtime_hash.clone();
                     acct.r#type = tron_proto::AccountType::Contract as i32;
                     if acct.account_name.is_empty() {
@@ -1828,6 +1929,35 @@ mod chain_id_tests {
         assert_eq!(chain_id_from_genesis(&genesis), 0x2b6653dc);
         assert_eq!(chain_id_from_genesis(&genesis), 728126428);
     }
+
+    /// VM-2: pre-#60/#71 the CHAINID word is the FULL 32-byte genesis id; once
+    /// ALLOW_TVM_COMPATIBLE_EVM (#60) / ALLOW_OPTIMIZED_RETURN_VALUE_OF_CHAIN_ID
+    /// (#71) is active it truncates to the last 4 bytes (mainnet 0x2b6653dc).
+    #[test]
+    fn chain_id_word_full_pre_60_then_truncated() {
+        use super::chain_id_word_from_genesis;
+        use revm::primitives::U256;
+        let mut genesis = [0u8; 32];
+        let s = "00000000000000001ebf88508a03865c71d452e25f4d51194196a1d22b6653dc";
+        for (i, byte) in genesis.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        // Post-#60/#71 (mainnet snapshot): truncated to the last 4 bytes.
+        assert_eq!(
+            chain_id_word_from_genesis(&genesis, true),
+            U256::from(0x2b6653dc_u64)
+        );
+        // Istanbul..#60 window: the FULL 32-byte genesis id.
+        assert_eq!(
+            chain_id_word_from_genesis(&genesis, false),
+            U256::from_be_bytes(genesis)
+        );
+        assert_ne!(
+            chain_id_word_from_genesis(&genesis, false),
+            chain_id_word_from_genesis(&genesis, true),
+            "the full genesis id must differ from the 4-byte truncation"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1882,5 +2012,55 @@ mod address_derivation_tests {
         wrong_addr[0] = 0x41;
         wrong_addr[1..].copy_from_slice(&h[12..]);
         assert_ne!(wrong_addr, hex21("4134ed0e191531d0410613527d3d491dda030d8b5c"));
+    }
+}
+
+#[cfg(test)]
+mod program_precompile_tests {
+    use super::program_precompile_get_code;
+
+    // Byte-for-byte against java `ProgramPrecompile.getCode` (pre-#26 deploy
+    // code derivation). RETURN=0xf3, STOP=0x00, PUSH1=0x60, PUSH2=0x61.
+
+    #[test]
+    fn extracts_bytes_after_first_return_stop() {
+        // PUSH1 0x01 ; RETURN ; STOP ; <runtime>
+        let init = [0x60, 0x01, 0xf3, 0x00, 0xde, 0xad, 0xbe, 0xef];
+        assert_eq!(program_precompile_get_code(&init), vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn typical_constructor_without_trailing_stop_falls_back_to_word() {
+        // A normal constructor ends with RETURN and NO following STOP → java
+        // returns a 32-byte zero word (DataWord.WORD_SIZE) pre-Constantinople.
+        let init = [0x60, 0x20, 0x60, 0x00, 0xf3];
+        assert_eq!(program_precompile_get_code(&init), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn push_immediates_are_not_scanned_as_opcodes() {
+        // PUSH2 carries 0xf3 0x00 as DATA (must not match RETURN;STOP); the real
+        // RETURN;STOP follows and yields the trailing 0x42.
+        let init = [0x61, 0xf3, 0x00, 0xf3, 0x00, 0x42];
+        assert_eq!(program_precompile_get_code(&init), vec![0x42]);
+    }
+
+    #[test]
+    fn return_stop_at_end_yields_empty() {
+        let init = [0x60, 0x00, 0xf3, 0x00];
+        assert_eq!(program_precompile_get_code(&init), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn empty_input_falls_back_to_word() {
+        assert_eq!(program_precompile_get_code(&[]), vec![0u8; 32]);
+    }
+
+    #[test]
+    fn trailing_push_past_end_falls_back_without_panic() {
+        // PUSH32 near the end claims more immediate bytes than remain — must not
+        // panic, and finds no RETURN;STOP → fallback.
+        let init = [0x60, 0x01, 0x7f, 0xf3, 0x00];
+        assert_eq!(program_precompile_get_code(&init), vec![0u8; 32]);
     }
 }

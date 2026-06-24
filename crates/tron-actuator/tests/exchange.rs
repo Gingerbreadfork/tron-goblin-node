@@ -232,7 +232,7 @@ fn inject_rejects_missing_exchange() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeMissing), "got: {err:?}");
 }
 
@@ -255,7 +255,7 @@ fn inject_rejects_non_creator_owner() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NotExchangeOwner), "got: {err:?}");
 }
 
@@ -269,7 +269,7 @@ fn inject_rejects_token_not_in_exchange() {
         token_id: b"9999999".to_vec(), // wrong token
         quant: 100,
     };
-    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::TokenNotInExchange), "got: {err:?}");
 }
 
@@ -284,7 +284,7 @@ fn inject_rejects_zero_or_negative_quant() {
             token_id: b"_".to_vec(),
             quant,
         };
-        let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+        let err = exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveTokenQuant),
             "quant={quant} got: {err:?}"
@@ -304,7 +304,7 @@ fn inject_maintains_pool_ratio_and_debits_both_sides() {
         token_id: b"_".to_vec(),
         quant: 100_000_000,
     };
-    exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap();
     exchange::execute_exchange_inject(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
         .unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -330,7 +330,7 @@ fn inject_rejects_when_owner_lacks_other_side_balance() {
     // token and the computed counterpart (here ~10M asset); Alice has 1k, so
     // validation rejects before execute.
     let err =
-        exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+        exchange::validate_exchange_inject(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::InsufficientAssetBalance { .. }),
         "got: {err:?}"
@@ -350,7 +350,7 @@ fn withdraw_rejects_missing_exchange() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeMissing), "got: {err:?}");
 }
 
@@ -364,7 +364,7 @@ fn withdraw_rejects_non_creator_owner() {
         token_id: b"_".to_vec(),
         quant: 100,
     };
-    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap_err();
+    let err = exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::NotExchangeOwner), "got: {err:?}");
 }
 
@@ -379,7 +379,7 @@ fn withdraw_returns_both_sides_proportionally() {
         token_id: b"_".to_vec(),
         quant: 100_000_000,
     };
-    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap();
     exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
         .unwrap();
     let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -406,7 +406,7 @@ fn withdraw_below_proportional_minimum_returns_zero_other_side_and_errors() {
         quant: 1,
     };
     // Validate passes (basic length / sign checks).
-    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v2, &c).unwrap();
+    exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c).unwrap();
     // Execute: 1 * 1e12 / 1 = 1e12 which is < i64::MAX, so credit_token
     // happens; check the result against expectations.
     exchange::execute_exchange_withdraw(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
@@ -445,7 +445,7 @@ fn transaction_rejects_missing_owner_account() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::OwnerAccountMissing), "got: {err:?}");
 }
 
@@ -460,7 +460,7 @@ fn transaction_rejects_missing_exchange() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeMissing), "got: {err:?}");
 }
 
@@ -476,7 +476,7 @@ fn transaction_rejects_token_not_in_exchange() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::TokenNotInExchange), "got: {err:?}");
 }
 
@@ -493,7 +493,7 @@ fn transaction_rejects_zero_quant_or_expected() {
             expected,
         };
         let err =
-            exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+            exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
         assert!(
             matches!(err, ActuatorError::NonPositiveTokenQuant),
             "({quant},{expected}) got: {err:?}"
@@ -516,7 +516,7 @@ fn transaction_applies_bancor_pricing() {
         quant: 100_000_000,
         expected: 90_000_000, // accept slippage
     };
-    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap();
+    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // First side grew by the swapped 100_000_000; second shrank by the exact
@@ -563,7 +563,7 @@ fn transaction_rejects_when_owner_lacks_input_balance() {
     // cannot fund the TRX swap (`balance < tokenQuant + calcFee()`); the prior
     // version deferred this to execute. Now validate catches it like java.
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::InsufficientBalance { .. }),
         "got: {err:?}"
@@ -583,7 +583,7 @@ fn transaction_rejects_closed_exchange() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(matches!(err, ActuatorError::ExchangeClosed), "got: {err:?}");
 }
 
@@ -602,7 +602,7 @@ fn transaction_rejects_balance_limit_exceeded() {
         expected: 1,
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::ExchangeBalanceLimitExceeded),
         "got: {err:?}"
@@ -623,7 +623,7 @@ fn transaction_rejects_output_below_expected_in_validate() {
         expected: 99_999_999_999, // unattainable
     };
     let err =
-        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap_err();
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap_err();
     assert!(
         matches!(err, ActuatorError::ExchangeOutputBelowExpected),
         "got: {err:?}"
@@ -642,7 +642,7 @@ fn transaction_with_swap_in_opposite_direction_also_works() {
         quant: 100_000_000,
         expected: 1,
     };
-    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v2, &ctx.dp, &c).unwrap();
+    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
     exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1,&c).unwrap();
     let ex = ctx.v2.get(1).unwrap().unwrap();
     // Asset side grew, TRX side shrank.
@@ -709,7 +709,7 @@ fn flag0_exchange_inject_reads_and_dual_writes_v1() {
         quant: 100_000_000,
     };
     // READ side: validate must ACCEPT at flag=0 (reads V1). Fails on asset_v2-only code.
-    exchange::validate_exchange_inject(&accounts, &dp, &v2, &c).unwrap();
+    exchange::validate_exchange_inject(&accounts, &dp, &v1, &v2, &c).unwrap();
     // WRITE side: execute debits the proportional 1e7 BTT.
     exchange::execute_exchange_inject(&accounts, &v1, &v2, &dp, &av1, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
@@ -765,7 +765,7 @@ fn flag0_exchange_transaction_credit_dual_writes_v1() {
         quant: 100_000_000,
         expected: 1,
     };
-    exchange::validate_exchange_transaction(&accounts, &v2, &dp, &c).unwrap();
+    exchange::validate_exchange_transaction(&accounts, &v1, &v2, &dp, &c).unwrap();
     exchange::execute_exchange_transaction(&accounts, &v1, &v2, &dp, &av1, &c).unwrap();
     let alice = accounts.get(&addr(ALICE)).unwrap().unwrap();
     let v1_bal = *alice.asset.get("BTT").unwrap();

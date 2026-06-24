@@ -25,6 +25,14 @@ pub struct CreateInputs {
     /// version. A top-level CREATE forces 1 (`VMActuator.java:415`). Governs the
     /// child's EIP-150 1/64 retention + GASPRICE. Default `0` (legacy).
     tron_contract_version: i32,
+    /// **TRON fork** — pre-`ALLOW_TVM_ISTANBUL` (#41) override for the CREATE2
+    /// address-derivation sender. java `Program.createContract2`:
+    /// `senderAddress = allowTvmIstanbul() ? getContextAddress() :
+    /// getCallerAddress()`. ONLY the `generateContractAddress2` input changes —
+    /// value/nonce stay on `caller` (java's `createContractImpl` sources the
+    /// endowment from `getContextAddress()`). `None` → use `caller`
+    /// (post-Istanbul, or any non-CREATE2 create).
+    tron_create2_sender: Option<Address>,
     /// Cached created address. This is computed lazily and cached to avoid
     /// redundant keccak computations when inspectors call `created_address`.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -54,6 +62,7 @@ impl CreateInputs {
             gas_limit,
             reservoir,
             tron_contract_version: 0,
+            tron_create2_sender: None,
             cached_address: OnceCell::new(),
             cached_init_code_hash: OnceCell::new(),
         }
@@ -68,6 +77,13 @@ impl CreateInputs {
     /// **TRON fork** — set the version the init frame runs as.
     pub const fn set_tron_contract_version(&mut self, version: i32) {
         self.tron_contract_version = version;
+    }
+
+    /// **TRON fork** — set the pre-Istanbul CREATE2 address-derivation sender
+    /// override (see the field doc). Set by the CREATE2 opcode handler when
+    /// `ALLOW_TVM_ISTANBUL` (#41) is not yet active.
+    pub const fn set_tron_create2_sender(&mut self, sender: Option<Address>) {
+        self.tron_create2_sender = sender;
     }
 
     /// Returns the address that this create call will create.
@@ -88,7 +104,12 @@ impl CreateInputs {
         *self.cached_address.get_or_init(|| match self.scheme {
             CreateScheme::Create => self.caller.create(nonce),
             CreateScheme::Create2 { salt } => {
-                tron_create2_address(&self.caller, B256::from(salt.to_be_bytes()), self.init_code_hash())
+                // Pre-Istanbul (#41) the derivation sender is the CALLER of the
+                // executing frame (`tron_create2_sender`), not the executing
+                // contract; post-Istanbul and by default it is `caller` (= the
+                // executing contract). java `Program.createContract2`.
+                let sender = self.tron_create2_sender.unwrap_or(self.caller);
+                tron_create2_address(&sender, B256::from(salt.to_be_bytes()), self.init_code_hash())
             }
             CreateScheme::Custom { address } => address,
         })
@@ -236,6 +257,41 @@ mod tron_address_tests {
         buf.extend_from_slice(salt.as_slice());
         buf.extend_from_slice(code_hash.as_slice());
         assert_eq!(tron, Address::from_word(keccak256(&buf)));
+    }
+
+    /// VM-3: pre-Istanbul CREATE2 derives the address from the frame's CALLER,
+    /// not the executing contract. `tron_create2_sender` overrides ONLY the
+    /// address-derivation sender; with no override it is `caller`.
+    #[test]
+    fn tron_create2_sender_override_changes_the_derivation_sender() {
+        let context = addr_hex("1111111111111111111111111111111111111111");
+        let frame_caller = addr_hex("2222222222222222222222222222222222222222");
+        let salt = U256::from(7u64);
+        let code = Bytes::from_static(&[0x60, 0x00]); // PUSH1 0
+        let salt_b256 = B256::from(salt.to_be_bytes());
+        let code_hash = keccak256(code.as_ref());
+
+        // Default (post-Istanbul / no override): derived from `caller` (=context).
+        let default_inputs =
+            CreateInputs::new(context, CreateScheme::Create2 { salt }, U256::ZERO, code.clone(), 0, 0);
+        assert_eq!(
+            default_inputs.created_address(0),
+            tron_create2_address(&context, salt_b256, code_hash),
+        );
+
+        // Pre-Istanbul override: derived from the frame's caller instead.
+        let mut overridden =
+            CreateInputs::new(context, CreateScheme::Create2 { salt }, U256::ZERO, code, 0, 0);
+        overridden.set_tron_create2_sender(Some(frame_caller));
+        assert_eq!(
+            overridden.created_address(0),
+            tron_create2_address(&frame_caller, salt_b256, code_hash),
+        );
+        assert_ne!(
+            default_inputs.created_address(0),
+            overridden.created_address(0),
+            "the sender override must change the CREATE2 address"
+        );
     }
 
     /// Nested-CREATE address pins the `rootTxId || nonce_be8` layout.

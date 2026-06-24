@@ -76,16 +76,21 @@ pub fn execute_witness_create(
         .unwrap_or(9_999_000_000);
     owner_account.balance = check_sub(owner_account.balance, fee)?;
     owner_account.is_witness = true;
+    // java WitnessCreateActuator.createWitness: when ALLOW_MULTI_SIGN (#18) is on
+    // it calls `setDefaultWitnessPermission`, attaching the default witness
+    // (id=1) plus owner (id=0) / active (id=2) permission rows when absent.
+    // Inert pre-activation; without it every post-activation WitnessCreate
+    // serializes the witness account without its permission table and forks the
+    // state root from java.
+    tron_chainbase::set_default_witness_permission(&mut owner_account, dyn_props);
     accounts.put(&owner, &owner_account)?;
 
-    // java WitnessCreateActuator.createWitness: after debiting the upgrade
-    // cost it routes `cost` to the blackhole — `burnTrx(cost)` when
+    // java WitnessCreateActuator.createWitness (:142-147): after debiting the
+    // upgrade cost it routes `cost` to the blackhole — `burnTrx(cost)` once
     // `supportBlackHoleOptimization()` is on, otherwise crediting the blackhole
-    // *account*. Mainnet has the optimization active (the only path we model;
-    // the legacy account-credit is approximated as a burn here, mirroring the
-    // bandwidth/energy fee paths), so the BURN_TRX_AMOUNT accumulator tracks
-    // every witness-create cost as java does.
-    dyn_props.burn_trx(fee);
+    // *account* via `adjustBalance`. `dispose_fee_to_blackhole` reproduces both
+    // arms (pre-opt account credit on the from-genesis chain, burn after #49).
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
 
     let witness = Witness {
         address: owner.as_bytes().to_vec(),

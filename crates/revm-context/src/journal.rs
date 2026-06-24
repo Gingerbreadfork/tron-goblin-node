@@ -211,6 +211,18 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn tron_allow_energy_adjustment_effective(&self) -> bool {
+        // `None` → preserve upstream (always-charge) behavior; TRON execution
+        // always sets the override from `ALLOW_ENERGY_ADJUSTMENT` (#81).
+        self.inner.cfg.tron_allow_energy_adjustment.unwrap_or(true)
+    }
+
+    #[inline]
+    fn tron_chain_id_word(&self) -> Option<U256> {
+        self.inner.cfg.tron_chain_id_word
+    }
+
+    #[inline]
     fn tron_account_created_locally(&self, address: Address) -> bool {
         self.inner
             .state
@@ -234,9 +246,16 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
         &mut self,
         restriction: Option<bool>,
         blackhole: Option<Address>,
+        energy_adjustment: Option<bool>,
     ) {
         self.inner.cfg.tron_selfdestruct_restriction = restriction;
         self.inner.cfg.tron_blackhole = blackhole;
+        self.inner.cfg.tron_allow_energy_adjustment = energy_adjustment;
+    }
+
+    #[inline]
+    fn set_tron_chain_id_word(&mut self, word: Option<U256>) {
+        self.inner.cfg.tron_chain_id_word = word;
     }
 
     #[inline]

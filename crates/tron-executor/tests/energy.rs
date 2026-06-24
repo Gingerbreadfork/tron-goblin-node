@@ -8,9 +8,10 @@ use hex_literal::hex;
 use tron_chainbase::{AccountStore, DynamicPropertiesStore, KvBackend, MemBackend};
 use tron_crypto::address::Address;
 use tron_executor::energy::{
-    account_energy_limit_with_fix_ratio, consume_energy, effective_origin_energy_limit,
-    get_pre_tx_energy, pay_energy_bill, reset_energy_pre_consume, revert_energy_pre_consume,
-    vm_energy_budget_create, vm_energy_budget_trigger, EnergyBill, EnergyCharge, EnergyError,
+    account_energy_limit_with_fix_ratio, account_energy_limit_with_float_ratio, consume_energy,
+    effective_origin_energy_limit, get_pre_tx_energy, pay_energy_bill, reset_energy_pre_consume,
+    revert_energy_pre_consume, total_energy_limit_with_float_ratio, vm_energy_budget_create,
+    vm_energy_budget_trigger, EnergyBill, EnergyCharge, EnergyError,
 };
 use tron_proto::account::{AccountResource, FreezeV2, Frozen};
 use tron_proto::Account;
@@ -48,6 +49,14 @@ fn seed_global_energy(env: &Env, total_limit: i64, total_weight: i64) {
     env.dyn_props.save_total_energy_current_limit(total_limit);
     env.dyn_props.save_total_energy_weight(total_weight);
     env.dyn_props.save_unfreeze_delay_days(1); // turn on supportUnfreezeDelay → V2 formula
+    // Model the post-#49 mainnet era (the validated snapshot range): a disposed
+    // energy fee is burned (BURN_TRX_AMOUNT) rather than credited to the
+    // blackhole account. Pre-#49 credit behavior is covered by tron-chainbase's
+    // dispose_fee_to_blackhole unit tests.
+    env.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
+    // Model a post-ENERGY_LIMIT_HARD_FORK (4,727,890) block so the VM energy
+    // budget uses the FIX ratio; the pre-fork float-ratio path has its own test.
+    env.dyn_props.save_latest_block_header_number(60_000_000);
 }
 
 #[test]
@@ -100,9 +109,78 @@ fn zero_quota_falls_back_to_trx_fee() {
     }
     let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
     assert_eq!(after.balance, 900_000);
-    // Burn counter bumped.
+    // Burn counter bumped (no fee pool, no blackhole-opt → burn).
     assert_eq!(env.dyn_props.burn_trx_amount(), 100_000);
-    assert_eq!(env.dyn_props.total_transaction_cost(), 100_000);
+    // TOTAL_TRANSACTION_COST is NOT bumped by energy fees: java only adds to it
+    // in the bandwidth path (BandwidthProcessor.useTransactionFee), never in the
+    // energy path (ReceiptCapsule.payEnergyBill).
+    assert_eq!(env.dyn_props.total_transaction_cost(), 0);
+}
+
+#[test]
+fn energy_fee_pool_excludes_out_of_time() {
+    use tron_executor::energy::set_tx_out_of_time;
+    // With ALLOW_TRANSACTION_FEE_POOL on, a normal tx's energy fee goes to the
+    // transaction-fee pool, but an OUT_OF_TIME tx's energy fee is EXCLUDED and
+    // burns instead — java `ReceiptCapsule.payEnergyBill`'s
+    // `supportTransactionFeePool() && !contractResult.equals(OUT_OF_TIME)`.
+    let env = Env::new();
+    seed_global_energy(&env, /*total_limit=*/ 0, /*total_weight=*/ 0); // no frozen → full fee
+    env.dyn_props.put_long(b"ALLOW_TRANSACTION_FEE_POOL", 1);
+    put(
+        &env.accounts,
+        ALICE,
+        Account { address: ALICE.to_vec(), balance: 1_000_000, ..Default::default() },
+    );
+
+    // Normal (not OUT_OF_TIME): 1000 energy × 100 sun = 100_000 fee → pool.
+    set_tx_out_of_time(false);
+    consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 1_000, 0).unwrap();
+    assert_eq!(env.dyn_props.transaction_fee_pool(), 100_000);
+    assert_eq!(env.dyn_props.burn_trx_amount(), 0);
+
+    // OUT_OF_TIME: the fee is excluded from the pool and burned instead.
+    set_tx_out_of_time(true);
+    consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 1_000, 0).unwrap();
+    assert_eq!(env.dyn_props.transaction_fee_pool(), 100_000, "pool unchanged for OUT_OF_TIME");
+    assert_eq!(env.dyn_props.burn_trx_amount(), 100_000, "OUT_OF_TIME energy fee burned");
+
+    // Reset the per-thread flag so sibling tests see the default.
+    set_tx_out_of_time(false);
+}
+
+#[test]
+fn float_ratio_budget_pre_energy_limit_hard_fork() {
+    // VME-1: pre-ENERGY_LIMIT_HARD_FORK (block 4,727,890) the VM energy budget
+    // uses the FLOAT ratio. With no frozen energy it reduces to feeLimit/spe and
+    // matches the fix ratio; the caller/creator split has no per-origin cap.
+    let env = Env::new();
+    let caller = Account { address: ALICE.to_vec(), balance: 100_000_000, ..Default::default() };
+    let fee_limit = 1_000_000;
+    let spe = 100; // default sun_per_energy (energy_fee unset)
+
+    let caller_budget =
+        account_energy_limit_with_float_ratio(&caller, &env.dyn_props, fee_limit, 0, 0);
+    assert_eq!(caller_budget, fee_limit / spe, "no frozen energy → feeLimit / spe");
+    // No frozen energy → the float ratio equals the fix ratio.
+    assert_eq!(
+        caller_budget,
+        account_energy_limit_with_fix_ratio(&caller, &env.dyn_props, fee_limit, 0, 0)
+    );
+
+    // creator == caller → just the caller budget.
+    assert_eq!(
+        total_energy_limit_with_float_ratio(&caller, &caller, &env.dyn_props, 50, fee_limit, 0, 0),
+        caller_budget
+    );
+
+    // Distinct creator with no frozen energy → caller + 0 (the else branch).
+    let creator = Account { address: BOB.to_vec(), balance: 0, ..Default::default() };
+    assert_eq!(
+        total_energy_limit_with_float_ratio(&creator, &caller, &env.dyn_props, 50, fee_limit, 0, 0),
+        caller_budget,
+        "creator with no frozen energy adds nothing"
+    );
 }
 
 #[test]

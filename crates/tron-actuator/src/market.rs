@@ -185,11 +185,11 @@ pub fn execute_market_sell_asset(
     account.balance = check_sub(account.balance, fee)?;
     // java MarketSellAssetActuator.execute (MarketSellAssetActuator.java:127-132):
     // after debiting the owner it sends `fee` to the blackhole — `burnTrx(fee)`
-    // on the supportBlackHoleOptimization path (mainnet), else crediting the
-    // blackhole account (approximated as a burn here). Market is disabled on
-    // mainnet and MARKET_SELL_FEE defaults to 0, so this is doubly inert, but
-    // it keeps BURN_TRX_AMOUNT exact if the market is ever activated with a fee.
-    dyn_props.burn_trx(fee);
+    // on the supportBlackHoleOptimization path, else crediting the blackhole
+    // account (the from-genesis arm); `dispose_fee_to_blackhole` does both.
+    // Market is disabled on mainnet and MARKET_SELL_FEE defaults to 0, so this
+    // is doubly inert, but stays exact if the market is ever activated.
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
     debit_token_impl(&mut account, &contract.sell_token_id, contract.sell_token_quantity)?;
     accounts.put(&owner, &account)?;
 
@@ -299,11 +299,11 @@ pub fn execute_market_cancel_order(
     account.balance = check_sub(account.balance, fee)?;
     // java MarketCancelOrderActuator.execute (MarketCancelOrderActuator.java:97-102):
     // after debiting the owner it sends `fee` to the blackhole — `burnTrx(fee)`
-    // on the supportBlackHoleOptimization path (mainnet), else crediting the
-    // blackhole account (approximated as a burn here). Market is disabled on
-    // mainnet and MARKET_CANCEL_FEE defaults to 0, so this is doubly inert, but
-    // it keeps BURN_TRX_AMOUNT exact if the market is ever activated with a fee.
-    dyn_props.burn_trx(fee);
+    // on the supportBlackHoleOptimization path, else crediting the blackhole
+    // account (the from-genesis arm); `dispose_fee_to_blackhole` does both.
+    // Market is disabled on mainnet and MARKET_CANCEL_FEE defaults to 0, so this
+    // is doubly inert, but stays exact if the market is ever activated.
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)?;
     // Return the unfilled sell quantity to the owner.
     credit_token_impl(&mut account, &order.sell_token_id, order.sell_token_quantity_remain)?;
     accounts.put(&owner, &account)?;
@@ -572,6 +572,9 @@ mod tests {
 
         let owner = test_owner();
         dyn_props.put_long(b"MARKET_SELL_FEE", FEE);
+        // Model the post-#49 mainnet era so the fee is burned (the pre-#49
+        // blackhole-account credit is covered by chainbase's fee unit tests).
+        dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
         accounts
             .put(
                 &owner,
@@ -625,6 +628,9 @@ mod tests {
 
         let owner = test_owner();
         dyn_props.put_long(b"MARKET_CANCEL_FEE", FEE);
+        // Model the post-#49 mainnet era so the fee is burned (the pre-#49
+        // blackhole-account credit is covered by chainbase's fee unit tests).
+        dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
         accounts
             .put(
                 &owner,

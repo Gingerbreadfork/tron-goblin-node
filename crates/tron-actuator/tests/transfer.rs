@@ -260,6 +260,9 @@ fn execute_charges_create_fee_when_recipient_absent() {
     let (_b, accounts, dyn_props) = fresh();
     fund(&accounts, ALICE, 100);
     dyn_props.put_long(b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT", 5);
+    // Post-#49 mainnet era: the create fee is burned (pre-#49 blackhole-account
+    // credit is covered by chainbase's dispose_fee_to_blackhole unit tests).
+    dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
 
     let contract = transfer(ALICE, BOB, 30);
     validate_transfer(&accounts, &dyn_props, &contract).unwrap();

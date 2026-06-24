@@ -71,8 +71,17 @@ pub fn validate_freeze_balance(
     // set and ALLOW_DELEGATE_RESOURCE is on, the freeze delegates the resource.
     // The receiver must be a valid, existing, non-self account; once
     // ALLOW_TVM_CONSTANTINOPLE is live a contract receiver is rejected.
-    let receiver = decode_receiver(&contract.receiver_address)?;
+    // java guards the receiver block on `!isEmpty(receiver) && supportDR()`
+    // (FreezeBalanceActuator.java:245 / UnfreezeBalanceActuator.java:339), so
+    // `DecodeUtil.addressValid` runs only once ALLOW_DELEGATE_RESOURCE is on.
+    // Pre-activation a non-empty malformed receiver is ignored (pure self-op);
+    // decoding it unconditionally would reject a tx java accepts.
     let support_dr = dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) == 1;
+    let receiver = if support_dr {
+        decode_receiver(&contract.receiver_address)?
+    } else {
+        None
+    };
     if let (Some(receiver), true) = (receiver, support_dr) {
         if receiver == owner {
             return Err(ActuatorError::ReceiverSameAsOwner);
@@ -118,8 +127,17 @@ pub fn execute_freeze_balance(
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let expire = now + contract.frozen_duration * FROZEN_PERIOD_MS / 3; // duration is in days; we treat 1 = 3-day base
 
-    let receiver = decode_receiver(&contract.receiver_address)?;
+    // java guards the receiver block on `!isEmpty(receiver) && supportDR()`
+    // (FreezeBalanceActuator.java:245 / UnfreezeBalanceActuator.java:339), so
+    // `DecodeUtil.addressValid` runs only once ALLOW_DELEGATE_RESOURCE is on.
+    // Pre-activation a non-empty malformed receiver is ignored (pure self-op);
+    // decoding it unconditionally would reject a tx java accepts.
     let support_dr = dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) == 1;
+    let receiver = if support_dr {
+        decode_receiver(&contract.receiver_address)?
+    } else {
+        None
+    };
 
     // Chain-wide weight delta. java-tron's `FreezeBalanceActuator.addTotalWeight`:
     //   weight = allowNewReward() ? increment : freezeBalance / TRX_PRECISION
@@ -366,8 +384,17 @@ pub fn validate_unfreeze_balance(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-    let receiver = decode_receiver(&contract.receiver_address)?;
+    // java guards the receiver block on `!isEmpty(receiver) && supportDR()`
+    // (FreezeBalanceActuator.java:245 / UnfreezeBalanceActuator.java:339), so
+    // `DecodeUtil.addressValid` runs only once ALLOW_DELEGATE_RESOURCE is on.
+    // Pre-activation a non-empty malformed receiver is ignored (pure self-op);
+    // decoding it unconditionally would reject a tx java accepts.
     let support_dr = dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) == 1;
+    let receiver = if support_dr {
+        decode_receiver(&contract.receiver_address)?
+    } else {
+        None
+    };
 
     if let (Some(receiver), true) = (receiver, support_dr) {
         // === Delegated (receiver) branch — java validate ===
@@ -501,8 +528,17 @@ pub fn execute_unfreeze_balance(
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-    let receiver = decode_receiver(&contract.receiver_address)?;
+    // java guards the receiver block on `!isEmpty(receiver) && supportDR()`
+    // (FreezeBalanceActuator.java:245 / UnfreezeBalanceActuator.java:339), so
+    // `DecodeUtil.addressValid` runs only once ALLOW_DELEGATE_RESOURCE is on.
+    // Pre-activation a non-empty malformed receiver is ignored (pure self-op);
+    // decoding it unconditionally would reject a tx java accepts.
     let support_dr = dyn_props.get_long(b"ALLOW_DELEGATE_RESOURCE").unwrap_or(0) == 1;
+    let receiver = if support_dr {
+        decode_receiver(&contract.receiver_address)?
+    } else {
+        None
+    };
 
     // `unfreeze_balance` (sun) and `decrease` (TRX-unit weight delta as a
     // floor-DIFFERENCE — java computes `new/1e6 − old/1e6` per branch,

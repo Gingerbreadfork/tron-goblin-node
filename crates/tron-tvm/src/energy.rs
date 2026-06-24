@@ -102,11 +102,15 @@ pub fn tron_gas_params_for(retain_call_gas_64th: bool) -> GasParams {
 /// revm's Frontier static table already matches TRON's per-opcode costs
 /// (SLOAD 50, CALL 40, EXP base 10, JUMPI 10, …). TRON has two deviations:
 ///
-/// 1. **MLOAD / MSTORE / MSTORE8 carry a base of 1** (plus memory expansion),
-///    not Ethereum's VERY_LOW tier (3). Verified against java-tron via
-///    `triggerconstantcontract` — with base 3 our `energy_used` ran exactly
+/// 1. **MLOAD / MSTORE / MSTORE8 carry a base of 1 post-#65** (plus memory
+///    expansion), not Ethereum's VERY_LOW tier (3). Verified against java-tron
+///    via `triggerconstantcontract` — with base 3 our `energy_used` ran exactly
 ///    `2 × (#MLOAD + #MSTORE)` high on every call (decimals +8, balanceOf +12,
-///    string returns +30); base 1 makes it match exactly.
+///    string returns +30); base 1 makes it match exactly. But java
+///    `OperationRegistry.adjustMemOperations` adds that `SPECIAL_TIER` base only
+///    when `ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX` (#65) is active —
+///    pre-#65 the three ops have NO base (memory expansion only), hence the
+///    `allow_higher_limit` gate.
 ///
 /// 2. **CODECOPY / CALLDATACOPY / RETURNDATACOPY carry NO base** (just memory
 ///    expansion + the 3-per-word copy cost), not Ethereum's VERY_LOW tier (3).
@@ -120,7 +124,7 @@ pub fn tron_gas_params_for(retain_call_gas_64th: bool) -> GasParams {
 ///    asymmetry: EXTCODECOPY keeps its base (java `EXT_CODE_COPY = 20`) and
 ///    MCOPY keeps VERY_LOW (java `getMCopyCost = VERY_LOW_TIER + calcMemEnergy`),
 ///    so only the three bare copies are zeroed here.
-pub fn tron_static_gas_table() -> [u16; 256] {
+pub fn tron_static_gas_table(allow_higher_limit: bool) -> [u16; 256] {
     // Opcodes: MLOAD=0x51, MSTORE=0x52, MSTORE8=0x53.
     const MLOAD: usize = 0x51;
     const MSTORE: usize = 0x52;
@@ -131,9 +135,13 @@ pub fn tron_static_gas_table() -> [u16; 256] {
     const CODECOPY: usize = 0x39;
     const RETURNDATACOPY: usize = 0x3e;
     let mut table = revm::interpreter::gas_table();
-    table[MLOAD] = 1;
-    table[MSTORE] = 1;
-    table[MSTORE8] = 1;
+    // The MLOAD/MSTORE/MSTORE8 SPECIAL_TIER base (1) is added only post-#65
+    // (`ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX`); pre-#65 they carry
+    // memory-expansion cost only — see the doc comment above.
+    let mem_base = u16::from(allow_higher_limit);
+    table[MLOAD] = mem_base;
+    table[MSTORE] = mem_base;
+    table[MSTORE8] = mem_base;
     table[CALLDATACOPY] = 0;
     table[CODECOPY] = 0;
     table[RETURNDATACOPY] = 0;
@@ -374,16 +382,29 @@ mod static_table_parity_tests {
     /// VERY_LOW = 3; MLOAD/MSTORE/MSTORE8 are 1.
     #[test]
     fn copy_opcode_bases_match_java() {
-        let t = tron_static_gas_table();
+        // post-#65 (ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX active):
+        // MLOAD/MSTORE/MSTORE8 carry the SPECIAL_TIER base 1.
+        let t = tron_static_gas_table(true);
         assert_eq!(t[0x37], 0, "CALLDATACOPY base must be 0");
         assert_eq!(t[0x39], 0, "CODECOPY base must be 0");
         assert_eq!(t[0x3e], 0, "RETURNDATACOPY base must be 0");
         assert_eq!(t[0x3c], 20, "EXTCODECOPY keeps EXT_CODE_COPY=20");
         assert_eq!(t[0x5e], 3, "MCOPY keeps VERY_LOW=3");
-        assert_eq!(t[0x51], 1, "MLOAD base 1");
-        assert_eq!(t[0x52], 1, "MSTORE base 1");
-        assert_eq!(t[0x53], 1, "MSTORE8 base 1");
+        assert_eq!(t[0x51], 1, "MLOAD base 1 post-#65");
+        assert_eq!(t[0x52], 1, "MSTORE base 1 post-#65");
+        assert_eq!(t[0x53], 1, "MSTORE8 base 1 post-#65");
         // sanity: a normal VERY_LOW op is untouched.
         assert_eq!(t[0x01], 3, "ADD stays VERY_LOW=3");
+
+        // pre-#65: java's base jump table registers MLOAD/MSTORE/MSTORE8 with
+        // the bare `calcMemEnergy` cost (no tier), so the base is 0; the copy
+        // ops and every other opcode are unchanged across the gate.
+        let t0 = tron_static_gas_table(false);
+        assert_eq!(t0[0x51], 0, "MLOAD base 0 pre-#65");
+        assert_eq!(t0[0x52], 0, "MSTORE base 0 pre-#65");
+        assert_eq!(t0[0x53], 0, "MSTORE8 base 0 pre-#65");
+        assert_eq!(t0[0x37], 0, "CALLDATACOPY base 0 in both eras");
+        assert_eq!(t0[0x5e], 3, "MCOPY VERY_LOW unchanged pre-#65");
+        assert_eq!(t0[0x01], 3, "ADD stays VERY_LOW=3 pre-#65");
     }
 }

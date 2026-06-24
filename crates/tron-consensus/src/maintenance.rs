@@ -33,6 +33,29 @@ use tron_crypto::address::Address;
 
 use crate::slot::MAX_ACTIVE_WITNESS_NUM;
 
+/// Lowercase-hex encode, used only by the env-gated maintenance vote trace
+/// (keeps the instrument self-contained without pulling `hex` into the lib).
+fn votelog_hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Parse a `41…` (optionally `0x`-prefixed) hex address from the
+/// `TRON_VOTELOG_TARGET` env var. Returns `None` on any malformed input.
+fn votelog_hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
 /// 6 hours in milliseconds — the default value of the
 /// `MAINTENANCE_TIME_INTERVAL` proposal parameter on mainnet.
 pub const DEFAULT_MAINTENANCE_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
@@ -133,6 +156,16 @@ pub fn update_active_witnesses(
         buf.copy_from_slice(raw);
         Some(Address::from_raw(buf))
     }
+    // Divergence-hunt instrument (env-gated, inert in production): when
+    // TRON_VOTELOG_TARGET names one or more `41…`-hex witness addresses,
+    // emit every voter record's old/new contribution to those witnesses this
+    // cycle. Paired with the per-maintenance countVote line the executor
+    // emits under TRON_MAINT_VOTELOG, this isolates the exact voter whose
+    // tally drifts from java-tron at a witness-schedule divergence.
+    let votelog_targets: Vec<Vec<u8>> = std::env::var("TRON_VOTELOG_TARGET")
+        .ok()
+        .map(|s| s.split(',').filter_map(|h| votelog_hex_decode(h.trim())).collect())
+        .unwrap_or_default();
     let mut deltas: HashMap<Address, i64> = HashMap::new();
     for voter in voters {
         let Some(record) = votes.get(voter)? else {
@@ -146,6 +179,29 @@ pub fn update_active_witnesses(
         for v in &record.new_votes {
             if let Some(witness_addr) = vote_addr(&v.vote_address) {
                 *deltas.entry(witness_addr).or_insert(0) += v.vote_count;
+            }
+        }
+        for t in &votelog_targets {
+            let old: i64 = record
+                .old_votes
+                .iter()
+                .filter(|v| v.vote_address == *t)
+                .map(|v| v.vote_count)
+                .sum();
+            let new: i64 = record
+                .new_votes
+                .iter()
+                .filter(|v| v.vote_address == *t)
+                .map(|v| v.vote_count)
+                .sum();
+            if old != 0 || new != 0 {
+                eprintln!(
+                    "MAINTVOTE_VOTER voter={} witness={} old={} new={}",
+                    votelog_hex_encode(voter.as_bytes()),
+                    votelog_hex_encode(t),
+                    old,
+                    new
+                );
             }
         }
     }
@@ -211,7 +267,7 @@ pub fn update_active_witnesses(
 /// under 32-bit `int` wraparound (`h = h * 31 + b`), and maps a zero result to
 /// `1`. The witness address is hashed in its 21-byte `0x41`-prefixed form, the
 /// same bytes java's `WitnessCapsule.getAddress()` carries.
-fn bytestring_hash_code(bytes: &[u8]) -> i32 {
+pub fn bytestring_hash_code(bytes: &[u8]) -> i32 {
     let mut h = bytes.len() as i32;
     for &b in bytes {
         h = h.wrapping_mul(31).wrapping_add(b as i8 as i32);
@@ -377,25 +433,42 @@ pub fn apply_maintenance(
     //    Gated on a non-empty vote tally to mirror java's `if (!countWitness
     //    .isEmpty())` wrapper around `incentiveManager.reward`.
     if !allow_change_delegation && !count_witness_empty {
-        // java `IncentiveManager.reward(newWitnessAddressList)`: the argument
-        // is `MaintenanceManager`'s `newWitnessAddressList`, built by iterating
-        // `consensusDelegate.getAllWitnesses()` and appending each address in
-        // DB-iteration order (witness store keyed by address → ascending
-        // byte order). It is NOT vote-sorted. `IncentiveManager.reward` then
-        // takes `subList(0, WITNESS_STANDBY_LENGTH)` — the FIRST 127 by that
-        // address order — sums their `getVoteCount()` into `voteSum`, returns
-        // early on `voteSum <= 0`, and pays every witness in the subset
-        // `(long)(voteCount * ((double) totalPay / voteSum))` into `allowance`
-        // UNCONDITIONALLY (no `pay > 0` skip). `witnesses.all()` already
-        // returns rows in ascending key (address) order — the same as java's
-        // `getAllWitnesses()` — so no sort is applied here.
-        let by_address: Vec<(Address, i64)> = witnesses
+        // java `MaintenanceManager` builds `newWitnessAddressList` from
+        // `getAllWitnesses()` (address order), but then calls
+        // `dposService.updateWitness(newWitnessAddressList)`, which runs
+        // `consensusDelegate.sortWitness(list)` — sorting that SAME list object
+        // IN-PLACE by vote_count DESC (with the `isSortOpt`/#88-gated tie-break).
+        // It then passes the now-vote-sorted list to
+        // `incentiveManager.reward`, which takes `subList(0,
+        // WITNESS_STANDBY_LENGTH=127)`. So the standby-reward set is the TOP 127
+        // BY VOTE_COUNT (the same ranking as the active SR list), NOT the
+        // address-ordered store iteration. We must sort identically to
+        // [`update_active_witnesses`] before taking the first 127, or a
+        // high-address standby SR with enough votes is starved of allowance
+        // while a low-address one is overpaid. That starvation compounds for a
+        // self-voting witness — no reward → no extra stake → no extra self-vote
+        // → still no reward — so its stake/votes drift far below mainnet over
+        // many cycles (root of the 2,586,234 schedule divergence). `reward` then
+        // sums the subset's `getVoteCount()` into `voteSum`, returns early on
+        // `voteSum <= 0`, and pays each `(long)(voteCount * ((double) totalPay /
+        // voteSum))` into `allowance` unconditionally (no `pay > 0` skip).
+        let mut ranked: Vec<(Address, i64)> = witnesses
             .all()?
             .into_iter()
             .map(|(addr, w)| (addr, w.vote_count))
             .collect();
+        let sort_opt = dyn_props.allow_consensus_logic_optimization();
+        ranked.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                if sort_opt {
+                    b.0.as_bytes().cmp(a.0.as_bytes())
+                } else {
+                    bytestring_hash_code(b.0.as_bytes()).cmp(&bytestring_hash_code(a.0.as_bytes()))
+                }
+            })
+        });
         const STANDBY_LEN: usize = 127;
-        let subset = &by_address[..by_address.len().min(STANDBY_LEN)];
+        let subset = &ranked[..ranked.len().min(STANDBY_LEN)];
         let vote_sum: i64 = subset.iter().map(|(_, v)| *v).sum();
         if vote_sum > 0 {
             let total_pay = dyn_props.witness_standby_allowance();

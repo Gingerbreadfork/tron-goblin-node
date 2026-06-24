@@ -254,6 +254,32 @@ pub fn activate_expired_proposals(
                             dyn_props
                                 .put_long(b"ADAPTIVE_RESOURCE_LIMIT_MULTIPLIER", 50);
                         }
+                        // java `ProposalService.process` calls
+                        // `addSystemContractAndSetPermission(id)` as each newly
+                        // enabled contract type becomes proposable — OR-setting
+                        // bit `id` in BOTH the AVAILABLE_CONTRACT_TYPE and
+                        // ACTIVE_DEFAULT_OPERATIONS bitmaps. The bitmaps feed
+                        // every auto-created account's default permission, so
+                        // missing this forks the account/state root once
+                        // ALLOW_MULTI_SIGN is live. The OR is idempotent, so we
+                        // set unconditionally; java guards 44/77 on the 0->1
+                        // transition, but since a bit is only ever set (never
+                        // cleared) the resulting bitmap is identical.
+                        26 => add_system_contract_and_set_permission(dyn_props, 48),
+                        30 => add_system_contract_and_set_permission(dyn_props, 49),
+                        44 => {
+                            add_system_contract_and_set_permission(dyn_props, 52);
+                            add_system_contract_and_set_permission(dyn_props, 53);
+                        }
+                        70 => {
+                            // FreezeBalanceV2 / UnfreezeBalanceV2 /
+                            // WithdrawExpireUnfreeze / DelegateResource /
+                            // UnDelegateResource contract types (54..=58).
+                            for cid in 54..=58 {
+                                add_system_contract_and_set_permission(dyn_props, cid);
+                            }
+                        }
+                        77 => add_system_contract_and_set_permission(dyn_props, 59),
                         _ => {}
                     }
                     report
@@ -274,6 +300,34 @@ pub fn activate_expired_proposals(
     }
 
     Ok(report)
+}
+
+/// java `DynamicPropertiesStore.addSystemContractAndSetPermission(id)`
+/// (DynamicPropertiesStore.java:1911-1919): OR-set bit `id` into BOTH the
+/// `AVAILABLE_CONTRACT_TYPE` and `ACTIVE_DEFAULT_OPERATIONS` bitmaps as a newly
+/// proposed contract type becomes enabled. `ACTIVE_DEFAULT_OPERATIONS` is the
+/// operations mask stamped onto every auto-created account's default active
+/// permission, so the bitmap must evolve in lock-step with java or account rows
+/// (and the state root) diverge. The OR is idempotent.
+fn add_system_contract_and_set_permission(dyn_props: &DynamicPropertiesStore, id: usize) {
+    // Genesis defaults (java `init()`: AVAILABLE = 7fff1fc0037e0000…, ACTIVE =
+    // 7fff1fc0033e0000…), used only if the key is somehow absent — a from-genesis
+    // chain seeds both at bootstrap and a snapshot import carries the live ones.
+    for (key, seed6) in [
+        (b"AVAILABLE_CONTRACT_TYPE".as_slice(), [0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x7e]),
+        (b"ACTIVE_DEFAULT_OPERATIONS".as_slice(), [0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x3e]),
+    ] {
+        let mut bitmap = dyn_props.get_bytes(key).unwrap_or_else(|| {
+            let mut b = vec![0u8; 32];
+            b[..6].copy_from_slice(&seed6);
+            b
+        });
+        let byte = id / 8;
+        if byte < bitmap.len() {
+            bitmap[byte] |= 1u8 << (id % 8);
+            dyn_props.put_bytes(key, &bitmap);
+        }
+    }
 }
 
 /// Map a TRON proposal parameter id to its `DynamicPropertiesStore`
@@ -377,4 +431,63 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         98 => b"ALLOW_HARDEN_EXCHANGE_CALCULATION",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod bitmap_evolution_tests {
+    use std::sync::Arc;
+
+    use tron_chainbase::{DynamicPropertiesStore, MemBackend};
+
+    use super::add_system_contract_and_set_permission;
+
+    fn seeded_store() -> DynamicPropertiesStore {
+        let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()));
+        // Genesis seeds (java init()): AVAILABLE = 7fff1fc0037e0000…,
+        // ACTIVE = 7fff1fc0033e0000… (rest zero).
+        let mut available = vec![0u8; 32];
+        available[..6].copy_from_slice(&[0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x7e]);
+        dp.put_bytes(b"AVAILABLE_CONTRACT_TYPE", &available);
+        let mut active = vec![0u8; 32];
+        active[..6].copy_from_slice(&[0x7f, 0xff, 0x1f, 0xc0, 0x03, 0x3e]);
+        dp.put_bytes(b"ACTIVE_DEFAULT_OPERATIONS", &active);
+        dp
+    }
+
+    fn bit_set(bytes: &[u8], id: usize) -> bool {
+        bytes[id / 8] & (1u8 << (id % 8)) != 0
+    }
+
+    /// java `addSystemContractAndSetPermission(id)` OR-sets bit `id` in BOTH
+    /// bitmaps. UnfreezeDelay (#70) enables contract types 54..=58.
+    #[test]
+    fn sets_bit_in_both_bitmaps_and_is_idempotent() {
+        let dp = seeded_store();
+        for id in 54..=58 {
+            add_system_contract_and_set_permission(&dp, id);
+        }
+        let avail = dp.get_bytes(b"AVAILABLE_CONTRACT_TYPE").unwrap();
+        let act = dp.get_bytes(b"ACTIVE_DEFAULT_OPERATIONS").unwrap();
+        for id in 54..=58 {
+            assert!(bit_set(&avail, id), "AVAILABLE bit {id} must be set");
+            assert!(bit_set(&act, id), "ACTIVE bit {id} must be set");
+        }
+        // Idempotent: re-applying changes nothing (the OR is a no-op).
+        add_system_contract_and_set_permission(&dp, 54);
+        assert_eq!(dp.get_bytes(b"AVAILABLE_CONTRACT_TYPE").unwrap(), avail);
+        assert_eq!(dp.get_bytes(b"ACTIVE_DEFAULT_OPERATIONS").unwrap(), act);
+    }
+
+    /// Constantinople (#26 → id 48) + ChangeDelegation (#30 → id 49) set bits
+    /// 48 and 49 (byte 6 bits 0+1 → 0x03), building toward the mainnet
+    /// ACTIVE_DEFAULT_OPERATIONS prefix.
+    #[test]
+    fn constantinople_and_change_delegation_set_bits_48_49() {
+        let dp = seeded_store();
+        add_system_contract_and_set_permission(&dp, 48);
+        add_system_contract_and_set_permission(&dp, 49);
+        let act = dp.get_bytes(b"ACTIVE_DEFAULT_OPERATIONS").unwrap();
+        assert_eq!(act[6], 0x03, "byte 6 gains bits 48 and 49");
+        assert!(bit_set(&act, 48) && bit_set(&act, 49));
+    }
 }

@@ -242,7 +242,7 @@ pub fn consume_bandwidth(
     account.balance -= fee;
     account.latest_opration_time = head_block_timestamp(stores.dyn_props);
     stores.accounts.put(owner, &account)?;
-    pay_bandwidth_fee(stores.dyn_props, fee);
+    pay_bandwidth_fee(stores.accounts, stores.dyn_props, fee)?;
     Ok(BandwidthCharge::Fee {
         bytes,
         fee_sun: fee,
@@ -641,7 +641,7 @@ fn consume_for_create_new_account(
     account.latest_opration_time = head_block_timestamp(stores.dyn_props);
     account.balance -= fee;
     stores.accounts.put(owner, account)?;
-    dispose_fee(stores.dyn_props, fee);
+    dispose_fee(stores.accounts, stores.dyn_props, fee)?;
     stores.dyn_props.add_total_create_account_cost(fee);
     Ok(BandwidthCharge::CreateNewAccountFee { fee_sun: fee })
 }
@@ -711,14 +711,17 @@ fn try_use_net_for_create_new_account(
 /// Flat-fee disposal shared by the create-account fee here and the
 /// executor's multi-sign / memo fees (java-tron
 /// `ResourceProcessor.consumeFeeForNewAccount` /
-/// `Manager.consumeMultiSignFee` / `consumeMemoFee`): burn under the
-/// blackhole optimization. The fee pool is deliberately NOT consulted —
-/// java only routes `useTransactionFee` bandwidth fees through it.
-/// Pre-optimization the credit goes to the blackhole *account*; we burn
-/// instead (same compromise as [`pay_bandwidth_fee`], identical supply
-/// tracking).
-pub fn dispose_fee(dyn_props: &DynamicPropertiesStore, fee: i64) {
-    dyn_props.burn_trx(fee);
+/// `Manager.consumeMultiSignFee` / `consumeMemoFee`). The fee pool is
+/// deliberately NOT consulted — java only routes `useTransactionFee`
+/// bandwidth fees through it. Disposal is the blackhole gate: `burnTrx` once
+/// `ALLOW_BLACKHOLE_OPTIMIZATION` (#49) is active, else credit the blackhole
+/// ACCOUNT (the from-genesis arm).
+pub fn dispose_fee(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    fee: i64,
+) -> Result<(), StoreError> {
+    tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)
 }
 
 /// Try the `useFreeNet` path. Mirrors `BandwidthProcessor.useFreeNet`,
@@ -876,22 +879,21 @@ pub fn head_block_timestamp(dyn_props: &DynamicPropertiesStore) -> i64 {
 /// java-tron's `BandwidthProcessor.useTransactionFee` payment effect:
 /// pushes the fee to either the fee pool, the burn counter, or the
 /// blackhole account, depending on which forks are active. Always bumps
-/// `TOTAL_TRANSACTION_COST`.
-fn pay_bandwidth_fee(dyn_props: &DynamicPropertiesStore, fee: i64) {
+/// `TOTAL_TRANSACTION_COST` — the bandwidth path IS the one java counts
+/// (`addTotalTransactionCost`, BandwidthProcessor.java:207).
+fn pay_bandwidth_fee(
+    accounts: &AccountStore,
+    dyn_props: &DynamicPropertiesStore,
+    fee: i64,
+) -> Result<(), StoreError> {
     dyn_props.add_total_transaction_cost(fee);
     if dyn_props.support_transaction_fee_pool() {
         dyn_props.add_transaction_fee_pool(fee);
-    } else if dyn_props.support_blackhole_optimization() {
-        dyn_props.burn_trx(fee);
+        Ok(())
     } else {
-        // Legacy: credit the blackhole account. We don't yet have a
-        // canonical blackhole-address constant exposed, so for now we
-        // mirror the post-fork behavior (burn). The blackhole account
-        // credit can be wired once a canonical
-        // `tron_types::BLACKHOLE_ADDRESS` lands; the on-chain effect is
-        // identical (the address receives the burned TRX rather than
-        // it being "destroyed", but the supply tracking is the same).
-        dyn_props.burn_trx(fee);
+        // burnTrx once ALLOW_BLACKHOLE_OPTIMIZATION (#49) is active, else credit
+        // the blackhole ACCOUNT (the from-genesis arm).
+        tron_chainbase::dispose_fee_to_blackhole(accounts, dyn_props, fee)
     }
 }
 

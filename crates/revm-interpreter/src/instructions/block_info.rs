@@ -9,7 +9,10 @@ use crate::InstructionContext as Ictx;
 /// EIP-1344: ChainID opcode
 pub fn chainid<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     check!(context.interpreter, ISTANBUL);
-    push!(context.interpreter, context.host.chain_id());
+    // TRON fork: in the Istanbul(#41)..#60 window CHAINID pushes the FULL 32-byte
+    // genesis id, not the truncated chain id. `tron_chain_id_word` carries the
+    // precomputed value and defaults to `chain_id()` for non-TRON / post-#60.
+    push!(context.interpreter, context.host.tron_chain_id_word());
     Ok(())
 }
 

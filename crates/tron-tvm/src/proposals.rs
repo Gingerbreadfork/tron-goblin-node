@@ -99,6 +99,18 @@ pub struct ProposalSet {
     /// (TIP-7939), ModExp bounds/repricing (TIP-7883). Mapped to revm
     /// `OSAKA`.
     pub allow_tvm_osaka: bool,
+    /// `ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX` (proposal #65). When
+    /// active, java's `OperationRegistry.adjustMemOperations` overrides
+    /// MLOAD/MSTORE/MSTORE8 to the `*Cost2` variants which add a
+    /// `SPECIAL_TIER` (1) base on top of the memory-expansion cost; pre-#65
+    /// those three ops carry NO base (just memory expansion). Drives the
+    /// MLOAD/MSTORE/MSTORE8 base in [`crate::tron_static_gas_table`].
+    pub allow_higher_limit_for_max_cpu_time_of_one_tx: bool,
+    /// `ALLOW_ENERGY_ADJUSTMENT` (proposal #81). Gates the SELFDESTRUCT
+    /// dead-beneficiary `NEW_ACCT_CALL` (25000) energy top-up: java adds it only
+    /// from `getSuicideCost2` (#81) / `getSuicideCost3` (#94) — pre-#81 SUICIDE
+    /// has no top-up (`getSuicideCost` = 0).
+    pub allow_energy_adjustment: bool,
 }
 
 impl ProposalSet {
@@ -134,6 +146,10 @@ impl ProposalSet {
             allow_tvm_selfdestruct_restriction: flag(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION"),
             allow_tvm_prague: flag(b"ALLOW_TVM_PRAGUE"),
             allow_tvm_osaka: flag(b"ALLOW_TVM_OSAKA"),
+            allow_higher_limit_for_max_cpu_time_of_one_tx: flag(
+                b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX",
+            ),
+            allow_energy_adjustment: flag(b"ALLOW_ENERGY_ADJUSTMENT"),
         }
     }
 
@@ -163,6 +179,11 @@ impl ProposalSet {
             allow_tvm_selfdestruct_restriction: false,
             allow_tvm_prague: false,
             allow_tvm_osaka: false,
+            // #65 is long-active on mainnet (the snapshot window) — MLOAD/
+            // MSTORE/MSTORE8 carry the SPECIAL_TIER base.
+            allow_higher_limit_for_max_cpu_time_of_one_tx: true,
+            // #81 long-active on mainnet — SELFDESTRUCT dead-account top-up on.
+            allow_energy_adjustment: true,
         }
     }
 
@@ -316,6 +337,8 @@ mod tests {
             b"ALLOW_TVM_VOTE",
             b"ALLOW_TVM_COMPATIBLE_EVM",
             b"ALLOW_SHIELDED_TRC20_TRANSACTION",
+            b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX",
+            b"ALLOW_ENERGY_ADJUSTMENT",
         ] {
             dps.put_long(key, 1);
         }
