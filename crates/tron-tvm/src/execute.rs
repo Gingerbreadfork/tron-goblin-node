@@ -80,20 +80,26 @@ fn halt_reason_to_contract_result(
     use revm::context_interface::result::OutOfGasError;
     use tron_proto::transaction::result::ContractResult;
     match reason {
-        // The 3 MiB hard memory cap (`cfg.memory_limit`) is java-tron's
-        // `EnergyCost.checkMemorySize` MEM_LIMIT check: when a memory-touching
-        // opcode's `newMemSize` exceeds the cap it throws `OutOfMemoryException`
-        // (EnergyCost.java:543-547), which `RuntimeImpl.setResultCode` maps to
-        // `OUT_OF_MEMORY` (RuntimeImpl.java:110-112) — NOT `OUT_OF_ENERGY`.
-        // revm surfaces the same fault as `OutOfGasError::MemoryLimit`
-        // (interpreter `MemoryLimitOOG` → `HaltReason::OutOfGas(MemoryLimit)`).
-        // State and fees are identical to any other OOG halt here (both
-        // spend-all-energy + revert); only the recorded `contractResult` code
-        // differs, which the contractRet tripwire checks against the block.
-        HaltReason::OutOfGas(OutOfGasError::MemoryLimit) => ContractResult::OutOfMemory,
-        // `OutOfEnergyException` → OUT_OF_ENERGY. Every OTHER OOG sub-kind
-        // (basic, ordinary memory-expansion energy cost, precompile,
-        // invalid-operand, reentrancy sentry) is the same TRON energy fault.
+        // java-tron's `EnergyCost.checkMemorySize` (EnergyCost.java:543-547)
+        // takes `newMemSize = memNeeded(offset, size)` as an UNBOUNDED
+        // BigInteger and throws `Program.Exception.memoryOverflow`
+        // (`OutOfMemoryException`, Program.java:2559) whenever it exceeds
+        // `MEM_LIMIT` (the 3 MiB cap), recorded as `OUT_OF_MEMORY` -- not
+        // `OUT_OF_ENERGY`. Because that check is on a BigInteger, a too-large
+        // memory operand is the same fault whether it fits usize (just over the
+        // 3 MiB cap) or not. revm splits the two: the former surfaces as
+        // `MemoryLimitOOG` -> `OutOfGas(MemoryLimit)`, the latter as
+        // `InvalidOperandOOG` -> `OutOfGas(InvalidOperand)` from
+        // `as_usize_or_fail` on a memory offset/size (its only callers). Both
+        // are java's `OutOfMemoryException`. State + fees are identical to any
+        // other OOG halt (spend-all-energy + revert); only the recorded
+        // `contractResult` differs, which the contractRet tripwire checks.
+        HaltReason::OutOfGas(OutOfGasError::MemoryLimit | OutOfGasError::InvalidOperand) => {
+            ContractResult::OutOfMemory
+        }
+        // `OutOfEnergyException` -> OUT_OF_ENERGY. Every other OOG sub-kind
+        // (basic, ordinary memory-expansion energy cost, precompile, reentrancy
+        // sentry) is the TRON energy fault.
         HaltReason::OutOfGas(_) => ContractResult::OutOfEnergy,
         // `IllegalOperationException` — unknown / disabled opcode (revm's
         // 0xFE designated-invalid is the same fault class in java).
@@ -1844,14 +1850,13 @@ mod halt_result_tests {
     /// java-tron's specific `contractResult`, and unmapped halts to UNKNOWN.
     #[test]
     fn maps_each_halt_to_javas_contract_result() {
-        // OutOfGas sub-kinds → OUT_OF_ENERGY (OutOfEnergyException), EXCEPT
-        // `MemoryLimit` (the 3 MiB hard cap), which is java's
-        // `OutOfMemoryException` → OUT_OF_MEMORY (tested separately below).
+        // OutOfGas sub-kinds -> OUT_OF_ENERGY (OutOfEnergyException), EXCEPT the
+        // two memory-overflow kinds (`MemoryLimit`, `InvalidOperand`), which are
+        // java's `OutOfMemoryException` -> OUT_OF_MEMORY (asserted below).
         for oog in [
             OutOfGasError::Basic,
             OutOfGasError::Memory,
             OutOfGasError::Precompile,
-            OutOfGasError::InvalidOperand,
             OutOfGasError::ReentrancySentry,
         ] {
             assert_eq!(
@@ -1861,14 +1866,17 @@ mod halt_result_tests {
             );
         }
 
-        // The 3 MiB memory-limit halt is java's `EnergyCost.checkMemorySize`
-        // `OutOfMemoryException` → OUT_OF_MEMORY (RuntimeImpl.java:110-112),
-        // NOT OUT_OF_ENERGY.
-        assert_eq!(
-            halt_reason_to_contract_result(&HaltReason::OutOfGas(OutOfGasError::MemoryLimit)),
-            ContractResult::OutOfMemory,
-            "OutOfGas(MemoryLimit) must map to OUT_OF_MEMORY"
-        );
+        // Both memory-overflow halts are java's `EnergyCost.checkMemorySize`
+        // `OutOfMemoryException` -> OUT_OF_MEMORY (a too-large memory operand,
+        // whether it fits usize but exceeds the 3 MiB cap, or trips
+        // `as_usize_or_fail`), NOT OUT_OF_ENERGY.
+        for oog in [OutOfGasError::MemoryLimit, OutOfGasError::InvalidOperand] {
+            assert_eq!(
+                halt_reason_to_contract_result(&HaltReason::OutOfGas(oog)),
+                ContractResult::OutOfMemory,
+                "OutOfGas({oog:?}) must map to OUT_OF_MEMORY"
+            );
+        }
 
         // Unknown / disabled / designated-invalid opcode → ILLEGAL_OPERATION.
         assert_eq!(
