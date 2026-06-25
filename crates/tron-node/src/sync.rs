@@ -700,6 +700,25 @@ mod fetch_pool_tests {
     }
 
     #[test]
+    fn fork_strike_demotes_after_threshold_then_resets() {
+        use crate::sync::record_fork_strike;
+        let mut s = std::collections::HashMap::new();
+        // Below the threshold (3): no demotion.
+        assert!(!record_fork_strike(&mut s, "p1"));
+        assert!(!record_fork_strike(&mut s, "p1"));
+        // The 3rd consecutive strike demotes and resets the count to 0.
+        assert!(record_fork_strike(&mut s, "p1"));
+        assert_eq!(s.get("p1"), Some(&0));
+        // Peers accumulate independently.
+        assert!(!record_fork_strike(&mut s, "p2"));
+        assert_eq!(s.get("p2"), Some(&1));
+        // A cleared peer (it applied a canonical block) starts fresh.
+        s.remove("p1");
+        assert!(!record_fork_strike(&mut s, "p1"));
+        assert_eq!(s.get("p1"), Some(&1));
+    }
+
+    #[test]
     fn ordered_ids_above_rebuilds_an_apply_queue_across_all_three_queues() {
         // A promoted leader rebuilds `expected` from the pool: it must see ids
         // that are still wanted, in flight, AND already delivered — in chain
@@ -1063,6 +1082,12 @@ pub struct SyncDriver {
     /// Whether the last progress line reported us caught up to the tip. Used
     /// to log the catch-up→tip and tip→falling-behind transitions once each.
     at_tip: bool,
+    /// Per-peer count of consecutive fork-class validation rejects
+    /// (`WrongWitness`) at our apply head. When a peer crosses
+    /// [`FORK_PEER_STRIKE_LIMIT`] it is cooled down so leadership rotates off it
+    /// immediately, instead of waiting for the 45s stall watchdog to hard-reset
+    /// the whole fetch pool. Cleared when the peer applies a canonical block.
+    fork_reject_strikes: std::collections::HashMap<String, u32>,
     /// Optional shared, continuously-growing peer pool for ROTATION drivers
     /// (java-tron-like always-active discovery). A background feeder keeps
     /// appending freshly-discovered peers (deduped) to it; the driver merges
@@ -1096,6 +1121,31 @@ pub struct SyncDriver {
     /// the at-tip apply path) sees fully-committed state because the
     /// batch always ends with a flush.
     pipeline_open: bool,
+}
+
+/// Per-peer fork-strike threshold: after this many consecutive `WrongWitness`
+/// rejects from one peer at our apply head, cool it down so rotation skips it
+/// and leadership moves to a canonical-serving peer — instead of churning until
+/// the 45s stall watchdog hard-resets the whole fetch pool.
+const FORK_PEER_STRIKE_LIMIT: u32 = 3;
+/// How long a fork-feeding peer is skipped in rotation. Long enough to escape
+/// the wedge and let the transient fork resolve, short enough to re-include the
+/// peer promptly once the canonical view reconverges.
+const FORK_PEER_COOLDOWN_MS: u64 = 60_000;
+
+/// Record a fork-class validation reject against `peer`; returns `true` when it
+/// crosses [`FORK_PEER_STRIKE_LIMIT`] (the caller then cools the peer down and
+/// the count resets to 0). A successful apply clears the peer's entry, so only
+/// *consecutive* fork rejects accumulate.
+fn record_fork_strike(strikes: &mut std::collections::HashMap<String, u32>, peer: &str) -> bool {
+    let c = strikes.entry(peer.to_string()).or_insert(0);
+    *c += 1;
+    if *c >= FORK_PEER_STRIKE_LIMIT {
+        *c = 0;
+        true
+    } else {
+        false
+    }
 }
 
 impl SyncDriver {
@@ -1153,6 +1203,7 @@ impl SyncDriver {
             pipelined_apply: false,
             pipeline: None,
             pipeline_open: false,
+            fork_reject_strikes: std::collections::HashMap::new(),
         }
     }
 
@@ -1311,6 +1362,14 @@ impl SyncDriver {
                 self.note_sync_progress(peer);
                 // Human-readable, time-throttled progress line.
                 self.log_sync_progress(block, block_num, peer);
+                // This peer just applied a canonical block — clear any
+                // fork-strike count and avoid-cooldown so we keep leading with
+                // it (a peer that served one fork then recovered isn't punished).
+                if self.fork_reject_strikes.remove(peer).is_some() {
+                    if let Some(ps) = &self.peer_state {
+                        ps.mark_useful(peer);
+                    }
+                }
             }
             AcceptOutcome::RejectedValidation(reason) => {
                 self.stats.blocks_rejected_validation += 1;
@@ -1333,6 +1392,23 @@ impl SyncDriver {
                         block = block_num,
                         reason = reason.as_str(),
                         "block rejected: validation"
+                    );
+                }
+                // A peer feeding fork blocks (`WrongWitness`) at our apply head
+                // keeps the leader churning until the 45s stall watchdog fires.
+                // Strike the serving peer; once it crosses the threshold, cool
+                // it down so rotation moves leadership to a canonical-serving
+                // peer in seconds. Out-of-order rejects (`is_tip_fork_churn`)
+                // never strike — they're not the peer's fault.
+                if reason.contains("WrongWitness")
+                    && record_fork_strike(&mut self.fork_reject_strikes, peer)
+                {
+                    if let Some(ps) = &self.peer_state {
+                        ps.mark_avoid(peer, FORK_PEER_COOLDOWN_MS);
+                    }
+                    info!(
+                        peer = peer,
+                        "peer fed fork blocks at the head; cooling it down so leadership rotates to a canonical peer"
                     );
                 }
             }
