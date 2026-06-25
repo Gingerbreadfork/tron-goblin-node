@@ -168,7 +168,7 @@ fn small_tx_charges_against_free_quota() {
     );
     let (tx, contract) = make_transfer_tx();
     let outcome =
-        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None).expect("ok");
     match outcome {
         BandwidthCharge::Free { bytes, .. } => {
             assert!(bytes > 0 && bytes < DEFAULT_FREE_NET_LIMIT);
@@ -180,6 +180,44 @@ fn small_tx_charges_against_free_quota() {
     assert_eq!(after.balance, 1_000);
     // PUBLIC_NET_USAGE also bumped (chain-wide accumulator).
     assert!(env.dyn_props.public_net_usage() > 0);
+}
+
+#[test]
+fn original_wire_size_adds_dropped_bytes_to_the_charge() {
+    use prost::Message;
+    let (tx, contract) = make_transfer_tx();
+    let owner = Address::from_raw(ALICE);
+    // 2 non-canonical Transaction-level bytes prost drops but java counts (#9).
+    let original = tx.encoded_len() as i64 + 2;
+
+    let env_a = Env::new();
+    seed_recipient(&env_a);
+    put(
+        &env_a.accounts,
+        ALICE,
+        Account { address: ALICE.to_vec(), balance: 1_000, ..Default::default() },
+    );
+    let baseline = match consume_bandwidth(env_a.stores(), &tx, &contract, &owner, 0, None).expect("ok") {
+        BandwidthCharge::Free { bytes, .. } => bytes,
+        other => panic!("expected Free, got {other:?}"),
+    };
+
+    let env_b = Env::new();
+    seed_recipient(&env_b);
+    put(
+        &env_b.accounts,
+        ALICE,
+        Account { address: ALICE.to_vec(), balance: 1_000, ..Default::default() },
+    );
+    let bumped =
+        match consume_bandwidth(env_b.stores(), &tx, &contract, &owner, 0, Some(original)).expect("ok") {
+            BandwidthCharge::Free { bytes, .. } => bytes,
+            other => panic!("expected Free, got {other:?}"),
+        };
+
+    // The 2 dropped wire bytes are added back: java's getSerializedSize, not
+    // prost's canonical encoded_len. A `None` original size keeps prost's size.
+    assert_eq!(bumped, baseline + 2);
 }
 
 #[test]
@@ -204,7 +242,7 @@ fn account_with_frozen_bandwidth_consumes_frozen_first() {
     env.dyn_props.save_unfreeze_delay_days(1);
     let (tx, contract) = make_transfer_tx();
     let outcome =
-        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None).expect("ok");
     assert!(matches!(outcome, BandwidthCharge::Frozen { .. }));
     let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
     assert!(after.net_usage > 0);
@@ -227,7 +265,7 @@ fn free_quota_exhaustion_falls_back_to_trx_fee() {
     );
     let (tx, contract) = make_transfer_tx();
     let outcome =
-        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None).expect("ok");
     let (charged_bytes, fee) = match outcome {
         BandwidthCharge::Fee { bytes, fee_sun } => (bytes, fee_sun),
         other => panic!("expected Fee, got {other:?}"),
@@ -251,7 +289,7 @@ fn insufficient_balance_for_fee_returns_error() {
         Account { address: ALICE.to_vec(), balance: 5, ..Default::default() },
     );
     let (tx, contract) = make_transfer_tx();
-    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
         .unwrap_err();
     assert!(matches!(err, BandwidthError::Insufficient { .. }));
     let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
@@ -262,7 +300,7 @@ fn insufficient_balance_for_fee_returns_error() {
 fn missing_account_yields_error() {
     let env = Env::new();
     let (tx, contract) = make_transfer_tx();
-    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
         .unwrap_err();
     assert!(matches!(err, BandwidthError::AccountMissing));
 }
@@ -315,7 +353,7 @@ fn transfer_asset_uses_issuer_quota_when_funded() {
         Account { address: ALICE.to_vec(), balance: 0, ..Default::default() },
     );
     let (tx, contract) = make_transfer_asset_tx(TOKEN_NAME);
-    let outcome = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+    let outcome = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
         .expect("ok");
     let charged = match outcome {
         BandwidthCharge::AssetIssuer { bytes, token_id, .. } => {
@@ -357,7 +395,7 @@ fn transfer_asset_falls_through_when_public_quota_exhausted() {
         Account { address: ALICE.to_vec(), balance: 100_000_000, ..Default::default() },
     );
     let (tx, contract) = make_transfer_asset_tx(TOKEN_NAME);
-    let outcome = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+    let outcome = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
         .expect("ok");
     // The issuer path fell through; the tx ended up on either the free
     // quota (Alice has none used) or the TRX fee (if free is full).
@@ -382,7 +420,7 @@ fn transfer_asset_falls_through_when_issuer_net_insufficient() {
         Account { address: ALICE.to_vec(), balance: 100_000_000, ..Default::default() },
     );
     let (tx, contract) = make_transfer_asset_tx(TOKEN_NAME);
-    let outcome = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+    let outcome = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
         .expect("ok");
     assert!(
         matches!(outcome, BandwidthCharge::Free { .. }) || matches!(outcome, BandwidthCharge::Fee { .. }),
@@ -410,7 +448,7 @@ fn public_net_accumulator_blocks_free_quota_when_exhausted() {
     );
     let (tx, contract) = make_transfer_tx();
     let outcome =
-        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None).expect("ok");
     assert!(
         matches!(outcome, BandwidthCharge::Fee { .. }),
         "expected fee, got {outcome:?}"
@@ -464,7 +502,7 @@ fn transfer_to_missing_account_burns_the_flat_create_fee() {
     );
     let (tx, contract) = make_transfer_tx();
     let outcome =
-        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None).expect("ok");
     let fee = match outcome {
         BandwidthCharge::CreateNewAccountFee { fee_sun } => fee_sun,
         other => panic!("expected CreateNewAccountFee, got {other:?}"),
@@ -488,7 +526,7 @@ fn transfer_to_missing_account_uses_frozen_net_at_the_new_account_rate() {
     put(&env.accounts, ALICE, acct);
     let (tx, contract) = make_transfer_tx();
     let outcome =
-        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0).expect("ok");
+        consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None).expect("ok");
     match outcome {
         BandwidthCharge::CreateNewAccountFrozen { net_cost, new_net_usage } => {
             // Default createNewAccountBandwidthRate = 1 → cost == bytes.
@@ -511,7 +549,7 @@ fn create_branch_with_nothing_to_pay_is_a_hard_error() {
         Account { address: ALICE.to_vec(), balance: 5, ..Default::default() },
     );
     let (tx, contract) = make_transfer_tx();
-    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+    let err = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
         .unwrap_err();
     assert!(matches!(err, BandwidthError::InsufficientForNewAccount { .. }), "got {err:?}");
 }
@@ -534,7 +572,7 @@ fn support_vm_pads_the_charged_bytes_by_max_result_size() {
             Account { address: ALICE.to_vec(), balance: 10_000_000, ..Default::default() },
         );
         let (tx, contract) = make_transfer_tx();
-        match consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0)
+        match consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), 0, None)
             .expect("ok")
         {
             BandwidthCharge::Free { bytes, .. } => bytes,
@@ -597,7 +635,7 @@ fn free_net_growth_matches_java_two_step_not_one_shot() {
         seed_recipient(&env);
         seed_free_acct(&env, free0, l);
         let (tx, contract) = make_transfer_tx();
-        match consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), l + 1)
+        match consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), l + 1, None)
             .expect("ok")
         {
             BandwidthCharge::Free { bytes, .. } => bytes,
@@ -631,7 +669,7 @@ fn free_net_growth_matches_java_two_step_not_one_shot() {
     seed_free_acct(&env, free0, l);
     let (tx, contract) = make_transfer_tx();
     let now = l + delta;
-    let charge = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), now)
+    let charge = consume_bandwidth(env.stores(), &tx, &contract, &Address::from_raw(ALICE), now, None)
         .expect("ok");
     let new_free = match charge {
         BandwidthCharge::Free { new_free_usage, .. } => new_free_usage,

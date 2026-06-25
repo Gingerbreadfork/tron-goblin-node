@@ -391,6 +391,7 @@ pub(crate) fn execute_block_parallel(
     now_slot: i64,
     head_block_time_ms: i64,
     signers: &[Result<Vec<Address>, String>],
+    original_tx_sizes: Option<&[i64]>,
 ) -> Option<Vec<TxResult>> {
     let n = txs.len();
     let mv = Arc::new(MvMemory::new());
@@ -447,6 +448,7 @@ pub(crate) fn execute_block_parallel(
             now_slot,
             head_block_time_ms,
             &signers[i],
+            original_tx_sizes.and_then(|s| s.get(i).copied()),
         );
         // Publish the EFFECTIVE write-set (no-op read-modify-writes dropped —
         // e.g. the zero-address beneficiary `+= 0`) so idempotent writes don't

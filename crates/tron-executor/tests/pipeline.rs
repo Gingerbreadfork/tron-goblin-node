@@ -199,6 +199,7 @@ fn run_classic(
             &undo,
             &cp,
             config,
+            None,
         )
         .unwrap();
         deltas.push(report.state_deltas);
@@ -221,7 +222,7 @@ fn run_pipelined(
     let mut pipeline = ApplyPipeline::new(&state, undo, cp);
     let mut deltas = Vec::new();
     for n in 1..=BLOCKS {
-        let report = pipeline.apply(&empty_block(n), None, config).unwrap();
+        let report = pipeline.apply(&empty_block(n), None, config, None).unwrap();
         deltas.push(report.state_deltas);
     }
     pipeline.flush().unwrap();
@@ -300,7 +301,7 @@ fn view_exposes_pending_block_and_flush_lands_it_in_base() {
     let mut pipeline = ApplyPipeline::new(&state, undo, cp);
 
     let config = ExecConfig::unsigned();
-    pipeline.apply(&empty_block(1), None, &config).unwrap();
+    pipeline.apply(&empty_block(1), None, &config, None).unwrap();
 
     // The view must show block 1's head pointer immediately —
     // regardless of whether the background commit already landed.
@@ -332,12 +333,12 @@ fn failed_execution_leaves_previous_pending_block_intact() {
     let mut pipeline = ApplyPipeline::new(&state, undo, cp);
 
     let config = ExecConfig::unsigned();
-    pipeline.apply(&empty_block(1), None, &config).unwrap();
+    pipeline.apply(&empty_block(1), None, &config, None).unwrap();
 
     // A structurally-broken block (no header) fails execution without
     // touching the overlay or the in-flight commit.
     let garbage = Block { block_header: None, transactions: Vec::new() };
-    assert!(pipeline.apply(&garbage, None, &config).is_err());
+    assert!(pipeline.apply(&garbage, None, &config, None).is_err());
 
     let dp_view = DynamicPropertiesStore::new(pipeline.view().dyn_props.clone());
     assert_eq!(

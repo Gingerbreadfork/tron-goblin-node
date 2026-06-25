@@ -1213,7 +1213,7 @@ pub fn execute_block(
     block: &Block,
     expected_parent: Option<BlockId>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, None, None, &ExecConfig::default())
+    execute_block_inner(state, block, expected_parent, None, None, &ExecConfig::default(), None)
 }
 
 /// As [`execute_block`], but with an explicit `ExecConfig`. The config
@@ -1225,7 +1225,7 @@ pub fn execute_block_with_config(
     expected_parent: Option<BlockId>,
     config: &ExecConfig,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, None, None, config)
+    execute_block_inner(state, block, expected_parent, None, None, config, None)
 }
 
 /// Execute `block` and persist a complete undo log to `undo_store`
@@ -1243,7 +1243,15 @@ pub fn execute_block_with_undo(
     expected_parent: Option<BlockId>,
     undo_store: &tron_chainbase::BlockUndoStore,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, Some(undo_store), None, &ExecConfig::default())
+    execute_block_inner(
+        state,
+        block,
+        expected_parent,
+        Some(undo_store),
+        None,
+        &ExecConfig::default(),
+        None,
+    )
 }
 
 /// As [`execute_block_with_undo`], but with an explicit `ExecConfig`.
@@ -1253,8 +1261,17 @@ pub fn execute_block_with_undo_and_config(
     expected_parent: Option<BlockId>,
     undo_store: &tron_chainbase::BlockUndoStore,
     config: &ExecConfig,
+    original_tx_sizes: Option<&[i64]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_inner(state, block, expected_parent, Some(undo_store), None, config)
+    execute_block_inner(
+        state,
+        block,
+        expected_parent,
+        Some(undo_store),
+        None,
+        config,
+        original_tx_sizes,
+    )
 }
 
 /// Like [`execute_block_with_undo`] but additionally wires the cross-
@@ -1280,6 +1297,7 @@ pub fn execute_block_with_undo_and_checkpoint(
         Some(undo_store),
         Some(checkpoint),
         &ExecConfig::default(),
+        None,
     )
 }
 
@@ -1292,6 +1310,7 @@ pub fn execute_block_with_undo_checkpoint_and_config(
     undo_store: &tron_chainbase::BlockUndoStore,
     checkpoint: &tron_chainbase::CheckPointV2,
     config: &ExecConfig,
+    original_tx_sizes: Option<&[i64]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     execute_block_inner(
         state,
@@ -1300,6 +1319,7 @@ pub fn execute_block_with_undo_checkpoint_and_config(
         Some(undo_store),
         Some(checkpoint),
         config,
+        original_tx_sizes,
     )
 }
 
@@ -1361,6 +1381,7 @@ fn execute_block_inner(
     undo_store: Option<&tron_chainbase::BlockUndoStore>,
     checkpoint: Option<&tron_chainbase::CheckPointV2>,
     config: &ExecConfig,
+    original_tx_sizes: Option<&[i64]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     // Undo path: wrap every base backend in a top-level SessionBackend
     // ("block session"). The per-tx sessions inside execute_one_tx
@@ -1380,7 +1401,8 @@ fn execute_block_inner(
         let block_session = BlockSession::wrap(state);
         let wrapped = block_session.as_state_backends();
         let t_exec = timing.then(std::time::Instant::now);
-        let mut report = execute_block_logic(&wrapped, block, expected_parent, config)?;
+        let mut report =
+            execute_block_logic(&wrapped, block, expected_parent, config, original_tx_sizes)?;
         let exec_us = t_exec.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         let t_commit = timing.then(std::time::Instant::now);
         let (record, deltas) = if let Some(checkpoint) = checkpoint {
@@ -1411,7 +1433,7 @@ fn execute_block_inner(
         }
         return Ok(report);
     }
-    execute_block_logic(state, block, expected_parent, config)
+    execute_block_logic(state, block, expected_parent, config, original_tx_sizes)
 }
 
 /// Block-level session: wraps every base backend on a [`StateBackends`]
@@ -2190,6 +2212,10 @@ fn execute_block_logic(
     block: &Block,
     expected_parent: Option<BlockId>,
     config: &ExecConfig,
+    // Per-tx ORIGINAL serialized wire sizes (java's getSerializedSize), in
+    // block order, captured at ingest from the raw block bytes. `None` for
+    // in-memory callers whose blocks are already prost-canonical.
+    original_tx_sizes: Option<&[i64]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     // === 1. Structural validation (read-only; safe to use base directly) ===
     if let Some(parent) = expected_parent {
@@ -2293,6 +2319,7 @@ fn execute_block_logic(
             now_slot,
             head_block_time_ms,
             &precomputed_signers,
+            original_tx_sizes,
         )
     } else {
         None
@@ -2313,6 +2340,7 @@ fn execute_block_logic(
                     now_slot,
                     head_block_time_ms,
                     &precomputed_signers[i],
+                    original_tx_sizes.and_then(|s| s.get(i).copied()),
                 )
             })
             .collect()
@@ -3100,6 +3128,9 @@ pub fn dry_run_for_state_root(
         expected_parent,
         &ephemeral,
         &ExecConfig::unsigned(),
+        // Self-produced (unsigned dry-run) blocks are prost-canonical, so the
+        // bandwidth charge needs no original-wire-size correction.
+        None,
     )?;
     let root = compute_state_root(state)?;
     let raw = block
@@ -3197,6 +3228,7 @@ pub(crate) fn execute_one_tx(
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
+    original_tx_size: Option<i64>,
 ) -> TxResult {
     let session = TxSession::fork(state);
     let view = session.view();
@@ -3211,6 +3243,7 @@ pub(crate) fn execute_one_tx(
         now_slot,
         head_block_time_ms,
         precomputed_signers,
+        original_tx_size,
     )
 }
 
@@ -3231,6 +3264,7 @@ pub(crate) fn execute_one_tx_versioned(
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
+    original_tx_size: Option<i64>,
 ) -> TxResult {
     execute_one_tx_isolated(
         view,
@@ -3243,6 +3277,7 @@ pub(crate) fn execute_one_tx_versioned(
         now_slot,
         head_block_time_ms,
         precomputed_signers,
+        original_tx_size,
     )
 }
 
@@ -3262,6 +3297,7 @@ fn execute_one_tx_isolated(
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
+    original_tx_size: Option<i64>,
 ) -> TxResult {
     let owners = SessionStoreOwners::from_state(view);
     let stores = owners.as_actuator_stores();
@@ -3473,7 +3509,7 @@ fn execute_one_tx_isolated(
                 asset_v1: stores.asset_v1,
                 asset_v2: stores.asset_v2,
             };
-            match bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot) {
+            match bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot, original_tx_size) {
                 Ok(bandwidth::BandwidthCharge::Free { bytes, .. }) => {
                     // Free-net path: PUBLIC_NET_USAGE/TIME writes were dropped by
                     // the versioned backend (parallel) to avoid serialising the

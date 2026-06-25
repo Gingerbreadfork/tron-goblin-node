@@ -269,6 +269,7 @@ impl ApplyPipeline {
         block: &Block,
         expected_parent: Option<BlockId>,
         config: &ExecConfig,
+        original_tx_sizes: Option<&[i64]>,
     ) -> Result<BlockExecutionReport, BlockExecError> {
         let timing = apply_timing::enabled();
 
@@ -277,7 +278,8 @@ impl ApplyPipeline {
         let session = BlockSession::wrap(&self.view);
         let wrapped = session.as_state_backends();
         let t_exec = timing.then(Instant::now);
-        let mut report = execute_block_logic(&wrapped, block, expected_parent, config)?;
+        let mut report =
+            execute_block_logic(&wrapped, block, expected_parent, config, original_tx_sizes)?;
         let exec_us = t_exec.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
 
         // 2) Drain on the applier thread: pre-images read through the

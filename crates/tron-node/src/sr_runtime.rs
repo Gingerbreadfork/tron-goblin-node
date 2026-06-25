@@ -651,6 +651,7 @@ impl SrRuntime {
                     &self.undo_store,
                     cp,
                     &self.exec_config,
+                    None,
                 )
                 .map_err(|e| SrRuntimeError::Execute(format!("{e:?}")))?,
                 None => execute_block_with_undo_and_config(
@@ -659,6 +660,7 @@ impl SrRuntime {
                     Some(head_id),
                     &self.undo_store,
                     &self.exec_config,
+                    None,
                 )
                 .map_err(|e| SrRuntimeError::Execute(format!("{e:?}")))?,
             },

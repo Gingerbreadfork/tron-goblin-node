@@ -34,7 +34,7 @@ fn apply_unsigned_with_undo(
     prev: Option<BlockId>,
     undo: &BlockUndoStore,
 ) -> Result<BlockExecutionReport, BlockExecError> {
-    execute_block_with_undo_and_config(state, block, prev, undo, &ExecConfig::unsigned())
+    execute_block_with_undo_and_config(state, block, prev, undo, &ExecConfig::unsigned(), None)
 }
 use tron_proto::{
     block_header::Raw as BlockHeaderRaw, transaction::contract::ContractType,

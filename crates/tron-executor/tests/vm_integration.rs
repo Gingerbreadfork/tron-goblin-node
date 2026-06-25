@@ -2014,7 +2014,7 @@ fn pipelined_parallel_storage_plus_dynamic_energy_matches_serial() {
     let root_s = std::env::temp_dir().join(format!("tron-se-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let cp_s = CheckPointV2::new(&root_s);
     for b in chain() {
-        execute_block_with_undo_checkpoint_and_config(&s, &b, None, &undo_s, &cp_s, &serial_cfg).expect("serial");
+        execute_block_with_undo_checkpoint_and_config(&s, &b, None, &undo_s, &cp_s, &serial_cfg, None).expect("serial");
     }
 
     // Parallel + pipeline + defer fsync (the catch-up shape).
@@ -2024,7 +2024,7 @@ fn pipelined_parallel_storage_plus_dynamic_energy_matches_serial() {
     let root_p = std::env::temp_dir().join(format!("tron-pe-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let cp_p = CheckPointV2::new(&root_p);
     let mut pipe = ApplyPipeline::new(&p, undo_p, cp_p);
-    for b in chain() { pipe.apply(&b, None, &par_cfg).expect("pipelined"); }
+    for b in chain() { pipe.apply(&b, None, &par_cfg, None).expect("pipelined"); }
     pipe.flush().expect("flush");
 
     let read_cs = |st: &StateBackends| ContractStateStore::new(st.contract_state.as_ref().unwrap().clone())

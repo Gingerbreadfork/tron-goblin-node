@@ -57,8 +57,8 @@ use tron_net::{
 };
 use tron_proto::{Block, Endpoint};
 use tron_types::{
-    block_id_from_block, genesis_block_id, mainnet_inputs, verify_tx_trie_root,
-    verify_tx_trie_root_raw, verify_witness_signature, BlockId,
+    block_id_from_block, genesis_block_id, mainnet_inputs, tx_sizes_from_block_bytes,
+    verify_tx_trie_root, verify_tx_trie_root_raw, verify_witness_signature, BlockId,
 };
 
 use crate::logfmt;
@@ -4489,9 +4489,17 @@ impl SyncDriver {
         // entries and would otherwise spuriously fail the merkle). In-memory
         // callers (tests / SR runtime) leave it `None` and fall back to the
         // decoded check, which is exact for their canonically-encoded blocks.
-        let trie_check = match self.pending_raw_block.take() {
-            Some(raw) => verify_tx_trie_root_raw(block, &raw),
-            None => verify_tx_trie_root(block),
+        // Capture each tx's ORIGINAL wire size from the same raw bytes the
+        // txTrieRoot check uses, so the bandwidth charge matches java's
+        // getSerializedSize (#9 — prost's canonical re-encode drops non-standard
+        // Transaction-level bytes java keeps). In-memory callers (None) carry
+        // prost-canonical blocks and fall back to the prost size downstream.
+        let (trie_check, original_tx_sizes) = match self.pending_raw_block.take() {
+            Some(raw) => (
+                verify_tx_trie_root_raw(block, &raw),
+                tx_sizes_from_block_bytes(&raw),
+            ),
+            None => (verify_tx_trie_root(block), None),
         };
         if let Err(e) = trie_check {
             return AcceptOutcome::RejectedValidation(format!("tx_trie: {e:?}"));
@@ -4816,7 +4824,7 @@ impl SyncDriver {
             .and(self.pipeline.as_mut());
         let exec_result = match (pipeline, &self.undo_store, &self.checkpoint) {
             (Some(pipeline), Some(_), Some(_)) => {
-                pipeline.apply(block, executed_head, &exec_config)
+                pipeline.apply(block, executed_head, &exec_config, original_tx_sizes.as_deref())
             }
             (_, Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                 &self.state,
@@ -4825,6 +4833,7 @@ impl SyncDriver {
                 undo,
                 cp,
                 &self.exec_config,
+                original_tx_sizes.as_deref(),
             ),
             (_, Some(undo), None) => tron_executor::execute_block_with_undo_and_config(
                 &self.state,
@@ -4832,6 +4841,7 @@ impl SyncDriver {
                 executed_head,
                 undo,
                 &self.exec_config,
+                original_tx_sizes.as_deref(),
             ),
             (_, None, _) => tron_executor::execute_block_with_config(
                 &self.state,
@@ -5867,6 +5877,7 @@ impl SyncDriver {
                     &undo_store,
                     cp,
                     &self.exec_config,
+                    None,
                 ),
                 None => tron_executor::execute_block_with_undo_and_config(
                     &self.state,
@@ -5874,6 +5885,7 @@ impl SyncDriver {
                     None,
                     &undo_store,
                     &self.exec_config,
+                    None,
                 ),
             };
             match apply_res {
@@ -5939,6 +5951,7 @@ impl SyncDriver {
                                     &undo_store,
                                     cp,
                                     &self.exec_config,
+                                    None,
                                 )
                             }
                             None => tron_executor::execute_block_with_undo_and_config(
@@ -5947,6 +5960,7 @@ impl SyncDriver {
                                 None,
                                 &undo_store,
                                 &self.exec_config,
+                                None,
                             ),
                         };
                         match reapply_res {

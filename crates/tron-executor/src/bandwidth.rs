@@ -143,6 +143,12 @@ pub fn consume_bandwidth(
     contract: &Contract,
     owner: &Address,
     now_slot: i64,
+    // The tx's ORIGINAL serialized wire size (java's
+    // `Transaction.getSerializedSize()`), captured at block ingest from the
+    // raw block bytes. `None` for in-memory callers (tests, SR-produced
+    // blocks) whose wire form is already prost-canonical — they keep the
+    // prost size.
+    original_size: Option<i64>,
 ) -> Result<BandwidthCharge, BandwidthError> {
     // java unconditionally rejects an oversized stored result before
     // any charging (`getResultSerializedSize() > MAX_RESULT_SIZE_IN_TX
@@ -160,10 +166,21 @@ pub fn consume_bandwidth(
     // the per-contract MAX_RESULT_SIZE_IN_TX padding when the VM fork
     // is active (mainnet), the full serialized size otherwise.
     let support_vm = stores.dyn_props.support_vm();
+    // java sizes the tx by its ORIGINAL serialized size (cached on the parsed
+    // TransactionCapsule), keeping any non-canonical / unknown
+    // Transaction-level bytes. prost recomputes a canonical size that drops
+    // them; add the dropped bytes back so net_usage matches java byte-for-byte.
+    // The gap applies equally to the clear-ret (VM) and full (non-VM) sizes —
+    // `clearRet().build()` preserves the unknown bytes (toBuilder keeps them),
+    // and the dropped bytes live in canonical Transaction fields, not `ret`.
+    // Zero when `original_size` is absent → exact prost behaviour preserved.
+    let dropped_bytes = original_size
+        .map(|orig| orig - tx.encoded_len() as i64)
+        .unwrap_or(0);
     let bytes = if support_vm {
-        serialized_bytes(tx) as i64 + MAX_RESULT_SIZE_IN_TX
+        serialized_bytes(tx) as i64 + dropped_bytes + MAX_RESULT_SIZE_IN_TX
     } else {
-        tx.encoded_len() as i64
+        tx.encoded_len() as i64 + dropped_bytes
     };
     let mut account = stores
         .accounts

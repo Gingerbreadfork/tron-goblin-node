@@ -1682,6 +1682,7 @@ fn state_deltas_absent_by_default() {
         None,
         &undo,
         &tron_executor::ExecConfig::unsigned(),
+        None,
     )
     .unwrap();
     assert!(report.state_deltas.is_none());
@@ -1708,6 +1709,7 @@ fn state_deltas_capture_pre_and_post_images_on_both_commit_paths() {
             None,
             &undo,
             &cfg,
+            None,
         )
         .unwrap()
     };
@@ -1732,6 +1734,7 @@ fn state_deltas_capture_pre_and_post_images_on_both_commit_paths() {
             &undo,
             &cp,
             &cfg,
+            None,
         )
         .unwrap();
         // Don't leave the checkpoint staging dir behind under the system temp dir.
@@ -2052,7 +2055,7 @@ fn pipelined_parallel_create_account_chain_matches_classic_serial() {
     let mut serial_outcomes = Vec::new();
     for b in chain() {
         let r = execute_block_with_undo_checkpoint_and_config(
-            &s.backends(), &b, None, &undo_s, &cp_s, &serial_cfg,
+            &s.backends(), &b, None, &undo_s, &cp_s, &serial_cfg, None,
         ).expect("serial apply");
         for t in &r.tx_results {
             serial_outcomes.push(format!("{:?}", t.outcome));
@@ -2073,7 +2076,7 @@ fn pipelined_parallel_create_account_chain_matches_classic_serial() {
     let mut pipeline = ApplyPipeline::new(&backends, undo_p, cp_p);
     let mut par_outcomes = Vec::new();
     for b in chain() {
-        let r = pipeline.apply(&b, None, &par_cfg).expect("pipelined apply");
+        let r = pipeline.apply(&b, None, &par_cfg, None).expect("pipelined apply");
         for t in &r.tx_results {
             par_outcomes.push(format!("{:?}", t.outcome));
         }
@@ -2144,7 +2147,7 @@ fn pipelined_parallel_weight_chain_matches_classic_serial() {
     let undo_s = BlockUndoStore::new(Arc::new(MemBackend::new()) as Arc<dyn KvBackend>);
     let root_s = tmp_root("serial"); let cp_s = CheckPointV2::new(&root_s);
     for b in chain() {
-        execute_block_with_undo_checkpoint_and_config(&s.backends(), &b, None, &undo_s, &cp_s, &serial_cfg).expect("serial");
+        execute_block_with_undo_checkpoint_and_config(&s.backends(), &b, None, &undo_s, &cp_s, &serial_cfg, None).expect("serial");
     }
 
     let par_cfg = ExecConfig { parallel_exec: true, defer_store_fsync: true, ..ExecConfig::unsigned() };
@@ -2153,7 +2156,7 @@ fn pipelined_parallel_weight_chain_matches_classic_serial() {
     let root_p = tmp_root("pipe"); let cp_p = CheckPointV2::new(&root_p);
     let backends = p.backends();
     let mut pipe = ApplyPipeline::new(&backends, undo_p, cp_p);
-    for b in chain() { pipe.apply(&b, None, &par_cfg).expect("pipelined"); }
+    for b in chain() { pipe.apply(&b, None, &par_cfg, None).expect("pipelined"); }
     pipe.flush().expect("flush");
 
     let wt_s = s.dyn_props.get_long(tron_chainbase::dynamic_properties_keys::TOTAL_NET_WEIGHT).unwrap_or(0);
@@ -2247,6 +2250,7 @@ fn pipelined_parallel_free_net_chain_matches_classic_serial() {
             &undo_s,
             &cp_s,
             &serial_cfg,
+            None,
         )
         .expect("serial apply");
     }
@@ -2265,7 +2269,7 @@ fn pipelined_parallel_free_net_chain_matches_classic_serial() {
     let backends = p.backends();
     let mut pipeline = ApplyPipeline::new(&backends, undo_p, cp_p);
     for b in chain() {
-        pipeline.apply(&b, None, &par_cfg).expect("pipelined apply");
+        pipeline.apply(&b, None, &par_cfg, None).expect("pipelined apply");
     }
     pipeline.flush().expect("flush");
 

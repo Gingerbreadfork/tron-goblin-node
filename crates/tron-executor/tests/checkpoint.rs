@@ -174,7 +174,7 @@ fn checkpoint_path_matches_no_checkpoint_path_and_cleans_up() {
     let undo_ref = BlockUndoStore::new(mem());
     seed_witness(&state_ref);
     let block = empty_block(1, [0u8; 32]);
-    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned())
+    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned(), None)
         .unwrap();
     let ref_snapshot = snapshot_state(&state_ref);
 
@@ -191,6 +191,7 @@ fn checkpoint_path_matches_no_checkpoint_path_and_cleans_up() {
         &undo,
         &cp,
         &ExecConfig::unsigned(),
+        None,
     )
     .unwrap();
     let cp_snapshot = snapshot_state(&state);
@@ -225,7 +226,7 @@ fn crash_after_manifest_before_per_store_flush_is_recoverable() {
     let undo_ref = BlockUndoStore::new(mem());
     seed_witness(&state_ref);
     let block = empty_block(1, [0u8; 32]);
-    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned())
+    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned(), None)
         .unwrap();
     let ref_snapshot = snapshot_state(&state_ref);
 
@@ -310,6 +311,7 @@ fn replay_is_idempotent_when_writes_already_landed() {
         &undo,
         &cp,
         &ExecConfig::unsigned(),
+        None,
     )
     .unwrap();
     let after_first_apply = snapshot_state(&state);
@@ -368,6 +370,7 @@ fn checkpoint_dir_has_no_leftover_tmp_after_apply() {
         &undo,
         &cp,
         &ExecConfig::unsigned(),
+        None,
     )
     .unwrap();
 
@@ -401,7 +404,7 @@ fn deferred_fsync_retains_manifest_and_replays_to_reference_state() {
     let state_ref = fresh_state();
     let undo_ref = BlockUndoStore::new(mem());
     seed_witness(&state_ref);
-    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned())
+    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned(), None)
         .unwrap();
     let ref_snapshot = snapshot_state(&state_ref);
 
@@ -415,7 +418,7 @@ fn deferred_fsync_retains_manifest_and_replays_to_reference_state() {
         defer_store_fsync: true,
         ..ExecConfig::unsigned()
     };
-    execute_block_with_undo_checkpoint_and_config(&state, &block, None, &undo, &cp, &cfg).unwrap();
+    execute_block_with_undo_checkpoint_and_config(&state, &block, None, &undo, &cp, &cfg, None).unwrap();
 
     // Same resulting state as the normal path...
     assert_eq!(
@@ -467,7 +470,7 @@ fn deferred_fsync_self_barrier_clears_after_n_blocks() {
     let mut parent = [0u8; 32];
     for n in 1..=DEFER_FSYNC_BARRIER_BLOCKS as i64 {
         let block = empty_block(n, parent);
-        execute_block_with_undo_checkpoint_and_config(&state, &block, None, &undo, &cp, &cfg)
+        execute_block_with_undo_checkpoint_and_config(&state, &block, None, &undo, &cp, &cfg, None)
             .unwrap();
         // Cheap stand-in for the next parent hash — the test applies with
         // `None` expected_parent so the exact value doesn't gate execution.
@@ -508,6 +511,7 @@ fn flush_barrier_clears_retained_manifests() {
         &undo,
         &cp,
         &cfg,
+        None,
     )
     .unwrap();
     assert_eq!(cp.list().unwrap().len(), 1);
@@ -640,6 +644,7 @@ fn checkpoint_path_updates_dynamic_properties_head_pointer() {
         &undo,
         &cp,
         &ExecConfig::unsigned(),
+        None,
     )
     .unwrap();
 
@@ -661,7 +666,7 @@ fn checkpoint_path_undo_log_matches_no_checkpoint_path() {
     let state_ref = fresh_state();
     let undo_ref = BlockUndoStore::new(mem());
     seed_witness(&state_ref);
-    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned())
+    execute_block_with_undo_and_config(&state_ref, &block, None, &undo_ref, &ExecConfig::unsigned(), None)
         .unwrap();
     let rec_ref = undo_ref.get(1).unwrap().expect("undo log");
 
@@ -677,6 +682,7 @@ fn checkpoint_path_undo_log_matches_no_checkpoint_path() {
         &undo,
         &cp,
         &ExecConfig::unsigned(),
+        None,
     )
     .unwrap();
     let rec_cp = undo.get(1).unwrap().expect("undo log");

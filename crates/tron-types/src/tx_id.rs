@@ -105,6 +105,53 @@ pub fn tx_trie_root_from_block_bytes(block_bytes: &[u8]) -> Option<[u8; 32]> {
     merkle_root(&leaves)
 }
 
+/// Per-transaction ORIGINAL serialized sizes, in block order — the wire length
+/// of every `transactions` entry (field 1, length-delimited) in `block_bytes`.
+///
+/// This is java-tron's `Transaction.getSerializedSize()` for each tx: the
+/// original wire size, including any non-canonical / unknown Transaction-level
+/// bytes that a prost round-trip (`Message::encoded_len`) silently drops. The
+/// bandwidth charge needs it so `net_usage` matches java byte-for-byte even on
+/// the ~0.1% of mainnet txs whose wire form is not prost-canonical (java's
+/// parsed `TransactionCapsule` caches the original size; prost recomputes a
+/// canonical one). Returns `None` on malformed/truncated input — the caller
+/// falls back to the prost size. The protobuf walk mirrors
+/// [`tx_trie_root_from_block_bytes`] exactly; the only difference is recording
+/// each tx span's length instead of its hash.
+pub fn tx_sizes_from_block_bytes(block_bytes: &[u8]) -> Option<Vec<i64>> {
+    const TRANSACTIONS_FIELD: u64 = 1;
+    let mut sizes: Vec<i64> = Vec::new();
+    let mut i = 0usize;
+    while i < block_bytes.len() {
+        let (tag, n) = read_varint(&block_bytes[i..])?;
+        i += n;
+        let field = tag >> 3;
+        match tag & 0x7 {
+            0 => {
+                let (_, n) = read_varint(&block_bytes[i..])?;
+                i += n;
+            }
+            1 => i = i.checked_add(8)?,
+            5 => i = i.checked_add(4)?,
+            2 => {
+                let (len, n) = read_varint(&block_bytes[i..])?;
+                i += n;
+                let len = len as usize;
+                let end = i.checked_add(len)?;
+                if end > block_bytes.len() {
+                    return None; // truncated
+                }
+                if field == TRANSACTIONS_FIELD {
+                    sizes.push(len as i64);
+                }
+                i = end;
+            }
+            _ => return None, // groups (3/4) — not used by these messages
+        }
+    }
+    Some(sizes)
+}
+
 /// Minimal protobuf varint reader: returns `(value, bytes_consumed)`, or
 /// `None` on overflow / truncation. Kept local to avoid pulling prost's
 /// decoder (which would re-introduce the very re-encoding we're avoiding).
@@ -222,6 +269,47 @@ mod tx_trie_raw_tests {
         // Re-encode roots are EQUAL — prost normalises both to canonical, so
         // the old decoded check couldn't tell them apart (the bug).
         assert_eq!(calc_tx_trie_root(&[dec_c]), calc_tx_trie_root(&[dec_s]));
+    }
+
+    #[test]
+    fn tx_sizes_match_prost_for_canonical_blocks() {
+        let txs: Vec<Transaction> = (0..3)
+            .map(|i| Transaction {
+                raw_data: Some(sample_raw(i)),
+                signature: vec![vec![i as u8; 65]],
+                ..Default::default()
+            })
+            .collect();
+        let block = Block { transactions: txs.clone(), ..Default::default() };
+        let sizes = tx_sizes_from_block_bytes(&block.encode_to_vec()).unwrap();
+        assert_eq!(sizes.len(), 3);
+        for (s, tx) in sizes.iter().zip(&txs) {
+            assert_eq!(*s, tx.encoded_len() as i64);
+        }
+    }
+
+    #[test]
+    fn tx_sizes_use_original_wire_size_including_dropped_bytes() {
+        // The #9 bug in miniature: a transaction carrying an UNKNOWN field
+        // (field 15) that prost drops on decode. java's getSerializedSize
+        // counts those bytes; prost's encoded_len does not.
+        let raw_bytes = sample_raw(9).encode_to_vec();
+        let sig = vec![0xCDu8; 65];
+        let unknown = ld_field(15, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        // raw_data = field 1, signature = field 2, then the unknown field.
+        let tx_wire = [ld_field(1, &raw_bytes), ld_field(2, &sig), unknown.clone()].concat();
+        let block = ld_field(1, &tx_wire); // transactions = Block field 1
+
+        let sizes = tx_sizes_from_block_bytes(&block).unwrap();
+        assert_eq!(sizes.len(), 1);
+        // Original wire size = the full tx span, including the unknown field.
+        assert_eq!(sizes[0], tx_wire.len() as i64);
+
+        // prost drops the unknown field, so its re-encode is shorter — and the
+        // gap is exactly the dropped bytes the bandwidth charge must add back.
+        let decoded = Transaction::decode(tx_wire.as_slice()).unwrap();
+        assert!((decoded.encoded_len() as i64) < sizes[0]);
+        assert_eq!(sizes[0] - decoded.encoded_len() as i64, unknown.len() as i64);
     }
 
     #[test]
