@@ -140,8 +140,10 @@ fn multiple_proposals_processed_in_id_order() {
     let dp = DynamicPropertiesStore::new(mem());
 
     // Two pending proposals — id=2 sets TRANSACTION_FEE=20, id=1 sets it to 10.
-    // Both expire, both approved. id=1 should be processed first (ascending order),
-    // so the final value should be 20 (id=2 overwrites).
+    // Both expire, both approved. java's `processProposals` walks ids
+    // DESCENDING, so id=2 is processed FIRST and id=1 LAST — the low-id value
+    // (10) wins as the last write, matching java's same-boundary same-parameter
+    // resolution order.
     proposals.put(
         1,
         &make_proposal(1, vec![(3, 10)], 1_700_000_000_000, 20),
@@ -152,8 +154,8 @@ fn multiple_proposals_processed_in_id_order() {
     ).unwrap();
 
     let report = activate_expired_proposals(&proposals, &dp, 1_700_000_010_000, &active_set(27)).unwrap();
-    assert_eq!(report.approved, vec![1, 2]);
-    assert_eq!(dp.get_long(b"TRANSACTION_FEE").unwrap(), 20);
+    assert_eq!(report.approved, vec![2, 1]);
+    assert_eq!(dp.get_long(b"TRANSACTION_FEE").unwrap(), 10);
 }
 
 #[test]

@@ -661,6 +661,10 @@ impl<
         self.journaled_state.db().tron_account_exists(address)
     }
 
+    fn tron_account_exists_or_created(&self, address: Address) -> bool {
+        self.journaled_state.db().tron_account_exists_or_created(address)
+    }
+
     // This impl IS the TRON VM Context (the `DB: TronDatabaseExt` bound),
     // so the shared CALL opcode path's TRON-only gating is always on here.
     fn tron_enabled(&self) -> bool {
@@ -673,6 +677,10 @@ impl<
 
     fn tron_allow_tvm_vote(&self) -> bool {
         self.journaled_state.db().tron_allow_tvm_vote()
+    }
+
+    fn tron_allow_multi_sign(&self) -> bool {
+        self.journaled_state.db().tron_allow_multi_sign()
     }
 
     fn tron_allow_tvm_compatible_evm(&self) -> bool {

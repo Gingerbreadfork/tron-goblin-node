@@ -83,6 +83,12 @@ pub trait TronDatabaseExt {
         false
     }
 
+    /// See [`crate::host::Host::tron_account_exists_or_created`] — committed
+    /// store OR an account created earlier in this same tx.
+    fn tron_account_exists_or_created(&self, address: Address) -> bool {
+        self.tron_account_exists(address)
+    }
+
     /// See [`TronHostExt::tron_freeze_expire_time`].
     fn tron_freeze_expire_time(
         &self,
@@ -235,6 +241,11 @@ pub trait TronDatabaseExt {
 
     /// See [`crate::host::Host::tron_allow_tvm_vote`].
     fn tron_allow_tvm_vote(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_allow_multi_sign`].
+    fn tron_allow_multi_sign(&self) -> bool {
         false
     }
 

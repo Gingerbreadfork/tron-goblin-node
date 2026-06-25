@@ -318,6 +318,15 @@ impl TronDatabaseExt for TronDatabase {
         matches!(self.accounts.get(&tron_addr), Ok(Some(_)))
     }
 
+    fn tron_account_exists_or_created(&self, address: Address) -> bool {
+        // java `isDeadAccount` reads the IN-FLIGHT Repository, so an account
+        // created earlier in THIS tx is visible. The committed-only
+        // `tron_account_exists` misses it; also consult the same-tx
+        // pending-created set so a same-tx-created inheritor (SELFDESTRUCT) /
+        // receiver (FREEZE) is not wrongly treated as dead.
+        self.tron_account_exists(address) || self.pending_created_contracts.contains_key(&address)
+    }
+
     fn tron_contract_version(&self, address: Address) -> i32 {
         // The version of the contract whose code a CALL frame is about to
         // execute. java reads `invoke.getDeposit().getContract(codeAddress)
@@ -348,6 +357,15 @@ impl TronDatabaseExt for TronDatabase {
         // Gates the FREEZE/UNFREEZE (Stake 1.0) static-call guard.
         match &self.dyn_props {
             Some(dp) => dp.get_long(b"ALLOW_TVM_VOTE").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_allow_multi_sign(&self) -> bool {
+        // java `VMConfig.allowMultiSign()` — the `ALLOW_MULTI_SIGN` proposal
+        // (#20). Gates CALLTOKEN/TOKENBALANCE tokenId range validation.
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_MULTI_SIGN").unwrap_or(0) == 1,
             None => false,
         }
     }
@@ -1234,15 +1252,40 @@ impl TronDatabaseExt for TronDatabase {
         {
             const UNFREEZE_MAX_TIMES: usize = 32;
             let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-            if let Ok(Some(acct)) = self.accounts.get(&owner) {
-                let unfreezing = acct
-                    .unfrozen_v2
-                    .iter()
-                    .filter(|u| u.unfreeze_expire_time > now)
-                    .count();
-                if unfreezing >= UNFREEZE_MAX_TIMES {
-                    return 0;
+            // java runs `UnfreezeBalanceV2Processor.validate` in a child
+            // Repository BEFORE `execute()` settles rewards; a failing validate
+            // discards the child so NO reward markers/allowance are written.
+            // Mirror that ordering: the unfreezing-count cap AND the
+            // frozen-balance existence/sufficiency checks must precede the
+            // `withdraw_reward_tvm` settle below — otherwise a soft return-0
+            // leaves the settle journaled and it commits on tx success, a
+            // DelegationStore/allowance state divergence vs java.
+            match self.accounts.get(&owner) {
+                Ok(Some(acct)) => {
+                    let unfreezing = acct
+                        .unfrozen_v2
+                        .iter()
+                        .filter(|u| u.unfreeze_expire_time > now)
+                        .count();
+                    if unfreezing >= UNFREEZE_MAX_TIMES {
+                        return 0;
+                    }
+                    // checkExistFrozenBalance + checkUnfreezeBalance: the
+                    // resource must hold frozenV2 >= unfreeze_balance (slot
+                    // amount, 0 if absent — which fails since unfreeze_balance
+                    // is already > 0 here).
+                    let frozen = acct
+                        .frozen_v2
+                        .iter()
+                        .find(|f| f.r#type == resource_type as i32)
+                        .map(|f| f.amount)
+                        .unwrap_or(0);
+                    if frozen < unfreeze_balance {
+                        return 0;
+                    }
                 }
+                // java's validate throws when the owner account is absent.
+                _ => return 0,
             }
         }
         // java's TVM `UnfreezeBalanceV2Processor.execute` settles pending

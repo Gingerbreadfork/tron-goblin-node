@@ -302,6 +302,19 @@ pub trait Host {
         false
     }
 
+    /// **TRON fork** — like [`Host::tron_account_exists`] but JOURNAL-AWARE:
+    /// also `true` when the account was CREATED earlier in this same tx (held
+    /// in the host's pending-created set, not yet committed to the AccountStore).
+    /// java's `isDeadAccount` reads the in-flight Repository
+    /// (`getContractState().getAccount`), so a same-tx-created inheritor /
+    /// receiver is visible. Used by SELFDESTRUCT / FREEZE dead-account
+    /// surcharges so a same-tx child is not wrongly charged `NEW_ACCT_CALL`.
+    /// Default delegates to the committed-only check.
+    #[inline]
+    fn tron_account_exists_or_created(&self, address: Address) -> bool {
+        self.tron_account_exists(address)
+    }
+
     /// **TRON fork** — `true` when running under the TRON VM (the real
     /// chainbase-backed Context). Used by the shared CALL opcode path to
     /// gate TRON-only semantics that diverge from upstream EVM — e.g.
@@ -343,6 +356,15 @@ pub trait Host {
     /// Default `false`.
     #[inline]
     fn tron_allow_tvm_vote(&self) -> bool {
+        false
+    }
+
+    /// **TRON fork** — is the `ALLOW_MULTI_SIGN` proposal (#20) active?
+    /// java `VMConfig.allowMultiSign()`. Gates CALLTOKEN/TOKENBALANCE tokenId
+    /// range validation (`checkTokenId` / `checkTokenIdInTokenBalance`) and the
+    /// `isTokenTransferMsg` path. Default `false`.
+    #[inline]
+    fn tron_allow_multi_sign(&self) -> bool {
         false
     }
 

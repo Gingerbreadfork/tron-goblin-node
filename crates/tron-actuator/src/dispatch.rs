@@ -674,7 +674,15 @@ pub fn dispatch_execute(
 }
 
 fn unpack<T: prost::Message + Default>(any: &Any) -> Result<T, ActuatorError> {
-    T::decode(any.value.as_slice()).map_err(|e| {
+    // java's generated protobuf parser silently SKIPS a field whose number is
+    // known but whose wire-type mismatches (`parseUnknownField`/`skipField`),
+    // leaving it at its default; strict prost `T::decode` hard-errors and
+    // REJECTS such a tx where java accepts it and runs the actuator to SUCCESS.
+    // `decode_lenient` is byte-identical to strict on well-formed txs (its fast
+    // path) and only falls back to java's skip-on-mismatch walk otherwise — the
+    // same parser the permission / bandwidth / VM paths already use. This was
+    // the last strict contract-parameter decode site in the dispatch path.
+    tron_proto::decode_lenient::<T>(any.value.as_slice()).map_err(|e| {
         ActuatorError::Store(format!("failed to decode contract parameter: {e}"))
     })
 }

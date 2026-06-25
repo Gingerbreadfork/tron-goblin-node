@@ -4571,6 +4571,29 @@ pub fn apply_genesis_allocations(
         };
         witnesses_store.put(&addr, &witness)?;
     }
+
+    // java `DposService.start` seeds the active-witness list at fresh genesis
+    // (latestBlockHeaderNumber == 0): sort the genesis witnesses by vote_count
+    // DESC, take the top 27, and `saveActiveWitnesses`. Without this our active
+    // list stays empty until the first maintenance (~block 7200), so during that
+    // window `total_missed` is never attributed (its bump is gated on a
+    // non-empty active list) and the producer-validation gate short-circuits —
+    // drifting witness-store counters vs java. The block schedule itself is
+    // computed from the witness rows (not this list), so seeding does not change
+    // block production; the first maintenance recomputes + overwrites the list.
+    // Tie-break is immaterial: genesis has 27 witnesses, so the top-27 set is
+    // all of them regardless of order, and that set is what the counters key on.
+    if let Some(sched) = &state.witness_schedule {
+        let schedule = tron_chainbase::WitnessScheduleStore::new(sched.clone());
+        let mut ranked: Vec<(Address, i64)> = witnesses
+            .iter()
+            .map(|w| (Address::from_raw(w.address), w.vote_count))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.as_bytes().cmp(a.0.as_bytes())));
+        let active: Vec<Address> = ranked.into_iter().take(27).map(|(a, _)| a).collect();
+        schedule.save_active(&active)?;
+    }
+
     Ok(())
 }
 

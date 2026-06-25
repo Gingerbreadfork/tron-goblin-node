@@ -327,6 +327,20 @@ pub fn execute_exchange_inject(
             )
         };
 
+    // java `ExchangeInjectActuator.execute` computes the paired amount via
+    // `floorDiv(Math.multiplyExact(otherBalance, tokenQuant), thisBalance)`.
+    // `multiplyExact` throws ArithmeticException when the i64 PRODUCT overflows
+    // (> i64::MAX); execute()'s catch only handles ItemNotFound /
+    // InvalidProtocolBuffer, so the exception propagates through processBlock
+    // (no per-tx catch) and rejects the WHOLE block. java's validate uses
+    // BigInteger and bounds only the QUOTIENT (always <= i64 given
+    // EXCHANGE_BALANCE_LIMIT), so it passes — reproduce the i64-product
+    // rejection HERE in execute, not validate. Not reachable on honest
+    // canonical replay (java never commits such a block); this is
+    // block-production / adversarial-block fidelity.
+    if other_balance.checked_mul(contract.quant).is_none() {
+        return Err(ActuatorError::Overflow);
+    }
     // Maintain ratio: new_other = floor(other * quant / my_balance).
     let other_quant = (other_balance as i128) * (contract.quant as i128) / (my_balance as i128);
     if other_quant <= 0 || other_quant > i64::MAX as i128 {
@@ -546,6 +560,24 @@ pub fn validate_exchange_transaction(
     // inert; the substantive divergence is the closed-exchange and
     // balance-limit checks, which our execute-only path could not catch
     // (java rejects at validate → recorded contractRet FAILED, not SUCCESS).
+    //
+    // java `Manager.rejectExchangeTransaction` (1886-1891): once VERSION_4_8_0_1
+    // is active, the Bancor swap (ExchangeTransactionContract ONLY — create /
+    // inject / withdraw stay enabled) is permanently DISABLED. java's gate fires
+    // in the mempool/producer path AND processBlock's per-tx loop (no per-tx
+    // catch → the whole block is rejected). Not reachable on honest canonical
+    // replay (post-fork blocks carry no swap, so this never fires there); it is
+    // block-production / adversarial-block validity. Gate on VERSION_4_8_0_1's
+    // hardForkTime (2020-08-07); the real 80%-witness activation lands a few
+    // maintenance cycles later — exact awaits the ForkController (audit
+    // coverage-gap #1). [Adversarial-block fidelity: java rejects the WHOLE
+    // block; here only the tx is rejected — moot on honest replay.]
+    const VERSION_4_8_0_1_HARD_FORK_TIME_MS: i64 = 1_596_780_000_000;
+    if dyn_props.latest_block_header_timestamp().unwrap_or(0) >= VERSION_4_8_0_1_HARD_FORK_TIME_MS {
+        return Err(ActuatorError::Validate(
+            "exchange transaction is forbidden once VERSION_4_8_0_1 is active",
+        ));
+    }
     let owner = require_owner(&contract.owner_address)?;
     let account = accounts
         .get(&owner)?

@@ -57,13 +57,33 @@ pub fn activate_expired_proposals(
         .collect();
     let mut report = ProposalActivationReport::default();
 
+    // java `ProposalController.processProposals` walks proposal ids from
+    // latestProposalNum DOWNWARD and BREAKS at the first already-processed
+    // (APPROVED/DISAPPROVED) proposal — all lower ids were resolved in a prior
+    // maintenance (it relies on id-monotonic expiration). It `continue`s past
+    // CANCELED ones and processes only expired Pending ones. Walking ascending
+    // and processing every expired Pending (no break) diverges in two
+    // constructible cases: same-boundary same-parameter resolution order (java
+    // applies high-id FIRST so the LOW-id value wins; ascending makes the
+    // high-id win) and a lower-id Pending+expired stranded behind a higher-id
+    // already-processed one under non-monotonic expiration. Historical mainnet
+    // expiration is id-monotonic with no same-parameter collisions, so
+    // canonical replay state is unchanged.
     let mut all = proposals.all()?;
-    all.sort_by_key(|(id, _)| *id);
+    all.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
 
     for (id, mut proposal) in all {
-        if proposal.state != ProposalState::Pending as i32 {
+        if proposal.state == ProposalState::Approved as i32
+            || proposal.state == ProposalState::Disapproved as i32
+        {
+            // java `hasProcessed()` → break the entire walk.
+            break;
+        }
+        if proposal.state == ProposalState::Canceled as i32 {
+            // java `hasCanceled()` → skip, but keep walking lower ids.
             continue;
         }
+        // state == Pending
         if proposal.expiration_time > now_ms {
             continue;
         }

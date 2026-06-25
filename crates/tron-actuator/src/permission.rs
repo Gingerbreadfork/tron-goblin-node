@@ -167,9 +167,27 @@ fn check_transaction_permission_inner(
             signers_owned.as_slice()
         }
     };
-    let mut seen: Vec<Address> = Vec::with_capacity(signers.len());
+    // java `TransactionCapsule.checkWeight` de-duplicates signers in a map
+    // keyed on the per-signature base64 (`getBase64FromByteString`) BEFORE
+    // VERSION_4_7_1 and on the base58check ADDRESS from VERSION_4_7_1 onward.
+    // Pre-4.7.1, two DISTINCT valid signatures from the SAME key (a different
+    // nonce's r,s, or the malleability twin (r, N-s, v^1) — neither side
+    // enforces low-s) do NOT collide, so java counts that key's weight TWICE
+    // and accepts the tx if the doubled weight meets threshold. Deduping by
+    // recovered address unconditionally rejects it (DuplicateSigner) where java
+    // commits it — a success/failure contractRet mismatch that HALTS a
+    // from-genesis replay through the pre-4.7.1 multisig window. Gate on
+    // VERSION_4_7_1's hardForkTime (2020-08-07); the real 80%-witness activation
+    // lands a few maintenance cycles later — exact activation awaits the
+    // ForkController (audit coverage-gap #1), but the time gate is exact for the
+    // whole pre-2020 era the replay traverses first.
+    const VERSION_4_7_1_HARD_FORK_TIME_MS: i64 = 1_596_780_000_000;
+    let pre_4_7_1 = dyn_props.latest_block_header_timestamp().unwrap_or(0)
+        < VERSION_4_7_1_HARD_FORK_TIME_MS;
+    let mut seen_addr: Vec<Address> = Vec::with_capacity(signers.len());
+    let mut seen_sig: Vec<&[u8]> = Vec::with_capacity(signers.len());
     let mut total_weight: i64 = 0;
-    for signer in signers {
+    for (i, signer) in signers.iter().enumerate() {
         let Some(key) = permission
             .keys
             .iter()
@@ -177,10 +195,20 @@ fn check_transaction_permission_inner(
         else {
             return Err(PermissionError::SignerNotInPermission(signer.clone()));
         };
-        if seen.iter().any(|s| s == signer) {
+        if pre_4_7_1 {
+            // Dedup on the raw signature bytes — base64 is just java's key
+            // representation, so identical bytes collide and distinct bytes
+            // (incl. a same-key malleability twin) do not.
+            let sig: &[u8] = sigs.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
+            if seen_sig.iter().any(|s| *s == sig) {
+                return Err(PermissionError::DuplicateSigner(signer.clone()));
+            }
+            seen_sig.push(sig);
+        } else if seen_addr.iter().any(|s| s == signer) {
             return Err(PermissionError::DuplicateSigner(signer.clone()));
+        } else {
+            seen_addr.push(signer.clone());
         }
-        seen.push(signer.clone());
         total_weight = total_weight.saturating_add(key.weight);
     }
     if total_weight < permission.threshold {

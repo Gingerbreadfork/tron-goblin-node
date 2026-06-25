@@ -34,8 +34,17 @@ fn unfreeze_delay_ms(dyn_props: &DynamicPropertiesStore) -> i64 {
     days * (FROZEN_PERIOD_MS / 3)
 }
 
-fn resource_valid(r: i32) -> bool {
-    (0..=2).contains(&r)
+fn resource_valid(r: i32, dyn_props: &DynamicPropertiesStore) -> bool {
+    // java FreezeBalanceV2Actuator:147 / UnfreezeBalanceV2Actuator:156:
+    // BANDWIDTH(0) and ENERGY(1) are always valid; TRON_POWER(2) is rejected
+    // unless `supportAllowNewResourceModel()` (ALLOW_NEW_RESOURCE_MODEL == 1,
+    // OFF for all mainnet history). The v1 actuator already gates this
+    // (freeze.rs); the v2 path previously accepted TRON_POWER unconditionally.
+    match r {
+        0 | 1 => true,
+        2 => dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1,
+        _ => false,
+    }
 }
 
 // =============================================================================
@@ -52,7 +61,7 @@ pub fn validate_freeze_balance_v2(
     if contract.frozen_balance <= 0 || contract.frozen_balance < TRX_PRECISION {
         return Err(ActuatorError::FreezeTooSmall);
     }
-    if !resource_valid(contract.resource) {
+    if !resource_valid(contract.resource, dyn_props) {
         return Err(ActuatorError::InvalidResourceCode);
     }
     let account = accounts
@@ -172,7 +181,7 @@ pub fn validate_unfreeze_balance_v2(
 ) -> Result<(), ActuatorError> {
     require_unfreeze_delay(dyn_props)?;
     let owner = require_owner(&contract.owner_address)?;
-    if !resource_valid(contract.resource) {
+    if !resource_valid(contract.resource, dyn_props) {
         return Err(ActuatorError::InvalidResourceCode);
     }
     let account = accounts

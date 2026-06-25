@@ -134,6 +134,22 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
         return Err(InstructionResult::OutOfGas);
     }
 
+    // java `createContractImpl` (Program.java:821) reads the endowment with a
+    // BARE `value.value().longValueExact()` — NO try/catch (unlike
+    // `callToAddress`). A value DataWord exceeding i64::MAX throws
+    // ArithmeticException which, not being a TransferException, propagates to
+    // VM.java:100 -> `spendAllEnergy()`: the WHOLE tx fails consuming ALL
+    // remaining energy with state reverted. This is the CREATE analogue of the
+    // CALL endowment-range guard, but java's CREATE arm is spend-all, NOT the
+    // consumed-only TransferException path — so map to the spend-all
+    // `OutOfMemory` result (execute.rs), never `TransferFailed`. Ungated:
+    // Program.java:821 is ungated and ALLOW_TVM_CONSTANTINOPLE already floors
+    // these opcodes. (Effectively unreachable on canonical mainnet — a >i64 sun
+    // endowment is ~9.2e12 TRX — but faithful to java for crafted bytecode.)
+    if u256_to_i64_exact(&value).is_none() {
+        return Err(InstructionResult::MemoryLimitOOG);
+    }
+
     // Call host to interact with target contract. TRON fork: the created
     // contract's init frame inherits the parent's contract version
     // (`Program.java:915`), so stamp this frame's version onto the inputs.
@@ -387,6 +403,24 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
         return Err(InstructionResult::TransferFailed);
     }
 
+    // java `checkTokenId` (Program.java:1046, 1812-1823): once ALLOW_MULTI_SIGN
+    // (#20) is active, CALLTOKEN's tokenId must be > MIN_TOKEN_ID (1_000_000);
+    // a tokenId in [0, 1_000_000] or outside signed-i64 range refunds the
+    // forwarded energy and throws TransferException — the whole tx fails as
+    // TRANSFER_FAILED (consumed-only energy, no spend-all). Honest contracts use
+    // real ids (> 1_000_000); a crafted/buggy contract trips it. ALLOW_TVM_
+    // CONSTANTINOPLE (which makes the result a TransferException rather than the
+    // older spend-all) predates ALLOW_MULTI_SIGN on mainnet, so gating on
+    // ALLOW_MULTI_SIGN suffices. The pre-ALLOW_MULTI_SIGN era (isTokenTransfer =
+    // tokenId != 0, with distinct native-value semantics) is a separate gap.
+    if context.host.tron_allow_multi_sign()
+        && u256_to_i64_exact(&token_id).map_or(true, |id| id <= 1_000_000)
+    {
+        context.interpreter.gas.erase_cost(gas_limit);
+        context.host.tron_mark_transfer_failed();
+        return Err(InstructionResult::TransferFailed);
+    }
+
     // Saturate the i128 stack words to i64. java-tron rejects out-of-i64
     // token id / value at the contract layer; the EVM keeps the truncated
     // value so an in-VM check inside the contract sees the same number.
@@ -459,6 +493,23 @@ pub fn call_token_id<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
 /// add asset-store knowledge to the interpreter.
 pub fn token_balance<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn!([token_id, address], context.interpreter);
+    // java `checkTokenIdInTokenBalance` (Program.java:1469, 1835-1853): once
+    // ALLOW_MULTI_SIGN (#20) is active, a tokenId outside signed-i64 range
+    // throws TransferException (whole tx TRANSFER_FAILED, consumed-only),
+    // while a tokenId <= MIN_TOKEN_ID (1_000_000) throws
+    // BytecodeExecutionException — a non-TransferException, so VM.java
+    // spendAllEnergy (whole tx fatal, all energy). Pre-ALLOW_MULTI_SIGN the
+    // opcode just queries the (usually absent) id and pushes 0.
+    if context.host.tron_allow_multi_sign() {
+        match u256_to_i64_exact(&token_id) {
+            None => {
+                context.host.tron_mark_transfer_failed();
+                return Err(InstructionResult::TransferFailed);
+            }
+            Some(id) if id <= 1_000_000 => return Err(InstructionResult::MemoryLimitOOG),
+            Some(_) => {}
+        }
+    }
     let addr = address.into_address();
     let id = u64_from_u256(&token_id) as i64;
     let bal = context.host.tron_token_balance(addr, id);
@@ -547,6 +598,16 @@ pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     // `caller != receiver` to switch self vs delegated. We pass both;
     // Host treats them as a hint.
     let receiver = receiver_address.into_address();
+    // java `EnergyCost.getFreezeCost` adds NEW_ACCT_CALL (25000) to the base
+    // FREEZE (20000) when the receiver is a dead account (isDeadAccount =
+    // getAccount(receiver) == null on the in-flight Repository). The full cost
+    // is charged BEFORE op.execute, so it fires even in the Stake-2.0 era where
+    // `tron_freeze` no-ops. FREEZE only exists under ALLOW_TVM_FREEZE (gated at
+    // registration), so no extra flag check is needed; the journal-aware check
+    // makes a same-tx-created receiver count as alive (no top-up).
+    if !context.host.tron_account_exists_or_created(receiver) {
+        gas!(context.interpreter, 25_000);
+    }
     let result = context.host.tron_freeze(
         caller,
         u64_from_u256(&frozen_balance) as i64,
@@ -624,12 +685,20 @@ pub fn vote_witness<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resu
     let amount_len = data_word_int_value_safe(&amount_array_len);
     let amount_off = data_word_int_value_safe(&amount_array_off);
 
-    // Expand and charge memory for both arrays before reading, matching
-    // java-tron's `EnergyCost.getVoteWitnessCost2`: the metered span of
-    // each array is its length word plus its elements
-    // (`memNeeded(offset, length * 32 + 32)`). Charging both yields the
-    // same high-water mark — and therefore the same memory energy — as
-    // java's single max-of-the-two charge, because memory only grows.
+    // Expand and charge memory for both arrays before reading. The span of
+    // each ABI dynamic array is its length word PLUS its elements:
+    // `memNeeded(offset, length*32 + 32)`. The trailing `+ 32` is the array's
+    // LENGTH WORD and is REQUIRED for the length-word read at `offset` below —
+    // revm faults (slice OOB) on an unexpanded read where java zero-extends.
+    // NOTE (audit #20, deferred): java's pre-ALLOW_ENERGY_ADJUSTMENT (#81)
+    // `getVoteWitnessCost` charges `length*32` (no +32) for ENERGY while still
+    // needing the +32 expansion for the read; `adjustForFairEnergy` swaps to
+    // `getVoteWitnessCost2` (`+32`) post-#81. Separating the energy cost from
+    // the read-expansion is not expressible with the coupled `resize_memory`
+    // here, so we keep the post-#81 (+32) charge — a <=1-word over-charge
+    // pre-#81 on the barely-used opcode-vote path. Post-#81 (the 83M-validated
+    // era) is exact. Charging both arrays yields the same high-water mark —
+    // and memory energy — as java's single max-of-the-two charge.
     let witness_span = witness_len.saturating_mul(32).saturating_add(32);
     let amount_span = amount_len.saturating_mul(32).saturating_add(32);
     context

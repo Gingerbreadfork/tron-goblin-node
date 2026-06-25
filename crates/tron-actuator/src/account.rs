@@ -32,7 +32,15 @@ fn name_valid(name: &[u8]) -> bool {
 }
 
 fn id_valid(id: &[u8]) -> bool {
+    // java `TransactionUtil.validAccountId` = `validReadableBytes(id, 32) &&
+    // len >= 8` (SetAccountIdActuator.validate:80, ungated): length in [8, 32]
+    // AND every byte printable ASCII (0x21..=0x7E). The length-only check
+    // accepted ids java rejects (NUL / space / control / high bytes). Ungated
+    // is replay-safe — java's own check is ungated and it syncs from genesis,
+    // so canonical history carries no non-printable account id; this only
+    // affects block production / adversarial-block validity.
     (MIN_ACCOUNT_ID_BYTES..=MAX_ACCOUNT_ID_BYTES).contains(&id.len())
+        && id.iter().all(|&b| (0x21..=0x7E).contains(&b))
 }
 
 // =============================================================================

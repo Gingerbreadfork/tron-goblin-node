@@ -129,9 +129,17 @@ impl MemoryTr for SharedMemory {
     #[cfg(feature = "memory_limit")]
     #[inline]
     fn limit_reached(&self, new_words: usize) -> bool {
-        self.my_checkpoint
-            .saturating_add(new_words.saturating_mul(32)) as u64
-            > self.memory_limit
+        // java enforces MEM_LIMIT (3MB) PER FRAME — each `Program` has its own
+        // `Memory`, so the cap applies to THIS frame's own size, not the
+        // cumulative shared buffer. revm offsets each child frame by the
+        // cumulative length of all live parent frames (`my_checkpoint =
+        // full_len()` in `new_child_context`); adding it here faulted a deep
+        // call chain whose frames COLLECTIVELY exceed 3MB even when no single
+        // frame does -> MemoryLimitOOG (spend-all) where java completes. Compare
+        // only this frame's own size (`new_words` is frame-relative,
+        // `num_words(offset+len)`). The 3MB limit is word-aligned (98304
+        // words), so the word-rounded test matches java's raw `offset+size`.
+        (new_words.saturating_mul(32)) as u64 > self.memory_limit
     }
 }
 

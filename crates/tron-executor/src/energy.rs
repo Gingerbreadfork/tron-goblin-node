@@ -1159,10 +1159,24 @@ pub fn pay_energy_bill(
         Some(left) => left,
         None => origin_quota_left(accounts, dyn_props, origin_addr, now_slot)?,
     };
-    let origin_usage = origin_share_raw
-        .min(origin_left)
-        .min(origin_energy_limit.max(0))
-        .max(0);
+    // java `ReceiptCapsule.getOriginUsage` applies the per-contract
+    // `originEnergyLimit` cap only in arm 1 (`getAllowTvmFreeze() ||
+    // supportUnfreezeDelay()`) and arm 2 (`checkForEnergyLimit()`, blockNum >=
+    // ENERGY_LIMIT_HARD_FORK_BLOCK). In the pre-fork arm-3 window the origin
+    // share is clamped ONLY by its live frozen quota — no contract cap. On
+    // mainnet ALLOW_TVM_FREEZE and the Stake-2.0 unfreeze-delay both activate
+    // strictly AFTER block 4,727,890, so `checkForEnergyLimit` is the binding
+    // term — the same gate the budget side uses above.
+    let apply_origin_cap =
+        dyn_props.latest_block_header_number().unwrap_or(0) >= ENERGY_LIMIT_HARD_FORK_BLOCK;
+    let origin_usage = if apply_origin_cap {
+        origin_share_raw
+            .min(origin_left)
+            .min(origin_energy_limit.max(0))
+            .max(0)
+    } else {
+        origin_share_raw.min(origin_left).max(0)
+    };
     let caller_usage = (total_i - origin_usage).max(0) as u64;
 
     // Debit origin first (frozen-only — guaranteed by the pre-clamp). java's

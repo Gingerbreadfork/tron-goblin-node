@@ -71,11 +71,23 @@ pub fn extcodehash<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resul
     popn_top!([], top, context.interpreter);
     let address = top.into_address();
     let account = load_account(&mut context.interpreter.gas, context.host, address, false)?;
-    // if account is empty, code hash is zero
-    let code_hash = if account.is_empty() {
-        B256::ZERO
+    let acct_code_hash = account.code_hash;
+    let acct_is_empty = account.is_empty();
+    // TRON keys EXTCODEHASH on store EXISTENCE, not EIP-161 emptiness
+    // (java `Program.getCodeHashAt`): a genuinely-absent account hashes to 0,
+    // but a present account with no code returns KECCAK_EMPTY — which
+    // `basic_ref` already loads as the code_hash of a non-contract row.
+    // revm's `is_empty()` (nonce==0 && balance==0 && code empty) wrongly
+    // collapses a present balance-0 non-contract to 0 because TRON hardcodes
+    // nonce=0 and never prunes accounts. The `!is_empty()` term keeps a
+    // same-tx-created child (held in the journal, not yet committed in the
+    // AccountStore) visible — the factory `extcodehash(child)` case. Mirrors
+    // the ISCONTRACT / CALL-new-account / SELFDESTRUCT existence fixes already
+    // keyed on `tron_account_exists`.
+    let code_hash = if context.host.tron_account_exists(address) || !acct_is_empty {
+        acct_code_hash
     } else {
-        account.code_hash
+        B256::ZERO
     };
     *top = code_hash.into_u256();
     Ok(())
@@ -429,7 +441,13 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     // never prunes accounts, so a zero-balance row is alive. Mirrors the
     // CALL-site fix in `call_helpers.rs`. The default `tron_account_exists`
     // returns `false` (no TRON store), preserving upstream EVM behaviour.
-    let target_is_dead = !context.host.tron_account_exists(target);
+    //
+    // Use the JOURNAL-AWARE variant: java's `isDeadAccount` reads the in-flight
+    // Repository, so an inheritor CREATED earlier in this same tx (a factory
+    // CREATEs child B then SELFDESTRUCTs to B) is visible and NOT dead — no
+    // 25000 NEW_ACCT_CALL top-up. The committed-only `tron_account_exists`
+    // missed the same-tx-created set.
+    let target_is_dead = !context.host.tron_account_exists_or_created(target);
 
     // java `EnergyCost.getSuicideCost3`: SUICIDE_V2 = 5000 base under the
     // restriction proposal (pre-#94 SUICIDE = 0), plus the dead-account
