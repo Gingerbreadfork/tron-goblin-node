@@ -491,6 +491,32 @@ fn vi_window_reward(
     reward
 }
 
+/// Replays java's `RewardViCalService.accumulateWitnessVi` from cycle 1 up to
+/// `cycle` for `witness`, returning the cumulative Vi. Used when the `reward-vi`
+/// store has no row for the cycle — the from-genesis case, where java
+/// background-built the store at boot but we never did. Byte-exact to java's
+/// `BigInteger` walk: `Vi(c) = Vi(c-1) + reward(c) * DECIMAL / vote(c)`
+/// (truncating division) when both reward and vote are non-zero, else `Vi(c-1)`
+/// (java skips on `reward == 0 || vote == 0`; an absent vote reads back as
+/// `REMARK`, but an absent vote always pairs with `reward == 0`, so the skip
+/// fires on the reward leg first). `i128` spans the real magnitudes (per-cycle
+/// term <= 9.2e36, running sum ~1e20 in practice); the multiply cannot overflow
+/// (`i64 * 1e18 < i128::MAX`) and the sum saturates on unreachable adversarial
+/// input rather than panicking.
+fn compute_vi_at(cycle: i64, witness: &Address, delegation: &DelegationStore) -> i128 {
+    let mut vi: i128 = 0;
+    let mut c: i64 = 1;
+    while c <= cycle {
+        let reward = delegation.get_reward(c, witness);
+        let vote = delegation.get_witness_vote(c, witness);
+        if reward != 0 && vote != 0 {
+            vi = vi.saturating_add((reward as i128) * REWARD_VI_DECIMAL / (vote as i128));
+        }
+        c += 1;
+    }
+    vi
+}
+
 /// `MortgageService.getOldReward` — rewards for cycles BEFORE the new
 /// algorithm activated.
 ///
@@ -514,17 +540,21 @@ fn old_reward(
         return 0;
     }
     if dyn_props.get_long(ALLOW_OLD_REWARD_OPT_KEY).unwrap_or(0) == 1 {
-        if let Some(store) = reward_vi {
-            return vi_window_reward(begin_cycle, end_cycle, votes, |cycle, witness| {
-                match store.get(&DelegationStore::vi_key(cycle, witness)) {
-                    Ok(Some(bytes)) => decode_signed_be_i128(&bytes),
-                    _ => 0,
+        // java `RewardViCalService`: with the opt on, the reward is a Vi walk.
+        // Read the background-built `reward-vi` store when a row exists (an
+        // imported mainnet DB carries every row); otherwise — the from-genesis
+        // case, where we never ran java's boot-time background builder — replay
+        // `accumulateWitnessVi` on the fly from the per-cycle reward/vote. The
+        // on-the-fly walk is byte-exact `i128`/`BigInteger` math, NOT the legacy
+        // `double` loop below, so it stays consensus-correct once #79 is active.
+        return vi_window_reward(begin_cycle, end_cycle, votes, |cycle, witness| {
+            if let Some(store) = reward_vi {
+                if let Ok(Some(bytes)) = store.get(&DelegationStore::vi_key(cycle, witness)) {
+                    return decode_signed_be_i128(&bytes);
                 }
-            });
-        }
-        // Opt flag on but no store wired — fall through to the exact
-        // legacy loop. Same values up to double-vs-BigInteger rounding;
-        // production always wires the store so this branch is test-only.
+            }
+            compute_vi_at(cycle, witness, delegation)
+        });
     }
     // java `MortgageService.getOldReward`: each cycle is computed from a FRESH
     // `long reward = 0` (`computeReward(cycle, votes)`) and the per-cycle

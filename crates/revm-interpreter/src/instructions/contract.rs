@@ -397,7 +397,14 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // caller, since the caller and target rows are the same account) never
     // happens. CALLTOKEN is a TRON-only opcode, so no `tron_enabled` gate is
     // needed.
-    if has_transfer && to == context.interpreter.input.target_address() {
+    // java `Program.isTokenTransfer`: a CALLTOKEN is a TRC-10 transfer when
+    // ALLOW_MULTI_SIGN is active (it sets isTokenTransferMsg) OR, pre-fork, when
+    // its tokenId != 0. When it is NOT (pre-fork, tokenId == 0) the `value` is a
+    // NATIVE TRX call-value, and the self-transfer ban — a token-only check
+    // (`validateForSmartContract`) — does not apply: java permits a native
+    // self-CALL (the value nets to zero).
+    let is_token_transfer = context.host.tron_allow_multi_sign() || !token_id.is_zero();
+    if is_token_transfer && has_transfer && to == context.interpreter.input.target_address() {
         context.interpreter.gas.erase_cost(gas_limit);
         context.host.tron_mark_transfer_failed();
         return Err(InstructionResult::TransferFailed);
@@ -431,10 +438,17 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     let target_address = to;
     let scheme = CallScheme::Call;
     let is_static = false;
-    // Native TRX value of a CALLTOKEN is always zero — the TRC-10 asset travels
-    // via `tron_token_*` (the host applies the asset_v2 debit/credit before the
-    // callee's first instruction). Mirrors java's `DataWord.ZERO()` native side.
-    let call_value = CallValue::Transfer(U256::ZERO);
+    // java `ProgramInvokeFactory`: the callee's native side is
+    // `!isTokenTransfer ? callValue : ZERO`. For a token transfer the native
+    // value is ZERO and `value` travels as the TRC-10 amount via `tron_token_*`
+    // (the host applies the asset_v2 debit/credit before the callee's first
+    // instruction). For a pre-ALLOW_MULTI_SIGN CALLTOKEN with tokenId == 0
+    // (`is_token_transfer == false`) `value` is the NATIVE TRX call-value.
+    let call_value = if is_token_transfer {
+        CallValue::Transfer(U256::ZERO)
+    } else {
+        CallValue::Transfer(value)
+    };
 
     context
         .interpreter

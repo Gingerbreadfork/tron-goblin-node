@@ -206,7 +206,7 @@ fn vote_witness_casts_decoded_pairs() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller, contract),
         2_000_000,
@@ -278,7 +278,7 @@ fn vote_witness_rejects_when_exceeding_tron_power_without_mutating() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller, contract),
         2_000_000,
@@ -332,7 +332,7 @@ fn vote_witness_rejects_unregistered_witness_without_mutating() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller, contract),
         2_000_000,

@@ -131,7 +131,7 @@ fn run(stores: &VmStores, caller: [u8; 21], contract: [u8; 21]) -> VmOutcome {
     };
     let block = VmBlockEnv {
         block_number: 100,
-        block_timestamp_ms: 1_700_000_000_000,
+        block_timestamp_ms: 1_700_000_000_000, ..Default::default()
     };
     execute_trigger(stores, block, &trigger, 1_000_000)
 }

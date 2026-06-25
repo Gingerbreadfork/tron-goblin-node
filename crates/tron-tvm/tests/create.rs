@@ -143,7 +143,7 @@ fn execute_create_deploys_contract_at_tron_derived_address() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &create,
         &tx_id,
@@ -258,7 +258,7 @@ fn execute_create_contract_row_carries_keccak_code_hash() {
     let tx_id = [0xab; 32];
     let outcome = execute_create(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &create,
         &tx_id,
         500_000,
@@ -341,7 +341,7 @@ fn execute_create_stamps_create_time_from_head_block_timestamp() {
     // create_time reads dyn_props, not VmBlockEnv.
     let outcome = execute_create(
         &stores,
-        VmBlockEnv { block_number: 2, block_timestamp_ms: 9_999_999 },
+        VmBlockEnv { block_number: 2, block_timestamp_ms: 9_999_999, ..Default::default()},
         &create,
         &tx_id,
         500_000,
@@ -419,7 +419,7 @@ fn execute_create_rejects_eip3541_ef_runtime_when_london_active() {
     let tx_id = [0xcd; 32];
     let outcome = execute_create(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &create,
         &tx_id,
         500_000,
@@ -478,7 +478,7 @@ fn execute_create_cleans_up_on_init_code_revert() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &create,
         &tx_id,
@@ -552,7 +552,7 @@ fn execute_create_halts_when_code_deposit_charge_exceeds_budget() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &create,
         &tx_id,
@@ -628,7 +628,7 @@ fn top_level_create_writes_contract_row_and_marks_account() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &create,
         &tx_id,
@@ -752,7 +752,7 @@ fn nested_create2_writes_contract_row_and_marks_account() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         2_000_000,
@@ -898,7 +898,7 @@ fn nested_create2_deploys_contract_larger_than_eip170_limit() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         15_000_000,
@@ -1009,7 +1009,7 @@ fn staking_opcode_shifts_following_nested_create_address() {
     let tx_id = [0x9a; 32];
     let (outcome, _t, _p) = tron_tvm::execute::execute_trigger_with_trace_tx_id(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_000_000, ..Default::default()},
         &trigger,
         3_000_000,
         tx_id,
@@ -1084,7 +1084,7 @@ fn token_funded_create_deploys_and_moves_trc10_when_flag_on() {
     let tx_id = [0x11; 32];
     let outcome = execute_create(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &create,
         &tx_id,
         500_000,
@@ -1163,7 +1163,7 @@ fn token_funded_create_deploys_without_moving_trc10_when_flag_off() {
     let tx_id = [0x22; 32];
     let outcome = execute_create(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &create,
         &tx_id,
         500_000,
@@ -1236,7 +1236,7 @@ fn token_funded_create_reverts_token_on_init_revert() {
     let tx_id = [0x33; 32];
     let outcome = execute_create(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 0 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 0, ..Default::default()},
         &create,
         &tx_id,
         500_000,

@@ -202,7 +202,7 @@ fn inner_frame_revert_does_not_leak_freeze_v2() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         2_000_000,
     );
@@ -282,7 +282,7 @@ fn inner_frame_revert_does_not_leak_unfreeze_v2() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         2_000_000,
     );
@@ -360,7 +360,7 @@ fn inner_frame_revert_does_not_leak_delegate_resource() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         2_000_000,
     );
@@ -445,7 +445,7 @@ fn ancestor_frame_revert_discards_succeeded_descendant_freeze() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         3_000_000,
     );
@@ -495,7 +495,7 @@ fn inner_frame_success_still_commits_freeze_v2() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         2_000_000,
     );
@@ -556,7 +556,7 @@ fn freeze_balance_v2_actually_freezes_caller_balance() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -646,7 +646,7 @@ fn unfreeze_balance_v2_moves_funds_to_unfrozen_v2_queue() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -713,7 +713,7 @@ fn withdraw_expire_unfreeze_sweeps_matured_entries() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: now,
+            block_timestamp_ms: now, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -782,7 +782,7 @@ fn cancel_all_unfreeze_v2_restakes_pending_entries() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -831,7 +831,7 @@ fn withdraw_reward_returns_allowance_and_zeroes_it() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -901,7 +901,7 @@ fn freeze_v1_is_noop_when_freezev2_active() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -975,7 +975,7 @@ fn unfreeze_v1_clears_matured_frozen_entries() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -1047,7 +1047,7 @@ fn delegate_resource_creates_record_and_moves_balances() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -1152,7 +1152,7 @@ fn delegate_resource_rejects_balance_below_one_trx() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, contract_addr),
         500_000,
     );
@@ -1217,7 +1217,7 @@ fn delegate_resource_rejects_contract_receiver() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, contract_addr),
         500_000,
     );
@@ -1301,7 +1301,7 @@ fn undelegate_resource_reverses_a_delegation() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -1438,7 +1438,7 @@ fn undelegate_energy_sheds_receiver_usage_not_just_acquired() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -1527,7 +1527,7 @@ fn delegate_resource_writes_both_index_rows() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, contract_addr),
         500_000,
     );
@@ -1623,7 +1623,7 @@ fn undelegate_resource_clears_both_index_rows_when_record_zeroed() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, contract_addr),
         500_000,
     );
@@ -1764,7 +1764,7 @@ fn delegate_resource_without_index_store_is_a_noop() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, contract_addr),
         500_000,
     );
@@ -1827,7 +1827,7 @@ fn vote_witness_writes_empty_vote_set_when_args_are_empty() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger(caller_user, contract_addr),
         500_000,
@@ -1890,7 +1890,7 @@ fn diag_call_roundtrip_energy() {
         }
         match execute_trigger(
             &stores,
-            VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+            VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
             &trigger(user, caller_c),
             5_000_000,
         ) {
@@ -1935,7 +1935,7 @@ fn diag_create2_base_energy() {
     install_contract(&stores, caller_c, bc, 100_000_000);
     match execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(user, caller_c),
         5_000_000,
     ) {
@@ -1972,7 +1972,7 @@ fn diag_factory_withdraw_energy() {
     let mut tr = trigger(user, factory);
     tr.data = data;
     match execute_trigger(&stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &tr, 50_000_000) {
         VmOutcome::Success { energy_used, .. } => eprintln!("Factory withdraw energy = {energy_used}  (java=50408; 50411 => +3 reproduced)"),
         other => eprintln!("Factory outcome: {other:?}"),
@@ -2086,7 +2086,7 @@ fn inner_frame_revert_does_not_leak_withdraw_reward_delegation() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         2_000_000,
     );
@@ -2130,7 +2130,7 @@ fn inner_frame_success_still_commits_withdraw_reward_delegation() {
 
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(caller_user, outer_addr),
         2_000_000,
     );

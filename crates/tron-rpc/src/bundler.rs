@@ -644,7 +644,7 @@ fn sim_call_outcome(
     let vm_stores = build_call_vm_stores(b);
     let block_env = VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let trigger = TriggerSmartContract {
         owner_address: owner,
@@ -733,7 +733,7 @@ fn check_validation_rules(
     let vm_stores = build_call_vm_stores(b);
     let block_env = VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     // Generous gas so validation runs to completion (execution isn't inspected).
     let mut sim_op = op.clone();

@@ -155,7 +155,7 @@ fn tokenbalance_opcode_returns_real_chainbase_asset_v2_balance() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,
@@ -240,7 +240,7 @@ fn tokenbalance_returns_zero_for_unknown_token() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,
@@ -337,7 +337,7 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
             &stores,
             VmBlockEnv {
                 block_number: 1,
-                block_timestamp_ms: 1_700_000_000_000,
+                block_timestamp_ms: 1_700_000_000_000, ..Default::default()
             },
             &trigger,
             500_000,

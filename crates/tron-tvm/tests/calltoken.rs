@@ -185,7 +185,7 @@ fn calltoken_transfers_trc10_and_callee_reads_token_data() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,
@@ -288,7 +288,7 @@ fn calltoken_insufficient_token_balance_skips_callee() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         500_000,
     );
@@ -367,7 +367,7 @@ fn calltoken_to_fresh_address_applies_default_permissions() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         500_000,
     );
@@ -439,7 +439,7 @@ fn calltoken_self_transfer_rejected_and_does_not_mint() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         500_000,
     );
@@ -513,7 +513,7 @@ fn calltoken_callee_sees_zero_native_callvalue() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,
@@ -590,7 +590,7 @@ fn calltoken_unwinds_trc10_transfer_when_callee_reverts() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,
@@ -698,7 +698,7 @@ fn calltoken_transfer_rolls_back_when_an_ancestor_frame_reverts() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         1_000_000,

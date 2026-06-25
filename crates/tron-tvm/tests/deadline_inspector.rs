@@ -116,7 +116,7 @@ fn infinite_loop_without_deadline_halts_on_out_of_gas() {
 
     let block = VmBlockEnv {
         block_number: 1,
-        block_timestamp_ms: 1_700_000_000_000,
+        block_timestamp_ms: 1_700_000_000_000, ..Default::default()
     };
     let (outcome, _, _) = execute_trigger_with_gas_cap(
         &stores,
@@ -146,7 +146,7 @@ fn infinite_loop_with_tight_deadline_returns_timeout() {
 
     let block = VmBlockEnv {
         block_number: 1,
-        block_timestamp_ms: 1_700_000_000_000,
+        block_timestamp_ms: 1_700_000_000_000, ..Default::default()
     };
     let timeout_ms: u64 = 100;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -209,7 +209,7 @@ fn already_elapsed_deadline_halts_essentially_immediately() {
 
     let block = VmBlockEnv {
         block_number: 1,
-        block_timestamp_ms: 1_700_000_000_000,
+        block_timestamp_ms: 1_700_000_000_000, ..Default::default()
     };
     let deadline = Instant::now() - Duration::from_secs(1);
     let started = Instant::now();
@@ -252,7 +252,7 @@ fn deadline_in_the_future_does_not_trip_for_short_call() {
 
     let block = VmBlockEnv {
         block_number: 1,
-        block_timestamp_ms: 1_700_000_000_000,
+        block_timestamp_ms: 1_700_000_000_000, ..Default::default()
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     let (outcome, _, _) = execute_trigger_with_deadline(

@@ -125,7 +125,7 @@ fn freezeexpiretime_is_wired_and_returns_zero_with_default_host() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,
@@ -246,7 +246,7 @@ fn freezeexpiretime_delegate_path_returns_expire_seconds() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         500_000,
     );
@@ -325,7 +325,7 @@ fn freezeexpiretime_delegate_path_zero_when_no_frozen_balance() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         500_000,
     );

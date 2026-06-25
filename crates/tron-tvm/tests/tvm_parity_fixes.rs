@@ -119,7 +119,7 @@ fn trigger(from: [u8; 21], to: [u8; 21]) -> tron_proto::TriggerSmartContract {
 fn run(stores: &VmStores, from: [u8; 21], to: [u8; 21]) -> VmOutcome {
     execute_trigger(
         stores,
-        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger(from, to),
         5_000_000,
     )

@@ -221,7 +221,7 @@ fn constant_call(s: &RpcState, contract: &[u8; 21], data: Vec<u8>) -> Option<Vec
     let vm_stores = crate::methods::build_call_vm_stores(backends);
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: vec![0x41; 21],

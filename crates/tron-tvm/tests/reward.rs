@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use tron_chainbase::{
-    AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend,
+    AccountStore, DelegationStore, DynamicPropertiesStore, KvBackend, MemBackend, RewardViStore,
 };
 use tron_crypto::address::Address;
 use tron_proto::{Account, Vote};
 use tron_tvm::reward::{
-    decode_signed_be_i128, query_reward, query_reward_actuator, query_reward_tvm, withdraw_reward,
+    compute_reward_window, decode_signed_be_i128, query_reward, query_reward_actuator,
+    query_reward_tvm, withdraw_reward,
     withdraw_reward_actuator, withdraw_reward_tvm, ALLOW_CHANGE_DELEGATION_KEY, ALLOW_OLD_REWARD_OPT_KEY,
     ALLOW_TVM_VOTE_KEY, CURRENT_CYCLE_NUMBER_KEY, NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY,
     REWARD_VI_DECIMAL,
@@ -752,4 +753,52 @@ fn withdraw_reward_noop_when_begin_cycle_in_future() {
     assert_eq!(paid, 0);
     assert_eq!(delegation.get_begin_cycle(&voter), 10);
     assert_eq!(delegation.get_end_cycle(&voter), 11);
+}
+
+#[test]
+fn old_reward_recomputes_vi_from_per_cycle_data_when_store_is_empty() {
+    // From-genesis: ALLOW_OLD_REWARD_OPT is on, but no `reward-vi` store row was
+    // ever written — java background-builds that store at boot via
+    // RewardViCalService; we never ran it, and maintenance only accumulates the
+    // Vi AFTER NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE. old_reward must therefore
+    // replay accumulateWitnessVi from the per-cycle reward/vote (which
+    // maintenance DID write for every cycle) instead of reading zeros.
+    let delegation = DelegationStore::new(mem());
+    let dp = DynamicPropertiesStore::new(mem());
+    dp.put_long(ALLOW_OLD_REWARD_OPT_KEY, 1);
+    // New algorithm far in the future, so the whole window stays old-era.
+    dp.put_long(NEW_REWARD_ALGORITHM_EFFECTIVE_CYCLE_KEY, 1_000);
+
+    let witness = addr(0xc1);
+    // Per-cycle (reward, vote): each delta_vi = reward * 1e18 / vote = 1e19, so
+    // the cumulative Vi is 1e19, 2e19, 3e19, 4e19 across cycles 1..=4.
+    for (cycle, reward, vote) in [(1, 1_000, 100), (2, 2_000, 200), (3, 3_000, 300), (4, 4_000, 400)] {
+        delegation.add_reward(cycle, &witness, reward);
+        delegation.set_witness_vote(cycle, &witness, vote);
+    }
+    let votes = vec![Vote {
+        vote_address: witness.as_bytes().to_vec(),
+        vote_count: 50,
+    }];
+
+    // Window [2, 5): begin_vi = Vi(1) = 1e19, end_vi = Vi(4) = 4e19, delta = 3e19;
+    // 3e19 * 50 / 1e18 = 1500.
+    let reward = compute_reward_window(2, 5, &votes, &delegation, &dp, None);
+    assert_eq!(reward, 1_500);
+
+    // A populated `reward-vi` row (the imported-snapshot case) takes precedence
+    // over recomputation: override Vi(1) = 0 and Vi(4) = 100e18 => delta 1e20,
+    // 1e20 * 50 / 1e18 = 5000.
+    let store = RewardViStore::new(mem());
+    store
+        .put(&DelegationStore::vi_key(1, &witness), &encode_vi(0))
+        .unwrap();
+    store
+        .put(
+            &DelegationStore::vi_key(4, &witness),
+            &encode_vi(100 * REWARD_VI_DECIMAL),
+        )
+        .unwrap();
+    let reward_with_store = compute_reward_window(2, 5, &votes, &delegation, &dp, Some(&store));
+    assert_eq!(reward_with_store, 5_000);
 }

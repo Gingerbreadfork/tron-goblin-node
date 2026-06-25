@@ -161,10 +161,17 @@ pub struct VmStores {
 }
 
 /// Per-block environment the EVM needs (BLOCKNUMBER, TIMESTAMP, ...).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct VmBlockEnv {
     pub block_number: i64,
     pub block_timestamp_ms: i64,
+    /// 20-byte EVM-form address of the block's producing witness (the TRON
+    /// `0x41` prefix stripped), surfaced to the VM as COINBASE (0x41). java
+    /// builds the coinbase DataWord via `new DataWord(witnessAddress)` exactly
+    /// like ADDRESS/CALLER, which we already carry in 20-byte EVM form. Zero
+    /// for read-only / simulation callers (eth_call, estimate) that have no
+    /// real producer.
+    pub beneficiary: [u8; 20],
 }
 
 /// A single LOG opcode emission surfaced from the VM. Owns its bytes
@@ -584,6 +591,10 @@ fn execute_trigger_inner(
             // underflowed.
             b.number = U256::from(block.block_number.max(0) as u64);
             b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
+            // COINBASE (0x41): the block's producing witness in 20-byte EVM
+            // form. java loads `block.getWitnessAddress()` into the coinbase
+            // DataWord the same way it builds ADDRESS/CALLER.
+            b.beneficiary = EvmAddress::from(block.beneficiary);
             // GASLIMIT (0x45) pushes 0 and BASEFEE (0x48) pushes
             // `getEnergyFee()` (java `gasLimitAction` / `baseFeeAction`); both
             // are handled in the opcode handlers (block_info.rs) reading the
@@ -941,6 +952,10 @@ fn execute_trigger_inner_with_tracer(
             // underflowed.
             b.number = U256::from(block.block_number.max(0) as u64);
             b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
+            // COINBASE (0x41): the block's producing witness in 20-byte EVM
+            // form. java loads `block.getWitnessAddress()` into the coinbase
+            // DataWord the same way it builds ADDRESS/CALLER.
+            b.beneficiary = EvmAddress::from(block.beneficiary);
             // GASLIMIT (0x45) pushes 0 and BASEFEE (0x48) pushes
             // `getEnergyFee()` (java `gasLimitAction` / `baseFeeAction`); both
             // are handled in the opcode handlers (block_info.rs) reading the
@@ -1511,6 +1526,10 @@ pub fn execute_create_with_trace(
             // underflowed.
             b.number = U256::from(block.block_number.max(0) as u64);
             b.timestamp = U256::from((block.block_timestamp_ms / 1000).max(0) as u64);
+            // COINBASE (0x41): the block's producing witness in 20-byte EVM
+            // form. java loads `block.getWitnessAddress()` into the coinbase
+            // DataWord the same way it builds ADDRESS/CALLER.
+            b.beneficiary = EvmAddress::from(block.beneficiary);
             // GASLIMIT (0x45) pushes 0 and BASEFEE (0x48) pushes `getEnergyFee()`
             // via the opcode handlers (block_info.rs) reading the host, NOT via
             // BlockEnv (see the trigger build sites for why).

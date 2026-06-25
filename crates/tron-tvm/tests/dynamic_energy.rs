@@ -116,7 +116,7 @@ fn run(stores: &VmStores, owner: [u8; 21], contract: [u8; 21]) -> u64 {
         stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         10_000_000,
@@ -460,7 +460,7 @@ fn reverted_top_level_tx_discards_catch_up_and_usage() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         10_000_000,

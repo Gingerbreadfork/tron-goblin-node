@@ -105,7 +105,7 @@ fn run(stores: &VmStores, caller: [u8; 21], contract: [u8; 21]) -> VmOutcome {
         stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         500_000,

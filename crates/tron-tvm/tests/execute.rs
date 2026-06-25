@@ -109,7 +109,7 @@ fn execute_trigger_succeeds_for_simple_return_contract() {
         &stores,
         VmBlockEnv {
             block_number: 100,
-            block_timestamp_ms: 1_700_000_000_000,
+            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
         },
         &trigger,
         100_000,
@@ -119,6 +119,57 @@ fn execute_trigger_succeeds_for_simple_return_contract() {
         VmOutcome::Success { return_data, .. } => {
             assert_eq!(return_data.len(), 32);
             assert_eq!(return_data[31], 0x42);
+        }
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+/// COINBASE (0x41) pushes the block's producing witness. java loads
+/// `block.getWitnessAddress()` into the coinbase DataWord exactly like
+/// ADDRESS/CALLER; we thread the 20-byte EVM-form witness through
+/// `VmBlockEnv.beneficiary`, and the opcode must return it right-aligned in a
+/// 32-byte word (12 leading zero bytes).
+#[test]
+fn coinbase_returns_block_producer_witness() {
+    let stores = fresh_stores();
+    //   COINBASE; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+    let contract_addr = install_contract(
+        &stores,
+        0xcc,
+        &[
+            0x41, // COINBASE
+            0x60, 0x00, // PUSH1 0
+            0x52, // MSTORE
+            0x60, 0x20, // PUSH1 32
+            0x60, 0x00, // PUSH1 0
+            0xf3, // RETURN
+        ],
+    );
+    let owner_addr = fund_account(&stores, 0xac, 1_000_000_000);
+    let trigger = TriggerSmartContract {
+        owner_address: owner_addr.to_vec(),
+        contract_address: contract_addr.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let witness = [0x11u8; 20];
+    let outcome = execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 100,
+            block_timestamp_ms: 1_700_000_000_000,
+            beneficiary: witness,
+        },
+        &trigger,
+        100_000,
+    );
+    match outcome {
+        VmOutcome::Success { return_data, .. } => {
+            assert_eq!(return_data.len(), 32);
+            assert_eq!(&return_data[0..12], &[0u8; 12]);
+            assert_eq!(&return_data[12..32], &witness);
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -172,7 +223,7 @@ fn memory_expansion_past_3mib_halts_out_of_memory() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         100_000_000,
@@ -208,7 +259,7 @@ fn block_timestamp_and_number_opcodes_reflect_block_env() {
     };
     let env = || VmBlockEnv {
         block_number: 83_316_753,
-        block_timestamp_ms: 1_700_000_001_000,
+        block_timestamp_ms: 1_700_000_001_000, ..Default::default()
     };
     let read_word = |o: VmOutcome| -> i64 {
         match o {
@@ -261,7 +312,7 @@ fn execute_trigger_top_level_calltoken_transfers_trc10_before_evm_runs() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         100_000,
@@ -310,7 +361,7 @@ fn execute_trigger_top_level_calltoken_unwinds_on_revert() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 0 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 0, ..Default::default()},
         &trigger,
         100_000,
     );
@@ -350,7 +401,7 @@ fn execute_trigger_top_level_calltoken_rejects_insufficient_balance() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 1, block_timestamp_ms: 0 },
+        VmBlockEnv { block_number: 1, block_timestamp_ms: 0, ..Default::default()},
         &trigger,
         100_000,
     );
@@ -380,7 +431,7 @@ fn execute_trigger_reports_revert_for_revert_opcode() {
         &stores,
         VmBlockEnv {
             block_number: 1,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         100_000,
@@ -403,7 +454,7 @@ fn execute_trigger_rejects_bad_address() {
         &stores,
         VmBlockEnv {
             block_number: 0,
-            block_timestamp_ms: 0,
+            block_timestamp_ms: 0, ..Default::default()
         },
         &trigger,
         100_000,
@@ -442,7 +493,7 @@ fn sstore_clear_does_not_refund_matching_java_tron() {
             &stores,
             VmBlockEnv {
                 block_number: 1,
-                block_timestamp_ms: 0,
+                block_timestamp_ms: 0, ..Default::default()
             },
             &trigger,
             1_000_000,
@@ -559,7 +610,7 @@ fn call_value_over_i64_max_is_transfer_failed_not_revert() {
     let energy_limit = 1_000_000u64;
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         energy_limit,
     );
@@ -604,7 +655,7 @@ fn call_value_within_i64_is_not_transfer_failed() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         1_000_000,
     );
@@ -644,7 +695,7 @@ fn nested_call_value_over_i64_max_fails_whole_tx() {
     };
     let outcome = execute_trigger(
         &stores,
-        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000 },
+        VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
         2_000_000,
     );

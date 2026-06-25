@@ -2272,6 +2272,16 @@ fn execute_block_logic(
     // via [`block_worth_parallel`], which sets `config.parallel_exec`. Here we
     // simply honor it — so tests that force `parallel_exec = true` always
     // exercise the parallel path regardless of block size.
+    // COINBASE (0x41): the block's producing witness in 20-byte EVM form (strip
+    // the TRON 0x41 prefix), threaded into every tx's VM block env.
+    let block_beneficiary: [u8; 20] = {
+        let w = &raw.witness_address;
+        let mut b = [0u8; 20];
+        if w.len() >= 20 {
+            b.copy_from_slice(&w[w.len() - 20..]);
+        }
+        b
+    };
     let tx_results: Vec<TxResult> = if config.parallel_exec {
         crate::parallel::execute_block_parallel(
             state,
@@ -2279,6 +2289,7 @@ fn execute_block_logic(
             config,
             raw.number,
             block_timestamp_ms,
+            block_beneficiary,
             now_slot,
             head_block_time_ms,
             &precomputed_signers,
@@ -2298,6 +2309,7 @@ fn execute_block_logic(
                     config,
                     raw.number,
                     block_timestamp_ms,
+                    block_beneficiary,
                     now_slot,
                     head_block_time_ms,
                     &precomputed_signers[i],
@@ -3181,6 +3193,7 @@ pub(crate) fn execute_one_tx(
     config: &ExecConfig,
     block_number: i64,
     block_timestamp_ms: i64,
+    beneficiary: [u8; 20],
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
@@ -3194,6 +3207,7 @@ pub(crate) fn execute_one_tx(
         config,
         block_number,
         block_timestamp_ms,
+        beneficiary,
         now_slot,
         head_block_time_ms,
         precomputed_signers,
@@ -3213,6 +3227,7 @@ pub(crate) fn execute_one_tx_versioned(
     config: &ExecConfig,
     block_number: i64,
     block_timestamp_ms: i64,
+    beneficiary: [u8; 20],
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
@@ -3224,6 +3239,7 @@ pub(crate) fn execute_one_tx_versioned(
         config,
         block_number,
         block_timestamp_ms,
+        beneficiary,
         now_slot,
         head_block_time_ms,
         precomputed_signers,
@@ -3242,6 +3258,7 @@ fn execute_one_tx_isolated(
     config: &ExecConfig,
     block_number: i64,
     block_timestamp_ms: i64,
+    beneficiary: [u8; 20],
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
@@ -3569,7 +3586,7 @@ fn execute_one_tx_isolated(
             == Some(tron_proto::transaction::result::ContractResult::OutOfTime as i32);
         return execute_vm_tx(
             view, iso, tx_id, ty, parameter, config, raw.fee_limit, block_number,
-            block_timestamp_ms, recorded_out_of_time, receipt,
+            block_timestamp_ms, beneficiary, recorded_out_of_time, receipt,
         );
     }
 
@@ -3800,6 +3817,10 @@ fn execute_vm_tx(
     // resource model still reads the head (N-1) via the dyn-props store.
     block_number: i64,
     block_timestamp_ms: i64,
+    // 20-byte EVM-form address of the block's producing witness, surfaced to
+    // the VM as the COINBASE (0x41) opcode (java reads `block.getWitnessAddress`
+    // into the coinbase DataWord).
+    beneficiary: [u8; 20],
     // When the canonical block records this VM tx's contractRet as
     // `OUT_OF_TIME`, force that outcome: skip VM execution, discard all VM
     // contract-state changes, and charge the full energy budget
@@ -3941,6 +3962,7 @@ fn execute_vm_tx(
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number,
         block_timestamp_ms,
+        beneficiary,
     };
     // Extract the caller (owner) and the contract's energy_limit budget.
     //

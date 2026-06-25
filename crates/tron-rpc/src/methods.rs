@@ -2160,6 +2160,7 @@ pub fn eth_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number,
         block_timestamp_ms,
+        ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),
@@ -2220,6 +2221,7 @@ pub fn eth_estimate_gas(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number,
         block_timestamp_ms,
+        ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),
@@ -2345,7 +2347,7 @@ fn build_trace_for_call(
     let vm_stores = build_call_vm_stores(b);
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),
@@ -2658,7 +2660,7 @@ pub fn trace_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let vm_stores = build_call_vm_stores(b);
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),
@@ -3675,6 +3677,7 @@ pub fn trigger_constant_contract(p: &Value, s: &RpcState) -> Result<Value, RpcEr
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number,
         block_timestamp_ms,
+        ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),
@@ -5909,7 +5912,7 @@ fn traced_call_outputs(
     let vm_stores = build_call_vm_stores(b);
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),
@@ -6140,7 +6143,7 @@ pub fn estimate_energy(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let req = parse_constant_call_request(p, s.constant_call_energy_limit, energy_fee)?;
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: s.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: s.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let trigger = tron_proto::TriggerSmartContract {
         owner_address: req.from.to_vec(),

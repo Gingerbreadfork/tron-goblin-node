@@ -94,7 +94,7 @@ pub fn eth_simulate_v1(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         prev_ts_ms = ts_ms;
         let block_env = VmBlockEnv {
             block_number: number,
-            block_timestamp_ms: ts_ms,
+            block_timestamp_ms: ts_ms, ..Default::default()
         };
 
         if let Some(overrides) = bc.get("stateOverrides").and_then(Value::as_object) {

@@ -329,7 +329,7 @@ fn run_constant_call_with_budget(
     let vm_stores = tron_rpc::methods::build_call_vm_stores(b);
     let block_env = tron_tvm::execute::VmBlockEnv {
         block_number: state.dyn_props.latest_block_header_number().unwrap_or(0),
-        block_timestamp_ms: state.dyn_props.latest_block_header_timestamp().unwrap_or(0),
+        block_timestamp_ms: state.dyn_props.latest_block_header_timestamp().unwrap_or(0), ..Default::default()
     };
     let (outcome, _energy_penalty) = tron_rpc::methods::dispatch_constant_trigger(
         state,
