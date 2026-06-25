@@ -188,7 +188,9 @@ java-tron doesn't have. What works today, by area:
   re-running only those that conflict, for a result **byte-identical to
   the serial loop** (pinned by equivalence tests — TRON has no state root,
   so a silent divergence would otherwise be invisible). Transaction-heavy
-  blocks apply ~2× faster on many cores; light blocks stay serial.
+  blocks apply faster on many cores — **1.3×** on a moderate SSTORE-heavy
+  block, scaling toward the core count as per-tx VM work grows past the
+  MVCC overhead; light blocks stay serial.
 - **TVM** — revm-based interpreter with TRON's energy schedule, the TRC-10
   transfer fields, the TRON opcodes (`0xd0..0xd4`), the per-contract
   dynamic-energy model, and Sapling shielded-TRC-20 (Groth16) proving.
@@ -410,6 +412,29 @@ The 18 ignored tests are opt-in: 5 Sapling Groth16 round-trips (load the
 embedded ~50 MB params and run real proofs), 6 live-network tests (dial
 real mainnet peers / DNS / Kad — need outbound connectivity), and 7
 perf/diagnostic probes. Add `-- --include-ignored` to run them too.
+
+### Performance
+
+The 7 perf/diagnostic probes cover throughput plus VM cost-parity, run with
+`cargo test --release -- --include-ignored`. Latest run on a 32-core host:
+
+| Benchmark | Result |
+| --- | --- |
+| **Block-STM throughput** — one block of 512 independent contract calls, 24 SSTOREs each | **25,530 tx/s** parallel vs **19,617 tx/s** serial (**1.30×**, 26.1ms → 20.0ms) |
+| **Block decode** (`bench-decode`) — 134k real mainnet blocks, 62.5M txs, protobuf ingest ceiling | **4,215 blocks/s** · **1.96M txs/s** |
+
+Full block-apply over real mainnet blocks (offline `replay-blocks`) is
+state-dependent — light early-chain blocks replay far faster than the
+heavy contract-laden blocks near the tip, where full state and per-tx VM
+work dominate.
+
+The parallel speedup scales with per-tx VM work relative to the MVCC
+bookkeeping overhead, and the result stays byte-identical to the serial path
+on every block. The remaining six probes are cost-parity diagnostics — they
+pin the VM's energy/gas to java-tron's exactly (CREATE2-empty = 32,012,
+STATICCALL = 40, per-op gas exact: PUSH1 3, MSTORE 6, MLOAD 3), so a
+one-unit drift trips a probe before it can become a silent consensus
+divergence.
 
 ## Layout
 

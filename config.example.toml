@@ -293,13 +293,14 @@ max_time_ratio = 5.0
 long_running_time = 10
 
 # Block-STM optimistic parallel block execution during bulk catch-up,
-# byte-identical to the serial path. OFF by default: it won ~1.4-3.2x on an
-# in-memory benchmark but measured SLOWER than serial on a real RocksDB-backed
-# mainnet catch-up (per-read MVCC bookkeeping + many-thread contention), so it
-# is left in for A/B experimentation rather than as a speedup. The sync driver
-# only engages it per-block while bulk-syncing, never at the tip. Run with
-# BLOCKSTM_DEBUG=1 to log per-block convergence (rounds / reexecs / converged).
-parallel_exec = false
+# byte-identical to the serial path. ON by default: after the dependency-ordered
+# scheduler rewrite it runs faster than serial on a real RocksDB-backed mainnet
+# catch-up. (Earlier builds shipped OFF — the naive scheduler's per-read MVCC
+# bookkeeping + re-execution churn measured slower than serial; the rewrite
+# fixed that.) The sync driver only engages it per-block while bulk-syncing,
+# never at the tip. Set false to force the serial path. Run with BLOCKSTM_DEBUG=1
+# to log per-block convergence (rounds / reexecs / converged).
+parallel_exec = true
 
 # Overlap each applied block's commit + undo-log fsync with the next block's
 # execution during bulk sync (identical writes in identical order — only the

@@ -195,9 +195,9 @@ impl Default for ExecConfig {
             // Full per-block durability by default; the sync driver opts
             // into deferral only while catching up (see field docs).
             defer_store_fsync: false,
-            // Serial execution by default (the validated source of truth);
-            // opt into Block-STM parallel execution explicitly.
-            parallel_exec: false,
+            // Block-STM parallel execution by default; byte-identical to the
+            // serial path (the sync driver engages it only while bulk-syncing).
+            parallel_exec: true,
             // Archive capture is an explicit archive-node opt-in.
             capture_state_deltas: false,
             // Log-only by default: the success/failure tripwire always logs,

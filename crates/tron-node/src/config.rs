@@ -830,15 +830,14 @@ pub struct VmConfig {
     /// during catch-up (byte-identical to serial; the `SyncDriver` only
     /// turns it on per-block while bulk-syncing, never at the tip).
     ///
-    /// **Default `false` (opt-in).** It passed byte-identical equivalence and
-    /// won ~1.4-3.2× on an in-memory benchmark, but on a real RocksDB-backed
-    /// mainnet catch-up it measured *slower* than the serial loop (~5 vs ~10
-    /// blk/s) — the per-read MVCC bookkeeping plus 32-thread allocator /
-    /// block-cache contention outweighs the parallelism on real per-tx work.
-    /// Left in, off by default, pending that overhead being addressed. Set
-    /// `true` to experiment / A/B compare (run with `BLOCKSTM_DEBUG=1` to log
-    /// per-block convergence: `rounds`/`reexecs`/`converged`).
-    #[serde(default, alias = "parallelExec")]
+    /// **Default `true`.** Byte-identical to serial. After the
+    /// dependency-ordered scheduler rewrite it runs faster than serial on a
+    /// real RocksDB-backed mainnet catch-up; an earlier naive scheduler was
+    /// slower (per-read MVCC bookkeeping plus thread allocator / block-cache
+    /// contention outweighed the parallelism), which is why it first shipped
+    /// off. Set `false` to force the serial loop (run with `BLOCKSTM_DEBUG=1`
+    /// to log per-block convergence: `rounds`/`reexecs`/`converged`).
+    #[serde(default = "default_vm_parallel_exec", alias = "parallelExec")]
     pub parallel_exec: bool,
     /// Overlap each applied block's commit I/O (cross-store checkpoint
     /// manifest fsync + per-store write batches + undo-log fsync) with the
@@ -860,6 +859,10 @@ fn default_vm_pipelined_apply() -> bool {
     true
 }
 
+fn default_vm_parallel_exec() -> bool {
+    true
+}
+
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
@@ -876,7 +879,7 @@ impl Default for VmConfig {
             save_featured_internal_tx: false,
             save_cancel_all_unfreeze_v2_details: false,
             constant_call_timeout_ms: 0,
-            parallel_exec: false,
+            parallel_exec: default_vm_parallel_exec(),
             pipelined_apply: default_vm_pipelined_apply(),
         }
     }
