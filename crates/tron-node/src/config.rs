@@ -31,7 +31,7 @@ pub struct NodeConfig {
     #[serde(default)]
     pub grpc: GrpcConfig,
 
-    /// HTTP REST API on port 8090 — the surface that TronWeb,
+    /// HTTP REST API (port 8091 by default) — the surface that TronWeb,
     /// TronGrid, and the reference wallet-cli speak.
     #[serde(default)]
     pub http: HttpRestConfig,
@@ -457,8 +457,9 @@ pub struct HttpRestConfig {
     /// — be deliberate before opening it up).
     #[serde(default = "default_http_host")]
     pub host: String,
-    /// Listen port. `8090` matches java-tron's default and what
-    /// TronWeb/TronGrid expect.
+    /// Listen port. `8091` = java-tron's `8090` + 1, so a java-tron node and
+    /// this one can share a host without clashing. (TronWeb/TronGrid targets
+    /// are configurable — point them at 8091, or override this back to 8090.)
     #[serde(default = "default_http_port")]
     pub port: u16,
     /// Set to `true` to disable the HTTP REST server entirely.
@@ -480,7 +481,7 @@ fn default_http_host() -> String {
     "127.0.0.1".into()
 }
 fn default_http_port() -> u16 {
-    8090
+    8091
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,8 +490,9 @@ pub struct GrpcConfig {
     /// public exposure (the gRPC surface includes writer methods).
     #[serde(default = "default_grpc_host")]
     pub host: String,
-    /// Listen port. `50051` matches java-tron's default and what
-    /// every TRON client library expects.
+    /// Listen port. `50052` = java-tron's `50051` + 1, so both can run on one
+    /// host without clashing. (Client libs are configurable — point them here,
+    /// or override this back to 50051.)
     #[serde(default = "default_grpc_port")]
     pub port: u16,
     /// Set to `true` to disable the gRPC server entirely.
@@ -512,7 +514,7 @@ fn default_grpc_host() -> String {
     "127.0.0.1".into()
 }
 fn default_grpc_port() -> u16 {
-    50051
+    50052
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,7 +523,8 @@ pub struct MetricsConfig {
     /// typically shouldn't be exposed publicly.
     #[serde(default = "default_metrics_host")]
     pub host: String,
-    /// Listen port. `9090` is the Prometheus default scrape port.
+    /// Listen port. `9091` = the Prometheus default `9090` + 1, keeping the
+    /// node's whole port block one above java-tron's so they coexist.
     #[serde(default = "default_metrics_port")]
     pub port: u16,
     /// Set to `true` to disable the metrics endpoint entirely.
@@ -543,7 +546,7 @@ fn default_metrics_host() -> String {
     "127.0.0.1".into()
 }
 fn default_metrics_port() -> u16 {
-    9090
+    9091
 }
 
 // -- event.subscribe.* (java-tron parity schema) --
@@ -971,8 +974,10 @@ pub struct RpcConfig {
     /// unexpectedly; set to `0.0.0.0` to listen on every interface.
     #[serde(default = "default_rpc_host")]
     pub host: String,
-    /// Listen port. `8545` is the Ethereum-standard default; java-tron
-    /// uses `8090` for its HTTP API but Ethereum wallets expect 8545.
+    /// Listen port. `8546` = the Ethereum-standard `8545` + 1, keeping the
+    /// node's port block one above java-tron's (whose optional JSON-RPC also
+    /// defaults to 8545) so they coexist. Point Ethereum wallets at 8546, or
+    /// override this back to 8545.
     #[serde(default = "default_rpc_port")]
     pub port: u16,
     /// Set to `true` to disable the RPC server entirely.
@@ -1020,9 +1025,10 @@ pub struct P2pConfig {
     /// count gate.) Default `100` ⇒ enabled.
     #[serde(default = "default_progress_log_interval")]
     pub progress_log_interval: usize,
-    /// Port we advertise to peers in our Hello messages. Default
-    /// `18888` (java-tron's mainnet P2P port). java-tron's
-    /// `NetUtil.validNode` rejects port `0` with `BAD_PROTOCOL`, so
+    /// Port we advertise to peers in our Hello messages. Default `18889`
+    /// (one above java-tron's mainnet P2P port `18888`, so both nodes can
+    /// share a host). java-tron's `NetUtil.validNode` rejects port `0` with
+    /// `BAD_PROTOCOL`, so
     /// even sync-only nodes that don't listen still need to advertise
     /// a valid port.
     #[serde(default = "default_advertise_port")]
@@ -1257,7 +1263,7 @@ impl Default for P2pConfig {
 }
 
 fn default_advertise_port() -> i32 {
-    18_888
+    18_889
 }
 
 fn default_listen() -> bool {
@@ -1324,7 +1330,7 @@ fn default_rpc_host() -> String {
     "127.0.0.1".into()
 }
 fn default_rpc_port() -> u16 {
-    8545
+    8546
 }
 fn default_chain_id() -> u64 {
     tron_rpc::MAINNET_CHAIN_ID
@@ -2173,12 +2179,12 @@ mod tests {
         assert_eq!(cfg.storage.max_open_files, 1024);
         assert_eq!(cfg.storage.write_buffer_size_mb, 64);
         assert_eq!(cfg.storage.snapshot_horizon, 64);
-        assert_eq!(cfg.rpc.port, 8545);
+        assert_eq!(cfg.rpc.port, 8546);
         assert_eq!(cfg.rpc.eth_call_gas_cap, 50_000_000);
-        assert_eq!(cfg.http.port, 8090);
-        assert_eq!(cfg.grpc.port, 50051);
-        assert_eq!(cfg.metrics.port, 9090);
-        assert_eq!(cfg.p2p.advertise_port, 18888);
+        assert_eq!(cfg.http.port, 8091);
+        assert_eq!(cfg.grpc.port, 50052);
+        assert_eq!(cfg.metrics.port, 9091);
+        assert_eq!(cfg.p2p.advertise_port, 18889);
         assert_eq!(cfg.p2p.max_peers, 60);
         assert!(cfg.p2p.listen);
         assert_eq!(cfg.p2p.listen_host, "0.0.0.0");

@@ -115,10 +115,11 @@ node_discovery_persist = true
 node_discovery_persist_interval_ms = 60000
 
 # Port advertised to peers in Hello messages, and (when `listen = true`) the
-# port the inbound listener binds. 18888 is mainnet's P2P port. A valid non-zero
-# port is required even for outbound-only nodes — java-tron's NetUtil.validNode
-# rejects port 0 with BAD_PROTOCOL.
-advertise_port = 18888
+# port the inbound listener binds. 18889 = mainnet's P2P port 18888 + 1, so a
+# java-tron node and this one can run on the same host without clashing. A valid
+# non-zero port is required even for outbound-only nodes — java-tron's
+# NetUtil.validNode rejects port 0 with BAD_PROTOCOL.
+advertise_port = 18889
 
 # Max concurrent peer connections (each = one tokio task + one TCP socket).
 # 60 spreads thinly across many ASNs to find archive-capable peers without
@@ -165,7 +166,7 @@ disabled = false
 # -----------------------------------------------------------------------------
 [rpc]
 host = "127.0.0.1"          # "0.0.0.0" to expose publicly
-port = 8545
+port = 8546                 # Ethereum-standard 8545 + 1 (java-tron's JSON-RPC also defaults to 8545)
 disabled = false
 # EIP-155 chain id surfaced via eth_chainId / net_version.
 chain_id = 11111
@@ -179,7 +180,7 @@ eth_call_gas_cap = 50000000
 # -----------------------------------------------------------------------------
 [http]
 host = "127.0.0.1"          # includes broadcasttransaction — open up deliberately
-port = 8090
+port = 8091                 # java-tron HTTP 8090 + 1, so both coexist on one host
 disabled = false
 
 
@@ -188,7 +189,7 @@ disabled = false
 # -----------------------------------------------------------------------------
 [grpc]
 host = "127.0.0.1"          # includes writer methods — open up deliberately
-port = 50051
+port = 50052                # java-tron gRPC 50051 + 1
 disabled = false
 
 
@@ -197,7 +198,7 @@ disabled = false
 # -----------------------------------------------------------------------------
 [metrics]
 host = "127.0.0.1"
-port = 9090
+port = 9091                 # Prometheus default 9090 + 1 (keeps the whole port block one above java-tron)
 disabled = false
 
 
