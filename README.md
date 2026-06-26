@@ -7,28 +7,34 @@ protocol — the same role java-tron plays, written from scratch in
 Rust with byte-exact database and wire compatibility as a stated
 goal.
 
-> Pointed at public mainnet from a
-> java-tron RocksDB snapshot, it replayed **over half a million real
-> mainnet blocks up to the live tip with zero consensus divergences** —
-> every transaction's computed success/failure cross-checked, block for
-> block, against the chain's own canonical `contractRet` — then flipped
-> from catch-up to tracking head-of-chain in real time. The block hashes
-> it derives from its own executed state match the canonical chain
-> block-for-block. Transactions run through an optional **Block-STM**
-> parallel executor that stays byte-identical to the serial path, and the
-> node rebuilds head state on a fork-switch (reorg-driven rollback). What
-> it does **not** yet claim: a long-term soak under real peer churn, or
-> that every last state edge case is covered (TRON headers carry no state
-> root, so state is verified separately by RPC reads — see below). Run it
-> as a second / validating client, or alongside java-tron, until you've
-> proven it in your own environment. See [Status](#status) for specifics.
+
+## 🧌 What is this?
+
+`tron-goblin-node` is a workspace of small, focused crates that
+reproduce java-tron's behaviour piece by piece, alongside some additional tooling.
+
+The goal is to have it stay in lockstep with the
+java-tron reference implementation by producing the same hashes, same state, same
+RPC responses, just with better performance, lighter hardware requirements, and features the TRON community frequently requests that are not yet supported by java-tron itself.
+
+## ✨ Highlights
+
+- Sync from genesis or a get caught up fast with a RocksDB snapshot
+- Block-STM parallel execution enables syncing to be several times faster than java-tron (enabled by default)
+- Byte-exact RocksDB + bidirectional P2P (pick right up where java-tron left off)
+- Build in TronGrid cross-compatible indexer + historical state archieve (both optional to suit your needs)
+- ERC-4337 bundler + eth_simulateV1 (full account-abstraction bundler including ERC-7562 validation and repution throttling)
+- Self auditing and diagnostic tools
+- Borderline excessive test coverage (2500+ tests)
+- Full node functionality - **not a tech demo**
 
 
-## ⚡ Watch real TRON mainnet, live — in one command
+## ⚡ Watch real TRON mainnet live!
+Want to just have some fun without diving in head first?
 
 No snapshot, no 100 GB backfill, no hours of syncing. Run one command and
 within seconds you're watching the **real** TRON mainnet stream into your
-terminal — live blocks every ~3s, every transaction decoded and classified
+terminal with live blocks every ~3s, every transaction decoded and classified
 into a self-updating dashboard:
 
 ```sh
@@ -63,7 +69,7 @@ into a self-updating dashboard:
    🚀 Heavy block: 844 txs in 3 seconds
 ```
 
-This is **not** a mock — it's the genuine TRON peer-to-peer protocol. The node
+This is **not** a mock, it's the genuine TRON peer-to-peer protocol. The node
 finds peers on its own (the DNS tree + Kademlia DHT — no hardcoded seed list),
 learns the current tip straight from them, and follows the live block tail,
 decoding every block itself: no chain state, no execution, no database, which
@@ -80,6 +86,8 @@ Pin a peer with `./try.sh --peer HOST:18888`. It runs on a throwaway temp
 directory and an isolated RPC port, and cleans up after itself. No API keys, no
 external services — just a release build (`cargo build --release`, or drop a
 `tron-node` binary next to the script).
+
+If you're just exploring, find this kind of stuff cool, or are simply screwing around a bit, this is for you.
 
 ### See the mempool too: pending txs before they're mined
 
@@ -100,13 +108,6 @@ expose. Add `--mempool-json <path>` (or `-` for stdout) to also stream one JSON
 object per pending tx for tooling. Decode-only, like `--explore` — no execution,
 no state, no snapshot.
 
-## What this is
-
-`tron-goblin-node` is a workspace of small, focused crates that
-reproduce java-tron's behaviour piece by piece. The goal is one
-binary you can point at a peer and have it stay in lockstep with the
-java-tron reference implementation — same hashes, same state, same
-RPC responses.
 
 Concretely, this means:
 
@@ -125,7 +126,7 @@ Concretely, this means:
   both served. TronWeb, the Java SDK, and TronGrid clients can
   point at this node without modification.
 
-## See it for yourself
+## 👀 See it for yourself
 
 A block hash commits to the full header **and** the transaction Merkle
 root — so if a node's block hash matches the network's, every transaction
@@ -157,9 +158,9 @@ separately (see [Compatibility notes](#compatibility-notes)). That
 distinction is the whole reason this project is careful about the word
 "parity."
 
-## Motivation
+## 💡 Motivation
 
-This node exists because of [**trongoblin.com**](https://trongoblin.com).
+This project exists because of [**trongoblin.com**](https://trongoblin.com).
 
 Running production infrastructure on TRON means living downstream of
 java-tron — its release cadence, its operational quirks, its
@@ -169,13 +170,18 @@ get surfaced as bugs instead of silently propagating, snapshot and
 RPC paths get a second set of eyes, and operators get a node they
 can actually profile, debug, and tune without fighting a JVM.
 
-## Status
+...and it's just kinda fun to make this all work.
 
-The short version: `tron-goblin-node` imports, validates, and executes
+## 🚦 Status
+
+[!WARNING]
+While a lot of effort has gone into making this as functional and bug-free as possible, a project of this scope will inevitably have some rough edges. If you're powering a project with it, you should at minimum keep a java-tron node as a fallback, and not trust it with anything mission-critical. Bug reports from real use are exactly how it gets hardened, so if you do run it, please send them.
+
+`tron-goblin-node` imports, validates, and executes
 live mainnet blocks into **byte-exact** RocksDB state, syncs off public
 mainnet up to the live tip and tracks head-of-chain, produces blocks as an
 SR, and serves java-tron's full API surface — plus developer tooling
-java-tron doesn't have. What works today, by area:
+java-tron doesn't have.What works today, by area:
 
 ### ⚙️ Consensus & execution
 
@@ -325,24 +331,11 @@ java-tron doesn't have. What works today, by area:
   per-method RPC counters, the consensus watchdog, and indexer / archive /
   firehose health.
 
-### Known gaps
-
-Real, currently-open items:
-
-- ❌ **Long-term soak / endurance.** The node reaches and holds the tip,
-  but stability over a long-running deployment under sustained peer churn
-  — memory, file descriptors, compaction pressure — hasn't been
-  characterized.
-- ❌ **Probably a number of other things.** java-tron is large
-  and old; some quirks will only surface when a specific client or
-  workload hits them. This list will be updated as new items are
-  discovered.
-
-## Tests & metrics
+## 🧪 Tests & metrics
 
 Parity work that doesn't have a test pinning it isn't real parity —
 java-tron's behaviour is too nuanced to maintain by inspection
-alone. So coverage is **dense**: every actuator branch, every RPC
+alone. So coverage is **dense**: essentially every actuator branch, every RPC
 shape, every chainbase encoding has at least one test that fails if
 the byte layout drifts.
 
@@ -392,51 +385,18 @@ Notable test categories:
   test that asserts our shape and references the java-tron site
   it diverges from.
 
-What coverage **doesn't** include yet:
-
-- Reorg-driven state rollback is unit-tested at the sync-driver level
-  (fork-switch head move, per-block state rollback, mempool re-push,
-  mid-reorg failure recovery, both undo-store and snapshot-stack
-  backends), but not yet exercised under a *live* sibling-fork overtake
-  on mainnet.
-- Long-running soak / load tests against mainnet snapshots. Manual
-  for now; CI integration is on the observability backlog.
-
 The default suite finishes in under 90 s on a modern laptop:
 
 ```sh
 cargo test --workspace --release
 ```
 
-The 18 ignored tests are opt-in: 5 Sapling Groth16 round-trips (load the
+The 18 "ignored" tests are opt-in: 5 Sapling Groth16 round-trips (load the
 embedded ~50 MB params and run real proofs), 6 live-network tests (dial
 real mainnet peers / DNS / Kad — need outbound connectivity), and 7
 perf/diagnostic probes. Add `-- --include-ignored` to run them too.
 
-### Performance
-
-The 7 perf/diagnostic probes cover throughput plus VM cost-parity, run with
-`cargo test --release -- --include-ignored`. Latest run on a 32-core host:
-
-| Benchmark | Result |
-| --- | --- |
-| **Block-STM throughput** — one block of 512 independent contract calls, 24 SSTOREs each | **25,530 tx/s** parallel vs **19,617 tx/s** serial (**1.30×**, 26.1ms → 20.0ms) |
-| **Block decode** (`bench-decode`) — 134k real mainnet blocks, 62.5M txs, protobuf ingest ceiling | **4,215 blocks/s** · **1.96M txs/s** |
-
-Full block-apply over real mainnet blocks (offline `replay-blocks`) is
-state-dependent — light early-chain blocks replay far faster than the
-heavy contract-laden blocks near the tip, where full state and per-tx VM
-work dominate.
-
-The parallel speedup scales with per-tx VM work relative to the MVCC
-bookkeeping overhead, and the result stays byte-identical to the serial path
-on every block. The remaining six probes are cost-parity diagnostics — they
-pin the VM's energy/gas to java-tron's exactly (CREATE2-empty = 32,012,
-STATICCALL = 40, per-op gas exact: PUSH1 3, MSTORE 6, MLOAD 3), so a
-one-unit drift trips a probe before it can become a silent consensus
-divergence.
-
-## Layout
+## 🧩 Layout
 
 The workspace is split into one crate per concern. java-tron's modules
 are big, monolithic Java packages; this repo flattens them out so each
@@ -474,7 +434,7 @@ TRC-10 transfer fields and the five TRON-extended opcodes
 gas accounting and journal logic. All other revm crates come from
 crates.io unchanged.
 
-## Build
+## 🦀 Build
 
 Prerequisites:
 
@@ -506,7 +466,7 @@ cargo test --workspace --release -- --include-ignored
                                   # Groth16 params), live-network, diagnostics
 ```
 
-## Run
+## 🚀 Run
 
 Initialise a data directory:
 
@@ -573,7 +533,7 @@ starting point ships at [`config.example.toml`](config.example.toml)
 (every key set to its built-in default); copy it and pass it with
 `--config`.
 
-## Indexer, historical state & firehose
+## 🔍 Indexer, historical state & firehose
 
 The node can be its own TronGrid: a built-in indexer serves address
 history, NFT transfers, internal transactions, and contract events from
@@ -667,7 +627,7 @@ Format, cursor protocol, and consumer setup:
 Every `[index]` knob is annotated in
 [`config.example.toml`](config.example.toml).
 
-## Documentation
+## 📚 Documentation
 
 This README is the high-level tour. Deeper, task-oriented guides live in
 [`docs/`](docs/):
@@ -687,7 +647,7 @@ This README is the high-level tour. Deeper, task-oriented guides live in
 A terser, structured set written for AI coding assistants lives under
 [`docs/llm/`](docs/llm/).
 
-## Compatibility notes
+## 🔄 Compatibility notes
 
 - **Database**: byte-exact, per-store **RocksDB** layout — RocksDB-only,
   no LevelDB backend. A java-tron snapshot is a `tron-node` data directory
@@ -712,7 +672,7 @@ A terser, structured set written for AI coding assistants lives under
   java-tron node — not by hash equality alone. (This is exactly how the
   delegated-resource divergence in [Status](#status) was found.)
 
-## Reference implementation
+## 📐 Reference implementation
 
 The `.proto` definitions needed to build are vendored at
 `crates/tron-proto/vendored/java-tron/`, so a fresh clone builds
@@ -738,7 +698,7 @@ export JAVA_TRON_PROTO_ROOT=$PWD/java-tron/protocol/src/main/protos
 cargo build --release
 ```
 
-## Acknowledgements
+## 🙏 Acknowledgements
 
 This project stands on a stack of other people's hard work.
 Thanks in particular to:
@@ -773,25 +733,29 @@ Thanks in particular to:
   **[prost](https://github.com/tokio-rs/prost)** — the async runtime,
   HTTP server, gRPC + Protobuf stack underneath every network
   surface in the node.
-- **[`eth_trie`](https://crates.io/crates/eth_trie)** — Ethereum
+- **[eth_trie](https://crates.io/crates/eth_trie)** — Ethereum
   Merkle-Patricia-Trie semantics for the account-state-root path
   TRON inherits from Ethereum.
 - **[tracing](https://github.com/tokio-rs/tracing)** — structured
   logging across every crate.
 
 If you maintain a crate we depend on and you're not listed here,
-that's an oversight — please open an issue and we'll fix it.
+that's an oversight, please open an issue and we'll fix it. Happy to give credit to the many great projects that helped give this one life.
 
-## Support
+## 🤝 Contributions
 
-This node is independent and unfunded, built from scratch to give TRON
-something it has never had: a real second client. It's free, open-source, and
+Contributions are absolutely welcome, just please take the time to validate your submissions. Using modern AI tools to help yourself contribute is fine, this project simply wouldn't be feasible without them, please just don't submit low quality junk.
+
+## 💚 Support
+
+This project is independent and unfunded, built from scratch to give TRON
+something it has never had: a real second client. **It has currently received no funding or support from the TRON Foundation**. It's free, open-source, and
 already does things the reference node can't.
 
 If it saved you time, taught you something, or you simply want an independent
 TRON client to keep existing, a donation puts that work directly back into more
 parity, more features, and keeping all of it free. Even a few TRX makes a
-difference, and there's no obligation at all.
+difference.
 
 Send TRX or any TRC-20 token, on TRON mainnet, to:
 
@@ -799,9 +763,12 @@ Send TRX or any TRC-20 token, on TRON mainnet, to:
 TKbx8NEyu41T69zgmQGbjAt1dF6o49QuNA
 ```
 
+Can't spare anything but still want to help? Drop a ⭐ on this repo, it helps get more eyes on the project and is **REALLY** appreciated.
+
 Every contribution keeps the goblin fed and the commits coming. Thank you. 🧌
 
-## License
+
+## 📜 License
 
 LGPL-3.0-or-later. See [`LICENSE`](LICENSE).
 
