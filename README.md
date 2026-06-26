@@ -1,6 +1,6 @@
 # <img src="goblin.svg" width="48" alt="" valign="middle"> Tron Goblin Node
 
-[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Tests](https://img.shields.io/badge/tests-2640%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
+[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Tests](https://img.shields.io/badge/tests-2707%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
 
 A Rust implementation of the [TRON](https://tron.network) full-node
 protocol — the same role java-tron plays, written from scratch in
@@ -341,7 +341,7 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **2640** |
+| Workspace tests passing | **2707** |
 | Ignored — live-network (6), Sapling Groth16 proving (5), perf/diagnostic (7) | 18 |
 | Integration test files (`crates/*/tests/`) | 123 |
 | Source modules with `#[cfg(test)]` blocks | 139 |
@@ -351,18 +351,18 @@ where parity risk lives):
 
 | Crate | Tests | Crate | Tests |
 | --- | ---: | --- | ---: |
-| `tron-node`      | 392 | `tron-types`     |  72 |
-| `tron-actuator`  | 368 | `tron-net`       |  78 |
-| `tron-rpc`       | 364 | `tron-index`     |  96 |
-| `tron-tvm`       | 401 | `tron-crypto`    |  35 |
-| `tron-chainbase` | 246 | `tron-mempool`   |  27 |
-| `tron-executor`  | 171 | `tron-wallet`    |  22 |
-| `tron-consensus` | 117 | `tron-eventer`   |  16 |
+| `tron-node`      | 393 | `tron-types`     |  74 |
+| `tron-actuator`  | 373 | `tron-net`       |  78 |
+| `tron-rpc`       | 400 | `tron-index`     |  96 |
+| `tron-tvm`       | 414 | `tron-crypto`    |  35 |
+| `tron-chainbase` | 249 | `tron-mempool`   |  27 |
+| `tron-executor`  | 175 | `tron-wallet`    |  22 |
+| `tron-consensus` | 121 | `tron-eventer`   |  16 |
 | `tron-grpc`      |  67 | `tron-firehose-*`|   8 |
 | `tron-proto`     |  13 | `tron-replay`    |   8 |
 
-These principal crates account for 2,501 of the 2,640 passing tests; the
-remaining ~139 live in the four vendored `revm-*` forks and the
+These principal crates account for 2,569 of the 2,707 passing tests; the
+remaining 138 live in the four vendored `revm-*` forks and the
 `tron-state-diff` / `tron-eventer-kafka` tooling crates.
 
 Notable test categories:
@@ -456,11 +456,11 @@ Then:
 cargo build --release
 ```
 
-The full workspace compiles in ~3–5 minutes on a modern machine.
+The full workspace compiles in ~3–5 minutes on a modern machine, and the full test suite runs in ~5 minutes.
 Tests:
 
 ```sh
-cargo test --workspace            # 2640 tests, all defaults
+cargo test --workspace            # 2707 tests, all defaults
 cargo test --workspace --release -- --include-ignored
                                   # + 18 opt-in: Sapling proving (~50 MB
                                   # Groth16 params), live-network, diagnostics
