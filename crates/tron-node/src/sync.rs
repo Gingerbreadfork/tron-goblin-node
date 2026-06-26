@@ -3665,6 +3665,34 @@ impl SyncDriver {
                             raw.copy_from_slice(&hash);
                             let id = BlockId::from_raw(raw);
                             let block_num = id.num() as i64;
+                            // Competing fork block at/below our head (a
+                            // DIFFERENT id than what we hold): the head+1
+                            // scheduler gate would drop it, but it's the
+                            // advert-path analogue of the ChainInventory fork
+                            // fetch (Change A) — route it like a head+1 dispatch
+                            // so khaos can build the rival branch and reorg.
+                            if block_num <= head
+                                && !self.already_have_canonical(block_num, &raw)
+                            {
+                                if multi_peer {
+                                    if am_leader && expected.is_empty() {
+                                        if let Some(pool) = &self.fetch_pool {
+                                            let new =
+                                                pool.push_wants([(block_num, raw)]);
+                                            if !new.is_empty() {
+                                                offered_max =
+                                                    offered_max.max(block_num);
+                                            }
+                                            for nid in new {
+                                                expected.push_back(nid);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    pending_fetch_queue.push_back(hash);
+                                }
+                                continue;
+                            }
                             match fetch_block_scheduler.try_fetch(
                                 block_num,
                                 raw,
@@ -3780,6 +3808,29 @@ impl SyncDriver {
                         }
                         let mut raw = [0u8; 32];
                         raw.copy_from_slice(&b.hash);
+                        // Competing fork block at/below head — advert-path
+                        // analogue of the ChainInventory fork fetch; see the
+                        // Inventory(BLOCK) arm above.
+                        if b.number <= head
+                            && !self.already_have_canonical(b.number, &raw)
+                        {
+                            if multi_peer {
+                                if am_leader && expected.is_empty() {
+                                    if let Some(pool) = &self.fetch_pool {
+                                        let new = pool.push_wants([(b.number, raw)]);
+                                        if !new.is_empty() {
+                                            offered_max = offered_max.max(b.number);
+                                        }
+                                        for nid in new {
+                                            expected.push_back(nid);
+                                        }
+                                    }
+                                }
+                            } else {
+                                pending_fetch_queue.push_back(b.hash.clone());
+                            }
+                            continue;
+                        }
                         match fetch_block_scheduler.try_fetch(
                             b.number,
                             raw,
@@ -3853,7 +3904,7 @@ impl SyncDriver {
                         // different id may be re-fetched; harmless — idempotent
                         // and pool-deduped.)
                         let head_now = self.head_number();
-                        fetched_ids.retain(|_, n| *n > head_now);
+                        fetched_ids.retain(|_, n| *n >= head_now);
                         // Remember OUR offered window (leader and worker
                         // alike) for a potential leadership takeover — see
                         // `my_window` at its declaration. Replaced wholesale
@@ -4461,8 +4512,15 @@ impl SyncDriver {
         else {
             return false;
         };
-        match self.resume_head() {
-            Some(head) => &head.as_bytes()[..] == parent,
+        // Read the EXECUTED head through the pipeline overlay, not the base
+        // store: mid-drain the in-flight block's head write is parked in the
+        // overlay (base still shows head-1), so a clean extension would
+        // otherwise read parent != base-head and be misclassified as a fork,
+        // wrongly skipping the consensus + ref_block gates. The block-signer
+        // and consensus-gate reads use this same view for that reason.
+        let dp = DynamicPropertiesStore::new(self.exec_state_view().dyn_props.clone());
+        match dp.latest_block_header_hash().ok().flatten() {
+            Some(head) => &head[..] == parent,
             None => true,
         }
     }
@@ -4659,9 +4717,25 @@ impl SyncDriver {
         // past genesis with a populated active-witness schedule — mirroring
         // java's `getLatestBlockHeaderNumber() == 0` early-return — so it's
         // inert pre-genesis and on context-less in-memory pushes.
-        if let Err(e) = self.validate_block_consensus_gate(block) {
-            self.stats.blocks_rejected_validation += 1;
-            return AcceptOutcome::RejectedValidation(format!("consensus: {e:?}"));
+        // Defer this gate for FORK blocks, exactly like the ref_block gate
+        // below. The slot-monotonicity + scheduled-witness checks are anchored
+        // at the HEAD's slot; for a fork candidate that head is our orphan
+        // branch, not the fork's parent, so a competing same-or-earlier-slot
+        // tip-fork sibling would be rejected here BEFORE khaos.push and the
+        // node would re-wedge onto the minority branch (the slot gate is the
+        // fourth pre-khaos blocker; b8bb90f fixed the other three). java runs
+        // validBlock inside processBlock/switchFork against the
+        // eraseBlock-rolled-back fork parent. The witness SIGNATURE is still
+        // verified above for every block. Re-validating slot/schedule on
+        // reorg-apply against the branch parent is the same honest-safe
+        // defense-in-depth nuance as tapos-on-reorg (see the ref_block note
+        // below): a winning fork is signature-valid and, on honest-majority
+        // DPoS, slot-valid by construction.
+        if self.block_extends_executed_head(block) {
+            if let Err(e) = self.validate_block_consensus_gate(block) {
+                self.stats.blocks_rejected_validation += 1;
+                return AcceptOutcome::RejectedValidation(format!("consensus: {e:?}"));
+            }
         }
 
         let id = match block_id_from_block(block) {
