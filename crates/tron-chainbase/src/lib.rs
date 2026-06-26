@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod blockstm;
 pub mod checkpoint_v2;
+pub mod convert;
 pub mod fee;
 pub mod java_checkpoint;
 pub mod pending_overlay;
@@ -30,6 +31,10 @@ pub use checkpoint_v2::{
 pub use java_checkpoint::{
     has_pending_java_checkpoint, replay_java_checkpoint, JavaCheckpointError,
     JAVA_CHECKPOINT_V1_DIR, JAVA_CHECKPOINT_V2_DIR,
+};
+pub use convert::{
+    open_dest_store, stream_source_into_dest, verify_dest_store, ConvertError, KvSource,
+    RocksDbSource, StreamStats, VisitError, CONVERT_BATCH, NODE_STORE_NAMES,
 };
 pub use fee::dispose_fee_to_blackhole;
 pub use pending_overlay::PendingOverlay;

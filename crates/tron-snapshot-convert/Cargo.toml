@@ -1,0 +1,47 @@
+[package]
+name = "tron-snapshot-convert"
+publish.workspace = true
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Standalone tool: convert a java-tron LevelDB snapshot into this node's RocksDB format, deleting each source store as it is converted so peak disk stays near 1x. Keeps the LevelDB dependency out of tron-node."
+
+[dependencies]
+# Down-dependency on the storage layer for the RocksDB write path, the
+# per-store comparator table, and the shared per-store streaming helper.
+tron-chainbase = { path = "../tron-chainbase" }
+# Pure-Rust LevelDB reader. java-tron writes its LevelDB stores with the
+# native Google LevelDB C++ library (via leveldbjni), i.e. the standard
+# on-disk LevelDB format; `rusty-leveldb` is a faithful pure-Rust reader
+# of exactly that format and gives explicit comparator-name control for
+# the one store (`market_pair_price_to_order`) java writes with a custom
+# key comparator. This is the ONLY crate in the workspace that depends on
+# it — tron-node stays LevelDB-free.
+rusty-leveldb = { version = "4.0.1", default-features = false, features = ["fs"] }
+# Zstd is an OPT-IN destination codec (`--zstd`, ~30% smaller than the default
+# Snappy). RocksDB only accepts a Zstd open if librocksdb-sys was built with the
+# codec, so this crate links the `zstd` feature. NOTE: a Zstd-converted snapshot
+# is readable ONLY by a tron-node also built with Zstd — the default node build
+# links Snappy/LZ4 only — so the converter DEFAULTS to Snappy and warns when
+# `--zstd` is passed. (`cargo build --workspace` links zstd into the shared
+# librocksdb-sys via feature unification, but `cargo build --bin tron-node` does
+# not, and tron-node never writes zstd regardless.)
+rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4", "zstd", "bindgen-runtime"] }
+thiserror.workspace = true
+tar.workspace = true
+flate2.workspace = true
+
+[lib]
+name = "tron_snapshot_convert"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tron-snapshot-convert"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Used by the round-trip tests to synthesize a small multi-store LevelDB
+# snapshot (write KVs, including one store with a custom comparator name)
+# the way java-tron would lay one out.
+rusty-leveldb = { version = "4.0.1", default-features = false, features = ["fs"] }

@@ -23,7 +23,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use rocksdb::{
-    BlockBasedOptions, Cache, Env, Options, WriteBatch, WriteBufferManager, WriteOptions, DB,
+    BlockBasedOptions, Cache, DBCompressionType, Env, Options, WriteBatch, WriteBufferManager,
+    WriteOptions, DB,
 };
 
 use crate::backend::{KvBackend, KvError, WriteOp};
@@ -48,6 +49,34 @@ fn safety_baseline() -> Options {
     let mut opts = Options::default();
     opts.set_paranoid_checks(true);
     opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+    opts
+}
+
+/// Build the `Options` for a fresh conversion-destination store (see
+/// [`RocksDbBackend::open_for_convert`]). Bulk-load shaped: a large
+/// per-store write buffer and a handful of in-flight memtables so the
+/// batched `put` stream rarely stalls, the configured compression codec,
+/// and an optional custom comparator. Standalone from the node's shared
+/// tuning — a converter runs one store at a time and closes it, so the
+/// process-wide cache/manager/Env are unnecessary overhead.
+fn convert_options(
+    compression_zstd: bool,
+    comparator: Option<(&str, fn(&[u8], &[u8]) -> Ordering)>,
+) -> Options {
+    let mut opts = safety_baseline();
+    opts.create_if_missing(true);
+    // 128 MiB write buffer, up to 4 in flight — bulk-load headroom so the
+    // 256-row batches stream in without tripping a write stall.
+    opts.set_write_buffer_size(128 * 1024 * 1024);
+    opts.set_max_write_buffer_number(4);
+    opts.set_compression_type(if compression_zstd {
+        DBCompressionType::Zstd
+    } else {
+        DBCompressionType::Snappy
+    });
+    if let Some((cmp_name, cmp_fn)) = comparator {
+        opts.set_comparator(cmp_name, Box::new(cmp_fn));
+    }
     opts
 }
 
@@ -453,6 +482,55 @@ impl RocksDbBackend {
     pub fn open_with(path: impl AsRef<Path>, opts: Options) -> Result<Self, RocksDbError> {
         let db = DB::open(&opts, path)?;
         Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open a *fresh* destination store for a snapshot/​engine conversion.
+    ///
+    /// Deliberately leaner than [`open`](Self::open): a converter is a
+    /// short-lived, single-store-at-a-time, write-only-then-close job, so
+    /// it skips the node's process-wide shared block cache / write-buffer
+    /// manager / background Env (those exist to bound memory across the
+    /// ~40 stores a *running* daemon holds open at once — irrelevant here)
+    /// and instead sizes a generous per-store write buffer for bulk load.
+    ///
+    /// `compression_zstd` selects [`DBCompressionType::Zstd`] over the
+    /// default Snappy. Zstd yields ~30% smaller SSTs; the choice is a pure
+    /// storage concern — RocksDB records the codec per-SST, so the daemon
+    /// (which opens stores with Snappy defaults) still reads a Zstd store
+    /// transparently and byte-faithfully. Requires the `zstd` feature on
+    /// the `rocksdb` crate; without it RocksDB rejects the open at runtime,
+    /// which surfaces as a normal `RocksDbError` to the caller.
+    pub fn open_for_convert(
+        path: impl AsRef<Path>,
+        compression_zstd: bool,
+    ) -> Result<Self, RocksDbError> {
+        Self::open_with(path, convert_options(compression_zstd, None))
+    }
+
+    /// Like [`open_for_convert`](Self::open_for_convert) but registers a
+    /// custom comparator (the destination MANIFEST records the name, and
+    /// later reads must register the same one). Only
+    /// `market_pair_price_to_order` needs this.
+    pub fn open_for_convert_with_comparator(
+        path: impl AsRef<Path>,
+        comparator_name: &str,
+        compare_fn: fn(&[u8], &[u8]) -> Ordering,
+        compression_zstd: bool,
+    ) -> Result<Self, RocksDbError> {
+        Self::open_with(
+            path,
+            convert_options(compression_zstd, Some((comparator_name, compare_fn))),
+        )
+    }
+
+    /// Force a flush of all memtables to SSTs and fsync the WAL, so a
+    /// just-written store is fully durable on disk before the caller marks
+    /// it done. The conversion deletes the source store after this
+    /// returns, so the destination must be crash-durable first.
+    pub fn flush_and_sync(&self) -> Result<(), RocksDbError> {
+        self.db.flush()?;
+        self.db.flush_wal(true)?;
+        Ok(())
     }
 
     /// Seek to the first key `>= start` and return up to `limit`

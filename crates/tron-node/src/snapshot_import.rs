@@ -550,7 +550,7 @@ pub fn import_live(
     secondary_cache_dir: Option<&Path>,
     force: bool,
 ) -> Result<ImportReport, ImportError> {
-    use tron_chainbase::{KvBackend, RocksDbBackend};
+    use tron_chainbase::RocksDbBackend;
 
     if !from.exists() {
         return Err(ImportError::SourceMissing(from.to_path_buf()));
@@ -672,19 +672,21 @@ pub fn import_live(
             source: e,
         })?;
 
-        let mut bytes_for_store = 0u64;
-        let store_name_for_err = name.clone();
-        src.for_each(|k, v| {
-            bytes_for_store += k.len() as u64 + v.len() as u64;
-            dst.put(k, v).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            Ok(())
-        })
-        .map_err(|e| ImportError::LiveScan {
-            store: store_name_for_err,
-            source: e,
-        })?;
+        // Stream the secondary's key-space into the destination via the
+        // shared chainbase helper — the same batched-write path the
+        // standalone `tron-snapshot-convert` uses (its source is LevelDB;
+        // ours is this RocksDB secondary). Keeps the two from drifting.
+        let mut source = tron_chainbase::RocksDbSource {
+            store_name: &name,
+            backend: &src,
+        };
+        let stats = tron_chainbase::stream_source_into_dest(&name, &mut source, &dst)
+            .map_err(|e| ImportError::LiveScan {
+                store: name.clone(),
+                source: Box::new(e),
+            })?;
 
-        total_bytes += bytes_for_store;
+        total_bytes += stats.byte_volume;
         store_names.push(name);
         // Drop both backends here — the secondary releases its file
         // handles, the destination flushes on drop. Important so the

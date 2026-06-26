@@ -23,6 +23,10 @@ members = [
     "crates/tron-wallet",
     "crates/tron-eventer",
     "crates/tron-eventer-kafka",
+    # Standalone LevelDB→RocksDB snapshot converter. Kept a SEPARATE crate
+    # from tron-node so its LevelDB reader dependency never leaks into the
+    # node binary.
+    "crates/tron-snapshot-convert",
     # Vendored forks of two revm component crates — needed so we can:
     #  * extend `CallInputs` with the TRC-10 transfer fields
     #    (`tron_token_id`, `tron_token_value`)
