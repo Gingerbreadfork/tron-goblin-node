@@ -3144,11 +3144,18 @@ impl SyncDriver {
             if multi_peer && am_leader && !was_leader {
                 if let Some(pool) = self.fetch_pool.clone() {
                     let head_now = self.head_number();
-                    let mut merged = pool.ordered_ids_above(head_now);
+                    // `head_now - 1` (not `head_now`) so a competing fork
+                    // block AT head height is inherited too; the filter then
+                    // drops only ids we already hold canonically (by id).
+                    let mut merged: Vec<(i64, [u8; 32])> = pool
+                        .ordered_ids_above(head_now - 1)
+                        .into_iter()
+                        .filter(|(n, id)| !self.already_have_canonical(*n, id))
+                        .collect();
                     let inherited = merged.len();
                     let mine: Vec<(i64, [u8; 32])> = my_window
                         .iter()
-                        .filter(|(n, _)| *n > head_now)
+                        .filter(|(n, id)| !self.already_have_canonical(*n, id))
                         .copied()
                         .collect();
                     for id in pool.push_wants(mine) {
@@ -3840,11 +3847,11 @@ impl SyncDriver {
                         if let Some(last) = chain_inv.ids.last() {
                             offered_max = offered_max.max(last.number);
                         }
-                        // Housekeeping: ids at/below the applied head can never
-                        // be re-offered (wants are filtered to `> head` below),
-                        // so their fetched-history entries are dead weight on a
-                        // long-lived connection. Prune here — once per window,
-                        // off the per-frame hot path.
+                        // Housekeeping: prune fetched-history entries at/below
+                        // the applied head — dead weight on a long-lived
+                        // connection. (A re-offered fork block at head with a
+                        // different id may be re-fetched; harmless — idempotent
+                        // and pool-deduped.)
                         let head_now = self.head_number();
                         fetched_ids.retain(|_, n| *n > head_now);
                         // Remember OUR offered window (leader and worker
@@ -3866,11 +3873,14 @@ impl SyncDriver {
                             // own window.
                             //
                             // Two filters keep the apply queue sound:
-                            //   * num > head — a window anchored at a stale
-                            //     head (a takeover: the locator went out before
-                            //     the inherited pool drained) must not
-                            //     re-enqueue blocks we already applied; those
-                            //     would be re-fetched only to rot in `ready`.
+                            //   * skip ids we already hold canonically
+                            //     (`already_have_canonical`, by id not height):
+                            //     a stale-head takeover must not re-enqueue
+                            //     already-applied blocks, but a DIFFERENT id at
+                            //     a height we hold (a fork at/below head) IS
+                            //     fetched so khaos can build the rival branch
+                            //     and reorg. A `num > head` filter dropped
+                            //     exactly that block and wedged us on a fork.
                             //   * extend `expected` ONLY with ids `push_wants`
                             //     newly inserted — ids the pool already tracks
                             //     are already in `expected` (the takeover
@@ -3879,7 +3889,7 @@ impl SyncDriver {
                             //     (its body can only be taken once).
                             let wants: Vec<(i64, [u8; 32])> = my_window
                                 .iter()
-                                .filter(|(n, _)| *n > head_now)
+                                .filter(|(n, id)| !self.already_have_canonical(*n, id))
                                 .copied()
                                 .collect();
                             appended = wants.len();
@@ -4418,6 +4428,45 @@ impl SyncDriver {
         dp.latest_block_header_number().unwrap_or(0)
     }
 
+    /// True iff `block_index[num]` already maps to exactly `id` — i.e. a
+    /// block we've applied on our canonical chain, not a competing fork
+    /// block at the same height. Drives id-based fetch decisions: an id we
+    /// already hold canonically is skipped, but a DIFFERENT id at a height
+    /// we hold (a fork at/below head, e.g. a 1-block tip-fork) is fetched
+    /// so khaos can build the rival branch and the reorg path switch to it.
+    /// Mirrors java-tron, which reconciles sync by block id, never by
+    /// height.
+    fn already_have_canonical(&self, num: i64, id: &[u8; 32]) -> bool {
+        let Some(bi) = self.state.block_index.as_ref() else {
+            return false;
+        };
+        BlockIndexStore::new(bi.clone())
+            .get(num)
+            .map(|ours| &ours.as_bytes()[..] == &id[..])
+            .unwrap_or(false)
+    }
+
+    /// True iff `block`'s parent hash equals our executed head — i.e. it
+    /// cleanly extends the canonical chain. False for a fork / reorg
+    /// candidate, whose txs are anchored to a different branch and must not
+    /// be ref_block-validated against our canonical index. On a fresh node
+    /// (no executed head yet) returns true so the normal linear-sync gate
+    /// still runs.
+    fn block_extends_executed_head(&self, block: &Block) -> bool {
+        let Some(parent) = block
+            .block_header
+            .as_ref()
+            .and_then(|h| h.raw_data.as_ref())
+            .map(|r| r.parent_hash.as_slice())
+        else {
+            return false;
+        };
+        match self.resume_head() {
+            Some(head) => &head.as_bytes()[..] == parent,
+            None => true,
+        }
+    }
+
     /// The id of our latest solidified block, for the P2P Hello `solid`
     /// field. `None` on a fresh node (no solid pointer yet, or its index
     /// entry is missing) so the caller can fall back to head.
@@ -4629,7 +4678,23 @@ impl SyncDriver {
         // block if any tx fails, since a structurally-invalid tx in
         // a valid-looking block means the producer or a relay
         // tampered with the contents.
-        if self.strict_ref_block {
+        // Only gate a block that cleanly EXTENDS our executed head. A block
+        // whose parent is not our head is a fork / reorg candidate: its txs
+        // are anchored to ITS branch, so validating them against our
+        // canonical `block_index` (a different chain at the shared heights)
+        // spuriously fails (`ref_block_hash mismatch`) and — fatally —
+        // rejects it before khaos can record the branch, so the reorg that
+        // would switch to it never fires. java-tron validates tapos inside
+        // applyBlock on the branch being applied (after khaosDb.push /
+        // during switchFork), never as a pre-push gate against the canonical
+        // chain. Mirror that: defer fork blocks to khaos; if one wins a
+        // reorg, `perform_reorg` re-applies it through the executor. (Note:
+        // the executor does not itself re-check tapos — a winning fork is
+        // witness-signature-validated above, and on honest-majority DPoS its
+        // tapos is valid by construction, so this is safe on mainnet; an
+        // explicit tapos-on-reorg-apply check is the only remaining
+        // java-parity nuance.)
+        if self.strict_ref_block && self.block_extends_executed_head(block) {
             if let Some(bi) = &self.state.block_index {
                 let block_num = block
                     .block_header
@@ -4654,14 +4719,57 @@ impl SyncDriver {
         // Seed KhaosDb on the first block of the session. We can't do
         // this in `new()` because `state` may not have a head yet.
         if !self.khaos_started {
+            // Depth of the recent-ancestor window seeded into KhaosDb on
+            // start. Bounded by khaos capacity (1024) and far deeper than
+            // any DPoS-final fork.
+            const SEED_WINDOW: i64 = 256;
             if let Some(head_id) = self.resume_head() {
-                // Resume from disk: load the head block and seed
-                // KhaosDb so the fork tree begins from the known head.
+                // Resume from disk: seed KhaosDb with a WINDOW of recent
+                // ancestors (oldest-first), not just the head. A shallow
+                // tip-fork — a competing block at or just below our head —
+                // can only reorg if its common ancestor is in the fork
+                // tree; seeding only the head orphans the entire competing
+                // branch (its parent missing) and wedges the node forever,
+                // even across restarts. During normal operation khaos
+                // accumulates this window as blocks apply; on a fresh start
+                // we rebuild it, like java-tron repopulating KhaosDatabase
+                // on boot.
                 let block_store = BlockStore::new(self.blocks_backend.clone());
-                if let Ok(head_block) = block_store.get(&head_id) {
-                    let _ = self.khaos.start(head_block);
-                    self.khaos_started = true;
+                let head_num = self.head_number();
+                let mut seeded = false;
+                if let Some(bi) = &self.state.block_index {
+                    let block_index = BlockIndexStore::new(bi.clone());
+                    let lowest = block_index.lowest().ok().flatten().unwrap_or(head_num);
+                    let start = head_num.saturating_sub(SEED_WINDOW).max(lowest);
+                    let mut chain: Vec<Block> = Vec::new();
+                    for n in start..=head_num {
+                        let Ok(id) = block_index.get(n) else {
+                            chain.clear();
+                            break;
+                        };
+                        let Ok(b) = block_store.get(&id) else {
+                            chain.clear();
+                            break;
+                        };
+                        chain.push(b);
+                    }
+                    if let Some((first, rest)) = chain.split_first() {
+                        if self.khaos.start(first.clone()).is_ok() {
+                            for b in rest {
+                                let _ = self.khaos.push(b.clone());
+                            }
+                            seeded = true;
+                        }
+                    }
                 }
+                // Fallback to head-only seeding if the window load failed
+                // (index gap, or no usable block_index).
+                if !seeded {
+                    if let Ok(head_block) = block_store.get(&head_id) {
+                        let _ = self.khaos.start(head_block);
+                    }
+                }
+                self.khaos_started = true;
             }
             // Fall through even if seeding failed (no head yet on a
             // fresh node) — `khaos.push` handles the empty-DB case.
