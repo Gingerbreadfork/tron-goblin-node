@@ -174,8 +174,8 @@ can actually profile, debug, and tune without fighting a JVM.
 
 ## 🚦 Status
 
-[!WARNING]
-While a lot of effort has gone into making this as functional and bug-free as possible, a project of this scope will inevitably have some rough edges. If you're powering a project with it, you should at minimum keep a java-tron node as a fallback, and not trust it with anything mission-critical. Bug reports from real use are exactly how it gets hardened, so if you do run it, please send them.
+> [!WARNING]
+> While a lot of effort has gone into making this as functional and bug-free as possible, a project of this scope will inevitably have some rough edges. If you're powering a project with it, you should at minimum keep a java-tron node as a fallback, and not trust it with anything mission-critical. Bug reports from real use are exactly how it gets hardened, so if you do run it, please send them.
 
 `tron-goblin-node` imports, validates, and executes
 live mainnet blocks into **byte-exact** RocksDB state, syncs off public
