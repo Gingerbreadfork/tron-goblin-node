@@ -22,8 +22,8 @@ RPC responses, just with better performance, lighter hardware requirements, and 
 - Sync from genesis or a get caught up fast with a RocksDB snapshot
 - Block-STM parallel execution enables syncing to be several times faster than java-tron (enabled by default)
 - Byte-exact RocksDB + bidirectional P2P (pick right up where java-tron left off)
-- Build in TronGrid cross-compatible indexer + historical state archieve (both optional to suit your needs)
-- ERC-4337 bundler + eth_simulateV1 (full account-abstraction bundler including ERC-7562 validation and repution throttling)
+- Built-in TronGrid cross-compatible indexer + historical state archive (both optional to suit your needs)
+- ERC-4337 bundler + eth_simulateV1 (full account-abstraction bundler including ERC-7562 validation and reputation throttling)
 - Self auditing and diagnostic tools
 - Borderline excessive test coverage (2500+ tests)
 - Full node functionality - **not a tech demo**

@@ -5,7 +5,7 @@
 //!
 //! ## Scope of this port
 //!
-//! The actuator has four moving parts. Three are fully ported:
+//! All four moving parts are ported:
 //!
 //! 1. **Permission/structure checks** — `checkSender`, `checkReceiver`,
 //!    `validateTransparent` (lengths, address validity, no-self-transfer,
@@ -15,23 +15,19 @@
 //! 3. **Proof verification** — spend/output proof checks plus the
 //!    final binding-signature check, using the embedded Sapling
 //!    verifying keys from `tron_tvm::shielded`. 100% parity.
+//! 4. **Merkle-tree state machinery + transparent halves** — when an
+//!    `IncrementalMerkleTreeStore` is attached, `validate` checks each
+//!    spend's anchor against the known roots (java-tron's
+//!    `merkleContainer.merkleRootExist`) and `execute` appends each
+//!    receive's note commitment to the current tree, re-persists it, and
+//!    indexes the new root so later spend anchors resolve. The
+//!    transparent halves adjust the TRC-10 "Zen" asset balance
+//!    (`Commons.adjustAssetBalanceV2`) on the from/to addresses,
+//!    auto-creating the recipient account like java-tron's
+//!    `executeTransparentTo`.
 //!
-//! The fourth — **Merkle-tree state machinery** — is documented stub
-//! work: java-tron uses an `IncrementalMerkleTreeContainer` to
-//! validate spend anchors against the historical roots set and to add
-//! newly-committed notes to the current tree. We **skip** the anchor
-//! lookup (always succeeds if the anchor parses as 32 bytes) and we
-//! **do not append** new commitments to a Merkle tree. A future
-//! "MerkleContainer" port can plug in here without touching the proof
-//! or nullifier logic.
-//!
-//! Similarly, the TRC-10 "Zen" asset balance adjustments
-//! (`Commons.adjustAssetBalanceV2` against `assetIssueStore`) are not
-//! yet wired because the actuator doesn't yet know which asset id is
-//! "Zen" without a chain-config lookup. These are documented stubs
-//! that return `NotImplemented` if either transparent_from_address or
-//! transparent_to_address is non-empty. **A purely-shielded → purely-
-//! shielded transaction works end-to-end through this actuator.**
+//! Both purely-shielded and mixed transparent/shielded transactions run
+//! end-to-end through this actuator.
 
 use std::collections::HashSet;
 
@@ -156,9 +152,9 @@ pub fn compute_shielded_sighash(
 /// in java-tron — the caller computes it from the full transaction
 /// proto (a TODO for the executor wiring layer).
 ///
-/// Note: the **Merkle anchor lookup** is intentionally skipped here
-/// (returns `Ok` for any 32-byte anchor). Re-add once a
-/// `MerkleContainer` store is ported.
+/// The **Merkle anchor lookup** runs when a `merkle_trees` store is
+/// attached: each spend's anchor must be a previously-known root. Without
+/// a store attached, only the 32-byte anchor length is checked.
 pub fn validate_shielded_transfer(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
@@ -246,8 +242,9 @@ pub fn validate_shielded_transfer(
 
 /// Execute the shielded transfer, mutating state:
 /// * Append each spend's nullifier to the [`NullifierStore`].
-/// * (Future) append each receive's note commitment to the Merkle tree.
-/// * (Future) adjust TRC-10 Zen asset balances on the transparent halves.
+/// * Append each receive's note commitment to the Merkle tree and re-index
+///   the new root (when a `merkle_trees` store is attached).
+/// * Adjust TRC-10 Zen asset balances on the transparent halves.
 ///
 /// Caller is expected to have called [`validate_shielded_transfer`]
 /// first; this function does not re-validate.

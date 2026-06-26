@@ -2,8 +2,9 @@
 name = "tron-eventer-kafka"
 publish.workspace = true
 version = "0.0.1"
-edition = "2021"
-license = "Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Kafka sink for tron-eventer — java-tron eventplugin-kafka parity (topics + JSON trigger shapes)"
 
 [dependencies]

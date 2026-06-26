@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use tron_chainbase::{AccountIdIndexStore, AccountIndexStore, AccountStore, DynamicPropertiesStore};
 use tron_proto::{
     permission::PermissionType, Account, AccountCreateContract, AccountPermissionUpdateContract,
-    AccountType, AccountUpdateContract, Permission, SetAccountIdContract,
+    AccountUpdateContract, Permission, SetAccountIdContract,
 };
 
 use crate::helpers::{check_sub, decode_address, require_owner};
@@ -478,9 +478,4 @@ pub fn execute_account_permission_update(
         created_recipient: false,
         ..Default::default()
     })
-}
-
-#[allow(dead_code)]
-fn _account_type_normal() -> i32 {
-    AccountType::Normal as i32
 }

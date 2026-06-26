@@ -21,10 +21,10 @@
 //! stores raw bytes; both the key truncation and the value slicing are
 //! applied by the caller in `Manager.processBlock` when populating the
 //! index. **Note**: nothing in the node currently populates this store
-//! — ref_block validation is the open ET-C4 (sub-issue B) item in
-//! REVIEW.md. Whoever wires the validator should also wire population
-//! here, in `execute_block_logic`'s step 3, so the byte layout matches
-//! java-tron exactly.
+//! — ref_block validation queries `BlockIndexStore` instead (see
+//! `tron-node::ref_block`). A future populator should wire it here, in
+//! `execute_block_logic`'s step 3, so the byte layout matches java-tron
+//! exactly.
 
 use std::sync::Arc;
 

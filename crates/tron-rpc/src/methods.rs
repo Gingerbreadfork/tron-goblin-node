@@ -5387,9 +5387,9 @@ pub fn txpool_inspect(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 // =============================================================================
 //
 // java-tron's market lets users post limit orders against a TRC-10/TRX
-// pair. The on-disk layout is in four stores; we read but don't mutate
-// (the actuator path for `MarketSellAssetContract` / `MarketCancelOrderContract`
-// is not yet implemented). Read coverage is enough for explorers and
+// pair. The on-disk layout is in four stores; this RPC module is read-only
+// (order mutation is handled by the `MarketSellAsset` / `MarketCancelOrder`
+// actuators in `tron-actuator`). Read coverage is enough for explorers and
 // dashboards that show open orders.
 
 /// Token-id length in the on-disk pair key. Matches java-tron's

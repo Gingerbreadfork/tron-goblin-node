@@ -17,7 +17,6 @@
 use tron_chainbase::{
     AccountStore, AssetIssueStore, AssetIssueV2Store, DynamicPropertiesStore,
 };
-use tron_crypto::address::Address;
 use tron_proto::{
     AssetIssueContract, ParticipateAssetIssueContract, TransferAssetContract,
     UnfreezeAssetContract, UpdateAssetContract,
@@ -920,6 +919,3 @@ pub(crate) fn token_id_for_name(
         .map(|c| c.id)
         .filter(|id| !id.is_empty()))
 }
-
-#[allow(dead_code)]
-fn _unused(_a: &Address) {}

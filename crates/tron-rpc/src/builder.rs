@@ -22,7 +22,6 @@
 
 use prost::Message as _;
 use serde_json::{json, Value};
-use tron_chainbase::{BlockIndexStore, BlockStore, DynamicPropertiesStore};
 use tron_proto::transaction::{
     contract::ContractType, Contract as TxContract, Raw as TxRaw,
 };
@@ -190,17 +189,6 @@ fn proto_name(t: ContractType) -> &'static str {
         ShieldedTransferContract => "ShieldedTransferContract",
         _ => "Unknown",
     }
-}
-
-/// Compile-time check: silence unused-import warnings if the
-/// reachable BlockIndexStore / BlockStore / DynamicPropertiesStore
-/// aren't directly named (we go through `RpcState` field accesses
-/// which keep them live transitively).
-#[allow(dead_code)]
-fn _keep_types_live() {
-    let _ = std::any::type_name::<BlockIndexStore>();
-    let _ = std::any::type_name::<BlockStore>();
-    let _ = std::any::type_name::<DynamicPropertiesStore>();
 }
 
 #[cfg(test)]

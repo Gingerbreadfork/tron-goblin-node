@@ -4703,7 +4703,7 @@ impl SyncDriver {
         let khaos_head = match self.khaos.push(block.clone()) {
             // `PushOutcome` also classifies extension vs reorg vs sibling;
             // we only need the resulting head here. Acting on the reorg
-            // signal is the sync-reorg follow-up (review §9).
+            // signal is a sync-reorg follow-up.
             Ok(outcome) => outcome.into_head(),
             Err(tron_consensus::KhaosPushError::Unlinked) => {
                 if !self.khaos_started {

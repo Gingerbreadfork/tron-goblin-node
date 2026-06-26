@@ -29,7 +29,7 @@
 //!
 //! java-tron's canonical store is `RecentBlockStore` — a 2-byte-keyed
 //! wrapping window of 65,536 entries. We have the store defined in
-//! `tron-chainbase` but nothing populates it (tracked in REVIEW.md).
+//! `tron-chainbase` but nothing populates it.
 //! Until that wires up, we query `BlockIndexStore` (already populated
 //! on every applied block) and apply the 65k window check ourselves.
 //! The byte-output for an in-window valid tx is identical either way;

@@ -80,23 +80,23 @@ cargo build --release -p tron-state-diff
 # Diff the accounts touched in the last 200 blocks, against your java-tron node
 ./target/release/tron-state-diff \
     --a http://127.0.0.1:8090 \
-    --b http://192.168.0.36:8090 \
+    --b http://<java-tron-host>:8090 \
     --from-recent-blocks 200
 
 # Diff a specific set of accounts
-tron-state-diff --b http://192.168.0.36:8090 \
+tron-state-diff --b http://<java-tron-host>:8090 \
     --accounts TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t,TWdYx... \
     --probes account,resource
 
 # Accounts from a file, machine-readable output
-tron-state-diff --b http://192.168.0.36:8090 --accounts-file addrs.txt --json
+tron-state-diff --b http://<java-tron-host>:8090 --accounts-file addrs.txt --json
 
 # Validate TVM execution: diff standard TRC20 view calls on every contract
 # touched in the last 200 blocks (both nodes need vm.supportConstant = true)
-tron-state-diff --b http://192.168.0.36:8090 --from-recent-blocks 200 --constant
+tron-state-diff --b http://<java-tron-host>:8090 --from-recent-blocks 200 --constant
 
 # One explicit call: USDT balanceOf for a padded address argument
-tron-state-diff --b http://192.168.0.36:8090 \
+tron-state-diff --b http://<java-tron-host>:8090 \
     --call TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t:balanceOf(address):000000000000000000000000<40hex>
 ```
 

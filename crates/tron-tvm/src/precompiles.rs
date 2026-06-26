@@ -1261,11 +1261,9 @@ fn maybe_trace_resource_precompile(
     result: &PrecompileResult,
 ) {
     use std::sync::OnceLock;
-    // Temporary investigation default: trace the first known divergence blocks
-    // (a56d573d @83316753 + the next two REVERTs) automatically, so a normal
-    // fresh-snapshot re-sync captures the clean-state precompile I/O with no env
-    // var to remember. Override with TRON_PRECOMPILE_TRACE_BLOCK=<n> (single
-    // block), or disable with TRON_PRECOMPILE_TRACE_BLOCK=0.
+    // Off by default; set TRON_PRECOMPILE_TRACE_BLOCK=<n> to log the clean-state
+    // resource-precompile I/O for a single block n (parity diffing without a
+    // debugger or archive replay). Unset or 0 disables it.
     static TRACE_BLOCKS: OnceLock<Vec<i64>> = OnceLock::new();
     let targets = TRACE_BLOCKS.get_or_init(|| {
         // Off by default now that the precompiles are confirmed byte-exact;

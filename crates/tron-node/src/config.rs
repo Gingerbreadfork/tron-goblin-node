@@ -63,8 +63,7 @@ pub struct NodeConfig {
     ///
     /// **Status**: schema only — the parser accepts these keys so that
     /// java-tron config files round-trip, but the plugin loader is not
-    /// yet wired (see PARITY.md "Eventer / logsfilter"). Setting fields
-    /// here is a no-op until the loader lands.
+    /// yet wired. Setting fields here is a no-op until the loader lands.
     #[serde(default)]
     pub event: Option<EventSubscribeConfig>,
 
@@ -75,9 +74,8 @@ pub struct NodeConfig {
     /// produce blocks) as long as it sees the master.
     ///
     /// **Status**: schema only — the parser accepts these keys but the
-    /// `BackupManager` runtime is not yet wired (see PARITY.md HIGH
-    /// "P2P: NodePersistService / RelayService / fastForward witness
-    /// role" — backup election lives in the same service tier).
+    /// `BackupManager` runtime (backup election + standby coordination)
+    /// is not yet wired.
     #[serde(default)]
     pub node_backup: NodeBackupConfig,
 
@@ -86,9 +84,7 @@ pub struct NodeConfig {
     /// ratios for the long-running gate, etc.).
     ///
     /// **Status**: schema parses with java-tron's clamps applied; only
-    /// a subset of fields are consulted by the executor today. See
-    /// PARITY.md HIGH "TVM opcodes" + "EVM `gas_refunded` hardcoded"
-    /// for the related execution gaps.
+    /// a subset of fields are consulted by the executor today.
     #[serde(default)]
     pub vm: VmConfig,
 
@@ -553,8 +549,7 @@ fn default_metrics_port() -> u16 {
 
 /// Top-level container mirroring java-tron's `event.subscribe` section
 /// (`EventPluginConfig` + `FilterQuery`). Schema is wire-compatible
-/// with `config.conf`; semantics deferred (no plugin loader yet — see
-/// PARITY.md MEDIUM "Eventer / logsfilter").
+/// with `config.conf`; semantics deferred (no plugin loader yet).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventSubscribeConfig {
     /// Master enable. When `false`, every other field is ignored.

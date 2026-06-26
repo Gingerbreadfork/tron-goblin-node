@@ -20,7 +20,7 @@ use rand_core::{CryptoRng, RngCore};
 use sapling_crypto::bundle::GrothProofBytes;
 use sapling_crypto::circuit::{OutputParameters, SpendParameters};
 use sapling_crypto::keys::{
-    EphemeralSecretKey, NullifierDerivingKey, OutgoingViewingKey, SpendValidatingKey,
+    OutgoingViewingKey, SpendValidatingKey,
 };
 use sapling_crypto::note::Rseed;
 use sapling_crypto::note_encryption::sapling_note_encryption;
@@ -276,14 +276,6 @@ fn bls12_381_scalar_from_bytes(bytes: &[u8; 32]) -> Result<bls12_381::Scalar, Pr
             hex::encode(bytes)
         )))
     }
-}
-
-// Silence unused-import warnings for items only the helpers
-// reference (NullifierDerivingKey is brought in for API parity).
-#[allow(dead_code)]
-fn _doc_imports() {
-    let _ = std::mem::size_of::<NullifierDerivingKey>();
-    let _ = std::mem::size_of::<EphemeralSecretKey>();
 }
 
 #[cfg(test)]

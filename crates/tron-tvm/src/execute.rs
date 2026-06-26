@@ -43,7 +43,7 @@ use tron_chainbase::{
 };
 use tron_proto::{CreateSmartContract, TriggerSmartContract};
 
-use crate::database::{evm_to_tron_address, TronDatabase};
+use crate::database::TronDatabase;
 use crate::evm::TronPrecompiles;
 
 /// Returns true when the `ALLOW_DYNAMIC_ENERGY` proposal is active.
@@ -1831,13 +1831,6 @@ fn parse_tron_address_to_evm(raw: &[u8]) -> Result<EvmAddress, String> {
         ));
     }
     Ok(EvmAddress::from_slice(&raw[1..]))
-}
-
-/// Suppress unused-import warning until we add a `CreateSmartContract`
-/// path in a follow-up.
-#[allow(dead_code)]
-fn _evm_addr_dance(a: EvmAddress) -> tron_crypto::address::Address {
-    evm_to_tron_address(&a)
 }
 
 #[cfg(test)]

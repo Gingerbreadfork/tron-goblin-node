@@ -78,7 +78,7 @@ Compare recent touched accounts against a java-tron node:
 ```sh
 ./target/release/tron-state-diff \
   --a http://127.0.0.1:8090 \
-  --b http://192.168.0.36:8090 \
+  --b http://<java-tron-host>:8090 \
   --from-recent-blocks 200
 ```
 
@@ -86,7 +86,7 @@ Validate TVM constant-call behavior:
 
 ```sh
 ./target/release/tron-state-diff \
-  --b http://192.168.0.36:8090 \
+  --b http://<java-tron-host>:8090 \
   --from-recent-blocks 200 \
   --constant
 ```

@@ -3407,8 +3407,8 @@ fn execute_one_tx_isolated(
     // belongs at the sync layer (where the block enters) and the
     // mempool (where individual txs enter). The executor's contract
     // is to be a pure-execution engine that trusts its caller has
-    // already gated on those policies. Sub-issue B of REVIEW.md ET-C4
-    // tracks wiring the missing sync-layer + mempool-layer check.
+    // already gated on those policies — the sync layer and the mempool
+    // run the ref_block / chain-id replay check before a tx reaches here.
 
     let Some(contract) = raw.contract.first() else {
         return TxResult {
