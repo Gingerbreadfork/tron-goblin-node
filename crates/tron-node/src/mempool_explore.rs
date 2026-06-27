@@ -815,6 +815,7 @@ mod tests {
             expiration_ms: 1_700_000_060_000,
             sender: Some([0x42; 21]),
             tx: usdt_pending_tx,
+            local: false,
         };
         let summary = decode_tx_summary(&pending.tx);
         st.observe_pending(&pending, &summary, 1_700_000_000_500);
@@ -834,6 +835,7 @@ mod tests {
             expiration_ms: 1_700_000_061_000,
             sender: Some([0x43; 21]),
             tx: swap_tx,
+            local: false,
         };
         let swap_summary = decode_tx_summary(&swap_pending.tx);
         st.observe_pending(&swap_pending, &swap_summary, 1_700_000_001_500);

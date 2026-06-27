@@ -1921,8 +1921,11 @@ impl SyncDriver {
     }
 
     /// Attach the transaction mempool. The sync loop subscribes to its
-    /// broadcast channel and, while connected to a peer, forwards
-    /// every newly-accepted tx as a `MessageType::Trx` frame.
+    /// broadcast channel and, while connected to a peer, advertises every
+    /// newly-accepted tx by id in an `Inventory{type=TRX}` frame; the peer
+    /// pulls the body via `FetchInvData`, which we answer with a
+    /// `Trxs` (TransactionsMessage) batch — the only tx-response framing a
+    /// java-tron peer routes (see `serve_tx_fetch_inv_data`).
     ///
     /// A peer may immediately reject our broadcast (with `Disconnect`
     /// or just by closing); we don't track per-peer acceptance — the
@@ -2759,6 +2762,14 @@ impl SyncDriver {
         // keep the connection "alive" every ~10s, so the 60s read-idle valve
         // never fires on a healthy-looking socket.
         let mut awaiting_inventory: Option<Instant> = None;
+        // When caught up to this peer (empty ChainInventory), defer the next
+        // SyncBlockChain re-poll until this instant. Re-polling at the tip every
+        // few seconds keeps the peer's `needSyncFromUs` set, which makes it drop
+        // our tx Inventory adverts (java InventoryMsgHandler.check) — so the tx
+        // never propagates. Follow the tip via inbound Inventory(BLOCK) adverts in
+        // the meantime; re-issue SyncBlockChain only as a stall safety. Matches
+        // java-tron stopping SyncBlockChain at remainNum==0.
+        let mut tip_repoll_after: Option<Instant> = None;
         // Per-peer in-flight cap (`p2p.sync_fetch_inflight_per_peer`, clamped
         // to [16,100] by the runtime). The most blocks this connection keeps
         // outstanding to its peer at once — the per-peer back-pressure that
@@ -3007,6 +3018,7 @@ impl SyncDriver {
                     rx,
                     mempool.as_ref(),
                     &peer_adv_receive,
+                    peer,
                 )
                 .await
                 {
@@ -3336,6 +3348,11 @@ impl SyncDriver {
                     // outstanding locator; aggregate locator volume over a sync
                     // is unchanged (one per window), just issued earlier.
                     && self.head_number() >= offered_max
+                    // Defer the tip re-poll so we don't re-arm the peer's
+                    // needSyncFromUs (which makes it drop our tx adverts); follow
+                    // via Inventory(BLOCK) adverts, re-poll only after the idle
+                    // window has elapsed (stall safety).
+                    && tip_repoll_after.map_or(true, |t| Instant::now() >= t)
                 {
                     Some(PendingAction::AskInventory)
                 } else {
@@ -3349,6 +3366,8 @@ impl SyncDriver {
                 && blocks_in_flight == 0
                 && prev_id.is_some()
                 && awaiting_inventory.is_none()
+                // Same tip-re-poll deferral as the refresh branch above.
+                && tip_repoll_after.map_or(true, |t| Instant::now() >= t)
             {
                 Some(PendingAction::AskInventory)
             } else {
@@ -3477,6 +3496,10 @@ impl SyncDriver {
                             // until this request's ChainInventory comes back
                             // (or the reply deadline above expires).
                             awaiting_inventory = Some(Instant::now());
+                            // The deferred tip re-poll just fired; the reply
+                            // decides the next state (empty -> re-arm the defer at
+                            // the throttle; non-empty -> bulk sync, stays cleared).
+                            tip_repoll_after = None;
                         }
                         PendingAction::FetchTx => {
                             // One bounded `FetchInvData{type=TRX}` frame
@@ -4011,7 +4034,13 @@ impl SyncDriver {
                             self.release_leadership(peer);
                             return PeerOutcome::CaughtUp;
                         }
-                        tokio::time::sleep(self.config.tail_interval).await;
+                        // Caught up to this peer. Don't block-sleep + re-poll
+                        // every tail_interval — that re-arms the peer's
+                        // needSyncFromUs and gets our tx adverts dropped. Defer
+                        // the next SyncBlockChain re-poll; new tip blocks arrive
+                        // via Inventory(BLOCK) adverts (the READ branch keeps
+                        // running) and our tx adverts are accepted in the meantime.
+                        tip_repoll_after = Some(Instant::now() + self.config.tail_interval * 4);
                     }
                 }
                 MessageType::Block => {
@@ -4331,6 +4360,7 @@ impl SyncDriver {
                         frame.payload,
                         self.mempool.as_deref(),
                         Some(&self.blocks_backend),
+                        peer,
                     )
                     .await
                     {
@@ -6390,6 +6420,7 @@ async fn drain_pending_tx_inventory<S>(
     rx: &mut broadcast::Receiver<[u8; 32]>,
     mempool: &TxMempool,
     adv_receive: &std::collections::HashSet<[u8; 32]>,
+    peer: &str,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -6447,6 +6478,17 @@ where
     }
     if to_advertise.is_empty() {
         return Ok(());
+    }
+    // Trace relay of locally-submitted (operator) transactions, per peer —
+    // lets an operator confirm their own broadcast is reaching the network.
+    for id in &to_advertise {
+        if id.len() == 32 {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(id);
+            if mempool.get(&h).map_or(false, |p| p.local) {
+                info!(tx = %hex::encode(id), peer = %peer, "advertised local transaction to peer");
+            }
+        }
     }
     let count = to_advertise.len();
     let payload = tron_proto::Inventory {
@@ -6561,6 +6603,7 @@ pub(crate) async fn serve_tx_fetch_inv_data<S>(
     payload: Bytes,
     mempool: Option<&TxMempool>,
     blocks: Option<&Arc<dyn KvBackend>>,
+    peer: &str,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -6603,6 +6646,21 @@ where
             }
             return Ok(());
         };
+        // java-tron's `FetchInvDataMsgHandler` answers a TRX `FetchInvData`
+        // with one or more `TransactionsMessage` (TRXS, 0x03) BATCHES — never a
+        // lone `TRX` (0x01) frame. A peer's inbound dispatch
+        // (`P2pEventHandlerImpl`) has a `case TRXS:` but NO `case TRX:`, so a
+        // bare 0x01 frame falls through to `default` →
+        // `P2pException(NO_SUCH_MESSAGE)` → the peer disconnects us and drops the
+        // tx WITHOUT pushing or re-broadcasting it. Serving individual `Trx`
+        // frames is therefore invisible to the network: peers fetch the body but
+        // never relay it onward (8 full relay peers pulled our tx, none
+        // re-broadcast). Mirror java exactly: accumulate the requested bodies and
+        // flush them as `Trxs` batches, size-capped at java's
+        // `FetchInvDataMsgHandler.MAX_SIZE` (1 MB of serialized tx).
+        const MAX_TRXS_BATCH_BYTES: usize = 1_000_000;
+        let mut batch: Vec<tron_proto::Transaction> = Vec::new();
+        let mut batch_bytes = 0usize;
         for raw in &inv.ids {
             if raw.len() != 32 {
                 not_found.push(raw.clone());
@@ -6612,18 +6670,41 @@ where
             h.copy_from_slice(raw);
             match mempool.get(&h) {
                 Some(pending) => {
-                    let body = pending.tx.encode_to_vec();
-                    if let Err(e) = conn
-                        .send_frame(Frame {
-                            ty: MessageType::Trx,
-                            payload: Bytes::from(body),
-                        })
-                        .await
-                    {
-                        return Err(format!("send Trx response: {e}"));
+                    if pending.local {
+                        info!(tx = %hex::encode(&h), peer = %peer, "served local transaction to fetching peer");
+                    }
+                    batch_bytes += pending.tx.encoded_len();
+                    batch.push(pending.tx);
+                    if batch_bytes > MAX_TRXS_BATCH_BYTES {
+                        let payload = tron_proto::Transactions {
+                            transactions: std::mem::take(&mut batch),
+                        }
+                        .encode_to_vec();
+                        if let Err(e) = conn
+                            .send_frame(Frame {
+                                ty: MessageType::Trxs,
+                                payload: Bytes::from(payload),
+                            })
+                            .await
+                        {
+                            return Err(format!("send Trxs response: {e}"));
+                        }
+                        batch_bytes = 0;
                     }
                 }
                 None => not_found.push(raw.clone()),
+            }
+        }
+        if !batch.is_empty() {
+            let payload = tron_proto::Transactions { transactions: batch }.encode_to_vec();
+            if let Err(e) = conn
+                .send_frame(Frame {
+                    ty: MessageType::Trxs,
+                    payload: Bytes::from(payload),
+                })
+                .await
+            {
+                return Err(format!("send Trxs response: {e}"));
             }
         }
     } else {
@@ -7352,7 +7433,7 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive)
+        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive, "test-peer")
             .await
             .expect("drain ok");
 
@@ -7381,7 +7462,7 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive)
+        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive, "test-peer")
             .await
             .expect("drain ok");
 
@@ -7402,7 +7483,7 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive)
+        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive, "test-peer")
             .await
             .expect("drain ok");
 
@@ -7428,7 +7509,7 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive)
+        drain_pending_tx_inventory(&mut us, &mut rx, &mempool, &adv_receive, "test-peer")
             .await
             .expect("drain ok");
         drop(us);
@@ -7506,7 +7587,7 @@ mod trx_inventory_tests {
     // ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn serve_responds_with_trx_for_each_known_hash() {
+    async fn serve_responds_with_trxs_batch_for_known_hashes() {
         use prost::Message as _;
         let mempool = TxMempool::new(MempoolConfig::default());
         let id1 = mempool.submit(&build_signed_transfer_bytes(31)).unwrap();
@@ -7526,18 +7607,23 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             Some(&mempool),
             None,
+            "test-peer",
         )
         .await
         .expect("serve ok");
 
-        // Expect two Trx frames back, in request order.
-        for &expected_id in &[id1, id2] {
-            let frame = peer.next_frame().await.unwrap().expect("frame");
-            assert_eq!(frame.ty, MessageType::Trx);
-            let tx = tron_proto::Transaction::decode(frame.payload).unwrap();
-            let raw = tx.raw_data.unwrap().encode_to_vec();
+        // Expect ONE Trxs (0x03) batch frame carrying both txs in request
+        // order — java-tron's FetchInvDataMsgHandler answers a TRX fetch with
+        // TransactionsMessage batches, and a peer's inbound dispatch has no
+        // `case TRX:` so a lone Trx (0x01) frame would be rejected.
+        let frame = peer.next_frame().await.unwrap().expect("frame");
+        assert_eq!(frame.ty, MessageType::Trxs);
+        let batch = tron_proto::Transactions::decode(frame.payload).unwrap();
+        assert_eq!(batch.transactions.len(), 2, "both txs in one batch");
+        for (tx, &expected_id) in batch.transactions.iter().zip(&[id1, id2]) {
+            let raw = tx.raw_data.as_ref().unwrap().encode_to_vec();
             let id = tron_crypto::hash::sha256(&raw);
-            assert_eq!(id, expected_id, "Trx body must match requested hash");
+            assert_eq!(id, expected_id, "batched tx body must match requested hash");
         }
     }
 
@@ -7562,13 +7648,16 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             Some(&mempool),
             None,
+            "test-peer",
         )
         .await
         .expect("serve ok");
 
-        // First: Trx for known.
+        // First: a Trxs batch carrying the known tx.
         let f1 = peer.next_frame().await.unwrap().expect("frame");
-        assert_eq!(f1.ty, MessageType::Trx);
+        assert_eq!(f1.ty, MessageType::Trxs);
+        let batch = tron_proto::Transactions::decode(f1.payload).unwrap();
+        assert_eq!(batch.transactions.len(), 1);
         // Then: ItemNotFound for unknown.
         let f2 = peer.next_frame().await.unwrap().expect("frame");
         assert_eq!(f2.ty, MessageType::ItemNotFound);
@@ -7615,6 +7704,7 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             None,
             Some(&backend),
+            "test-peer",
         )
         .await
         .expect("serve ok");
@@ -7645,6 +7735,7 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             None,
             Some(&backend),
+            "test-peer",
         )
         .await
         .expect("serve ok");
@@ -7748,6 +7839,7 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             Some(&mempool),
             None,
+            "test-peer",
         )
         .await
         .expect("serve ok");
@@ -7774,7 +7866,7 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        serve_tx_fetch_inv_data(&mut us, Bytes::from(req.encode_to_vec()), None, None)
+        serve_tx_fetch_inv_data(&mut us, Bytes::from(req.encode_to_vec()), None, None, "test-peer")
             .await
             .expect("serve ok");
 
@@ -7802,6 +7894,7 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             Some(&mempool),
             None,
+            "test-peer",
         )
         .await
         .expect("serve ok");
@@ -7935,6 +8028,7 @@ mod trx_inventory_tests {
             Bytes::from(req.encode_to_vec()),
             Some(&mempool),
             None,
+            "test-peer",
         )
         .await
         .expect("serve ok");

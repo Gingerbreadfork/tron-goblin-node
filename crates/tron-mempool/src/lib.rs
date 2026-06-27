@@ -206,6 +206,9 @@ pub struct PendingTx {
     /// Primary signer (first recovered signer) of this tx, used to key
     /// the per-sender cap. `None` only if no signer could be determined.
     pub sender: Option<[u8; 21]>,
+    /// True if submitted locally (operator RPC/gRPC) rather than relayed from
+    /// a peer — used to trace our own broadcasts through the relay path.
+    pub local: bool,
 }
 
 pub struct TxMempool {
@@ -485,6 +488,7 @@ impl TxMempool {
             received_at_ms: now_ms,
             expiration_ms,
             sender,
+            local: is_local,
         };
         inner.pending.insert(tx_id, pending);
         drop(inner);

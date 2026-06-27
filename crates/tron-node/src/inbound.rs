@@ -392,6 +392,7 @@ where
                     frame.payload,
                     server.mempool.as_deref(),
                     Some(&server.blocks),
+                    peer_addr,
                 )
                 .await?;
                 server.note_served();
