@@ -95,6 +95,22 @@ operator-visible keys are:
 - `pipelined_apply`: overlaps commit/fsync work with the next block during bulk
   sync without changing committed write order.
 
+### `[mempool]`
+
+Transaction pending-pool sizing. These are **local resource limits, not
+consensus parameters** — they can differ from java-tron without affecting
+replay. Defaults match java-tron's `node.*` values.
+
+- `max_transaction_pending_size` (alias `maxTransactionPendingSize`, default
+  `2000`): cap on pending transactions. Peer-relayed txs are held below this;
+  operator (local RPC/gRPC) submissions reserve headroom so the node can always
+  broadcast its own transactions even under a peer-tx flood.
+- `pending_transaction_timeout_ms` (alias `pendingTransactionTimeout`, default
+  `60000`): how long a tx may wait in the pool before it is aged out,
+  independent of its own expiration (mirrors java-tron's `PendingManager`). A
+  running sweep drops entries older than this so the pool keeps churning and the
+  cap can never latch. `0` disables age-out (per-tx expiration only).
+
 ### `[index]`
 
 Enables built-in address history, event search, archive state deltas, and

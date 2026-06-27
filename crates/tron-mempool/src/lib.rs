@@ -11,8 +11,12 @@
 //!   matching java-tron's `Manager.validateCommon`.
 //! * Dedups by `tx_id = sha256(raw_data.encode())`.
 //! * Caps total pending at `max_size` (default 2000, matching java-tron's
-//!   `Manager.MAX_TRANSACTION_PENDING`); evicts the oldest-expired
-//!   first, falls back to oldest-received.
+//!   `Manager.MAX_TRANSACTION_PENDING`). A full pool hard-rejects
+//!   (java-tron's `isTooManyPending` -> `SERVER_BUSY`) — it does NOT
+//!   evict live txs to make room. A running age-out sweep
+//!   (`pending_timeout_ms`, java's `PendingManager`) keeps the pool
+//!   churning so the cap stays transient, and operator submits may use
+//!   a reserved slice (`local_reserved`) peer relay cannot touch.
 //! * Pushes accepted `tx_id`s onto a tokio `broadcast` channel so the
 //!   sync driver (or any other subscriber) can fan out to peers.
 //!
@@ -66,6 +70,31 @@ pub struct MempoolConfig {
     /// Admitting a tx beyond this would relay it to peers that all reject it
     /// on receive, so the same ceiling is enforced at admission.
     pub max_future_expiration_ms: i64,
+    /// How long (ms) a tx may wait in the pool before it is aged out,
+    /// independent of its own `expiration`. Mirrors java-tron's
+    /// `node.pendingTransactionTimeout` (`PendingManager`, default 60s):
+    /// java clears `pendingTransactions` every block and only re-queues
+    /// entries younger than this. A running sweep (driven by the node)
+    /// applies the same age-out here so the pool churns and the cap can
+    /// never latch. `0` disables age-out (per-tx expiration only).
+    pub pending_timeout_ms: i64,
+    /// Slots within `max_size` reserved for locally-submitted (operator
+    /// RPC/gRPC) txs. Peer-relayed submits are capped at
+    /// `max_size - local_reserved`; local submits may use the full
+    /// `max_size`. java keeps `pendingTransactions` tiny via a per-block
+    /// clear, so its single cap-check (local path only) rarely fires; we
+    /// keep a persistent pool, so this reservation gives the operator the
+    /// same "always able to broadcast" guarantee under a peer-tx flood.
+    pub local_reserved: usize,
+    /// How long (ms) a recently-included tx_id is remembered so an
+    /// already-mined tx that a peer re-advertises (or a client re-submits)
+    /// is not re-admitted and re-relayed. Mirrors java-tron's
+    /// `transactionIdCache` (`expireAfterWrite(1h)`).
+    pub recently_included_ttl_ms: i64,
+    /// Hard cap on the recent-inclusion set; the oldest entries are dropped
+    /// past this. Mirrors java-tron's `Manager.TX_ID_CACHE_SIZE` (100k),
+    /// bounding memory on a busy chain where the TTL alone would retain more.
+    pub recently_included_max: usize,
 }
 
 /// java-tron `Constant.MAXIMUM_TIME_UNTIL_EXPIRATION` — one day, in
@@ -82,6 +111,10 @@ impl Default for MempoolConfig {
             max_bytes: 128 * 1024 * 1024,
             per_sender_cap: 256,
             max_future_expiration_ms: MAXIMUM_TIME_UNTIL_EXPIRATION_MS,
+            pending_timeout_ms: 60_000,
+            local_reserved: 256,
+            recently_included_ttl_ms: 60 * 60 * 1_000,
+            recently_included_max: 100_000,
         }
     }
 }
@@ -107,6 +140,8 @@ pub enum MempoolError {
     BadSignature(String),
     #[error("duplicate tx_id (already in mempool)")]
     Duplicate,
+    #[error("transaction was recently included in a block")]
+    AlreadyIncluded,
     #[error("mempool full ({size} / {max})")]
     Full { size: usize, max: usize },
     #[error("transaction too large ({size} bytes > {max})")]
@@ -136,6 +171,7 @@ impl MempoolError {
             MempoolError::ExpirationTooFar { .. } => "expiration_too_far",
             MempoolError::BadSignature(_) => "bad_signature",
             MempoolError::Duplicate => "duplicate",
+            MempoolError::AlreadyIncluded => "already_included",
             MempoolError::Full { .. } => "full",
             MempoolError::TxTooLarge { .. } => "tx_too_large",
             MempoolError::BytesFull { .. } => "bytes_full",
@@ -193,6 +229,13 @@ pub struct TxMempool {
 
 struct Inner {
     pending: HashMap<[u8; 32], PendingTx>,
+    /// Recently-included tx_ids → expiry_ms. java `transactionIdCache`:
+    /// remembers mined txs so a re-advertised/re-submitted already-included
+    /// tx isn't re-admitted. Checked prune-on-read; TTL/size-bounded by the
+    /// sweep + the FIFO order queue below.
+    recently_included: HashMap<[u8; 32], i64>,
+    /// FIFO insertion order over `recently_included`, for size-cap eviction.
+    recently_included_order: std::collections::VecDeque<[u8; 32]>,
 }
 
 impl TxMempool {
@@ -201,6 +244,8 @@ impl TxMempool {
         Self {
             inner: Mutex::new(Inner {
                 pending: HashMap::new(),
+                recently_included: HashMap::new(),
+                recently_included_order: std::collections::VecDeque::new(),
             }),
             broadcast: tx,
             config,
@@ -244,14 +289,29 @@ impl TxMempool {
         self.broadcast.subscribe()
     }
 
-    /// Submit raw protobuf-encoded transaction bytes.
+    /// Submit a peer-relayed transaction (the P2P relay path).
     ///
-    /// Returns the canonical `tx_id` on success. Side effects: inserts
-    /// into the pending map; bumps the broadcast channel. The
-    /// expiration eviction sweeper runs first so a full mempool with
-    /// expired entries doesn't reject new txs.
+    /// Capped at `max_size - local_reserved` so operator submissions
+    /// always retain headroom. Returns the canonical `tx_id` on success.
+    /// Side effects: inserts into the pending map; bumps the broadcast
+    /// channel. The age-out/expiration sweep runs first so a stale-but-
+    /// full pool doesn't reject a fresh tx.
     pub fn submit(&self, raw: &[u8]) -> Result<[u8; 32], MempoolError> {
-        let result = self.submit_inner(raw);
+        self.submit_metered(raw, false)
+    }
+
+    /// Submit a locally-originated transaction (operator RPC/gRPC path).
+    ///
+    /// Like [`Self::submit`] but may use the full `max_size`, including
+    /// the `local_reserved` slice peer relay cannot — so the node's own
+    /// broadcasts are never starved by a peer-tx flood. Mirrors java-tron,
+    /// where only the local `broadcastTransaction` path is cap-checked.
+    pub fn submit_local(&self, raw: &[u8]) -> Result<[u8; 32], MempoolError> {
+        self.submit_metered(raw, true)
+    }
+
+    fn submit_metered(&self, raw: &[u8], is_local: bool) -> Result<[u8; 32], MempoolError> {
+        let result = self.submit_inner(raw, is_local);
         if let Some(m) = &self.metrics {
             match &result {
                 Ok(_) => {
@@ -269,7 +329,7 @@ impl TxMempool {
     /// Inner submit body. Wrapped by [`submit`] so every exit path
     /// runs through one metrics accounting site (instead of sprinkling
     /// counter bumps into every `return Err(...)`).
-    fn submit_inner(&self, raw: &[u8]) -> Result<[u8; 32], MempoolError> {
+    fn submit_inner(&self, raw: &[u8], is_local: bool) -> Result<[u8; 32], MempoolError> {
         let now_ms = now_ms();
 
         // Reject oversized txs before the (more expensive) decode. Bounds
@@ -335,8 +395,18 @@ impl TxMempool {
         // A racing submitter could insert the same tx_id between this
         // check and the final insertion below; the lock at insertion
         // catches it with a second check.
-        if self.inner.lock().unwrap().pending.contains_key(&tx_id) {
-            return Err(MempoolError::Duplicate);
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.pending.contains_key(&tx_id) {
+                return Err(MempoolError::Duplicate);
+            }
+            // Already mined recently? Don't re-admit/re-relay it (java
+            // `transactionIdCache`). Prune-on-read: ignore stale records.
+            if let Some(&expiry) = inner.recently_included.get(&tx_id) {
+                if now_ms < expiry {
+                    return Err(MempoolError::AlreadyIncluded);
+                }
+            }
         }
 
         // State-aware validation (opt-in). Runs the actuator dispatch
@@ -356,14 +426,31 @@ impl TxMempool {
         if inner.pending.contains_key(&tx_id) {
             return Err(MempoolError::Duplicate);
         }
+        if let Some(&expiry) = inner.recently_included.get(&tx_id) {
+            if now_ms < expiry {
+                return Err(MempoolError::AlreadyIncluded);
+            }
+        }
 
-        // Evict expired before checking the cap, so a steady stream
-        // of new txs naturally rolls out the old ones.
-        Self::evict_expired_inner(&mut inner, now_ms);
-        if inner.pending.len() >= self.config.max_size {
+        // Age out expired / timed-out txs before the cap check, so a
+        // steady stream of fresh txs (and the running sweep) keep the
+        // pool churning instead of latching at the cap.
+        Self::evict_expired_inner(&mut inner, now_ms, self.config.pending_timeout_ms);
+        // Peer relay is held below `max_size - local_reserved`; operator
+        // (local) submits may use the full `max_size`. java-tron checks
+        // its cap only on the local path and never make-room-evicts, so a
+        // full pool is a transient hard reject (its `SERVER_BUSY`).
+        let cap = if is_local {
+            self.config.max_size
+        } else {
+            self.config.max_size.saturating_sub(self.config.local_reserved)
+        };
+        // Strictly-greater, matching java-tron `Manager.isTooManyPending`
+        // (`size > maxTransactionPendingSize`) — the pool admits up to `cap`.
+        if inner.pending.len() > cap {
             return Err(MempoolError::Full {
                 size: inner.pending.len(),
-                max: self.config.max_size,
+                max: cap,
             });
         }
 
@@ -440,7 +527,28 @@ impl TxMempool {
     /// after a tx gets included in a produced block — otherwise the
     /// same tx would get re-broadcast on every block.
     pub fn remove(&self, tx_id: &[u8; 32]) -> bool {
-        let removed = self.inner.lock().unwrap().pending.remove(tx_id).is_some();
+        let now = now_ms();
+        let removed = {
+            let mut inner = self.inner.lock().unwrap();
+            let removed = inner.pending.remove(tx_id).is_some();
+            // Mark as recently-included regardless of whether it was resident,
+            // so a re-advertised mined tx we never held still isn't admitted +
+            // re-relayed (java `transactionIdCache`).
+            let expiry = now + self.config.recently_included_ttl_ms;
+            if inner.recently_included.insert(*tx_id, expiry).is_none() {
+                inner.recently_included_order.push_back(*tx_id);
+            }
+            let max = self.config.recently_included_max;
+            while inner.recently_included.len() > max {
+                match inner.recently_included_order.pop_front() {
+                    Some(old) => {
+                        inner.recently_included.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+            removed
+        };
         if removed {
             if let Some(p) = &self.persistence {
                 if let Err(e) = p.delete(tx_id) {
@@ -454,12 +562,33 @@ impl TxMempool {
         removed
     }
 
-    /// Remove every tx whose `expiration_ms` is `<= now_ms`. Returns
-    /// the number evicted. Can be called externally by a periodic
-    /// sweeper task; `submit` also runs it implicitly.
+    /// Forget a recent-inclusion record so the tx can be re-admitted. Called
+    /// on reorg for txs from reverted (now non-canonical) blocks — they are
+    /// no longer included and must be eligible for the winning fork.
+    pub fn forget_included(&self, tx_id: &[u8; 32]) {
+        // Drop from the lookup map; the order-queue entry is trimmed lazily by
+        // the sweep (a tombstone pointing at an absent key is a no-op).
+        self.inner.lock().unwrap().recently_included.remove(tx_id);
+    }
+
+    /// Remove every tx that is expired (`expiration_ms <= now_ms`) or has
+    /// waited longer than `pending_timeout_ms` (received-age, java's
+    /// `PendingManager` sweep). Returns the number evicted. The node
+    /// drives this on a timer so the pool churns; `submit` also runs it
+    /// implicitly before the cap check.
     pub fn evict_expired(&self, now_ms: i64) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        let evicted_ids = Self::evict_expired_inner(&mut inner, now_ms);
+        let evicted_ids =
+            Self::evict_expired_inner(&mut inner, now_ms, self.config.pending_timeout_ms);
+        // Prune expired recent-inclusion records + trim the stale order-queue
+        // front so neither the map nor the queue grows without bound.
+        inner.recently_included.retain(|_, &mut e| e > now_ms);
+        while let Some(front) = inner.recently_included_order.front().copied() {
+            if inner.recently_included.contains_key(&front) {
+                break;
+            }
+            inner.recently_included_order.pop_front();
+        }
         let n = evicted_ids.len();
         drop(inner);
         if let Some(p) = &self.persistence {
@@ -478,10 +607,20 @@ impl TxMempool {
         n
     }
 
-    fn evict_expired_inner(inner: &mut Inner, now_ms: i64) -> Vec<[u8; 32]> {
+    fn evict_expired_inner(
+        inner: &mut Inner,
+        now_ms: i64,
+        pending_timeout_ms: i64,
+    ) -> Vec<[u8; 32]> {
         let mut to_remove: Vec<[u8; 32]> = Vec::new();
         for (id, p) in inner.pending.iter() {
-            if p.expiration_ms > 0 && p.expiration_ms <= now_ms {
+            // Per-tx expiration (java `Manager.validateCommon`)...
+            let expired = p.expiration_ms > 0 && p.expiration_ms <= now_ms;
+            // ...or received-age past the pending timeout (java
+            // `PendingManager`, default 60s), independent of expiration.
+            let timed_out = pending_timeout_ms > 0
+                && now_ms.saturating_sub(p.received_at_ms) > pending_timeout_ms;
+            if expired || timed_out {
                 to_remove.push(*id);
             }
         }
@@ -523,7 +662,9 @@ impl TxMempool {
         };
         stats.scanned = entries.len();
         for (key, raw) in entries {
-            match self.submit(&raw) {
+            // Boot-restore of our own previously-accepted txs — the operator
+            // (uncapped/full-cap) path, not the peer cap.
+            match self.submit_local(&raw) {
                 Ok(_) => stats.restored += 1,
                 Err(MempoolError::Duplicate) => {
                     // Already in pending (e.g. second call to reload).
@@ -577,7 +718,7 @@ pub struct ReloadStats {
 
 impl Mempool for TxMempool {
     fn submit_tron(&self, raw: &[u8]) -> SubmitOutcome {
-        match self.submit(raw) {
+        match self.submit_local(raw) {
             Ok(id) => SubmitOutcome::Accepted(id),
             Err(e) => SubmitOutcome::Rejected(e.to_string()),
         }
@@ -601,7 +742,10 @@ impl Mempool for TxMempool {
     }
 }
 
-fn now_ms() -> i64 {
+/// Wall-clock milliseconds since the Unix epoch — the reference clock
+/// for expiration/age-out. Public so the node's sweeper task can pass a
+/// consistent `now` into [`TxMempool::evict_expired`].
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -736,18 +880,85 @@ mod tests {
     }
 
     #[test]
-    fn submit_full_rejected_after_eviction() {
+    fn submit_full_hard_rejected_at_cap() {
         let m = TxMempool::new(MempoolConfig {
             max_size: 2,
             broadcast_buffer: 8,
+            local_reserved: 0,
             ..MempoolConfig::default()
         });
-        // Fill with distinct amounts so distinct tx_ids.
-        for amount in [1i64, 2] {
+        // java's strictly-greater cap (`size > max_size`) admits up to and
+        // including max_size + 1 pending; with max_size=2 the 4th is rejected.
+        for amount in [1i64, 2, 3] {
             m.submit(&signed_tx(amount, 60_000)).unwrap();
         }
-        let err = m.submit(&signed_tx(3, 60_000)).unwrap_err();
+        let err = m.submit(&signed_tx(4, 60_000)).unwrap_err();
         assert!(matches!(err, MempoolError::Full { .. }));
+    }
+
+    #[test]
+    fn evict_expired_ages_out_timed_out_but_unexpired_txs() {
+        // A tx whose per-tx `expiration` is far in the future is still
+        // aged out once it has waited longer than `pending_timeout_ms`
+        // (java-tron's PendingManager 60s sweep). This is the churn that
+        // keeps the pool from latching at the cap.
+        let m = TxMempool::new(MempoolConfig {
+            pending_timeout_ms: 60_000,
+            ..MempoolConfig::default()
+        });
+        // expiration ~1h out, so it is NOT expiration-expired.
+        m.submit(&signed_tx(1, 3_600_000)).unwrap();
+        assert_eq!(m.pending_count(), 1);
+        // Not yet timed out at +30s.
+        assert_eq!(m.evict_expired(now_ms() + 30_000), 0);
+        assert_eq!(m.pending_count(), 1);
+        // Timed out at +61s (> 60s received-age) even though unexpired.
+        assert_eq!(m.evict_expired(now_ms() + 61_000), 1);
+        assert_eq!(m.pending_count(), 0);
+    }
+
+    #[test]
+    fn local_submit_uses_reserved_slice_when_peers_fill_pool() {
+        // Peers can fill only `max_size - local_reserved` (= 1); the
+        // operator's own (local) submit may still use the reserved slot.
+        let m = TxMempool::new(MempoolConfig {
+            max_size: 2,
+            local_reserved: 1,
+            ..MempoolConfig::default()
+        });
+        // peer cap = max_size - local_reserved = 1; strictly-greater admits
+        // up to len 2 (peers fill the pool to max_size).
+        m.submit(&signed_tx(1, 60_000)).unwrap();
+        m.submit(&signed_tx(2, 60_000)).unwrap();
+        // A further peer tx is rejected — peers can't touch the reserve.
+        let err = m.submit(&signed_tx(3, 60_000)).unwrap_err();
+        assert!(matches!(err, MempoolError::Full { .. }), "got {err:?}");
+        // The operator still gets in, using the reserved slot (full cap).
+        m.submit_local(&signed_tx(4, 60_000)).unwrap();
+        assert_eq!(m.pending_count(), 3);
+        // Now even local is full at the absolute cap.
+        let err = m.submit_local(&signed_tx(5, 60_000)).unwrap_err();
+        assert!(matches!(err, MempoolError::Full { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn recently_included_tx_not_readmitted() {
+        let m = TxMempool::new(MempoolConfig::default());
+        let bytes = signed_tx(1, 60_000);
+        let id = m.submit(&bytes).unwrap();
+        // "mine" it: remove() (the block-apply path) records a recent inclusion.
+        assert!(m.remove(&id));
+        assert_eq!(m.pending_count(), 0);
+        // The same now-mined tx, re-advertised/re-submitted, is rejected — not
+        // re-admitted into the pool (java transactionIdCache behaviour).
+        let err = m.submit(&bytes).unwrap_err();
+        assert!(matches!(err, MempoolError::AlreadyIncluded), "got {err:?}");
+        assert_eq!(m.pending_count(), 0);
+        // On a reorg, forget_included clears the record so the reverted tx can
+        // be re-admitted to the pool for the winning fork.
+        m.forget_included(&id);
+        m.submit(&bytes).unwrap();
+        assert_eq!(m.pending_count(), 1);
     }
 
     #[test]

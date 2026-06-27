@@ -203,6 +203,17 @@ disabled = false
 
 
 # -----------------------------------------------------------------------------
+# [mempool] — transaction pending-pool sizing (local resource limits, NOT
+# consensus). Defaults match java-tron's node.* values.
+# -----------------------------------------------------------------------------
+[mempool]
+max_transaction_pending_size = 2000    # java node.maxTransactionPendingSize; peer relay held below
+                                       # this, operator submits reserve headroom above it
+pending_transaction_timeout_ms = 60000 # java node.pendingTransactionTimeout; a running sweep ages
+                                       # out txs older than this so the pool can't latch at the cap
+
+
+# -----------------------------------------------------------------------------
 # [witness] — Super Representative block production (OPTIONAL)
 # -----------------------------------------------------------------------------
 # Uncomment to run as a block producer. Without this section the node is

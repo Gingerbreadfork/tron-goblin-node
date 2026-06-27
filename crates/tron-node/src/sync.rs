@@ -5414,13 +5414,18 @@ impl SyncDriver {
                 mempool.remove(&id);
             }
         }
+        // Age out stale/expired pending txs on every applied block (java runs
+        // PendingManager per block); complements the 5s sampler sweep.
+        mempool.evict_expired(tron_mempool::now_ms());
     }
 
     /// Push every transaction from the reorged-out blocks back into
     /// the mempool. Mirrors java-tron's `Manager.popTransactions` +
     /// `rePushLoop`: txs that were on the abandoned fork are
-    /// re-validated against the post-reorg state via the standard
-    /// `submit_tron` path. Failures (expired, conflicting with a tx on
+    /// re-validated against the post-reorg state via the operator
+    /// (`submit_local`) path — uncapped like java-tron's `pushTransaction`
+    /// (its rePush is not cap-checked), so a peer-full pool can't drop
+    /// valid reorged-out txs. Failures (expired, conflicting with a tx on
     /// the new fork, signer balance dropped below fee, etc.) are
     /// silently dropped — matching java-tron's behaviour where
     /// `pushTransaction` exceptions inside `rePushLoop` are logged
@@ -5444,8 +5449,14 @@ impl SyncDriver {
             block_count += 1;
             for tx in &kb.block.transactions {
                 total += 1;
+                // The reverted block is no longer canonical: forget its
+                // recent-inclusion record so these txs can be re-admitted.
+                if let Some(rd) = tx.raw_data.as_ref() {
+                    let id = tron_crypto::hash::sha256(&rd.encode_to_vec());
+                    mempool.forget_included(&id);
+                }
                 let raw = tx.encode_to_vec();
-                match mempool.submit(&raw) {
+                match mempool.submit_local(&raw) {
                     Ok(_) => accepted += 1,
                     Err(MempoolError::Duplicate) => {
                         // Already in pending — fine; the next block
@@ -6371,9 +6382,9 @@ fn log_inbound_tx_outcome(outcome: &Result<[u8; 32], MempoolError>) {
 /// Filters against `adv_receive` so we don't echo a hash back to the
 /// peer that just told us about it (matches java-tron's
 /// `peer.getAdvInvReceive() == null` check). Non-blocking via
-/// `try_recv`. Lagged broadcasts are reported and skipped — the
-/// next-peer rotation will pick up the dropped notifications via the
-/// mempool's pending map.
+/// `try_recv`. On a lagged receiver it re-advertises the full resident
+/// pending set, so no accepted tx (including our own local submissions)
+/// is silently dropped from relay.
 async fn drain_pending_tx_inventory<S>(
     conn: &mut PeerConnection<S>,
     rx: &mut broadcast::Receiver<[u8; 32]>,
@@ -6385,6 +6396,7 @@ where
 {
     use prost::Message as _;
     let mut to_advertise: Vec<Vec<u8>> = Vec::new();
+    let mut lagged = false;
     loop {
         match rx.try_recv() {
             Ok(tx_id) => {
@@ -6405,13 +6417,32 @@ where
             }
             Err(broadcast::error::TryRecvError::Empty) => break,
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                warn!(
-                    dropped = n,
-                    "mempool broadcast channel lagged; some tx adv notifications lost"
-                );
+                // The channel overflowed and this receiver skipped `n` tx_ids.
+                // Don't lose them: flag a self-heal pass below that re-advertises
+                // the full resident pending set, so no accepted tx — including
+                // our own local submissions — is ever silently dropped from relay.
+                warn!(dropped = n, "mempool broadcast channel lagged; self-healing from pending set");
+                lagged = true;
                 continue;
             }
             Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    // Self-heal a lagged receiver: re-advertise resident pending txs the peer
+    // hasn't already told us about, deduped against what we already queued.
+    // Capped per drain so a pathologically-large pool can't overflow one
+    // Inventory frame; any remainder re-advertises on subsequent drains.
+    if lagged {
+        const SELF_HEAL_ADV_CAP: usize = 4096;
+        let seen: std::collections::HashSet<Vec<u8>> = to_advertise.iter().cloned().collect();
+        for id in mempool.pending_ids() {
+            if to_advertise.len() >= SELF_HEAL_ADV_CAP {
+                break;
+            }
+            if adv_receive.contains(&id) || seen.contains(&id.to_vec()) {
+                continue;
+            }
+            to_advertise.push(id.to_vec());
         }
     }
     if to_advertise.is_empty() {

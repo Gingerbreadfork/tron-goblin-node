@@ -454,7 +454,34 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
     // account state to validate against and the validator would reject
     // every inbound tx. Skip it in that mode so the dashboard observes
     // the raw pending stream; never skip it for a normal node.
-    let mut mempool = tron_mempool::TxMempool::new(tron_mempool::MempoolConfig::default())
+    // Mempool sizing from `[mempool]` (java-tron node.maxTransactionPendingSize
+    // / node.pendingTransactionTimeout). Local resource limits, not consensus.
+    // Clamp defensively so a small/misconfigured cap can't lock peer relay out
+    // (peer cap = max_size - local_reserved): keep max_size >= 1 and reserve at
+    // most half the pool for operator submits.
+    let mp_defaults = tron_mempool::MempoolConfig::default();
+    let max_size = config.mempool.max_transaction_pending_size.max(1);
+    let local_reserved = mp_defaults.local_reserved.min(max_size / 2);
+    let pending_timeout_ms = config.mempool.pending_transaction_timeout_ms.max(0);
+    if config.mempool.max_transaction_pending_size < 1 {
+        tracing::warn!("[mempool] max_transaction_pending_size < 1; clamped to 1");
+    }
+    if pending_timeout_ms == 0 {
+        tracing::warn!(
+            "[mempool] pending_transaction_timeout_ms = 0 disables tx age-out; the pool then relies on per-tx expiration + block-apply drain only"
+        );
+    }
+    let mempool_cfg = tron_mempool::MempoolConfig {
+        max_size,
+        local_reserved,
+        pending_timeout_ms,
+        // Relay-notification channel sized to hold a full pool's worth of tx_ids
+        // so normal churn can't lap it and silently drop advertisements; a lagging
+        // peer drain additionally self-heals from the pending set (see sync.rs).
+        broadcast_buffer: max_size.saturating_mul(4).max(8192),
+        ..mp_defaults
+    };
+    let mut mempool = tron_mempool::TxMempool::new(mempool_cfg)
         .with_persistence(stores.mempool.clone())
         .with_metrics(metrics.clone());
     if !config.p2p.mempool {
@@ -558,6 +585,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 if let Ok(all) = ws.all() {
                     m.set_total_witnesses(all.len() as i64);
                 }
+                // Age out expired / timed-out pending txs (java-tron runs
+                // PendingManager every block; a 5s tick approximates it) so
+                // the pool churns and the cap can't latch.
+                mp_for_sampler.evict_expired(tron_mempool::now_ms());
                 m.set_mempool_size(mp_for_sampler.pending_count() as i64);
             }
         }));

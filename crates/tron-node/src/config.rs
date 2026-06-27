@@ -114,6 +114,55 @@ pub struct NodeConfig {
     /// delete it any time, the node rebuilds it.
     #[serde(default)]
     pub index: IndexConfig,
+
+    /// Transaction-mempool sizing (`[mempool]`). Mirrors java-tron's
+    /// `node.maxTransactionPendingSize` / `node.pendingTransactionTimeout`
+    /// — both local resource limits, not consensus parameters.
+    #[serde(default)]
+    pub mempool: MempoolSettings,
+}
+
+/// `[mempool]` — transaction pending-pool sizing. Local resource limits
+/// (memory / relay back-pressure), NOT consensus parameters, so they may
+/// differ from java-tron without affecting replay. Defaults match
+/// java-tron's `node.*` values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolSettings {
+    /// Max pending transactions. java-tron `node.maxTransactionPendingSize`
+    /// (default 2000). Operator (local RPC) submissions reserve headroom
+    /// within this; peer relay is held below it.
+    #[serde(
+        default = "default_max_transaction_pending_size",
+        alias = "maxTransactionPendingSize"
+    )]
+    pub max_transaction_pending_size: usize,
+    /// Age-out window (ms): how long a tx may wait before being swept,
+    /// independent of its own expiration. java-tron
+    /// `node.pendingTransactionTimeout` (default 60000). A running sweep
+    /// drops entries older than this so the pool churns and the cap can
+    /// never latch.
+    #[serde(
+        default = "default_pending_transaction_timeout_ms",
+        alias = "pendingTransactionTimeout"
+    )]
+    pub pending_transaction_timeout_ms: i64,
+}
+
+impl Default for MempoolSettings {
+    fn default() -> Self {
+        Self {
+            max_transaction_pending_size: default_max_transaction_pending_size(),
+            pending_transaction_timeout_ms: default_pending_transaction_timeout_ms(),
+        }
+    }
+}
+
+fn default_max_transaction_pending_size() -> usize {
+    2000
+}
+
+fn default_pending_transaction_timeout_ms() -> i64 {
+    60_000
 }
 
 /// Per-store RocksDB tuning. The defaults mirror java-tron's
@@ -1211,6 +1260,7 @@ impl Default for NodeConfig {
             local_witness: LocalWitnessConfig::default(),
             committee: CommitteeConfig::default(),
             index: IndexConfig::default(),
+            mempool: MempoolSettings::default(),
         }
     }
 }
