@@ -89,7 +89,42 @@ Use `--mode copy` by default. `--mode move` is faster on the same filesystem but
 consumes the source. `--mode symlink` is instant but ties the destination to the
 source path.
 
-Important: snapshots must be RocksDB. LevelDB snapshots are not supported.
+Important: `import-snapshot` expects a **RocksDB** snapshot — this node has no
+LevelDB backend. To use a java-tron **LevelDB** snapshot (the older
+`db.engine = LEVELDB`, and the only engine many full-history archive snapshots
+ship in), convert it first with the standalone `tron-snapshot-convert` tool
+(below).
+
+### Convert a LevelDB snapshot
+
+`tron-snapshot-convert` is a separate binary (built with the workspace, kept out
+of the `tron-node` binary so its LevelDB reader never ships in the node). It
+rewrites each java-tron LevelDB store into this node's RocksDB format and
+**deletes each source store as it finishes**, so peak disk stays near 1× rather
+than needing room for both copies at once.
+
+```sh
+# from an on-disk LevelDB snapshot directory (per-store sub-dirs); each source
+# store is removed as it converts (pass --keep-source to keep them)
+./target/release/tron-snapshot-convert \
+  --from ./java-tron-leveldb-snapshot \
+  --data-dir ./mainnet-data
+
+# or stream a download straight in — the full (multi-TB) source never lands on disk
+curl -s <snapshot-url> | ./target/release/tron-snapshot-convert \
+  --stream --gzip --data-dir ./mainnet-data
+```
+
+- The conversion is a byte-faithful key-by-key copy, so a converted snapshot
+  runs identically to the original. Each store is integrity-checked (key count
+  + key/value byte sums) before its source is removed, and the run is crash-safe
+  and resumable — a completed store carries a done-marker and is skipped on a
+  re-run.
+- Output is **Snappy** by default, which `tron-node` reads natively. `--zstd` is
+  ~30% smaller but only readable by a `tron-node` built with Zstd support, so it
+  is opt-in.
+- Deletion is per-store (a LevelDB store can't be safely pruned mid-read); the
+  `block` store is the single-largest disk high-water mark.
 
 Copy from a running java-tron primary using RocksDB secondary opens:
 

@@ -53,7 +53,8 @@ inline `key_hex` outside throwaway development environments.
 
 ## Snapshot and Backup Safety
 
-- Use RocksDB snapshots only; LevelDB snapshots are unsupported.
+- `import-snapshot` takes RocksDB snapshots only; convert a java-tron LevelDB
+  snapshot to RocksDB first with `tron-snapshot-convert`.
 - Stop the source node before ordinary filesystem copies.
 - Use `import-live` when copying from a running RocksDB primary.
 - Run `verify-snapshot` after manual copies or restored backups.

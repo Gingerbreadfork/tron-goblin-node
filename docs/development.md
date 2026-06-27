@@ -50,6 +50,10 @@ cargo test -p tron-node sync
 - `tron-eventer`: java-tron logsfilter-compatible event emission.
 - `tron-wallet`: key, keystore, mnemonic, signing, broadcast CLI.
 - `tron-state-diff`: RPC-level state parity verifier against java-tron.
+- `tron-snapshot-convert`: standalone binary converting a java-tron LevelDB
+  snapshot into this node's RocksDB format (per-store convert-and-delete,
+  crash-safe resume, optional tar streaming). Kept separate from `tron-node` so
+  its LevelDB reader dependency never ships in the node binary.
 
 ## Parity Testing Strategy
 

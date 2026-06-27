@@ -245,7 +245,11 @@ java-tron doesn't have.What works today, by area:
   after `import-snapshot`.
 - **Snapshot tooling** — `import-snapshot`, `import-live`,
   `export-snapshot`, and `verify-snapshot` move state to and from a
-  java-tron data directory.
+  java-tron RocksDB data directory. A separate `tron-snapshot-convert`
+  binary converts a java-tron **LevelDB** snapshot (what most full-history
+  archive snapshots ship as) into this node's RocksDB format, deleting each
+  source store as it converts so peak disk stays near 1× — and it can stream
+  straight from a download.
 - **Historical-state archive** (`[index.archive]`) — every block's
   committed write-set recorded as per-key versions, so `getaccount` /
   `getaccountresource` / `triggerconstantcontract` resolve **at any
@@ -516,13 +520,24 @@ from a recent state):
     --data-dir ./mainnet-data
 ```
 
-> **The snapshot must be RocksDB.** This node is RocksDB-only — there is
-> no LevelDB backend. A java-tron **LevelDB** snapshot (`db.engine =
-> LEVELDB`, the older default) will not open: RocksDB reads LevelDB SSTs
-> only partially (you'll see `Cannot find Properties block from file` in
-> the logs) and can crash trying to rewrite them. Use a RocksDB snapshot
-> (`db.engine = ROCKSDB` — java-tron's recommended engine), or convert a
-> LevelDB one first with java-tron's `Toolkit db convert`.
+> **`import-snapshot` expects a RocksDB snapshot.** This node is
+> RocksDB-only — there is no LevelDB backend — so a java-tron **LevelDB**
+> snapshot (`db.engine = LEVELDB`, the older default) won't open directly:
+> RocksDB reads LevelDB SSTs only partially (`Cannot find Properties block
+> from file` in the logs) and can crash trying to rewrite them. Either use a
+> RocksDB snapshot (`db.engine = ROCKSDB`), or convert a LevelDB one with the
+> bundled **`tron-snapshot-convert`**, which rewrites each store into RocksDB
+> and deletes the source as it goes (so you don't need 2× the disk) and can
+> stream a download straight in:
+
+```sh
+# convert a LevelDB snapshot dir in place — each source store is deleted as it
+# converts, so peak disk stays near 1x
+tron-snapshot-convert --from ./java-tron-leveldb-snapshot --data-dir ./mainnet-data
+
+# or pipe the download straight in — the full (multi-TB) source never lands
+curl -s <snapshot-url> | tron-snapshot-convert --stream --gzip --data-dir ./mainnet-data
+```
 
 `tron-node --help` lists every subcommand with its flags.
 
@@ -652,7 +667,8 @@ A terser, structured set written for AI coding assistants lives under
 - **Database**: byte-exact, per-store **RocksDB** layout — RocksDB-only,
   no LevelDB backend. A java-tron snapshot is a `tron-node` data directory
   after `import-snapshot`, **provided it was written with `db.engine =
-  ROCKSDB`**; LevelDB snapshots are not supported.
+  ROCKSDB`**; a LevelDB snapshot must be converted to RocksDB first with the
+  bundled `tron-snapshot-convert` tool.
 - **P2P**: byte-exact handshake + adv-broadcast, **inbound and
   outbound** — the node dials peers to sync and also listens on the P2P
   port (`18888` by default; `[p2p] listen`) to serve peers that sync

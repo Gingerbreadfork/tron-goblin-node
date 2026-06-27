@@ -28,7 +28,7 @@ networking, RPC, indexing, and operational tooling in Rust.
 | APIs | `tron-rpc`, `tron-grpc` | Ethereum-compatible JSON-RPC, TRON REST wallet endpoints, gRPC Wallet/Database/Monitor/Network surfaces. |
 | Mempool and production | `tron-mempool`, `tron-node/src/sr_runtime.rs`, `pbft_runtime.rs` | Admission validation, persistence, relay, SR block production, PBFT vote runtime. |
 | Indexing and events | `tron-index`, `tron-eventer`, `tron-eventer-kafka`, firehose consumer crates | Address history, archive deltas, event/log triggers, durable firehose and reference sinks. |
-| Tools | `tron-wallet`, `tron-state-diff`, `tron-replay` | Key/signing CLI, RPC parity diffing, block stream replay/testing. |
+| Tools | `tron-wallet`, `tron-state-diff`, `tron-replay`, `tron-snapshot-convert` | Key/signing CLI, RPC parity diffing, block stream replay/testing, java-tron LevelDB→RocksDB snapshot conversion. |
 
 The vendored `revm-*` crates are patched at the workspace root so all downstream
 uses resolve to local forks. Those forks carry TRON-specific interpreter/context
