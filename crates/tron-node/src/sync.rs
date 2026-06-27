@@ -6588,13 +6588,19 @@ pub(crate) fn serve_sync_block_chain_ids(
 
 /// Serve an inbound `FetchInvData` request by looking up each
 /// requested id and sending the corresponding body frame.
-///   * `type=TRX` → look up in `mempool`; reply with one `Trx` frame
-///     per hit. Misses gather into one `ItemNotFound`.
+///   * `type=TRX` → look up in `mempool`; reply with the bodies batched
+///     into `Trxs` (`TransactionsMessage`) frames — java-tron's only
+///     tx-fetch response framing.
 ///   * `type=BLOCK` → look up in `blocks` store via `BlockStore`;
-///     reply with one `Block` frame per hit. Misses gather into one
-///     `ItemNotFound`. Mirrors java-tron's
+///     reply with one `Block` frame per hit. Mirrors java-tron's
 ///     `FetchInvDataMsgHandler.processMessage` block path which reads
 ///     `blockStore.get(blockId)` and serves the matching capsule.
+///
+/// Misses (ids we don't hold) are silently omitted — no response frame is
+/// sent for them. java throws `DB_ITEM_NOT_FOUND` server-side and never
+/// emits an `ItemNotFound` message; a peer that received one would route
+/// it to its dispatch `default` → `P2pException(NO_SUCH_MESSAGE)` →
+/// disconnect (the same bug class as serving a lone `Trx` frame).
 ///
 /// Returns the wire-error string on send failure so the caller can
 /// drop the peer.
@@ -6627,23 +6633,14 @@ where
         return Ok(());
     }
     let inv_type = inv.r#type;
-    let mut not_found: Vec<Vec<u8>> = Vec::new();
+    // Count of requested ids we couldn't serve. java omits any response for
+    // misses (it throws `DB_ITEM_NOT_FOUND` server-side), so we send nothing
+    // back for them — this is only for an optional trace.
+    let mut misses = 0usize;
     if is_trx {
         let Some(mempool) = mempool else {
-            let payload = tron_proto::Inventory {
-                r#type: inv_type,
-                ids: inv.ids,
-            }
-            .encode_to_vec();
-            if let Err(e) = conn
-                .send_frame(Frame {
-                    ty: MessageType::ItemNotFound,
-                    payload: Bytes::from(payload),
-                })
-                .await
-            {
-                return Err(format!("send ItemNotFound: {e}"));
-            }
+            // No mempool attached → nothing to serve. Omit a response (java
+            // never sends `ItemNotFound`; sending one disconnects the peer).
             return Ok(());
         };
         // java-tron's `FetchInvDataMsgHandler` answers a TRX `FetchInvData`
@@ -6663,7 +6660,7 @@ where
         let mut batch_bytes = 0usize;
         for raw in &inv.ids {
             if raw.len() != 32 {
-                not_found.push(raw.clone());
+                misses += 1;
                 continue;
             }
             let mut h = [0u8; 32];
@@ -6692,7 +6689,7 @@ where
                         batch_bytes = 0;
                     }
                 }
-                None => not_found.push(raw.clone()),
+                None => misses += 1,
             }
         }
         if !batch.is_empty() {
@@ -6710,26 +6707,15 @@ where
     } else {
         // BLOCK: serve from BlockStore using the BlockId as key.
         let Some(blocks_be) = blocks else {
-            let payload = tron_proto::Inventory {
-                r#type: inv_type,
-                ids: inv.ids,
-            }
-            .encode_to_vec();
-            if let Err(e) = conn
-                .send_frame(Frame {
-                    ty: MessageType::ItemNotFound,
-                    payload: Bytes::from(payload),
-                })
-                .await
-            {
-                return Err(format!("send ItemNotFound: {e}"));
-            }
+            // No block store attached → nothing to serve. Omit a response
+            // (java never sends `ItemNotFound`; sending one disconnects the
+            // peer).
             return Ok(());
         };
         let store = BlockStore::new(blocks_be.clone());
         for raw in &inv.ids {
             if raw.len() != 32 {
-                not_found.push(raw.clone());
+                misses += 1;
                 continue;
             }
             let mut h = [0u8; 32];
@@ -6747,25 +6733,15 @@ where
                         return Err(format!("send Block response: {e}"));
                     }
                 }
-                Err(_) => not_found.push(raw.clone()),
+                Err(_) => misses += 1,
             }
         }
     }
-    if !not_found.is_empty() {
-        let payload = tron_proto::Inventory {
-            r#type: inv_type,
-            ids: not_found,
-        }
-        .encode_to_vec();
-        if let Err(e) = conn
-            .send_frame(Frame {
-                ty: MessageType::ItemNotFound,
-                payload: Bytes::from(payload),
-            })
-            .await
-        {
-            return Err(format!("send ItemNotFound: {e}"));
-        }
+    // Misses get no response frame — java omits them (throws
+    // `DB_ITEM_NOT_FOUND` server-side) and an `ItemNotFound` frame would
+    // disconnect the peer (`NO_SUCH_MESSAGE`). Trace only.
+    if misses > 0 {
+        debug!(peer = %peer, misses, ty = inv_type, "FetchInvData: omitting response for missing items");
     }
     Ok(())
 }
@@ -7628,7 +7604,7 @@ mod trx_inventory_tests {
     }
 
     #[tokio::test]
-    async fn serve_responds_with_item_not_found_for_unknown_hash() {
+    async fn serve_omits_response_for_unknown_hash() {
         use prost::Message as _;
         let mempool = TxMempool::new(MempoolConfig::default());
         let known = mempool.submit(&build_signed_transfer_bytes(41)).unwrap();
@@ -7653,18 +7629,20 @@ mod trx_inventory_tests {
         .await
         .expect("serve ok");
 
-        // First: a Trxs batch carrying the known tx.
+        // The known tx comes back as a Trxs batch; the unknown id gets NO
+        // response frame — java omits misses (an `ItemNotFound` frame would
+        // disconnect the peer with `NO_SUCH_MESSAGE`).
         let f1 = peer.next_frame().await.unwrap().expect("frame");
         assert_eq!(f1.ty, MessageType::Trxs);
         let batch = tron_proto::Transactions::decode(f1.payload).unwrap();
         assert_eq!(batch.transactions.len(), 1);
-        // Then: ItemNotFound for unknown.
-        let f2 = peer.next_frame().await.unwrap().expect("frame");
-        assert_eq!(f2.ty, MessageType::ItemNotFound);
-        let inv = tron_proto::Inventory::decode(f2.payload).unwrap();
-        assert_eq!(inv.r#type, tron_proto::inventory::InventoryType::Trx as i32);
-        assert_eq!(inv.ids.len(), 1);
-        assert_eq!(inv.ids[0], unknown.to_vec());
+        // No second frame — close our side and confirm EOF.
+        drop(us);
+        let f2 = peer.next_frame().await;
+        assert!(
+            matches!(f2, Ok(None) | Err(_)),
+            "a miss must produce no ItemNotFound frame"
+        );
     }
 
     #[tokio::test]
@@ -7717,7 +7695,7 @@ mod trx_inventory_tests {
     }
 
     #[tokio::test]
-    async fn serve_block_request_misses_emit_item_not_found_with_block_type() {
+    async fn serve_block_request_omits_response_on_miss() {
         use prost::Message as _;
         use tron_chainbase::{KvBackend as KB, MemBackend};
         let backend: Arc<dyn KB> = Arc::new(MemBackend::new());
@@ -7740,14 +7718,14 @@ mod trx_inventory_tests {
         .await
         .expect("serve ok");
 
-        let frame = peer.next_frame().await.unwrap().expect("frame");
-        assert_eq!(frame.ty, MessageType::ItemNotFound);
-        let inv = tron_proto::Inventory::decode(frame.payload).unwrap();
-        assert_eq!(
-            inv.r#type,
-            tron_proto::inventory::InventoryType::Block as i32
+        // A block miss gets no response frame (java omits it). Close our side
+        // and confirm EOF — no `ItemNotFound`.
+        drop(us);
+        let frame = peer.next_frame().await;
+        assert!(
+            matches!(frame, Ok(None) | Err(_)),
+            "a block miss must produce no ItemNotFound frame"
         );
-        assert_eq!(inv.ids[0], unknown.to_vec());
     }
 
     #[tokio::test]
@@ -7820,7 +7798,7 @@ mod trx_inventory_tests {
     }
 
     #[tokio::test]
-    async fn serve_block_request_without_blocks_store_returns_item_not_found() {
+    async fn serve_block_request_omits_response_without_blocks_store() {
         use prost::Message as _;
         let mempool = TxMempool::new(MempoolConfig::default());
         let req = tron_proto::Inventory {
@@ -7832,8 +7810,8 @@ mod trx_inventory_tests {
         let mut us = PeerConnection::new(a_s);
         let mut peer = PeerConnection::new(b_s);
 
-        // BLOCK request, no blocks backend attached → ItemNotFound
-        // echoing all requested ids.
+        // BLOCK request, no blocks backend attached → nothing served, and no
+        // `ItemNotFound` (java omits misses).
         serve_tx_fetch_inv_data(
             &mut us,
             Bytes::from(req.encode_to_vec()),
@@ -7844,18 +7822,16 @@ mod trx_inventory_tests {
         .await
         .expect("serve ok");
 
-        let frame = peer.next_frame().await.unwrap().expect("frame");
-        assert_eq!(frame.ty, MessageType::ItemNotFound);
-        let inv = tron_proto::Inventory::decode(frame.payload).unwrap();
-        assert_eq!(
-            inv.r#type,
-            tron_proto::inventory::InventoryType::Block as i32
+        drop(us);
+        let frame = peer.next_frame().await;
+        assert!(
+            matches!(frame, Ok(None) | Err(_)),
+            "no blocks store must produce no response frame"
         );
-        assert_eq!(inv.ids.len(), 2);
     }
 
     #[tokio::test]
-    async fn serve_responds_with_item_not_found_when_no_mempool_attached() {
+    async fn serve_omits_response_when_no_mempool_attached() {
         use prost::Message as _;
         let req = tron_proto::Inventory {
             r#type: tron_proto::inventory::InventoryType::Trx as i32,
@@ -7870,14 +7846,17 @@ mod trx_inventory_tests {
             .await
             .expect("serve ok");
 
-        let frame = peer.next_frame().await.unwrap().expect("frame");
-        assert_eq!(frame.ty, MessageType::ItemNotFound);
-        let inv = tron_proto::Inventory::decode(frame.payload).unwrap();
-        assert_eq!(inv.ids.len(), 2, "all requested ids must be echoed back");
+        // No mempool attached → nothing served, no `ItemNotFound`. Confirm EOF.
+        drop(us);
+        let frame = peer.next_frame().await;
+        assert!(
+            matches!(frame, Ok(None) | Err(_)),
+            "no mempool must produce no response frame"
+        );
     }
 
     #[tokio::test]
-    async fn serve_treats_malformed_short_hash_as_not_found() {
+    async fn serve_treats_malformed_short_hash_as_miss() {
         use prost::Message as _;
         let mempool = TxMempool::new(MempoolConfig::default());
         let req = tron_proto::Inventory {
@@ -7899,8 +7878,13 @@ mod trx_inventory_tests {
         .await
         .expect("serve ok");
 
-        let frame = peer.next_frame().await.unwrap().expect("frame");
-        assert_eq!(frame.ty, MessageType::ItemNotFound);
+        // A malformed (short) hash is treated as a miss → no response frame.
+        drop(us);
+        let frame = peer.next_frame().await;
+        assert!(
+            matches!(frame, Ok(None) | Err(_)),
+            "malformed hash must produce no response frame"
+        );
     }
 
     // ────────────────────────────────────────────────────────────
