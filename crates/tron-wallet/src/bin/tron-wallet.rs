@@ -6,11 +6,11 @@
 //!   write a v3 keystore JSON file encrypted under `--password`.
 //! * `address [--priv HEX | --keystore FILE [--password PW]]` — derive
 //!   the TRON Base58Check address for a given key.
-//! * `sign --keystore FILE --tx HEX [--password PW]` — decode a hex
-//!   protobuf `Transaction`, sign it, print the signed transaction's
-//!   hex.
-//! * `send --keystore FILE --tx HEX --rpc URL [--password PW]` — sign
-//!   and POST `broadcastTransaction` to `--rpc`.
+//! * `sign --keystore FILE --tx HEX [--memo TEXT] [--password PW]` —
+//!   decode a hex protobuf `Transaction`, optionally attach an on-chain
+//!   memo (the `data` field), sign it, and print the signed hex.
+//! * `send --keystore FILE --tx HEX --rpc URL [--memo TEXT] [--password PW]`
+//!   — same, then POST `broadcastTransaction` to `--rpc`.
 //!
 //! Password discovery: the `--password` flag wins (useful in
 //! scripts/tests but echoes in shell history). Otherwise the env var
@@ -29,7 +29,7 @@ use std::process::ExitCode;
 use serde_json::json;
 use tron_wallet::{
     address_from_private, address_to_base58, broadcast_signed_tx, generate_private_key,
-    sign_transaction_bytes, Keystore,
+    sign_transaction_bytes_with_memo, Keystore,
 };
 
 fn main() -> ExitCode {
@@ -76,8 +76,8 @@ Usage:
   tron-wallet keygen   [--out FILE] [--password PW] [--light]
                        [--mnemonic [PHRASE] [--hd-path PATH] [--hd-passphrase PW]]
   tron-wallet address  (--priv HEX | --keystore FILE [--password PW])
-  tron-wallet sign     --keystore FILE --tx HEX [--password PW]
-  tron-wallet send     --keystore FILE --tx HEX --rpc URL [--password PW]
+  tron-wallet sign     --keystore FILE --tx HEX [--memo TEXT] [--password PW]
+  tron-wallet send     --keystore FILE --tx HEX --rpc URL [--memo TEXT] [--password PW]
   tron-wallet keystore list   --dir DIR
   tron-wallet keystore new    --dir DIR [--password PW] [--light]
                               [--mnemonic [PHRASE] [--hd-path PATH] [--hd-passphrase PW]]
@@ -88,6 +88,11 @@ Usage:
 
 Password discovery (in order): --password PW, env TRON_WALLET_PASSWORD, then
 interactive prompt when stdin is a TTY.
+
+Memo (sign/send): --memo TEXT attaches an on-chain note to the transaction's
+data field. It is set before signing, so it is covered by the signature/txID.
+The network charges the chain memo fee (1 TRX on mainnet) for any transaction
+that carries a memo.
 
 Mnemonic mode:
   --mnemonic            generate a new 12-word BIP-39 phrase and derive a key
@@ -199,13 +204,15 @@ fn cmd_sign(args: &[String]) -> Result<serde_json::Value, String> {
     let keystore_path = arg_value(args, "--keystore")
         .ok_or_else(|| "sign: --keystore FILE required".to_string())?;
     let tx_hex = arg_value(args, "--tx").ok_or_else(|| "sign: --tx HEX required".to_string())?;
+    let memo = arg_value(args, "--memo");
     let pw = resolve_password(args)?
         .ok_or_else(|| "no password (try --password or TRON_WALLET_PASSWORD)".to_string())?;
 
     let ks = Keystore::load_from_file(&PathBuf::from(keystore_path)).map_err(|e| e.to_string())?;
     let priv_key = ks.decrypt(&pw).map_err(|e| e.to_string())?;
     let tx_bytes = parse_hex(&tx_hex)?;
-    let signed = sign_transaction_bytes(&tx_bytes, &priv_key).map_err(|e| e.to_string())?;
+    let signed = sign_transaction_bytes_with_memo(&tx_bytes, &priv_key, memo.as_deref())
+        .map_err(|e| e.to_string())?;
     Ok(json!({
         "ok": true,
         "signedHex": format!("0x{}", hex::encode(signed)),
@@ -217,21 +224,27 @@ async fn cmd_send(args: &[String]) -> Result<serde_json::Value, String> {
         .ok_or_else(|| "send: --keystore FILE required".to_string())?;
     let tx_hex = arg_value(args, "--tx").ok_or_else(|| "send: --tx HEX required".to_string())?;
     let rpc = arg_value(args, "--rpc").ok_or_else(|| "send: --rpc URL required".to_string())?;
+    let memo = arg_value(args, "--memo");
     let pw = resolve_password(args)?
         .ok_or_else(|| "no password (try --password or TRON_WALLET_PASSWORD)".to_string())?;
 
     let ks = Keystore::load_from_file(&PathBuf::from(keystore_path)).map_err(|e| e.to_string())?;
     let priv_key = ks.decrypt(&pw).map_err(|e| e.to_string())?;
     let tx_bytes = parse_hex(&tx_hex)?;
-    let signed = sign_transaction_bytes(&tx_bytes, &priv_key).map_err(|e| e.to_string())?;
+    let signed = sign_transaction_bytes_with_memo(&tx_bytes, &priv_key, memo.as_deref())
+        .map_err(|e| e.to_string())?;
     let response = broadcast_signed_tx(&rpc, &signed)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "signedHex": format!("0x{}", hex::encode(&signed)),
         "response": response,
-    }))
+    });
+    if let Some(m) = &memo {
+        out["memo"] = json!(m);
+    }
+    Ok(out)
 }
 
 // =============================================================================

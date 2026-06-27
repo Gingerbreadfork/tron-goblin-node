@@ -59,9 +59,30 @@ pub fn sign_transaction_bytes(
     tx_bytes: &[u8],
     private_key: &[u8; 32],
 ) -> Result<Vec<u8>, WalletError> {
+    sign_transaction_bytes_with_memo(tx_bytes, private_key, None)
+}
+
+/// Like [`sign_transaction_bytes`], but first attaches `memo` to the
+/// transaction's `data` field — TRON's on-chain note. The memo lives in
+/// `raw_data`, so it must be set before signing: it changes the txID
+/// (this is what TronWeb's `addUpdateData` does client-side). The
+/// network charges the chain memo fee (`getMemoFee`, 1 TRX on mainnet)
+/// for any transaction carrying a non-empty `data` field. A `None` or
+/// empty memo leaves the transaction untouched.
+pub fn sign_transaction_bytes_with_memo(
+    tx_bytes: &[u8],
+    private_key: &[u8; 32],
+    memo: Option<&str>,
+) -> Result<Vec<u8>, WalletError> {
     use prost::Message as _;
     let mut tx = tron_proto::Transaction::decode(tx_bytes)
         .map_err(|e| WalletError::Decode(format!("transaction proto: {e}")))?;
+    if let Some(memo) = memo.filter(|m| !m.is_empty()) {
+        let raw = tx.raw_data.as_mut().ok_or_else(|| {
+            WalletError::Decode("transaction has no raw_data to attach a memo to".into())
+        })?;
+        raw.data = memo.as_bytes().to_vec();
+    }
     tron_types::sign_transaction(&mut tx, private_key)
         .map_err(|e| WalletError::Sign(format!("{e:?}")))?;
     let mut out = Vec::with_capacity(tx.encoded_len());
@@ -272,6 +293,71 @@ mod tests {
             decoded.signature[0].len(),
             65,
             "signature is r(32) || s(32) || v(1)"
+        );
+    }
+
+    #[test]
+    fn sign_with_memo_attaches_to_raw_data() {
+        use prost::Message as _;
+        use tron_proto::{
+            transaction::{contract::ContractType, Contract as TxContract, Raw as TxRaw},
+            Transaction, TransferContract,
+        };
+        let from: [u8; 21] = hex!("412e988a386a799f506693793c6a5af6b54dfaabfb");
+        let transfer = TransferContract {
+            owner_address: from.to_vec(),
+            to_address: {
+                let mut b = [0u8; 21];
+                b[0] = 0x41;
+                b[1..].fill(0xbb);
+                b
+            }
+            .to_vec(),
+            amount: 1,
+        };
+        let mut value = Vec::new();
+        transfer.encode(&mut value).unwrap();
+        let tx = Transaction {
+            raw_data: Some(TxRaw {
+                contract: vec![TxContract {
+                    r#type: ContractType::TransferContract as i32,
+                    parameter: Some(prost_types::Any {
+                        type_url: "type.googleapis.com/protocol.TransferContract".into(),
+                        value,
+                    }),
+                    ..Default::default()
+                }],
+                timestamp: 1_700_000_000_000,
+                ..Default::default()
+            }),
+            signature: Vec::new(),
+            ret: Vec::new(),
+            unparsed_field10: None,
+        };
+        let mut unsigned = Vec::new();
+        tx.encode(&mut unsigned).unwrap();
+        let priv_key = hex!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        // A memo lands in raw_data.data and the tx is still signed.
+        let memo = "Broadcasted with Tron Goblin Node";
+        let signed = sign_transaction_bytes_with_memo(&unsigned, &priv_key, Some(memo)).unwrap();
+        let decoded = Transaction::decode(&*signed).unwrap();
+        assert_eq!(decoded.signature.len(), 1, "still signed with a memo");
+        assert_eq!(
+            decoded.raw_data.unwrap().data,
+            memo.as_bytes(),
+            "memo attached to raw_data.data"
+        );
+
+        // No / empty memo leaves data empty (and equals the plain signer).
+        let plain = sign_transaction_bytes(&unsigned, &priv_key).unwrap();
+        let none = sign_transaction_bytes_with_memo(&unsigned, &priv_key, None).unwrap();
+        let empty = sign_transaction_bytes_with_memo(&unsigned, &priv_key, Some("")).unwrap();
+        assert_eq!(none, plain, "None memo == plain sign");
+        assert_eq!(empty, plain, "empty memo == plain sign");
+        assert!(
+            Transaction::decode(&*none).unwrap().raw_data.unwrap().data.is_empty(),
+            "no memo -> empty data"
         );
     }
 
