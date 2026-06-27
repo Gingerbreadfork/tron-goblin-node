@@ -19,15 +19,10 @@ tron-chainbase = { path = "../tron-chainbase" }
 # key comparator. This is the ONLY crate in the workspace that depends on
 # it — tron-node stays LevelDB-free.
 rusty-leveldb = { version = "4.0.1", default-features = false, features = ["fs"] }
-# Zstd is an OPT-IN destination codec (`--zstd`, ~30% smaller than the default
-# Snappy). RocksDB only accepts a Zstd open if librocksdb-sys was built with the
-# codec, so this crate links the `zstd` feature. NOTE: a Zstd-converted snapshot
-# is readable ONLY by a tron-node also built with Zstd — the default node build
-# links Snappy/LZ4 only — so the converter DEFAULTS to Snappy and warns when
-# `--zstd` is passed. (`cargo build --workspace` links zstd into the shared
-# librocksdb-sys via feature unification, but `cargo build --bin tron-node` does
-# not, and tron-node never writes zstd regardless.)
-rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4", "zstd", "bindgen-runtime"] }
+# RocksDB write path + the Zstd codec for the optional `--zstd` output. The
+# workspace dep links zstd by default now (so a normal `tron-node` reads
+# zstd-compressed snapshots too), so just inherit it rather than re-declaring.
+rocksdb = { workspace = true }
 thiserror.workspace = true
 tar.workspace = true
 flate2.workspace = true

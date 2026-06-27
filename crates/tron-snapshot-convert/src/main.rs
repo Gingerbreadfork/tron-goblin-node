@@ -38,11 +38,9 @@ options:
                     done-marker (engine.properties=ROCKSDB) is present are
                     skipped. A crashed run is safe to re-run as-is.
   --zstd            write destination SSTs with Zstd (~30% smaller) instead of
-                    the default Snappy. WARNING: a Zstd-compressed snapshot is
-                    NOT readable by the standard tron-node build (Snappy/LZ4
-                    only) — and the source is deleted during conversion, so an
-                    unreadable result is unrecoverable. Use --zstd only with a
-                    tron-node built with Zstd support. Default: Snappy.
+                    the default Snappy. The node reads zstd natively; Snappy is
+                    the default only because it is java-tron's snapshot format
+                    (the most portable for re-sharing). Default: Snappy.
   -h, --help        show this help
 
 notes:
@@ -111,15 +109,6 @@ fn main() -> ExitCode {
     if opts.keep_source && stream {
         eprintln!("note: --keep-source is ignored with --stream (the source is never on disk)");
     }
-    if opts.compression_zstd {
-        eprintln!(
-            "WARNING: --zstd output is NOT readable by the standard tron-node build \
-             (Snappy/LZ4 only). The source is deleted during conversion, so a Zstd \
-             snapshot the node cannot open would be unrecoverable — use --zstd only \
-             with a tron-node built with Zstd support."
-        );
-    }
-
     let mut progress = |line: &str| println!("{line}");
 
     let started = std::time::Instant::now();

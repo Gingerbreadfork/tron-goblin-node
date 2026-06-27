@@ -98,10 +98,10 @@ pub enum ConvertError {
 pub struct ConvertOptions {
     /// Destination node data dir; stores land in `data_dir/database/`.
     pub data_dir: PathBuf,
-    /// Compress destination SSTs with Zstd (vs Snappy). Default FALSE —
-    /// Snappy, which the standard node build reads natively. Zstd output is
-    /// ~30% smaller but is NOT readable by a node not built with Zstd, so it
-    /// is strictly opt-in (`--zstd`).
+    /// Compress destination SSTs with Zstd (vs Snappy). Default FALSE
+    /// (Snappy) — java-tron's snapshot format, the most portable choice.
+    /// `--zstd` opts into ~30% smaller output; the node reads it natively
+    /// (it links the Zstd codec).
     pub compression_zstd: bool,
     /// Keep (don't delete) each source store after converting it. Only
     /// meaningful for directory input; a `--stream` source is never on

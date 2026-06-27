@@ -95,14 +95,18 @@ tonic-build = "0.12"
 # Base58
 bs58 = "0.5"
 # RocksDB.
-# `default-features = false` drops the heavy compression backends (zstd/zlib/
-# bzip2) we don't use. We re-add `bindgen-runtime` explicitly: it makes
+# `default-features = false` drops the compression backends we don't use
+# (zlib/bzip2). We keep snappy (java-tron's default — byte-exact snapshot
+# parity), lz4, and zstd: zstd lets the node READ zstd-compressed RocksDB
+# snapshots (e.g. produced by `tron-snapshot-convert --zstd`) while it still
+# WRITES snappy, so consensus/parity is unchanged. We re-add `bindgen-runtime`
+# explicitly: it makes
 # librocksdb-sys's bindgen LOAD libclang dynamically at build time (dlopen,
 # which finds the versioned `libclang.so.NN` every distro ships) instead of
 # statically LINKING `-lclang` (which needs a bare `libclang.so` only the
 # `-devel`/`-dev` packages provide). Without it the build needs the
 # libclang-shim workaround; with it a normal libclang install just works.
-rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4", "bindgen-runtime"] }
+rocksdb = { version = "0.23", default-features = false, features = ["snappy", "lz4", "zstd", "bindgen-runtime"] }
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }

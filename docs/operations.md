@@ -120,9 +120,9 @@ curl -s <snapshot-url> | ./target/release/tron-snapshot-convert \
   + key/value byte sums) before its source is removed, and the run is crash-safe
   and resumable — a completed store carries a done-marker and is skipped on a
   re-run.
-- Output is **Snappy** by default, which `tron-node` reads natively. `--zstd` is
-  ~30% smaller but only readable by a `tron-node` built with Zstd support, so it
-  is opt-in.
+- Output is **Snappy** by default (java-tron's snapshot format — the most
+  portable). `--zstd` opts into ~30% smaller output; `tron-node` reads it
+  natively (it links the Zstd codec).
 - Deletion is per-store (a LevelDB store can't be safely pruned mid-read); the
   `block` store is the single-largest disk high-water mark.
 
