@@ -4670,7 +4670,15 @@ pub fn apply_genesis_allocations(
 /// blackhole-optimization path. Notably java does NOT touch
 /// `latest_operation_time` here, unlike its other fee debits. Returns
 /// the amount actually charged.
-fn charge_flat_fee(
+///
+/// Public so the mempool admission validator can replay java's
+/// pre-actuator flat-fee debits (`consumeMultiSignFee` / `consumeMemoFee`)
+/// on an isolated state overlay — rejecting at admission exactly what a
+/// java peer rejects (`AccountResourceInsufficientException`) instead of
+/// relaying a tx that never lands. Admission must run this against a
+/// throwaway [`tron_chainbase::SessionBackend`] overlay so the debit (and
+/// the blackhole/burn write) never touch committed state.
+pub fn charge_flat_fee(
     accounts: &AccountStore,
     dyn_props: &tron_chainbase::DynamicPropertiesStore,
     contract: &tron_proto::transaction::Contract,
