@@ -138,3 +138,15 @@ tar = "0.4"
 flate2 = "1"
 bls12_381 = "0.8"
 jubjub = "0.10"
+
+# Build-artifact footprint. Cargo's default dev/test debuginfo is FULL DWARF
+# (`debug = 2`), which dominates target/ across the workspace's debug + test
+# binaries (heavy deps: rocksdb, revm, sapling). `line-tables-only` keeps
+# file:line in panic backtraces (what the parity/replay work relies on) while
+# dropping the variable/type debuginfo — roughly halving debug/test artifact
+# size. The test/bench profiles inherit this from dev. Trade-off: a gdb/lldb
+# step-debug session loses local-variable inspection (not used here). Cargo
+# does not garbage-collect target/, so a periodic `cargo clean` is still the
+# way to reclaim space — this just keeps the steady-state much smaller.
+[profile.dev]
+debug = "line-tables-only"
