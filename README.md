@@ -20,6 +20,7 @@ RPC responses, just with better performance, lighter hardware requirements, and 
 ## ✨ Highlights
 
 - Sync from genesis or a get caught up fast with a RocksDB snapshot
+- Convert multi-TB java-tron LevelDB archive snapshots to RocksDB without needing 2× the disk — the node itself is RocksDB-only
 - Block-STM parallel execution enables syncing to be several times faster than java-tron (enabled by default)
 - Byte-exact RocksDB + bidirectional P2P (pick right up where java-tron left off)
 - Built-in TronGrid cross-compatible indexer + historical state archive (both optional to suit your needs)
