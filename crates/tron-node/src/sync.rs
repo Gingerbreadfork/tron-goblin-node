@@ -157,6 +157,29 @@ pub struct DriverStats {
 /// from a dead/stuck leader is prompt.
 const LEADERSHIP_STALE: Duration = Duration::from_secs(30);
 
+// Tip-following currency-based leadership preemption — keeps us off a leader
+// that follows the tip late (a slow / behind peer serving tip blocks at 6-25s
+// lag never trips `LEADERSHIP_STALE` because it still applies a block now and
+// then). These only ever apply within `NEAR_TIP_WINDOW` of the network tip:
+// during bulk sync leadership stays put (it's throughput-bound, and the
+// cooperative fetch pool already fans bulk fetches across the fleet).
+//
+/// A leader whose applied head trails the network-tip estimate by more than
+/// this many blocks is "lagging" and may be preempted by a current peer.
+const LEADER_LAG_BLOCKS: i64 = 2;
+/// Currency-based preemption is considered only when our head is within this
+/// many blocks of the network tip — i.e. we are tip-following, not bulk-syncing.
+const NEAR_TIP_WINDOW: i64 = 256;
+/// A challenger's peer counts as "current" (a viable faster leader) when it has
+/// advertised a block within this many of the network-tip estimate.
+const TIP_CURRENCY_SLACK: i64 = 1;
+/// Block adverts more than this far above our head are ignored when raising the
+/// network-tip estimate — a bogus far-future advert can't trigger preemption.
+const SANE_TIP_AHEAD: i64 = 64;
+/// Minimum interval between currency-based preemptions, so several current peers
+/// can't thrash the leader slot before a freshly-promoted leader catches up.
+const PREEMPT_COOLDOWN: Duration = Duration::from_secs(5);
+
 /// Coordinates the single active block-applying `SyncDriver` across the
 /// per-peer driver fleet. The runtime spawns one driver per peer, all
 /// sharing the same RocksDB state; without coordination every driver
@@ -169,6 +192,12 @@ const LEADERSHIP_STALE: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct SyncLeadership {
     inner: std::sync::Mutex<LeaderState>,
+    /// Highest block number any connected peer has advertised — the
+    /// network-tip estimate, shared across the per-peer driver fleet. Drives
+    /// currency-based preemption: a leader whose applied head trails this is
+    /// following the tip late and may be replaced by a peer that has the tip.
+    /// Monotonic (`fetch_max`); raised only by sane, near-head adverts.
+    network_tip: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Debug)]
@@ -179,6 +208,10 @@ struct LeaderState {
     /// When the leader last applied a block (or, for a fresh claimant,
     /// when it took the slot). Drives the staleness check.
     last_progress: Instant,
+    /// When leadership last changed hands. Rate-limits currency-based
+    /// preemption (`PREEMPT_COOLDOWN`) so several current peers can't thrash
+    /// the slot before a freshly-promoted leader catches up.
+    last_change: Instant,
 }
 
 impl SyncLeadership {
@@ -187,7 +220,9 @@ impl SyncLeadership {
             inner: std::sync::Mutex::new(LeaderState {
                 leader: None,
                 last_progress: Instant::now(),
+                last_change: Instant::now(),
             }),
+            network_tip: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -213,10 +248,50 @@ impl SyncLeadership {
         if free_or_stale {
             g.leader = Some(peer.to_string());
             g.last_progress = Instant::now();
+            g.last_change = Instant::now();
             true
         } else {
             false
         }
+    }
+
+    /// Currency-based preemption: hand leadership to `peer` when an incumbent
+    /// is following the tip late. Only ever called by a driver whose own peer
+    /// is *current* (has advertised at/near the network tip) while our applied
+    /// head lags it — see [`SyncDriver::should_preempt_leader`]. Returns `true`
+    /// if `peer` is the leader after the call.
+    ///
+    /// Preempts only an OCCUPIED slot held by a *different* peer (a free slot
+    /// is left to the eligibility-gated [`Self::claim_or_check`] path), and only
+    /// once per `cooldown` so a freshly-promoted leader gets a few blocks to
+    /// prove it can keep up before another current peer can challenge.
+    pub fn try_preempt(&self, peer: &str, cooldown: Duration) -> bool {
+        let mut g = self.inner.lock().expect("SyncLeadership poisoned");
+        if g.leader.as_deref() == Some(peer) {
+            return true;
+        }
+        if g.leader.is_none() || g.last_change.elapsed() < cooldown {
+            return false;
+        }
+        g.leader = Some(peer.to_string());
+        g.last_progress = Instant::now();
+        g.last_change = Instant::now();
+        true
+    }
+
+    /// Raise the shared network-tip estimate to `num` (monotonic). Callers
+    /// bound `num` to a sane window above our head so a bogus far-future advert
+    /// can't inflate it.
+    pub fn observe_network_tip(&self, num: i64) {
+        if num > 0 {
+            self.network_tip
+                .fetch_max(num, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Current network-tip estimate (highest sane block any peer advertised).
+    pub fn network_tip(&self) -> i64 {
+        self.network_tip.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reset the staleness timer — the leader just applied a block.
@@ -1308,11 +1383,42 @@ impl SyncDriver {
     /// Whether this driver may act as the active syncer right now —
     /// claiming or retaining leadership if it can. With no coordinator
     /// attached, always `true` (original behavior).
-    fn is_active_syncer(&self, peer: &str, eligible: bool) -> bool {
+    ///
+    /// When `preempt` is set (this driver's peer is current and the incumbent
+    /// is following the tip late — see [`Self::should_preempt_leader`]), it may
+    /// also take an occupied slot from a lagging leader, rate-limited by
+    /// [`PREEMPT_COOLDOWN`].
+    fn is_active_syncer(&self, peer: &str, eligible: bool, preempt: bool) -> bool {
         match &self.leadership {
-            Some(l) => l.claim_or_check(peer, LEADERSHIP_STALE, eligible),
+            Some(l) => {
+                (preempt && l.try_preempt(peer, PREEMPT_COOLDOWN))
+                    || l.claim_or_check(peer, LEADERSHIP_STALE, eligible)
+            }
             None => true,
         }
+    }
+
+    /// Whether this driver should preempt the current leader because it is
+    /// following the tip late. True only when (1) we are tip-following — our
+    /// head is within [`NEAR_TIP_WINDOW`] of the network tip, never during bulk
+    /// sync; (2) the leader is lagging — our head trails the network tip by more
+    /// than [`LEADER_LAG_BLOCKS`]; and (3) THIS peer is current — it has
+    /// advertised a block within [`TIP_CURRENCY_SLACK`] of the network tip, so
+    /// it is a strictly better tip source. `my_peer_tip` is the highest block
+    /// this peer has advertised.
+    fn should_preempt_leader(&self, my_peer_tip: i64) -> bool {
+        let Some(l) = &self.leadership else {
+            return false;
+        };
+        let net_tip = l.network_tip();
+        if net_tip <= 0 {
+            return false;
+        }
+        let our_head = self.head_number();
+        let near_tip = our_head >= net_tip - NEAR_TIP_WINDOW;
+        let lagging = our_head < net_tip - LEADER_LAG_BLOCKS;
+        let peer_current = my_peer_tip >= net_tip - TIP_CURRENCY_SLACK;
+        near_tip && lagging && peer_current
     }
 
     /// Record that the active syncer applied a block, resetting the
@@ -2802,6 +2908,15 @@ impl SyncDriver {
         let mut expected: std::collections::VecDeque<[u8; 32]> =
             std::collections::VecDeque::new();
         let mut offered_max: i64 = 0;
+        // Highest block THIS peer has advertised — its currency, used to decide
+        // whether it's a viable faster leader than a tip-lagging incumbent
+        // (see `should_preempt_leader`). Seeded from the handshake head and
+        // raised by live Inventory(BLOCK) adverts; also seeds the shared
+        // network-tip estimate so a single fast peer is enough to detect lag.
+        let mut my_peer_tip: i64 = peer_head.max(0);
+        if let Some(l) = &self.leadership {
+            l.observe_network_tip(my_peer_tip);
+        }
         // The `(num, id)` list from this peer's most recent ChainInventory to
         // US — our own offered window, kept whether we're leader or worker.
         // A freshly-promoted leader merges this into the apply queue it
@@ -3065,7 +3180,11 @@ impl SyncDriver {
             // leadership slot — but only an eligible (not dramatically
             // behind) peer may take it, so a fresh node can't win the slot
             // and stall us.
-            let am_leader = self.is_active_syncer(peer, leader_eligible);
+            // Currency-based preemption: if THIS peer has the tip while the
+            // incumbent leader follows it late, take the slot (rate-limited) so
+            // we fetch tip blocks from a current peer, not a slow/behind leader.
+            let preempt = self.should_preempt_leader(my_peer_tip);
+            let am_leader = self.is_active_syncer(peer, leader_eligible, preempt);
             // With a fetch pool attached, every ahead-enough peer also FETCHES
             // (each on its own valid sync context — its own SyncBlockChain →
             // offered window → in-window FetchInvData), while only the leader
@@ -3688,6 +3807,16 @@ impl SyncDriver {
                             raw.copy_from_slice(&hash);
                             let id = BlockId::from_raw(raw);
                             let block_num = id.num() as i64;
+                            // Track this peer's currency + raise the shared
+                            // network-tip estimate, bounded to a sane window
+                            // above our head so a bogus far-future advert can't
+                            // poison leader preemption.
+                            if block_num <= head + SANE_TIP_AHEAD {
+                                my_peer_tip = my_peer_tip.max(block_num);
+                                if let Some(l) = &self.leadership {
+                                    l.observe_network_tip(block_num);
+                                }
+                            }
                             // Competing fork block at/below our head (a
                             // DIFFERENT id than what we hold): the head+1
                             // scheduler gate would drop it, but it's the
@@ -8716,6 +8845,50 @@ mod leadership_tests {
         // The stalled leader still nominally holds it until an *eligible*
         // peer takes over.
         assert!(l.claim_or_check("good", STALE, false), "incumbent retains regardless of eligibility");
+    }
+
+    // ── Currency-based tip preemption (`try_preempt` / `observe_network_tip`) ──
+
+    const COOL: Duration = Duration::from_millis(40);
+
+    #[test]
+    fn current_peer_preempts_a_lagging_leader_after_cooldown() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("slow", STALE, true), "slow leader takes the free slot");
+        // Right after the claim the cooldown blocks preemption — a freshly
+        // promoted leader gets a grace window to prove it can keep up.
+        assert!(!l.try_preempt("fast", COOL), "cooldown blocks an immediate preempt");
+        assert!(l.claim_or_check("slow", STALE, false), "slow still leads inside the cooldown");
+        // After the cooldown a current challenger steals the slot even though
+        // the incumbent isn't fully stalled (it's just following the tip late).
+        std::thread::sleep(COOL + Duration::from_millis(10));
+        assert!(l.try_preempt("fast", COOL), "current peer preempts the lagging leader");
+        assert!(!l.claim_or_check("slow", STALE, false), "slow is now the standby");
+    }
+
+    #[test]
+    fn try_preempt_leaves_a_free_slot_to_the_eligibility_gated_path() {
+        let l = SyncLeadership::new();
+        // A free slot must NOT be grabbed by `try_preempt` (which skips the
+        // eligibility gate) — it's left to `claim_or_check`.
+        assert!(!l.try_preempt("fast", Duration::ZERO), "free slot is not preempted");
+        assert!(l.claim_or_check("fast", STALE, true), "eligibility-gated claim takes the free slot");
+        // The incumbent calling `try_preempt` is a harmless no-op retain.
+        assert!(l.try_preempt("fast", Duration::ZERO), "incumbent retains via try_preempt");
+    }
+
+    #[test]
+    fn observe_network_tip_is_monotonic() {
+        let l = SyncLeadership::new();
+        assert_eq!(l.network_tip(), 0);
+        l.observe_network_tip(100);
+        assert_eq!(l.network_tip(), 100);
+        l.observe_network_tip(90); // lower → ignored
+        assert_eq!(l.network_tip(), 100);
+        l.observe_network_tip(105);
+        assert_eq!(l.network_tip(), 105);
+        l.observe_network_tip(0); // non-positive → ignored
+        assert_eq!(l.network_tip(), 105);
     }
 }
 
