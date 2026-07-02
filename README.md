@@ -507,7 +507,7 @@ TCP reachability pre-flight, log capture, and a post-run summary:
 Run with `--help` for all options.
 
 By default the node is a **full peer**: it listens on the P2P port
-(`18888`) and serves blocks to nodes that sync *from* it, in addition to
+(`18889` by default — java-tron's `18888` + 1) and serves blocks to nodes that sync *from* it, in addition to
 dialing peers to sync itself. For other peers to actually reach you, that
 port must be open through your firewall / NAT (port-forward). To run as a
 firewalled, outbound-only sync client instead, set `[p2p] listen = false`.
@@ -672,7 +672,7 @@ A terser, structured set written for AI coding assistants lives under
   bundled `tron-snapshot-convert` tool.
 - **P2P**: byte-exact handshake + adv-broadcast, **inbound and
   outbound** — the node dials peers to sync and also listens on the P2P
-  port (`18888` by default; `[p2p] listen`) to serve peers that sync
+  port (`18889` by default — java-tron's `18888` + 1; `[p2p] listen`) to serve peers that sync
   from it. Identifies itself on the wire as `tron-goblin/0.0.1`.
 - **JSON-RPC + gRPC**: response shapes match java-tron's. Deliberate
   deviations (e.g. `createtransaction` permissiveness, `getaccount`
