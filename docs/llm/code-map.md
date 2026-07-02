@@ -17,13 +17,15 @@
 | Block or transaction ID/root mismatch | `crates/tron-types/src/` |
 | Store codec/session/rollback issue | `crates/tron-chainbase/src/` |
 | Contract actuator behavior | `crates/tron-actuator/src/` |
+| DPoS consensus: witness schedule, maintenance, reward, proposals, slot timing | `crates/tron-consensus/src/` (`maintenance.rs`, `proposals.rs`, `slot.rs`, `producer.rs`, `sr_epoch.rs`) |
 | Block apply or Block-STM | `crates/tron-executor/src/lib.rs` |
 | TVM/precompile/energy issue | `crates/tron-tvm/src/` |
 | P2P framing/discovery | `crates/tron-net/src/` |
-| Sync/reorg/fetch/inbound serving | `crates/tron-node/src/sync.rs`, `fetch_block.rs`, `inbound.rs` |
+| Sync/reorg/fetch/inbound serving | `crates/tron-node/src/sync.rs`, `fetch_block.rs`, `inbound.rs`; fork-choice + reorg tree in `crates/tron-consensus/src/khaos.rs`, `fork_choice.rs` |
 | Config parsing/defaults | `crates/tron-node/src/config.rs` |
 | Node command-line behavior | `crates/tron-node/src/main.rs` |
 | Snapshot import/export | `crates/tron-node/src/snapshot_import.rs`, `snapshot_export.rs` |
+| Convert a java-tron LevelDB snapshot to RocksDB | `crates/tron-snapshot-convert/` (standalone `tron-snapshot-convert` binary; keeps the LevelDB dependency out of `tron-node`) |
 | Admin DB tools | `crates/tron-node/src/admin.rs`, `main.rs` admin subcommands |
 | JSON-RPC/REST behavior | `crates/tron-rpc/src/` |
 | gRPC behavior | `crates/tron-grpc/src/` |
@@ -33,6 +35,8 @@
 | Event subscription | `crates/tron-eventer/src/`, `crates/tron-node/src/event_loader.rs` |
 | Wallet CLI | `crates/tron-wallet/src/bin/tron-wallet.rs` |
 | State parity diff | `crates/tron-state-diff/src/main.rs`, `crates/tron-state-diff/README.md` |
+| Block-stream fixtures (generate/validate; crypto+proto+types harness) | `crates/tron-replay/src/main.rs` |
+| Live mainnet / mempool feed dashboards | `crates/tron-node/src/explore.rs` (`--explore`), `mempool_explore.rs` (`--mempool`) |
 
 ## Important `tron-node/src` Files
 

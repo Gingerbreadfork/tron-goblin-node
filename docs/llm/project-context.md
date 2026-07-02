@@ -11,8 +11,11 @@ mempool, and operational tooling.
 - Pre-release and experimental.
 - Can sync public mainnet from java-tron RocksDB snapshots, apply blocks, hold
   live tip in tested sessions, and compute canonical block hashes.
-- Block-STM parallel execution is optional and must remain byte-identical to the
-  serial path.
+- Can import a java-tron LevelDB snapshot via the bundled `tron-snapshot-convert`
+  tool, and build/sign/broadcast local transactions relayed to mainnet peers
+  (wallet CLI).
+- Block-STM parallel execution is optional (on by default during bulk sync, off
+  at the tip) and must remain byte-identical to the serial path.
 - Major remaining risks include long-running mainnet soak and residual
   java-tron edge-case parity.
 

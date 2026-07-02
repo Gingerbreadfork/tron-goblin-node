@@ -34,6 +34,9 @@ Use this when making code changes in `tron-goblin-node`.
 - Are java-tron default omissions and protobuf encoding quirks respected?
 - Is there any change to block ID, tx ID, Merkle root, or account-state root
   computation?
+- Does it affect DPoS scheduling — witness ranking/tie-break, vote tally, reward,
+  or maintenance accounting? These paths are era/proposal-gated; match java-tron's
+  gate exactly (behavior differs before/after specific proposals).
 
 ## Config Change Checklist
 
