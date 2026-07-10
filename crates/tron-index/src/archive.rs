@@ -631,26 +631,38 @@ impl ArchiveWriter {
     // -- retention / windowing --------------------------------------------
 
     /// Retention entry point the runtime calls on a timer. Given the
-    /// current chain `head` and a `retain_blocks` window, compute the
-    /// floor `head - retain_blocks` (saturating, and never above
-    /// `head`) and prune below it. `retain_blocks == 0` keeps only the
-    /// head's snapshot; a window wider than the covered range is a
-    /// no-op. Returns `None` when capture has not started yet (no
-    /// coverage to prune).
+    /// current chain `head`, a `retain_blocks` window, and the
+    /// `solidified` (irreversible) height, compute the floor
+    /// `head - retain_blocks` (saturating, and never above `head`),
+    /// clamp it to `solidified`, and prune below it. `retain_blocks == 0`
+    /// keeps only the solidified head's snapshot; a window wider than the
+    /// covered range is a no-op. Returns `None` when capture has not
+    /// started yet (no coverage to prune).
     ///
-    /// The engine stays config-agnostic — the caller supplies both the
-    /// head and the window; **full-history mode is simply never calling
-    /// this.**
+    /// **Why clamp to `solidified`.** The floor's anchor is re-pinned as
+    /// the coverage base. If the floor sat at an unsolidified (reorg-able)
+    /// height, that re-pin could carry a value from a block that is later
+    /// orphaned; the reorg unwind deletes only ring-tracked rows, not the
+    /// re-pin, so a read at `>= floor` would serve the orphaned value
+    /// forever. Keeping the floor at or below the irreversible head makes
+    /// the anchor un-orphanable. (With the default multi-million-block
+    /// window the floor is already far below `solidified`; the clamp only
+    /// bites for very small retention windows, e.g. `retain_blocks == 0`.)
+    ///
+    /// The engine stays config-agnostic — the caller supplies the head,
+    /// the window, and the solidified height; **full-history mode is
+    /// simply never calling this.**
     pub fn prune_for_window(
         &self,
         head: i64,
         retain_blocks: u64,
+        solidified: i64,
     ) -> Result<Option<PruneStats>, IndexError> {
         if self.head()?.is_none() {
             return Ok(None);
         }
         let retain = i64::try_from(retain_blocks).unwrap_or(i64::MAX);
-        let floor = head.saturating_sub(retain).max(0);
+        let floor = head.saturating_sub(retain).min(solidified).max(0);
         self.prune_below(floor).map(Some)
     }
 
@@ -1478,22 +1490,40 @@ mod tests {
         for h in 1..=100 {
             apply(&w, &mut model, h, &[(key(1), Some(vec![h as u8]))]);
         }
-        // Window of 40 blocks at head 100 → floor 60.
-        let s = w.prune_for_window(100, 40).unwrap().unwrap();
+        // Window of 40 blocks at head 100 (solidified 100) → floor 60.
+        let s = w.prune_for_window(100, 40, 100).unwrap().unwrap();
         assert!(!s.noop);
         assert_eq!(w.coverage().unwrap().unwrap().0, 60);
 
         // Window wider than the covered range → floor clamps at 0,
         // which is <= base (now 60) → no-op.
-        let wide = w.prune_for_window(100, 1_000).unwrap().unwrap();
+        let wide = w.prune_for_window(100, 1_000, 100).unwrap().unwrap();
         assert!(wide.noop);
         assert_eq!(w.coverage().unwrap().unwrap().0, 60);
     }
 
     #[test]
+    fn prune_for_window_clamps_floor_to_solidified() {
+        let w = writer();
+        let mut model = HashMap::new();
+        for h in 1..=100 {
+            apply(&w, &mut model, h, &[(key(1), Some(vec![h as u8]))]);
+        }
+        // retain_blocks = 0 would put the floor at head 100, but the
+        // solidified head is 90 — the floor must clamp to 90 so the re-pinned
+        // anchor sits at an irreversible height, never a reorg-able one.
+        let s = w.prune_for_window(100, 0, 90).unwrap().unwrap();
+        assert!(!s.noop);
+        assert_eq!(w.coverage().unwrap().unwrap().0, 90);
+        // Reads at and above the clamped floor still resolve exactly.
+        assert_eq!(w.reader().value_at(STORE, &key(1), 95).unwrap(), val(&[95]));
+        assert_eq!(w.reader().value_at(STORE, &key(1), 90).unwrap(), val(&[90]));
+    }
+
+    #[test]
     fn prune_for_window_before_capture_is_none() {
         let w = writer();
-        assert_eq!(w.prune_for_window(100, 10).unwrap(), None);
+        assert_eq!(w.prune_for_window(100, 10, 100).unwrap(), None);
     }
 
     /// Many keys + a tight chunk-spanning prune: exercises group

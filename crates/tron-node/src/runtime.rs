@@ -775,6 +775,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             if let Some(archive) = parts.archive.as_ref() {
                 let prune_writer = archive.writer.clone();
                 let retain = config.index.archive.retain_blocks;
+                let prune_dyn_props = stores.dyn_props.clone();
                 let mut sd_prune = shutdown.subscribe();
                 handles.push(tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(Duration::from_secs(600));
@@ -787,7 +788,15 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                                     Ok(Some((_, head))) => head,
                                     _ => continue,
                                 };
-                                match prune_writer.prune_for_window(head, retain) {
+                                // Clamp the prune floor to the irreversible head
+                                // so a re-pinned anchor can never carry a value
+                                // from a reorg-able block.
+                                let solidified = tron_chainbase::DynamicPropertiesStore::new(
+                                    prune_dyn_props.clone(),
+                                )
+                                .latest_solidified_block_num()
+                                .unwrap_or(0);
+                                match prune_writer.prune_for_window(head, retain, solidified) {
                                     Ok(Some(stats)) if !stats.noop => info!(
                                         rows_deleted = stats.rows_deleted,
                                         rows_repinned = stats.rows_repinned,
