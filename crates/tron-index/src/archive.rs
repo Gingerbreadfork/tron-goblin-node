@@ -704,6 +704,29 @@ impl ArchiveWriter {
             return Ok(stats);
         }
 
+        // Advance the durable coverage base to `floor` BEFORE deleting any
+        // version rows. At-height reads run lock-free and validate coverage
+        // (base ≤ H ≤ head) with a `base_height` read that is separate from
+        // the row read, so the two orderings differ sharply:
+        //   * base LAST  (old behavior): throughout the delete pass the base
+        //     still admits H ∈ [old_base, floor) while those rows are being
+        //     deleted — a read lands past the deleted anchor, resolves
+        //     `NotCovered`, and serves the LIVE value as exact history. A
+        //     crash mid-pass froze that state until the next pass.
+        //   * base FIRST (here): a read (or a crash) can only ever
+        //     UNDER-claim — H < floor is rejected as out-of-coverage while
+        //     its rows may still physically exist, which is safe.
+        // Re-prune stays idempotent: the next pass runs a higher rolling
+        // floor, which still sweeps any rows a crashed pass left behind, and
+        // an unrepinned anchor below `floor` reads correctly from its
+        // original (lower-height) row until then.
+        self.backend.write_batch(&[WriteOp::Put(
+            meta_key(b"base_height"),
+            floor.to_be_bytes().to_vec(),
+        )])?;
+        self.backend.sync_wal()?;
+        stats.base_after = floor;
+
         // Stream every version row in byte order, grouping by the
         // (store ‖ escaped-key) prefix. Within a group rows are
         // newest-first; the first row with height <= floor is the
@@ -783,23 +806,17 @@ impl ArchiveWriter {
         Ok(stats)
     }
 
-    /// Flush the final delete/re-pin batch together with the advanced
-    /// coverage base, then fsync. Bundling the base advance into the
-    /// last batch keeps the on-disk base from ever claiming coverage
-    /// (`base = floor`) the rows don't yet back.
+    /// Flush the final delete/re-pin batch, then fsync. The coverage base
+    /// was already advanced to `floor` (durably) at the start of the pass,
+    /// so this only has to make the row deletions durable.
     fn commit_prune(
         &self,
-        mut ops: Vec<WriteOp>,
+        ops: Vec<WriteOp>,
         floor: i64,
         stats: &mut PruneStats,
     ) -> Result<(), IndexError> {
-        ops.push(WriteOp::Put(
-            meta_key(b"base_height"),
-            floor.to_be_bytes().to_vec(),
-        ));
         self.backend.write_batch(&ops)?;
         self.backend.sync_wal()?;
-        stats.base_after = floor;
         self.counters.prune_passes.fetch_add(1, Ordering::Relaxed);
         self.counters
             .pruned_rows

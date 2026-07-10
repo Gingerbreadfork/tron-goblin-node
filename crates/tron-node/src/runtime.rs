@@ -757,10 +757,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
 
         // Rolling-window retention for the historical-state archive: prune
         // archived versions older than the configured window on a timer.
-        // `prune_for_window` clamps the floor to the live head, and
-        // ArchiveWriter serializes its writes (RocksDB backend + inner
-        // Mutex), so this runs safely alongside per-block capture. Full mode
-        // (and the raw capture_state_deltas flag) never prune.
+        // `prune_for_window` clamps the floor to the live head. Prune runs
+        // off the apply path (this detached timer, no capture lock) and
+        // concurrently with lock-free at-height reads; correctness rests on
+        // `prune_below` advancing the durable coverage base to the floor
+        // BEFORE deleting any rows, so a concurrent read can only under-claim
+        // (reject a still-present height), never serve a deleted height's
+        // live value as history. Capture writes only version rows at the head
+        // (heights above the floor) plus the head pin, a keyspace disjoint
+        // from what prune deletes. Full mode (and the raw
+        // capture_state_deltas flag) never prune.
         if config.index.archive.enabled
             && config.index.archive.mode == crate::config::ArchiveMode::Rolling
         {
