@@ -595,3 +595,137 @@ fn firehose_repairs_and_unwinds_over_rocksdb_stores() {
     let _w = open();
     assert_eq!(entries().last(), Some(&('U', 3)), "startup unwind to the recovered head");
 }
+
+/// Firehose reconciliation is block-id-aware, not height-only, over the
+/// real on-disk stores: when a tip reorg replaces the head block's
+/// canonical id in RocksDB but a crash lost the log's UNWIND + re-apply
+/// before fsync, the log head is left on the abandoned branch at the SAME
+/// height as consensus. A height-only check would treat that as a no-op
+/// and strand consumers on the orphan. Open must compare the recorded
+/// block id to the on-disk canonical id and UNWIND to the solidified
+/// last-common height.
+#[test]
+fn firehose_open_unwinds_equal_height_reorg_over_rocksdb_stores() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let log_dir = dir.join("firehose");
+    std::fs::create_dir_all(&log_dir).unwrap();
+
+    let blocks = rocks(dir, "block");
+    let block_index = rocks(dir, "block-index");
+    let txret = rocks(dir, "transactionRetStore");
+    let dyn_props = rocks(dir, "properties");
+
+    let make_block = |height: i64, fork: u8| -> (Block, BlockId, TransactionRet) {
+        let c = tron_proto::TransferContract {
+            owner_address: vec![0x41; 21],
+            to_address: vec![0x42; 21],
+            amount: height * 10,
+        };
+        let tx = Transaction {
+            raw_data: Some(TxRaw {
+                contract: vec![TxContract {
+                    r#type: ContractType::TransferContract as i32,
+                    parameter: Some(Any { type_url: String::new(), value: c.encode_to_vec() }),
+                    ..Default::default()
+                }],
+                data: vec![height as u8, fork],
+                ..Default::default()
+            }),
+            ret: vec![tron_proto::transaction::Result {
+                contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tx_id = tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
+        let block = Block {
+            transactions: vec![tx],
+            block_header: Some(BlockHeader {
+                raw_data: Some(tron_proto::block_header::Raw {
+                    number: height,
+                    timestamp: 1_700_000_000_000 + height * 3000,
+                    witness_address: vec![fork; 21],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let id = block_id_from_block(&block).unwrap();
+        let ret = TransactionRet {
+            block_number: height,
+            block_time_stamp: 1_700_000_000_000 + height * 3000,
+            transactioninfo: vec![TransactionInfo {
+                id: tx_id.to_vec(),
+                block_number: height,
+                ..Default::default()
+            }],
+        };
+        (block, id, ret)
+    };
+    let persist = |block: &Block, id: &BlockId, ret: &TransactionRet| {
+        BlockStore::new(blocks.clone()).put(id, block).unwrap();
+        BlockIndexStore::new(block_index.clone()).put(id).unwrap();
+        TransactionRetStore::new(txret.clone()).put(id.num() as i64, ret).unwrap();
+        let dp = DynamicPropertiesStore::new(dyn_props.clone());
+        if dp.latest_block_header_number().unwrap_or(0) < id.num() as i64 {
+            dp.save_latest_block_header_number(id.num() as i64);
+        }
+    };
+    let open = || {
+        FirehoseWriter::open(
+            &log_dir,
+            u64::MAX,
+            blocks.clone(),
+            block_index.clone(),
+            txret.clone(),
+            dyn_props.clone(),
+        )
+        .unwrap()
+    };
+    let entries = || -> Vec<(char, i64)> {
+        tron_index::FirehoseLogReader::new(log_dir.clone())
+            .read_from(1, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| match fh::Entry::decode(p.as_slice()).unwrap().event {
+                Some(fh::entry::Event::Apply(a)) => ('A', a.height),
+                Some(fh::entry::Event::Unwind(u)) => ('U', u.to_height),
+                None => ('?', 0),
+            })
+            .collect()
+    };
+
+    // Blocks 1-4 on the original branch (fork 0); then the firehose closes
+    // with its head at APPLY(4, B).
+    {
+        let w = open();
+        for h in 1..=4 {
+            let (block, id, ret) = make_block(h, 0);
+            persist(&block, &id, &ret);
+            w.on_block_applied(&block, &id, &ret).unwrap();
+        }
+    }
+    assert_eq!(entries(), vec![('A', 1), ('A', 2), ('A', 3), ('A', 4)]);
+
+    // Solidified head sits below the fork point.
+    DynamicPropertiesStore::new(dyn_props.clone()).save_latest_solidified_block_num(2);
+
+    // The lost reorg: height 4's canonical id is overwritten on disk with
+    // B′ (fork 1), but the consensus head stays at 4 — equal to the log
+    // head. The log still records the old-branch id.
+    let (b4b, id4b, ret4b) = make_block(4, 1);
+    let (_, id4a, _) = make_block(4, 0);
+    assert_ne!(id4a.as_bytes(), id4b.as_bytes(), "the two branches' height-4 ids differ");
+    persist(&b4b, &id4b, &ret4b);
+
+    // Reopen: id-aware reconciliation detects the orphaned head and unwinds
+    // to the solidified last-common height (2), not a no-op and not N-1 (3).
+    let w = open();
+    assert_eq!(
+        entries().last(),
+        Some(&('U', 2)),
+        "equal-height abandoned-branch head unwinds to the solidified last-common height"
+    );
+    assert_eq!(w.counters().unwinds.load(std::sync::atomic::Ordering::Relaxed), 1);
+}

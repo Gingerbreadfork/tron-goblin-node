@@ -765,4 +765,102 @@ mod tests {
         rig.apply(&w, 4);
         assert_eq!(heights(&rig.entries())[6], ('A', 4));
     }
+
+    /// A log head at `APPLY(N, B)` whose canonical id at height N is a
+    /// DIFFERENT id B′ marks an abandoned branch: a tip reorg replaced
+    /// block N and the executor committed B′ durably, but a crash landed
+    /// before the log's UNWIND + APPLY(B′) were fsynced, so the torn tail
+    /// was truncated and the log head is still the old-branch APPLY(N).
+    /// Heights are equal, so a height-only reconciliation sees a no-op and
+    /// would strand consumers on the orphaned block forever. Comparing the
+    /// recorded block id to the canonical id catches it; open() must UNWIND
+    /// to the last provably-common (solidified) height. When the ids match
+    /// (no reorg) there is nothing to reconcile and open() stays a no-op.
+    #[test]
+    fn open_unwinds_equal_height_log_head_on_abandoned_branch() {
+        // Divergent branch: the canonical id at the head height is
+        // swapped out from under a log head that still records the old id.
+        let rig = Rig::new("branch-swap");
+        {
+            let w = rig.open();
+            for h in 1..=5 {
+                rig.apply(&w, h);
+            }
+        }
+        // The solidified/irreversible head is at or below the true fork
+        // point — the last height provably common to both branches.
+        DynamicPropertiesStore::new(rig.dyn_props.clone()).save_latest_solidified_block_num(3);
+        // The lost reorg: height 5's canonical id becomes B′, but the
+        // consensus head stays at 5, so heights still match.
+        let (b5b, id5b, ret5b) = rig.make_block(5, 1);
+        let (_, id5a, _) = rig.make_block(5, 0);
+        assert_ne!(
+            id5a.as_bytes(),
+            id5b.as_bytes(),
+            "the two branches' height-5 ids must differ for the swap to be meaningful"
+        );
+        rig.persist(&b5b, &id5b, &ret5b);
+
+        let w = rig.open();
+        // UNWIND to the solidified height (3), NOT the N-1 fallback (4) and
+        // NOT a no-op: this proves reconciliation used the solidified
+        // last-common height, not merely the equal-height comparison.
+        assert_eq!(
+            heights(&rig.entries()).last().copied(),
+            Some(('U', 3)),
+            "abandoned-branch head unwinds to the solidified last-common height"
+        );
+        assert_eq!(w.counters().unwinds.load(Ordering::Relaxed), 1);
+        drop(w);
+
+        // Control: identical shape, but the canonical id at the head
+        // height still equals what the log recorded (no reorg happened).
+        let rig2 = Rig::new("branch-match");
+        {
+            let w = rig2.open();
+            for h in 1..=5 {
+                rig2.apply(&w, h);
+            }
+        }
+        DynamicPropertiesStore::new(rig2.dyn_props.clone()).save_latest_solidified_block_num(3);
+        let before = rig2.entries().len();
+        let w2 = rig2.open();
+        assert_eq!(
+            rig2.entries().len(),
+            before,
+            "matching ids at equal heights: no reconciliation entry appended"
+        );
+        assert_eq!(w2.counters().unwinds.load(Ordering::Relaxed), 0);
+    }
+
+    /// A non-empty log whose head is above the recovered consensus head,
+    /// combined with NO consensus head at all, means the firehose
+    /// directory survived a wiped or replaced data directory. Auto-emitting
+    /// `UNWIND(0)` would tell every consumer to delete all derived data, so
+    /// open() must refuse rather than silently reconcile to nothing.
+    #[test]
+    fn open_refuses_a_log_head_above_an_absent_consensus_head() {
+        let rig = Rig::new("mismatch-dir");
+        {
+            let w = rig.open();
+            for h in 1..=5 {
+                rig.apply(&w, h);
+            }
+        }
+        // Reopen against a fresh/empty state store: no latest block header
+        // number, so the consensus head reads as absent.
+        let empty_dyn_props = mem();
+        let res = FirehoseWriter::open(
+            &rig.dir,
+            u64::MAX,
+            rig.blocks.clone(),
+            rig.block_index.clone(),
+            rig.txret.clone(),
+            empty_dyn_props,
+        );
+        assert!(
+            matches!(res, Err(IndexError::Corrupt(_))),
+            "a log head above an absent consensus head must refuse to open, not auto-UNWIND"
+        );
+    }
 }
