@@ -92,10 +92,14 @@ fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, IndexError> {
 /// per valid frame. Returns the `(next_seq, byte_offset)` just past
 /// the last valid frame visited — the truncation point for a torn
 /// tail, and the resume position for offset-based tailing. Stops at
-/// the first invalid frame or when `visit` returns false.
+/// the first invalid frame, when `visit` returns false, or — without
+/// reading (or counting) the frame — before a seq past `max_seq`, so
+/// the returned position is the exact resume point for a bounded
+/// read.
 fn scan_segment_from(
     path: &Path,
     start: (u64, u64),
+    max_seq: u64,
     mut visit: impl FnMut(u64, Vec<u8>) -> bool,
 ) -> Result<(u64, u64), IndexError> {
     let mut f = File::open(path).map_err(|e| IndexError::Io(format!("open {path:?}: {e}")))?;
@@ -112,6 +116,9 @@ fn scan_segment_from(
     }
     let mut header = [0u8; FRAME_HEADER];
     loop {
+        if seq > max_seq {
+            break;
+        }
         match f.read_exact(&mut header) {
             Ok(()) => {}
             Err(_) => break, // clean EOF or torn header
@@ -185,7 +192,7 @@ impl FirehoseLogReader {
             if out.len() >= limit {
                 break;
             }
-            scan_segment_from(&path, (first_seq, 8), |seq, payload| {
+            scan_segment_from(&path, (first_seq, 8), u64::MAX, |seq, payload| {
                 if seq >= from_seq {
                     out.push((seq, payload));
                 }
@@ -236,10 +243,14 @@ impl FirehoseLogReader {
                 }
                 _ => (*first_seq, 8),
             };
-            let scan = scan_segment_from(path, start, |seq, payload| {
-                if seq > up_to {
-                    return false;
-                }
+            // Bound the scan at `up_to` INSIDE the scanner: frames past the
+            // bound (appended but not yet durable) are neither read nor
+            // counted, so the returned position resumes exactly at
+            // `up_to + 1` — the seq the caller comes back with. Consuming
+            // the first out-of-bound frame instead would make the position
+            // overshoot, fail the resume match, and force a full segment
+            // rescan on every read that races the writer.
+            let scan = scan_segment_from(path, start, up_to, |seq, payload| {
                 if seq >= from_seq {
                     out.push((seq, payload));
                 }
@@ -269,7 +280,7 @@ impl FirehoseLogReader {
         let segments = list_segments(&self.dir)?;
         for (first_seq, path) in segments.into_iter().rev() {
             let mut last: Option<(u64, Vec<u8>)> = None;
-            scan_segment_from(&path, (first_seq, 8), |seq, payload| {
+            scan_segment_from(&path, (first_seq, 8), u64::MAX, |seq, payload| {
                 last = Some((seq, payload));
                 true
             })?;
@@ -365,7 +376,7 @@ impl FirehoseLogWriter {
                 f.sync_all().ok();
                 (seg_first_seq, 8)
             } else {
-                scan_segment_from(&path, (seg_first_seq, 8), |_, _| true)?
+                scan_segment_from(&path, (seg_first_seq, 8), u64::MAX, |_, _| true)?
             }
         } else {
             let mut f = File::create(&path)
@@ -690,6 +701,12 @@ mod tests {
         // Resume by offset — and the bound holds.
         let (chunk, pos) = r.read_chunk(4, 4, 10, Some(pos)).unwrap();
         assert_eq!(chunk.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![4]);
+        // A bound-stop must NOT consume the first frame past the bound
+        // (entries 5..6 are on disk): the position resumes at exactly
+        // `up_to + 1`, the seq the caller comes back with — otherwise the
+        // resume match fails and every bounded read that races the writer
+        // degrades to a full segment rescan.
+        assert_eq!(pos.expect("position for resume").next_seq, 5);
 
         // The bound advances; new entries appended later are picked up
         // from the same position.
