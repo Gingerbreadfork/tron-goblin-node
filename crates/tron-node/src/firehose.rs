@@ -106,7 +106,15 @@ impl FirehoseWriter {
         // independent conditions force an UNWIND; a height comparison alone
         // catches only the first:
         //   (1) the log is AHEAD of the recovered head — power loss rolled the
-        //       chain back below what the log already emitted.
+        //       chain back below what the log already emitted. Unwinding to
+        //       the recovered head alone is not enough: the same crash may
+        //       also have truncated a reorg's UNWIND + re-APPLY entries, so
+        //       the log's record AT the recovered head height can itself be
+        //       on an abandoned branch (and nothing later would retract it —
+        //       the next apply extends the head, so neither the reorg path
+        //       nor gap repair fires). Unwind to the solidified height, which
+        //       is at or below any fork point; the dropped canonical blocks
+        //       re-derive from the stores on the next apply.
         //   (2) the log head sits at (or below) the consensus head but on an
         //       ABANDONED branch: a tip reorg replaced block N, the executor
         //       committed N′ durably, but a crash landed before the log's
@@ -142,7 +150,13 @@ impl FirehoseWriter {
                      firehose directory to reset it."
                 )));
             }
-            Some(consensus_head)
+            // Provably-common ground, not just the recovered head: the height
+            // comparison cannot tell whether the log's entry at consensus_head
+            // survived the fork. Without a readable solidified mark, fall back
+            // to the recovered head itself.
+            let solidified = DynamicPropertiesStore::new(dyn_props.clone())
+                .latest_solidified_block_num();
+            Some(solidified.map(|s| s.min(consensus_head)).unwrap_or(consensus_head))
         } else if head_height >= 0 {
             let canonical = BlockIndexStore::new(block_index.clone())
                 .get(head_height)
@@ -764,6 +778,54 @@ mod tests {
         // Re-applying 4 continues normally (no extra unwind).
         rig.apply(&w, 4);
         assert_eq!(heights(&rig.entries())[6], ('A', 4));
+    }
+
+    /// A log AHEAD of the recovered consensus head must unwind to the
+    /// solidified height, not merely to the recovered head: the crash that
+    /// rolled the chain back may also have truncated a reorg's UNWIND +
+    /// re-APPLY entries, leaving the log's record AT the recovered head
+    /// height on the abandoned branch. An `UNWIND(consensus_head)` would
+    /// keep that orphaned block forever — the next apply extends the head,
+    /// so neither the reorg path nor gap repair ever retracts it. Unwinding
+    /// to solidified (at or below any fork point) drops it, and the
+    /// canonical branch re-derives from the stores on the next apply.
+    #[test]
+    fn open_unwinds_ahead_log_to_the_solidified_height() {
+        let rig = Rig::new("ahead-solid");
+        {
+            let w = rig.open();
+            for h in 1..=5 {
+                rig.apply(&w, h);
+            }
+        }
+        let dp = DynamicPropertiesStore::new(rig.dyn_props.clone());
+        dp.save_latest_solidified_block_num(3);
+        // The lost reorg + rollback: height 4's canonical id becomes B′ and
+        // the recovered consensus head is 4, while the log head is still the
+        // old-branch APPLY(5).
+        let (b4b, id4b, ret4b) = rig.make_block(4, 1);
+        rig.persist(&b4b, &id4b, &ret4b);
+        dp.save_latest_block_header_number(4);
+
+        let w = rig.open();
+        assert_eq!(
+            heights(&rig.entries()).last().copied(),
+            Some(('U', 3)),
+            "ahead log unwinds to the solidified height, not the recovered head"
+        );
+
+        // The next apply gap-repairs the canonical branch above the unwind:
+        // height 4 re-derives as B′ before height 5 appends.
+        let (b5b, id5b, ret5b) = rig.make_block(5, 1);
+        rig.persist(&b5b, &id5b, &ret5b);
+        w.on_block_applied(&b5b, &id5b, &ret5b).unwrap();
+        let entries = rig.entries();
+        assert_eq!(
+            heights(&entries),
+            vec![('A', 1), ('A', 2), ('A', 3), ('A', 4), ('A', 5), ('U', 3), ('A', 4), ('A', 5)]
+        );
+        let Some(fh::entry::Event::Apply(a)) = &entries[6].event else { panic!() };
+        assert_eq!(a.block_id, id4b.as_bytes().to_vec(), "height 4 repairs to the canonical branch");
     }
 
     /// A log head at `APPLY(N, B)` whose canonical id at height N is a
