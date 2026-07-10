@@ -65,6 +65,22 @@ const TXINFO_WAIT_MARGIN: i64 = 1;
 /// poll cadence this is ~5 minutes.
 const TXINFO_WAIT_MAX_ATTEMPTS: u32 = 100;
 
+/// Safety valve for a hole in the canonical block index at the forward
+/// edge (`cursor + 1`). A brief gap is normal — the block store is still
+/// writing that height — so the follower parks and retries quietly. A
+/// hole that persists this many consecutive ticks is durable store
+/// damage the forward edge cannot route around (unlike the backward
+/// edge, it can never raise a floor past unindexed *live* heights), so
+/// the follower escalates once to the disposable-index rebuild remedy.
+/// At the 3s park cadence this is ~5 minutes.
+const FORWARD_HOLE_MAX_ATTEMPTS: u32 = 100;
+
+/// Per-park bound on the stranded-ring reclaim sweep. Downtime longer
+/// than the ring depth strands old `id_at/` / `keys_at/` entries below
+/// the live window (the per-block prune only trims one height per
+/// block); the sweep drains them across parks in batches this size.
+const RING_SWEEP_LIMIT: usize = 50_000;
+
 /// Engine tuning. The node's `[index.backfill]` config maps onto this.
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
@@ -167,6 +183,13 @@ struct EngineInner {
     /// `(height, consecutive waits)` for the missing-txinfo boundary —
     /// the safety valve's memory.
     txinfo_wait: Option<(i64, u32)>,
+    /// `(height, consecutive stalls)` for a forward-edge block-index
+    /// hole — de-dupes the operator warning and drives the escalation to
+    /// a rebuild signal once the hole proves persistent.
+    forward_hole: Option<(i64, u32)>,
+    /// Whether the one-time startup sweep of ring entries stranded below
+    /// the live window has completed. Runs when parking.
+    ring_swept: bool,
 }
 
 /// The follower engine. `tick()` is the entire control surface — the
@@ -226,6 +249,8 @@ impl IndexEngine {
                 windows_since_sync: 0,
                 dirty: false,
                 txinfo_wait: None,
+                forward_hole: None,
+                ring_swept: false,
             }),
         }
     }
@@ -308,7 +333,12 @@ impl IndexEngine {
             // would otherwise stamp the cursor id.
             let cursor0_id = match self.bi().get(cursor0) {
                 Ok(id) => Some(*id.as_bytes()),
-                Err(_) => None,
+                // Only a genuine absence leaves the id unarmed; a real
+                // store error must propagate, never be mistaken for "no
+                // id" (which would silently disarm reorg detection for
+                // the head-first backward phase).
+                Err(StoreError::NotFound) => None,
+                Err(e) => return Err(e.into()),
             };
             let mut ops = vec![
                 IndexDb::floor_put_op(floor),
@@ -350,7 +380,34 @@ impl IndexEngine {
             inner.dirty = false;
             inner.windows_since_sync = 0;
         }
+        let sweep = !inner.ring_swept;
+        drop(inner);
+        if sweep {
+            self.sweep_stranded_ring(head_raw)?;
+        }
         Ok(Tick::Parked)
+    }
+
+    /// One-time reclaim of ring entries left below the live window by
+    /// downtime longer than the ring depth. The per-block prune only
+    /// trims the single height leaving the window each block, so a gap
+    /// wider than `ring_depth` strands everything below it forever
+    /// (space only — not a correctness fault). Bounded per park; repeats
+    /// across parks until drained, then latches off.
+    fn sweep_stranded_ring(&self, head_raw: i64) -> Result<(), IndexError> {
+        let threshold = head_raw - self.opts.ring_depth;
+        let pruned = self.db.prune_ring_below(threshold, RING_SWEEP_LIMIT)?;
+        if pruned < RING_SWEEP_LIMIT {
+            self.inner.lock().expect("index engine poisoned").ring_swept = true;
+        }
+        if pruned > 0 {
+            tracing::debug!(
+                pruned,
+                below = threshold,
+                "index: reclaimed stranded recent-ring entries"
+            );
+        }
+        Ok(())
     }
 
     /// Compare the recorded canonical id at the cursor height against
@@ -415,7 +472,15 @@ impl IndexEngine {
         // store's canonical id where nothing was indexed.
         let ancestor_id = match self.db.id_at(ancestor)? {
             Some(id) => Some(id),
-            None => self.bi().get(ancestor).ok().map(|c| *c.as_bytes()),
+            // Fall back to the store's canonical id where nothing was
+            // indexed — but only a genuine absence disarms detection; a
+            // real store error must propagate rather than leave the
+            // cursor id silently unset.
+            None => match self.bi().get(ancestor) {
+                Ok(c) => Some(*c.as_bytes()),
+                Err(StoreError::NotFound) => None,
+                Err(e) => return Err(e.into()),
+            },
         };
         ops.extend(IndexDb::cursor_put_ops(ancestor, ancestor_id));
         self.db.commit(&ops)?;
@@ -504,8 +569,11 @@ impl IndexEngine {
                     // A hole in the canonical index below the head is a
                     // store inconsistency; stop the window here and let
                     // the next tick retry (forward) — backward walks
-                    // treat it as the effective floor.
-                    tracing::warn!(height = h, "index: block-index hole; window truncated");
+                    // treat it as the effective floor. The operator-facing
+                    // signal is owned by the callers (`forward_hole` /
+                    // `backward_window`), which de-dupe and escalate; this
+                    // planner stays quiet to avoid per-tick spam.
+                    tracing::debug!(height = h, "index: block-index hole; window truncated");
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -518,8 +586,14 @@ impl IndexEngine {
     fn forward_window(&self, cursor: i64, head: i64, head_raw: i64) -> Result<Tick, IndexError> {
         let planned = self.plan_window(cursor + 1, head, 1)?;
         if planned.is_empty() {
-            return Ok(Tick::Parked);
+            // `cursor < head` but nothing could be planned: the canonical
+            // block index has a hole at `cursor + 1`. Distinguish a
+            // transient gap (retry quietly) from a persistent one (a
+            // one-time escalation to the rebuild remedy).
+            return self.forward_hole(cursor + 1);
         }
+        // Entries exist at the forward edge — clear any prior hole stall.
+        self.inner.lock().expect("index engine poisoned").forward_hole = None;
 
         // In-flight txinfo wait: a height the head has already moved
         // past has final txinfo (apply is serialized; the hook runs
@@ -593,6 +667,41 @@ impl IndexEngine {
         self.commit_window(ops)?;
         self.counters.blocks_indexed.fetch_add(indexed, Ordering::Relaxed);
         Ok(Tick::Forward { upto: last.0, blocks: indexed })
+    }
+
+    /// Handle a forward window blocked by a canonical block-index hole at
+    /// `at` (== `cursor + 1`). The forward edge cannot skip a live height
+    /// without leaving a permanent gap, so unlike the backward path it
+    /// has no floor to raise. Warn once when the stall begins, park and
+    /// retry quietly while the block store might still be catching up,
+    /// and — if the hole never fills — escalate exactly once to
+    /// [`IndexError::Corrupt`], whose handler stops the follower with the
+    /// delete-and-rebuild remedy. Silent per-tick spinning is what this
+    /// replaces.
+    fn forward_hole(&self, at: i64) -> Result<Tick, IndexError> {
+        let attempts = {
+            let mut inner = self.inner.lock().expect("index engine poisoned");
+            let n = match inner.forward_hole {
+                Some((h, n)) if h == at => n + 1,
+                _ => 1,
+            };
+            inner.forward_hole = Some((at, n));
+            n
+        };
+        if attempts == 1 {
+            tracing::warn!(
+                height = at,
+                "index: forward edge blocked by a canonical block-index hole; \
+                 retrying while the block store catches up"
+            );
+        }
+        if attempts >= FORWARD_HOLE_MAX_ATTEMPTS {
+            return Err(IndexError::Corrupt(format!(
+                "canonical block index has a persistent hole at height {at}; the forward \
+                 edge cannot advance past it"
+            )));
+        }
+        Ok(Tick::Parked)
     }
 
     fn backward_window(&self, back_edge: i64, floor: i64, head_raw: i64) -> Result<Tick, IndexError> {
