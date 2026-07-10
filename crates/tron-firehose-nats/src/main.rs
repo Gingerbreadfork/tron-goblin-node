@@ -59,7 +59,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    // Resume point: the newest message already in the stream.
+    // Resume point: the newest message already in the stream. Only a
+    // genuinely-empty stream (NoMessageFound) starts at 0. A transport /
+    // JetStream error must NOT be treated as empty: that re-tails from the
+    // oldest retained entry and bulk-republishes the whole log, which
+    // JetStream's short duplicate window cannot dedup — downstream would
+    // double-count everything. Fail instead so the supervisor restarts and
+    // retries the resume-point read.
+    use async_nats::jetstream::stream::LastRawMessageErrorKind;
     let cursor: u64 = match stream
         .get_last_raw_message_by_subject(&format!("{prefix}.>"))
         .await
@@ -67,7 +74,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(msg) => fh::Entry::decode(msg.payload.as_ref())
             .map(|e| e.seq)
             .unwrap_or(0),
-        Err(_) => 0, // empty stream
+        Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => 0, // empty stream
+        Err(e) => return Err(e.into()),
     };
     tracing::info!(node = %node_url, nats = %nats_url, stream = %stream_name, cursor,
         "bridging firehose into JetStream");

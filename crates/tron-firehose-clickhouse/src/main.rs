@@ -271,11 +271,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for ddl in SCHEMA {
         ch.query(ddl).execute().await?;
     }
+    // An empty cursor table legitimately returns 0 (ClickHouse max() over no
+    // rows of a non-nullable UInt is 0). A query/transport error must fail
+    // instead of silently becoming 0, which would re-tail from the oldest
+    // retained entry and bulk-republish the whole log; let the supervisor
+    // restart and retry the resume-point read.
     let cursor: u64 = ch
         .query("SELECT max(seq) FROM fh_cursor")
         .fetch_one::<u64>()
-        .await
-        .unwrap_or(0);
+        .await?;
     tracing::info!(node = %node_url, clickhouse = %ch_url, cursor,
         "tailing firehose into clickhouse");
 
