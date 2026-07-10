@@ -49,6 +49,20 @@ fn err_response(code: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<V
     (code, Json(json!({ "success": false, "error": msg.into(), "data": [] })))
 }
 
+/// Record an internal fault server-side and answer the client with a stable,
+/// generic 500 body. An inner error's `Display` text can carry store
+/// internals or filesystem paths, so it is logged via `tracing` for the
+/// operator and never surfaced to the caller — the same containment
+/// `rpc_error_response` gives `-32603` internal errors. `context` names the
+/// failing operation for the log only.
+fn internal_error_response(
+    context: &str,
+    detail: impl std::fmt::Display,
+) -> (StatusCode, Json<Value>) {
+    tracing::error!(error = %detail, "index API internal error: {context}");
+    err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+}
+
 /// Parse a TRON address path/query param: base58 `T…`, `41…` hex, or
 /// (`0x`-)20-byte hex.
 fn parse_tron_address(s: &str) -> Result<[u8; 21], String> {
@@ -344,7 +358,7 @@ async fn account_trc20(
     };
     let page = match reader.trc20_page(&addr, &query) {
         Ok(p) => p,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return internal_error_response("trc20_page", e),
     };
     // One resolution per DISTINCT token per request: token_info can run
     // up to three constant calls for an unresolved token, and a page
@@ -398,7 +412,7 @@ async fn account_trc721(
     };
     let page = match reader.trc721_page(&addr, &query) {
         Ok(p) => p,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return internal_error_response("trc721_page", e),
     };
     let mut token_memo: HashMap<[u8; 21], Value> = HashMap::new();
     let mut resolve_budget = TOKEN_RESOLVE_BUDGET;
@@ -446,7 +460,7 @@ async fn account_transactions(
     };
     let page = match reader.native_page(&addr, &query) {
         Ok(p) => p,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return internal_error_response("native_page", e),
     };
 
     // Hydrate full tx bodies from BlockStore — page-bounded (≤ limit
@@ -499,7 +513,7 @@ async fn account_internal(
     };
     let page = match reader.internal_page(&addr, &query) {
         Ok(p) => p,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return internal_error_response("internal_page", e),
     };
     let data: Vec<Value> = page
         .rows
@@ -612,7 +626,7 @@ async fn contract_events(
 
     let page = match reader.logs_page(&addr, topic0, &query) {
         Ok(p) => p,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return internal_error_response("logs_page", e),
     };
 
     // Hydrate topics/data from the block-keyed transaction-info, one
@@ -768,6 +782,20 @@ mod tests {
         assert_eq!(selector("name()"), [0x06, 0xfd, 0xde, 0x03]);
         assert_eq!(selector("symbol()"), [0x95, 0xd8, 0x9b, 0x41]);
         assert_eq!(selector("decimals()"), [0x31, 0x3c, 0xe5, 0x67]);
+    }
+
+    #[test]
+    fn internal_errors_are_sanitized_to_a_generic_body() {
+        // The inner detail (which can carry store internals or filesystem
+        // paths) must never reach the client body — the caller sees a stable
+        // generic message; the detail goes to the server log instead.
+        let (status, body) =
+            internal_error_response("unit", "rocksdb: /var/lib/tron/index corrupt at cf=logs");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let err = body.0["error"].as_str().unwrap();
+        assert_eq!(err, "internal server error");
+        assert!(!err.contains("rocksdb"), "leaked store internal: {err}");
+        assert!(!err.contains("/var/lib/tron"), "leaked filesystem path: {err}");
     }
 }
 
@@ -1155,7 +1183,7 @@ async fn archive_coverage(State(state): State<RpcState>) -> (StatusCode, Json<Va
                 "note": "archive enabled but no blocks captured yet",
             })),
         ),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => internal_error_response("archive coverage", e),
     }
 }
 
@@ -1378,7 +1406,7 @@ async fn commitment_root(State(state): State<RpcState>) -> (StatusCode, Json<Val
                 )
             }
         }
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => internal_error_response("commitment root", e),
     }
 }
 
@@ -1404,7 +1432,7 @@ async fn commitment_status(State(state): State<RpcState>) -> (StatusCode, Json<V
                 },
             })),
         ),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => internal_error_response("commitment status", e),
     }
 }
 
@@ -1440,7 +1468,7 @@ async fn commitment_proof(
     // the background builder folds a block during the walk.
     let (height, root, proof) = match reader.prove_consistent(store, &raw_key) {
         Ok(t) => t,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return internal_error_response("commitment proof", e),
     };
 
     let leaf_path = leaf_path_for(store, &raw_key);
