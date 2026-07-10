@@ -196,11 +196,17 @@ fn selector(sig: &str) -> [u8; 4] {
 /// to a `bytes32` short string for non-standard tokens.
 fn decode_abi_string(data: &[u8]) -> Option<String> {
     if data.len() >= 64 {
+        // `data` is contract-controlled: a hostile token can return any offset
+        // word. Use checked arithmetic throughout so a huge offset yields
+        // `None`, never a wrapping add that slips past a bounds guard into a
+        // panicking slice (`data[offset + 24..offset + 32]` with start > end).
         let offset = u64::from_be_bytes(data[24..32].try_into().ok()?) as usize;
-        if data.len() >= offset + 32 {
-            let len = u64::from_be_bytes(data[offset + 24..offset + 32].try_into().ok()?) as usize;
-            if len <= 1024 && data.len() >= offset + 32 + len {
-                return String::from_utf8(data[offset + 32..offset + 32 + len].to_vec()).ok();
+        let len_end = offset.checked_add(32)?;
+        if data.len() >= len_end {
+            let len = u64::from_be_bytes(data[len_end - 8..len_end].try_into().ok()?) as usize;
+            let str_end = len_end.checked_add(len)?;
+            if len <= 1024 && data.len() >= str_end {
+                return String::from_utf8(data[len_end..str_end].to_vec()).ok();
             }
         }
     }
@@ -689,6 +695,31 @@ fn transaction_to_json(tx: &tron_proto::Transaction) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_abi_string_rejects_hostile_offsets_without_panicking() {
+        // A well-formed dynamic string: offset=32, len=3, "abc".
+        let mut ok = vec![0u8; 96];
+        ok[31] = 32; // offset word = 32
+        ok[63] = 3; // length word = 3
+        ok[64..67].copy_from_slice(b"abc");
+        assert_eq!(decode_abi_string(&ok), Some("abc".to_string()));
+
+        // Hostile offset near usize::MAX: offset + 32 wraps in a release
+        // build; checked arithmetic must yield None, never a panicking slice.
+        let mut evil = vec![0u8; 64];
+        evil[24..32].copy_from_slice(&0xFFFF_FFFF_FFFF_FFE4u64.to_be_bytes());
+        assert_eq!(decode_abi_string(&evil), None);
+
+        // Offset just past the buffer, and an oversized length: both None.
+        let mut oob = vec![0u8; 64];
+        oob[31] = 200; // offset 200 > data.len()
+        assert_eq!(decode_abi_string(&oob), None);
+        let mut biglen = vec![0u8; 96];
+        biglen[31] = 32;
+        biglen[56..64].copy_from_slice(&u64::MAX.to_be_bytes()); // len = u64::MAX
+        assert_eq!(decode_abi_string(&biglen), None);
+    }
 
     #[test]
     fn decimal_rendering_handles_zero_small_and_u256_max() {
