@@ -49,6 +49,25 @@ impl Firehose for FirehoseService {
 
         tokio::spawn(async move {
             let mut next = from_seq;
+            // Reject a cursor ahead of the durable log head. `durable + 1` is
+            // allowed — a caught-up consumer legitimately waits for the next
+            // entry — but anything beyond means the log was reset/recreated
+            // (seqs restart lower) or the cursor is stale. Without this the
+            // stream parks in `wait_past` forever: it stays open, delivers
+            // nothing, and when seqs eventually catch up they name unrelated
+            // blocks.
+            let durable0 = handle.durable_seq();
+            if from_seq > durable0 + 1 {
+                let _ = tx
+                    .send(Err(Status::out_of_range(format!(
+                        "from_seq {from_seq} is ahead of the durable firehose head \
+                         {durable0} — the log was reset or the cursor is stale; resume \
+                         at {} or earlier",
+                        durable0 + 1
+                    ))))
+                    .await;
+                return;
+            }
             // Offset-resumable read position: a live tail seeks to the
             // new frames instead of rescanning (and re-CRC-ing) the
             // active segment from its start on every block.
