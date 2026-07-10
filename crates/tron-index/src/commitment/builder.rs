@@ -270,7 +270,26 @@ impl CommitmentBuilder {
                 );
                 self.run_bootstrap(cursor.anchor, Some(cursor))
             }
-            None => self.run_bootstrap(anchor_height, None),
+            None => {
+                // A fresh (non-resume) bootstrap must start from an EMPTY node
+                // store: run_bootstrap folds live keys additively and never
+                // wipes, so leftover leaves for keys deleted since a prior fold
+                // would survive and yield a permanently wrong root. We reach
+                // here only with no committed height; a non-empty tree on disk
+                // means the committed-height meta was lost over populated state.
+                // Refuse the additive bootstrap loudly rather than commit a
+                // silently-wrong root (the commitment is off the apply path, so
+                // this only stops the builder; the operator wipes the dir).
+                if self.smt.root() != EMPTY_ROOT {
+                    return Err(CommitmentError::Corrupt(
+                        "no committed height but a non-empty tree on disk \
+                         (committed-height meta lost?) — refusing an additive \
+                         bootstrap; wipe the commitment directory to re-Merkleize"
+                            .into(),
+                    ));
+                }
+                self.run_bootstrap(anchor_height, None)
+            }
         }
     }
 

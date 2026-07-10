@@ -114,31 +114,34 @@ impl CommitmentStore {
         CommitmentError::Backend(e.to_string())
     }
 
+    /// Read a fixed-width big-endian meta value. A **present** value of the
+    /// wrong length is a `Corrupt` error, NOT `None`: coercing it to `None`
+    /// (== "absent") would, for `committed_height`, silently trigger a fresh
+    /// additive bootstrap over a non-empty tree and produce a permanently
+    /// wrong root that nothing detects.
+    fn get_fixed<const N: usize>(&self, name: &[u8]) -> Result<Option<[u8; N]>, CommitmentError> {
+        match self.backend.get(&meta_key(name)).map_err(Self::be_err)? {
+            None => Ok(None),
+            Some(v) => <[u8; N]>::try_from(v.as_slice()).map(Some).map_err(|_| {
+                CommitmentError::Corrupt(format!(
+                    "commitment meta {} is {} bytes, expected {N}",
+                    String::from_utf8_lossy(name),
+                    v.len()
+                ))
+            }),
+        }
+    }
+
     fn get_u32(&self, name: &[u8]) -> Result<Option<u32>, CommitmentError> {
-        Ok(self
-            .backend
-            .get(&meta_key(name))
-            .map_err(Self::be_err)?
-            .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
-            .map(u32::from_be_bytes))
+        Ok(self.get_fixed::<4>(name)?.map(u32::from_be_bytes))
     }
 
     fn get_i64(&self, name: &[u8]) -> Result<Option<i64>, CommitmentError> {
-        Ok(self
-            .backend
-            .get(&meta_key(name))
-            .map_err(Self::be_err)?
-            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-            .map(i64::from_be_bytes))
+        Ok(self.get_fixed::<8>(name)?.map(i64::from_be_bytes))
     }
 
     fn get_u64(&self, name: &[u8]) -> Result<Option<u64>, CommitmentError> {
-        Ok(self
-            .backend
-            .get(&meta_key(name))
-            .map_err(Self::be_err)?
-            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-            .map(u64::from_be_bytes))
+        Ok(self.get_fixed::<8>(name)?.map(u64::from_be_bytes))
     }
 
     /// Check or stamp the on-disk format. Returns `true` when this is a fresh
@@ -424,6 +427,20 @@ mod tests {
         assert!(!s.check_or_init().unwrap(), "second open is clean");
         assert_eq!(s.committed_height().unwrap(), None);
         assert_eq!(s.root().unwrap(), EMPTY_ROOT);
+    }
+
+    #[test]
+    fn wrong_length_committed_height_meta_is_corrupt_not_absent() {
+        let s = store();
+        s.check_or_init().unwrap();
+        // Write a truncated (3-byte) committed_height value directly.
+        s.backend
+            .put(&meta_key(b"committed_height"), &[1, 2, 3])
+            .unwrap();
+        match s.committed_height() {
+            Err(CommitmentError::Corrupt(_)) => {}
+            other => panic!("expected Corrupt for a wrong-length meta, got {other:?}"),
+        }
     }
 
     #[test]
