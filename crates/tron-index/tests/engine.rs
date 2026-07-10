@@ -34,6 +34,7 @@ fn addr(b: u8) -> [u8; 21] {
 const ALICE: u8 = 0xaa;
 const BOB: u8 = 0xbb;
 const CAROL: u8 = 0xcc;
+const DAVE: u8 = 0xdd;
 const TOKEN: u8 = 0xee;
 
 fn transfer_tx(from: u8, to: u8, amount: i64, salt: u8) -> tron_proto::Transaction {
@@ -109,6 +110,33 @@ fn transfer_log(from: u8, to: u8, amount: u64) -> tron_proto::transaction_info::
         address: addr(TOKEN)[1..].to_vec(), // 20-byte VM form
         topics: vec![TRANSFER_TOPIC.to_vec(), topic_addr(&addr(from)), topic_addr(&addr(to))],
         data,
+    }
+}
+
+/// A TRC721 `Transfer(from, to, tokenId)` log (4 topics; `tokenId` in
+/// `topics[3]`, no data word) in stored transaction-info form.
+fn nft_transfer_log(from: u8, to: u8, token_id: u64) -> tron_proto::transaction_info::Log {
+    let mut id = vec![0u8; 32];
+    id[24..].copy_from_slice(&token_id.to_be_bytes());
+    tron_proto::transaction_info::Log {
+        address: addr(TOKEN)[1..].to_vec(),
+        topics: vec![
+            TRANSFER_TOPIC.to_vec(),
+            topic_addr(&addr(from)),
+            topic_addr(&addr(to)),
+            id,
+        ],
+        data: vec![],
+    }
+}
+
+/// A non-`Transfer` event log — surfaces only in the logs namespace,
+/// never as a TRC20/TRC721 transfer.
+fn generic_event_log(topic0: u8) -> tron_proto::transaction_info::Log {
+    tron_proto::transaction_info::Log {
+        address: addr(TOKEN)[1..].to_vec(),
+        topics: vec![vec![topic0; 32], vec![0x07; 32]],
+        data: vec![0x09],
     }
 }
 
@@ -252,6 +280,47 @@ fn standard_chain() -> Chain {
         chain.put_block(n, 0, txs, Some(infos));
     }
     chain
+}
+
+/// Append a canonical block that emits the full VM row set from stored
+/// transaction-info: a native transfer, plus a trigger whose info
+/// carries a TRC20 Transfer, a TRC721 Transfer, an internal transfer,
+/// and a generic (non-Transfer) event log.
+fn put_vm_block(
+    chain: &Chain,
+    num: i64,
+    fork_tag: u8,
+    native_from: u8,
+    native_to: u8,
+    vm_from: u8,
+    vm_to: u8,
+) {
+    let txs = vec![
+        transfer_tx(native_from, native_to, num * 10, num as u8),
+        trigger_tx(vm_from, TOKEN, num as u8),
+    ];
+    let infos = vec![
+        tron_proto::TransactionInfo::default(),
+        tron_proto::TransactionInfo {
+            log: vec![
+                transfer_log(vm_from, vm_to, 1_000_000),
+                nft_transfer_log(vm_from, vm_to, 500 + num as u64),
+                generic_event_log(0x42),
+            ],
+            internal_transactions: vec![tron_proto::InternalTransaction {
+                hash: vec![0; 32],
+                caller_address: addr(TOKEN).to_vec(),
+                transfer_to_address: addr(vm_to).to_vec(),
+                call_value_info: vec![tron_proto::internal_transaction::CallValueInfo {
+                    call_value: 77,
+                    token_id: String::new(),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    ];
+    chain.put_block(num, fork_tag, txs, Some(infos));
 }
 
 fn dump_index(db: &IndexDb) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -771,4 +840,241 @@ fn logs_page_merges_event_groups_newest_first() {
         .logs_page(&addr(0x55), None, &PageQuery { limit: 10, ..Default::default() })
         .unwrap();
     assert!(page.rows.is_empty());
+}
+
+#[test]
+fn reorg_unwind_removes_vm_rows_and_converges_byte_identically() {
+    // Heights 1-10 are plain native transfers; 11-12 carry the full VM
+    // row set (TRC20 + TRC721 + internal + logs) from stored
+    // transaction-info. The reorg replaces 11-12 and appends 13 with a
+    // different branch whose VM rows point at different parties.
+    let caps = CaptureSet { logs: true, ..caps_default() };
+    let chain = Chain::new();
+    for n in 1..=10i64 {
+        chain.put_block(n, 0, vec![transfer_tx(ALICE, BOB, n, n as u8)], Some(vec![Default::default()]));
+    }
+    for n in 11..=12i64 {
+        put_vm_block(&chain, n, 0, ALICE, BOB, ALICE, CAROL);
+    }
+    let (engine, db) = chain.engine(caps, opts_floor_first());
+    run_to_park(&engine);
+    assert_eq!(engine.status().cursor, Some(12));
+
+    // The orphaned branch's VM rows across every namespace are present
+    // before the reorg.
+    let pq = PageQuery { limit: 100, ..Default::default() };
+    {
+        let reader = chain.reader(&db);
+        assert_eq!(reader.trc20_page(&addr(CAROL), &pq).unwrap().rows.len(), 2);
+        assert_eq!(reader.trc721_page(&addr(CAROL), &pq).unwrap().rows.len(), 2);
+        assert_eq!(reader.internal_page(&addr(CAROL), &pq).unwrap().rows.len(), 2);
+        assert_eq!(reader.logs_page(&addr(TOKEN), None, &pq).unwrap().rows.len(), 6);
+    }
+
+    // Reorg: 11-13 on a different branch (fork tag 1), VM rows to DAVE.
+    for n in 11..=13i64 {
+        put_vm_block(&chain, n, 1, CAROL, BOB, BOB, DAVE);
+    }
+    let t = engine.tick().unwrap();
+    assert!(matches!(t, Tick::Unwound { ancestor: 10, .. }), "got {t:?}");
+    run_to_park(&engine);
+
+    // Every VM namespace unwound: the orphaned branch's CAROL rows are
+    // gone across trc20/trc721/internal; the new branch's DAVE rows are in.
+    {
+        let reader = chain.reader(&db);
+        assert!(reader.trc20_page(&addr(CAROL), &pq).unwrap().rows.is_empty());
+        assert!(reader.trc721_page(&addr(CAROL), &pq).unwrap().rows.is_empty());
+        assert!(reader.internal_page(&addr(CAROL), &pq).unwrap().rows.is_empty());
+        let dave = reader.trc721_page(&addr(DAVE), &pq).unwrap();
+        assert_eq!(
+            dave.rows.iter().map(|r| r.parts.height).collect::<Vec<_>>(),
+            vec![13, 12, 11]
+        );
+    }
+
+    // Byte-identical to a fresh index of the post-reorg chain — proving
+    // the per-height key ring un-indexed every VM namespace exactly, not
+    // just the native rows.
+    let (engine2, db2) = chain.engine(caps, opts_floor_first());
+    run_to_park(&engine2);
+    assert_eq!(dump_index(&db), dump_index(&db2), "post-reorg index == fresh build on the new branch");
+}
+
+#[test]
+fn trc721_only_capture_indexes_nft_rows_at_the_tip() {
+    // A capture set that wants TRC721 but not TRC20/internal/logs must
+    // still treat the head block's transaction-info as required, or the
+    // tip's NFT rows are dropped.
+    let chain = Chain::new();
+    for n in 1..=3i64 {
+        let txs = vec![trigger_tx(ALICE, TOKEN, n as u8)];
+        let infos = vec![tron_proto::TransactionInfo {
+            log: vec![nft_transfer_log(ALICE, BOB, 900 + n as u64)],
+            ..Default::default()
+        }];
+        chain.put_block(n, 0, txs, Some(infos));
+    }
+    let caps = CaptureSet {
+        native: true,
+        trc20: false,
+        trc721: true,
+        internal: false,
+        logs: false,
+        callee_contract: false,
+    };
+    let (engine, db) = chain.engine(caps, opts_floor_first());
+    run_to_park(&engine);
+
+    let reader = chain.reader(&db);
+    let pq = PageQuery { limit: 100, ..Default::default() };
+    let bob = reader.trc721_page(&addr(BOB), &pq).unwrap();
+    assert_eq!(bob.rows.len(), 3, "the head block's NFT row is not dropped");
+    assert_eq!(bob.rows[0].parts.height, 3, "newest (tip) block first");
+    // A TRC721-only capture never fabricates TRC20 rows from the same log.
+    assert!(reader.trc20_page(&addr(BOB), &pq).unwrap().rows.is_empty());
+}
+
+#[test]
+fn head_block_waits_for_txinfo_then_indexes_vm_rows() {
+    let chain = Chain::new();
+    for n in 1..=2i64 {
+        chain.put_block(
+            n,
+            0,
+            vec![transfer_tx(ALICE, BOB, n * 10, n as u8)],
+            Some(vec![Default::default()]),
+        );
+    }
+    let head_txs = || vec![transfer_tx(ALICE, BOB, 30, 3), trigger_tx(CAROL, TOKEN, 3)];
+    let head_infos = || {
+        vec![
+            tron_proto::TransactionInfo::default(),
+            tron_proto::TransactionInfo {
+                log: vec![transfer_log(ALICE, BOB, 1_000_000)],
+                ..Default::default()
+            },
+        ]
+    };
+    // The head block lands, but its transaction-info hook has not written
+    // yet — only the head (within the wait margin) is held back.
+    chain.put_block(3, 0, head_txs(), None);
+
+    let (engine, db) = chain.engine(caps_default(), opts_floor_first());
+    run_to_park(&engine);
+    assert_eq!(engine.status().cursor, Some(2), "head withheld until its txinfo lands");
+    let pq = PageQuery { limit: 100, ..Default::default() };
+    assert!(
+        chain.reader(&db).trc20_page(&addr(BOB), &pq).unwrap().rows.is_empty(),
+        "no VM rows before the head's txinfo arrives"
+    );
+
+    // The hook's write arrives; the head now indexes with its VM rows.
+    chain.put_block(3, 0, head_txs(), Some(head_infos()));
+    run_to_park(&engine);
+    assert_eq!(engine.status().cursor, Some(3));
+    let bob = chain.reader(&db).trc20_page(&addr(BOB), &pq).unwrap();
+    assert_eq!(bob.rows.len(), 1, "head's TRC20 transfer indexed once txinfo landed");
+    assert_eq!(bob.rows[0].parts.height, 3);
+}
+
+#[test]
+fn safety_valve_force_indexes_a_persistently_txinfo_less_head() {
+    let chain = Chain::new();
+    for n in 1..=2i64 {
+        chain.put_block(
+            n,
+            0,
+            vec![transfer_tx(ALICE, BOB, n * 10, n as u8)],
+            Some(vec![Default::default()]),
+        );
+    }
+    // The head permanently lacks transaction-info (a wedged / dead hook).
+    // The follower must not park on it forever.
+    chain.put_block(3, 0, vec![transfer_tx(ALICE, BOB, 30, 3), trigger_tx(CAROL, TOKEN, 3)], None);
+
+    let (engine, db) = chain.engine(caps_default(), opts_floor_first());
+    let mut parks = 0u32;
+    let mut fired = false;
+    for _ in 0..1_000 {
+        match engine.tick().unwrap() {
+            Tick::Forward { upto: 3, .. } => {
+                fired = true;
+                break;
+            }
+            Tick::Parked => parks += 1,
+            _ => {}
+        }
+    }
+    assert!(fired, "safety valve never force-indexed the txinfo-less head");
+    assert!(parks > 1, "the head was waited on across ticks before the valve fired");
+    assert_eq!(engine.status().cursor, Some(3));
+
+    // Force-indexed as genuinely missing: native rows present, no VM
+    // rows, counted as a missing-txinfo block.
+    let reader = chain.reader(&db);
+    let pq = PageQuery { limit: 100, ..Default::default() };
+    let bob = reader.native_page(&addr(BOB), &pq).unwrap();
+    assert_eq!(bob.rows[0].parts.height, 3, "the head's native rows are indexed");
+    assert!(
+        reader.trc20_page(&addr(BOB), &pq).unwrap().rows.is_empty(),
+        "no VM rows for the txinfo-less head"
+    );
+    assert!(
+        engine
+            .counters()
+            .missing_txinfo_blocks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1,
+        "the head is counted as a missing-txinfo block"
+    );
+}
+
+#[test]
+fn window_is_clamped_to_the_transaction_budget() {
+    // Ten canonical heights, two transactions each.
+    let chain = Chain::new();
+    for n in 1..=10i64 {
+        chain.put_block(
+            n,
+            0,
+            vec![transfer_tx(ALICE, BOB, n, n as u8), trigger_tx(CAROL, TOKEN, n as u8)],
+            None,
+        );
+    }
+    // Native-only: no transaction-info needed, so only the tx budget
+    // bounds the window.
+    let native_only = CaptureSet {
+        native: true,
+        trc20: false,
+        trc721: false,
+        internal: false,
+        logs: false,
+        callee_contract: false,
+    };
+    let opts = EngineOptions {
+        head_first: false,
+        window_blocks: 10,
+        window_tx_budget: 3,
+        sync_every_windows: 100,
+        ..Default::default()
+    };
+    // The plan would span all ten heights, but 2 txs/block hits the 3-tx
+    // budget after the second height.
+    let (engine, _db) = chain.engine(native_only, opts.clone());
+    let t = engine.tick().unwrap();
+    assert!(
+        matches!(t, Tick::Forward { upto: 2, blocks: 2 }),
+        "budget clamped the window to 2 heights, got {t:?}"
+    );
+
+    // A budget below a single block's tx count still makes progress: the
+    // clamp always keeps at least one height.
+    let opts1 = EngineOptions { window_tx_budget: 1, ..opts };
+    let (engine1, _db1) = chain.engine(native_only, opts1);
+    let t = engine1.tick().unwrap();
+    assert!(
+        matches!(t, Tick::Forward { upto: 1, blocks: 1 }),
+        "at least one height is always kept, got {t:?}"
+    );
 }
