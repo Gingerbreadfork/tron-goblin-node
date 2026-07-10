@@ -97,9 +97,9 @@ impl FirehoseWriter {
             },
             None => (-1, None),
         };
-        let consensus_head = DynamicPropertiesStore::new(dyn_props.clone())
-            .latest_block_header_number()
-            .unwrap_or(0);
+        let consensus_head_opt = DynamicPropertiesStore::new(dyn_props.clone())
+            .latest_block_header_number();
+        let consensus_head = consensus_head_opt.unwrap_or(0);
         let counters = Arc::new(FirehoseCounters::default());
 
         // Reconcile the log against the recovered consensus chain. Two
@@ -121,6 +121,27 @@ impl FirehoseWriter {
         //       next apply). If solidified can't be read, drop just the
         //       orphaned head block (correct for the dominant 1-block tip fork).
         let reconcile_to = if head_height > consensus_head {
+            // Guard against a firehose directory that does not belong to this
+            // data directory. A legitimate power-loss rollback leaves the log
+            // ahead by at most the fsync window plus a reorg (tens of blocks).
+            // No consensus head at all (a wiped/fresh state store), or an
+            // implausibly large gap, instead means the firehose dir survived a
+            // wiped/replaced data dir. UNWIND(consensus_head) here would tell
+            // every consumer to DELETE all derived data (WHERE height >
+            // consensus_head, i.e. > 0), so refuse to open and let the operator
+            // remove the stale firehose dir intentionally.
+            const MAX_PLAUSIBLE_ROLLBACK: i64 = 10_000;
+            if consensus_head_opt.is_none()
+                || head_height - consensus_head > MAX_PLAUSIBLE_ROLLBACK
+            {
+                return Err(IndexError::Corrupt(format!(
+                    "firehose log head {head_height} is implausibly far ahead of the \
+                     consensus head {consensus_head} — the firehose directory does not \
+                     match this data directory (wiped or replaced?). Refusing to \
+                     auto-UNWIND, which would wipe all consumer state; remove the stale \
+                     firehose directory to reset it."
+                )));
+            }
             Some(consensus_head)
         } else if head_height >= 0 {
             let canonical = BlockIndexStore::new(block_index.clone())
