@@ -33,6 +33,15 @@ use tron_types::BlockId;
 /// it minimizes the repair window for live consumers.
 const SYNC_EVERY: u32 = 16;
 const RECENT_MS: i64 = 5 * 60 * 1000;
+/// Max store-derived gap-repair heights processed in a single
+/// `on_block_applied` call. A gap larger than this is repaired
+/// incrementally across successive applies so a huge gap (firehose
+/// re-enabled after a long off period, or a snapshot swap to a much
+/// higher head) can't re-derive hundreds of thousands of heights
+/// synchronously under the writer lock and stall block apply. The chain
+/// advances one block per apply while a repair pass closes this many, so
+/// the window converges.
+const GAP_REPAIR_MAX: i64 = 512;
 
 #[derive(Debug, Default)]
 pub struct FirehoseCounters {
@@ -195,9 +204,16 @@ impl FirehoseWriter {
                 tracing::info!(to_height = h - 1, "firehose: reorg unwind appended");
             } else if h > inner.head_height + 1 {
                 // The log missed blocks (firehose was off / crash tail
-                // truncated): re-derive them from the stores.
+                // truncated): re-derive them from the stores — but only up to
+                // GAP_REPAIR_MAX heights per apply so a huge gap can't stall
+                // block apply under the writer lock. A gap wider than the cap
+                // is closed incrementally: repair a bounded prefix now, DON'T
+                // append APPLY(h) (that would leave a hole), and let later
+                // applies continue from where this one stopped. Block h itself
+                // re-derives from the stores when the window reaches it.
                 let from = inner.head_height + 1;
-                for g in from..h {
+                let repair_end = h.min(from + GAP_REPAIR_MAX);
+                for g in from..repair_end {
                     match self.derive_from_stores(g, solidified)? {
                         Some(event) => {
                             self.append(&mut inner, event)?;
@@ -216,9 +232,21 @@ impl FirehoseWriter {
                         }
                     }
                 }
-                if h > from {
-                    tracing::warn!(from, to = h - 1, "firehose: repaired log gap from stores");
+                if repair_end < h {
+                    // Gap exceeds the per-apply cap. Record progress, persist
+                    // it, and return without appending APPLY(h).
+                    inner.head_height = repair_end - 1;
+                    inner.log.sync()?;
+                    inner.blocks_since_sync = 0;
+                    tracing::warn!(
+                        from,
+                        repaired_to = repair_end - 1,
+                        target = h,
+                        "firehose: repairing large gap incrementally (will continue on next apply)"
+                    );
+                    return Ok(());
                 }
+                tracing::warn!(from, to = h - 1, "firehose: repaired log gap from stores");
             }
         }
 
