@@ -214,9 +214,22 @@ fn decode_abi_string(data: &[u8]) -> Option<String> {
     None
 }
 
-/// One read-only call against current state; `None` on revert/halt or
-/// when constant-call backends aren't wired.
+/// Max DISTINCT unresolved tokens a single history request will spend VM
+/// constant-calls to resolve (each token costs up to 3 calls). Bounds the
+/// per-request VM work an unauthenticated caller can trigger regardless of
+/// how many distinct token contracts a page spans; tokens beyond the cap
+/// serve their cached-or-empty metadata and self-heal on later requests.
+const TOKEN_RESOLVE_BUDGET: u32 = 32;
+
+/// One read-only call against current state; `None` on revert/halt, when
+/// constant-call backends aren't wired, or when the operator has disabled
+/// constant calls (`vm.supportConstant = false`) — the same gate
+/// `trigger_constant_contract` enforces, so disabling public constant
+/// calls also disables this internal metadata-resolution surface.
 fn constant_call(s: &RpcState, contract: &[u8; 21], data: Vec<u8>) -> Option<Vec<u8>> {
+    if !s.support_constant {
+        return None;
+    }
     let backends = s.eth_call_backends.as_ref()?;
     let vm_stores = crate::methods::build_call_vm_stores(backends);
     let block_env = tron_tvm::execute::VmBlockEnv {
@@ -238,30 +251,49 @@ fn constant_call(s: &RpcState, contract: &[u8; 21], data: Vec<u8>) -> Option<Vec
     }
 }
 
-/// Resolve (and cache) a TRC20 token's metadata. Unresolved entries
-/// are cached too, but re-attempted on each request so a token that
-/// starts answering later self-heals.
-fn token_info(s: &RpcState, reader: &IndexReader, contract: &[u8; 21]) -> Value {
+/// Resolve (and cache) a TRC20 token's metadata. Unresolved entries are
+/// cached too and re-attempted so a token that starts answering later
+/// self-heals — but only while `resolve_budget` (a per-request counter)
+/// is non-zero, so one request can't fan out into unbounded VM work.
+fn token_info(
+    s: &RpcState,
+    reader: &IndexReader,
+    contract: &[u8; 21],
+    resolve_budget: &mut u32,
+) -> Value {
     let cached = reader.token_meta(contract).ok().flatten();
     let meta = match cached {
         Some(m) if m.resolved => m,
-        _ => {
-            let name = constant_call(s, contract, selector("name()").to_vec())
-                .and_then(|d| decode_abi_string(&d));
-            let symbol = constant_call(s, contract, selector("symbol()").to_vec())
-                .and_then(|d| decode_abi_string(&d));
-            let decimals = constant_call(s, contract, selector("decimals()").to_vec())
-                .filter(|d| d.len() >= 32)
-                .map(|d| d[31] as i32);
-            let resolved = name.is_some() || symbol.is_some() || decimals.is_some();
-            let meta = TokenMeta {
-                name: name.unwrap_or_default(),
-                symbol: symbol.unwrap_or_default(),
-                decimals: decimals.unwrap_or(0),
-                resolved,
-            };
-            let _ = reader.put_token_meta(contract, &meta);
-            meta
+        cached => {
+            // Spend a resolution only when the operator permits constant
+            // calls and this request still has budget; otherwise serve the
+            // cached (possibly unresolved) entry or an empty placeholder.
+            if !s.support_constant || *resolve_budget == 0 {
+                cached.unwrap_or(TokenMeta {
+                    name: String::new(),
+                    symbol: String::new(),
+                    decimals: 0,
+                    resolved: false,
+                })
+            } else {
+                *resolve_budget -= 1;
+                let name = constant_call(s, contract, selector("name()").to_vec())
+                    .and_then(|d| decode_abi_string(&d));
+                let symbol = constant_call(s, contract, selector("symbol()").to_vec())
+                    .and_then(|d| decode_abi_string(&d));
+                let decimals = constant_call(s, contract, selector("decimals()").to_vec())
+                    .filter(|d| d.len() >= 32)
+                    .map(|d| d[31] as i32);
+                let resolved = name.is_some() || symbol.is_some() || decimals.is_some();
+                let meta = TokenMeta {
+                    name: name.unwrap_or_default(),
+                    symbol: symbol.unwrap_or_default(),
+                    decimals: decimals.unwrap_or(0),
+                    resolved,
+                };
+                let _ = reader.put_token_meta(contract, &meta);
+                meta
+            }
         }
     };
     json!({
@@ -312,6 +344,7 @@ async fn account_trc20(
     // up to three constant calls for an unresolved token, and a page
     // has up to 200 rows that are usually the same token.
     let mut token_memo: HashMap<[u8; 21], Value> = HashMap::new();
+    let mut resolve_budget = TOKEN_RESOLVE_BUDGET;
     let data: Vec<Value> = page
         .rows
         .iter()
@@ -322,7 +355,7 @@ async fn account_trc20(
             }
             let info = token_memo
                 .entry(token)
-                .or_insert_with(|| token_info(&state, reader, &token))
+                .or_insert_with(|| token_info(&state, reader, &token, &mut resolve_budget))
                 .clone();
             json!({
                 "transaction_id": hex::encode(&r.row.txid),
@@ -362,6 +395,7 @@ async fn account_trc721(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let mut token_memo: HashMap<[u8; 21], Value> = HashMap::new();
+    let mut resolve_budget = TOKEN_RESOLVE_BUDGET;
     let data: Vec<Value> = page
         .rows
         .iter()
@@ -372,7 +406,7 @@ async fn account_trc721(
             }
             let info = token_memo
                 .entry(token)
-                .or_insert_with(|| token_info(&state, reader, &token))
+                .or_insert_with(|| token_info(&state, reader, &token, &mut resolve_budget))
                 .clone();
             json!({
                 "transaction_id": hex::encode(&r.row.txid),
