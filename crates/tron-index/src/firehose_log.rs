@@ -331,8 +331,28 @@ impl FirehoseLogWriter {
             None => (1, segment_path(&dir, 1), false),
         };
         let (next_seq, good_end) = if existing {
-            let (next_seq, good_end) = scan_segment_from(&path, (seg_first_seq, 8), |_, _| true)?;
-            (next_seq, good_end)
+            // A crash during `rotate()` — after the segment file is created
+            // but before its 8-byte magic is fully written and fsynced — can
+            // leave the newest segment 0..8 bytes long. That is a torn header,
+            // not corruption of committed data: the previous segment holds the
+            // durable tail. Reinitialize it empty rather than refusing to open
+            // (a hard `bad magic header` error here would brick node startup).
+            let torn_header = std::fs::metadata(&path).map(|m| m.len() < 8).unwrap_or(false);
+            if torn_header {
+                tracing::warn!(
+                    segment = ?path,
+                    "firehose: newest segment has a torn magic header (crash mid-rotate); \
+                     reinitializing it empty"
+                );
+                let mut f = File::create(&path)
+                    .map_err(|e| IndexError::Corrupt(format!("recreate {path:?}: {e}")))?;
+                f.write_all(MAGIC)
+                    .map_err(|e| IndexError::Corrupt(format!("write magic: {e}")))?;
+                f.sync_all().ok();
+                (seg_first_seq, 8)
+            } else {
+                scan_segment_from(&path, (seg_first_seq, 8), |_, _| true)?
+            }
         } else {
             let mut f = File::create(&path)
                 .map_err(|e| IndexError::Corrupt(format!("create {path:?}: {e}")))?;
@@ -428,6 +448,9 @@ impl FirehoseLogWriter {
             File::create(&path).map_err(|e| IndexError::Corrupt(format!("create {path:?}: {e}")))?;
         f.write_all(MAGIC)
             .map_err(|e| IndexError::Corrupt(format!("write magic: {e}")))?;
+        // fsync the header before we start appending frames so a crash can't
+        // leave a torn magic (open() tolerates one, but shrink the window).
+        f.sync_all().ok();
         self.file = f;
         self.seg_first_seq = self.next_seq;
         self.seg_bytes = 8;
@@ -544,6 +567,36 @@ mod tests {
         assert_eq!(
             all,
             vec![(1, b"good-1".to_vec()), (2, b"good-2".to_vec()), (3, b"good-3".to_vec())]
+        );
+    }
+
+    #[test]
+    fn torn_segment_header_recovers_on_open() {
+        let dir = tmp_dir("tornhdr");
+        {
+            let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+            w.append(b"one").unwrap();
+            w.append(b"two").unwrap();
+            w.sync().unwrap();
+        }
+        // Simulate a crash DURING rotate(): the next segment file was created
+        // and a partial (< 8 byte) magic written but not fsynced. next_seq
+        // after two synced appends is 3, so the torn segment is named for 3.
+        let torn = segment_path(&dir, 3);
+        std::fs::write(&torn, [b'T', b'R', b'N']).unwrap(); // 3 bytes < 8
+
+        // Open must NOT error — a hard "bad magic header" here would brick node
+        // startup. It reinitializes the torn newest segment and continues.
+        let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+        assert_eq!(w.next_seq(), 3, "resumes at the torn segment's first seq");
+        assert_eq!(w.append(b"three").unwrap(), 3);
+        w.sync().unwrap();
+
+        // The prior segment's data survives; the new entry lands at seq 3.
+        let all = FirehoseLogReader::new(&dir).read_from(1, 10).unwrap();
+        assert_eq!(
+            all,
+            vec![(1, b"one".to_vec()), (2, b"two".to_vec()), (3, b"three".to_vec())]
         );
     }
 
