@@ -137,28 +137,46 @@ impl IndexReader {
 
     pub fn status(&self) -> ReaderStatus {
         let dp = DynamicPropertiesStore::new(self.dyn_props.clone());
-        let head = dp.latest_block_header_number().unwrap_or(0);
-        let solidified = dp.latest_solidified_block_num().unwrap_or(0);
+        let head = dp.latest_block_header_number();
+        let solidified = dp.latest_solidified_block_num();
         let cursor = self.db.cursor_height().ok().flatten();
         let back_edge = self.db.back_edge().ok().flatten();
         let floor = self.db.floor().ok().flatten();
         let backfill_complete = matches!((back_edge, floor), (Some(b), Some(f)) if b <= f);
-        let target = if self.follow_solidified { head.min(solidified) } else { head };
+        // `at_tip` requires a KNOWN head: an absent dyn-props head must
+        // not read as "caught up" merely because the cursor is ≥ 0.
+        let at_tip = match head {
+            Some(head) => {
+                let target =
+                    if self.follow_solidified { head.min(solidified.unwrap_or(0)) } else { head };
+                cursor.map(|c| c >= target).unwrap_or(false)
+            }
+            None => false,
+        };
         ReaderStatus {
             cursor,
             indexed_from: back_edge,
             floor,
             backfill_complete,
-            at_tip: cursor.map(|c| c >= target).unwrap_or(false),
-            head,
-            solidified,
+            at_tip,
+            head: head.unwrap_or(0),
+            solidified: solidified.unwrap_or(0),
         }
     }
 
+    /// Solidified (last-irreversible) block height, or `None` when the
+    /// dyn-props mark is absent — kept distinct from a genuine height of
+    /// 0. Confirmation-gating callers must not equate the two: an
+    /// unknown mark means nothing can be proven confirmed, not that
+    /// block 0 is.
+    fn solidified_mark(&self) -> Option<i64> {
+        DynamicPropertiesStore::new(self.dyn_props.clone()).latest_solidified_block_num()
+    }
+
+    /// Solidified height as a plain value (unknown mark ⇒ 0) — the
+    /// public convenience view.
     pub fn solidified(&self) -> i64 {
-        DynamicPropertiesStore::new(self.dyn_props.clone())
-            .latest_solidified_block_num()
-            .unwrap_or(0)
+        self.solidified_mark().unwrap_or(0)
     }
 
     // -- token metadata cache ------------------------------------------------
@@ -230,7 +248,10 @@ impl IndexReader {
     {
         let limit = q.limit.clamp(1, 1000);
         let prefix = keys::addr_prefix(ns, addr);
-        let solidified = self.solidified();
+        let solidified = self.solidified_mark();
+        // Unknown mark ⇒ nothing is provably confirmed (`height ≤ -1` is
+        // impossible), rather than falsely confirming block 0.
+        let confirmed_upto = solidified.unwrap_or(-1);
 
         let (hmin, hmax) = self.height_bounds(q, solidified);
         if hmin > hmax {
@@ -304,18 +325,32 @@ impl IndexReader {
                     break 'outer;
                 }
                 let Some(parts) = keys::decode_row_key(k) else { continue };
-                // Range stop conditions (heights are monotone along
-                // the scan direction).
+                // Heights are monotone along the scan direction: the
+                // trailing bound is a hard stop, the leading bound a
+                // per-row skip — a resumed (possibly stale or
+                // cross-query) fingerprint can start the scan outside the
+                // range on the leading side. The resume cursor advances
+                // even for a leading-skipped key so paging still makes
+                // forward progress.
                 if q.ascending {
                     if parts.height > hmax {
                         exhausted = true;
                         break 'outer;
                     }
-                } else if parts.height < hmin {
-                    exhausted = true;
-                    break 'outer;
+                    last_examined = Some(k.clone());
+                    if parts.height < hmin {
+                        continue;
+                    }
+                } else {
+                    if parts.height < hmin {
+                        exhausted = true;
+                        break 'outer;
+                    }
+                    last_examined = Some(k.clone());
+                    if parts.height > hmax {
+                        continue;
+                    }
                 }
-                last_examined = Some(k.clone());
                 let Ok(row) = T::decode(v.as_slice()) else { continue };
                 if min_dir_mask != 0 && row.direction() & min_dir_mask != min_dir_mask {
                     continue;
@@ -334,7 +369,7 @@ impl IndexReader {
                 rows.push(PageRow {
                     key: k.clone(),
                     parts,
-                    confirmed: parts.height <= solidified,
+                    confirmed: parts.height <= confirmed_upto,
                     row,
                 });
                 if rows.len() >= limit {
@@ -362,14 +397,26 @@ impl IndexReader {
 
     /// Height bounds from the range-boundable filters (confirmation
     /// state, timestamp range, explicit block range).
-    fn height_bounds(&self, q: &PageQuery, solidified: i64) -> (i64, i64) {
+    fn height_bounds(&self, q: &PageQuery, solidified: Option<i64>) -> (i64, i64) {
         let mut hmax = i64::MAX;
         let mut hmin = 0i64;
         if q.only_confirmed {
-            hmax = hmax.min(solidified);
+            match solidified {
+                Some(s) => hmax = hmax.min(s),
+                None => {
+                    // No solidified mark ⇒ nothing is confirmed; collapse
+                    // to an empty range rather than silently confirming
+                    // block 0 and returning a misleading page.
+                    tracing::warn!(
+                        "index: only_confirmed page requested but the solidified \
+                         mark is unavailable — no rows can be confirmed"
+                    );
+                    hmax = hmax.min(-1);
+                }
+            }
         }
         if q.only_unconfirmed {
-            hmin = hmin.max(solidified + 1);
+            hmin = hmin.max(solidified.unwrap_or(-1) + 1);
         }
         if let Some(ts) = q.max_timestamp_ms {
             hmax = hmax.min(self.height_at_or_before_ts(ts));
@@ -404,7 +451,8 @@ impl IndexReader {
         q: &PageQuery,
     ) -> Result<LogsPage, IndexError> {
         let limit = q.limit.clamp(1, 1000);
-        let solidified = self.solidified();
+        let solidified = self.solidified_mark();
+        let confirmed_upto = solidified.unwrap_or(-1);
         let (hmin, hmax) = self.height_bounds(q, solidified);
         if hmin > hmax {
             return Ok(LogsPage { rows: Vec::new(), fingerprint: None });
@@ -414,16 +462,38 @@ impl IndexReader {
         base.push(keys::NS_LOGS);
         base.extend_from_slice(contract);
 
-        // The signature groups this query spans.
+        // The signature groups this query spans. A no-topic0 query walks
+        // one probe per distinct event signature the contract emitted,
+        // capped so a pathological contract can't unbound the walk.
+        const MAX_SIGNATURE_GROUPS: usize = 1024;
         let groups: Vec<[u8; 32]> = match topic0 {
             Some(t) => vec![t],
             None => {
                 let mut groups = Vec::new();
                 let mut probe = base.clone();
-                while groups.len() < 1024 {
+                loop {
+                    if groups.len() >= MAX_SIGNATURE_GROUPS {
+                        tracing::warn!(
+                            contract = %hex::encode(contract),
+                            cap = MAX_SIGNATURE_GROUPS,
+                            "index: logs no-topic0 query hit the signature-group cap; \
+                             later signatures are omitted from this page — narrow the \
+                             query with an explicit topic0"
+                        );
+                        break;
+                    }
                     let chunk = self.db.backend().scan_from(&probe, 1)?;
                     let Some((k, _)) = chunk.first() else { break };
-                    if !k.starts_with(&base) || k.len() != 70 {
+                    if !k.starts_with(&base) {
+                        break; // walked past this contract's groups
+                    }
+                    if k.len() != 70 {
+                        tracing::warn!(
+                            contract = %hex::encode(contract),
+                            key_len = k.len(),
+                            "index: malformed idx_logs key during signature-group \
+                             discovery; stopping the group scan early"
+                        );
                         break;
                     }
                     let mut t = [0u8; 32];
@@ -506,6 +576,13 @@ impl IndexReader {
                       scanned: &mut usize|
          -> Result<(), IndexError> {
             while c.buf.is_empty() {
+                // Honor the global scan budget inside the refill: with
+                // many signature groups a single pass could otherwise
+                // scan groups × GROUP_CHUNK rows before the outer loop
+                // re-checks the budget.
+                if *scanned >= SCAN_BUDGET {
+                    return Ok(());
+                }
                 let Some(seek) = c.next_seek.clone() else { return Ok(()) };
                 let chunk = if q.ascending {
                     backend.scan_back_from(&seek, GROUP_CHUNK)?
@@ -533,15 +610,27 @@ impl IndexReader {
                         break;
                     }
                     let Some(parts) = keys::decode_logs_key(&k) else { continue };
-                    // Height range stop (monotone along the scan).
+                    // Heights are monotone along the scan: the trailing
+                    // bound is a hard stop for the group, the leading
+                    // bound a per-row skip (a resumed, possibly stale or
+                    // cross-query fingerprint can start the scan outside
+                    // the range on the leading side).
                     if q.ascending {
                         if parts.height > hmax {
                             c.next_seek = None;
                             break;
                         }
-                    } else if parts.height < hmin {
-                        c.next_seek = None;
-                        break;
+                        if parts.height < hmin {
+                            continue;
+                        }
+                    } else {
+                        if parts.height < hmin {
+                            c.next_seek = None;
+                            break;
+                        }
+                        if parts.height > hmax {
+                            continue;
+                        }
                     }
                     c.buf.push_back((k, v));
                 }
@@ -596,7 +685,7 @@ impl IndexReader {
                 height: parts.height,
                 txidx: parts.txidx,
                 logidx: parts.logidx,
-                confirmed: parts.height <= solidified,
+                confirmed: parts.height <= confirmed_upto,
                 row,
             });
         }
@@ -724,5 +813,78 @@ impl RowCommon for InternalRow {
     }
     fn timestamp_ms(&self) -> i64 {
         self.timestamp_ms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::IndexDb;
+    use tron_chainbase::MemBackend;
+
+    /// Reader over an in-memory index holding one native row per given
+    /// height for `addr`. The consensus stores are empty (no timestamp
+    /// or confirmation filters exercised here).
+    fn reader_with_native_heights(heights: &[i64], addr: &Addr) -> IndexReader {
+        let idx: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        for &h in heights {
+            let row = NativeRow {
+                txid: vec![0u8; 32],
+                contract_type: 1,
+                from: addr.to_vec(),
+                to: None,
+                amount: 0,
+                asset: None,
+                timestamp_ms: h,
+                direction: DIR_FROM,
+                success: true,
+            };
+            idx.put(&keys::native_key(addr, h, 0), &row.encode_to_vec()).unwrap();
+        }
+        IndexReader::new(
+            IndexDb::new(idx),
+            Arc::new(MemBackend::new()),
+            Arc::new(MemBackend::new()),
+            Arc::new(MemBackend::new()),
+        )
+    }
+
+    /// A descending page must reject rows ABOVE `hmax` that a stale /
+    /// cross-query fingerprint makes the scan walk past first, not just
+    /// stop below `hmin`.
+    #[test]
+    fn descending_scan_rejects_rows_above_hmax_on_stale_fingerprint() {
+        let addr: Addr = [0x41u8; 21];
+        let reader = reader_with_native_heights(&[10, 20, 30, 40], &addr);
+        let q = PageQuery {
+            limit: 100,
+            // Resume position at height 45 — above the requested max.
+            fingerprint: Some(keys::native_key(&addr, 45, 0)),
+            min_block: Some(15),
+            max_block: Some(25),
+            ..Default::default()
+        };
+        let page = reader.native_page(&addr, &q).unwrap();
+        let heights: Vec<i64> = page.rows.iter().map(|r| r.parts.height).collect();
+        assert_eq!(heights, vec![20], "heights 30 and 40 are out of range and must not leak");
+    }
+
+    /// The mirror case: an ascending page must reject rows BELOW `hmin`.
+    #[test]
+    fn ascending_scan_rejects_rows_below_hmin_on_stale_fingerprint() {
+        let addr: Addr = [0x41u8; 21];
+        let reader = reader_with_native_heights(&[10, 20, 30, 40], &addr);
+        let q = PageQuery {
+            limit: 100,
+            // Resume position at height 5 — below the requested min.
+            fingerprint: Some(keys::native_key(&addr, 5, 0)),
+            ascending: true,
+            min_block: Some(15),
+            max_block: Some(25),
+            ..Default::default()
+        };
+        let page = reader.native_page(&addr, &q).unwrap();
+        let heights: Vec<i64> = page.rows.iter().map(|r| r.parts.height).collect();
+        assert_eq!(heights, vec![20], "height 10 is out of range and must not leak");
     }
 }
