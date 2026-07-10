@@ -52,7 +52,10 @@ pub use extract::{
     created_contract_address, extract_block, tx_facts, CaptureSet, TxFacts, TxInfoMatcher,
     TRANSFER_TOPIC,
 };
-pub use firehose_log::{FirehoseLogReader, FirehoseLogWriter, FirehoseTailHandle, ReadPos};
+pub use firehose_log::{
+    FirehoseLogReader, FirehoseLogWriter, FirehoseTailHandle, ReadPos,
+    MAX_FRAME_PAYLOAD as FIREHOSE_MAX_FRAME_PAYLOAD,
+};
 pub use keys::{Addr, KeyParts};
 pub use query::{IndexReader, LogPageRow, LogsPage, Page, PageQuery, PageRow, ReaderStatus};
 pub use rows::{InternalRow, LogRow, NativeRow, TokenMeta, Trc20Row, Trc721Row, DIR_FROM, DIR_TO};

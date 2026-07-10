@@ -43,7 +43,9 @@ const SEGMENT_TARGET_BYTES: u64 = 128 * 1024 * 1024;
 /// length above this as a torn/corrupt frame and stops, so the writer must
 /// refuse to append one — an unreadable frame would hide every later entry
 /// in the segment (and the next open would truncate it and them away).
-const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+/// Public so entry producers can recognize a payload as permanently
+/// unappendable up front and skip it, rather than retrying it forever.
+pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
 fn crc32(payload: &[u8]) -> u32 {
     let mut crc = flate2::Crc::new();

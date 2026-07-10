@@ -235,6 +235,13 @@ impl FirehoseWriter {
                     &mut inner,
                     fh::entry::Event::Unwind(fh::Unwind { to_height: h - 1 }),
                 )?;
+                // The in-memory head must track the log after EVERY
+                // successful append: if a later append in this call fails,
+                // the next apply has to see the log's true head so it
+                // gap-repairs the missing heights — a stale (higher) head
+                // would emit a second unwind instead and permanently skip
+                // the height whose APPLY was lost.
+                inner.head_height = h - 1;
                 self.counters.unwinds.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(to_height = h - 1, "firehose: reorg unwind appended");
             } else if h > inner.head_height + 1 {
@@ -250,9 +257,11 @@ impl FirehoseWriter {
                 let repair_end = h.min(from + GAP_REPAIR_MAX);
                 for g in from..repair_end {
                     match self.derive_from_stores(g, solidified)? {
-                        Some(event) => {
-                            self.append(&mut inner, event)?;
-                            self.counters.gap_repaired_blocks.fetch_add(1, Ordering::Relaxed);
+                        Some(apply) => {
+                            if self.append_apply(&mut inner, apply)? {
+                                inner.head_height = g;
+                                self.counters.gap_repaired_blocks.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         None => {
                             // Canonical block below head missing from the
@@ -285,9 +294,13 @@ impl FirehoseWriter {
             }
         }
 
-        let event = fh::entry::Event::Apply(build_apply(h, block, Some(ret), solidified));
-        self.append(&mut inner, event)?;
-        self.counters.entries.fetch_add(1, Ordering::Relaxed);
+        let apply = build_apply(h, block, Some(ret), solidified);
+        if self.append_apply(&mut inner, apply)? {
+            self.counters.entries.fetch_add(1, Ordering::Relaxed);
+        }
+        // Advance the head even when the entry was skipped for size: the
+        // height is permanently unrepresentable, and leaving the head behind
+        // would make every later apply re-derive and re-skip it.
         inner.head_height = h;
 
         // Durability: every entry near the tip, batched during
@@ -317,6 +330,31 @@ impl FirehoseWriter {
         inner.log.append(&entry.encode_to_vec())
     }
 
+    /// Append one APPLY entry unless it exceeds the log's frame cap.
+    /// An oversize entry is *permanently* unappendable — the reader
+    /// treats such a frame as torn, so the log writer refuses it, and
+    /// retrying (live or via gap repair) can never succeed. Skip the
+    /// height with a loud error instead, exactly like a canonical
+    /// block missing from the stores: consumers observe the documented
+    /// height jump. Returns whether the entry was appended.
+    fn append_apply(&self, inner: &mut Inner, apply: fh::BlockApplied) -> Result<bool, IndexError> {
+        let height = apply.height;
+        let seq = inner.log.next_seq();
+        let entry = fh::Entry { seq, event: Some(fh::entry::Event::Apply(apply)) };
+        let payload = entry.encode_to_vec();
+        if payload.len() > tron_index::FIREHOSE_MAX_FRAME_PAYLOAD {
+            tracing::error!(
+                height,
+                bytes = payload.len(),
+                "firehose: entry exceeds the frame cap and can never be appended; \
+                 skipping the height (consumers will observe a height jump)"
+            );
+            return Ok(false);
+        }
+        inner.log.append(&payload)?;
+        Ok(true)
+    }
+
     /// Re-derive one canonical block's APPLY event from the stores —
     /// the same `(block, txinfo)` inputs the live path uses, so
     /// repaired entries are byte-equivalent to what would have been
@@ -326,7 +364,7 @@ impl FirehoseWriter {
         &self,
         height: i64,
         solidified: i64,
-    ) -> Result<Option<fh::entry::Event>, IndexError> {
+    ) -> Result<Option<fh::BlockApplied>, IndexError> {
         let id = match BlockIndexStore::new(self.block_index.clone()).get(height) {
             Ok(id) => id,
             Err(StoreError::NotFound) => return Ok(None),
@@ -338,12 +376,7 @@ impl FirehoseWriter {
             Err(e) => return Err(e.into()),
         };
         let ret = TransactionRetStore::new(self.txret.clone()).get(height)?;
-        Ok(Some(fh::entry::Event::Apply(build_apply(
-            height,
-            &block,
-            ret.as_ref(),
-            solidified,
-        ))))
+        Ok(Some(build_apply(height, &block, ret.as_ref(), solidified)))
     }
 }
 
@@ -590,6 +623,20 @@ mod tests {
                 .map(|(_, p)| fh::Entry::decode(p.as_slice()).unwrap())
                 .collect()
         }
+
+        /// A block whose firehose entry exceeds the log's frame cap —
+        /// permanently unappendable by design. The entry carries decoded
+        /// facts, so the oversize payload must come from the txinfo's VM
+        /// logs (which `build_apply` copies into the entry verbatim).
+        fn make_oversize_block(&self, height: i64, fork: u8) -> (Block, BlockId, TransactionRet) {
+            let (block, id, mut ret) = self.make_block(height, fork);
+            ret.transactioninfo[0].log = vec![tron_proto::transaction_info::Log {
+                address: vec![0xee; 20],
+                topics: vec![],
+                data: vec![0u8; tron_index::FIREHOSE_MAX_FRAME_PAYLOAD + 1024],
+            }];
+            (block, id, ret)
+        }
     }
 
     fn heights(entries: &[fh::Entry]) -> Vec<(char, i64)> {
@@ -665,6 +712,65 @@ mod tests {
         assert_eq!(a.txs[0].amount, 20);
         assert!(!a.txinfo_missing);
         assert_eq!(w.counters().gap_repaired_blocks.load(Ordering::Relaxed), 2);
+    }
+
+    /// When the APPLY following a reorg's UNWIND cannot be appended, the
+    /// in-memory head must already reflect the unwind: a stale (higher)
+    /// head would classify the NEXT apply as another reorg and emit a
+    /// second UNWIND — permanently and silently skipping the lost height,
+    /// with the second unwind even re-anchoring the consumers' height-
+    /// continuity check so nothing downstream flags the hole. With the
+    /// head tracked per append, the unappendable height is skipped once
+    /// (an explicit height jump) and the stream continues cleanly.
+    #[test]
+    fn failed_apply_after_unwind_never_emits_a_second_unwind() {
+        let rig = Rig::new("unwind-then-fail");
+        let w = rig.open();
+        for h in 1..=3 {
+            rig.apply(&w, h);
+        }
+        // Reorg re-apply at height 2 with an entry past the frame cap:
+        // the UNWIND appends, the APPLY cannot.
+        let (block, id, ret) = rig.make_oversize_block(2, 1);
+        rig.persist(&block, &id, &ret);
+        w.on_block_applied(&block, &id, &ret).unwrap();
+        // The chain continues on the new branch.
+        let (b3, id3, ret3) = rig.make_block(3, 1);
+        rig.persist(&b3, &id3, &ret3);
+        w.on_block_applied(&b3, &id3, &ret3).unwrap();
+        assert_eq!(
+            heights(&rig.entries()),
+            vec![('A', 1), ('A', 2), ('A', 3), ('U', 1), ('A', 3)],
+            "height 2 is skipped as a visible jump, not buried under a second unwind"
+        );
+        assert_eq!(w.counters().unwinds.load(Ordering::Relaxed), 1);
+    }
+
+    /// Gap repair must skip a canonical block whose entry exceeds the
+    /// frame cap (it can never be appended — retrying would wedge the
+    /// repair window forever) and keep repairing the heights above it.
+    #[test]
+    fn unappendable_block_is_skipped_during_gap_repair() {
+        let rig = Rig::new("gap-oversize");
+        {
+            let w = rig.open();
+            rig.apply(&w, 1);
+        } // firehose "off"
+
+        // Heights 2 (oversize) and 3 (ordinary) land in the stores only.
+        let (b2, id2, ret2) = rig.make_oversize_block(2, 0);
+        rig.persist(&b2, &id2, &ret2);
+        let (b3, id3, ret3) = rig.make_block(3, 0);
+        rig.persist(&b3, &id3, &ret3);
+
+        let w = rig.open();
+        rig.apply(&w, 4);
+        assert_eq!(
+            heights(&rig.entries()),
+            vec![('A', 1), ('A', 3), ('A', 4)],
+            "the unappendable height is a jump; repair continues past it"
+        );
+        assert_eq!(w.counters().gap_repaired_blocks.load(Ordering::Relaxed), 1);
     }
 
     /// java's `InternalTransaction` records a plain (TRX-only) call leg
