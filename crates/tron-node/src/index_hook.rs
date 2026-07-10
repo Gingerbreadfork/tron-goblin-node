@@ -45,6 +45,11 @@ pub struct IndexHook {
     /// transactions (snapshots bring their own refs; live blocks
     /// previously wrote none).
     tx_refs: Option<tron_chainbase::TransactionStore>,
+    /// Raw `trans` backend handle — the tx-refs store is a SEPARATE RocksDB
+    /// from `ret_backend`, so the durability barrier must fsync it too or a
+    /// power loss loses recently-written refs while the blocks survive
+    /// manifest recovery, permanently breaking by-id lookups for those txs.
+    tx_refs_backend: Option<Arc<dyn KvBackend>>,
     /// Raw backend handle for the WAL durability barrier below.
     ret_backend: Arc<dyn KvBackend>,
     /// Blocks since the last txinfo WAL fsync (see `on_block_applied`).
@@ -75,6 +80,7 @@ impl IndexHook {
         Self {
             ret_store: TransactionRetStore::new(transaction_ret_backend.clone()),
             tx_refs: None,
+            tx_refs_backend: None,
             ret_backend: transaction_ret_backend,
             ret_since_sync: std::sync::atomic::AtomicU32::new(0),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -88,7 +94,8 @@ impl IndexHook {
     /// Attach the `trans` store so applied blocks also persist
     /// tx-id → block-num refs (the lookups behind the by-id RPCs).
     pub fn with_tx_refs(mut self, backend: Arc<dyn KvBackend>) -> Self {
-        self.tx_refs = Some(tron_chainbase::TransactionStore::new(backend));
+        self.tx_refs = Some(tron_chainbase::TransactionStore::new(backend.clone()));
+        self.tx_refs_backend = Some(backend);
         self
     }
 
@@ -174,6 +181,15 @@ impl IndexHook {
                 self.ret_since_sync.store(0, Ordering::Relaxed);
                 if let Err(e) = self.ret_backend.sync_wal() {
                     tracing::warn!(error = %e, "index hook: transactionRetStore WAL sync failed");
+                }
+                // The `trans` (tx-refs) store is a separate RocksDB, so it
+                // needs its own fsync in the same barrier — otherwise a power
+                // loss keeps the manifest-recovered block but loses its
+                // tx-id → block-num ref, permanently missing it in by-id RPCs.
+                if let Some(tx_refs_backend) = &self.tx_refs_backend {
+                    if let Err(e) = tx_refs_backend.sync_wal() {
+                        tracing::warn!(error = %e, "index hook: trans (tx-refs) WAL sync failed");
+                    }
                 }
             }
         }
