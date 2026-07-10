@@ -89,6 +89,12 @@ pub fn reconstruct_root(proof: &Proof) -> Option<NodeHash> {
 /// For an inclusion proof (`proof.leaf_value_hash` is `Some`), also require
 /// `keccak256(value_bytes) == proof.leaf_value_hash`; `value_bytes` must be
 /// supplied. For an exclusion check pass `value_bytes = None`.
+///
+/// Supplying `value_bytes = Some(..)` asks "prove K = V". An exclusion proof
+/// (absent leaf) does not answer that question — the claimed value is provably
+/// NOT at the key — so it is reported as `Invalid`, never `Excluded`. This
+/// keeps a caller that only checks `outcome != Invalid` from mistaking an
+/// absence proof for a positive K = V answer.
 pub fn verify_proof(
     expected_root: &NodeHash,
     proof: &Proof,
@@ -106,7 +112,15 @@ pub fn verify_proof(
             }
             true
         }
-        None => false,
+        None => {
+            // Exclusion proof. If the caller supplied a value to bind, they
+            // asked to prove that value present; an absence proof refutes
+            // rather than answers that, so it is invalid for the request.
+            if value_bytes.is_some() {
+                return ProofOutcome::Invalid;
+            }
+            false
+        }
     };
 
     let Some(acc) = reconstruct_root(proof) else {
@@ -212,6 +226,31 @@ mod tests {
         let pr = smt.prove(&p).unwrap();
         // An inclusion proof with no value cannot be bound → Invalid.
         assert_eq!(verify_proof(&root, &pr, None), ProofOutcome::Invalid);
+    }
+
+    #[test]
+    fn exclusion_proof_with_claimed_value_is_invalid() {
+        // Build a tree that does NOT contain `absent`, take its exclusion
+        // proof, then ask verify_proof to prove a value present at that key.
+        let be = Mem::default();
+        let present = lp(1);
+        let raw = b"present".to_vec();
+        let mut smt = Smt::open(&be, EMPTY_ROOT);
+        let (root, ops) = smt.apply(&[(present, Some(keccak256(&raw)))]).unwrap();
+        be.write_nodes(&ops).unwrap();
+        let smt = Smt::open(&be, root);
+
+        let absent = lp(999);
+        let pr = smt.prove(&absent).unwrap();
+        assert!(pr.leaf_value_hash.is_none(), "absent key → exclusion proof");
+        // As a pure exclusion check (no claimed value) it is Excluded.
+        assert_eq!(verify_proof(&root, &pr, None), ProofOutcome::Excluded);
+        // But answering "prove K = V" with an absence proof must be Invalid,
+        // not Excluded — the claimed value is provably not present.
+        assert_eq!(
+            verify_proof(&root, &pr, Some(b"anything")),
+            ProofOutcome::Invalid
+        );
     }
 
     #[test]

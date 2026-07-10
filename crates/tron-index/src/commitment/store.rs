@@ -404,9 +404,11 @@ impl CommitmentStore {
             .map_err(Self::be_err)
     }
 
-    /// Record only the committed height + root (used when the re-bootstrap
-    /// fallback sets `committed_height = head - K` without re-walking the
-    /// node ops, since those were already persisted chunk-by-chunk).
+    /// Overwrite only the committed-height and root meta rows, atomically and
+    /// synced, leaving the node/leaf rows untouched. Currently exercised only
+    /// by the store's own unit tests; the builder's re-bootstrap path finalizes
+    /// through [`Self::finish_bootstrap`] and keeps `committed_height = anchor`,
+    /// so it does not use this.
     pub fn set_height_and_root(
         &self,
         committed_height: i64,

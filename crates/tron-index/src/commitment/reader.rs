@@ -73,6 +73,32 @@ impl CommitmentReader {
     /// when no leaves are folded yet; the height is `-1` before the first
     /// commit so callers can detect "not yet committed".
     pub fn root(&self) -> Result<(i64, NodeHash), CommitmentError> {
+        self.consistent_height_root()
+    }
+
+    /// Read `(committed_height, root)` as one self-consistent pair.
+    ///
+    /// The committed height and root are independent point reads over the
+    /// store, and the background builder commits both in a single atomic
+    /// `commit_block` batch. A batch landing between the two reads could
+    /// otherwise pair a height with a root from the adjacent generation,
+    /// mislabelling the tuple — a transient false alarm for a cross-node root
+    /// comparison. The committed height doubles as a seqlock: sample it, read
+    /// the root, then re-sample the height, and accept the pair only when the
+    /// two height samples agree (no commit intervened). A bounded number of
+    /// retries covers a commit racing the read; sustained churn beyond that
+    /// falls back to a plain read, since the pair is best-effort comparison
+    /// metadata, not consensus state.
+    fn consistent_height_root(&self) -> Result<(i64, NodeHash), CommitmentError> {
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            let before = self.store.committed_height()?.unwrap_or(-1);
+            let root = self.store.root()?;
+            let after = self.store.committed_height()?.unwrap_or(-1);
+            if before == after {
+                return Ok((before, root));
+            }
+        }
         let height = self.store.committed_height()?.unwrap_or(-1);
         let root = self.store.root()?;
         Ok((height, root))
@@ -99,16 +125,17 @@ impl CommitmentReader {
     /// snapshot-isolated multi-key read at the backend layer, a proof walk
     /// racing a commit could in principle observe rows from two generations.
     /// Pinning the served root to the reconstruction makes such a pair benign:
-    /// it stays internally consistent (the proof verifies against it), and the
-    /// reported `height` is the store's committed height as best-effort
-    /// metadata. `height` is `-1` before the first commit.
+    /// it stays internally consistent (the proof verifies against it). The
+    /// anchor height and the root the proof is built against are read together
+    /// through the seqlock in [`Self::consistent_height_root`], so the reported
+    /// `height` reflects the same commit generation as that root rather than a
+    /// separately-sampled one. `height` is `-1` before the first commit.
     pub fn prove_consistent(
         &self,
         store: UndoStoreId,
         raw_key: &[u8],
     ) -> Result<(i64, NodeHash, Proof), CommitmentError> {
-        let height = self.store.committed_height()?.unwrap_or(-1);
-        let root = self.store.root().unwrap_or(EMPTY_ROOT);
+        let (height, root) = self.consistent_height_root()?;
         let smt = Smt::open(&self.store, root);
         let path = leaf_path_for(store, raw_key);
         let proof = smt.prove(&path)?;
@@ -218,6 +245,17 @@ mod tests {
             .unwrap();
         assert!(proof_ex.leaf_value_hash.is_none());
         assert_eq!(verify_proof(&root_ex, &proof_ex, None), ProofOutcome::Excluded);
+    }
+
+    #[test]
+    fn root_pairs_committed_height_with_current_root() {
+        let reader = reader_with_blocks(5); // committed up to 5 - K = 3.
+        let (h, root) = reader.root().unwrap();
+        // The seqlock read returns the store's committed height paired with the
+        // matching root.
+        assert_eq!(h, 3);
+        assert_eq!(Some(h), reader.store.committed_height().unwrap());
+        assert_eq!(root, reader.store.root().unwrap());
     }
 
     #[test]
