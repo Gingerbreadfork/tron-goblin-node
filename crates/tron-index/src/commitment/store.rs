@@ -45,6 +45,12 @@ pub struct CommitmentMeta {
     /// Cumulative leaves folded during the current bootstrap (progress
     /// reporting).
     pub bootstrap_keys_done: u64,
+    /// Live chain head captured when the last bootstrap/re-bootstrap scan
+    /// completed. The scan reflects a fuzzy cut of state up to (at most) this
+    /// height, so a committed root BELOW it has not yet canonically
+    /// converged — clients comparing roots across nodes must treat it as
+    /// provisional. `None` before any bootstrap.
+    pub bootstrap_horizon: Option<i64>,
 }
 
 /// Resumable bootstrap position: the store currently being scanned (its
@@ -288,7 +294,14 @@ impl CommitmentStore {
             root: self.root()?,
             bootstrap_progress: self.bootstrap_progress()?,
             bootstrap_keys_done: self.bootstrap_keys_done()?,
+            bootstrap_horizon: self.bootstrap_horizon()?,
         })
+    }
+
+    /// Live head captured at the last bootstrap's scan completion (see
+    /// [`CommitmentMeta::bootstrap_horizon`]).
+    pub fn bootstrap_horizon(&self) -> Result<Option<i64>, CommitmentError> {
+        self.get_i64(b"bootstrap_horizon")
     }
 
     /// Encode a [`BootstrapCursor`] into its meta row value.
@@ -362,11 +375,13 @@ impl CommitmentStore {
     }
 
     /// Finalize a completed bootstrap: record the anchor as `committed_height`
-    /// and the root, and clear the bootstrap cursor. Synced for durability.
+    /// and the root, the live head at scan completion as the convergence
+    /// `horizon`, and clear the bootstrap cursor. Synced for durability.
     pub fn finish_bootstrap(
         &self,
         anchor: i64,
         root: &NodeHash,
+        horizon: i64,
     ) -> Result<(), CommitmentError> {
         self.backend
             .write_batch_sync(&[
@@ -375,6 +390,10 @@ impl CommitmentStore {
                     anchor.to_be_bytes().to_vec(),
                 ),
                 WriteOp::Put(meta_key(b"root"), root.to_vec()),
+                WriteOp::Put(
+                    meta_key(b"bootstrap_horizon"),
+                    horizon.to_be_bytes().to_vec(),
+                ),
                 WriteOp::Delete(meta_key(b"bootstrap_progress")),
             ])
             .map_err(Self::be_err)

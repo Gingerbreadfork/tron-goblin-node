@@ -40,6 +40,12 @@ pub struct CommitmentStatus {
     pub bootstrapping: bool,
     /// Leaves folded so far during bootstrap (progress reporting).
     pub bootstrap_keys_done: u64,
+    /// `true` while the committed root has NOT yet canonically converged after
+    /// a bootstrap/re-bootstrap: the committed height is still below the scan
+    /// horizon, so the tree is a fuzzy cut that matches no single canonical
+    /// height. A cross-node root comparison must ignore a provisional root
+    /// (comparing one would raise a false divergence alarm).
+    pub provisional: bool,
 }
 
 /// Derive the SMT leaf path for a raw store key: `keccak256(store_id ‖ key)`.
@@ -113,10 +119,25 @@ impl CommitmentReader {
         Ok((height, served_root, proof))
     }
 
+    /// Whether the committed root is still provisional — the tree has not yet
+    /// converged after a (re-)bootstrap (committed height below the scan
+    /// horizon), so it matches no single canonical height.
+    pub fn provisional(&self) -> Result<bool, CommitmentError> {
+        Ok(match (self.store.committed_height()?, self.store.bootstrap_horizon()?) {
+            (Some(c), Some(h)) => c < h,
+            _ => false,
+        })
+    }
+
     /// Full status snapshot for the `/status` route.
     pub fn status(&self) -> Result<CommitmentStatus, CommitmentError> {
         let meta = self.store.meta()?;
         let head = self.counters.head_height();
+        // Provisional until the fold-forward passes the bootstrap scan horizon.
+        let provisional = match (meta.committed_height, meta.bootstrap_horizon) {
+            (Some(c), Some(h)) => c < h,
+            _ => false,
+        };
         Ok(CommitmentStatus {
             committed_height: meta.committed_height,
             head_height: if head < 0 { None } else { Some(head) },
@@ -124,6 +145,7 @@ impl CommitmentReader {
             root: meta.root,
             bootstrapping: meta.bootstrap_progress.is_some(),
             bootstrap_keys_done: meta.bootstrap_keys_done,
+            provisional,
         })
     }
 }
@@ -196,6 +218,24 @@ mod tests {
             .unwrap();
         assert!(proof_ex.leaf_value_hash.is_none());
         assert_eq!(verify_proof(&root_ex, &proof_ex, None), ProofOutcome::Excluded);
+    }
+
+    #[test]
+    fn root_is_provisional_until_committed_passes_the_bootstrap_horizon() {
+        let store = CommitmentStore::new(Arc::new(MemBackend::new()));
+        store.check_or_init().unwrap();
+        // Bootstrap anchored at height 100 but the live head reached 150 during
+        // the scan: the tree is a fuzzy cut, so the committed root is provisional.
+        store.finish_bootstrap(100, &EMPTY_ROOT, 150).unwrap();
+        let reader =
+            CommitmentReader::new(store.clone(), Arc::new(CommitmentCounters::new()), K);
+        assert!(reader.provisional().unwrap(), "below horizon → provisional");
+        assert!(reader.status().unwrap().provisional);
+
+        // Fold forward past the horizon: the tree is now canonical.
+        store.commit_block(&[], 150, &EMPTY_ROOT, true).unwrap();
+        assert!(!reader.provisional().unwrap(), "at/above horizon → converged");
+        assert!(!reader.status().unwrap().provisional);
     }
 
     #[test]

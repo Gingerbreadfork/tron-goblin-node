@@ -358,7 +358,11 @@ impl CommitmentBuilder {
         }
 
         let root = self.smt.root();
-        self.store.finish_bootstrap(anchor, &root)?;
+        // The live head at scan completion is the convergence horizon: the
+        // scan is a fuzzy cut of state up to at most this height, so committed
+        // roots below it are provisional until the fold-forward passes it.
+        let horizon = self.live_head().max(anchor);
+        self.store.finish_bootstrap(anchor, &root, horizon)?;
         self.state.committed_height = Some(anchor);
         self.state.max_seen_height = self.state.max_seen_height.max(anchor);
         self.counters
@@ -367,6 +371,21 @@ impl CommitmentBuilder {
         self.counters.bootstrapping.store(false, Ordering::Relaxed);
         tracing::info!(anchor, keys = keys_done, "commitment: bootstrap complete");
         Ok(())
+    }
+
+    /// The live chain head, read from the DynProps backend the builder scans.
+    /// Used as the bootstrap convergence horizon; `0` if DynProps is somehow
+    /// absent from the scanned surface (the provisional flag then stays inert,
+    /// which is safe).
+    fn live_head(&self) -> i64 {
+        self.backends
+            .iter()
+            .find(|(id, _)| *id == UndoStoreId::DynProps)
+            .and_then(|(_, b)| {
+                tron_chainbase::DynamicPropertiesStore::new(b.clone())
+                    .latest_block_header_number()
+            })
+            .unwrap_or(0)
     }
 
     /// Buffer one applied block's write-set and fold every now-confirmed

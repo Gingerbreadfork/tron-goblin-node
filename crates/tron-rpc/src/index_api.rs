@@ -1342,6 +1342,11 @@ fn resolve_proof_target(
 /// `bootstrapping` note is returned before the first committed height.
 async fn commitment_root(State(state): State<RpcState>) -> (StatusCode, Json<Value>) {
     let reader = get_commitment!(state);
+    // `provisional` warns a cross-node comparator that the tree has not yet
+    // converged after a (re-)bootstrap, so this root matches no canonical
+    // height and must not be compared. Best-effort; a read error defaults to
+    // not-provisional (the height/root read below would surface a real fault).
+    let provisional = reader.provisional().unwrap_or(false);
     match reader.root() {
         Ok((height, root)) => {
             // The reader returns `-1` before the first commit (still
@@ -1354,6 +1359,7 @@ async fn commitment_root(State(state): State<RpcState>) -> (StatusCode, Json<Val
                         "data": {
                             "height": Value::Null,
                             "root": hex0x(&root),
+                            "provisional": provisional,
                             "note": "commitment bootstrapping",
                         },
                     })),
@@ -1363,7 +1369,11 @@ async fn commitment_root(State(state): State<RpcState>) -> (StatusCode, Json<Val
                     StatusCode::OK,
                     Json(json!({
                         "success": true,
-                        "data": { "height": height, "root": hex0x(&root) },
+                        "data": {
+                            "height": height,
+                            "root": hex0x(&root),
+                            "provisional": provisional,
+                        },
                     })),
                 )
             }
@@ -1389,6 +1399,7 @@ async fn commitment_status(State(state): State<RpcState>) -> (StatusCode, Json<V
                     "root": hex0x(&s.root),
                     "bootstrapping": s.bootstrapping,
                     "bootstrap_keys_done": s.bootstrap_keys_done,
+                    "provisional": s.provisional,
                     "empty_root": hex0x(&EMPTY_ROOT),
                 },
             })),
