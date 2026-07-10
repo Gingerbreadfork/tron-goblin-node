@@ -27,7 +27,12 @@ use crate::commitment::smt::{
 
 /// Bumped on any layout/semantics change a reader could mis-interpret. A bump
 /// wipes the node store and re-bootstraps at the current head.
-pub const COMMITMENT_FORMAT_VERSION: u32 = 1;
+///
+/// v2: only branch nodes (two non-empty children) are persisted; single-child
+/// and empty nodes are derived from the leaves on read. Roots and proofs are
+/// byte-identical to v1, but the on-disk node set differs, so a v1 store must
+/// be re-Merkleized.
+pub const COMMITMENT_FORMAT_VERSION: u32 = 2;
 
 const TAG_META: u8 = 0x00;
 const TAG_NODE: u8 = 0x01;
@@ -441,6 +446,39 @@ impl NodeBackend for CommitmentStore {
             })?)),
             None => Ok(None),
         }
+    }
+
+    fn leaves_under(
+        &self,
+        level: usize,
+        prefix: &LeafPath,
+        limit: usize,
+    ) -> Result<Vec<(LeafPath, NodeHash)>, CommitmentError> {
+        let want = mask_prefix(prefix, level);
+        // Leaves are keyed `0x02 ‖ path(32)`, so the subtree is a contiguous
+        // range from its low bound. Scan `limit` rows and keep the leading run
+        // that stays within the subtree; the first row past it (or a non-leaf
+        // row) ends the run, since keys are in ascending order.
+        let rows = self
+            .backend
+            .scan_from(&leaf_key(&want), limit)
+            .map_err(Self::be_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (k, v) in rows {
+            if k.first() != Some(&TAG_LEAF) || k.len() != 1 + 32 {
+                break; // left the leaf keyspace
+            }
+            let mut path = [0u8; 32];
+            path.copy_from_slice(&k[1..33]);
+            if mask_prefix(&path, level) != want {
+                break; // left the subtree
+            }
+            let vh = <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                CommitmentError::Corrupt("leaf row is not 32 bytes".into())
+            })?;
+            out.push((path, vh));
+        }
+        Ok(out)
     }
 }
 

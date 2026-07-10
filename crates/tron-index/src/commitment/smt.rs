@@ -145,21 +145,38 @@ pub enum NodeOp {
 }
 
 /// Persistence seam the SMT walks. Keys are `(level, subtree-prefix)`; the
-/// production node-key encoding lives in `store.rs`. The SMT never stores
-/// default nodes — `get_node`/`get_leaf` returning `None` means "default /
-/// absent at this position".
+/// production node-key encoding lives in `store.rs`.
+///
+/// Only **branch** internal nodes — those with two non-empty child subtrees —
+/// are stored. A `get_node` miss means the node is derivable from the leaves:
+/// an empty subtree is the level default, and a subtree with one non-empty
+/// child is a single-child "spine" whose hash the SMT folds up from the leaf
+/// (or a deeper stored branch). [`leaves_under`](NodeBackend::leaves_under)
+/// gives the SMT the leaves it needs for that derivation. This keeps stored
+/// rows at O(2·leaves) instead of O(leaves·256).
 ///
 /// `prefix` for a node at `level` is the leaf path with only its top `level`
 /// bits significant; the lower bits MUST be ignored by an implementor (the
 /// SMT masks them, but a backend that round-trips the bytes must agree on the
 /// canonical packing — see `store.rs`).
 pub trait NodeBackend {
-    /// Internal node hash at `(level, prefix)`, or `None` for the default.
+    /// Stored (branch) node hash at `(level, prefix)`, or `None` when no branch
+    /// row exists there (the SMT then derives it from the leaves).
     fn get_node(&self, level: usize, prefix: &LeafPath) -> Result<Option<NodeHash>, CommitmentError>;
     /// Apply a batch of node/leaf ops.
     fn write_nodes(&self, ops: &[NodeOp]) -> Result<(), CommitmentError>;
     /// The current value-hash leaf at `path`, or `None` if the key is absent.
     fn get_leaf(&self, path: &LeafPath) -> Result<Option<NodeHash>, CommitmentError>;
+    /// Up to `limit` `(leaf_path, value_hash)` pairs whose path lies in the
+    /// subtree rooted at `(level, prefix)` (i.e. shares its top `level` bits),
+    /// in ascending path order. Used to derive an unstored node's hash: 0 ⇒
+    /// default, 1 ⇒ single-leaf spine, ≥2 ⇒ recurse into the child subtrees.
+    fn leaves_under(
+        &self,
+        level: usize,
+        prefix: &LeafPath,
+        limit: usize,
+    ) -> Result<Vec<(LeafPath, NodeHash)>, CommitmentError>;
 }
 
 /// Forwarding impl so a shared borrow of any backend is itself a backend.
@@ -174,6 +191,14 @@ impl<B: NodeBackend + ?Sized> NodeBackend for &B {
     }
     fn get_leaf(&self, path: &LeafPath) -> Result<Option<NodeHash>, CommitmentError> {
         (**self).get_leaf(path)
+    }
+    fn leaves_under(
+        &self,
+        level: usize,
+        prefix: &LeafPath,
+        limit: usize,
+    ) -> Result<Vec<(LeafPath, NodeHash)>, CommitmentError> {
+        (**self).leaves_under(level, prefix, limit)
     }
 }
 
@@ -248,6 +273,13 @@ impl<B: NodeBackend> Smt<B> {
         self.root
     }
 
+    /// Recompute the root from the stored nodes and leaves, deriving any
+    /// unstored (single-child/empty) nodes. In production the root is read from
+    /// meta; this recomputation is for tests and integrity checks.
+    pub fn root_from_backend(&self) -> Result<NodeHash, CommitmentError> {
+        Ok(self.read_subtree_hash(0, &[0u8; 32])?.unwrap_or(EMPTY_ROOT))
+    }
+
     /// Borrow the backend (read-only).
     pub fn backend(&self) -> &B {
         &self.backend
@@ -286,6 +318,10 @@ impl<B: NodeBackend> Smt<B> {
         // being consumed to their recomputed hashes; it begins at level 256
         // (leaf slots) and is rebuilt one level up per iteration.
         let mut current: BTreeMap<LeafPath, NodeHash> = BTreeMap::new();
+        // Set when this batch actually REMOVES a leaf. Only a removal can make a
+        // former branch node lose branch status, so it gates DeleteNode
+        // emission below (a pure insert/overwrite batch never un-branches).
+        let mut has_deletes = false;
 
         for (path, vh) in &final_leaf {
             let existing = self.backend.get_leaf(path)?;
@@ -302,6 +338,7 @@ impl<B: NodeBackend> Smt<B> {
                 None => {
                     if existing.is_some() {
                         ops.push(NodeOp::DeleteLeaf(*path));
+                        has_deletes = true;
                     }
                     // An absent leaf contributes the default at level 256.
                     current.insert(*path, default_hashes()[DEPTH]);
@@ -356,16 +393,26 @@ impl<B: NodeBackend> Smt<B> {
                 };
                 let parent_hash = hash_internal(level, &left, &right);
 
-                if parent_hash == d[level] {
-                    ops.push(NodeOp::DeleteNode {
-                        level,
-                        prefix: parent_prefix,
-                    });
-                } else {
+                // Persist ONLY branch nodes — those with two non-empty children.
+                // Single-child ("spine") and empty nodes are re-derived on read
+                // from the leaves, so storing them would be O(leaves·256) rows
+                // for no benefit. A node can only lose branch status when a leaf
+                // is removed, so emit a DeleteNode (to clear a now-stale branch
+                // row) only when this batch removed a leaf; a pure
+                // insert/overwrite batch — all of bootstrap — emits none,
+                // avoiding ~256 no-op tombstones per folded leaf.
+                let both_children_present =
+                    left != d[child_level] && right != d[child_level];
+                if both_children_present {
                     ops.push(NodeOp::PutNode {
                         level,
                         prefix: parent_prefix,
                         hash: parent_hash,
+                    });
+                } else if has_deletes {
+                    ops.push(NodeOp::DeleteNode {
+                        level,
+                        prefix: parent_prefix,
                     });
                 }
                 parents.insert(parent_prefix, parent_hash);
@@ -421,18 +468,28 @@ impl<B: NodeBackend> Smt<B> {
     /// Materialized hash of the subtree rooted at `(level, prefix)`, or `None`
     /// when that subtree is empty (its level default).
     ///
-    /// At an internal level (`level < DEPTH`) this reads the stored node,
-    /// masking the prefix to its level so the backend key is canonical. At the
-    /// leaf-slot level (`level == DEPTH`) the "subtree" is a single leaf: the
-    /// leaf row is read by full path and re-hashed with [`hash_leaf`], because
-    /// leaves are persisted as value-hash rows, not as internal nodes. Folding
-    /// or proving over a sibling leaf therefore reconstructs its leaf-node hash
-    /// rather than treating it as the empty default.
+    /// At the leaf-slot level (`level == DEPTH`) the "subtree" is a single leaf,
+    /// read by full path and re-hashed with [`hash_leaf`]. At an internal level
+    /// a stored **branch** row is returned directly; on a miss the node is
+    /// derived from the leaves beneath it (only branch nodes are persisted):
+    ///
+    /// * 0 leaves ⇒ empty ⇒ `None` (the level default);
+    /// * 1 leaf ⇒ a single-child "spine": fold that leaf's node hash up from
+    ///   the leaf slot to `level` through default siblings — pure, no further
+    ///   reads;
+    /// * ≥2 leaves ⇒ still a single-child node here (a two-non-empty-children
+    ///   node would be stored), so recurse into both children (one is empty and
+    ///   returns immediately) and combine, terminating at the deeper stored
+    ///   branch.
+    ///
+    /// The derived hash is byte-identical to what the store-every-node scheme
+    /// held, so roots and proofs are unchanged.
     fn read_subtree_hash(
         &self,
         level: usize,
         prefix: &LeafPath,
     ) -> Result<Option<NodeHash>, CommitmentError> {
+        let d = default_hashes();
         if level >= DEPTH {
             // `prefix` is the full leaf path at the leaf-slot level.
             return Ok(self
@@ -441,7 +498,39 @@ impl<B: NodeBackend> Smt<B> {
                 .map(|vh| hash_leaf(prefix, &vh)));
         }
         let canon = mask_prefix(prefix, level);
-        self.backend.get_node(level, &canon)
+        if let Some(h) = self.backend.get_node(level, &canon)? {
+            return Ok(Some(h)); // stored branch
+        }
+        let leaves = self.backend.leaves_under(level, &canon, 2)?;
+        match leaves.len() {
+            0 => Ok(None), // empty subtree ⇒ default
+            1 => {
+                // Single-leaf spine: fold hash_leaf up to `level` with default
+                // siblings. No backend reads beyond the one leaf.
+                let (leaf_path, vh) = &leaves[0];
+                let mut h = hash_leaf(leaf_path, vh);
+                for j in (level..DEPTH).rev() {
+                    let (l, r) = if path_bit(leaf_path, j) {
+                        (d[j + 1], h)
+                    } else {
+                        (h, d[j + 1])
+                    };
+                    h = hash_internal(j, &l, &r);
+                }
+                Ok(Some(h))
+            }
+            _ => {
+                // ≥2 leaves under an unstored node ⇒ single-child chain. Recurse
+                // into both children; the empty side returns `None` immediately
+                // and the non-empty side descends to the deeper stored branch.
+                let child0 = mask_prefix(&canon, level + 1); // bit `level` = 0
+                let mut child1 = child0;
+                child1[level / 8] |= 1 << (7 - (level % 8)); // bit `level` = 1
+                let left = self.read_subtree_hash(level + 1, &child0)?.unwrap_or(d[level + 1]);
+                let right = self.read_subtree_hash(level + 1, &child1)?.unwrap_or(d[level + 1]);
+                Ok(Some(hash_internal(level, &left, &right)))
+            }
+        }
     }
 }
 
@@ -501,6 +590,12 @@ mod tests {
         fn new() -> Self {
             Self::default()
         }
+        fn node_count(&self) -> usize {
+            self.nodes.borrow().len()
+        }
+        fn leaf_count(&self) -> usize {
+            self.leaves.borrow().len()
+        }
     }
 
     impl NodeBackend for MemNodeBackend {
@@ -537,6 +632,23 @@ mod tests {
         fn get_leaf(&self, path: &LeafPath) -> Result<Option<NodeHash>, CommitmentError> {
             Ok(self.leaves.borrow().get(path).copied())
         }
+
+        fn leaves_under(
+            &self,
+            level: usize,
+            prefix: &LeafPath,
+            limit: usize,
+        ) -> Result<Vec<(LeafPath, NodeHash)>, CommitmentError> {
+            let want = mask_prefix(prefix, level);
+            Ok(self
+                .leaves
+                .borrow()
+                .range(want..)
+                .take_while(|(p, _)| mask_prefix(p, level) == want)
+                .take(limit)
+                .map(|(p, h)| (*p, *h))
+                .collect())
+        }
     }
 
     /// Apply `changes` and persist the emitted ops, returning the new root.
@@ -550,10 +662,11 @@ mod tests {
         root
     }
 
-    /// Reconstruct the current root by reading node (0, all-zero) or
-    /// EMPTY_ROOT.
+    /// Reconstruct the current root by deriving it from the stored
+    /// nodes/leaves (only branch nodes are persisted, so a single-child root is
+    /// not at `get_node(0)` — it is folded up from the leaves).
     fn current_root(be: &MemNodeBackend) -> NodeHash {
-        be.get_node(0, &[0u8; 32]).unwrap().unwrap_or(EMPTY_ROOT)
+        Smt::open(be, EMPTY_ROOT).root_from_backend().unwrap()
     }
 
     fn vh(byte: u8) -> NodeHash {
@@ -1144,6 +1257,29 @@ mod tests {
         let be_solo = MemNodeBackend::new();
         let solo = apply_persist(&be_solo, &[(a, Some(va))]);
         assert_eq!(after_delete, solo);
+    }
+
+    /// The storage win: only branch nodes are persisted, so the node-row count
+    /// is O(leaves) — about `leaves - 1` — not O(leaves · 256). A binary tree
+    /// with L leaves has exactly L-1 internal branch nodes.
+    #[test]
+    fn stored_nodes_are_branch_only_not_per_path() {
+        let be = MemNodeBackend::new();
+        const L: u64 = 200;
+        for i in 0..L {
+            apply_persist(&be, &[(path(i), Some(vh(i as u8)))]);
+        }
+        assert_eq!(be.leaf_count(), L as usize);
+        // Exactly L-1 branch nodes for L distinct leaves — nowhere near
+        // L*256 (the store-every-path-node cost this change removes).
+        assert_eq!(
+            be.node_count(),
+            L as usize - 1,
+            "expected {} branch nodes, got {}",
+            L - 1,
+            be.node_count()
+        );
+        assert!(be.node_count() < L as usize * 8, "must be O(L), not O(L*256)");
     }
 
     // -- Extra: apply emits delete-node ops that round-trip to default ------

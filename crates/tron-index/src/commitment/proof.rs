@@ -158,6 +158,12 @@ mod tests {
         fn get_leaf(&self, path: &LeafPath) -> Result<Option<NodeHash>, CommitmentError> {
             Ok(self.leaves.borrow().get(path).copied())
         }
+        fn leaves_under(&self, level: usize, prefix: &LeafPath, limit: usize) -> Result<Vec<(LeafPath, NodeHash)>, CommitmentError> {
+            let want = mask_prefix(prefix, level);
+            Ok(self.leaves.borrow().range(want..)
+                .take_while(|(p, _)| mask_prefix(p, level) == want)
+                .take(limit).map(|(p, h)| (*p, *h)).collect())
+        }
     }
 
     fn lp(seed: u64) -> LeafPath {
