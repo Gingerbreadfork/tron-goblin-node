@@ -661,11 +661,26 @@ pub fn extract_block(
         if caps.internal {
             for (itxidx, itx) in info.internal_transactions.iter().enumerate() {
                 let itxidx = itxidx as u32;
-                let (Some(caller), Some(target)) =
-                    (addr21(&itx.caller_address), addr21(&itx.transfer_to_address))
-                else {
-                    continue;
-                };
+                // Index each endpoint independently: a malformed or empty
+                // counterparty address must not erase the internal
+                // transfer from the other party's history (mirrors the
+                // native extractor's per-participant `involve`).
+                let caller = addr21(&itx.caller_address);
+                let target = addr21(&itx.transfer_to_address);
+                let mut dirs: BTreeMap<Addr, u32> = BTreeMap::new();
+                involve(&mut dirs, caller, DIR_FROM);
+                involve(&mut dirs, target, DIR_TO);
+                if dirs.is_empty() {
+                    continue; // neither endpoint decodable — nothing to index
+                }
+                // The stored row keeps both endpoints: the decodable side
+                // in its normalized 21-byte form, an undecodable side in
+                // its original bytes so the counterparty stays visible.
+                let caller_bytes =
+                    caller.map(|a| a.to_vec()).unwrap_or_else(|| itx.caller_address.clone());
+                let transfer_to_bytes = target
+                    .map(|a| a.to_vec())
+                    .unwrap_or_else(|| itx.transfer_to_address.clone());
                 let call_value = itx
                     .call_value_info
                     .iter()
@@ -691,14 +706,11 @@ pub fn extract_block(
                     .iter()
                     .find(|cv| !cv.token_id.is_empty() && cv.token_id != "0")
                     .map(|cv| cv.token_id.clone());
-                let mut dirs: BTreeMap<Addr, u32> = BTreeMap::new();
-                *dirs.entry(caller).or_insert(0) |= DIR_FROM;
-                *dirs.entry(target).or_insert(0) |= DIR_TO;
                 for (addr, direction) in dirs {
                     let row = InternalRow {
                         txid: tx_id.to_vec(),
-                        caller: caller.to_vec(),
-                        transfer_to: target.to_vec(),
+                        caller: caller_bytes.clone(),
+                        transfer_to: transfer_to_bytes.clone(),
                         call_value,
                         token_id: token_id.clone(),
                         rejected: itx.rejected,
@@ -716,4 +728,77 @@ pub fn extract_block(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps_internal() -> CaptureSet {
+        CaptureSet {
+            native: false,
+            trc20: false,
+            trc721: false,
+            internal: true,
+            logs: false,
+            callee_contract: false,
+        }
+    }
+
+    fn trigger_tx(owner: [u8; 21], callee: [u8; 21]) -> Transaction {
+        let c = tron_proto::TriggerSmartContract {
+            owner_address: owner.to_vec(),
+            contract_address: callee.to_vec(),
+            ..Default::default()
+        };
+        Transaction {
+            raw_data: Some(tron_proto::transaction::Raw {
+                contract: vec![tron_proto::transaction::Contract {
+                    r#type: ContractType::TriggerSmartContract as i32,
+                    parameter: Some(prost_types::Any {
+                        type_url: String::new(),
+                        value: c.encode_to_vec(),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// An internal transaction whose `transfer_to_address` is
+    /// undecodable still indexes the decodable caller — a bad endpoint
+    /// must not drop the transfer from the other party's history.
+    #[test]
+    fn internal_one_bad_endpoint_still_indexes_the_good_side() {
+        let caller = [0x41u8; 21];
+        let block = Block {
+            transactions: vec![trigger_tx(caller, [0x42u8; 21])],
+            ..Default::default()
+        };
+        // A 5-byte target is neither 20- nor 21-byte, so `addr21`
+        // rejects it while the caller stays decodable.
+        let itx = tron_proto::InternalTransaction {
+            caller_address: caller.to_vec(),
+            transfer_to_address: vec![1, 2, 3, 4, 5],
+            ..Default::default()
+        };
+        let ret = TransactionRet {
+            transactioninfo: vec![tron_proto::TransactionInfo {
+                internal_transactions: vec![itx],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let entries = extract_block(100, &block, Some(&ret), &caps_internal());
+        let internal: Vec<_> =
+            entries.puts.iter().filter(|(k, _)| k[0] == keys::NS_INTERNAL).collect();
+        assert_eq!(internal.len(), 1, "the decodable caller is still indexed");
+        assert_eq!(entries.internal_rows, 1);
+        let row = InternalRow::decode(internal[0].1.as_slice()).unwrap();
+        assert_eq!(row.direction, DIR_FROM, "caller keyed as the sender");
+        assert_eq!(row.caller, caller.to_vec());
+        assert_eq!(row.transfer_to, vec![1, 2, 3, 4, 5], "bad endpoint kept verbatim");
+    }
 }
