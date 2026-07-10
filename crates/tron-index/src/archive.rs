@@ -1074,17 +1074,33 @@ impl ArchiveAtBackend {
             if take_arch {
                 let (ak, resolved) = arch_next.take().expect("checked");
                 arch_next = arch.next().map_err(to_kv)?;
-                // Drop the live duplicate of this key, if buffered.
-                if live_buf.front().map(|(lk, _)| *lk == ak).unwrap_or(false) {
-                    live_buf.pop_front();
-                }
+                // Take the live duplicate of this key, if buffered.
+                let live_dup = if live_buf.front().map(|(lk, _)| *lk == ak).unwrap_or(false) {
+                    live_buf.pop_front().map(|(_, v)| v)
+                } else {
+                    None
+                };
                 match resolved {
                     AtHeight::Value(v) => {
                         if !visit(&ak, v) {
                             return Ok(());
                         }
                     }
-                    AtHeight::Deleted | AtHeight::NotCovered => {}
+                    // `NotCovered` means no archived version applies, so the
+                    // live value is authoritative — exactly what the point
+                    // `get()` does (`NotCovered => live.get`). A scan must
+                    // agree, so emit the live duplicate instead of dropping the
+                    // key. Only reachable in degraded states (a mid-prune crash
+                    // or on-disk corruption); in the normal case every archived
+                    // key has a covered version. `Deleted` emits nothing.
+                    AtHeight::NotCovered => {
+                        if let Some(v) = live_dup {
+                            if !visit(&ak, v) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    AtHeight::Deleted => {}
                 }
             } else {
                 let (lk, lv) = live_buf.pop_front().expect("checked");
