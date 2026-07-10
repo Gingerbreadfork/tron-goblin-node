@@ -85,8 +85,6 @@ pub struct CommitmentCounters {
     pub bootstrapping: AtomicBool,
     /// Leaves folded so far during bootstrap.
     pub bootstrap_keys_done: AtomicU64,
-    /// Set by the hook when it drops a message; the builder resyncs on it.
-    pub resync_needed: AtomicBool,
 }
 
 impl CommitmentCounters {

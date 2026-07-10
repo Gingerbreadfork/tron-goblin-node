@@ -242,13 +242,12 @@ impl IndexHook {
                 })
                 .unwrap_or_default();
             if tx.try_send(tron_index::CommitmentMsg::Block { height, deltas }).is_err() {
-                // Drop-and-flag: never block apply on the builder. The dropped
-                // height becomes a gap the builder repairs (resume source, else
-                // re-bootstrap); record the backpressure for metrics.
+                // Drop-and-record: never block apply on the builder. The dropped
+                // height becomes a gap the builder detects and repairs (resume
+                // source, else re-bootstrap); count the backpressure for metrics.
                 if let Some(counters) = &self.commitment_counters {
                     use std::sync::atomic::Ordering;
                     counters.lagged.fetch_add(1, Ordering::Relaxed);
-                    counters.resync_needed.store(true, Ordering::Relaxed);
                 }
                 tracing::debug!(
                     block = height,
@@ -276,6 +275,24 @@ pub fn build_transaction_ret(
         .and_then(|h| h.raw_data.as_ref())
         .map(|r| r.timestamp)
         .unwrap_or(0);
+
+    // The executor must return exactly one result per block transaction. The
+    // `zip` below silently truncates to the shorter side, so a mismatch would
+    // store a short `TransactionRet` with no other signal; surface it loudly
+    // (and trip debug builds) instead.
+    if block.transactions.len() != report.tx_results.len() {
+        tracing::warn!(
+            block = block_number,
+            transactions = block.transactions.len(),
+            tx_results = report.tx_results.len(),
+            "index hook: block tx count != executor tx_results; TransactionRet will be truncated"
+        );
+    }
+    debug_assert_eq!(
+        block.transactions.len(),
+        report.tx_results.len(),
+        "block tx count must equal executor tx_results count"
+    );
 
     let infos = block
         .transactions
