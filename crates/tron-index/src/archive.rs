@@ -1750,4 +1750,178 @@ mod tests {
         // The first still-covered ring height survives.
         assert!(w.backend.get(&meta_keys_at(expire_hi + 1)).unwrap().is_some());
     }
+
+    /// A retention prune advances the durable coverage `base` to the new
+    /// floor BEFORE it deletes any version row, so an interruption mid-prune
+    /// fails safe: the surviving state can only ever UNDER-claim coverage
+    /// (reject a height whose rows physically still exist) — it can never
+    /// serve a deleted height's live value as exact history.
+    ///
+    /// The in-memory backend cannot literally interrupt a running prune, so
+    /// this drives the two phases explicitly: it makes the base advance
+    /// durable (exactly as `prune_below` does first) and then deletes only
+    /// part of the sub-floor rows, leaving the store in the state a crash
+    /// before the final `commit_prune` would leave behind. It then asserts
+    /// the safety properties, and that a later prune at a higher floor sweeps
+    /// the leftover rows cleanly and idempotently.
+    #[test]
+    fn crash_mid_prune_underclaims_and_reprunes_cleanly() {
+        let w = writer();
+        let r = w.reader();
+        let mut model = HashMap::new();
+
+        let a = key(0xaa); // written every block → an exact version at the floor
+        let b = key(0xbb); // written once far below the floor → would need a re-pin
+        for h in 1..=20i64 {
+            let mut writes = vec![(a.clone(), Some(vec![h as u8]))];
+            if h == 2 {
+                writes.push((b.clone(), Some(b"b-early".to_vec())));
+            }
+            apply(&w, &mut model, h, &writes);
+        }
+        assert_eq!(w.coverage().unwrap(), Some((0, 20)));
+        let old_base = 0i64;
+        let floor = 10i64;
+
+        // Phase 1 of a prune, made durable: advance the coverage base to the
+        // floor. This is exactly what `prune_below` commits before it touches
+        // any version row.
+        w.backend
+            .write_batch(&[WriteOp::Put(meta_key(b"base_height"), floor.to_be_bytes().to_vec())])
+            .unwrap();
+        w.backend.sync_wal().unwrap();
+        // Phase 2, interrupted: delete only some of the sub-floor rows and
+        // never re-pin `b`, as a crash before `commit_prune` would leave it.
+        for h in 1..=5i64 {
+            w.backend
+                .write_batch(&[WriteOp::Delete(row_key(STORE, &a, h))])
+                .unwrap();
+        }
+
+        // The covered range now excludes [old_base, floor): a coverage-gated
+        // read below the floor is rejected as out-of-coverage, never served as
+        // a live value dressed up as history.
+        let (base, head) = w.coverage().unwrap().unwrap();
+        assert_eq!((base, head), (floor, 20));
+        for h in old_base..floor {
+            assert!(h < base, "height {h} must be out of coverage after the base advance");
+        }
+
+        // Reads at and above the floor still resolve exactly — including `b`,
+        // whose anchor was never re-pinned: its seek finds the original
+        // lower-height row (which physically survives) and reads correctly.
+        for h in floor..=head {
+            assert_eq!(r.value_at(STORE, &a, h).unwrap(), val(&[h as u8]), "a@{h}");
+            assert_eq!(r.value_at(STORE, &b, h).unwrap(), val(b"b-early"), "b@{h}");
+        }
+
+        // A re-prune at the same floor is a clean no-op (base already == floor)
+        // and leaves the interrupted state untouched.
+        let same = w.prune_below(floor).unwrap();
+        assert!(same.noop);
+        assert_eq!(same.rows_deleted, 0);
+        assert_eq!(w.coverage().unwrap(), Some((floor, 20)));
+
+        // A later prune at a higher floor sweeps every leftover sub-floor row
+        // — including the ones the interrupted pass never reached — and
+        // re-pins `b`'s anchor at the new floor. Reads at and above it stay
+        // exact.
+        let higher = 15i64;
+        let s = w.prune_below(higher).unwrap();
+        assert!(!s.noop);
+        assert_eq!(w.coverage().unwrap(), Some((higher, 20)));
+        for h in higher..=20 {
+            assert_eq!(r.value_at(STORE, &a, h).unwrap(), val(&[h as u8]), "a@{h} post-reprune");
+            assert_eq!(r.value_at(STORE, &b, h).unwrap(), val(b"b-early"), "b@{h} post-reprune");
+        }
+        // No sub-floor row survived for either key after the higher prune.
+        for h in 1..higher {
+            assert!(
+                w.backend.get(&row_key(STORE, &a, h)).unwrap().is_none(),
+                "a@{h} leftover below the new floor"
+            );
+        }
+        assert!(w.backend.get(&row_key(STORE, &b, 2)).unwrap().is_none());
+        assert!(w.backend.get(&row_key(STORE, &b, higher)).unwrap().is_some());
+    }
+
+    /// The invariant that makes a lock-free at-height read safe against a
+    /// concurrent retention prune, asserted through the invariant itself
+    /// rather than by racing two live threads (the in-memory backend exposes
+    /// no read-time injection hook). A reader validates coverage with a
+    /// `base_height` read and then resolves the row in a separate,
+    /// unsynchronized read. Because a prune advances the durable base to the
+    /// floor BEFORE deleting any row, a completed pass guarantees:
+    ///
+    ///   * the base equals the floor, so every read at `H < floor` is out of
+    ///     coverage (rejected by the API's coverage gate), and
+    ///   * every key covered before the prune still resolves to a concrete
+    ///     anchor at the floor — a real version, a re-pinned value, or a
+    ///     re-pinned tombstone — so a read at `H >= floor` can never observe a
+    ///     deleted anchor left without its re-pin.
+    ///
+    /// Together these bound every interleaving of a concurrent reader: seeing
+    /// the old base means no row has been deleted yet (all rows present);
+    /// seeing the new base means `H < floor` is already rejected.
+    #[test]
+    fn prune_leaves_every_covered_key_a_concrete_anchor_at_the_floor() {
+        let w = writer();
+        let r = w.reader();
+        let mut model = HashMap::new();
+
+        let a = key(0xa0); // an exact version exists at the floor
+        let b = key(0xb0); // last write below the floor → re-pinned value
+        let c = key(0xc0); // deleted below the floor → re-pinned tombstone
+        let d = key(0xd0); // born above the floor → covered by a base tombstone
+
+        for h in 1..=20i64 {
+            let mut writes = vec![(a.clone(), Some(vec![h as u8]))];
+            match h {
+                3 => writes.push((b.clone(), Some(b"b-val".to_vec()))),
+                4 => writes.push((c.clone(), Some(b"c-val".to_vec()))),
+                6 => writes.push((c.clone(), None)), // deleted at 6, below the floor
+                15 => writes.push((d.clone(), Some(b"d-late".to_vec()))),
+                _ => {}
+            }
+            apply(&w, &mut model, h, &writes);
+        }
+        assert_eq!(w.coverage().unwrap(), Some((0, 20)));
+
+        let floor = 10i64;
+        w.prune_below(floor).unwrap();
+        let (base, head) = w.coverage().unwrap().unwrap();
+        assert_eq!((base, head), (floor, 20));
+
+        // Base advanced to the floor: every height below it is out of
+        // coverage, so the gate rejects such a read rather than serving a live
+        // value as history.
+        for h in 0..floor {
+            assert!(h < base, "height {h} must be below the advanced base");
+        }
+
+        // No covered key resolves to `NotCovered` at the floor — each keeps a
+        // concrete anchor. A deleted anchor left without its re-pin would
+        // surface here as `NotCovered` and fall through to the live store.
+        for k in [&a, &b, &c, &d] {
+            assert_ne!(
+                r.value_at(STORE, k, floor).unwrap(),
+                AtHeight::NotCovered,
+                "a covered key must keep a concrete anchor at the floor"
+            );
+        }
+        // Each anchor holds the correct as-of-floor value.
+        assert_eq!(r.value_at(STORE, &a, floor).unwrap(), val(&[floor as u8]));
+        assert_eq!(r.value_at(STORE, &b, floor).unwrap(), val(b"b-val"));
+        assert_eq!(r.value_at(STORE, &c, floor).unwrap(), AtHeight::Deleted); // tombstone
+        assert_eq!(r.value_at(STORE, &d, floor).unwrap(), AtHeight::Deleted); // not yet born
+
+        // Reads across the whole retained window stay exact.
+        for h in floor..=head {
+            assert_eq!(r.value_at(STORE, &a, h).unwrap(), val(&[h as u8]), "a@{h}");
+            assert_eq!(r.value_at(STORE, &b, h).unwrap(), val(b"b-val"), "b@{h}");
+            assert_eq!(r.value_at(STORE, &c, h).unwrap(), AtHeight::Deleted, "c@{h}");
+            let expect_d = if h >= 15 { val(b"d-late") } else { AtHeight::Deleted };
+            assert_eq!(r.value_at(STORE, &d, h).unwrap(), expect_d, "d@{h}");
+        }
+    }
 }

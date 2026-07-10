@@ -339,3 +339,72 @@ fn at_height_scans_merge_live_and_archive_correctly() {
     assert_eq!(first_two[0].0, b"p/archived".to_vec());
     assert_eq!(first_two[1].0, b"p/born11".to_vec());
 }
+
+// ---------------------------------------------------------------------------
+// Retention floor + reorg interaction
+// ---------------------------------------------------------------------------
+
+/// With a zero-block retain window the retention floor is clamped to the
+/// solidified (irreversible) height, so the anchor re-pinned at the floor can
+/// never carry a value from a block a later reorg orphans. After such a prune,
+/// a reorg that rewrites the reversible blocks just above the floor resolves
+/// cleanly: the floor's anchor (at the irreversible height) is untouched,
+/// reads at and above the floor reflect the NEW chain, and no read ever
+/// returns a value that lived only on the orphaned chain.
+#[test]
+fn zero_retain_prune_floor_survives_a_reorg_above_solidified() {
+    let rig = Rig::new();
+
+    // Capture 10..=20 on the original chain. `a` moves every block; `orphan`
+    // exists only on the original chain, above the floor.
+    for h in 10..=20i64 {
+        let a_old = format!("a{h}-old").into_bytes();
+        if h == 18 {
+            rig.apply(h, &[(b"a", Some(a_old.as_slice())), (b"orphan", Some(b"old-only"))]);
+        } else {
+            rig.apply(h, &[(b"a", Some(a_old.as_slice()))]);
+        }
+    }
+    assert_eq!(rig.writer.reader().coverage().unwrap(), Some((9, 20)));
+
+    // retain_blocks = 0 would put the floor at head 20, but the solidified
+    // head is 15 — the floor must clamp to 15 so the re-pinned anchor sits at
+    // an irreversible height, never a reorg-able one.
+    let stats = rig.writer.prune_for_window(20, 0, 15).unwrap().unwrap();
+    assert!(!stats.noop);
+    assert_eq!(rig.writer.coverage().unwrap(), Some((15, 20)));
+
+    // Reorg: the reversible blocks 16..=20 are rewritten. The first re-apply
+    // (height 16 <= head) unwinds the orphaned heights, then the new chain is
+    // applied forward. Block 15 (the solidified floor) is the common ancestor,
+    // never rewritten.
+    for h in 16..=20i64 {
+        let a_new = format!("a{h}-new").into_bytes();
+        rig.apply(h, &[(b"a", Some(a_new.as_slice()))]);
+    }
+
+    // The floor anchor sits at the irreversible height 15 — unchanged by the
+    // reorg, and identical on both chains (it is the fork point).
+    assert_eq!(rig.value_at(b"a", 15), AtHeight::Value(b"a15-old".to_vec()));
+    // Reads above the floor reflect the new chain, block for block.
+    for h in 16..=20i64 {
+        let expected = format!("a{h}-new").into_bytes();
+        assert_eq!(rig.value_at(b"a", h), AtHeight::Value(expected), "a@{h}");
+    }
+    // The key written only on the orphaned chain resolves to absent (its
+    // covered anchor is the pre-creation tombstone re-pinned at the floor) —
+    // never the value it held on the orphaned chain.
+    assert_eq!(rig.value_at(b"orphan", 18), AtHeight::Deleted);
+    assert_eq!(rig.value_at(b"orphan", 20), AtHeight::Deleted);
+    assert_ne!(rig.value_at(b"orphan", 18), AtHeight::Value(b"old-only".to_vec()));
+
+    // Coverage base stayed clamped at the solidified floor across the reorg.
+    assert_eq!(rig.writer.coverage().unwrap(), Some((15, 20)));
+    assert_eq!(
+        rig.writer
+            .counters()
+            .reorg_unwinds
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
