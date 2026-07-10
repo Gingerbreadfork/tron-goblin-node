@@ -377,14 +377,31 @@ impl ArchiveWriter {
             return Err(IndexError::Corrupt("finish_reset without a wiping marker".into()));
         };
         let wiping_key = meta_wiping();
-        let all = self.backend.scan_all()?;
-        let ops: Vec<WriteOp> = all
-            .into_iter()
-            .filter(|(k, _)| *k != wiping_key)
-            .map(|(k, _)| WriteOp::Delete(k))
-            .collect();
-        for chunk in ops.chunks(100_000) {
-            self.backend.write_batch(chunk)?;
+        // Delete every row except the wiping marker, streaming in bounded
+        // chunks via scan_from. scan_all would materialize the ENTIRE archive
+        // (keys AND values) in one allocation — hours/terabytes of history —
+        // and OOM the node; the `wiping` marker then re-OOMs on every reopen.
+        const CHUNK: usize = 50_000;
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let rows = self.backend.scan_from(&cursor, CHUNK)?;
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            let mut next = last.clone();
+            let ops: Vec<WriteOp> = rows
+                .iter()
+                .filter(|(k, _)| *k != wiping_key)
+                .map(|(k, _)| WriteOp::Delete(k.clone()))
+                .collect();
+            if !ops.is_empty() {
+                self.backend.write_batch(&ops)?;
+            }
+            // Advance strictly past the last key scanned. The just-deleted rows
+            // and the surviving marker all sort before it, so no row is
+            // revisited and the loop terminates.
+            next.push(0);
+            cursor = next;
         }
         let mut finalize = vec![
             WriteOp::Put(

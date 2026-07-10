@@ -201,14 +201,28 @@ impl CommitmentStore {
 
     fn finish_reset(&self) -> Result<(), CommitmentError> {
         let wiping = meta_wiping();
-        let all = self.backend.scan_all().map_err(Self::be_err)?;
-        let ops: Vec<WriteOp> = all
-            .into_iter()
-            .filter(|(k, _)| *k != wiping)
-            .map(|(k, _)| WriteOp::Delete(k))
-            .collect();
-        for chunk in ops.chunks(100_000) {
-            self.backend.write_batch(chunk).map_err(Self::be_err)?;
+        // Delete every row except the wiping marker, streaming in bounded
+        // chunks. scan_all would materialize the entire node store (which for a
+        // populated commitment is multi-GB to TB) in one allocation and OOM the
+        // node — and the durable `wiping` marker then re-OOMs on every reopen.
+        const CHUNK: usize = 50_000;
+        let mut cursor: Vec<u8> = Vec::new();
+        loop {
+            let rows = self.backend.scan_from(&cursor, CHUNK).map_err(Self::be_err)?;
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            let mut next = last.clone();
+            let ops: Vec<WriteOp> = rows
+                .iter()
+                .filter(|(k, _)| *k != wiping)
+                .map(|(k, _)| WriteOp::Delete(k.clone()))
+                .collect();
+            if !ops.is_empty() {
+                self.backend.write_batch(&ops).map_err(Self::be_err)?;
+            }
+            next.push(0);
+            cursor = next;
         }
         self.backend
             .write_batch(&[
