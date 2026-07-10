@@ -54,6 +54,15 @@ pub struct CaptureSet {
 }
 
 impl CaptureSet {
+    /// Whether any captured kind is derived from transaction-info (the VM
+    /// side): TRC20/TRC721 transfers, internal transactions, and event logs.
+    /// The single source of truth so the engine's txinfo-wait decision and
+    /// the extractor's txinfo requirement can never drift apart — omitting
+    /// `trc721` here once dropped NFT rows at the tip.
+    pub fn wants_vm(&self) -> bool {
+        self.trc20 || self.trc721 || self.internal || self.logs
+    }
+
     /// Stable fingerprint of the effective capture set. A mismatch at
     /// open time means rows on disk were written under a different
     /// contract → rebuild (see `db::IndexDb::check_or_init`).
@@ -519,7 +528,7 @@ pub fn extract_block(
     // transaction-info matched by tx id, falling back to block
     // position only for id-less infos (the shared rulebook).
     let matcher = TxInfoMatcher::new(txinfo);
-    let wants_vm_kinds = caps.trc20 || caps.trc721 || caps.internal || caps.logs;
+    let wants_vm_kinds = caps.wants_vm();
     if wants_vm_kinds && txinfo.is_none() && !block.transactions.is_empty() {
         out.txinfo_missing = true;
     }

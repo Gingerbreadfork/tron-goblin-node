@@ -529,7 +529,7 @@ impl IndexEngine {
         // racing its hook write: truncate the window there and let the
         // wake-up retry, with an attempts cap so a wedged hook can't
         // park the follower forever.
-        let wants_vm = self.caps.trc20 || self.caps.internal || self.caps.logs;
+        let wants_vm = self.caps.wants_vm();
         let mut cut = planned.len();
         if wants_vm {
             let txret = TransactionRetStore::new(self.txret.clone());
@@ -671,7 +671,7 @@ impl IndexEngine {
         planned: &[(i64, BlockId, Option<Vec<u8>>)],
     ) -> Result<Vec<Option<BlockEntries>>, IndexError> {
         use rayon::prelude::*;
-        let wants_vm = self.caps.trc20 || self.caps.internal || self.caps.logs;
+        let wants_vm = self.caps.wants_vm();
         if planned.len() < 8 {
             return planned
                 .iter()
