@@ -69,6 +69,38 @@ pub struct IndexDb {
     backend: Arc<dyn KvBackend>,
 }
 
+/// Reset-in-progress marker (empty value). [`IndexDb::wipe`] is a
+/// multi-batch delete; the marker makes a crash mid-wipe re-resolve as
+/// [`InitOutcome::NeedsRebuild`] rather than a fresh DB behind surviving
+/// rows. Lives in `NS_META` alongside the other bookkeeping stamps.
+fn meta_wiping() -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 6);
+    k.push(keys::NS_META);
+    k.extend_from_slice(b"wiping");
+    k
+}
+
+/// The `NS_META ‖ "id_at/"` / `NS_META ‖ "keys_at/"` scan prefixes,
+/// derived from the canonical key builder minus its 8-byte height
+/// suffix so the layout stays defined in exactly one place.
+fn ring_id_prefix() -> Vec<u8> {
+    let mut p = keys::meta_id_at(0);
+    p.truncate(p.len() - 8);
+    p
+}
+
+fn ring_keys_prefix() -> Vec<u8> {
+    let mut p = keys::meta_keys_at(0);
+    p.truncate(p.len() - 8);
+    p
+}
+
+/// Recover the height encoded in a ring key's 8-byte big-endian suffix.
+fn ring_height_of(key: &[u8], prefix: &[u8]) -> Option<i64> {
+    let suffix: [u8; 8] = key.get(prefix.len()..)?.try_into().ok()?;
+    Some(u64::from_be_bytes(suffix) as i64)
+}
+
 impl IndexDb {
     pub fn new(backend: Arc<dyn KvBackend>) -> Self {
         Self { backend }
@@ -86,6 +118,16 @@ impl IndexDb {
     ///
     /// [`wipe`]: Self::wipe
     pub fn check_or_init(&self, scope_fingerprint: u64) -> Result<InitOutcome, IndexError> {
+        // A crash during a multi-batch [`wipe`] leaves this durable
+        // marker set with the version stamp (which sorts first) already
+        // deleted but later row namespaces still on disk. Resolve that
+        // half-emptied state to a rebuild rather than a fresh cold-start,
+        // so the stale rows are dropped instead of resumed as complete.
+        if self.backend.get(&meta_wiping())?.is_some() {
+            return Ok(InitOutcome::NeedsRebuild {
+                reason: "index wipe interrupted before completion",
+            });
+        }
         match self.format_version()? {
             None => {
                 self.stamp(scope_fingerprint)?;
@@ -142,23 +184,55 @@ impl IndexDb {
     /// RocksDB instance prefer destroying the directory before open
     /// (the node's open helper does); this exists for in-memory
     /// backends and small DBs where tombstoning is fine.
+    ///
+    /// The wipe spans several batches, and the meta stamps sort first,
+    /// so a naive delete would drop the version stamp in the opening
+    /// batch and leave later row namespaces behind — a crash there would
+    /// re-open as a fresh empty DB shadowing stale rows. A durable
+    /// `wiping` marker, set before the first delete and cleared only
+    /// after the last, forces an interrupted wipe to re-resolve as
+    /// [`InitOutcome::NeedsRebuild`] instead (see [`check_or_init`]).
+    ///
+    /// [`check_or_init`]: Self::check_or_init
     pub fn wipe(&self) -> Result<(), IndexError> {
+        let wiping = meta_wiping();
+        self.backend
+            .write_batch(&[WriteOp::Put(wiping.clone(), Vec::new())])?;
+        self.backend.sync_wal()?;
         let all = self.backend.scan_all()?;
-        let ops: Vec<WriteOp> = all.into_iter().map(|(k, _)| WriteOp::Delete(k)).collect();
+        let ops: Vec<WriteOp> = all
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| *k != wiping)
+            .map(WriteOp::Delete)
+            .collect();
         for chunk in ops.chunks(100_000) {
             self.backend.write_batch(chunk)?;
         }
+        // Clear the marker last: only now, with every row gone, is the DB
+        // genuinely fresh. Make the clear durable so a fresh stamp is
+        // never shadowed by a surviving marker.
+        self.backend.write_batch(&[WriteOp::Delete(wiping)])?;
+        self.backend.sync_wal()?;
         Ok(())
     }
 
     // -- cursor / edges ------------------------------------------------------
 
     fn get_i64(&self, key: &[u8]) -> Result<Option<i64>, IndexError> {
-        Ok(self
-            .backend
-            .get(key)?
-            .and_then(|v| v.try_into().ok())
-            .map(i64::from_be_bytes))
+        let Some(bytes) = self.backend.get(key)? else {
+            return Ok(None);
+        };
+        // A present-but-wrong-length value is corruption, not absence:
+        // coercing it to `None` would silently re-trigger a full
+        // re-backfill (or misreport a reorg deeper than the ring). Hard-
+        // error like [`cursor`] does.
+        //
+        // [`cursor`]: Self::cursor
+        let value: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+            IndexError::Corrupt(format!("meta i64 has {} bytes (want 8)", bytes.len()))
+        })?;
+        Ok(Some(i64::from_be_bytes(value)))
     }
 
     /// The composite live-edge cursor: `(height, recorded canonical
@@ -224,10 +298,21 @@ impl IndexDb {
     // -- recent ring ---------------------------------------------------------
 
     pub fn id_at(&self, height: i64) -> Result<Option<[u8; 32]>, IndexError> {
-        Ok(self
-            .backend
-            .get(&keys::meta_id_at(height))?
-            .and_then(|v| v.try_into().ok()))
+        let Some(bytes) = self.backend.get(&keys::meta_id_at(height))? else {
+            return Ok(None);
+        };
+        // A wrong-length ring id is corruption, not a missing entry: a
+        // reorg unwind mistaking it for absent would hard-error on a
+        // phantom hole. Surface the real fault (matches [`cursor`]).
+        //
+        // [`cursor`]: Self::cursor
+        let id: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            IndexError::Corrupt(format!(
+                "ring id_at/{height} has {} bytes (want 32)",
+                bytes.len()
+            ))
+        })?;
+        Ok(Some(id))
     }
 
     pub fn keys_at(&self, height: i64) -> Result<Option<Vec<Vec<u8>>>, IndexError> {
@@ -237,6 +322,35 @@ impl IndexDb {
                 .map(Some)
                 .ok_or_else(|| IndexError::Corrupt(format!("ring keys_at/{height} undecodable"))),
         }
+    }
+
+    /// Delete `id_at/` + `keys_at/` ring entries recorded strictly below
+    /// `threshold`, returning the number of entries removed. The engine's
+    /// per-block prune only trims the single height leaving the ring
+    /// window each block, so entries stranded below the window by
+    /// downtime longer than the ring depth are never revisited; this
+    /// reclaims them. The height-BE key order lets the scan stop at the
+    /// first live entry, and `limit` bounds one call so a large gap drains
+    /// across successive sweeps rather than in one unbounded batch.
+    pub fn prune_ring_below(&self, threshold: i64, limit: usize) -> Result<usize, IndexError> {
+        let mut ops: Vec<WriteOp> = Vec::new();
+        for prefix in [ring_id_prefix(), ring_keys_prefix()] {
+            for (k, _) in self.backend.scan_from(&prefix, limit)? {
+                if !k.starts_with(&prefix) {
+                    break; // left the ring namespace
+                }
+                match ring_height_of(&k, &prefix) {
+                    Some(h) if h >= threshold => break, // ascending: rest are live
+                    Some(_) => ops.push(WriteOp::Delete(k)),
+                    None => continue,
+                }
+            }
+        }
+        let pruned = ops.len();
+        if pruned > 0 {
+            self.backend.write_batch(&ops)?;
+        }
+        Ok(pruned)
     }
 
     // -- batches ---------------------------------------------------------------
@@ -328,5 +442,63 @@ mod tests {
         db.wipe().unwrap();
         assert_eq!(db.cursor_height().unwrap(), None);
         assert_eq!(db.check_or_init(7).unwrap(), InitOutcome::Fresh);
+    }
+
+    #[test]
+    fn interrupted_wipe_needs_rebuild() {
+        let db = db();
+        db.check_or_init(7).unwrap();
+        db.commit(&IndexDb::cursor_put_ops(100, Some([9u8; 32])))
+            .unwrap();
+        // Simulate a crash mid-wipe: the durable marker is set while the
+        // version stamp and some rows are still present.
+        db.backend
+            .write_batch(&[WriteOp::Put(meta_wiping(), Vec::new())])
+            .unwrap();
+        assert!(matches!(
+            db.check_or_init(7).unwrap(),
+            InitOutcome::NeedsRebuild { .. }
+        ));
+        // A completed wipe clears the marker → genuinely fresh again.
+        db.wipe().unwrap();
+        assert!(db.backend.get(&meta_wiping()).unwrap().is_none());
+        assert_eq!(db.check_or_init(7).unwrap(), InitOutcome::Fresh);
+    }
+
+    #[test]
+    fn wrong_length_meta_is_corrupt() {
+        let db = db();
+        // A truncated i64 meta value must hard-error, not read as absent
+        // (absence would silently re-trigger a full backfill).
+        db.backend.put(&keys::meta_back_edge(), &[1, 2, 3]).unwrap();
+        assert!(matches!(db.back_edge(), Err(IndexError::Corrupt(_))));
+        db.backend.put(&keys::meta_floor(), &[0u8; 9]).unwrap();
+        assert!(matches!(db.floor(), Err(IndexError::Corrupt(_))));
+        // Same for a wrong-length ring id.
+        db.backend.put(&keys::meta_id_at(5), &[0u8; 16]).unwrap();
+        assert!(matches!(db.id_at(5), Err(IndexError::Corrupt(_))));
+    }
+
+    #[test]
+    fn prune_ring_below_reclaims_stranded_entries() {
+        let db = db();
+        for h in [10i64, 20, 30, 40] {
+            db.backend
+                .write_batch(&[
+                    WriteOp::Put(keys::meta_id_at(h), vec![h as u8; 32]),
+                    WriteOp::Put(keys::meta_keys_at(h), keys::encode_key_list(&[])),
+                ])
+                .unwrap();
+        }
+        // Heights 10 and 20 fall below the threshold → 2 entries each.
+        assert_eq!(db.prune_ring_below(30, 1000).unwrap(), 4);
+        assert!(db.id_at(10).unwrap().is_none());
+        assert!(db.id_at(20).unwrap().is_none());
+        assert!(db.id_at(30).unwrap().is_some());
+        assert!(db.id_at(40).unwrap().is_some());
+        assert!(db.keys_at(20).unwrap().is_none());
+        assert!(db.keys_at(30).unwrap().is_some());
+        // Idempotent: nothing left below the threshold.
+        assert_eq!(db.prune_ring_below(30, 1000).unwrap(), 0);
     }
 }
