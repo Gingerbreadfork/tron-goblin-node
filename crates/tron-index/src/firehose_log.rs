@@ -39,6 +39,11 @@ const MAGIC: &[u8; 8] = b"TRNFH001";
 const FRAME_HEADER: usize = 8;
 /// Rotate to a new segment once the current one crosses this size.
 const SEGMENT_TARGET_BYTES: u64 = 128 * 1024 * 1024;
+/// Largest payload a single frame may carry. The reader treats any framed
+/// length above this as a torn/corrupt frame and stops, so the writer must
+/// refuse to append one — an unreadable frame would hide every later entry
+/// in the segment (and the next open would truncate it and them away).
+const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
 
 fn crc32(payload: &[u8]) -> u32 {
     let mut crc = flate2::Crc::new();
@@ -113,7 +118,7 @@ fn scan_segment_from(
         }
         let len = u32::from_le_bytes(header[..4].try_into().expect("4 bytes")) as usize;
         let want_crc = u32::from_le_bytes(header[4..].try_into().expect("4 bytes"));
-        if len > 64 * 1024 * 1024 {
+        if len > MAX_FRAME_PAYLOAD {
             break; // absurd length ⇒ torn/corrupt frame
         }
         let mut payload = vec![0u8; len];
@@ -418,6 +423,17 @@ impl FirehoseLogWriter {
     /// Append one payload; returns its seq. Durable only after
     /// [`sync`](Self::sync) (the caller owns the fsync cadence).
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, IndexError> {
+        // Refuse a payload the reader could never read back: a frame past
+        // the length cap is treated as torn, so appending one would hide
+        // every later entry in the segment and be truncated away on the
+        // next open. Reject it up front rather than persist a poison frame.
+        if payload.len() > MAX_FRAME_PAYLOAD {
+            return Err(IndexError::Io(format!(
+                "firehose append: payload {} bytes exceeds the {}-byte frame limit",
+                payload.len(),
+                MAX_FRAME_PAYLOAD
+            )));
+        }
         if self.seg_bytes >= SEGMENT_TARGET_BYTES {
             self.rotate()?;
         }
@@ -686,5 +702,23 @@ mod tests {
         let bogus = ReadPos { next_seq: 3, segment_first: 999, offset: 4 };
         let (chunk, _) = r.read_chunk(3, 7, 10, Some(bogus)).unwrap();
         assert_eq!(chunk.first().map(|(s, _)| *s), Some(3));
+    }
+
+    #[test]
+    fn append_rejects_oversize_payload() {
+        let dir = tmp_dir("oversize");
+        let mut w = FirehoseLogWriter::open(&dir, u64::MAX).unwrap();
+        // One byte past the reader's frame cap: appending it would write an
+        // unreadable frame that hides everything after it, so append must
+        // refuse it — and must not consume a seq or leave a torn tail.
+        let big = vec![0u8; MAX_FRAME_PAYLOAD + 1];
+        assert!(w.append(&big).is_err());
+        // The writer stays usable and the next entry lands at seq 1.
+        assert_eq!(w.append(b"ok").unwrap(), 1);
+        w.sync().unwrap();
+        assert_eq!(
+            FirehoseLogReader::new(&dir).read_from(1, 10).unwrap(),
+            vec![(1, b"ok".to_vec())]
+        );
     }
 }
