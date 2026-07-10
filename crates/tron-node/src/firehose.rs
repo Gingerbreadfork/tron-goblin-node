@@ -70,12 +70,15 @@ impl FirehoseWriter {
         dyn_props: Arc<dyn KvBackend>,
     ) -> Result<Self, IndexError> {
         let mut log = FirehoseLogWriter::open(dir, retain_bytes)?;
-        let mut head_height = match log.reader().head()? {
+        // The log head's height AND (for an Apply) the block_id it recorded —
+        // the id is needed to detect an abandoned-branch head that height
+        // alone cannot see (see the reconciliation below).
+        let (mut head_height, head_block_id) = match log.reader().head()? {
             Some((_, payload)) => match fh::Entry::decode(payload.as_slice()) {
                 Ok(e) => match e.event {
-                    Some(fh::entry::Event::Apply(a)) => a.height,
-                    Some(fh::entry::Event::Unwind(u)) => u.to_height,
-                    None => -1,
+                    Some(fh::entry::Event::Apply(a)) => (a.height, Some(a.block_id)),
+                    Some(fh::entry::Event::Unwind(u)) => (u.to_height, None),
+                    None => (-1, None),
                 },
                 Err(e) => {
                     return Err(IndexError::Corrupt(format!(
@@ -83,28 +86,67 @@ impl FirehoseWriter {
                     )))
                 }
             },
-            None => -1,
+            None => (-1, None),
         };
         let consensus_head = DynamicPropertiesStore::new(dyn_props.clone())
             .latest_block_header_number()
             .unwrap_or(0);
         let counters = Arc::new(FirehoseCounters::default());
-        if head_height > consensus_head {
+
+        // Reconcile the log against the recovered consensus chain. Two
+        // independent conditions force an UNWIND; a height comparison alone
+        // catches only the first:
+        //   (1) the log is AHEAD of the recovered head — power loss rolled the
+        //       chain back below what the log already emitted.
+        //   (2) the log head sits at (or below) the consensus head but on an
+        //       ABANDONED branch: a tip reorg replaced block N, the executor
+        //       committed N′ durably, but a crash landed before the log's
+        //       UNWIND + APPLY(N′) were fsynced, so the torn tail was truncated
+        //       and the log head is still old-branch APPLY(N). Heights match
+        //       (both N), so (1) never fires and consumers would keep the
+        //       orphaned block forever. Compare the recorded block_id to the
+        //       canonical id at that height; on a mismatch, unwind to the last
+        //       provably-common height — the solidified/irreversible head is at
+        //       or below the true fork point — and let the canonical branch
+        //       re-derive above it (via the store-derived gap repair on the
+        //       next apply). If solidified can't be read, drop just the
+        //       orphaned head block (correct for the dominant 1-block tip fork).
+        let reconcile_to = if head_height > consensus_head {
+            Some(consensus_head)
+        } else if head_height >= 0 {
+            let canonical = BlockIndexStore::new(block_index.clone())
+                .get(head_height)
+                .ok()
+                .map(|id| id.as_bytes().to_vec());
+            match (&head_block_id, canonical) {
+                (Some(logged), Some(canon)) if *logged != canon => {
+                    let solidified = DynamicPropertiesStore::new(dyn_props.clone())
+                        .latest_solidified_block_num();
+                    Some(solidified.map(|s| s.min(head_height - 1)).unwrap_or(head_height - 1))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(to) = reconcile_to {
             tracing::warn!(
                 log_head = head_height,
                 consensus_head,
-                "firehose: log is ahead of recovered consensus state — emitting UNWIND \
-                 (power loss rolled the chain back; re-applied blocks will follow)"
+                unwind_to = to,
+                "firehose: reconciling log to consensus — emitting UNWIND (chain rolled back, \
+                 or a reorg's entries were lost to a crash before fsync)"
             );
             let seq = log.next_seq();
             let entry = fh::Entry {
                 seq,
-                event: Some(fh::entry::Event::Unwind(fh::Unwind { to_height: consensus_head })),
+                event: Some(fh::entry::Event::Unwind(fh::Unwind { to_height: to })),
             };
             log.append(&entry.encode_to_vec())?;
             log.sync()?;
             counters.unwinds.fetch_add(1, Ordering::Relaxed);
-            head_height = consensus_head;
+            head_height = to;
         }
         tracing::info!(head_height, consensus_head, "firehose: log open");
         Ok(Self {
