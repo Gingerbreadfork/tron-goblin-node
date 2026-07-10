@@ -169,11 +169,22 @@ fn enc_value(v: Option<&[u8]>) -> Vec<u8> {
     }
 }
 
-fn dec_value(bytes: &[u8]) -> AtHeight {
+fn dec_value(bytes: &[u8], counters: &ArchiveCounters) -> AtHeight {
     match bytes.first() {
         Some(0x00) => AtHeight::Deleted,
         Some(0x01) => AtHeight::Value(bytes[1..].to_vec()),
-        _ => AtHeight::Deleted, // malformed — treat as absent, never panic
+        other => {
+            // Neither the tombstone tag (0x00) nor the value tag (0x01):
+            // the version row is corrupt. Resolve it as absent so a
+            // historical read never panics, but surface the event — a
+            // silent map-to-absent would hide on-disk damage.
+            counters.corruption_events.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                tag = ?other.copied(),
+                "archive: version row has a malformed value tag; resolving as absent"
+            );
+            AtHeight::Deleted
+        }
     }
 }
 
@@ -218,6 +229,11 @@ pub struct ArchiveCounters {
     pub prune_passes: AtomicU64,
     /// Cumulative version rows deleted by retention pruning.
     pub pruned_rows: AtomicU64,
+    /// Malformed rows encountered on the read path (an undecodable value
+    /// tag, or a row key whose escaped segment will not decode). Each is
+    /// resolved defensively without panicking; a non-zero count means
+    /// on-disk damage is silently degrading historical reads.
+    pub corruption_events: AtomicU64,
     /// Lowest covered height — mirrors the stored `base_height` after
     /// the most recent prune so the sampler can surface it without a
     /// read.
@@ -290,7 +306,7 @@ impl ArchiveWriter {
     }
 
     pub fn reader(&self) -> ArchiveReader {
-        ArchiveReader { backend: self.backend.clone() }
+        ArchiveReader { backend: self.backend.clone(), counters: self.counters.clone() }
     }
 
     /// Check or stamp the on-disk format. `Err` for a newer-format DB.
@@ -453,7 +469,12 @@ impl ArchiveWriter {
         height: i64,
         deltas: Option<&[DeltaRef<'_>]>,
     ) -> Result<(), IndexError> {
-        let mut inner = self.inner.lock().expect("archive writer poisoned");
+        // Recover the guard on a poisoned lock rather than panic: a prior
+        // panic while holding it must not escalate into an apply-path
+        // panic. The archive follows a never-fails-the-apply philosophy —
+        // every other failure here is logged and degraded — and `inner`
+        // guards only the fsync-cadence counter, which is safe to resume.
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         // Missing deltas with capture on means the block ran a commit
         // path that can't capture (config inconsistency) — coverage is
@@ -513,9 +534,19 @@ impl ArchiveWriter {
         // advances. Reorgs are bounded by the solidified gate, so the
         // ring always covers them.
         ops.push(WriteOp::Put(meta_keys_at(height), encode_key_list(&ring)));
-        let expired = height - RING_DEPTH;
-        if expired > 0 {
-            ops.push(WriteOp::Delete(meta_keys_at(expired)));
+        // Retire ring records that have fallen outside the reorg window.
+        // A normal single-block advance exposes exactly one newly-expired
+        // height; a gap-repair jump from the previous head to `height`
+        // exposes the whole span between the old and new expiry points at
+        // once — deleting only the newest of them would orphan the rest
+        // until a coverage reset. Retire the full span here. It is bounded
+        // by the (repairable) gap distance; a reorg re-apply leaves the
+        // window unchanged, so the range is empty.
+        let prev_head = head.unwrap_or(height - 1);
+        let expire_hi = height - RING_DEPTH;
+        let expire_lo = (prev_head - RING_DEPTH + 1).max(1);
+        for h in expire_lo..=expire_hi {
+            ops.push(WriteOp::Delete(meta_keys_at(h)));
         }
         ops.push(WriteOp::Put(meta_key(b"head"), height.to_be_bytes().to_vec()));
         self.backend.write_batch(&ops)?;
@@ -874,11 +905,15 @@ impl ArchiveWriter {
 #[derive(Clone)]
 pub struct ArchiveReader {
     backend: Arc<dyn KvBackend>,
+    /// Shared with the writer that produced this reader (via
+    /// [`ArchiveWriter::reader`]) so read-path corruption is counted into
+    /// the same metrics. A standalone reader gets its own detached set.
+    counters: Arc<ArchiveCounters>,
 }
 
 impl ArchiveReader {
     pub fn new(backend: Arc<dyn KvBackend>) -> Self {
-        Self { backend }
+        Self { backend, counters: Arc::new(ArchiveCounters::default()) }
     }
 
     pub fn coverage(&self) -> Result<Option<(i64, i64)>, IndexError> {
@@ -913,7 +948,7 @@ impl ArchiveReader {
             Some((k, v))
                 if k.len() == seek.len() && k[..group_prefix_len] == seek[..group_prefix_len] =>
             {
-                Ok(dec_value(v))
+                Ok(dec_value(v, &self.counters))
             }
             _ => Ok(AtHeight::NotCovered),
         }
@@ -969,7 +1004,7 @@ impl ArchiveReader {
                 return Ok(None);
             };
             let after = match self.backend.get(&vkey)? {
-                Some(v) => match dec_value(&v) {
+                Some(v) => match dec_value(&v, &self.counters) {
                     AtHeight::Value(val) => Some(val),
                     _ => None,
                 },
@@ -1019,7 +1054,17 @@ impl ArchGroupIter {
             return Ok(None);
         }
         let Some((raw_key, _)) = unescape_key(&k[2..]) else {
-            self.done = true; // malformed row — stop defensively
+            // A row key whose escaped segment will not decode is corrupt.
+            // Stop the archive side of the merged scan here rather than
+            // panic; record the event so the resulting truncation of
+            // archived coverage (later keys served straight from live) is
+            // observable instead of silent.
+            self.reader.counters.corruption_events.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                store = ?self.store,
+                "archive: undecodable row key during at-height scan; ending archive scan early"
+            );
+            self.done = true;
             return Ok(None);
         };
         // Resolve this key's version ≤ height with a direct seek.
@@ -1425,7 +1470,10 @@ mod tests {
         assert!(w.backend.get(&row_key(STORE, &d, 5)).unwrap().is_none());
         // The retained anchor (the tombstone, exactly at floor) survives.
         assert_eq!(
-            dec_value(&w.backend.get(&row_key(STORE, &d, 8)).unwrap().unwrap()),
+            dec_value(
+                &w.backend.get(&row_key(STORE, &d, 8)).unwrap().unwrap(),
+                &ArchiveCounters::default()
+            ),
             AtHeight::Deleted
         );
     }
@@ -1452,7 +1500,10 @@ mod tests {
         assert_eq!(r.value_at(STORE, &d, 20).unwrap(), AtHeight::Deleted);
         assert!(w.backend.get(&row_key(STORE, &d, 4)).unwrap().is_none());
         assert_eq!(
-            dec_value(&w.backend.get(&row_key(STORE, &d, floor)).unwrap().unwrap()),
+            dec_value(
+                &w.backend.get(&row_key(STORE, &d, floor)).unwrap().unwrap(),
+                &ArchiveCounters::default()
+            ),
             AtHeight::Deleted
         );
     }
@@ -1610,5 +1661,93 @@ mod tests {
         w.prune_below(10).unwrap();
         // A key never written: still NotCovered (falls through to live).
         assert_eq!(r.value_at(STORE, &key(99), 15).unwrap(), AtHeight::NotCovered);
+    }
+
+    /// A version row whose value tag is neither tombstone nor value
+    /// resolves as absent (never panics) and is counted so the silent
+    /// degradation is observable. The reader shares the writer's
+    /// counters, so the bump is visible through `counters()`.
+    #[test]
+    fn malformed_value_row_reads_absent_and_is_counted() {
+        let w = writer();
+        let r = w.reader();
+        // Plant a row with a bogus leading tag byte.
+        let rk = row_key(STORE, &key(7), 100);
+        w.backend
+            .write_batch(&[WriteOp::Put(rk, vec![0x42, 0x99])])
+            .unwrap();
+        assert_eq!(r.value_at(STORE, &key(7), 100).unwrap(), AtHeight::Deleted);
+        assert_eq!(
+            w.counters().corruption_events.load(Ordering::Relaxed),
+            1,
+            "the malformed decode must be counted"
+        );
+    }
+
+    /// A gap-repair jump must retire the whole span of ring records that
+    /// fell outside the reorg window, not just the single newest-expired
+    /// height — otherwise the skipped heights leak until a coverage reset.
+    #[test]
+    fn gap_repair_expires_the_full_stale_ring_span() {
+        let backend = Arc::new(MemBackend::new());
+        let undo_be: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let live: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
+        let w = ArchiveWriter::new(
+            backend,
+            Some(BlockUndoStore::new(undo_be.clone())),
+            vec![(STORE, live.clone())],
+        );
+        assert!(w.check_or_init().unwrap());
+
+        let k = key(1);
+        // One block: persist its undo record and mutate live, and (unless
+        // `silent`) feed the archive exactly like the apply hook does.
+        let write_block = |height: i64, silent: bool| {
+            let before = live.get(&k).unwrap();
+            let after = vec![height as u8];
+            let mut record = tron_chainbase::BlockUndoRecord::new();
+            record.push(tron_chainbase::UndoEntry {
+                store: STORE,
+                key: k.clone(),
+                before: before.clone(),
+            });
+            BlockUndoStore::new(undo_be.clone()).put(height, &record).unwrap();
+            live.put(&k, &after).unwrap();
+            if !silent {
+                let deltas = [DeltaRef {
+                    store: STORE,
+                    key: &k,
+                    before: before.as_deref(),
+                    after: Some(&after),
+                }];
+                w.on_block_applied(height, Some(&deltas)).unwrap();
+            }
+        };
+
+        // Consecutive coverage up to RING_DEPTH + 1 so the ring floor sits
+        // well above height 1.
+        let last = RING_DEPTH + 1;
+        for h in 1..=last {
+            write_block(h, false);
+        }
+        // A two-block gap the archive misses, then a normal apply that
+        // repairs it — head jumps from `last` to `last + 3`.
+        write_block(last + 1, true);
+        write_block(last + 2, true);
+        write_block(last + 3, false);
+
+        // Every ring height now older than the window must be gone, not
+        // just the newest-expired one.
+        let expire_hi = (last + 3) - RING_DEPTH;
+        let expire_lo = (last - RING_DEPTH) + 1;
+        assert!(expire_hi - expire_lo >= 2, "the gap must expose more than one height");
+        for h in expire_lo..=expire_hi {
+            assert!(
+                w.backend.get(&meta_keys_at(h)).unwrap().is_none(),
+                "ring entry at {h} should have been expired by the gap jump"
+            );
+        }
+        // The first still-covered ring height survives.
+        assert!(w.backend.get(&meta_keys_at(expire_hi + 1)).unwrap().is_some());
     }
 }
