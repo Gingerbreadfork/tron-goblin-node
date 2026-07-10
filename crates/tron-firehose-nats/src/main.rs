@@ -71,9 +71,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .get_last_raw_message_by_subject(&format!("{prefix}.>"))
         .await
     {
-        Ok(msg) => fh::Entry::decode(msg.payload.as_ref())
-            .map(|e| e.seq)
-            .unwrap_or(0),
+        // The same rule applies to the payload: a last message that does
+        // not decode as an Entry (foreign publisher on the subject,
+        // corruption) must fail, not silently become cursor 0.
+        Ok(msg) => match fh::Entry::decode(msg.payload.as_ref()) {
+            Ok(entry) => entry.seq,
+            Err(e) => {
+                return Err(format!(
+                    "the stream's last message on '{prefix}.>' does not decode as a \
+                     tronfirehose.Entry: {e} — refusing to restart from seq 0; remove the \
+                     foreign/corrupt message (or purge the stream) and restart the bridge"
+                )
+                .into())
+            }
+        },
         Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => 0, // empty stream
         Err(e) => return Err(e.into()),
     };
