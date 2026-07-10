@@ -906,4 +906,180 @@ mod tests {
         post.insert((ACC, key1), b"NEWBRANCH".to_vec());
         assert_eq!(b.root(), reference_root(&post));
     }
+
+    // -- 13. Restart replay via the resume source ---------------------------
+
+    #[test]
+    fn restart_repairs_forward_gap_from_resume_source() {
+        // A resume source backed by an in-memory log of per-height write-sets,
+        // standing in for the archive's reorg ring after a process restart.
+        struct LogResume {
+            log: BTreeMap<i64, Vec<CommitmentDeltaRef>>,
+        }
+        impl ResumeSource for LogResume {
+            fn deltas_at(
+                &self,
+                height: i64,
+            ) -> Result<Option<Vec<CommitmentDeltaRef>>, CommitmentError> {
+                Ok(self.log.get(&height).cloned())
+            }
+        }
+
+        let k = 2u64;
+        let s = store();
+
+        // Every height's canonical write-set, as the archive retains it.
+        let mut log: BTreeMap<i64, Vec<CommitmentDeltaRef>> = BTreeMap::new();
+        for h in 1..=12i64 {
+            let key = h.to_be_bytes().to_vec();
+            let val = vec![h as u8];
+            log.insert(h, vec![delta(UndoStoreId::Accounts, &key, Some(&val))]);
+        }
+
+        // First run: fold and persist through height 8, committing up to 8 - K.
+        {
+            let mut b = builder(s.clone(), k);
+            b.bootstrap_or_resume(0).unwrap();
+            for h in 1..=8i64 {
+                b.ingest(h, log.get(&h).unwrap().clone()).unwrap();
+            }
+            assert_eq!(b.committed_height(), Some(8 - k as i64));
+        }
+
+        // Restart: a fresh builder over the SAME store loads the persisted
+        // committed height but starts with an empty in-memory buffer, exactly
+        // as the process would after a crash or restart.
+        let mut b2 = CommitmentBuilder::new(
+            s.clone(),
+            Vec::new(),
+            k,
+            Arc::new(CommitmentCounters::new()),
+        )
+        .unwrap();
+        b2.bootstrap_or_resume(0).unwrap(); // already committed — no re-Merkleize
+        assert_eq!(b2.committed_height(), Some(6));
+        assert_eq!(b2.pending_depth(), 0);
+
+        // The first live block after restart lands well above the persisted
+        // height: every height the node applied while this builder was down
+        // (7..=11) was never delivered here, leaving a forward gap below the
+        // release ceiling.
+        let resume = LogResume { log: log.clone() };
+        let out = b2
+            .ingest_with_resume(12, log.get(&12).unwrap().clone(), Some(&resume))
+            .unwrap();
+
+        // The gap heights are folded contiguously from the resume source, and
+        // the ingest never falls back to a full re-Merkleize.
+        assert_eq!(out.folded, vec![7, 8, 9, 10]);
+        assert!(!out.rebootstrapped);
+        assert_eq!(b2.committed_height(), Some(10));
+
+        // The repaired root equals folding every height 1..=10 directly.
+        let mut expected: BTreeMap<(u8, Vec<u8>), Vec<u8>> = BTreeMap::new();
+        for hh in 1..=10i64 {
+            expected.insert((ACC, hh.to_be_bytes().to_vec()), vec![hh as u8]);
+        }
+        assert_eq!(b2.root(), reference_root(&expected));
+    }
+
+    #[test]
+    fn restart_without_resume_coverage_rebootstraps() {
+        let k = 2u64;
+        let s = store();
+
+        // First run: fold and persist through height 8.
+        {
+            let mut b = builder(s.clone(), k);
+            b.bootstrap_or_resume(0).unwrap();
+            for h in 1..=8i64 {
+                let key = h.to_be_bytes().to_vec();
+                let val = vec![h as u8];
+                b.ingest(h, vec![delta(UndoStoreId::Accounts, &key, Some(&val))])
+                    .unwrap();
+            }
+            assert_eq!(b.committed_height(), Some(6));
+        }
+
+        // Restart, then the same forward gap — but with NO resume source. With
+        // no way to replay the missing heights, the builder must fall back to a
+        // full re-Merkleize rather than fold a discontiguous tree.
+        let mut b2 = CommitmentBuilder::new(
+            s.clone(),
+            Vec::new(),
+            k,
+            Arc::new(CommitmentCounters::new()),
+        )
+        .unwrap();
+        b2.bootstrap_or_resume(0).unwrap();
+        let key = 12i64.to_be_bytes().to_vec();
+        let out = b2
+            .ingest(12, vec![delta(UndoStoreId::Accounts, &key, Some(&[12u8]))])
+            .unwrap();
+        assert!(out.rebootstrapped);
+    }
+
+    #[test]
+    fn restart_with_resume_matches_uninterrupted_tree() {
+        struct LogResume {
+            log: BTreeMap<i64, Vec<CommitmentDeltaRef>>,
+        }
+        impl ResumeSource for LogResume {
+            fn deltas_at(
+                &self,
+                height: i64,
+            ) -> Result<Option<Vec<CommitmentDeltaRef>>, CommitmentError> {
+                Ok(self.log.get(&height).cloned())
+            }
+        }
+
+        let k = 2u64;
+        let mut log: BTreeMap<i64, Vec<CommitmentDeltaRef>> = BTreeMap::new();
+        for h in 1..=12i64 {
+            let key = h.to_be_bytes().to_vec();
+            let val = vec![h as u8];
+            log.insert(h, vec![delta(UndoStoreId::Accounts, &key, Some(&val))]);
+        }
+
+        // Restart path: commit through 8, reopen the store, then repair the
+        // 7..=10 gap from the resume source when height 12 arrives.
+        let restart_root = {
+            let s = store();
+            {
+                let mut b = builder(s.clone(), k);
+                b.bootstrap_or_resume(0).unwrap();
+                for h in 1..=8i64 {
+                    b.ingest(h, log.get(&h).unwrap().clone()).unwrap();
+                }
+            }
+            let mut b2 = CommitmentBuilder::new(
+                s.clone(),
+                Vec::new(),
+                k,
+                Arc::new(CommitmentCounters::new()),
+            )
+            .unwrap();
+            b2.bootstrap_or_resume(0).unwrap();
+            let resume = LogResume { log: log.clone() };
+            b2.ingest_with_resume(12, log.get(&12).unwrap().clone(), Some(&resume))
+                .unwrap();
+            b2.root()
+        };
+
+        // Uninterrupted path: a single builder folds the identical stream
+        // 1..=12 with no restart and no resume.
+        let plain_root = {
+            let s = store();
+            let mut b = builder(s, k);
+            b.bootstrap_or_resume(0).unwrap();
+            for h in 1..=12i64 {
+                b.ingest(h, log.get(&h).unwrap().clone()).unwrap();
+            }
+            assert_eq!(b.committed_height(), Some(10));
+            b.root()
+        };
+
+        // Resume reconstructs the canonical tree byte-for-byte, not a hybrid.
+        assert_eq!(restart_root, plain_root);
+    }
 }
