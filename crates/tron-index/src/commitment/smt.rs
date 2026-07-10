@@ -374,12 +374,17 @@ impl<B: NodeBackend> Smt<B> {
             current = parents;
         }
 
-        // After folding to level 0 there is exactly one entry: the root.
+        // After folding a non-empty batch to level 0 there is exactly one
+        // entry: the root. An empty batch never populates `current` (nothing
+        // to fold), so the root is unchanged — fall back to it, NOT the
+        // all-default `d[0]`, which would wrongly reset a populated tree to
+        // EMPTY_ROOT. (Deleting the last leaf still populates `current` with
+        // the default leaf slot, so that case folds to EMPTY_ROOT here.)
         let new_root = current
             .values()
             .next()
             .copied()
-            .unwrap_or(d[0]);
+            .unwrap_or(self.root);
         self.root = new_root;
         Ok((new_root, ops))
     }
@@ -693,6 +698,40 @@ mod tests {
             apply_persist(&be, &[(*p, None)]);
         }
         assert_eq!(current_root(&be), r0, "delete must restore the prior root");
+    }
+
+    /// Regression: an empty write-set must leave a populated tree's root
+    /// unchanged (and emit no ops), NOT reset it to EMPTY_ROOT. The apply
+    /// hook forwards every height including empty/absent write-sets, so an
+    /// empty `apply` on a live tree is a routine event.
+    #[test]
+    fn empty_apply_preserves_a_populated_root() {
+        let be = MemNodeBackend::new();
+        for i in 0..7u64 {
+            apply_persist(&be, &[(path(500 + i * 7), Some(vh(i as u8)))]);
+        }
+        let populated = current_root(&be);
+        assert_ne!(populated, EMPTY_ROOT, "sanity: the tree is non-empty");
+
+        let mut smt = Smt::open(&be, populated);
+        let (root, ops) = smt.apply(&[]).unwrap();
+        assert_eq!(root, populated, "empty apply must return the unchanged root");
+        assert_eq!(smt.root(), populated, "empty apply must not mutate self.root");
+        assert!(ops.is_empty(), "empty apply must emit no node ops");
+        // A follow-up real change still folds against the preserved tree.
+        let r2 = apply_persist(&be, &[(path(9999), Some(vh(42)))]);
+        assert_ne!(r2, populated);
+        assert_ne!(r2, EMPTY_ROOT);
+    }
+
+    /// An empty apply on a genuinely empty tree stays at EMPTY_ROOT.
+    #[test]
+    fn empty_apply_on_empty_tree_is_empty_root() {
+        let be = MemNodeBackend::new();
+        let mut smt = Smt::open(&be, EMPTY_ROOT);
+        let (root, ops) = smt.apply(&[]).unwrap();
+        assert_eq!(root, EMPTY_ROOT);
+        assert!(ops.is_empty());
     }
 
     // -- 4. Single-vs-batch apply agree -------------------------------------
