@@ -109,10 +109,23 @@ impl Firehose for FirehoseService {
                 let (chunk, new_pos) = read;
                 pos = new_pos;
                 if chunk.is_empty() {
-                    if !handle.wait_past(next.saturating_sub(1)).await {
-                        return;
-                    }
-                    continue;
+                    // `next <= durable` here (the caught-up case returned
+                    // above), yet nothing was read: the durable entry at `next`
+                    // is gone — pruned by retention, or a corrupt/torn frame
+                    // below the durable mark truncated the scan. `wait_past`
+                    // would return immediately (durable >= next), so looping
+                    // here pegs a core re-CRC-ing the segment forever. Surface
+                    // it once as a data-loss error and stop; the consumer must
+                    // resync from the oldest retained entry.
+                    let _ = tx
+                        .send(Err(Status::data_loss(format!(
+                            "firehose entry {next} is at or below the durable head \
+                             {durable} but is not readable — it was pruned by retention \
+                             or the log is corrupt/truncated below its durable mark; \
+                             resync from the oldest retained entry"
+                        ))))
+                        .await;
+                    return;
                 }
                 for (seq, payload) in chunk {
                     let entry = match Entry::decode(payload.as_slice()) {
