@@ -50,6 +50,15 @@ fn segment_path(dir: &Path, first_seq: u64) -> PathBuf {
     dir.join(format!("firehose-{first_seq:020}.fhlog"))
 }
 
+/// Best-effort fsync of a directory so a freshly-created or removed segment's
+/// directory entry is durable. A failure only widens the crash window (open()
+/// tolerates a torn/missing newest segment), so it is not fatal.
+fn fsync_dir(dir: &Path) {
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
 /// `(first_seq, path)` for every segment in `dir`, ascending.
 fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, IndexError> {
     let mut out = Vec::new();
@@ -442,15 +451,23 @@ impl FirehoseLogWriter {
     }
 
     fn rotate(&mut self) -> Result<(), IndexError> {
-        self.file.sync_data().ok();
+        // Propagate the old segment's final fsync. Swallowing it would let a
+        // later sync() — which fsyncs only the NEW segment — publish a durable
+        // mark covering the old segment's un-fsynced tail, so a power loss
+        // could vanish entries tailers were already told were durable.
+        self.file
+            .sync_data()
+            .map_err(|e| IndexError::Io(format!("firehose rotate fsync: {e}")))?;
         let path = segment_path(&self.dir, self.next_seq);
         let mut f =
             File::create(&path).map_err(|e| IndexError::Corrupt(format!("create {path:?}: {e}")))?;
         f.write_all(MAGIC)
             .map_err(|e| IndexError::Corrupt(format!("write magic: {e}")))?;
         // fsync the header before we start appending frames so a crash can't
-        // leave a torn magic (open() tolerates one, but shrink the window).
+        // leave a torn magic (open() tolerates one, but shrink the window),
+        // then fsync the directory so the new segment's entry is durable too.
         f.sync_all().ok();
+        fsync_dir(&self.dir);
         self.file = f;
         self.seg_first_seq = self.next_seq;
         self.seg_bytes = 8;
