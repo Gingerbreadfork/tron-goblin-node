@@ -31,8 +31,8 @@ pub mod smt;
 pub mod store;
 
 pub use builder::{
-    BuildState, Committed, CommitmentBuilder, CommitmentCounters, CommitmentDeltaRef,
-    CommitmentMsg, ResumeSource,
+    ArchiveResume, BuildState, Committed, CommitmentBuilder, CommitmentCounters,
+    CommitmentDeltaRef, CommitmentMsg, ResumeSource,
 };
 pub use proof::{reconstruct_root, verify_proof, ProofOutcome};
 pub use reader::{leaf_path_for, CommitmentReader, CommitmentStatus};

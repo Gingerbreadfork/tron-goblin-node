@@ -890,6 +890,67 @@ impl ArchiveReader {
         }
     }
 
+    /// Reconstruct the write-set (post-images) captured at `height` from the
+    /// reorg ring: the same `(store, key, after)` set the apply hook fed the
+    /// archive — and, from the identical `report.state_deltas`, the commitment
+    /// builder. Used as a gap-repair source so a commitment restart or dropped
+    /// write-set replays in O(gap) instead of a full re-Merkleize.
+    ///
+    /// `Ok(None)` when the height's ring entry is absent (older than the ring
+    /// window, or the height was never captured) or unreadable — the caller
+    /// then falls back to re-bootstrap, which is always correct. Only a backend
+    /// I/O error propagates as `Err`.
+    pub fn write_set_at(
+        &self,
+        height: i64,
+    ) -> Result<Option<Vec<(UndoStoreId, Vec<u8>, Option<Vec<u8>>)>>, IndexError> {
+        let Some(bytes) = self.backend.get(&meta_keys_at(height))? else {
+            return Ok(None); // outside the ring window → re-bootstrap
+        };
+        let Some(ring) = decode_key_list(&bytes) else {
+            tracing::warn!(
+                height,
+                "archive: ring undecodable during commitment resume; re-bootstrapping"
+            );
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for vkey in ring {
+            // The ring holds this height's post-image version rows plus base
+            // pins at the coverage base; keep only rows whose embedded height
+            // is exactly `height` (the write-set), skipping the pins.
+            let Some((prefix, h)) = split_row_key(&vkey) else {
+                tracing::warn!(
+                    height,
+                    "archive: unparseable ring row during resume; re-bootstrapping"
+                );
+                return Ok(None);
+            };
+            if h != height {
+                continue;
+            }
+            let (Some(store), Some((raw_key, _))) = (
+                prefix.get(1).copied().and_then(UndoStoreId::from_u8),
+                unescape_key(prefix.get(2..).unwrap_or(&[])),
+            ) else {
+                tracing::warn!(
+                    height,
+                    "archive: undecodable ring key during resume; re-bootstrapping"
+                );
+                return Ok(None);
+            };
+            let after = match self.backend.get(&vkey)? {
+                Some(v) => match dec_value(&v) {
+                    AtHeight::Value(val) => Some(val),
+                    _ => None,
+                },
+                None => None,
+            };
+            out.push((store, raw_key, after));
+        }
+        Ok(Some(out))
+    }
+
 }
 
 /// Lazy, pull-based walk of one store's archived keys in raw-key
@@ -1168,6 +1229,48 @@ mod tests {
         assert_eq!(prefix, &row_key(STORE, &key(7), 0)[..k.len() - 8]);
         assert_eq!(split_row_key(&[TAG_ROW, 0, 1]), None); // too short
         assert_eq!(split_row_key(&meta_key(b"head")), None); // not a row
+    }
+
+    /// `write_set_at` reconstructs a block's exact `(store, key, after)`
+    /// write-set from the ring — the input the commitment resume source needs
+    /// — excluding the base pins the same block writes, and mapping deletes to
+    /// `None`. A never-captured height returns `None` (re-bootstrap fallback).
+    #[test]
+    fn write_set_at_reconstructs_the_block_write_set() {
+        let w = writer();
+        let r = w.reader();
+        let mut model = HashMap::new();
+
+        // Block 10 (first capture, base = 9): two upserts. The block also
+        // writes base pins at height 9 — these must NOT appear in ws(10).
+        apply(&w, &mut model, 10, &[(key(1), Some(vec![0xaa])), (key(2), Some(vec![0xbb]))]);
+        // Block 11: rewrite key 1, delete key 2.
+        apply(&w, &mut model, 11, &[(key(1), Some(vec![0xcc])), (key(2), None)]);
+
+        let sorted = |ws: Vec<(UndoStoreId, Vec<u8>, Option<Vec<u8>>)>| {
+            let mut v: Vec<_> = ws.into_iter().map(|(s, k, a)| (s as u8, k, a)).collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            sorted(r.write_set_at(10).unwrap().expect("height 10 covered")),
+            vec![
+                (STORE as u8, key(1), Some(vec![0xaa])),
+                (STORE as u8, key(2), Some(vec![0xbb])),
+            ]
+        );
+        assert_eq!(
+            sorted(r.write_set_at(11).unwrap().expect("height 11 covered")),
+            vec![
+                (STORE as u8, key(1), Some(vec![0xcc])),
+                (STORE as u8, key(2), None), // delete → after = None
+            ]
+        );
+
+        // Heights with no ring entry → None, forcing the caller to re-bootstrap.
+        assert_eq!(r.write_set_at(9).unwrap(), None);
+        assert_eq!(r.write_set_at(99).unwrap(), None);
     }
 
     /// The core invariant: after pruning to `floor`, every height

@@ -731,11 +731,13 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                 .latest_block_header_number()
                 .unwrap_or(0);
             let max_lag = config.index.commitment.max_lag_blocks;
+            let resume = commitment.resume.clone();
             handles.push(tokio::spawn(run_commitment_builder(
                 builder,
                 rx,
                 anchor_head,
                 max_lag,
+                resume,
                 shutdown.clone(),
             )));
         }
@@ -2639,6 +2641,10 @@ struct CommitmentParts {
     /// moved into the dedicated background task — the only writer of the tree.
     builder: Option<tron_index::CommitmentBuilder>,
     rx: Option<tokio::sync::mpsc::Receiver<tron_index::CommitmentMsg>>,
+    /// Archive reader used as the builder's gap-repair `ResumeSource` (present
+    /// only when the archive is enabled). Lets a restart / dropped write-set
+    /// replay a gap in O(gap) instead of a full state re-Merkleize.
+    resume: Option<tron_index::ArchiveReader>,
 }
 
 /// Bounded depth of the commitment write-set channel (blocks). A full channel
@@ -2844,11 +2850,23 @@ fn open_index_subsystem(
                 "index: state-commitment layer enabled"
             );
             hook = hook.with_commitment(tx, counters.clone());
+            // Wire the archive (if enabled) as the builder's resume source so a
+            // restart or dropped write-set repairs incrementally from the
+            // archive's reorg ring instead of re-Merkleizing the whole state.
+            let resume = archive_parts.as_ref().map(|a| a.reader.clone());
+            if resume.is_none() {
+                warn!(
+                    "index: commitment enabled without the historical-state archive — gap \
+                     recovery falls back to a full re-bootstrap; enable [index.archive] (or \
+                     capture_state_deltas) so restarts repair in O(gap)"
+                );
+            }
             commitment_parts = Some(CommitmentParts {
                 reader,
                 counters,
                 builder: Some(builder),
                 rx: Some(rx),
+                resume,
             });
         }
     }
@@ -2923,6 +2941,7 @@ async fn run_commitment_builder(
     mut rx: tokio::sync::mpsc::Receiver<tron_index::CommitmentMsg>,
     anchor_head: i64,
     max_lag_blocks: u64,
+    resume: Option<tron_index::ArchiveReader>,
     shutdown: ShutdownSignal,
 ) {
     let mut sd = shutdown.subscribe();
@@ -2958,10 +2977,18 @@ async fn run_commitment_builder(
             },
         };
         // Fold off-thread (a block recomputes hundreds of node hashes; a rare
-        // deep-reorg fallback re-Merkleizes from live state).
+        // deep-reorg fallback re-Merkleizes from live state). A forward gap
+        // below the release ceiling is repaired from the archive resume source
+        // (O(gap)) when one is wired, else it re-bootstraps.
+        let resume = resume.clone();
         let (b, result) = match tokio::task::spawn_blocking(move || {
             let mut builder = builder;
-            let r = builder.ingest(height, deltas);
+            let resume_src = resume.map(tron_index::ArchiveResume::new);
+            let r = builder.ingest_with_resume(
+                height,
+                deltas,
+                resume_src.as_ref().map(|s| s as &dyn tron_index::ResumeSource),
+            );
             (builder, r)
         })
         .await

@@ -126,6 +126,39 @@ pub trait ResumeSource: Send {
     fn deltas_at(&self, height: i64) -> Result<Option<Vec<CommitmentDeltaRef>>, CommitmentError>;
 }
 
+/// A [`ResumeSource`] backed by the historical-state archive. Replays a gap's
+/// write-set from the archive's reorg ring (which covers the most recent
+/// heights), converting the archive's `(store, key, after)` tuples into
+/// [`CommitmentDeltaRef`]s — byte-identical to the write-set the apply hook
+/// fed the builder, since both derive from the same `report.state_deltas`.
+/// A gap older than the ring window resolves to `None` → full re-bootstrap.
+/// Requires the archive (`[index] capture_state_deltas` / `[index.archive]`)
+/// to be enabled; without it the builder has no resume source and every gap
+/// re-Merkleizes.
+pub struct ArchiveResume {
+    reader: crate::archive::ArchiveReader,
+}
+
+impl ArchiveResume {
+    pub fn new(reader: crate::archive::ArchiveReader) -> Self {
+        Self { reader }
+    }
+}
+
+impl ResumeSource for ArchiveResume {
+    fn deltas_at(&self, height: i64) -> Result<Option<Vec<CommitmentDeltaRef>>, CommitmentError> {
+        let rows = self
+            .reader
+            .write_set_at(height)
+            .map_err(|e| CommitmentError::Backend(e.to_string()))?;
+        Ok(rows.map(|rows| {
+            rows.into_iter()
+                .map(|(store, key, after)| CommitmentDeltaRef { store, key, after })
+                .collect()
+        }))
+    }
+}
+
 /// Builder state: the fold watermark, the head the builder has seen, and the
 /// height-keyed pending buffer of not-yet-folded write-sets.
 #[derive(Debug, Default)]
