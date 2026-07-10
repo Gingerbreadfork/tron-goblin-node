@@ -162,6 +162,34 @@ fn trc20_transfers(tx: &fh::Tx) -> Vec<Trc20Transfer> {
         .collect()
 }
 
+/// Detect an unrepairable-gap block-height hole across firehose entries.
+///
+/// The firehose keeps seqs strictly contiguous, but signals a store gap it
+/// could not repair by *skipping* the missing height(s): it emits
+/// `APPLY(h-1)` then `APPLY(h+1)` with no seq gap, so the hole shows up only
+/// as an APPLY whose height overshoots the expected next height (see
+/// `working/FIREHOSE.md`). Given `expected` (the height the next APPLY should
+/// carry, `None` before the first APPLY) and an entry, this returns the
+/// skipped-height range `(from, to)` when the entry overshoots, plus the
+/// expected-next height to carry forward. `UNWIND` re-anchors the expected
+/// height at `to_height + 1`; a non-block entry leaves it unchanged.
+fn height_continuity(
+    expected: Option<i64>,
+    entry: &fh::Entry,
+) -> (Option<(i64, i64)>, Option<i64>) {
+    match &entry.event {
+        Some(fh::entry::Event::Apply(a)) => {
+            let hole = match expected {
+                Some(eh) if a.height > eh => Some((eh, a.height - 1)),
+                _ => None,
+            };
+            (hole, Some(a.height + 1))
+        }
+        Some(fh::entry::Event::Unwind(u)) => (None, Some(u.to_height + 1)),
+        None => (None, expected),
+    }
+}
+
 /// The per-connection prepared statements (see `run`).
 struct Statements {
     block: tokio_postgres::Statement,
@@ -348,6 +376,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // stored and what the node can still serve.
     let mut resuming = cursor > 0;
     let mut expected_seq = cursor as u64 + 1;
+    // The block height the next APPLY should carry (`None` until the first
+    // APPLY sets the baseline), used to flag a skipped-height hole the
+    // firehose signals with contiguous seqs — see `height_continuity`.
+    let mut expected_height: Option<i64> = None;
     while let Some(entry) = stream.message().await? {
         if entry.seq > expected_seq {
             if !resuming {
@@ -371,6 +403,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
+        let (hole, next_height) = height_continuity(expected_height, &entry);
+        if let Some((from, to)) = hole {
+            // Seqs stay contiguous, so the exactly-once cursor logic is
+            // unaffected; the derived tables simply have no rows for these
+            // heights because the node could not repair the store gap.
+            tracing::warn!(
+                from_height = from,
+                to_height = to,
+                seq = entry.seq,
+                "firehose block-height hole: heights {from}..={to} are absent from the derived \
+                 tables (the node could not repair a store gap); seqs remain contiguous"
+            );
+        }
+        expected_height = next_height;
         resuming = true;
         let txn = pg.transaction().await?;
         apply_entry(&txn, &stmts, &entry).await?;
@@ -459,5 +505,44 @@ mod tests {
         assert_eq!(got[0].from[0], 0x41);
         assert_eq!(got[0].token[0], 0x41);
         assert_eq!(got[0].token.len(), 21);
+    }
+
+    fn apply(height: i64, seq: u64) -> fh::Entry {
+        fh::Entry {
+            seq,
+            event: Some(fh::entry::Event::Apply(fh::BlockApplied {
+                height,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn unwind(to_height: i64, seq: u64) -> fh::Entry {
+        fh::Entry {
+            seq,
+            event: Some(fh::entry::Event::Unwind(fh::Unwind { to_height })),
+        }
+    }
+
+    #[test]
+    fn height_continuity_flags_skipped_heights_but_not_contiguous_ones() {
+        // First APPLY (no baseline yet): never a hole; baseline becomes h+1.
+        assert_eq!(height_continuity(None, &apply(100, 1)), (None, Some(101)));
+        // Contiguous next height: no hole.
+        assert_eq!(height_continuity(Some(101), &apply(101, 2)), (None, Some(102)));
+        // Skipped height (APPLY(103) where 102 was expected): the hole is 102.
+        assert_eq!(
+            height_continuity(Some(102), &apply(103, 3)),
+            (Some((102, 102)), Some(104))
+        );
+        // Wider hole: expected 200, got 205 → heights 200..=204 missing.
+        assert_eq!(
+            height_continuity(Some(200), &apply(205, 4)),
+            (Some((200, 204)), Some(206))
+        );
+        // UNWIND re-anchors the expected height and is never itself a hole.
+        assert_eq!(height_continuity(Some(300), &unwind(250, 5)), (None, Some(251)));
+        // A re-apply below head (h < expected) is not flagged as a forward hole.
+        assert_eq!(height_continuity(Some(251), &apply(251, 6)), (None, Some(252)));
     }
 }
