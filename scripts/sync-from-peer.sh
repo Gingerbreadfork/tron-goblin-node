@@ -112,10 +112,24 @@ fi
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-binary="$repo_root/target/release/tron-node"
-if [ ! -x "$binary" ] || [ "$force_release_build" -eq 1 ]; then
-    echo "==> Building tron-node (release)…"
-    cargo build --release --bin tron-node
+# Two layouts to support: a release bundle, which puts tron-node at the
+# bundle root one level up from this script and carries no sources; and a
+# source checkout, which builds into target/release.
+binary=""
+for cand in "$repo_root/tron-node" "$repo_root/target/release/tron-node"; do
+    if [ -x "$cand" ]; then binary="$cand"; break; fi
+done
+if [ -z "$binary" ] || [ "$force_release_build" -eq 1 ]; then
+    if [ -f "$repo_root/Cargo.toml" ]; then
+        echo "==> Building tron-node (release)…"
+        cargo build --release --bin tron-node
+        binary="$repo_root/target/release/tron-node"
+    elif [ -z "$binary" ]; then
+        echo "ERROR: no 'tron-node' binary found at $repo_root, and no sources to build one." >&2
+        exit 1
+    else
+        echo "==> No sources here; using the bundled $binary." >&2
+    fi
 fi
 
 # TCP reachability check. /dev/tcp is a bash builtin — no `nc` required.
