@@ -290,7 +290,7 @@ where
         head,
         node_type: 0,
         lowest_block_num: server.lowest_block_num(),
-        code_version: b"tron-goblin/0.0.1",
+        code_version: tron_types::CODE_VERSION_BYTES,
     })
     .await
     .map_err(|e| format!("handshake: {e}"))?;

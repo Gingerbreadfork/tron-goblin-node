@@ -19,6 +19,21 @@ pub mod strict_math;
 pub mod tx_id;
 pub mod tx_sign;
 
+/// How this software identifies itself to the outside world: the P2P
+/// handshake's `code_version`, `web3_clientVersion`, and `getNodeInfo`.
+///
+/// Built from the workspace version that every tron-* crate shares, so the
+/// identity a running node reports always matches the tag it was built from.
+/// This lives here because both `tron-net` (handshake) and `tron-rpc`
+/// (JSON-RPC) need it and neither depends on the other.
+///
+/// Not to be confused with the `*_P2P_VERSION` protocol numbers in
+/// `tron-net`, which gate peer compatibility and must not track releases.
+pub const CODE_VERSION: &str = concat!("tron-goblin/", env!("CARGO_PKG_VERSION"));
+
+/// [`CODE_VERSION`] as raw UTF-8, the form the P2P wire field takes.
+pub const CODE_VERSION_BYTES: &[u8] = CODE_VERSION.as_bytes();
+
 pub use account_state_root::{
     compute_account_state_root, compute_account_state_root_with_storage, compute_storage_root,
     AccountState, KECCAK_EMPTY_STORAGE_ROOT,

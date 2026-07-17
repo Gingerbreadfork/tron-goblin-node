@@ -272,7 +272,7 @@ fn cmd_listen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 head: genesis,
                 node_type: 0,
                 lowest_block_num: 0,
-                code_version: b"tron-goblin/0.0.1",
+                code_version: tron_types::CODE_VERSION_BYTES,
             };
             match conn.handshake(inputs).await {
                 Ok(outcome) => match outcome.hello() {

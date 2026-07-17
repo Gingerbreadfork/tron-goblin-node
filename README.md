@@ -673,7 +673,7 @@ A terser, structured set written for AI coding assistants lives under
 - **P2P**: byte-exact handshake + adv-broadcast, **inbound and
   outbound** — the node dials peers to sync and also listens on the P2P
   port (`18889` by default — java-tron's `18888` + 1; `[p2p] listen`) to serve peers that sync
-  from it. Identifies itself on the wire as `tron-goblin/0.0.1`.
+  from it. Identifies itself on the wire as `tron-goblin/<version>`.
 - **JSON-RPC + gRPC**: response shapes match java-tron's. Deliberate
   deviations (e.g. `createtransaction` permissiveness, `getaccount`
   on unknown addresses) are pinned in tests and documented at the

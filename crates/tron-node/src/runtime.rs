@@ -2506,7 +2506,7 @@ async fn probe_peer_head(peer: String) -> Option<(i64, [u8; 32])> {
                 head: ahead_id,
                 node_type: 0,
                 lowest_block_num: 0,
-                code_version: b"tron-goblin/0.0.1",
+                code_version: tron_types::CODE_VERSION_BYTES,
             })
             .await
         {

@@ -260,7 +260,7 @@ fn energy_fee_at(s: &RpcState, timestamp_ms: i64) -> i64 {
 // =============================================================================
 
 pub fn web3_client_version(_p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
-    Ok(json!("tron-goblin/0.0.1"))
+    Ok(json!(tron_types::CODE_VERSION))
 }
 
 pub fn web3_sha3(p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
@@ -1492,7 +1492,7 @@ pub fn get_node_info(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     Ok(json!({
         "configNodeInfo": {
             "p2pVersion": "0",
-            "versionCode": "tron-goblin/0.0.1",
+            "versionCode": tron_types::CODE_VERSION,
         },
         "block": {
             "number": s.dyn_props.latest_block_header_number().unwrap_or(0),
@@ -1540,7 +1540,7 @@ pub fn get_stats_info(_p: &Value, s: &RpcState) -> Value {
         "node": {
             "ip": "",
             "nodeType": 0,
-            "version": "tron-goblin/0.0.1",
+            "version": tron_types::CODE_VERSION,
             "hostname": "",
         },
         "blockchain": {

@@ -2598,7 +2598,7 @@ impl SyncDriver {
             head,
             node_type: 0,
             lowest_block_num: lowest,
-            code_version: b"tron-goblin/0.0.1",
+            code_version: tron_types::CODE_VERSION_BYTES,
         };
         match conn.handshake(hello).await {
             Ok(outcome) => {

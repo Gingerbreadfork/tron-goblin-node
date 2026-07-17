@@ -90,7 +90,8 @@ async fn call(addr: std::net::SocketAddr, body: Value) -> Value {
 async fn web3_client_version_returns_our_string() {
     let (addr, ..) = spawn_server().await;
     let resp = call(addr, json!({"jsonrpc":"2.0","method":"web3_clientVersion","id":1})).await;
-    assert_eq!(resp["result"], "tron-goblin/0.0.1");
+    assert_eq!(resp["result"], tron_types::CODE_VERSION);
+    assert!(resp["result"].as_str().unwrap().starts_with("tron-goblin/"));
     assert_eq!(resp["id"], 1);
 }
 
@@ -517,7 +518,7 @@ async fn get_node_info_returns_block_header_and_version() {
     assert_eq!(resp["result"]["block"]["number"], 99_i64);
     assert_eq!(
         resp["result"]["configNodeInfo"]["versionCode"],
-        "tron-goblin/0.0.1"
+        tron_types::CODE_VERSION
     );
 }
 
