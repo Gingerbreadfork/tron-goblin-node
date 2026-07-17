@@ -4,6 +4,8 @@
 /target
 target/
 **/*.rs.bk
+# Release bundles from scripts/build-release.sh.
+/dist
 # Cargo's normalised manifest left behind by `cargo vendor` / unpacking
 # vendored crates. The "real" manifest is the one without `.orig`.
 *.orig
