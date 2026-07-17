@@ -6246,6 +6246,7 @@ dependencies = [
  "tar",
  "thiserror 1.0.69",
  "tron-chainbase",
+ "tron-types",
 ]
 
 [[package]]

@@ -150,8 +150,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// This crate is out-of-process by design and depends on no tron-* crate, so
+/// the version string is built here rather than pulled from tron-types. It
+/// still tracks the workspace version automatically.
+const CODE_VERSION: &str = concat!("tron-goblin/", env!("CARGO_PKG_VERSION"));
+
+const USAGE: &str = "\
+tron-firehose-nats — republishes a tron-goblin-node firehose to NATS JetStream.
+
+Usage:
+  tron-firehose-nats          Run the consumer (configured by env).
+  tron-firehose-nats --help   Show this help.
+  tron-firehose-nats --version
+
+Environment:
+  NATS_URL              JetStream endpoint. Default nats://127.0.0.1:4222
+  NATS_STREAM           Stream name. Default TRON_FIREHOSE
+  NATS_SUBJECT_PREFIX   Subject prefix. Default tron.firehose
+  TRON_FIREHOSE_URL     Node firehose gRPC endpoint.
+                        Default http://127.0.0.1:50051
+  RUST_LOG              Log filter. Default \"info\".
+
+Each message carries Nats-Msg-Id = firehose seq, so JetStream dedupes
+server-side and a replay after a crash is idempotent. See
+docs/apis-indexing-firehose.md.
+";
+
+/// Handles `--help` / `--version` before any logging or config work.
+/// Returns true when the process should exit without running.
+fn handle_cli_args() -> bool {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" | "help" => {
+                print!("{USAGE}");
+                return true;
+            }
+            "-V" | "--version" | "version" => {
+                println!("{CODE_VERSION}");
+                return true;
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n");
+                eprint!("{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() {
+    if handle_cli_args() {
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

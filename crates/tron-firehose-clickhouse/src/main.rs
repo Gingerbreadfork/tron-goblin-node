@@ -373,8 +373,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// This crate is out-of-process by design and depends on no tron-* crate, so
+/// the version string is built here rather than pulled from tron-types. It
+/// still tracks the workspace version automatically.
+const CODE_VERSION: &str = concat!("tron-goblin/", env!("CARGO_PKG_VERSION"));
+
+const USAGE: &str = "\
+tron-firehose-clickhouse — tails a tron-goblin-node firehose into ClickHouse.
+
+Usage:
+  tron-firehose-clickhouse          Run the consumer (configured by env).
+  tron-firehose-clickhouse --help   Show this help.
+  tron-firehose-clickhouse --version
+
+Environment:
+  CLICKHOUSE_URL        HTTP endpoint. Default http://127.0.0.1:8123
+  CLICKHOUSE_DATABASE   Database name. Default \"default\"
+  CLICKHOUSE_USER       Optional. Sent only when set.
+  CLICKHOUSE_PASSWORD   Optional. Sent only when set.
+  TRON_FIREHOSE_URL     Node firehose gRPC endpoint.
+                        Default http://127.0.0.1:50051
+  RUST_LOG              Log filter. Default \"info\".
+
+Uses ReplacingMergeTree for idempotence and lightweight deletes for unwinds,
+so a replay after a crash converges. See docs/apis-indexing-firehose.md.
+";
+
+/// Handles `--help` / `--version` before any logging or config work.
+/// Returns true when the process should exit without running.
+fn handle_cli_args() -> bool {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" | "help" => {
+                print!("{USAGE}");
+                return true;
+            }
+            "-V" | "--version" | "version" => {
+                println!("{CODE_VERSION}");
+                return true;
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n");
+                eprint!("{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() {
+    if handle_cli_args() {
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

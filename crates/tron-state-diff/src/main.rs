@@ -42,6 +42,8 @@ use serde_json::Value;
 
 use crate::diff::Mismatch;
 
+const CODE_VERSION: &str = concat!("tron-goblin/", env!("CARGO_PKG_VERSION"));
+
 const USAGE: &str = "\
 tron-state-diff — diff RPC state between this node (A) and a reference java-tron node (B)
 
@@ -736,6 +738,13 @@ fn parse_args() -> Result<Option<Args>, String> {
         let mut next = || it.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
+            // This crate is standalone by design (serde_json only), so the
+            // string is built here rather than pulled from tron-types. The
+            // version still tracks the workspace automatically.
+            "-V" | "--version" => {
+                println!("{CODE_VERSION}");
+                std::process::exit(0);
+            }
             "--a" => a = next()?,
             "--b" => b = Some(next()?),
             "--accounts" => {

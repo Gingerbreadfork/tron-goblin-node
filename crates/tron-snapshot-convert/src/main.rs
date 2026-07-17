@@ -88,6 +88,10 @@ fn main() -> ExitCode {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
+            "-V" | "--version" | "version" => {
+                println!("{}", tron_types::CODE_VERSION);
+                return ExitCode::SUCCESS;
+            }
             other => {
                 eprintln!("unknown flag: {other}");
                 eprint!("{USAGE}");

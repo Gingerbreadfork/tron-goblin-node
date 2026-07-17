@@ -210,6 +210,10 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
+        "--version" | "-V" | "version" => {
+            println!("{} ({})", tron_types::CODE_VERSION, env!("GOBLIN_GIT_SHA"));
+            ExitCode::SUCCESS
+        }
         other => {
             eprintln!("unknown subcommand: {other}");
             eprint!("{USAGE}");

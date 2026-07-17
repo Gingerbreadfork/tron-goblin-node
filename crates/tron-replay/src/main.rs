@@ -123,6 +123,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("-h") | Some("--help") | Some("help") => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("{}", tron_types::CODE_VERSION);
+            ExitCode::SUCCESS
+        }
         _ => {
             eprint!("{USAGE}");
             ExitCode::FAILURE

@@ -11,6 +11,8 @@ description = "Standalone tool: convert a java-tron LevelDB snapshot into this n
 # Down-dependency on the storage layer for the RocksDB write path, the
 # per-store comparator table, and the shared per-store streaming helper.
 tron-chainbase = { path = "../tron-chainbase" }
+# Already in the graph via tron-chainbase; named directly for CODE_VERSION.
+tron-types = { path = "../tron-types" }
 # Pure-Rust LevelDB reader. java-tron writes its LevelDB stores with the
 # native Google LevelDB C++ library (via leveldbjni), i.e. the standard
 # on-disk LevelDB format; `rusty-leveldb` is a faithful pure-Rust reader

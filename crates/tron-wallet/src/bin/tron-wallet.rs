@@ -52,6 +52,10 @@ fn main() -> ExitCode {
             println!("{}", usage());
             return ExitCode::from(0);
         }
+        "version" | "-V" | "--version" => {
+            println!("{}", tron_types::CODE_VERSION);
+            return ExitCode::from(0);
+        }
         other => Err(format!("unknown subcommand '{other}'\n\n{}", usage())),
     };
     match result {
