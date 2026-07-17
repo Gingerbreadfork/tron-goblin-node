@@ -1,7 +1,12 @@
 name: Test Suite
 
 on:
+  # Branches only. A bare `push:` also fires on tag pushes, so cutting a
+  # release ran this suite twice over the identical commit — once for the
+  # branch and once for the tag — alongside the release build.
   push:
+    branches:
+      - '**'
   pull_request:
   workflow_dispatch:
 
