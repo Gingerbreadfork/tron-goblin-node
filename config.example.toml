@@ -468,7 +468,7 @@ retain_blocks = 2592000
 # gRPC port), resuming by sequence number; exactly-once is achieved by
 # committing the cursor transactionally with the consumer's own writes.
 # Format + cursor protocol + reference consumers (Postgres / NATS
-# JetStream / ClickHouse): working/FIREHOSE.md and the
+# JetStream / ClickHouse): docs/apis-indexing-firehose.md and the
 # crates/tron-firehose-* binaries.
 [index.firehose]
 enable = false

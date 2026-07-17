@@ -147,14 +147,14 @@ counters.
 ## The API
 
 All endpoints are served on the HTTP REST port (default
-`127.0.0.1:8090`). When the layer is not enabled, every route returns
+`127.0.0.1:8091`). When the layer is not enabled, every route returns
 `501 Not Implemented` with a message pointing at
 `[index.commitment] enabled = true`.
 
 ### Current root
 
 ```sh
-curl -s 'http://127.0.0.1:8090/v1/commitment/root'
+curl -s 'http://127.0.0.1:8091/v1/commitment/root'
 ```
 
 ```json
@@ -183,7 +183,7 @@ While the layer is still performing its one-time bootstrap, `height` is
 ### Status
 
 ```sh
-curl -s 'http://127.0.0.1:8090/v1/commitment/status'
+curl -s 'http://127.0.0.1:8091/v1/commitment/status'
 ```
 
 ```json
@@ -229,7 +229,7 @@ its store and raw key, and the same convenience sugar as
 Account inclusion proof:
 
 ```sh
-curl -s 'http://127.0.0.1:8090/v1/commitment/proof?account=TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+curl -s 'http://127.0.0.1:8091/v1/commitment/proof?account=TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
 ```
 
 ```json

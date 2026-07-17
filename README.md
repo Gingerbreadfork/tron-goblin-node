@@ -137,9 +137,9 @@ official `trongrid.io` API for the most recent blocks:
 
 ```sh
 CT='-H Content-Type:application/json'
-H=$(curl -s $CT -X POST http://127.0.0.1:8090/wallet/getnowblock -d '{}' | jq .block_header.raw_data.number)
+H=$(curl -s $CT -X POST http://127.0.0.1:8091/wallet/getnowblock -d '{}' | jq .block_header.raw_data.number)
 for N in $(seq $((H-6)) $((H-2))); do
-  O=$(curl -s $CT -X POST http://127.0.0.1:8090/wallet/getblockbynum -d "{\"num\":$N}" | jq -r .blockID)
+  O=$(curl -s $CT -X POST http://127.0.0.1:8091/wallet/getblockbynum -d "{\"num\":$N}" | jq -r .blockID)
   T=$(curl -s $CT -X POST https://api.trongrid.io/wallet/getblockbynum  -d "{\"num\":$N}" | jq -r .blockID)
   [ "$O" = "$T" ] && echo "✔ #$N  $O" || echo "✘ #$N  MISMATCH"
 done
@@ -330,7 +330,7 @@ java-tron doesn't have.What works today, by area:
   explicit `UNWIND` entries for reorgs and crash recovery, tailed over gRPC
   (`tronfirehose.Firehose/Tail`, resume by sequence). Postgres, NATS
   JetStream, and ClickHouse reference consumers ship in-workspace.
-- **Prometheus `/metrics`** (`--metrics-port`, default 9090) — chain head,
+- **Prometheus `/metrics`** (`--metrics-port`, default 9091) — chain head,
   sync flow, reorg/fork-tree outcomes, SR/PBFT traffic, mempool (with
   reject-reason labels), peers (incl. inbound peers syncing *from* us),
   per-method RPC counters, the consensus watchdog, and indexer / archive /

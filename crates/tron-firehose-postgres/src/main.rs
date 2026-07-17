@@ -2,7 +2,7 @@
 //!
 //! Tails a tron-goblin-node's `tronfirehose.Firehose` gRPC stream into
 //! a Postgres explorer schema, demonstrating the documented cursor
-//! protocol (`working/FIREHOSE.md`):
+//! protocol (`docs/apis-indexing-firehose.md`):
 //!
 //! * **Exactly-once**: every entry is applied in one Postgres
 //!   transaction together with the cursor update (`fh_cursor.seq`).
@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! DATABASE_URL=postgres://user:pass@host/db \
-//! TRON_FIREHOSE_URL=http://127.0.0.1:50051 \
+//! TRON_FIREHOSE_URL=http://127.0.0.1:50052 \
 //!     tron-firehose-postgres
 //! ```
 
@@ -168,7 +168,7 @@ fn trc20_transfers(tx: &fh::Tx) -> Vec<Trc20Transfer> {
 /// could not repair by *skipping* the missing height(s): it emits
 /// `APPLY(h-1)` then `APPLY(h+1)` with no seq gap, so the hole shows up only
 /// as an APPLY whose height overshoots the expected next height (see
-/// `working/FIREHOSE.md`). Given `expected` (the height the next APPLY should
+/// `docs/apis-indexing-firehose.md`). Given `expected` (the height the next APPLY should
 /// carry, `None` before the first APPLY) and an entry, this returns the
 /// skipped-height range `(from, to)` when the entry overshoots, plus the
 /// expected-next height to carry forward. `UNWIND` re-anchors the expected
@@ -292,7 +292,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pg_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL is required (postgres://user:pass@host/db)")?;
     let node_url = std::env::var("TRON_FIREHOSE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:50052".to_string());
 
     let (mut pg, connection) = tokio_postgres::connect(&pg_url, NoTls).await?;
     tokio::spawn(async move {
@@ -446,7 +446,7 @@ Usage:
 Environment:
   DATABASE_URL         Required. postgres://user:pass@host/db
   TRON_FIREHOSE_URL    Node firehose gRPC endpoint.
-                       Default http://127.0.0.1:50051
+                       Default http://127.0.0.1:50052
   RUST_LOG             Log filter. Default \"info\".
 
 The consumer is resumable and exactly-once: it commits each entry with its

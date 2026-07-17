@@ -184,14 +184,32 @@ redirected/file capture the prefix keeps the full `YYYY-MM-DD HH:MM:SS.mmm`.
 ";
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Answer the pure queries before init_tracing(), which creates ./logs in
+    // the working directory and panics outright when that is not writable.
+    // `--version` in particular is what packaging and orchestration run from
+    // arbitrary or read-only directories, and it must neither fail there nor
+    // leave a log file behind as the side effect of a question.
+    match args.get(1).map(String::as_str) {
+        Some("--help" | "-h" | "help") => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Some("--version" | "-V" | "version") => {
+            println!("{} ({})", tron_types::CODE_VERSION, env!("GOBLIN_GIT_SHA"));
+            return ExitCode::SUCCESS;
+        }
+        None => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+        _ => {}
+    }
+
     // Held for the process lifetime so the non-blocking file appender flushes.
     let _log_guard = init_tracing();
-
-    let args: Vec<String> = std::env::args().collect();
-    let Some(cmd) = args.get(1) else {
-        eprint!("{USAGE}");
-        return ExitCode::from(2);
-    };
+    let cmd = &args[1];
 
     match cmd.as_str() {
         "start" => run_start(&args[2..]),
@@ -206,14 +224,6 @@ fn main() -> ExitCode {
         "bench-decode" => run_bench_decode(&args[2..]),
         "admin" => run_admin(&args[2..]),
         "diag" => tron_node::diag::run_diag(&args[2..]),
-        "--help" | "-h" | "help" => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
-        "--version" | "-V" | "version" => {
-            println!("{} ({})", tron_types::CODE_VERSION, env!("GOBLIN_GIT_SHA"));
-            ExitCode::SUCCESS
-        }
         other => {
             eprintln!("unknown subcommand: {other}");
             eprint!("{USAGE}");

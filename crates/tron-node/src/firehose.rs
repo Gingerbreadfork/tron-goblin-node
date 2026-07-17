@@ -13,7 +13,7 @@
 //! binding: it can neither lose blocks (store repair) nor claim a
 //! block that didn't commit (startup unwind), and external consumers
 //! get exactly-once semantics by persisting their cursor
-//! transactionally with their own writes (see `working/FIREHOSE.md`).
+//! transactionally with their own writes (see `docs/apis-indexing-firehose.md`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

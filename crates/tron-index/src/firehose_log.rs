@@ -8,7 +8,7 @@
 //! half: framing, segments, rotation, retention, torn-tail recovery,
 //! and the tail-wakeup handle. Payloads are opaque here — the node
 //! writes prost-encoded `tronfirehose.Entry` messages (see
-//! `working/FIREHOSE.md` for the documented format).
+//! `docs/apis-indexing-firehose.md` for the documented format).
 //!
 //! ## On-disk format (version 1)
 //!

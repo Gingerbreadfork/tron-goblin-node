@@ -24,7 +24,7 @@
 //!
 //! Usage:
 //!   tron-state-diff --b http://<java-tron>:8090 \
-//!       [--a http://127.0.0.1:8090] \
+//!       [--a http://127.0.0.1:8091] \
 //!       [--accounts T...,T...] [--accounts-file addrs.txt] \
 //!       [--from-recent-blocks N] \
 //!       [--probes account,resource,contract] \
@@ -51,7 +51,7 @@ REQUIRED:
   --b <url>                 reference node base URL (e.g. http://127.0.0.1:8090)
 
 OPTIONS:
-  --a <url>                 node-under-test base URL          [default http://127.0.0.1:8090]
+  --a <url>                 node-under-test base URL          [default http://127.0.0.1:8091]
   --accounts <a,b,c>        base58 addresses to probe (comma-separated)
   --accounts-file <path>    file of base58 addresses, one per line ('#' comments ok)
   --from-recent-blocks <N>  also probe every address touched in the last N blocks
@@ -719,7 +719,7 @@ fn parse_call_spec(spec: &str) -> Result<(String, String, String), String> {
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut a = "http://127.0.0.1:8090".to_string();
+    let mut a = "http://127.0.0.1:8091".to_string();
     let mut b: Option<String> = None;
     let mut accounts: Vec<String> = Vec::new();
     let mut accounts_file: Option<String> = None;

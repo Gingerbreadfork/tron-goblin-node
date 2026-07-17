@@ -52,8 +52,11 @@ jobs:
           echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
 
       - name: Build and package release bundle
-        # Same script contributors run locally, so a published archive matches
-        # a locally built one.
+        # Same script contributors run locally, so the bundle's contents and
+        # layout are the same recipe either way. The archive is not
+        # byte-reproducible (tar records mtimes and ownership, gzip stamps a
+        # timestamp), so the published .sha256 attests to this artifact only —
+        # a local rebuild will not reproduce the hash.
         run: scripts/build-release.sh "${GITHUB_REF_NAME}"
 
       - name: Publish GitHub Release

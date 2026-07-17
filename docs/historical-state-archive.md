@@ -88,7 +88,7 @@ Provision headroom and watch the `tron_node_*archive*` metrics.
 ## The API
 
 All endpoints are served on the HTTP REST port (default
-`127.0.0.1:8090`). Each takes a `block` (the height `H` to read at) and
+`127.0.0.1:8091`). Each takes a `block` (the height `H` to read at) and
 is valid only inside the retained coverage window — see
 [Caveats](#caveats). A request for an out-of-window height returns
 `success: false` with an error naming the covered `[base, head]` range.
@@ -102,7 +102,7 @@ is valid only inside the retained coverage window — see
 ### State at height — account
 
 ```sh
-curl -s 'http://127.0.0.1:8090/v1/archive/account?address=TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX&block=83000000'
+curl -s 'http://127.0.0.1:8091/v1/archive/account?address=TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX&block=83000000'
 ```
 
 ```json
@@ -126,7 +126,7 @@ in the response instead of hex.
 ### State at height — account resource
 
 ```sh
-curl -s 'http://127.0.0.1:8090/v1/archive/accountresource?address=TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX&block=83000000'
+curl -s 'http://127.0.0.1:8091/v1/archive/accountresource?address=TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX&block=83000000'
 ```
 
 ```json
@@ -156,7 +156,7 @@ usage computed against the network-wide weights as of block `H`.
 `block.number` / `block.timestamp` opcodes — comes from state as of `H`.
 
 ```sh
-curl -s -X POST 'http://127.0.0.1:8090/v1/archive/triggerconstantcontract' \
+curl -s -X POST 'http://127.0.0.1:8091/v1/archive/triggerconstantcontract' \
   -H 'Content-Type: application/json' \
   -d '{
     "owner_address": "410000000000000000000000000000000000000000",

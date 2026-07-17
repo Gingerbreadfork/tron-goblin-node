@@ -155,11 +155,11 @@ Verify a copied database:
 
 | Service | Default | Config section |
 | --- | --- | --- |
-| P2P | `0.0.0.0:18888` when listening | `[p2p]` |
-| Ethereum JSON-RPC | `127.0.0.1:8545` | `[rpc]` |
-| TRON REST wallet API | `127.0.0.1:8090` | `[http]` |
-| TRON gRPC | `127.0.0.1:50051` | `[grpc]` |
-| Prometheus metrics | `127.0.0.1:9090` | `[metrics]` |
+| P2P | `0.0.0.0:18889` when listening | `[p2p]` |
+| Ethereum JSON-RPC | `127.0.0.1:8546` | `[rpc]` |
+| TRON REST wallet API | `127.0.0.1:8091` | `[http]` |
+| TRON gRPC | `127.0.0.1:50052` | `[grpc]` |
+| Prometheus metrics | `127.0.0.1:9091` | `[metrics]` |
 
 Keep writer APIs bound to localhost unless the deployment has authentication,
 firewalling, or a trusted network boundary. REST and gRPC include transaction
@@ -198,7 +198,7 @@ At `info`, the node reports startup head, sync progress, and catch-up status.
 
 ## Monitoring and Alerting
 
-The node exposes Prometheus metrics on `127.0.0.1:9090` by default (`[metrics]`
+The node exposes Prometheus metrics on `127.0.0.1:9091` by default (`[metrics]`
 section, or `--metrics-port`). Scrape `/metrics` for chain head, sync flow,
 reorg/fork outcomes, peer counts, per-method RPC counters, and indexer health.
 
@@ -246,7 +246,7 @@ state parity checks:
 ```sh
 cargo build --release -p tron-state-diff
 ./target/release/tron-state-diff \
-  --a http://127.0.0.1:8090 \
+  --a http://127.0.0.1:8091 \
   --b http://JAVA_TRON_HOST:8090 \
   --from-recent-blocks 200
 ```
@@ -265,7 +265,7 @@ export TRON_WALLET_PASSWORD
 ./target/release/tron-wallet keygen --out wallet.json
 ./target/release/tron-wallet address --keystore wallet.json
 ./target/release/tron-wallet sign --keystore wallet.json --tx 0x...
-./target/release/tron-wallet send --keystore wallet.json --tx 0x... --rpc http://127.0.0.1:8090
+./target/release/tron-wallet send --keystore wallet.json --tx 0x... --rpc http://127.0.0.1:8091
 ```
 
 Password lookup order is `--password`, `TRON_WALLET_PASSWORD`, then an

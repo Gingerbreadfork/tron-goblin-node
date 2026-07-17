@@ -6,7 +6,7 @@
 
 The `tron-rpc` crate provides Ethereum-compatible JSON-RPC methods such as
 `eth_*` and `net_*`, backed by chainbase state and TVM constant execution.
-Default bind: `127.0.0.1:8545`.
+Default bind: `127.0.0.1:8546`.
 
 Important config:
 
@@ -20,13 +20,13 @@ contract (here USDT's `decimals()`) against the latest state, and fetch the
 head number:
 
 ```sh
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
         {"to":"0xa614f803b6fd780986a42c78ec9c7f77e6ded13c","data":"0x313ce567"},
         "latest"]}'
 # → {"jsonrpc":"2.0","id":1,"result":"0x0000…0006"}   (6 decimals)
 
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
 ```
 
@@ -82,7 +82,7 @@ traced; anything else returns `-32603 cannot trace non-VM contract type …`.
 The optional second param carries the standard tracer options:
 
 ```sh
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"debug_traceTransaction","params":[
         "0x<contract-tx-hash>",
         {"disableMemory":true,"disableStorage":true}]}'
@@ -113,7 +113,7 @@ as `eth_call` (eth-style `to`/`from` or TRON-style
 `contract_address`/`owner_address` are both accepted):
 
 ```sh
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"estimateEnergy","params":[
         {"to":"0x<contract>","data":"0x<selector+args>"}]}'
 ```
@@ -150,7 +150,7 @@ be eth `0x…` (20-byte), TRON `41…`, or base58 `T…`; `balance` is in **sun*
 (no wei scaling).
 
 ```sh
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{
     "jsonrpc": "2.0", "id": 1, "method": "eth_simulateV1",
     "params": [
@@ -254,13 +254,13 @@ v0.7 EntryPoint address is shown; long fields are abbreviated with `…`):
 
 ```sh
 # Which EntryPoints this bundler accepts:
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"eth_supportedEntryPoints","params":[]}'
 # → {"jsonrpc":"2.0","id":1,"result":["0x0000000071727de22e5e9d8baf0edac6f37da032"]}
 
 # Submit a UserOperation (unpacked v0.7 shape); the result is the userOpHash,
 # computed by the EntryPoint itself so it matches the deployed version:
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"eth_sendUserOperation","params":[
         {
           "sender":               "0x1234…",
@@ -278,7 +278,7 @@ curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
 # → {"jsonrpc":"2.0","id":1,"result":"0xefbc1a…"}
 
 # Poll the receipt with that userOpHash once the bundle is mined (null until then):
-curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8545 \
+curl -s -H 'Content-Type: application/json' -X POST http://127.0.0.1:8546 \
   -d '{"jsonrpc":"2.0","id":1,"method":"eth_getUserOperationReceipt","params":["0xefbc1a…"]}'
 ```
 
@@ -289,13 +289,13 @@ see *why* validation failed.
 ## TRON REST Wallet API
 
 The HTTP REST surface provides java-tron-compatible `/wallet/*` endpoints used
-by TronWeb and TronGrid-style clients. Default bind: `127.0.0.1:8090`.
+by TronWeb and TronGrid-style clients. Default bind: `127.0.0.1:8091`.
 
 Examples:
 
 ```sh
 curl -s -H 'Content-Type: application/json' \
-  -X POST http://127.0.0.1:8090/wallet/getnowblock \
+  -X POST http://127.0.0.1:8091/wallet/getnowblock \
   -d '{}'
 ```
 
@@ -306,7 +306,7 @@ Keep it on localhost or behind explicit access controls.
 
 The `tron-grpc` crate serves Wallet, WalletSolidity, Database, Monitor, and
 Network services on the java-tron-compatible gRPC API. Default bind:
-`127.0.0.1:50051`.
+`127.0.0.1:50052`.
 
 The implementation wraps the same underlying RPC and chainbase handlers used by
 the HTTP surfaces where practical.
@@ -323,7 +323,7 @@ imports) as the import path — e.g. with
 grpcurl -plaintext \
   -import-path crates/tron-proto/vendored/java-tron \
   -proto api/api.proto \
-  -d '{}' 127.0.0.1:50051 protocol.Wallet/GetNowBlock
+  -d '{}' 127.0.0.1:50052 protocol.Wallet/GetNowBlock
 ```
 
 ## Built-In TronGrid-Compatible Index
@@ -353,7 +353,7 @@ Common query parameters mirror TronGrid, including `limit`, `fingerprint`,
 For example, the two most recent confirmed USDT transfers for an account:
 
 ```sh
-curl -s 'http://127.0.0.1:8090/v1/accounts/<T-address>/transactions/trc20?limit=2&only_confirmed=true&contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'
+curl -s 'http://127.0.0.1:8091/v1/accounts/<T-address>/transactions/trc20?limit=2&only_confirmed=true&contract_address=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'
 ```
 
 ```json
@@ -448,23 +448,23 @@ Reference consumers:
   deduplication.
 - `tron-firehose-clickhouse`: writes analytics tables in ClickHouse.
 
-Build and run a consumer with Cargo, for example:
+All three ship prebuilt in the release bundle. Run them from there, or with
+Cargo from a source checkout (`cargo run --release -p tron-firehose-postgres`):
 
 ```sh
 DATABASE_URL=postgres://USER:PASSWORD@HOST/DB \
-TRON_FIREHOSE_URL=http://127.0.0.1:50051 \
-  cargo run --release -p tron-firehose-postgres
+  ./tron-firehose-postgres
 
 NATS_URL=nats://127.0.0.1:4222 \
-TRON_FIREHOSE_URL=http://127.0.0.1:50051 \
-  cargo run --release -p tron-firehose-nats
+  ./tron-firehose-nats
 
 CLICKHOUSE_URL=http://127.0.0.1:8123 \
-TRON_FIREHOSE_URL=http://127.0.0.1:50051 \
-  cargo run --release -p tron-firehose-clickhouse
+  ./tron-firehose-clickhouse
 ```
 
-Replace uppercase placeholders with deployment-specific values. The consumers
-are configured by environment variables; check each consumer's `src/main.rs`
-module docs for optional variables and idempotence semantics when wiring
-production pipelines.
+Replace uppercase placeholders with deployment-specific values. `TRON_FIREHOSE_URL`
+defaults to `http://127.0.0.1:50052` — the node's gRPC port, which serves the
+firehose — so it only needs setting for a remote or re-pointed node.
+
+The consumers are configured entirely by environment variable; each one's
+`--help` lists every variable it reads, with defaults and idempotence notes.

@@ -24,6 +24,38 @@ log() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
 VERSION="${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 
+# A release tag names the archive, but the binaries report the manifest
+# version. Those are separate sources, so a tag pushed without a matching
+# Cargo.toml bump would publish tron-node-v1.0.1-*.tar.gz whose contents
+# announce 1.0.0 on the wire and to --version. Refuse instead: the whole
+# point of the workspace version is that the tag and the binary agree.
+# Only an explicit vX.Y.Z argument is checked — a bare local run passes a
+# `git describe` string, which is not a release claim.
+check_version_matches_tag() {
+  local manifest tag_version
+  manifest="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+              sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+  if [[ -z "$manifest" ]]; then
+    err "could not read [workspace.package] version from Cargo.toml"
+    exit 1
+  fi
+  if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    tag_version="${VERSION#v}"
+    if [[ "$tag_version" != "$manifest" ]]; then
+      err "tag/manifest mismatch: building '${VERSION}' but [workspace.package]"
+      err "version is '${manifest}', so every binary would report"
+      err "tron-goblin/${manifest}. Bump Cargo.toml or retag."
+      exit 1
+    fi
+  fi
+}
+
+# A tag is git-legal with a slash in it (v1/rc1), which would nest the output
+# under dist/ and break both the archive path and the CI upload glob.
+case "$VERSION" in
+  */*) err "version '${VERSION}' contains '/', which cannot appear in a bundle name"; exit 1 ;;
+esac
+
 # ubuntu-22.04 runners report linux/x86_64, so CI keeps naming its archives
 # tron-node-<tag>-linux-x86_64 without special-casing.
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -103,6 +135,21 @@ package() {
   install -m 0644 config.example.toml goblin.svg README.md LICENSE LICENSE.GPL "$dest/"
   install -m 0755 try.sh "$dest/"
 
+  # The vendored revm-* forks are MIT, whose notice clause requires the
+  # copyright and permission notice to travel with "copies or substantial
+  # portions" — a linked binary is one. Their upstream text is not covered by
+  # the LGPL/GPL pair above, so carry each fork's LICENSE verbatim.
+  mkdir -p "$dest/licenses"
+  for crate in crates/revm-*/; do
+    name="$(basename "$crate")"
+    if [[ -f "${crate}LICENSE" ]]; then
+      install -m 0644 "${crate}LICENSE" "$dest/licenses/LICENSE.${name}"
+    else
+      err "no LICENSE in ${crate} — MIT attribution would be missing from the bundle"
+      exit 1
+    fi
+  done
+
   local skip
   for s in scripts/*.sh; do
     skip=""
@@ -118,6 +165,7 @@ package() {
   ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
 }
 
+check_version_matches_tag
 preflight
 build
 package

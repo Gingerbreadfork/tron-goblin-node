@@ -3,7 +3,7 @@
 // Entries are appended to a local durable log (own fsync, crash-safe
 // framing) once per applied block, and external consumers tail them
 // over this gRPC stream, resuming by `seq`. The full format + cursor
-// protocol contract is documented in working/FIREHOSE.md. Wire
+// protocol contract is documented in docs/apis-indexing-firehose.md. Wire
 // stability: additive fields only; any breaking change bumps the
 // on-disk segment magic AND this package name.
 

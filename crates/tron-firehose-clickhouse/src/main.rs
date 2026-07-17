@@ -23,7 +23,7 @@
 //!
 //! ```text
 //! CLICKHOUSE_URL=http://127.0.0.1:8123 \
-//! TRON_FIREHOSE_URL=http://127.0.0.1:50051 \
+//! TRON_FIREHOSE_URL=http://127.0.0.1:50052 \
 //!     tron-firehose-clickhouse
 //! ```
 //!
@@ -193,7 +193,7 @@ fn trc20_rows(height: i64, tx_idx: i32, tx: &fh::Tx) -> Vec<Trc20Row> {
 /// could not repair by *skipping* the missing height(s): it emits
 /// `APPLY(h-1)` then `APPLY(h+1)` with no seq gap, so the hole shows up only
 /// as an APPLY whose height overshoots the expected next height (see
-/// `working/FIREHOSE.md`). Given `expected` (the height the next APPLY should
+/// `docs/apis-indexing-firehose.md`). Given `expected` (the height the next APPLY should
 /// carry, `None` before the first APPLY) and an entry, this returns the
 /// skipped-height range `(from, to)` when the entry overshoots, plus the
 /// expected-next height to carry forward. `UNWIND` re-anchors the expected
@@ -283,7 +283,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ch_url = std::env::var("CLICKHOUSE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8123".to_string());
     let node_url = std::env::var("TRON_FIREHOSE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:50052".to_string());
     let mut ch = Client::default()
         .with_url(&ch_url)
         .with_database(
@@ -392,7 +392,7 @@ Environment:
   CLICKHOUSE_USER       Optional. Sent only when set.
   CLICKHOUSE_PASSWORD   Optional. Sent only when set.
   TRON_FIREHOSE_URL     Node firehose gRPC endpoint.
-                        Default http://127.0.0.1:50051
+                        Default http://127.0.0.1:50052
   RUST_LOG              Log filter. Default \"info\".
 
 Uses ReplacingMergeTree for idempotence and lightweight deletes for unwinds,

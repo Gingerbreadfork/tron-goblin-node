@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! NATS_URL=nats://127.0.0.1:4222 \
-//! TRON_FIREHOSE_URL=http://127.0.0.1:50051 \
+//! TRON_FIREHOSE_URL=http://127.0.0.1:50052 \
 //!     tron-firehose-nats
 //! ```
 //!
@@ -43,7 +43,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
     let node_url = std::env::var("TRON_FIREHOSE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+        .unwrap_or_else(|_| "http://127.0.0.1:50052".to_string());
     let stream_name =
         std::env::var("NATS_STREAM").unwrap_or_else(|_| "TRON_FIREHOSE".to_string());
     let prefix =
@@ -168,7 +168,7 @@ Environment:
   NATS_STREAM           Stream name. Default TRON_FIREHOSE
   NATS_SUBJECT_PREFIX   Subject prefix. Default tron.firehose
   TRON_FIREHOSE_URL     Node firehose gRPC endpoint.
-                        Default http://127.0.0.1:50051
+                        Default http://127.0.0.1:50052
   RUST_LOG              Log filter. Default \"info\".
 
 Each message carries Nats-Msg-Id = firehose seq, so JetStream dedupes

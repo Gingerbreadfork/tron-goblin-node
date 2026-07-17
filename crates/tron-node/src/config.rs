@@ -1939,7 +1939,7 @@ pub struct IndexConfig {
     /// logs + internal txs) with explicit unwind entries, tailed by
     /// external consumers over the gRPC `tronfirehose.Firehose`
     /// service on the existing gRPC port. Format + cursor protocol:
-    /// `working/FIREHOSE.md`.
+    /// `docs/apis-indexing-firehose.md`.
     #[serde(default)]
     pub firehose: IndexFirehoseConfig,
 }

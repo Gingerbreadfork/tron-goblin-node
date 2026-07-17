@@ -13,7 +13,7 @@ Before relying on a node for critical workflows:
   RocksDB compaction and enabled indexes.
 - Keep REST, JSON-RPC, gRPC, and metrics bound to localhost unless access is
   explicitly controlled.
-- Expose only TCP P2P port `18888` for public peer service by default.
+- Expose only TCP P2P port `18889` for public peer service by default.
 - Run `cargo test --workspace` for the deployed commit, plus targeted tests for
   any local patches.
 - Compare against a java-tron reference using `tron-state-diff` for the accounts
@@ -30,7 +30,7 @@ Default service binds are intentionally conservative:
 
 | Surface | Public by default? | Notes |
 | --- | --- | --- |
-| P2P `18888` | Yes, when `[p2p] listen = true` | Needed for serving blocks to peers. |
+| P2P `18889` | Yes, when `[p2p] listen = true` | Needed for serving blocks to peers. |
 | JSON-RPC `8545` | No | Includes read APIs and Ethereum-compatible calls. |
 | REST `/wallet/*` `8090` | No | Includes transaction broadcast/writer methods. |
 | gRPC `50051` | No | Includes wallet service methods. |
