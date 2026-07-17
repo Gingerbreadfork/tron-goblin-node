@@ -1,7 +1,7 @@
 # Security and Production Readiness
 
-`tron-goblin-node` is pre-release software. Public or production-like use should
-be deliberate: run it behind normal infrastructure controls, compare it against
+Running a consensus node in public or production-like conditions should be
+deliberate: run it behind normal infrastructure controls, compare it against
 java-tron, and keep a rollback path.
 
 ## Readiness Checklist

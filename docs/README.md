@@ -6,11 +6,10 @@ high-level project narrative and status page; these docs are organized by task.
 
 ## Status
 
-`tron-goblin-node` is pre-release software. It is suitable for evaluation,
-parity testing, development, and controlled infrastructure experiments. Treat it
-as not yet a drop-in production replacement for java-tron unless your deployment
-has its own soak testing, monitoring, rollback plan, and java-tron comparison
-path.
+`tron-goblin-node` is suitable for evaluation, parity testing, development, and
+controlled infrastructure experiments. Treat it as not yet a drop-in production
+replacement for java-tron unless your deployment has its own soak testing,
+monitoring, rollback plan, and java-tron comparison path.
 
 ## Start Here
 
