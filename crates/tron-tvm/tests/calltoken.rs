@@ -335,6 +335,10 @@ fn calltoken_to_fresh_address_applies_default_permissions() {
     // ALLOW_MULTI_SIGN drives `withDefaultPermission`; head-block timestamp is
     // stamped as the new account's create_time.
     stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    // `createAccountIfNotExist` only creates the recipient once
+    // ALLOW_TVM_SOLIDITY_059 (#32) is active; the mainnet shape this models
+    // (default permissions, i.e. post-ALLOW_MULTI_SIGN #20) is well past it.
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_SOLIDITY_059", 1);
     stores.dynamic_properties.save_latest_block_header_timestamp(1_700_000_000_000);
 
     let token_id = 1_000_001i64;
@@ -725,4 +729,1062 @@ fn calltoken_transfer_rolls_back_when_an_ancestor_frame_reverts() {
             "receiver must not retain the rolled-back credit",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// ALLOW_TVM_SOLIDITY_059 (#32): a contract may not create the recipient of a
+// TRC-10 transfer before the proposal activates.
+//
+// java `Program.callToAddress` calls `createAccountIfNotExist`, whose body is
+// wrapped in `if (VMConfig.allowTvmSolidity059())`. With the proposal inactive
+// the recipient stays absent and the TRC-10 overload of
+// `VMUtils.validateForSmartContract` throws "Validate InternalTransfer error,
+// no ToAccount. And not allowed to create account in smart contract."
+// `callToAddress`'s catch then picks the flavour on
+// ALLOW_TVM_CONSTANTINOPLE (#26): a `TransferException` (energy-refunding,
+// `spendAllEnergy`-exempt, `contractResult TRANSFER_FAILED`) with it active, a
+// plain `BytecodeExecutionException` (all energy spent, `UNKNOWN`) before it.
+// ---------------------------------------------------------------------------
+
+/// Fund `caller_user` with TRX and `asset_balance` of `token_id`, install the
+/// CALLTOKEN-issuing contract with the same asset balance, and run it. The
+/// target is deliberately never installed.
+fn run_calltoken_to_absent_target(
+    stores: &VmStores,
+    token_id: i64,
+    caller_asset_balance: i64,
+    transfer_amount: i64,
+) -> VmOutcome {
+    let caller_user = tron_addr(0xa0);
+    let caller_contract = tron_addr(0xc0);
+    let absent_target = tron_addr(0xd7); // never installed → no account row
+
+    let mut acct = Account {
+        address: caller_user.to_vec(),
+        balance: 1_000_000_000,
+        ..Default::default()
+    };
+    acct.asset_v2.insert(token_id.to_string(), caller_asset_balance);
+    stores
+        .accounts
+        .put(&Address::from_raw(caller_user), &acct)
+        .unwrap();
+
+    install_contract_with_balance(
+        stores,
+        caller_contract,
+        &build_calltoken_caller(absent_target, token_id, transfer_amount),
+        token_id,
+        caller_asset_balance,
+    );
+
+    let trigger = TriggerSmartContract {
+        owner_address: caller_user.to_vec(),
+        contract_address: caller_contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+        &trigger,
+        500_000,
+    )
+}
+
+/// #32 OFF, #26 ON: java throws a `TransferException`. The whole transaction
+/// fails as TRANSFER_FAILED with consumed-only energy (`VMActuator` exempts a
+/// `TransferException` from `spendAllEnergy`), the target is never created and
+/// the caller's asset map is untouched.
+#[test]
+fn calltoken_to_absent_target_pre_059_transfer_failed() {
+    let stores = fresh_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    // ALLOW_TVM_SOLIDITY_059 deliberately left unset.
+    let token_id = 1_000_001i64;
+    let initial_balance = 10_000i64;
+    let transfer_amount = 250i64;
+
+    let outcome =
+        run_calltoken_to_absent_target(&stores, token_id, initial_balance, transfer_amount);
+    let VmOutcome::TransferFailed { energy_used } = outcome else {
+        panic!("expected TransferFailed, got {outcome:?}");
+    };
+    assert!(
+        energy_used < 500_000,
+        "a TransferException is spend-all-exempt, so energy must be \
+         consumed-only; got {energy_used} of a 500000 limit"
+    );
+
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(tron_addr(0xd7)))
+            .unwrap()
+            .is_none(),
+        "the target must NOT have been created before ALLOW_TVM_SOLIDITY_059"
+    );
+    let caller_acct = stores
+        .accounts
+        .get(&Address::from_raw(tron_addr(0xc0)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        caller_acct.asset_v2.get(&token_id.to_string()).copied(),
+        Some(initial_balance),
+        "no asset may move when the transfer is refused"
+    );
+}
+
+/// #32 OFF and #26 OFF: java's catch falls through to a plain
+/// `BytecodeExecutionException`, which is NOT a `TransferException`, so
+/// `VMActuator` calls `spendAllEnergy()` and `RuntimeImpl.setResultCode`
+/// records `contractResult UNKNOWN`.
+#[test]
+fn calltoken_to_absent_target_pre_constantinople_spends_all_energy() {
+    let stores = fresh_stores();
+    // Neither ALLOW_TVM_SOLIDITY_059 nor ALLOW_TVM_CONSTANTINOPLE set.
+    let token_id = 1_000_001i64;
+
+    let outcome = run_calltoken_to_absent_target(&stores, token_id, 10_000, 250);
+    let VmOutcome::Halt { result, energy_used, .. } = outcome else {
+        panic!("expected Halt, got {outcome:?}");
+    };
+    assert_eq!(
+        result,
+        tron_proto::transaction::result::ContractResult::Unknown,
+        "a BytecodeExecutionException records UNKNOWN"
+    );
+    assert_eq!(
+        energy_used, 500_000,
+        "a non-TransferException spends ALL energy"
+    );
+}
+
+/// #32 ON — today's mainnet. `createAccountIfNotExist` creates the recipient
+/// and the transfer proceeds. Pins the existing behaviour against regression.
+#[test]
+fn calltoken_to_absent_target_post_059_creates_account() {
+    let stores = fresh_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_SOLIDITY_059", 1);
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    let token_id = 1_000_001i64;
+    let initial_balance = 10_000i64;
+    let transfer_amount = 250i64;
+
+    let outcome =
+        run_calltoken_to_absent_target(&stores, token_id, initial_balance, transfer_amount);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "expected Success, got {outcome:?}"
+    );
+
+    let target = stores
+        .accounts
+        .get(&Address::from_raw(tron_addr(0xd7)))
+        .unwrap()
+        .expect("target must be created once ALLOW_TVM_SOLIDITY_059 is active");
+    assert_eq!(
+        target.asset_v2.get(&token_id.to_string()).copied(),
+        Some(transfer_amount),
+        "the created target must be credited"
+    );
+}
+
+/// Ordering trap: java checks the sender's TOKEN balance
+/// (`if (senderBalance < endowment) { stackPushZero(); refundEnergy(...);
+/// return; }`) BEFORE `createAccountIfNotExist`. An under-funded CALLTOKEN must
+/// therefore push 0 and let the caller continue — the transaction SUCCEEDS —
+/// even though the target is absent and #32 is off. It must never be turned
+/// into a TransferException.
+#[test]
+fn calltoken_insufficient_balance_pre_059_still_pushes_zero() {
+    let stores = fresh_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    // ALLOW_TVM_SOLIDITY_059 deliberately left unset.
+    let token_id = 1_000_001i64;
+
+    // Caller holds 100 but tries to send 250.
+    let outcome = run_calltoken_to_absent_target(&stores, token_id, 100, 250);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "an under-funded CALLTOKEN pushes 0 and continues; expected Success, \
+         got {outcome:?}"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(tron_addr(0xd7)))
+            .unwrap()
+            .is_none(),
+        "the target must still not be created"
+    );
+}
+
+// =============================================================================
+// Shared fixtures and builders for the era / static-context CALLTOKEN tests
+// =============================================================================
+
+/// `fresh_stores` leaves ALLOW_MULTI_SIGN (#20) unset, so it is already a
+/// pre-#20 fixture: `Program.isTokenTransfer` falls to
+/// `msg.getTokenId().longValue() != 0` and a CALLTOKEN with a zero low-64
+/// tokenId is a NATIVE TRX call. This adds ALLOW_TVM_CONSTANTINOPLE (#26) so the
+/// failure flavour is the modern `TransferException`.
+fn pre_multisign_stores() -> VmStores {
+    let stores = fresh_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    stores
+}
+
+/// The modern mainnet era: ALLOW_MULTI_SIGN (#20) and
+/// ALLOW_TVM_CONSTANTINOPLE (#26) both active — what the 83M snapshot rig runs.
+fn modern_stores() -> VmStores {
+    let stores = pre_multisign_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    stores
+}
+
+/// Like [`build_calltoken_caller`] but taking the tokenId and the value as RAW
+/// 32-byte stack words, so a test can place a word outside `i64` range or with
+/// high bytes set below the low-64 the asset key uses.
+fn build_calltoken_caller_raw(target: [u8; 21], token_id: [u8; 32], value: [u8; 32]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend(push1(0)); // outSize
+    bc.extend(push1(0)); // outOffset
+    bc.extend(push1(0)); // inSize
+    bc.extend(push1(0)); // inOffset
+    bc.push(0x7f); // PUSH32 tokenId
+    bc.extend_from_slice(&token_id);
+    bc.push(0x7f); // PUSH32 value
+    bc.extend_from_slice(&value);
+    bc.push(0x73); // PUSH20 target
+    bc.extend_from_slice(&target[1..]);
+    bc.extend(push_u256_bytecode(100_000)); // gas
+    bc.push(0xd0); // CALLTOKEN
+    // A trailing SSTORE makes "the opcode pushed 0 and the frame carried on"
+    // observable and distinguishable from "the opcode killed the frame".
+    bc.push(0x50); // POP the success flag
+    bc.extend_from_slice(&[0x60, 0x01, 0x60, 0x02, 0x55]); // SSTORE slot2 := 1
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// OUTER: `STATICCALL(gas, inner, 0, 0, 0, 0); POP; STOP` — puts `inner` in a
+/// static context.
+fn outer_staticcalls(inner: [u8; 21]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend_from_slice(&[0x60, 0x00]); // outLen
+    bc.extend_from_slice(&[0x60, 0x00]); // outOff
+    bc.extend_from_slice(&[0x60, 0x00]); // inLen
+    bc.extend_from_slice(&[0x60, 0x00]); // inOff
+    bc.push(0x73); // PUSH20 to
+    bc.extend_from_slice(&inner[1..]);
+    bc.extend_from_slice(&[0x62, 0x0f, 0x42, 0x40]); // PUSH3 1_000_000 gas
+    bc.push(0xfa); // STATICCALL
+    bc.push(0x50); // POP
+    bc.push(0x00); // STOP
+    bc
+}
+
+fn word_u64(v: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+fn trigger_for(owner: [u8; 21], contract: [u8; 21]) -> TriggerSmartContract {
+    TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    }
+}
+
+fn run(stores: &VmStores, trigger: &TriggerSmartContract, limit: u64) -> VmOutcome {
+    execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+        trigger,
+        limit,
+    )
+}
+
+fn slot(stores: &VmStores, contract: [u8; 21], index: u8) -> Vec<u8> {
+    let mut key = [0u8; 32];
+    key[31] = index;
+    let composed = StorageRowStore::compose_key(&Address::from_raw(contract), &key);
+    stores.storage.get(&composed).unwrap().unwrap_or_default()
+}
+
+fn asset_of(stores: &VmStores, addr: [u8; 21], key: &str) -> Option<i64> {
+    stores
+        .accounts
+        .get(&Address::from_raw(addr))
+        .unwrap()
+        .and_then(|a| a.asset_v2.get(key).copied())
+}
+
+fn set_trx_balance(stores: &VmStores, addr: [u8; 21], balance: i64) {
+    let key = Address::from_raw(addr);
+    let acct = stores.accounts.get(&key).unwrap().unwrap();
+    stores
+        .accounts
+        .put(&key, &Account { balance, ..acct })
+        .unwrap();
+}
+
+// =============================================================================
+// Static context: java throws only for a VALUE-BEARING CALLTOKEN
+// =============================================================================
+//
+// `OperationActions.callTokenAction` (OperationActions.java:973-987) guards with
+// `if (program.isStaticCall() && !value.isZero())` — the same predicate
+// `callAction` uses for CALL, not the unconditional form `create2Action` and
+// `suicideAction` use. A zero-value CALLTOKEN moves nothing (the transfer block
+// in `Program.callToAddress` is gated on `endowment > 0`), so it is permitted
+// inside a static context.
+
+/// A zero-value CALLTOKEN inside a STATICCALL must proceed, not halt.
+#[test]
+fn calltoken_zero_value_permitted_inside_staticcall() {
+    let stores = modern_stores();
+    let owner = tron_addr(0xa0);
+    let outer = tron_addr(0xc0);
+    let inner = tron_addr(0xc1);
+    let receiver = tron_addr(0xc2);
+    let token_id = 1_000_001i64;
+
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(&stores, outer, &outer_staticcalls(inner), 0, 0);
+    install_contract_with_balance(
+        &stores,
+        inner,
+        &build_calltoken_caller(receiver, token_id, 0),
+        token_id,
+        10_000,
+    );
+    install_contract_with_balance(&stores, receiver, &build_calltoken_receiver(), 0, 0);
+
+    let limit = 500_000u64;
+    match run(&stores, &trigger_for(owner, outer), limit) {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(
+                energy_used < limit,
+                "a permitted CALLTOKEN must not burn the whole limit"
+            );
+        }
+        other => panic!("a zero-value CALLTOKEN is legal inside a static call, got {other:?}"),
+    }
+    assert_eq!(
+        asset_of(&stores, receiver, &token_id.to_string()),
+        None,
+        "a zero-value CALLTOKEN moves no asset (java gates the transfer on endowment > 0)"
+    );
+    assert_eq!(
+        asset_of(&stores, inner, &token_id.to_string()),
+        Some(10_000),
+        "the caller's asset balance is untouched"
+    );
+}
+
+/// The preserved half of the guard: a CALLTOKEN that DOES carry value inside a
+/// static context throws `StaticCallModificationException`, a
+/// `BytecodeExecutionException` subclass — spend-all, `contractResult UNKNOWN`.
+/// Guards against over-relaxing the guard to an unconditional allow.
+#[test]
+fn calltoken_nonzero_value_rejected_inside_staticcall() {
+    let stores = modern_stores();
+    let owner = tron_addr(0xa1);
+    let outer = tron_addr(0xc3);
+    let inner = tron_addr(0xc4);
+    let receiver = tron_addr(0xc5);
+    let token_id = 1_000_001i64;
+
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(&stores, outer, &outer_staticcalls(inner), 0, 0);
+    install_contract_with_balance(
+        &stores,
+        inner,
+        &build_calltoken_caller(receiver, token_id, 5),
+        token_id,
+        10_000,
+    );
+    install_contract_with_balance(&stores, receiver, &build_calltoken_receiver(), 0, 0);
+
+    // The throw is contained to `inner`'s frame; `outer` pushes 0 and STOPs.
+    // What must hold is that no asset moved and `inner` died at the opcode.
+    let _ = run(&stores, &trigger_for(owner, outer), 500_000);
+    assert_eq!(
+        asset_of(&stores, inner, &token_id.to_string()),
+        Some(10_000),
+        "a rejected static CALLTOKEN must move nothing"
+    );
+    assert_eq!(asset_of(&stores, receiver, &token_id.to_string()), None);
+}
+
+/// The callee of a CALLTOKEN inherits the caller's static context. java builds
+/// the child invoke with `msg.getOpCode() == Op.STATICCALL || isStaticCall()`
+/// (Program.java:1138), and CALLTOKEN is never STATICCALL — so the child is
+/// static exactly when the parent is. Without this the relaxed zero-value path
+/// above would be a static ESCAPE: the callee could SSTORE where java forbids
+/// it.
+#[test]
+fn calltoken_callee_inherits_static_context() {
+    let stores = modern_stores();
+    let owner = tron_addr(0xa2);
+    let outer = tron_addr(0xc6);
+    let inner = tron_addr(0xc7);
+    let writer = tron_addr(0xc8);
+    let token_id = 1_000_001i64;
+
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(&stores, outer, &outer_staticcalls(inner), 0, 0);
+    install_contract_with_balance(
+        &stores,
+        inner,
+        &build_calltoken_caller(writer, token_id, 0),
+        token_id,
+        10_000,
+    );
+    // PUSH1 1 PUSH1 0 SSTORE STOP — a state mutation the static context forbids.
+    install_contract_with_balance(
+        &stores,
+        writer,
+        &[0x60, 0x01, 0x60, 0x00, 0x55, 0x00],
+        0,
+        0,
+    );
+
+    let _ = run(&stores, &trigger_for(owner, outer), 500_000);
+    assert!(
+        slot(&stores, writer, 0).iter().all(|&b| b == 0),
+        "the CALLTOKEN callee must run STATIC, so its SSTORE cannot commit"
+    );
+}
+
+/// ORDERING: java throws the static-call exception in `callTokenAction`, before
+/// `exeCall` ever reaches `callToAddress`/`checkTokenId`. So a static,
+/// value-bearing CALLTOKEN with a tokenId that would ALSO trip `checkTokenId`
+/// must record the spend-all static halt, not the consumed-only
+/// TRANSFER_FAILED. Energy distinguishes the two, so this genuinely detects a
+/// mis-ordered guard.
+#[test]
+fn calltoken_static_guard_precedes_token_id_check() {
+    let stores = modern_stores();
+    let owner = tron_addr(0xa3);
+    // Run the value-bearing static CALLTOKEN at the ROOT frame so the outcome
+    // is the transaction's own, not a contained nested halt.
+    let caller = tron_addr(0xc9);
+    let receiver = tron_addr(0xca);
+
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // tokenId = 5 (<= MIN_TOKEN_ID) would trip `checkTokenId` -> TransferFailed.
+    install_contract_with_balance(
+        &stores,
+        caller,
+        &build_calltoken_caller(receiver, 5, 5),
+        5,
+        10_000,
+    );
+    install_contract_with_balance(&stores, receiver, &build_calltoken_receiver(), 0, 0);
+
+    // Not static: `checkTokenId` owns the failure, consumed-only.
+    let limit = 500_000u64;
+    match run(&stores, &trigger_for(owner, caller), limit) {
+        VmOutcome::TransferFailed { energy_used } => {
+            assert!(
+                energy_used < limit,
+                "checkTokenId raises a TransferException, which is spend-all-exempt"
+            );
+        }
+        other => panic!("expected TransferFailed from checkTokenId, got {other:?}"),
+    }
+
+    // Static: the static guard fires FIRST, so it is a spend-all halt instead.
+    let stores = modern_stores();
+    let outer = tron_addr(0xcb);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(&stores, outer, &outer_staticcalls(caller), 0, 0);
+    install_contract_with_balance(
+        &stores,
+        caller,
+        &build_calltoken_caller(receiver, 5, 5),
+        5,
+        10_000,
+    );
+    install_contract_with_balance(&stores, receiver, &build_calltoken_receiver(), 0, 0);
+    let outcome = run(&stores, &trigger_for(owner, outer), limit);
+    assert!(
+        !matches!(outcome, VmOutcome::TransferFailed { .. }),
+        "the static guard must pre-empt checkTokenId's TransferException, got {outcome:?}"
+    );
+    assert_eq!(
+        asset_of(&stores, caller, "5"),
+        Some(10_000),
+        "nothing moves either way"
+    );
+}
+
+/// Pre-ALLOW_MULTI_SIGN, tokenId 0 makes `value` a NATIVE call-value rather
+/// than a token amount. With value 0 there is still nothing to move, so a
+/// static context permits it. Covers the `is_token_transfer == false` branch of
+/// the relaxed guard.
+#[test]
+fn calltoken_zero_value_zero_token_id_permitted_inside_staticcall() {
+    let stores = pre_multisign_stores(); // ALLOW_MULTI_SIGN deliberately off
+    let owner = tron_addr(0xa4);
+    let outer = tron_addr(0xcc);
+    let inner = tron_addr(0xcd);
+    let receiver = tron_addr(0xce);
+
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(&stores, outer, &outer_staticcalls(inner), 0, 0);
+    install_contract_with_balance(&stores, inner, &build_calltoken_caller(receiver, 0, 0), 0, 0);
+    install_contract_with_balance(&stores, receiver, &build_calltoken_receiver(), 0, 0);
+
+    let limit = 500_000u64;
+    match run(&stores, &trigger_for(owner, outer), limit) {
+        VmOutcome::Success { energy_used, .. } => assert!(energy_used < limit),
+        other => panic!("a zero-value native CALLTOKEN is legal inside static, got {other:?}"),
+    }
+}
+
+// =============================================================================
+// CALLTOKEN endowment range
+// =============================================================================
+//
+// `callTokenAction` (OperationActions.java:973-987) pops the value word and
+// `exeCall` (:1019-1043) hands it to `MessageCall` as the 4th constructor
+// argument — the ENDOWMENT. So CALLTOKEN reaches the same
+// `msg.getEndowment().value().longValueExact()` at Program.java:1034 that CALL
+// does, and `value()` is unsigned: every word from 2^63 up throws.
+
+/// A callee that records the three call-shape words the caller handed it.
+fn build_call_shape_recorder() -> Vec<u8> {
+    vec![
+        0x34, 0x60, 0x00, 0x55, // CALLVALUE      -> slot 0
+        0xd2, 0x60, 0x01, 0x55, // CALLTOKENVALUE -> slot 1
+        0xd3, 0x60, 0x02, 0x55, // CALLTOKENID    -> slot 2
+        0x00, // STOP
+    ]
+}
+
+/// Set up owner + a CALLTOKEN caller with raw words + a recorder callee.
+/// Returns `(owner, caller, receiver)`.
+fn raw_calltoken_rig(
+    stores: &VmStores,
+    token_id: [u8; 32],
+    value: [u8; 32],
+    caller_asset_id: i64,
+    caller_asset_balance: i64,
+) -> ([u8; 21], [u8; 21], [u8; 21]) {
+    let owner = tron_addr(0xa9);
+    let caller = tron_addr(0xd0);
+    let receiver = tron_addr(0xd1);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(
+        stores,
+        caller,
+        &build_calltoken_caller_raw(receiver, token_id, value),
+        caller_asset_id,
+        caller_asset_balance,
+    );
+    install_contract_with_balance(stores, receiver, &build_call_shape_recorder(), 0, 0);
+    (owner, caller, receiver)
+}
+
+/// value = 2^63, one above `i64::MAX`. Today this truncates to `i64::MIN` and
+/// drives a `0 - i64::MIN` overflow in the asset transfer.
+#[test]
+fn calltoken_value_over_i64_max_is_transfer_failed() {
+    let stores = modern_stores();
+    let mut value = [0u8; 32];
+    value[24] = 0x80;
+    let (owner, caller, _) =
+        raw_calltoken_rig(&stores, word_u64(1_000_001), value, 1_000_001, 10_000);
+
+    let limit = 500_000u64;
+    match run(&stores, &trigger_for(owner, caller), limit) {
+        VmOutcome::TransferFailed { energy_used } => {
+            assert!(energy_used > 0 && energy_used < limit);
+        }
+        other => panic!("expected TransferFailed, got {other:?}"),
+    }
+    assert_eq!(asset_of(&stores, caller, "1000001"), Some(10_000));
+}
+
+/// value = 2^64 exactly: its LOW 64 BITS ARE ZERO, so before the guard it
+/// truncated to 0, performed no transfer at all, and the transaction reported
+/// SUCCESS. The highest-signal regression in this family.
+#[test]
+fn calltoken_value_2_pow_64_is_transfer_failed_not_success() {
+    let stores = modern_stores();
+    let mut value = [0u8; 32];
+    value[23] = 0x01; // 2^64
+    let (owner, caller, receiver) =
+        raw_calltoken_rig(&stores, word_u64(1_000_001), value, 1_000_001, 10_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::TransferFailed { .. }),
+        "a 2^64 endowment must not truncate to a silent no-op, got {outcome:?}"
+    );
+    assert_eq!(asset_of(&stores, caller, "1000001"), Some(10_000));
+    assert_eq!(asset_of(&stores, receiver, "1000001"), None);
+}
+
+/// The all-ones word pins the UNSIGNED (`value()`) reading: the signed
+/// `sValue()` helper would accept it as -1.
+#[test]
+fn calltoken_value_all_ones_is_transfer_failed() {
+    let stores = modern_stores();
+    let (owner, caller, _) =
+        raw_calltoken_rig(&stores, word_u64(1_000_001), [0xFF; 32], 1_000_001, 10_000);
+    assert!(matches!(
+        run(&stores, &trigger_for(owner, caller), 500_000),
+        VmOutcome::TransferFailed { .. }
+    ));
+}
+
+/// Boundary: `i64::MAX` is in range. The caller holds far fewer tokens, so java
+/// takes its insufficient-balance push-0 (Program.java:1060-1063) and the frame
+/// carries on. Guards against the guard over-firing by one.
+#[test]
+fn calltoken_value_at_i64_max_is_not_transfer_failed() {
+    let stores = modern_stores();
+    let mut value = [0u8; 32];
+    value[24] = 0x7F;
+    value[25..].fill(0xFF);
+    let (owner, caller, _) =
+        raw_calltoken_rig(&stores, word_u64(1_000_001), value, 1_000_001, 10_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(
+        !matches!(outcome, VmOutcome::TransferFailed { .. }),
+        "i64::MAX is in range; the shortfall is an ordinary push-0, got {outcome:?}"
+    );
+    assert_eq!(
+        slot(&stores, caller, 2).last(),
+        Some(&1u8),
+        "the caller must run on past the CALLTOKEN"
+    );
+}
+
+/// Pre-#26 half: without ALLOW_TVM_CONSTANTINOPLE the raw `ArithmeticException`
+/// propagates, so it spends all energy and records UNKNOWN — explicitly neither
+/// TRANSFER_FAILED nor OUT_OF_MEMORY.
+#[test]
+fn calltoken_value_over_i64_max_pre_constantinople_is_spend_all_unknown() {
+    let stores = fresh_stores(); // ALLOW_TVM_CONSTANTINOPLE deliberately unset
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    let mut value = [0u8; 32];
+    value[24] = 0x80;
+    let (owner, caller, _) =
+        raw_calltoken_rig(&stores, word_u64(1_000_001), value, 1_000_001, 10_000);
+
+    let limit = 500_000u64;
+    match run(&stores, &trigger_for(owner, caller), limit) {
+        VmOutcome::Halt {
+            result,
+            energy_used,
+            ..
+        } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::Unknown
+            );
+            assert_eq!(energy_used, limit, "spendAllEnergy consumes the whole limit");
+        }
+        other => panic!("expected a spend-all Halt/UNKNOWN, got {other:?}"),
+    }
+}
+
+/// The endowment read precedes `checkTokenId` and is independent of the
+/// `isTokenTransfer` branch, so it applies to a pre-#20 CALLTOKEN with
+/// tokenId 0 (native-value semantics) exactly as to a token transfer.
+#[test]
+fn calltoken_value_over_i64_max_with_zero_token_id_pre_multisign() {
+    let stores = pre_multisign_stores(); // ALLOW_MULTI_SIGN off
+    let mut value = [0u8; 32];
+    value[23] = 0x01; // 2^64
+    let (owner, caller, _) = raw_calltoken_rig(&stores, [0u8; 32], value, 0, 0);
+    assert!(matches!(
+        run(&stores, &trigger_for(owner, caller), 500_000),
+        VmOutcome::TransferFailed { .. }
+    ));
+}
+
+// =============================================================================
+// Pre-ALLOW_MULTI_SIGN (#20): tokenId keying, the native branch, and the
+// full-word CALLTOKENID
+// =============================================================================
+//
+// `Program.isTokenTransfer` (Program.java:1827-1833) falls back to
+// `msg.getTokenId().longValue() != 0` before #20, and `DataWord.longValue()`
+// (DataWord.java:237-245) is a LOW-64-BIT truncation. On the native branch java
+// zeroes BOTH the token id and the token value it hands the callee
+// (Program.java:1135-1136) and moves TRX instead.
+
+/// The shape java calls a plain "TRX call via CALLTOKEN": pre-#20, tokenId 0,
+/// value > 0. The callee must RUN with `msg.value == value`, TRX must move, and
+/// no `asset_v2["0"]` row may be invented. Before the fix the token id/value
+/// reached the child unzeroed, the asset machinery tried to move asset "0",
+/// found no balance and short-circuited the child with a revert + stack 0.
+#[test]
+fn calltoken_pre_multisign_zero_token_id_is_native_trx_call() {
+    let stores = pre_multisign_stores();
+    let (owner, caller, receiver) = raw_calltoken_rig(&stores, [0u8; 32], word_u64(100), 0, 0);
+    set_trx_balance(&stores, caller, 5_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "a pre-#20 zero-tokenId CALLTOKEN is an ordinary TRX call, got {outcome:?}"
+    );
+
+    let caller_acct = stores
+        .accounts
+        .get(&Address::from_raw(caller))
+        .unwrap()
+        .unwrap();
+    let recv_acct = stores
+        .accounts
+        .get(&Address::from_raw(receiver))
+        .unwrap()
+        .unwrap();
+    assert_eq!(caller_acct.balance, 4_900, "caller debited the TRX value");
+    assert_eq!(recv_acct.balance, 100, "receiver credited the TRX value");
+    assert!(
+        caller_acct.asset_v2.is_empty() && recv_acct.asset_v2.is_empty(),
+        "the native branch must not touch asset_v2 at all"
+    );
+
+    // The callee ran, and saw a NATIVE value with both token words zeroed.
+    assert_eq!(slot(&stores, receiver, 0).last(), Some(&100u8), "CALLVALUE");
+    assert!(
+        slot(&stores, receiver, 1).iter().all(|&b| b == 0),
+        "CALLTOKENVALUE must be 0 on the native branch"
+    );
+    assert!(
+        slot(&stores, receiver, 2).iter().all(|&b| b == 0),
+        "CALLTOKENID must be 0 on the native branch"
+    );
+}
+
+/// The native branch is self-transfer-banned too: `validateForSmartContract`'s
+/// TRX overload throws "Cannot transfer TRX to yourself" (VMUtils.java:146-148),
+/// so this is NOT a permitted no-op self-call.
+#[test]
+fn calltoken_pre_multisign_native_self_transfer_rejected() {
+    let stores = pre_multisign_stores();
+    let owner = tron_addr(0xaa);
+    let own = tron_addr(0xd2);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(
+        &stores,
+        own,
+        &build_calltoken_caller_raw(own, [0u8; 32], word_u64(100)),
+        0,
+        0,
+    );
+    set_trx_balance(&stores, own, 5_000);
+
+    let outcome = run(&stores, &trigger_for(owner, own), 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::TransferFailed { .. }),
+        "a funded native self-CALLTOKEN must be TRANSFER_FAILED, got {outcome:?}"
+    );
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(own))
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.balance, 5_000, "no TRX may move");
+}
+
+/// java's ban is gated on `endowment > 0`, so a ZERO-value native self-CALLTOKEN
+/// is permitted and the callee runs. Locks the `has_transfer` half of the guard.
+#[test]
+fn calltoken_pre_multisign_native_self_transfer_zero_value_allowed() {
+    let stores = pre_multisign_stores();
+    let owner = tron_addr(0xab);
+    let own = tron_addr(0xd3);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(
+        &stores,
+        own,
+        &build_calltoken_caller_raw(own, [0u8; 32], [0u8; 32]),
+        0,
+        0,
+    );
+
+    let outcome = run(&stores, &trigger_for(owner, own), 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "a zero-value self-CALLTOKEN is permitted, got {outcome:?}"
+    );
+    assert_eq!(
+        slot(&stores, own, 2).last(),
+        Some(&1u8),
+        "the caller must run on past the CALLTOKEN"
+    );
+}
+
+/// `DataWord.longValue()` truncates to the LOW 64 bits, so a tokenId word of
+/// `1 << 64` — low 8 bytes zero, bit 64 set — is a NATIVE call, not a token
+/// transfer. A whole-word `is_zero()` test would wrongly take the token path.
+#[test]
+fn calltoken_pre_multisign_high_word_token_id_is_native() {
+    let stores = pre_multisign_stores();
+    let mut token_id = [0u8; 32];
+    token_id[23] = 0x01; // 1 << 64
+    let (owner, caller, receiver) = raw_calltoken_rig(&stores, token_id, word_u64(50), 0, 0);
+    set_trx_balance(&stores, caller, 5_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "low-64 keying makes this the native branch, got {outcome:?}"
+    );
+    let recv = stores
+        .accounts
+        .get(&Address::from_raw(receiver))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recv.balance, 50, "TRX moved, not a token");
+    assert!(recv.asset_v2.is_empty(), "no asset_v2 row may be created");
+    assert!(
+        slot(&stores, receiver, 2).iter().all(|&b| b == 0),
+        "CALLTOKENID is zeroed on the native branch"
+    );
+}
+
+/// Key-vs-CALLTOKENID divergence. The asset STORE KEY is the low-64 signed
+/// decimal (`String.valueOf(tokenId.longValue())`, Program.java:1059) while the
+/// callee's CALLTOKENID sees the FULL 32-byte word (Program.java:1136). Before
+/// #20 nothing constrains the word, so the two legitimately differ.
+#[test]
+fn calltoken_pre_multisign_full_word_token_id_reaches_callee() {
+    let stores = pre_multisign_stores();
+    // (1 << 64) + 1_000_001 — low-64 is 1_000_001, high bytes set.
+    let mut token_id = word_u64(1_000_001);
+    token_id[23] = 0x01;
+    let (owner, caller, receiver) =
+        raw_calltoken_rig(&stores, token_id, word_u64(250), 1_000_001, 10_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+
+    // The asset moved under the LOW-64 key.
+    assert_eq!(asset_of(&stores, caller, "1000001"), Some(9_750));
+    assert_eq!(asset_of(&stores, receiver, "1000001"), Some(250));
+    // But CALLTOKENID pushed the WHOLE word.
+    assert_eq!(
+        slot(&stores, receiver, 2),
+        token_id.to_vec(),
+        "CALLTOKENID must push the full 32-byte word, not the low-64 key"
+    );
+}
+
+/// A tokenId word of `U256::MAX` has low-64 == -1, so java's key is `"-1"` and
+/// CALLTOKENID pushes `2^256-1`. The old `v.max(0) as u64` clamp pushed 0 for
+/// any negative low-64 — a second, independent error in the same expression.
+#[test]
+fn calltoken_pre_multisign_negative_low_word_token_id() {
+    let stores = pre_multisign_stores();
+    let (owner, caller, receiver) =
+        raw_calltoken_rig(&stores, [0xFF; 32], word_u64(250), -1, 10_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+    assert_eq!(
+        asset_of(&stores, caller, "-1"),
+        Some(9_750),
+        "the asset key is String.valueOf(-1L)"
+    );
+    assert_eq!(asset_of(&stores, receiver, "-1"), Some(250));
+    assert_eq!(
+        slot(&stores, receiver, 2),
+        [0xFFu8; 32].to_vec(),
+        "CALLTOKENID must push the full word, not a clamped 0"
+    );
+}
+
+/// The whole pre-#20 change set must be INERT once ALLOW_MULTI_SIGN is active —
+/// `checkTokenId` then forces the tokenId into `(1_000_000, i64::MAX]` with all
+/// high bytes zero, so word == low-64 == the i64. This is the guard that the
+/// change set does not move the 83M snapshot rig.
+#[test]
+fn calltoken_post_multisign_unchanged() {
+    let stores = modern_stores();
+    let (owner, caller, receiver) =
+        raw_calltoken_rig(&stores, word_u64(1_000_001), word_u64(250), 1_000_001, 10_000);
+
+    let outcome = run(&stores, &trigger_for(owner, caller), 500_000);
+    assert!(matches!(outcome, VmOutcome::Success { .. }), "got {outcome:?}");
+    assert_eq!(asset_of(&stores, caller, "1000001"), Some(9_750));
+    assert_eq!(asset_of(&stores, receiver, "1000001"), Some(250));
+    // Native value 0, token value 250, token id 1_000_001 — the modern shape.
+    assert!(slot(&stores, receiver, 0).iter().all(|&b| b == 0), "CALLVALUE");
+    assert_eq!(slot(&stores, receiver, 1).last(), Some(&250u8));
+    assert_eq!(slot(&stores, receiver, 2), word_u64(1_000_001).to_vec());
+}
+
+/// ORDERING: java's TOKEN-balance check (Program.java:1058-1063) precedes the
+/// transfer block, so a self-CALLTOKEN the caller cannot fund pushes 0 and the
+/// frame carries on — it never reaches the self-transfer ban. Also guards the
+/// inspector's self-transfer no-op against regressing into a mint.
+#[test]
+fn self_calltoken_with_insufficient_token_balance_pushes_zero() {
+    let stores = modern_stores();
+    let owner = tron_addr(0xac);
+    let own = tron_addr(0xd4);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Holds 0 of token 1_000_001 but CALLTOKENs itself for 250.
+    install_contract_with_balance(
+        &stores,
+        own,
+        &build_calltoken_caller_raw(own, word_u64(1_000_001), word_u64(250)),
+        1_000_001,
+        0,
+    );
+
+    let outcome = run(&stores, &trigger_for(owner, own), 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "an under-funded self-CALLTOKEN takes java's balance push-0, got {outcome:?}"
+    );
+    assert_eq!(
+        slot(&stores, own, 2).last(),
+        Some(&1u8),
+        "the frame must run on past the CALLTOKEN"
+    );
+    assert_eq!(
+        asset_of(&stores, own, "1000001"),
+        Some(0),
+        "and must not net-mint itself the amount"
+    );
 }

@@ -1,6 +1,6 @@
 use crate::{Gas, InstructionResult, InterpreterResult};
 use core::ops::Range;
-use primitives::{Bytes, Log};
+use primitives::{Bytes, Log, U256};
 use std::vec::Vec;
 
 /// Represents the outcome of a call operation in a virtual machine.
@@ -30,6 +30,11 @@ pub struct CallOutcome {
     /// the parent's tracker for this call, so the parent can refund it when
     /// the call reverts/halts.
     pub charged_new_account_state_gas: bool,
+    /// TRON fork: copied from [`crate::CallInputs::tron_raw_return_offset`] —
+    /// the raw 256-bit return offset as popped from the stack, which
+    /// [`Self::memory_offset`] loses to a `usize::MAX` sentinel when the return
+    /// size is zero. Read by the pre-#94 precompile return-data write.
+    pub tron_raw_return_offset: U256,
 }
 
 impl CallOutcome {
@@ -48,6 +53,7 @@ impl CallOutcome {
             was_precompile_called: false,
             precompile_call_logs: Vec::new(),
             charged_new_account_state_gas: false,
+            tron_raw_return_offset: U256::ZERO,
         }
     }
 

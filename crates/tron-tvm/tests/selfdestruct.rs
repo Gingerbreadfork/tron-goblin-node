@@ -39,6 +39,13 @@ fn fresh_stores(restriction: bool) -> VmStores {
     dynamic_properties.put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
     dynamic_properties.put_long(b"ALLOW_TVM_FREEZE", 1);
     dynamic_properties.put_long(b"ALLOW_TVM_VOTE", 1);
+    // `Program.createAccountIfNotExist` — which lets SELFDESTRUCT hand its
+    // inheritance to an address with no store row — is gated on
+    // ALLOW_TVM_SOLIDITY_059 (#32). java's `ProposalUtil` makes #32 a
+    // prerequisite of both ALLOW_TVM_FREEZE (#52) and ALLOW_TVM_VOTE (#59)
+    // above, so a fixture enabling those must enable this too. Tests that model
+    // the pre-#32 era build their stores with `pre_059_stores`.
+    dynamic_properties.put_long(b"ALLOW_TVM_SOLIDITY_059", 1);
     // FreezeV2 = supportUnfreezeDelay() = UNFREEZE_DELAY_DAYS > 0.
     dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 14);
     if restriction {
@@ -514,4 +521,210 @@ fn same_tx_created_contract_suicide_persists_fresh_heir() {
     assert_eq!(heir_acc.address, heir.to_vec());
     // Stamped with the head-block timestamp (java createNormalAccount).
     assert_eq!(heir_acc.create_time, 1_700_000_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// ALLOW_TVM_SOLIDITY_059 (#32): SELFDESTRUCT may not create its obtainer
+// before the proposal activates.
+//
+// java `Program.suicide` calls `createAccountIfNotExist(getContractState(),
+// obtainer)` — a no-op before #32 — and then `MUtil.transfer(.., balance)`.
+// `MUtil.transfer` opens with `if (0 == amount) { return; }`, so the dying
+// contract's balance decides which of three java outcomes applies:
+//
+//   balance > 0  → `VMUtils.validateForSmartContract` throws "no ToAccount";
+//                  the catch yields a `TransferException` under
+//                  ALLOW_TVM_CONSTANTINOPLE (#26), else a
+//                  `BytecodeExecutionException`.
+//   balance == 0 with ALLOW_TVM_TRANSFER_TRC10 → the transfer no-ops and
+//                  `MUtil.transferAllToken` calls `importAllAsset()` on the
+//                  obtainer's null `AccountCapsule` → NullPointerException.
+//                  An NPE is not a `ContractValidateException`, so the local
+//                  catch misses it and `VMActuator`'s `catch (Throwable)`
+//                  spends all energy — always UNKNOWN, never TRANSFER_FAILED.
+//   balance == 0 without TRC-10 → java SUCCEEDS, having never created the
+//                  obtainer. Only the phantom row must not appear.
+// ---------------------------------------------------------------------------
+
+/// Stores modelling the pre-#32 era: no ALLOW_TVM_SOLIDITY_059, and none of the
+/// later proposals (#52 freeze, #59 vote) that java's `ProposalUtil` makes
+/// conditional on it. `trc10` toggles ALLOW_TVM_TRANSFER_TRC10 (#18) and
+/// `constantinople` ALLOW_TVM_CONSTANTINOPLE (#26), both of which legitimately
+/// predate #32.
+fn pre_059_stores(trc10: bool, constantinople: bool) -> VmStores {
+    let dynamic_properties = Arc::new(DynamicPropertiesStore::new(mem()));
+    if trc10 {
+        dynamic_properties.put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
+    }
+    if constantinople {
+        dynamic_properties.put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    }
+    dynamic_properties.save_latest_block_header_timestamp(1_700_000_000_000);
+    VmStores {
+        accounts: Arc::new(AccountStore::new(mem())),
+        code: Arc::new(CodeStore::new(mem())),
+        storage: Arc::new(StorageRowStore::new(mem())),
+        witnesses: Arc::new(WitnessStore::new(mem())),
+        contract_state: Arc::new(ContractStateStore::new(mem())),
+        dynamic_properties,
+        delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
+        delegated_resource_account_index: None,
+        delegation: Arc::new(DelegationStore::new(mem())),
+        block_index: None,
+        contracts: Some(Arc::new(ContractStore::new(mem()))),
+        votes: Some(Arc::new(VotesStore::new(mem()))),
+        reward_vi: None,
+        abi: Some(Arc::new(AbiStore::new(mem()))),
+    }
+}
+
+/// Balance > 0 with #26 active: `MUtil.transfer` reaches
+/// `validateForSmartContract`, which rejects the absent obtainer, and the catch
+/// raises a `TransferException`. The transaction fails as TRANSFER_FAILED, the
+/// heir is never created, and the contract row survives because all state is
+/// unwound (no delete-account is recorded).
+#[test]
+fn suicide_absent_heir_pre_059_with_balance_transfer_failed() {
+    let stores = pre_059_stores(true, true);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xac);
+    let heir = tron_addr(0xad); // never installed
+    install_caller(&stores, caller, 1_000_000);
+    install_contract(&stores, contract, suicide_bytecode(heir), 500_000);
+
+    let out = run(&stores, caller, contract);
+    let VmOutcome::TransferFailed { energy_used } = out else {
+        panic!("expected TransferFailed, got {out:?}");
+    };
+    assert!(
+        energy_used < 1_000_000,
+        "a TransferException is spend-all-exempt; got {energy_used}"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(heir))
+            .unwrap()
+            .is_none(),
+        "the heir must not be created before ALLOW_TVM_SOLIDITY_059"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(contract))
+            .unwrap()
+            .is_some(),
+        "the failed transaction is unwound, so the contract row survives"
+    );
+}
+
+/// Balance 0 with TRC-10 active: java skips the transfer and NPEs inside
+/// `MUtil.transferAllToken`. An NPE never reaches the
+/// `allowTvmConstantinople` branch of the catch, so the result is the
+/// spend-all UNKNOWN flavour even with #26 active.
+#[test]
+fn suicide_absent_heir_pre_059_zero_balance_trc10_on_spends_all() {
+    let stores = pre_059_stores(true, true);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xac);
+    let heir = tron_addr(0xad); // never installed
+    install_caller(&stores, caller, 1_000_000);
+    install_contract(&stores, contract, suicide_bytecode(heir), 0);
+
+    let out = run(&stores, caller, contract);
+    let VmOutcome::Halt { result, energy_used, .. } = out else {
+        panic!("expected Halt, got {out:?}");
+    };
+    assert_eq!(
+        result,
+        tron_proto::transaction::result::ContractResult::Unknown,
+        "an NPE is not a TransferException, so the result is UNKNOWN"
+    );
+    assert_eq!(energy_used, 1_000_000, "all energy is spent");
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(heir))
+            .unwrap()
+            .is_none(),
+        "the heir must not be created"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(contract))
+            .unwrap()
+            .is_some(),
+        "the failed transaction is unwound, so the contract row survives"
+    );
+}
+
+/// Balance 0 with TRC-10 inactive: `MUtil.transfer` returns at `amount == 0`
+/// and `transferAllToken` is never called, so java SUCCEEDS. The contract is
+/// still destroyed; the only observable difference from the post-#32 era is
+/// that the obtainer row is never written — the phantom-account case.
+#[test]
+fn suicide_absent_heir_pre_059_zero_balance_trc10_off_succeeds_without_creating_heir() {
+    let stores = pre_059_stores(false, true);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xac);
+    let heir = tron_addr(0xad); // never installed
+    install_caller(&stores, caller, 1_000_000);
+    install_contract(&stores, contract, suicide_bytecode(heir), 0);
+
+    let out = run(&stores, caller, contract);
+    assert!(
+        matches!(out, VmOutcome::Success { .. }),
+        "expected Success, got {out:?}"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(contract))
+            .unwrap()
+            .is_none(),
+        "the dying contract is still destroyed"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(heir))
+            .unwrap()
+            .is_none(),
+        "no phantom row may be created for the never-created obtainer"
+    );
+}
+
+/// The gate keys on the obtainer's EXISTENCE, not on the proposal alone: with
+/// #32 off but the heir already installed, `createAccountIfNotExist` has
+/// nothing to do and `validateForSmartContract` passes, so the inheritance
+/// proceeds exactly as it always did.
+#[test]
+fn suicide_existing_heir_pre_059_unaffected() {
+    let stores = pre_059_stores(true, true);
+    let caller = tron_addr(0x11);
+    let contract = tron_addr(0xac);
+    let heir = tron_addr(0xad);
+    install_caller(&stores, caller, 1_000_000);
+    install_caller(&stores, heir, 5);
+    install_contract(&stores, contract, suicide_bytecode(heir), 500_000);
+
+    let out = run(&stores, caller, contract);
+    assert!(
+        matches!(out, VmOutcome::Success { .. }),
+        "expected Success, got {out:?}"
+    );
+    assert_eq!(
+        balance_of(&stores, heir),
+        500_005,
+        "the heir inherits the contract's whole balance"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&Address::from_raw(contract))
+            .unwrap()
+            .is_none(),
+        "the contract is destroyed"
+    );
 }

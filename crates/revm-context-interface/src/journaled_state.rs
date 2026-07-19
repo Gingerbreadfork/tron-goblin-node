@@ -145,6 +145,28 @@ pub trait JournalTr {
         false
     }
 
+    /// TRON fork: must a precompile's return data be written to memory in
+    /// FULL, at the raw return offset, ignoring the caller's return size?
+    ///
+    /// java-tron's `Program.callToPrecompiledAddress` picks its memory-write
+    /// overload on `ALLOW_TVM_SELFDESTRUCT_RESTRICTION` (proposal #94,
+    /// `Program.java:1771-1775`). Before #94 it calls `memorySave(int addr,
+    /// byte[] value)`, i.e. `memory.write(addr, value, value.length, false)` —
+    /// the length is the precompile output's own length and `outDataSize` is
+    /// never consulted, so the write both ignores the return window and
+    /// extends memory for free (`Memory.extend` has no energy accounting).
+    /// From #94 it calls `memorySave(int addr, int allocSize, byte[] value)`,
+    /// which truncates to `min(outDataSize, value.length)`.
+    ///
+    /// Applies to precompile returns ONLY: the regular-call path
+    /// (`Program.callToAddress:1185-1191`) uses `memorySaveLimited` in both
+    /// eras, which is the truncating, non-extending write.
+    ///
+    /// Default `false` — every non-TRON host keeps the truncating write.
+    fn tron_precompile_full_output_write(&self) -> bool {
+        false
+    }
+
     /// TRON fork: should SELFDESTRUCT charge the dead-beneficiary `NEW_ACCT_CALL`
     /// (25000) energy top-up? java adds it only from `ALLOW_ENERGY_ADJUSTMENT`
     /// (#81); pre-#81 there is no top-up. Default `true` preserves upstream
@@ -165,6 +187,19 @@ pub trait JournalTr {
         false
     }
 
+    /// TRON fork: was `address` created by a CREATE/CREATE2 anywhere in this
+    /// transaction and has that creation NOT been reverted? Unlike
+    /// [`Self::tron_account_created_locally`] (frame-scoped, java
+    /// `Repository.isNewContract`) this is the transaction-scoped flag, which
+    /// stays set after a successful child frame returns and is cleared when the
+    /// creating checkpoint reverts. It models java's in-flight `Repository`
+    /// holding the `SmartContract` row from `deposit.createContract` — written
+    /// before the init code runs and published to the parent only by
+    /// `deposit.commit()` on success. Read by ISCONTRACT.
+    fn tron_account_created_in_tx(&self, _address: Address) -> bool {
+        false
+    }
+
     /// TRON fork: record that a value-transfer operation raised a
     /// `TransferException` (transfer/endowment/self-transfer validation
     /// failure). Set by the CALL/CALLTOKEN opcode handler before it returns
@@ -179,6 +214,12 @@ pub trait JournalTr {
         false
     }
 
+    /// TRON fork: record that an operation raised a plain
+    /// `BytecodeExecutionException` — java's non-`TransferException` failure
+    /// flavour, which `VMActuator` follows with `spendAllEnergy()` and
+    /// `RuntimeImpl.setResultCode` maps to `contractResult UNKNOWN`. Set by an
+    /// opcode handler before it returns a spend-all halt result; read by the
+    /// executor to relabel the halt. Default no-op for journals that don't
     /// TRON fork: set the journal's SELFDESTRUCT overrides (restriction
     /// gate + burn-account redirect + the #81 energy-adjustment top-up gate).
     /// Default no-op for journals that don't carry the TRON cfg.

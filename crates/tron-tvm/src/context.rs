@@ -38,6 +38,23 @@ pub trait EvmContext {
     /// see [`crate::precompiles::chain_param`] for the mapping.
     fn chain_parameter_long(&self, key: &[u8]) -> Result<Option<i64>, EvmContextError>;
 
+    /// java-tron `VMConfig.allowTvmSelfdestructRestriction()` — the
+    /// `ALLOW_TVM_SELFDESTRUCT_RESTRICTION` proposal (#94). Selects
+    /// `extractSigArray` (fixed 65-byte elements, up-front size cap) over
+    /// `extractBytesArray` (per-element declared length) in the signature
+    /// precompiles.
+    ///
+    /// Defaults to reading the dynamic property directly so contexts that
+    /// don't carry a per-tx proposal snapshot still resolve it; an unset
+    /// key is `false`, which is the correct from-genesis starting state.
+    fn allow_tvm_selfdestruct_restriction(&self) -> bool {
+        self.chain_parameter_long(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            == 1
+    }
+
     /// Latest block number (head). Used by some precompiles to compute
     /// expiry windows.
     fn block_number(&self) -> i64;

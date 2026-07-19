@@ -136,18 +136,31 @@ pub fn create<const IS_CREATE2: bool, IT: ITy, H: Host + ?Sized>(
 
     // java `createContractImpl` (Program.java:821) reads the endowment with a
     // BARE `value.value().longValueExact()` — NO try/catch (unlike
-    // `callToAddress`). A value DataWord exceeding i64::MAX throws
-    // ArithmeticException which, not being a TransferException, propagates to
-    // VM.java:100 -> `spendAllEnergy()`: the WHOLE tx fails consuming ALL
-    // remaining energy with state reverted. This is the CREATE analogue of the
-    // CALL endowment-range guard, but java's CREATE arm is spend-all, NOT the
-    // consumed-only TransferException path — so map to the spend-all
-    // `OutOfMemory` result (execute.rs), never `TransferFailed`. Ungated:
-    // Program.java:821 is ungated and ALLOW_TVM_CONSTANTINOPLE already floors
-    // these opcodes. (Effectively unreachable on canonical mainnet — a >i64 sun
-    // endowment is ~9.2e12 TRX — but faithful to java for crafted bytecode.)
-    if u256_to_i64_exact(&value).is_none() {
-        return Err(InstructionResult::MemoryLimitOOG);
+    // `callToAddress`). A value DataWord outside signed-64-bit range throws
+    // `ArithmeticException` which, not being a `TransferException`, propagates
+    // to VM.java:100 -> `spendAllEnergy()`: the frame consumes ALL its
+    // remaining energy and records `contractResult UNKNOWN`
+    // (`RuntimeImpl.setResultCode` has no `ArithmeticException` arm). Ungated on
+    // ALLOW_TVM_CONSTANTINOPLE — Program.java:821 has no branch on it, so this
+    // is the spend-all flavour in every era, never the consumed-only
+    // `TransferFailed`.
+    //
+    // `value()` is UNSIGNED (`new BigInteger(1, data)`), so the accepted set is
+    // `[0, i64::MAX]` — the signed `sValue()` helper would wrongly admit the
+    // two's-complement negative window.
+    //
+    // Depth: java checks `getCallDeep() == MAX_DEPTH` and answers by pushing
+    // zero (`Program.createContract`, Program.java:799) BEFORE reaching
+    // `createContractImpl`'s endowment read, so at the depth limit there is no
+    // throw at all. CREATE2 is the exception — `Program.createContract2`
+    // (Program.java:1639) gates its push-zero on `allowTvmCompatibleEvm()`, and
+    // before that proposal it falls through to `createContractImpl` and DOES
+    // hit the bare `longValueExact()`. When the depth refusal applies, skip the
+    // guard and let frame construction produce java's push-zero.
+    let depth_refuses_create = context.host.tron_call_depth_exhausted()
+        && (!IS_CREATE2 || context.host.tron_allow_tvm_compatible_evm());
+    if !depth_refuses_create && u256_to_i64_exact_unsigned(&value).is_none() {
+        return Err(InstructionResult::TronBytecodeExecution);
     }
 
     // Call host to interact with target contract. TRON fork: the created
@@ -216,7 +229,7 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
         return Err(InstructionResult::CallNotAllowedInsideStatic);
     }
 
-    let (input, return_memory_offset) =
+    let (input, return_memory_offset, raw_return_offset) =
         get_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())?;
 
     let is_call = KIND == CALL;
@@ -225,25 +238,47 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
 
     // TRON fork: the call value (endowment) must fit in a signed 64-bit long.
     // java-tron's `Program.callToAddress` evaluates `msg.getEndowment().value()
-    // .longValueExact()` BEFORE any transfer/balance check (`Program.java`); a
-    // value above `Long.MAX_VALUE` (2^63-1) throws `ArithmeticException`, caught
-    // and rethrown as `TransferException("endowment out of long range")` after
-    // `refundEnergy(msg.getEnergy())`. A balance can never reach that magnitude,
-    // so upstream revm would instead let `transfer_loaded` fail with
-    // `OutOfFunds`, push 0, and let the contract continue to its own REVERT —
-    // diverging from java (`contractResult REVERT`, refund) where the whole tx
-    // dies as `TRANSFER_FAILED` at this opcode. Mirror java: refund the
-    // forwarded `gas_limit`, mark the transfer-failure, and return the tx-fatal
-    // `TransferFailed` (consumed-only energy, no spend-all). Applies to the
-    // value-bearing call opcodes (CALL/CALLCODE); DELEGATECALL/STATICCALL carry
-    // no popped value. Only under the TRON VM (`tron_enabled`).
+    // .longValueExact()` (Program.java:1032-1041) BEFORE `checkTokenId` and
+    // before any transfer/balance check. `DataWord.value()` is UNSIGNED
+    // (`new BigInteger(1, data)`), so the accepted set is `[0, i64::MAX]` and
+    // any word from 2^63 up throws `ArithmeticException`. A balance can never
+    // reach that magnitude, so upstream revm would instead let `transfer_loaded`
+    // fail with `OutOfFunds`, push 0, and let the contract continue to its own
+    // REVERT — diverging from java, where the transaction dies at this opcode.
+    // Applies to the value-bearing call opcodes (CALL/CALLCODE);
+    // DELEGATECALL/STATICCALL carry no popped value. Only under the TRON VM
+    // (`tron_enabled`).
+    //
+    // Depth first: java answers `getCallDeep() == MAX_DEPTH` with
+    // `stackPushZero(); refundEnergy(...); return;` (Program.java:1002-1007)
+    // before the endowment read, so at the limit there is no throw — skip the
+    // guard and let frame construction produce that push-zero.
+    //
+    // Era: with ALLOW_TVM_CONSTANTINOPLE (#26) active java refunds the forwarded
+    // energy and rethrows as `TransferException("endowment out of long range")`
+    // — spend-all-exempt, `contractResult TRANSFER_FAILED`. Before #26 the raw
+    // `ArithmeticException` propagates to VM.java:100, which runs
+    // `spendAllEnergy()`, and `RuntimeImpl.setResultCode` has no arm for it →
+    // `contractResult UNKNOWN`. The pre-#26 arm therefore neither refunds nor
+    // marks a transfer failure.
+    //
+    // Precompile targets are excluded: `OperationActions.exeCall` routes them
+    // to `callToPrecompiledAddress`, whose endowment read
+    // (`Program.java:1693`) has NO try/catch in either era, so the raw
+    // `ArithmeticException` always propagates — spend-all, UNKNOWN. That arm is
+    // handled where the precompile frame is built.
     if matches!(KIND, CALL | CALLCODE)
-        && u256_to_i64_exact(&value).is_none()
         && context.host.tron_enabled()
+        && !context.host.tron_call_depth_exhausted()
+        && !context.host.tron_is_precompile(to)
+        && u256_to_i64_exact_unsigned(&value).is_none()
     {
-        context.interpreter.gas.erase_cost(gas_limit);
-        context.host.tron_mark_transfer_failed();
-        return Err(InstructionResult::TransferFailed);
+        if context.host.tron_allow_tvm_constantinople() {
+            context.interpreter.gas.erase_cost(gas_limit);
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        return Err(InstructionResult::TronBytecodeExecution);
     }
 
     // TRON fork: a CALL with non-zero TRX value to the executing contract's
@@ -251,28 +286,108 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     // transfer block (its `senderAddress != contextAddress` guard is a
     // ByteString *reference* compare, always true for distinct objects) and
     // `VMUtils.validateForSmartContract` throws a `ContractValidateException`
-    // ("Cannot transfer TRX to yourself"), which `callToAddress` rethrows as a
-    // `TransferException` after `refundEnergy(msg.getEnergy())`. A
-    // `TransferException` is exempt from `spendAllEnergy` (VM.java) and ends the
-    // whole transaction as a failure (`TRANSFER_FAILED`), the forwarded energy
-    // refunded. We mirror that here: refund the forwarded `gas_limit` (java's
-    // `msg.getEnergy()`, which includes the value-transfer stipend), mark the
-    // transfer-failure on the journal (→ `contractResult TRANSFER_FAILED`), and
-    // return the tx-fatal `TransferFailed` — which, like a `TransferException`,
-    // ends execution WITHOUT spending all energy (it settles consumed-only, the
-    // same as a revert, via `last_frame_result`'s `is_ok_or_revert` branch) and
-    // unwinds every frame (`frame_return_result` short-circuits it to the top).
-    // Only fires under the TRON VM (`tron_enabled`); upstream EVM keeps the
-    // legal `from == to` self-transfer. CALLCODE/DELEGATECALL/STATICCALL never
-    // reach here: CALLCODE/DELEGATECALL keep the caller's own context (java sets
+    // ("Cannot transfer TRX to yourself", VMUtils.java:146-148). Only fires
+    // under the TRON VM (`tron_enabled`); upstream EVM keeps the legal
+    // `from == to` self-transfer. CALLCODE/DELEGATECALL/STATICCALL never reach
+    // here: CALLCODE/DELEGATECALL keep the caller's own context (java sets
     // `contextAddress = senderAddress`, so its self-guard is false) and
     // STATICCALL carries no value.
-    if KIND == CALL && has_transfer && to == context.interpreter.input.target_address()
+    //
+    // Two earlier java steps must be reproduced first, because both answer with
+    // a push-zero rather than a throw and so PRE-EMPT this failure:
+    //   * depth — `getCallDeep() == MAX_DEPTH` (Program.java:1002-1007);
+    //   * sender balance — `if (senderBalance < endowment) { stackPushZero();
+    //     refundEnergy(...); return; }` (Program.java:1049-1055), which runs
+    //     before the transfer block. When the sender cannot fund the transfer,
+    //     emitting the frame lets `transfer_loaded`'s `from == to` arm return
+    //     `OutOfFunds`, which is that same push-zero.
+    // The balance read targets the executing contract's own address, always
+    // already warm, so it adds no access-list or gas side effect.
+    //
+    // Era: with ALLOW_TVM_CONSTANTINOPLE (#26) active `callToAddress` refunds
+    // the forwarded energy (`msg.getEnergy()`, which includes the value-transfer
+    // stipend) and rethrows as `TransferException` — spend-all-exempt,
+    // `contractResult TRANSFER_FAILED`, settling consumed-only via
+    // `last_frame_result`'s `is_ok_or_revert` branch. Before #26 it is a plain
+    // `BytecodeExecutionException`, which VM.java:100 follows with
+    // `spendAllEnergy()` and `RuntimeImpl` maps to `contractResult UNKNOWN`.
+    if KIND == CALL
+        && has_transfer
+        && to == context.interpreter.input.target_address()
         && context.host.tron_enabled()
+        && !context.host.tron_call_depth_exhausted()
+        && context
+            .host
+            .balance(context.interpreter.input.target_address())
+            .is_some_and(|b| b.data >= value)
+    {
+        if context.host.tron_allow_tvm_constantinople() {
+            context.interpreter.gas.erase_cost(gas_limit);
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        return Err(InstructionResult::TronBytecodeExecution);
+    }
+
+    // TRON fork: before ALLOW_TVM_SOLIDITY_059 (#32) a contract may NOT create
+    // the recipient of a value transfer. java's `Program.callToAddress` calls
+    // `createAccountIfNotExist`, whose whole body is wrapped in
+    // `if (VMConfig.allowTvmSolidity059())`; with the proposal inactive the
+    // account is left absent and `VMUtils.validateForSmartContract` then throws
+    // `ContractValidateException("Validate InternalTransfer error, no ToAccount.
+    // And not allowed to create an account in a smartContract.")`. The catch in
+    // `callToAddress` picks the failure flavour: with ALLOW_TVM_CONSTANTINOPLE
+    // (#26) active it refunds the forwarded energy and throws a
+    // `TransferException` (spend-all-exempt, `contractResult TRANSFER_FAILED`);
+    // before #26 a plain `BytecodeExecutionException`, which `VMActuator`
+    // follows with `spendAllEnergy()` and `RuntimeImpl` maps to `UNKNOWN`.
+    // Either way the whole transaction dies at this opcode.
+    //
+    // Ordering mirrors java exactly: the i64-endowment guard and the
+    // self-transfer guard (both above) come first, because
+    // `validateForSmartContract` checks `toAddress == ownerAddress` before it
+    // looks the recipient up. The sender-balance term reproduces java's earlier
+    // `if (senderBalance < endowment) { stackPushZero(); refundEnergy(...);
+    // return; }` — an under-funded CALL must still push 0 and let the caller
+    // continue, so the recipient is only consulted once the sender can afford
+    // the transfer.
+    //
+    // Existence is the JOURNAL-AWARE check because java reads
+    // `getContractState().newRepositoryChild()`, which layers same-tx writes.
+    // Restricted to `KIND == CALL`: java sets `contextAddress = senderAddress`
+    // for CALLCODE/DELEGATECALL so its `senderAddress != contextAddress`
+    // reference compare skips the whole transfer block, and STATICCALL carries
+    // no value. CREATE/CREATE2 are likewise excluded — `createContractImpl`
+    // creates `newAddress` before validating (java's own
+    // "TODO: unreachable exception").
+    //
+    // Precompile targets are excluded here too, but for the opposite reason:
+    // `callToPrecompiledAddress` NEVER reaches `createAccountIfNotExist`, so
+    // its recipient is missing at every height, not only before #32, and its
+    // failure is never converted to a `TransferException`. That case is handled
+    // where the precompile frame is built, ungated and with spend-all energy.
+    if KIND == CALL
+        && has_transfer
+        && context.host.tron_enabled()
+        && !context.host.tron_call_depth_exhausted()
+        && !context.host.tron_allow_tvm_solidity_059()
+        && !context.host.tron_is_precompile(to)
+        && !context.host.tron_account_exists_or_created(to)
+        && context
+            .host
+            .balance(context.interpreter.input.target_address())
+            .is_some_and(|b| b.data >= value)
     {
         context.interpreter.gas.erase_cost(gas_limit);
-        context.host.tron_mark_transfer_failed();
-        return Err(InstructionResult::TransferFailed);
+        if context.host.tron_allow_tvm_constantinople() {
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        // Pre-Constantinople java throws `BytecodeExecutionException`, which
+        // `VM.play` catches for THIS frame: the frame spends all its energy and
+        // halts, and the caller pushes zero and continues. Only a root-frame
+        // throw reaches the receipt, as UNKNOWN.
+        return Err(InstructionResult::TronBytecodeExecution);
     }
 
     let target_address = if matches!(KIND, CALLCODE | DELEGATECALL) {
@@ -321,7 +436,9 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
                 // carry TRC-10 transfer info. `call_token` (defined
                 // alongside) sets these to non-zero values.
                 tron_token_id: 0,
+                tron_token_id_word: U256::ZERO,
                 tron_token_value: 0,
+                tron_raw_return_offset: raw_return_offset,
             },
         ))));
     Err(InstructionResult::Suspend)
@@ -351,12 +468,6 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
 /// 63/64 gas forwarding, journal checkpoints) must remain intact. Doing
 /// this outside the interpreter would require duplicating those rules.
 pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Result {
-    // Static-call restriction: CALLTOKEN performs a balance-changing
-    // side effect, so it follows the same rule as CALL+value=0.
-    if context.interpreter.runtime_flag.is_static() {
-        return Err(InstructionResult::CallNotAllowedInsideStatic);
-    }
-
     // java-tron's `callTokenAction` pops exactly [gas, to, value, tokenId]
     // (exeCall then pops the in/out memory ranges) — 8 stack items, NOT 9.
     // `value` is the TRC-10 *token* amount paired with `tokenId`; the native
@@ -374,7 +485,22 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // stipend follow java's `callTokenAction` (keyed on a non-zero token amount).
     let has_transfer = !value.is_zero();
 
-    let (input, return_memory_offset) =
+    // Static-call restriction. java `callTokenAction` (OperationActions.java:
+    // 973-987) throws `StaticCallModificationException` only for a CALLTOKEN
+    // that actually carries a value: `if (program.isStaticCall() &&
+    // !value.isZero())` — the same predicate `callAction` uses for CALL. A
+    // zero-value CALLTOKEN moves nothing (the transfer block in
+    // `Program.callToAddress` is gated on `endowment > 0`) and is permitted
+    // inside a static context. The throw happens before `exeCall`, so it
+    // precedes the endowment, `checkTokenId` and self-transfer checks below;
+    // `CallNotAllowedInsideStatic` is a spend-all halt recording
+    // `contractResult UNKNOWN`, matching java's `spendAllEnergy` +
+    // `setRuntimeFailure` for a `BytecodeExecutionException` subclass.
+    if context.interpreter.runtime_flag.is_static() && has_transfer {
+        return Err(InstructionResult::CallNotAllowedInsideStatic);
+    }
+
+    let (input, return_memory_offset, raw_return_offset) =
         get_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())?;
 
     // CALLTOKEN gas accounting follows CALL: cold/warm access, value-
@@ -382,62 +508,182 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     let (gas_limit, bytecode, bytecode_hash, charged_new_account_state_gas) =
         load_acc_and_calc_gas(&mut context, to, has_transfer, /* is_call */ true, local_gas_limit)?;
 
-    // TRON fork: a CALLTOKEN with non-zero TRC-10 value to the executing
-    // contract's OWN address is forbidden — the token analogue of the native
-    // value self-CALL above. java-tron's `Program.callToAddress` enters the
-    // transfer block and `VMUtils.validateForSmartContract(... tokenId ...)`
-    // throws "Cannot transfer asset to yourself", rethrown as a
-    // `TransferException` after `refundEnergy(msg.getEnergy())`. Mirror it:
-    // refund the forwarded `gas_limit`, mark the transfer-failure on the journal
-    // (→ `contractResult TRANSFER_FAILED`), and return the tx-fatal
-    // `TransferFailed` (consumed-only energy, no spend-all; unwinds every frame).
-    // Doing this in the opcode handler — BEFORE the child frame is created —
-    // also means `Trc10Inspector::call` never runs for a self-CALLTOKEN, so the
-    // asset_v2 debit/credit (which would otherwise net-mint `value` to the
-    // caller, since the caller and target rows are the same account) never
-    // happens. CALLTOKEN is a TRON-only opcode, so no `tron_enabled` gate is
-    // needed.
-    // java `Program.isTokenTransfer`: a CALLTOKEN is a TRC-10 transfer when
-    // ALLOW_MULTI_SIGN is active (it sets isTokenTransferMsg) OR, pre-fork, when
-    // its tokenId != 0. When it is NOT (pre-fork, tokenId == 0) the `value` is a
-    // NATIVE TRX call-value, and the self-transfer ban — a token-only check
-    // (`validateForSmartContract`) — does not apply: java permits a native
-    // self-CALL (the value nets to zero).
-    let is_token_transfer = context.host.tron_allow_multi_sign() || !token_id.is_zero();
-    if is_token_transfer && has_transfer && to == context.interpreter.input.target_address() {
-        context.interpreter.gas.erase_cost(gas_limit);
-        context.host.tron_mark_transfer_failed();
-        return Err(InstructionResult::TransferFailed);
+    // java `Program.isTokenTransfer` (Program.java:1827-1833): a CALLTOKEN is a
+    // TRC-10 transfer when ALLOW_MULTI_SIGN (#20) is active — `callTokenAction`
+    // passes `VMConfig.allowMultiSign()` as `isTokenTransferMsg`, so post-#20 it
+    // is unconditionally true — otherwise when `msg.getTokenId().longValue() !=
+    // 0`. `DataWord.longValue()` (DataWord.java:237-245) is a LOW-64-BIT
+    // truncation, not a whole-word test, so a word whose low 8 bytes are zero
+    // takes the native path however its high bytes are set. When this is false
+    // `value` is a NATIVE TRX call-value rather than a token amount.
+    let is_token_transfer = context.host.tron_allow_multi_sign() || u64_from_u256(&token_id) != 0;
+
+    // The asset-store key and the token amount java carries into the callee.
+    // `Program.java:1059` derives the key as
+    // `String.valueOf(msg.getTokenId().longValue())` — low-64 SIGNED decimal,
+    // negatives included — which is what `u64_from_u256(..) as i64` reproduces.
+    // On the native path java zeroes BOTH the token id and the token value it
+    // hands to the child (`Program.java:1135-1136`,
+    // `!isTokenTransfer ? DataWord.ZERO() : callValue` / `... : msg.getTokenId()`),
+    // so the asset machinery must see nothing at all.
+    let (token_id_i64, token_value_i64) = if is_token_transfer {
+        (u64_from_u256(&token_id) as i64, u64_from_u256(&value) as i64)
+    } else {
+        (0, 0)
+    };
+
+    // java `Program.callToAddress` (Program.java:1030-1041) reads the endowment
+    // as `msg.getEndowment().value().longValueExact()` before `checkTokenId` and
+    // before any balance or self-transfer check. For CALLTOKEN the endowment IS
+    // the popped `value`: `callTokenAction` (OperationActions.java:973-987)
+    // hands it to `exeCall`, which builds `MessageCall(op, energy, codeAddress,
+    // value, ...)` — the 4th constructor argument is `endowment`. `value()` is
+    // UNSIGNED, so any word from 2^63 up throws `ArithmeticException`. Without
+    // this guard the word is silently truncated to its low 64 bits below.
+    //
+    // Depth and era handling match the CALL/CALLCODE endowment guard: java's
+    // `getCallDeep() == MAX_DEPTH` push-zero precedes the read, and
+    // ALLOW_TVM_CONSTANTINOPLE (#26) selects `TransferException` (refund the
+    // forwarded energy, consumed-only, TRANSFER_FAILED) over the older raw
+    // `ArithmeticException` (spend-all, UNKNOWN).
+    // A precompile target is excluded for the same reason as CALL/CALLCODE:
+    // `callToPrecompiledAddress:1693` reads the endowment with no try/catch in
+    // either era, so the `ArithmeticException` is always spend-all + UNKNOWN.
+    if !context.host.tron_call_depth_exhausted()
+        && !context.host.tron_is_precompile(to)
+        && u256_to_i64_exact_unsigned(&value).is_none()
+    {
+        if context.host.tron_allow_tvm_constantinople() {
+            context.interpreter.gas.erase_cost(gas_limit);
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        return Err(InstructionResult::TronBytecodeExecution);
     }
 
-    // java `checkTokenId` (Program.java:1046, 1812-1823): once ALLOW_MULTI_SIGN
-    // (#20) is active, CALLTOKEN's tokenId must be > MIN_TOKEN_ID (1_000_000);
-    // a tokenId in [0, 1_000_000] or outside signed-i64 range refunds the
-    // forwarded energy and throws TransferException — the whole tx fails as
-    // TRANSFER_FAILED (consumed-only energy, no spend-all). Honest contracts use
-    // real ids (> 1_000_000); a crafted/buggy contract trips it. ALLOW_TVM_
-    // CONSTANTINOPLE (which makes the result a TransferException rather than the
-    // older spend-all) predates ALLOW_MULTI_SIGN on mainnet, so gating on
-    // ALLOW_MULTI_SIGN suffices. The pre-ALLOW_MULTI_SIGN era (isTokenTransfer =
-    // tokenId != 0, with distinct native-value semantics) is a separate gap.
+    // java `checkTokenId` (Program.java:1046, 1799-1824): once ALLOW_MULTI_SIGN
+    // (#20) is active, CALLTOKEN's tokenId must be > MIN_TOKEN_ID (1_000_000).
+    // java's predicate is `(tokenId <= MIN_TOKEN_ID && tokenId != 0) ||
+    // (tokenId == 0 && msg.isTokenTransferMsg())`; under ALLOW_MULTI_SIGN
+    // `isTokenTransferMsg` is always true for CALLTOKEN, so the two arms
+    // collapse to "reject everything <= MIN_TOKEN_ID". The id is read with the
+    // SIGNED `sValue()` (Program.java:1804), so `u256_to_i64_exact` is the right
+    // helper here — not the unsigned endowment form. Both of java's failure arms
+    // fork the same way on ALLOW_TVM_CONSTANTINOPLE: `TransferException` with
+    // the forwarded energy refunded from #26 on, otherwise a raw
+    // `ArithmeticException` / `BytecodeExecutionException` that spends all
+    // energy and records UNKNOWN.
     if context.host.tron_allow_multi_sign()
+        && !context.host.tron_call_depth_exhausted()
         && u256_to_i64_exact(&token_id).map_or(true, |id| id <= 1_000_000)
     {
-        context.interpreter.gas.erase_cost(gas_limit);
-        context.host.tron_mark_transfer_failed();
-        return Err(InstructionResult::TransferFailed);
+        if context.host.tron_allow_tvm_constantinople() {
+            context.interpreter.gas.erase_cost(gas_limit);
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        return Err(InstructionResult::TronBytecodeExecution);
     }
 
-    // Saturate the i128 stack words to i64. java-tron rejects out-of-i64
-    // token id / value at the contract layer; the EVM keeps the truncated
-    // value so an in-VM check inside the contract sees the same number.
-    let token_id_i64 = u64_from_u256(&token_id) as i64;
-    let token_value_i64 = u64_from_u256(&value) as i64;
+    // TRON fork: a CALLTOKEN carrying value to the executing contract's OWN
+    // address is forbidden on BOTH of java's branches. `Program.callToAddress`
+    // enters the transfer block (its `senderAddress != contextAddress` guard is
+    // a reference compare, always true for distinct arrays) and
+    // `VMUtils.validateForSmartContract` rejects the self-transfer either way:
+    // the TRX overload throws "Cannot transfer TRX to yourself"
+    // (VMUtils.java:146-148) and the TRC-10 overload "Cannot transfer asset to
+    // yourself" (VMUtils.java:201-203). The native path is therefore banned too,
+    // which is why this check does not consult `is_token_transfer`.
+    //
+    // Returning here — BEFORE the child frame is created — also means
+    // `Trc10Inspector::call` never runs for a self-CALLTOKEN, so the asset_v2
+    // debit/credit (which would otherwise net-mint `value` to the caller, since
+    // the caller and target rows are the same account) never happens. That
+    // ordering must be preserved in both eras.
+    //
+    // java's earlier per-branch balance check answers with a push-zero rather
+    // than a throw (`if (senderBalance < endowment) { stackPushZero();
+    // refundEnergy(...); return; }`, Program.java:1049-1063) and so pre-empts
+    // this failure. The balance source follows the branch java takes: the TOKEN
+    // balance for a TRC-10 transfer, the TRX balance for a native one. When the
+    // sender is short, emitting the frame reproduces the push-zero —
+    // `Trc10Inspector::call` for the token case, `transfer_loaded`'s `from == to`
+    // arm for the native one. Depth and era handling as above.
+    if has_transfer
+        && to == context.interpreter.input.target_address()
+        && !context.host.tron_call_depth_exhausted()
+        && if is_token_transfer {
+            i128::from(
+                context
+                    .host
+                    .tron_token_balance(context.interpreter.input.target_address(), token_id_i64),
+            ) >= i128::from(token_value_i64)
+        } else {
+            context
+                .host
+                .balance(context.interpreter.input.target_address())
+                .is_some_and(|b| b.data >= value)
+        }
+    {
+        if context.host.tron_allow_tvm_constantinople() {
+            context.interpreter.gas.erase_cost(gas_limit);
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        return Err(InstructionResult::TronBytecodeExecution);
+    }
+
+    // TRON fork: the TRC-10 arm of the pre-ALLOW_TVM_SOLIDITY_059 (#32)
+    // "cannot create an account in a smart contract" rule. Same gate and same
+    // two failure flavours as the native value CALL above, but the refusal text
+    // comes from the TRC-10 overload of `VMUtils.validateForSmartContract`
+    // ("no ToAccount. And not allowed to create account in smart contract").
+    //
+    // Ordering follows `Program.callToAddress`: `checkTokenId` (above), then the
+    // sender's TOKEN balance — `if (senderBalance < endowment) { stackPushZero();
+    // refundEnergy(...); return; }` on the `isTokenTransfer` branch — and only
+    // then `createAccountIfNotExist`. The balance term is therefore a guard, not
+    // a failure: an under-funded CALLTOKEN still pushes 0 and lets the caller
+    // continue (`Trc10Inspector::call` produces that outcome).
+    //
+    // Restricted to `is_token_transfer`: when it is false (pre-ALLOW_MULTI_SIGN
+    // with tokenId == 0) java treats `value` as a NATIVE TRX endowment and takes
+    // the `!isTokenTransfer` arm, which the native self-transfer ban above and
+    // the ordinary CALL machinery below already cover.
+    //
+    // Precompile targets are excluded: `callToPrecompiledAddress` never reaches
+    // `createAccountIfNotExist`, so its TRC-10 recipient is missing at every
+    // height and the failure is never converted to a `TransferException`. That
+    // case is handled where the precompile frame is built.
+    if is_token_transfer
+        && has_transfer
+        && !context.host.tron_call_depth_exhausted()
+        && !context.host.tron_allow_tvm_solidity_059()
+        && !context.host.tron_is_precompile(to)
+        && !context.host.tron_account_exists_or_created(to)
+        && context
+            .host
+            .tron_token_balance(context.interpreter.input.target_address(), token_id_i64)
+            >= token_value_i64
+    {
+        context.interpreter.gas.erase_cost(gas_limit);
+        if context.host.tron_allow_tvm_constantinople() {
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        return Err(InstructionResult::TronBytecodeExecution);
+    }
 
     let caller = context.interpreter.input.target_address();
     let target_address = to;
     let scheme = CallScheme::Call;
-    let is_static = false;
+    // The callee inherits the caller's static context. java builds the child
+    // invoke with `msg.getOpCode() == Op.STATICCALL || isStaticCall()`
+    // (Program.java:1138); CALLTOKEN is never STATICCALL, so the child is static
+    // exactly when the frame issuing the CALLTOKEN is. A zero-value CALLTOKEN is
+    // reachable inside a static context, so this must propagate or the callee
+    // could SSTORE/LOG/CREATE where java forbids it.
+    let is_static = context.interpreter.runtime_flag.is_static();
     // java `ProgramInvokeFactory`: the callee's native side is
     // `!isTokenTransfer ? callValue : ZERO`. For a token transfer the native
     // value is ZERO and `value` travels as the TRC-10 amount via `tron_token_*`
@@ -472,7 +718,19 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
                 // checkpoint and the callee's first instruction to
                 // perform the asset_v2 debit/credit.
                 tron_token_id: token_id_i64,
+                // `CALLTOKENID` inside the callee pushes the whole 32-byte word
+                // java passed to `createProgramInvoke` (`msg.getTokenId()`,
+                // Program.java:1136), which before ALLOW_MULTI_SIGN can carry
+                // high bytes the low-64 asset key above does not. Zeroed on the
+                // native path, matching java's `!isTokenTransfer ?
+                // DataWord.ZERO() : msg.getTokenId()`.
+                tron_token_id_word: if is_token_transfer {
+                    token_id
+                } else {
+                    U256::ZERO
+                },
                 tron_token_value: token_value_i64,
+                tron_raw_return_offset: raw_return_offset,
             },
         ))));
     Err(InstructionResult::Suspend)
@@ -490,9 +748,16 @@ pub fn call_token_value<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> 
 /// CALLTOKENID (opcode `0xd3`) — pushes the TRC-10 token id of the
 /// current CALLTOKEN frame. Returns 0 for any frame that wasn't a
 /// CALLTOKEN.
+///
+/// java pushes the id `DataWord` verbatim (`OperationActions.java:764-769`
+/// `program.stackPush(program.getTokenId())` → `Program.java:1479-1480`
+/// `invoke.getTokenId().clone()`), so the full 32-byte word the CALLTOKEN
+/// carried is what reaches the callee — NOT the low-64-signed value used to key
+/// the asset store. The two coincide once `checkTokenId` constrains the id to
+/// `(1_000_000, i64::MAX]`, and can differ before ALLOW_MULTI_SIGN (#20).
 pub fn call_token_id<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    let v = context.interpreter.input.tron_token_id();
-    push!(context.interpreter, U256::from(v.max(0) as u64));
+    let v = context.interpreter.input.tron_token_id_word();
+    push!(context.interpreter, v);
     Ok(())
 }
 
@@ -507,20 +772,33 @@ pub fn call_token_id<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
 /// add asset-store knowledge to the interpreter.
 pub fn token_balance<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     popn!([token_id, address], context.interpreter);
-    // java `checkTokenIdInTokenBalance` (Program.java:1469, 1835-1853): once
-    // ALLOW_MULTI_SIGN (#20) is active, a tokenId outside signed-i64 range
-    // throws TransferException (whole tx TRANSFER_FAILED, consumed-only),
-    // while a tokenId <= MIN_TOKEN_ID (1_000_000) throws
-    // BytecodeExecutionException — a non-TransferException, so VM.java
-    // spendAllEnergy (whole tx fatal, all energy). Pre-ALLOW_MULTI_SIGN the
-    // opcode just queries the (usually absent) id and pushes 0.
+    // java `checkTokenIdInTokenBalance` (Program.java:1469, 1838-1853): once
+    // ALLOW_MULTI_SIGN (#20) is active the tokenId is read with the SIGNED
+    // `sValue().longValueExact()` and two arms can fail. Pre-ALLOW_MULTI_SIGN
+    // the opcode just queries the (usually absent) id and pushes 0.
+    //
+    // Out of signed-i64 range: gated on ALLOW_TVM_CONSTANTINOPLE (#26) —
+    // `TransferException` from #26 on (consumed-only, TRANSFER_FAILED),
+    // otherwise the raw `ArithmeticException` (spend-all, UNKNOWN).
+    //
+    // `<= MIN_TOKEN_ID` (1_000_000): `BytecodeExecutionException` in BOTH eras —
+    // Program.java:1848-1851 has NO Constantinople branch on that arm — so it is
+    // always spend-all with `contractResult UNKNOWN`.
+    //
+    // Neither arm refunds: unlike `checkTokenId`, `checkTokenIdInTokenBalance`
+    // contains no `refundEnergy` call at all.
     if context.host.tron_allow_multi_sign() {
         match u256_to_i64_exact(&token_id) {
             None => {
-                context.host.tron_mark_transfer_failed();
-                return Err(InstructionResult::TransferFailed);
+                if context.host.tron_allow_tvm_constantinople() {
+                    context.host.tron_mark_transfer_failed();
+                    return Err(InstructionResult::TransferFailed);
+                }
+                return Err(InstructionResult::TronBytecodeExecution);
             }
-            Some(id) if id <= 1_000_000 => return Err(InstructionResult::MemoryLimitOOG),
+            Some(id) if id <= 1_000_000 => {
+                return Err(InstructionResult::TronBytecodeExecution)
+            }
             Some(_) => {}
         }
     }
@@ -622,9 +900,21 @@ pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     if !context.host.tron_account_exists_or_created(receiver) {
         gas!(context.interpreter, 25_000);
     }
+    // java `Program.freeze` reads the amount with `frozenBalance.sValue()
+    // .longValueExact()` (Program.java:1947) INSIDE the try, so a word outside
+    // signed-64 range throws `ArithmeticException` and the opcode pushes 0 —
+    // but only AFTER `increaseNonce()` (Program.java:1934) has already run.
+    // Substituting 0 reproduces both halves: the host bumps the internal-tx
+    // nonce and then rejects at its `frozen_balance <= 0` guard before any
+    // store write. An early return here would skip the nonce bump and shift
+    // every later CREATE address in the transaction.
+    //
+    // The resource code keeps the truncating reading: java's v1
+    // `parseResourceCode` (Program.java:2240) switches on `DataWord.intValue()`,
+    // which accumulates all 32 bytes into an `int` and never throws.
     let result = context.host.tron_freeze(
         caller,
-        u64_from_u256(&frozen_balance) as i64,
+        u256_to_i64_exact(&frozen_balance).unwrap_or(0),
         // Stake 1.0 had no explicit duration arg from the stack —
         // java-tron derived it from chain params. Pass 0; Host can
         // re-derive.
@@ -813,14 +1103,17 @@ pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     require_non_staticcall!(context.interpreter);
     popn!([resource_type, frozen_balance], context.interpreter);
     let caller = context.interpreter.input.target_address();
-    let Some(frozen) = u256_to_i64_exact(&frozen_balance) else {
-        push!(context.interpreter, U256::ZERO);
-        return Ok(());
-    };
+    // java bumps the internal-tx nonce (`increaseNonce`, Program.java:2035)
+    // ABOVE the try that `sValue().longValueExact()` throws from
+    // (Program.java:2044), so an out-of-range amount still advances the nonce.
+    // Passing 0 keeps the host call — and therefore the bump — while the host's
+    // `frozen_balance <= 0` guard reproduces java's rejection with no state
+    // change. That nonce seeds `generateContractAddress` (Program.java:807), so
+    // skipping it would move every later CREATE address in the transaction.
     let result = context.host.tron_freeze_balance_v2(
         caller,
-        frozen,
-        u64_from_u256(&resource_type) as u32,
+        u256_to_i64_exact(&frozen_balance).unwrap_or(0),
+        resource_code_v2(&resource_type),
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
@@ -834,14 +1127,14 @@ pub fn unfreeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) 
     require_non_staticcall!(context.interpreter);
     popn!([resource_type, unfreeze_balance], context.interpreter);
     let caller = context.interpreter.input.target_address();
-    let Some(unfreeze) = u256_to_i64_exact(&unfreeze_balance) else {
-        push!(context.interpreter, U256::ZERO);
-        return Ok(());
-    };
+    // Nonce ordering as in `freeze_balance_v2` above: java's `increaseNonce`
+    // (Program.java:2066) precedes the throwing `longValueExact`
+    // (Program.java:2073), so the host must still be entered on an
+    // out-of-range amount.
     let result = context.host.tron_unfreeze_balance_v2(
         caller,
-        unfreeze,
-        u64_from_u256(&resource_type) as u32,
+        u256_to_i64_exact(&unfreeze_balance).unwrap_or(0),
+        resource_code_v2(&resource_type),
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
@@ -891,15 +1184,15 @@ pub fn delegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     );
     let caller = context.interpreter.input.target_address();
     let receiver = receiver_address.into_address();
-    let Some(delegate) = u256_to_i64_exact(&delegate_balance) else {
-        push!(context.interpreter, U256::ZERO);
-        return Ok(());
-    };
+    // Nonce ordering as in `freeze_balance_v2` above: java's `increaseNonce`
+    // (Program.java:2176) precedes the throwing `longValueExact`
+    // (Program.java:2187). The host rejects amount 0 at its
+    // `balance < TRX_PRECISION` guard, after the bump and before any write.
     let result = context.host.tron_delegate_resource(
         caller,
-        delegate,
+        u256_to_i64_exact(&delegate_balance).unwrap_or(0),
         receiver,
-        u64_from_u256(&resource_type) as u32,
+        resource_code_v2(&resource_type),
         false,
         0,
     );
@@ -919,24 +1212,51 @@ pub fn undelegate_resource<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) 
     );
     let caller = context.interpreter.input.target_address();
     let receiver = receiver_address.into_address();
-    let Some(undelegate) = u256_to_i64_exact(&undelegate_balance) else {
-        push!(context.interpreter, U256::ZERO);
-        return Ok(());
-    };
+    // Nonce ordering as in `freeze_balance_v2` above: java's `increaseNonce`
+    // (Program.java:2210) precedes the throwing `longValueExact`
+    // (Program.java:2221).
     let result = context.host.tron_undelegate_resource(
         caller,
-        undelegate,
+        u256_to_i64_exact(&undelegate_balance).unwrap_or(0),
         receiver,
-        u64_from_u256(&resource_type) as u32,
+        resource_code_v2(&resource_type),
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
 }
 
 /// Truncate a `U256` to its low 64 bits.
+///
+/// This is the reading java's *v1* resource-code path uses: `parseResourceCode`
+/// (Program.java:2240) and `Program.freezeExpireTime` (Program.java:2000) both
+/// switch on `DataWord.intValue()`, which accumulates all 32 bytes into an
+/// `int` (`DataWord.java:208-216`) and therefore truncates to the low 32 bits
+/// without ever throwing — its javadoc's `@throws ArithmeticException` is
+/// wrong. The Stake-2.0 opcodes use [`resource_code_v2`] instead.
 fn u64_from_u256(v: &U256) -> u64 {
     let words = v.as_limbs();
     words[0]
+}
+
+/// java `Program.parseResourceCodeV2` (Program.java:2250): `DataWord.sValue()
+/// .byteValueExact()` switched to BANDWIDTH/ENERGY/TRON_POWER. Every other
+/// 256-bit word yields `UNRECOGNIZED` — whether it overflows a signed byte
+/// (java throws `ArithmeticException` and catches it, returning UNRECOGNIZED)
+/// or simply falls outside `0..=2` — so only an exact 0, 1 or 2 across all 256
+/// bits is a resource code. `sValue()` is the SIGNED reading
+/// (`DataWord.java:259-261`), so large-negative words are rejected too.
+///
+/// Anything else is returned as `u32::MAX`, which every host bridge rejects
+/// with its `resource_type > N` guard — after the internal-tx nonce bump and
+/// before any store access, exactly as java's validate-throws path discards the
+/// child `Repository`.
+fn resource_code_v2(v: &U256) -> u32 {
+    let limbs = v.as_limbs();
+    if limbs[1] == 0 && limbs[2] == 0 && limbs[3] == 0 && limbs[0] <= 2 {
+        limbs[0] as u32
+    } else {
+        u32::MAX
+    }
 }
 
 /// java `DataWord.sValue().longValueExact()`: the signed 256-bit value, or
@@ -957,5 +1277,122 @@ fn u256_to_i64_exact(v: &U256) -> Option<i64> {
         Some(low as i64) // negative two's-complement, fits in i64
     } else {
         None
+    }
+}
+
+/// java `DataWord.value().longValueExact()`: the UNSIGNED 256-bit value, or
+/// `None` when it exceeds `i64::MAX`.
+///
+/// `DataWord.value()` is `new BigInteger(1, data)` (`DataWord.java:197-199`), so
+/// the whole word is read as a MAGNITUDE and any bit at or above bit 63 puts it
+/// outside signed 64-bit range, where `longValueExact()` throws
+/// `ArithmeticException`. The accepted set is exactly `[0, i64::MAX]`.
+///
+/// This is the endowment form, used wherever java reads a call/create value:
+/// `Program.java:821` (CREATE/CREATE2) and `Program.java:1034`
+/// (CALL/CALLCODE/CALLTOKEN). [`u256_to_i64_exact`] mirrors the signed
+/// `sValue()` and is the form the token-id and staking opcodes use; it
+/// additionally accepts the two's-complement negative window
+/// `[2^256 - 2^63, 2^256)`, which java's `value()` rejects.
+fn u256_to_i64_exact_unsigned(v: &U256) -> Option<i64> {
+    let limbs = v.as_limbs();
+    if limbs[1] == 0 && limbs[2] == 0 && limbs[3] == 0 && limbs[0] >> 63 == 0 {
+        Some(limbs[0] as i64)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tron_endowment_predicate_tests {
+    use super::{u256_to_i64_exact, u256_to_i64_exact_unsigned};
+    use primitives::U256;
+
+    /// The two predicates mirror java's two `DataWord` readings and must agree
+    /// everywhere EXCEPT the two's-complement negative window
+    /// `[2^256 - 2^63, 2^256)`, which `sValue()` accepts and `value()` rejects.
+    /// Endowments are read with `value()`; token ids and staking amounts with
+    /// `sValue()`.
+    #[test]
+    fn signed_and_unsigned_readings_differ_only_on_the_negative_window() {
+        // Agreement on the non-negative range.
+        for v in [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(1_000_001u64),
+            U256::from(i64::MAX as u64),
+        ] {
+            assert_eq!(u256_to_i64_exact(&v), u256_to_i64_exact_unsigned(&v), "{v}");
+            assert!(u256_to_i64_exact_unsigned(&v).is_some());
+        }
+
+        // 2^63 — one above i64::MAX — is out of range under BOTH readings.
+        let two_63 = U256::from(1u64) << 63;
+        assert_eq!(u256_to_i64_exact(&two_63), None);
+        assert_eq!(u256_to_i64_exact_unsigned(&two_63), None);
+
+        // The window the unsigned reading closes: all-ones is -1 signed.
+        assert_eq!(u256_to_i64_exact(&U256::MAX), Some(-1));
+        assert_eq!(u256_to_i64_exact_unsigned(&U256::MAX), None);
+
+        // ... and its low end, two's-complement i64::MIN.
+        let i64_min_word = U256::MAX - (U256::from(1u64) << 63) + U256::from(1u64);
+        assert_eq!(u256_to_i64_exact(&i64_min_word), Some(i64::MIN));
+        assert_eq!(u256_to_i64_exact_unsigned(&i64_min_word), None);
+
+        // 2^64 has a ZERO low limb: a truncating reading would see 0.
+        let two_64 = U256::from(1u64) << 64;
+        assert_eq!(u256_to_i64_exact_unsigned(&two_64), None);
+        assert_eq!(u256_to_i64_exact(&two_64), None);
+    }
+}
+
+#[cfg(test)]
+mod tron_resource_code_tests {
+    use super::{resource_code_v2, u64_from_u256};
+    use primitives::U256;
+
+    /// java `parseResourceCodeV2` accepts a resource code only when
+    /// `sValue().byteValueExact()` succeeds AND lands on 0, 1 or 2. Every other
+    /// word — high limbs set, low limb above 2, or a large-negative
+    /// two's-complement word — is `UNRECOGNIZED`, which the host bridges see as
+    /// the out-of-range sentinel.
+    #[test]
+    fn resource_code_v2_accepts_only_exact_zero_one_two() {
+        assert_eq!(resource_code_v2(&U256::ZERO), 0);
+        assert_eq!(resource_code_v2(&U256::from(1u64)), 1);
+        assert_eq!(resource_code_v2(&U256::from(2u64)), 2);
+
+        // Above the switch's arms.
+        assert_eq!(resource_code_v2(&U256::from(3u64)), u32::MAX);
+
+        // High limbs set: a low-32 truncation would read these as 0 and 1.
+        assert_eq!(resource_code_v2(&(U256::from(1u64) << 32)), u32::MAX);
+        assert_eq!(resource_code_v2(&((U256::from(1u64) << 32) + U256::from(1u64))), u32::MAX);
+        assert_eq!(resource_code_v2(&(U256::from(1u64) << 64)), u32::MAX);
+
+        // Large-negative words: `sValue()` reads the whole 256 bits as signed,
+        // so `byteValueExact()` throws. `…FF00000000` also truncates to 0.
+        assert_eq!(resource_code_v2(&U256::MAX), u32::MAX);
+        assert_eq!(
+            resource_code_v2(&(U256::MAX - U256::from(0xFFFF_FFFFu64))),
+            u32::MAX
+        );
+    }
+
+    /// Regression guard for the three v1 sites (FREEZE 0xd5, UNFREEZE 0xd6,
+    /// FREEZEEXPIRETIME 0xd7) that must KEEP the truncating reading: java's
+    /// `parseResourceCode` / `Program.freezeExpireTime` switch on
+    /// `DataWord.intValue()`, which never throws, so `2^32` legitimately is
+    /// BANDWIDTH there. Applying [`resource_code_v2`] to them would introduce a
+    /// divergence rather than remove one.
+    #[test]
+    fn u64_from_u256_still_truncates_for_v1_resource_codes() {
+        assert_eq!(u64_from_u256(&(U256::from(1u64) << 32)) as u32, 0);
+        assert_eq!(
+            u64_from_u256(&((U256::from(1u64) << 32) + U256::from(1u64))) as u32,
+            1
+        );
+        assert_eq!(u64_from_u256(&(U256::MAX - U256::from(0xFFFF_FFFFu64))) as u32, 0);
     }
 }

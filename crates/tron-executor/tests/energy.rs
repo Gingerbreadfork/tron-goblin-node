@@ -475,6 +475,11 @@ fn split_clamps_origin_share_at_origin_energy_limit() {
     assert_eq!(caller_used, 900);
 }
 
+/// Covers the NO-CAPTURE arm only: this calls `pay_energy_bill` with no prior
+/// budget call, so the origin clamp comes from the live `origin_quota_left`
+/// read — java `ReceiptCapsule.getOriginUsage` arms 2/3, i.e. the pre-#52 era.
+/// From ALLOW_TVM_FREEZE onward the clamp is the budget-time capture instead;
+/// the `freeze_only_*` tests below cover that.
 #[test]
 fn split_clamps_origin_share_at_origin_quota_left() {
     let env = Env::new();
@@ -981,5 +986,407 @@ fn revert_undoes_preconsume_to_original_state() {
     assert_eq!(
         after.energy_window_size, 0,
         "revert must restore the ORIGINAL window"
+    );
+}
+
+// =============================================================================
+// The ALLOW_TVM_FREEZE-on / UNFREEZE_DELAY_DAYS-off window (proposal #52 through
+// Stake 2.0)
+// =============================================================================
+//
+// java gates its origin-clamp CAPTURE on `VMConfig.allowTvmFreeze() ||
+// VMConfig.allowTvmFreezeV2()` (VMActuator.java:736-738) — the same predicate
+// `ReceiptCapsule.getOriginUsage` reads on the consume side
+// (ReceiptCapsule.java:265-269) — while the account-mutating origin pre-consume
+// is `allowTvmFreezeV2`-only. In the freeze-only window the capture therefore
+// exists without the pre-consume, and the origin's share is clamped by the
+// BUDGET-time quota rather than a pay-time re-read. The window matters because
+// the Stake 1.0 FREEZE/UNFREEZE opcodes are live in it and mutate exactly what
+// `getAccountLeftEnergyFromFreeze` reads.
+
+/// `seed_global_energy` with the Stake-2.0 unfreeze delay OFF and
+/// ALLOW_TVM_FREEZE on — the freeze-only era.
+fn seed_global_energy_freeze_only(env: &Env, total_limit: i64, total_weight: i64) {
+    env.dyn_props.save_total_energy_limit(total_limit);
+    env.dyn_props.save_total_energy_current_limit(total_limit);
+    env.dyn_props.save_total_energy_weight(total_weight);
+    env.dyn_props.save_unfreeze_delay_days(0);
+    env.dyn_props.put_long(b"ALLOW_TVM_FREEZE", 1);
+    env.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
+    env.dyn_props.save_latest_block_header_number(60_000_000);
+}
+
+/// An account staked under Stake 1.0: the legacy
+/// `accountResource.frozenBalanceForEnergy` slot, which is what the v1 FREEZE
+/// opcode writes.
+fn v1_energy_account(addr: [u8; 21], frozen_trx: i64, balance_sun: i64) -> Account {
+    Account {
+        address: addr.to_vec(),
+        balance: balance_sun,
+        account_resource: Some(AccountResource {
+            frozen_balance_for_energy: Some(Frozen {
+                frozen_balance: frozen_trx * 1_000_000,
+                expire_time: 0,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Raise (or lower) an already-stored account's v1 frozen-for-energy stake,
+/// standing in for an in-VM FREEZE / UNFREEZE opcode.
+fn restake_energy(env: &Env, addr: [u8; 21], frozen_trx: i64) {
+    let mut a = env.accounts.get(&Address::from_raw(addr)).unwrap().unwrap();
+    a.account_resource
+        .get_or_insert_with(Default::default)
+        .frozen_balance_for_energy = Some(Frozen {
+        frozen_balance: frozen_trx * 1_000_000,
+        expire_time: 0,
+    });
+    put(&env.accounts, addr, a);
+}
+
+/// The origin's share must be clamped by the quota captured at budget time, not
+/// by a pay-time re-read that an in-VM FREEZE has inflated.
+#[test]
+fn freeze_only_origin_clamp_uses_budget_capture_when_origin_freezes_midtx() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_freeze_only(&env, 100_000_000_000, 200);
+    let origin = v1_energy_account(ORIGIN, 1, 0);
+    let caller = v1_energy_account(CALLER, 100, 0);
+    put(&env.accounts, ORIGIN, origin.clone());
+    put(&env.accounts, CALLER, caller.clone());
+
+    vm_energy_budget_trigger(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        &caller,
+        Some((&Address::from_raw(ORIGIN), &origin)),
+        /*percent=*/ 30,
+        /*raw_origin_energy_limit=*/ 10_000_000_000,
+        /*fee_limit=*/ 10_000_000_000,
+        /*call_value=*/ 0,
+        /*now_slot=*/ 0,
+    );
+    let captured = get_pre_tx_energy(&Address::from_raw(ORIGIN))
+        .expect("the freeze-only era captures the origin clamp")
+        .left;
+    assert!(captured > 0);
+
+    // In-VM FREEZE: the origin stakes 100x more, so a live re-read would let it
+    // absorb the whole 70% share.
+    restake_energy(&env, ORIGIN, 100);
+
+    let bill = pay_energy_bill(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        Some(&Address::from_raw(ORIGIN)),
+        /*origin_energy_limit=*/ 10_000_000_000,
+        /*consume_user_resource_percent=*/ 30,
+        /*energy_used=*/ 10_000_000_000,
+        /*now_slot=*/ 0,
+    )
+    .expect("bill ok");
+
+    let origin_used = match bill.origin_charge.expect("split") {
+        EnergyCharge::Frozen { energy_used, .. } => energy_used,
+        other => panic!("expected Frozen, got {other:?}"),
+    };
+    assert_eq!(
+        origin_used, captured,
+        "the origin share must be bounded by the BUDGET-time quota"
+    );
+    match bill.caller_charge {
+        EnergyCharge::Frozen { energy_used, .. } => {
+            assert_eq!(energy_used, 10_000_000_000 - captured)
+        }
+        other => panic!("expected Frozen, got {other:?}"),
+    }
+}
+
+/// The broad blast radius: `repo.addTotalEnergyWeight` runs for ANY in-tx energy
+/// freeze, and `calculateGlobalEnergyLimitV2` divides by the total weight — so a
+/// freeze targeting some unrelated account still shifts the origin's live quota.
+/// The captured clamp must make the split identical to a run with no mutation.
+#[test]
+fn freeze_only_origin_clamp_survives_total_energy_weight_dilution() {
+    fn run(dilute: bool) -> (i64, i64) {
+        tron_executor::energy::clear_pre_tx_energy_quota();
+        let env = Env::new();
+        seed_global_energy_freeze_only(&env, 100_000_000_000, 200);
+        let origin = v1_energy_account(ORIGIN, 1, 0);
+        let caller = v1_energy_account(CALLER, 100, 0);
+        put(&env.accounts, ORIGIN, origin.clone());
+        put(&env.accounts, CALLER, caller.clone());
+
+        vm_energy_budget_trigger(
+            &env.accounts,
+            &env.dyn_props,
+            &Address::from_raw(CALLER),
+            &caller,
+            Some((&Address::from_raw(ORIGIN), &origin)),
+            30,
+            10_000_000_000,
+            10_000_000_000,
+            0,
+            0,
+        );
+        if dilute {
+            // An unrelated in-VM energy freeze grows the chain-wide weight.
+            env.dyn_props.save_total_energy_weight(20_000);
+        }
+        let bill = pay_energy_bill(
+            &env.accounts,
+            &env.dyn_props,
+            &Address::from_raw(CALLER),
+            Some(&Address::from_raw(ORIGIN)),
+            10_000_000_000,
+            30,
+            10_000_000_000,
+            0,
+        )
+        .expect("bill ok");
+        let o = match bill.origin_charge.expect("split") {
+            EnergyCharge::Frozen { energy_used, .. } => energy_used,
+            other => panic!("expected Frozen, got {other:?}"),
+        };
+        let c = match bill.caller_charge {
+            EnergyCharge::Frozen { energy_used, .. } => energy_used,
+            other => panic!("expected Frozen, got {other:?}"),
+        };
+        (o, c)
+    }
+
+    assert_eq!(
+        run(true),
+        run(false),
+        "TOTAL_ENERGY_WEIGHT dilution mid-tx must not move the split"
+    );
+}
+
+/// java's `useEnergy` skips its over-limit rejection entirely under this gate
+/// (EnergyProcessor.java:112-116) and never charges the origin a TRX fee. The
+/// capture keeps our clamp and our charge base in agreement, so an origin whose
+/// live quota collapses mid-VM still settles wholly from stake.
+#[test]
+fn freeze_only_origin_never_pays_fee_when_quota_drops_midtx() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_freeze_only(&env, 100_000_000_000, 200);
+    // Give the origin a TRX balance so a fee path would actually be reachable.
+    let origin = v1_energy_account(ORIGIN, 1, 1_000_000_000);
+    let caller = v1_energy_account(CALLER, 100, 0);
+    put(&env.accounts, ORIGIN, origin.clone());
+    put(&env.accounts, CALLER, caller.clone());
+
+    vm_energy_budget_trigger(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        &caller,
+        Some((&Address::from_raw(ORIGIN), &origin)),
+        30,
+        10_000_000_000,
+        10_000_000_000,
+        0,
+        0,
+    );
+    let captured = get_pre_tx_energy(&Address::from_raw(ORIGIN)).unwrap().left;
+    assert!(captured > 0);
+
+    // In-VM UNFREEZE: the origin's stake is gone by pay time.
+    restake_energy(&env, ORIGIN, 0);
+
+    let bill = pay_energy_bill(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        Some(&Address::from_raw(ORIGIN)),
+        10_000_000_000,
+        30,
+        10_000_000_000,
+        0,
+    )
+    .expect("bill ok");
+
+    match bill.origin_charge.expect("split") {
+        EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, captured),
+        other => panic!("the origin must never be routed to a fee, got {other:?}"),
+    }
+    assert_eq!(
+        env.accounts
+            .get(&Address::from_raw(ORIGIN))
+            .unwrap()
+            .unwrap()
+            .balance,
+        1_000_000_000,
+        "the origin's TRX balance is never touched"
+    );
+}
+
+/// java leaves `originEnergyLeft` at its `0` default when
+/// `consumeUserResourcePercent == 100` (VMActuator.java:734-739 only assigns it
+/// inside `if (percent < ONE_HUNDRED)`). Our capture is deliberately NOT
+/// guarded on the percent, because `origin_left` is already forced to 0 there —
+/// which reproduces that default rather than leaving a live-read fallback.
+#[test]
+fn freeze_only_percent_100_captures_zero_left() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_freeze_only(&env, 100_000_000_000, 200);
+    let origin = v1_energy_account(ORIGIN, 100, 0);
+    let caller = v1_energy_account(CALLER, 100, 0);
+    put(&env.accounts, ORIGIN, origin.clone());
+    put(&env.accounts, CALLER, caller.clone());
+
+    vm_energy_budget_trigger(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        &caller,
+        Some((&Address::from_raw(ORIGIN), &origin)),
+        /*percent=*/ 100,
+        10_000_000_000,
+        10_000_000_000,
+        0,
+        0,
+    );
+    assert_eq!(
+        get_pre_tx_energy(&Address::from_raw(ORIGIN)).unwrap().left,
+        0
+    );
+
+    let bill = pay_energy_bill(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        Some(&Address::from_raw(ORIGIN)),
+        10_000_000,
+        100,
+        1_000,
+        0,
+    )
+    .expect("bill ok");
+    match bill.origin_charge.expect("origin still decayed at 0 usage") {
+        EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 0),
+        other => panic!("expected Frozen{{0}}, got {other:?}"),
+    }
+    match bill.caller_charge {
+        EnergyCharge::Frozen { energy_used, .. } => assert_eq!(energy_used, 1_000),
+        other => panic!("expected Frozen, got {other:?}"),
+    }
+}
+
+/// Before proposal #52 java's `getOriginUsage` falls through to arms 2/3, both
+/// of which genuinely re-read `getAccountLeftEnergyFromFreeze(origin)`. No
+/// capture may exist, and a mid-tx quota change MUST move the split — the proof
+/// that the new gate did not widen too far.
+#[test]
+fn pre_tvm_freeze_era_origin_still_live_reads() {
+    fn run(restake: bool) -> i64 {
+        tron_executor::energy::clear_pre_tx_energy_quota();
+        let env = Env::new();
+        seed_global_energy_freeze_only(&env, 100_000_000_000, 200);
+        env.dyn_props.put_long(b"ALLOW_TVM_FREEZE", 0);
+        let origin = v1_energy_account(ORIGIN, 1, 0);
+        let caller = v1_energy_account(CALLER, 100, 0);
+        put(&env.accounts, ORIGIN, origin.clone());
+        put(&env.accounts, CALLER, caller.clone());
+
+        vm_energy_budget_trigger(
+            &env.accounts,
+            &env.dyn_props,
+            &Address::from_raw(CALLER),
+            &caller,
+            Some((&Address::from_raw(ORIGIN), &origin)),
+            30,
+            10_000_000_000,
+            10_000_000_000,
+            0,
+            0,
+        );
+        assert!(
+            get_pre_tx_energy(&Address::from_raw(ORIGIN)).is_none(),
+            "no origin capture exists before ALLOW_TVM_FREEZE"
+        );
+        if restake {
+            restake_energy(&env, ORIGIN, 100);
+        }
+        let bill = pay_energy_bill(
+            &env.accounts,
+            &env.dyn_props,
+            &Address::from_raw(CALLER),
+            Some(&Address::from_raw(ORIGIN)),
+            10_000_000_000,
+            30,
+            10_000_000_000,
+            0,
+        )
+        .expect("bill ok");
+        match bill.origin_charge.expect("split") {
+            EnergyCharge::Frozen { energy_used, .. } => energy_used,
+            other => panic!("expected Frozen, got {other:?}"),
+        }
+    }
+
+    assert!(
+        run(true) > run(false),
+        "arms 2/3 re-read the origin's live quota at pay time"
+    );
+}
+
+/// The freeze-only capture is value-only: every other `EnergyPreConsume` field
+/// is a `Default` zero, which would corrupt an account if it ever reached
+/// `reset_account_usage` or the revert restore. Both entry points early-return
+/// on `!support_unfreeze_delay()`, which is false by construction here — this
+/// pins that guard.
+#[test]
+fn freeze_only_capture_does_not_trigger_reset_or_revert() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_freeze_only(&env, 100_000_000_000, 200);
+    let origin = v1_energy_account(ORIGIN, 1, 0);
+    let caller = v1_energy_account(CALLER, 100, 0);
+    put(&env.accounts, ORIGIN, origin.clone());
+    put(&env.accounts, CALLER, caller.clone());
+
+    vm_energy_budget_trigger(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        &caller,
+        Some((&Address::from_raw(ORIGIN), &origin)),
+        30,
+        10_000_000_000,
+        10_000_000_000,
+        0,
+        0,
+    );
+    assert!(get_pre_tx_energy(&Address::from_raw(ORIGIN)).is_some());
+    let before = env.accounts.get(&Address::from_raw(ORIGIN)).unwrap().unwrap();
+
+    reset_energy_pre_consume(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        Some(&Address::from_raw(ORIGIN)),
+    )
+    .unwrap();
+    revert_energy_pre_consume(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(CALLER),
+        Some(&Address::from_raw(ORIGIN)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        env.accounts.get(&Address::from_raw(ORIGIN)).unwrap().unwrap(),
+        before,
+        "a value-only capture must never reach the reset / revert restore"
     );
 }

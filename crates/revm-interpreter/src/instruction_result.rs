@@ -106,6 +106,56 @@ pub enum InstructionResult {
     FatalExternalError,
     /// Invalid encoding of an instruction's immediate operand.
     InvalidImmediateEncoding,
+    /// TRON fork: a precompile body raised an exception outside any
+    /// try-block — java-tron's `ValidateMultiSign` reads `words[0..3]` and
+    /// parses the signature array before its `try`, so a malformed input
+    /// throws `ArrayIndexOutOfBoundsException`. `Program
+    /// .callToPrecompiledAddress` does not wrap `contract.execute`, so the
+    /// throw reaches `VM.java`, which runs `program.spendAllEnergy()` on the
+    /// frame that executed the CALL and halts it. That frame therefore loses
+    /// its ENTIRE remaining budget, not just the energy it forwarded.
+    ///
+    /// Not transaction-fatal: `VM.play`'s outer catch records it as a runtime
+    /// failure, and a parent frame pushes zero and carries on
+    /// (`Program.callToAddress`). At the root frame the transaction consumes
+    /// its full energy limit and records `contractResult UNKNOWN`.
+    PrecompileThrow,
+    /// TRON fork: java-tron's `BytecodeExecutionException`, and the bare
+    /// `ArithmeticException` an ungated `longValueExact()` throws. Raised by a
+    /// transfer/token validation that fails BEFORE the
+    /// `ALLOW_TVM_CONSTANTINOPLE` proposal (#26) converts these throws into a
+    /// `TransferException`.
+    ///
+    /// Energy polarity is the opposite of [`InstructionResult::TransferFailed`]:
+    /// `VM.java`'s per-opcode catch runs `program.spendAllEnergy()` for every
+    /// exception that is NOT a `TransferException`, so the executing frame loses
+    /// its whole remaining budget. `RuntimeImpl.setResultCode` has no arm for
+    /// either exception type, so the recorded code is `contractResult UNKNOWN`.
+    ///
+    /// Not transaction-fatal by itself: like any halt it is contained to the
+    /// frame that raised it, and a parent frame pushes zero and continues
+    /// (`VM.play`'s outer catch records a runtime failure and
+    /// `Program.callToAddress` does `stackPushZero(); return;`). Only a
+    /// root-frame occurrence fails the transaction.
+    TronBytecodeExecution,
+    /// TRON fork: java-tron's `BytecodeExecutionException("transfer failure")`
+    /// from `Program.callToPrecompiledAddress` (`Program.java:1723`, TRC-10
+    /// twin at `:1730`) — a value-bearing CALL/CALLTOKEN whose target is a
+    /// precompile with no account row.
+    ///
+    /// That method never calls `createAccountIfNotExist`, so
+    /// `VMUtils.validateForSmartContract` finds no `toAccount`
+    /// (`VMUtils.java:155-159`) and throws at every height — the behaviour is
+    /// ungated. Two earlier java checks take precedence and push zero instead:
+    /// `getCallDeep() == MAX_DEPTH` (`Program.java:1677`) and
+    /// `senderBalance < endowment` (`Program.java:1707`).
+    ///
+    /// java runs the precompile INLINE in the caller's frame, so
+    /// `spendAllEnergy()` burns the caller's whole remaining budget, not just
+    /// the energy forwarded to the call. `Frame::return_result` reproduces that
+    /// by halting the calling frame on this result rather than pushing zero.
+    /// `RuntimeImpl.setResultCode` has no arm for it → `contractResult UNKNOWN`.
+    TronPrecompileTransferFailure,
 }
 
 impl From<TransferError> for InstructionResult {
@@ -149,6 +199,9 @@ impl From<HaltReason> for InstructionResult {
             HaltReason::CreateCollision => Self::CreateCollision,
             HaltReason::PrecompileError => Self::PrecompileError,
             HaltReason::PrecompileErrorWithContext(_) => Self::PrecompileError,
+            HaltReason::PrecompileThrow => Self::PrecompileThrow,
+            HaltReason::TronBytecodeExecution => Self::TronBytecodeExecution,
+            HaltReason::TronPrecompileTransferFailure => Self::TronPrecompileTransferFailure,
             HaltReason::NonceOverflow => Self::NonceOverflow,
             HaltReason::CreateContractSizeLimit => Self::CreateContractSizeLimit,
             HaltReason::CreateContractStartingWithEF => Self::CreateContractStartingWithEF,
@@ -227,6 +280,9 @@ macro_rules! return_error {
             | $crate::InstructionResult::CreateInitCodeSizeLimit
             | $crate::InstructionResult::FatalExternalError
             | $crate::InstructionResult::InvalidImmediateEncoding
+            | $crate::InstructionResult::PrecompileThrow
+            | $crate::InstructionResult::TronBytecodeExecution
+            | $crate::InstructionResult::TronPrecompileTransferFailure
     };
 }
 
@@ -405,6 +461,28 @@ impl<HaltReasonTr: From<HaltReason>> From<InstructionResult> for SuccessOrHalt<H
             InstructionResult::InvalidImmediateEncoding => {
                 Self::Halt(HaltReason::OpcodeNotFound.into())
             }
+            // Deliberately NOT `HaltReason::PrecompileError`: that resolves to
+            // `ContractResult::PrecompiledContract`, java's
+            // `PrecompiledContractException`, which is a different fault. An
+            // uncaught throw has no dedicated java code and lands on UNKNOWN.
+            InstructionResult::PrecompileThrow => {
+                Self::Halt(HaltReason::PrecompileThrow.into())
+            }
+            // Deliberately NOT an `OutOfGas` sub-kind: `MemoryLimit` resolves to
+            // `ContractResult::OutOfMemory`, java's `OutOfMemoryException`,
+            // which is a different fault. A `BytecodeExecutionException` has no
+            // dedicated java result code and lands on UNKNOWN.
+            InstructionResult::TronBytecodeExecution => {
+                Self::Halt(HaltReason::TronBytecodeExecution.into())
+            }
+            // Deliberately NOT `TransferFailed`: that is java's
+            // `TransferException`, which `VM.java:99` exempts from
+            // `spendAllEnergy()` and `RuntimeImpl` records as TRANSFER_FAILED.
+            // `callToPrecompiledAddress` throws a plain
+            // `BytecodeExecutionException`, which is neither.
+            InstructionResult::TronPrecompileTransferFailure => {
+                Self::Halt(HaltReason::TronPrecompileTransferFailure.into())
+            }
         }
     }
 }
@@ -469,11 +547,80 @@ mod tests {
             InstructionResult::CreateContractStartingWithEF,
             InstructionResult::CreateInitCodeSizeLimit,
             InstructionResult::FatalExternalError,
+            InstructionResult::PrecompileThrow,
+            InstructionResult::TronBytecodeExecution,
+            InstructionResult::TronPrecompileTransferFailure,
         ];
         for result in error_results {
             assert!(!result.is_ok());
             assert!(!result.is_revert());
             assert!(result.is_halt());
         }
+    }
+
+    /// TRON fork: an uncaught precompile throw is an ERROR result, never a
+    /// success or a revert — `Frame::return_result` keys the "kill the calling
+    /// frame" path off that classification, and `is_ok_or_revert()` being
+    /// false is what suppresses the unspent-gas refund.
+    #[test]
+    fn precompile_throw_is_an_error_result() {
+        let r = InstructionResult::PrecompileThrow;
+        assert!(matches!(r, return_error!()));
+        assert!(!r.is_ok());
+        assert!(!r.is_ok_or_revert());
+        assert!(!r.is_revert());
+        assert!(r.is_halt());
+    }
+
+    /// It must map to its OWN halt reason. `HaltReason::PrecompileError`
+    /// resolves to java's `PrecompiledContractException`, a different fault
+    /// with a different `contractResult`.
+    #[test]
+    fn precompile_throw_maps_to_its_own_halt_reason() {
+        use crate::SuccessOrHalt;
+        use context_interface::result::HaltReason;
+        let got: SuccessOrHalt<HaltReason> = InstructionResult::PrecompileThrow.into();
+        assert_eq!(got, SuccessOrHalt::Halt(HaltReason::PrecompileThrow));
+        // And the mapping round-trips.
+        assert_eq!(
+            InstructionResult::from(HaltReason::PrecompileThrow),
+            InstructionResult::PrecompileThrow
+        );
+    }
+
+    /// TRON fork: a `BytecodeExecutionException` is an ERROR result. That
+    /// classification is what drives java's `spendAllEnergy()` polarity —
+    /// `is_ok_or_revert()` being false suppresses the unspent-gas refund, so
+    /// the frame settles having consumed its whole limit. This is the exact
+    /// opposite of `TransferFailed`, which is a revert-class result.
+    #[test]
+    fn tron_bytecode_execution_is_an_error_result() {
+        let r = InstructionResult::TronBytecodeExecution;
+        assert!(matches!(r, return_error!()));
+        assert!(!r.is_ok());
+        assert!(!r.is_ok_or_revert());
+        assert!(!r.is_revert());
+        assert!(r.is_halt());
+
+        // Contrast: `TransferException` is spend-all-exempt.
+        let t = InstructionResult::TransferFailed;
+        assert!(t.is_revert());
+        assert!(t.is_ok_or_revert());
+        assert!(!t.is_halt());
+    }
+
+    /// It must map to its OWN halt reason: an `OutOfGas(MemoryLimit)` mapping
+    /// would record `contractResult OUT_OF_MEMORY` (java's
+    /// `OutOfMemoryException`) instead of UNKNOWN.
+    #[test]
+    fn tron_bytecode_execution_maps_to_its_own_halt_reason() {
+        use crate::SuccessOrHalt;
+        use context_interface::result::HaltReason;
+        let got: SuccessOrHalt<HaltReason> = InstructionResult::TronBytecodeExecution.into();
+        assert_eq!(got, SuccessOrHalt::Halt(HaltReason::TronBytecodeExecution));
+        assert_eq!(
+            InstructionResult::from(HaltReason::TronBytecodeExecution),
+            InstructionResult::TronBytecodeExecution
+        );
     }
 }

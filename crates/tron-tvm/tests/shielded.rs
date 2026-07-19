@@ -70,6 +70,23 @@ fn decode_rejects_oversized_depth() {
 }
 
 #[test]
+fn decode_rejects_nonzero_high_depth_bytes() {
+    // java `MerkleHash.parseInt` runs the first word through
+    // `DataWord.intValueSafe()`, which saturates to `Integer.MAX_VALUE` once
+    // the word occupies more than four bytes — so a byte set anywhere above
+    // the low four rejects, whatever the low four bytes say.
+    let mut input = [0u8; 96];
+    input[0] = 1;
+    input[31] = 5; // an otherwise valid depth
+    assert!(decode_merkle_hash_input(&input).is_none());
+
+    // Clearing the high byte restores the valid depth.
+    input[0] = 0;
+    let (depth, _, _) = decode_merkle_hash_input(&input).expect("valid once byte 0 is clear");
+    assert_eq!(depth, 5);
+}
+
+#[test]
 fn decode_accepts_well_formed_input() {
     let mut input = [0u8; 96];
     input[31] = 5; // depth = 5

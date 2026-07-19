@@ -960,6 +960,14 @@ fn internal_call_trace_is_captured_for_nested_call() {
 #[test]
 fn selfdestruct_emits_suicide_internal_tx() {
     let state = build_state();
+    // The beneficiary has no account row, so the suicide must create it.
+    // java gates `createAccountIfNotExist` on ALLOW_TVM_SOLIDITY_059 (#32);
+    // before it, `MUtil.transfer` of a non-zero balance to an absent obtainer
+    // throws and the transaction dies. That pre-#32 matrix is covered by the
+    // tron-tvm selfdestruct tests; here the post-#32 gate is what lets the
+    // inheritance succeed and the "suicide" entry be recorded.
+    tron_chainbase::DynamicPropertiesStore::new(state.dyn_props.clone())
+        .put_long(b"ALLOW_TVM_SOLIDITY_059", 1);
     let (caller_priv, caller_bytes) = caller_keypair(0xe2);
     let contract_bytes = addr_with_byte(0xec);
     let beneficiary_bytes = addr_with_byte(0xed);

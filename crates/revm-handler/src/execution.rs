@@ -52,7 +52,11 @@ pub fn create_init_frame<CTX: ContextTr>(
                 // only emitted from bytecode. Tx-level TRC-10 transfers
                 // are handled by `TransferAssetContract`, not by VM.
                 tron_token_id: 0,
+                tron_token_id_word: primitives::U256::ZERO,
                 tron_token_value: 0,
+                // The transaction-entry frame has no parent memory to write a
+                // return value into, so there is no return offset to carry.
+                tron_raw_return_offset: primitives::U256::ZERO,
             })))
         }
         TxKind::Create => Ok(FrameInput::Create(Box::new(CreateInputs::new(

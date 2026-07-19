@@ -60,6 +60,14 @@ pub trait InputsTr {
     fn tron_token_id(&self) -> i64 {
         0
     }
+    /// **TRON-fork extension.** The full 32-byte TRC-10 token id word passed by
+    /// the parent CALLTOKEN frame — what the `CALLTOKENID` opcode (`0xd3`)
+    /// pushes. java hands the callee the whole `DataWord`
+    /// (`Program.java:1136`); [`InputsTr::tron_token_id`] is the separately
+    /// derived low-64-signed asset-store key. Defaults to `U256::ZERO`.
+    fn tron_token_id_word(&self) -> U256 {
+        U256::ZERO
+    }
     /// **TRON-fork extension.** TRC-10 token value passed by the parent
     /// CALLTOKEN frame. Defaults to `0`. Read by the `CALLTOKENVALUE`
     /// opcode (`0xd2`).

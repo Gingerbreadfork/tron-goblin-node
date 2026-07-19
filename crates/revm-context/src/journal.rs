@@ -211,6 +211,17 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn tron_precompile_full_output_write(&self) -> bool {
+        // Explicitly `Some(false)`, NOT `!tron_selfdestruct_restriction_effective()`:
+        // that helper falls back to the spec-derived EIP-6780 rule when the
+        // override is absent, so an Ethereum host on a pre-Cancun spec would
+        // opt into TRON's pre-#94 precompile write. Only a host that set the
+        // TRON override AND set it to "restriction off" gets the full-output
+        // write.
+        matches!(self.inner.cfg.tron_selfdestruct_restriction, Some(false))
+    }
+
+    #[inline]
     fn tron_allow_energy_adjustment_effective(&self) -> bool {
         // `None` → preserve upstream (always-charge) behavior; TRON execution
         // always sets the override from `ALLOW_ENERGY_ADJUSTMENT` (#81).
@@ -228,6 +239,20 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
             .state
             .get(&address)
             .map(|a| a.is_created_locally())
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn tron_account_created_in_tx(&self, address: Address) -> bool {
+        // `AccountStatus::Created` (as opposed to the frame-scoped
+        // `CreatedLocal`) is set by `create_account_checkpoint` before the init
+        // code runs and cleared by the `AccountCreated` journal entry when the
+        // creating checkpoint reverts, so it is exactly "created and not
+        // rolled back" for the whole transaction.
+        self.inner
+            .state
+            .get(&address)
+            .map(|a| a.is_created())
             .unwrap_or(false)
     }
 
@@ -465,5 +490,54 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
             .map(|a| {
                 AccountInfoLoad::new(&a.data.info, a.is_cold, a.state_clear_aware_is_empty(spec))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use database_interface::EmptyDB;
+
+    fn journal_with(
+        spec: SpecId,
+        tron_selfdestruct_restriction: Option<bool>,
+    ) -> Journal<EmptyDB, JournalEntry> {
+        let mut journal: Journal<EmptyDB, JournalEntry> = Journal::new(EmptyDB::default());
+        journal.inner.cfg.spec = spec;
+        journal.inner.cfg.tron_selfdestruct_restriction = tron_selfdestruct_restriction;
+        journal
+    }
+
+    /// The pre-#94 precompile write must key off the TRON override being
+    /// PRESENT and false, never off `!tron_selfdestruct_restriction_effective()`.
+    ///
+    /// That helper falls back to `spec.is_enabled_in(CANCUN)` when the override
+    /// is absent, so an upstream Ethereum host on any pre-Cancun spec would
+    /// invert to `true` and silently opt into TRON's full-output,
+    /// memory-extending write.
+    #[test]
+    fn precompile_full_output_write_needs_the_tron_override() {
+        // No override — an Ethereum host. Truncating write at every spec.
+        for spec in [SpecId::BYZANTIUM, SpecId::ISTANBUL, SpecId::CANCUN] {
+            let journal = journal_with(spec, None);
+            assert!(
+                !journal.tron_precompile_full_output_write(),
+                "{spec:?}: a host that set no TRON override must keep truncating"
+            );
+        }
+
+        // The trap this guards: on a pre-Cancun spec the `effective` helper is
+        // false, so its negation would wrongly enable the write.
+        let pre_cancun = journal_with(SpecId::BYZANTIUM, None);
+        assert!(!pre_cancun.tron_selfdestruct_restriction_effective());
+        assert!(!pre_cancun.tron_precompile_full_output_write());
+
+        // TRON pre-#94 — the only configuration that gets the full write.
+        assert!(journal_with(SpecId::BYZANTIUM, Some(false)).tron_precompile_full_output_write());
+        assert!(journal_with(SpecId::CANCUN, Some(false)).tron_precompile_full_output_write());
+
+        // TRON post-#94 — truncating, whatever the spec.
+        assert!(!journal_with(SpecId::BYZANTIUM, Some(true)).tron_precompile_full_output_write());
+        assert!(!journal_with(SpecId::CANCUN, Some(true)).tron_precompile_full_output_write());
     }
 }

@@ -62,6 +62,16 @@ fn fresh_stores() -> VmStores {
     }
 }
 
+/// `fresh_stores()` with the Stake-2.0 unfreeze delay OFF — the
+/// ALLOW_TVM_FREEZE-on / UNFREEZE_DELAY_DAYS-off window in which the legacy
+/// FREEZE (0xd5) opcode actually reaches `Program.freeze` instead of
+/// `OperationActions.freezeAction`'s push-zero short circuit.
+fn fresh_stores_pre_stake2() -> VmStores {
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"UNFREEZE_DELAY_DAYS", 0);
+    stores
+}
+
 /// `fresh_stores()` plus a real `DelegatedResourceAccountIndex` store attached,
 /// for the DELEGATERESOURCE / UNDELEGATERESOURCE index-maintenance tests. The
 /// returned store handle is shared with the `VmStores`, so tests can read the
@@ -128,6 +138,128 @@ fn push_u64(v: u64) -> Vec<u8> {
     buf[24..].copy_from_slice(&v.to_be_bytes());
     out.extend_from_slice(&buf);
     out
+}
+
+/// PUSH32 of a full 256-bit word — for operands that must exercise the high
+/// limbs (out-of-`i64` amounts, out-of-range resource codes).
+fn push_u256(word: [u8; 32]) -> Vec<u8> {
+    let mut out = vec![0x7f];
+    out.extend_from_slice(&word);
+    out
+}
+
+/// The 32-byte word an opcode's `SSTORE`d result left in storage slot 0, or
+/// all-zero when the slot was never written (an all-zero store is elided).
+fn slot0(stores: &VmStores, addr: [u8; 21]) -> [u8; 32] {
+    let key = tron_chainbase::StorageRowStore::compose_key(&Address::from_raw(addr), &[0u8; 32]);
+    match stores.storage.get(&key).unwrap() {
+        Some(bytes) => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        }
+        None => [0u8; 32],
+    }
+}
+
+/// The success flag a staking opcode pushed, read back out of slot 0.
+fn pushed_flag(stores: &VmStores, addr: [u8; 21]) -> u8 {
+    slot0(stores, addr)[31]
+}
+
+/// Seed an account row directly (contracts with pre-existing staking state).
+fn put_account(stores: &VmStores, addr: [u8; 21], account: Account) {
+    stores
+        .accounts
+        .put(&Address::from_raw(addr), &account)
+        .unwrap();
+}
+
+/// Install `bytecode` at `addr` as a contract, carrying whatever TRON-side
+/// staking fields `account` already holds.
+fn install_contract_with(
+    stores: &VmStores,
+    addr: [u8; 21],
+    bytecode: Vec<u8>,
+    mut account: Account,
+) {
+    let hash = code_hash(&bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
+    account.address = addr.to_vec();
+    account.code = bytecode;
+    account.code_hash = hash.as_slice().to_vec();
+    put_account(stores, addr, account);
+}
+
+/// Run `bytecode` as the contract at `addr` and require the transaction to
+/// succeed. Every staking test below has the same shape: a fresh caller EOA
+/// triggers the contract, the contract runs one staking opcode and `SSTORE`s
+/// the pushed flag into slot 0.
+fn run_contract(stores: &VmStores, caller: [u8; 21], addr: [u8; 21]) {
+    install_caller(stores, caller, 1_000_000_000);
+    let outcome = execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: NOW_MS,
+            ..Default::default()
+        },
+        &trigger(caller, addr),
+        500_000,
+    );
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "expected Success, got: {outcome:?}"
+    );
+}
+
+/// The block timestamp every fixture anchors on (`fresh_stores` saves the same
+/// value as the latest block-header timestamp).
+const NOW_MS: i64 = 1_700_000_000_000;
+
+/// Three days in ms — java `FROZEN_PERIOD * getMinFrozenTime()`, the expiry a
+/// v1 TVM freeze stamps (`Program.freeze` passes `getMinFrozenTime()` = 3).
+const V1_EXPIRE: i64 = NOW_MS + 3 * 24 * 60 * 60 * 1000;
+
+/// FREEZE (0xd5) pops `[resource_type, frozen_balance, receiver_address]`, so
+/// the push order is receiver, balance, resource. The trailing
+/// `PUSH1 0; SSTORE; STOP` records the pushed flag in slot 0.
+fn freeze_v1_code(receiver: [u8; 21], balance: Vec<u8>, resource: Vec<u8>) -> Vec<u8> {
+    let mut bc = vec![0x73];
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(balance);
+    bc.extend(resource);
+    bc.push(0xd5);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    bc
+}
+
+/// UNFREEZE (0xd6) pops `[resource_type, receiver_address]`.
+fn unfreeze_v1_code(receiver: [u8; 21], resource: Vec<u8>) -> Vec<u8> {
+    let mut bc = vec![0x73];
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(resource);
+    bc.push(0xd6);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    bc
+}
+
+fn frozen(balance: i64, expire: i64) -> tron_proto::account::Frozen {
+    tron_proto::account::Frozen {
+        frozen_balance: balance,
+        expire_time: expire,
+    }
+}
+
+fn energy_frozen(account: &Account) -> Option<tron_proto::account::Frozen> {
+    account
+        .account_resource
+        .as_ref()
+        .and_then(|r| r.frozen_balance_for_energy.clone())
 }
 
 // =============================================================================
@@ -925,6 +1057,362 @@ fn freeze_v1_is_noop_when_freezev2_active() {
     assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
 }
 
+/// java `setFrozenForEnergy` writes `accountResource.frozenBalanceForEnergy` —
+/// NOT the legacy `frozen` list, which belongs to BANDWIDTH alone. Only
+/// TOTAL_ENERGY_WEIGHT moves.
+#[test]
+fn freeze_v1_self_energy_writes_account_resource_slot() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb1);
+    let contract_addr = tron_addr(0xf1);
+
+    let bc = freeze_v1_code(contract_addr, push_u64(10_000_000), push1(1));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    assert_eq!(energy_frozen(&acct), Some(frozen(10_000_000, V1_EXPIRE)));
+    assert!(
+        acct.frozen.is_empty(),
+        "an ENERGY freeze must not write the bandwidth frozen list"
+    );
+    assert_eq!(acct.balance, 40_000_000);
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 10);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// `setFrozenForBandwidth(frozenBalance + getFrozenBalance(), expireTime)`
+/// REPLACES entry 0 rather than appending, so a second freeze leaves exactly
+/// one entry carrying the summed balance and the new expiry.
+#[test]
+fn freeze_v1_self_bandwidth_twice_overwrites_entry_zero() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb2);
+    let contract_addr = tron_addr(0xf2);
+
+    // Two back-to-back FREEZEs, each SSTOREing its flag over slot 0.
+    let mut bc = freeze_v1_code(contract_addr, push_u64(10_000_000), push1(0));
+    bc.truncate(bc.len() - 1); // drop the trailing STOP
+    bc.extend(freeze_v1_code(contract_addr, push_u64(4_000_000), push1(0)));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    assert_eq!(
+        acct.frozen,
+        vec![frozen(14_000_000, V1_EXPIRE)],
+        "the second freeze merges into entry 0 instead of appending"
+    );
+    assert_eq!(acct.balance, 36_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 14);
+}
+
+/// `FreezeBalanceProcessor.validate`'s ResourceCode switch accepts BANDWIDTH
+/// and ENERGY only — TRON_POWER(2) is a Stake-2.0 code and throws here.
+#[test]
+fn freeze_v1_rejects_tron_power_resource_code() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb3);
+    let contract_addr = tron_addr(0xf3);
+
+    let bc = freeze_v1_code(contract_addr, push_u64(10_000_000), push1(2));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert!(acct.frozen.is_empty());
+    assert_eq!(energy_frozen(&acct), None);
+    assert_eq!(acct.balance, 50_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 0);
+}
+
+/// `frozenBalance.sValue().longValueExact()` (Program.java:1947) throws on a
+/// word outside signed-64 range and the opcode pushes 0. A truncating read
+/// would see the low 64 bits (1000 TRX here) and freeze for real.
+#[test]
+fn freeze_v1_rejects_balance_above_i64() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb4);
+    let contract_addr = tron_addr(0xf4);
+
+    // 2^64 + 1_000_000_000 — low limb 1e9, high limb 1.
+    let mut word = [0u8; 32];
+    word[15] = 1;
+    word[24..].copy_from_slice(&1_000_000_000u64.to_be_bytes());
+    let bc = freeze_v1_code(contract_addr, push_u256(word), push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000_000,
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert!(acct.frozen.is_empty());
+    assert_eq!(acct.balance, 50_000_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// "FrozenCount must be 0 or 1" — an owner whose legacy `frozen` list already
+/// holds two entries is rejected outright.
+#[test]
+fn freeze_v1_rejects_owner_with_two_frozen_entries() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb5);
+    let contract_addr = tron_addr(0xf5);
+
+    let bc = freeze_v1_code(contract_addr, push_u64(10_000_000), push1(0));
+    let seeded = vec![
+        frozen(1_000_000, NOW_MS + 1),
+        frozen(2_000_000, NOW_MS + 2),
+    ];
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            frozen: seeded.clone(),
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert_eq!(acct.frozen, seeded);
+    assert_eq!(acct.balance, 50_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// The delegating branch: a receiver that differs from the owner gets a
+/// `DelegatedResource` row keyed `from || to`, an auto-created account row
+/// (`repo.createNormalAccount`) and the acquired credit, while the owner is
+/// debited and books `delegatedFrozenBalanceForBandwidth`. The weight switch
+/// sits outside the branch, so TOTAL_NET_WEIGHT moves here too.
+#[test]
+fn freeze_v1_delegated_bandwidth_creates_row_and_receiver() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb6);
+    let contract_addr = tron_addr(0xf6);
+    let receiver = tron_addr(0x16);
+
+    let bc = freeze_v1_code(receiver, push_u64(10_000_000), push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    let key = DelegatedResourceStore::v1_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    let record = stores
+        .delegated_resources
+        .get_raw(&key)
+        .unwrap()
+        .expect("v1 DelegatedResource row written");
+    assert_eq!(record.from, contract_addr.to_vec());
+    assert_eq!(record.to, receiver.to_vec());
+    assert_eq!(record.frozen_balance_for_bandwidth, 10_000_000);
+    assert_eq!(record.expire_time_for_bandwidth, V1_EXPIRE);
+
+    let owner = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.delegated_frozen_balance_for_bandwidth, 10_000_000);
+    assert_eq!(owner.balance, 40_000_000);
+    assert!(
+        owner.frozen.is_empty(),
+        "a delegating freeze never writes the owner's own frozen list"
+    );
+
+    let recv = stores
+        .accounts
+        .get(&Address::from_raw(receiver))
+        .unwrap()
+        .expect("receiver auto-created by createNormalAccount");
+    assert_eq!(recv.acquired_delegated_frozen_balance_for_bandwidth, 10_000_000);
+    assert_eq!(recv.create_time, NOW_MS);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 10);
+}
+
+/// Same on the ENERGY fields, which live under `AccountResource`.
+#[test]
+fn freeze_v1_delegated_energy_credits_energy_fields() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb7);
+    let contract_addr = tron_addr(0xf7);
+    let receiver = tron_addr(0x17);
+
+    let bc = freeze_v1_code(receiver, push_u64(10_000_000), push1(1));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            ..Default::default()
+        },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    let key = DelegatedResourceStore::v1_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    let record = stores.delegated_resources.get_raw(&key).unwrap().unwrap();
+    assert_eq!(record.frozen_balance_for_energy, 10_000_000);
+    assert_eq!(record.expire_time_for_energy, V1_EXPIRE);
+    assert_eq!(record.frozen_balance_for_bandwidth, 0);
+
+    let owner = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        owner
+            .account_resource
+            .as_ref()
+            .unwrap()
+            .delegated_frozen_balance_for_energy,
+        10_000_000
+    );
+    let recv = stores
+        .accounts
+        .get(&Address::from_raw(receiver))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recv.account_resource
+            .as_ref()
+            .unwrap()
+            .acquired_delegated_frozen_balance_for_energy,
+        10_000_000
+    );
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 10);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// "Do not allow delegate resources to contract addresses" — and, because java
+/// validates inside a child Repository committed only on success, the receiver
+/// account its own delegation branch may have created is discarded with it.
+/// Nothing at all may be written.
+#[test]
+fn freeze_v1_delegated_to_contract_receiver_writes_nothing() {
+    let stores = fresh_stores_pre_stake2();
+    let caller_user = tron_addr(0xb8);
+    let contract_addr = tron_addr(0xf8);
+    let receiver = tron_addr(0x18);
+
+    let bc = freeze_v1_code(receiver, push_u64(10_000_000), push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 50_000_000,
+            ..Default::default()
+        },
+    );
+    let receiver_row = Account {
+        address: receiver.to_vec(),
+        r#type: tron_proto::AccountType::Contract as i32,
+        balance: 123,
+        ..Default::default()
+    };
+    put_account(&stores, receiver, receiver_row.clone());
+    run_contract(&stores, caller_user, contract_addr);
+
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    let key = DelegatedResourceStore::v1_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    assert!(stores.delegated_resources.get_raw(&key).unwrap().is_none());
+    let owner = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.balance, 50_000_000);
+    assert_eq!(owner.delegated_frozen_balance_for_bandwidth, 0);
+    assert_eq!(
+        stores
+            .accounts
+            .get(&Address::from_raw(receiver))
+            .unwrap()
+            .unwrap(),
+        receiver_row,
+        "the rejected receiver row must be byte-identical"
+    );
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
 // =============================================================================
 // VOTEWITNESS (0xd8) — the handler reads the witness/amount arrays from
 // memory and the bridge validates + casts them (see the focused test
@@ -935,61 +1423,494 @@ fn freeze_v1_is_noop_when_freezev2_active() {
 // UNFREEZE (0xd6) — legacy v1
 // =============================================================================
 
+/// SELF unfreeze — the receiver on the stack IS the executing contract, so
+/// java's `!isEqual(ownerAddress, receiverAddress)` is false and
+/// `UnfreezeBalanceProcessor` takes the non-delegating branch: every matured
+/// entry leaves the legacy `frozen` list, its balance is credited, and
+/// TOTAL_NET_WEIGHT sheds the corresponding weight.
 #[test]
-fn unfreeze_v1_clears_matured_frozen_entries() {
+fn unfreeze_v1_self_clears_matured_frozen_entries() {
     let stores = fresh_stores();
     let caller_user = tron_addr(0xa8);
     let contract_addr = tron_addr(0xc8);
-    let receiver = tron_addr(0xd8);
 
-    // UNFREEZE pops [resource_type, receiver_address].
-    // Stack push order: receiver first, then resource_type.
-    let mut bc = Vec::new();
-    bc.push(0x73);
-    bc.extend_from_slice(&receiver[1..]);
-    bc.extend(push1(0));
-    bc.push(0xd6);
-    bc.extend(push1(0));
-    bc.push(0x55);
-    bc.push(0x00);
-    let hash = code_hash(&bc);
-    stores.code.put(hash.as_slice(), &bc).unwrap();
-    // Pre-seed an EXPIRED frozen entry on the contract.
-    stores.accounts.put(
-        &Address::from_raw(contract_addr),
-        &Account {
-            address: contract_addr.to_vec(),
+    let bc = unfreeze_v1_code(contract_addr, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
             balance: 0,
-            code: bc.clone(),
-            code_hash: hash.as_slice().to_vec(),
-            frozen: vec![tron_proto::account::Frozen {
-                frozen_balance: 5_000_000,
-                expire_time: 1_700_000_000_000 - 1, // already past
-            }],
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
             ..Default::default()
         },
-    ).unwrap();
-    install_caller(&stores, caller_user, 1_000_000_000);
-
-    let outcome = execute_trigger(
-        &stores,
-        VmBlockEnv {
-            block_number: 1,
-            block_timestamp_ms: 1_700_000_000_000, ..Default::default()
-        },
-        &trigger(caller_user, contract_addr),
-        500_000,
     );
-    assert!(matches!(outcome, VmOutcome::Success { .. }));
+    stores.dynamic_properties.save_total_net_weight(5);
+    run_contract(&stores, caller_user, contract_addr);
 
     let acct = stores
         .accounts
         .get(&Address::from_raw(contract_addr))
         .unwrap()
         .unwrap();
-    // The matured entry was removed from `frozen` — the bridge
-    // cleared it. (Balance-side credit lives in revm's journal.)
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
     assert!(acct.frozen.is_empty());
+    assert_eq!(acct.balance, 5_000_000, "unlocked stake credited to balance");
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// DELEGATED unfreeze with no `DelegatedResource` row — the receiver on the
+/// stack differs from the executing contract, so java sets `delegating` and
+/// `UnfreezeBalanceProcessor.validate` throws "delegated Resource does not
+/// exist" before `execute` runs. The opcode pushes 0 and the owner's own
+/// matured `frozen` entry is NOT swept: it belongs to the self branch java
+/// never reaches.
+#[test]
+fn unfreeze_v1_delegated_without_record_is_rejected() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa8);
+    let contract_addr = tron_addr(0xc8);
+    let receiver = tron_addr(0xd8);
+
+    let bc = unfreeze_v1_code(receiver, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_net_weight(5);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert_eq!(
+        acct.frozen,
+        vec![frozen(5_000_000, NOW_MS - 1)],
+        "the self-branch sweep must not run on the delegating branch"
+    );
+    assert_eq!(acct.balance, 0);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 5);
+}
+
+/// ENERGY unfreeze reads `accountResource.frozenBalanceForEnergy` and clears
+/// it, crediting the balance and shedding TOTAL_ENERGY_WEIGHT.
+#[test]
+fn unfreeze_v1_self_energy_clears_account_resource_slot() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa4);
+    let contract_addr = tron_addr(0xc4);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(1));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            account_resource: Some(tron_proto::account::AccountResource {
+                frozen_balance_for_energy: Some(frozen(7_000_000, NOW_MS - 1)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_energy_weight(7);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    assert_eq!(energy_frozen(&acct), None);
+    assert_eq!(acct.balance, 7_000_000);
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 0);
+}
+
+/// The ENERGY branch's maturity check: an unexpired `frozenBalanceForEnergy`
+/// makes `validate` throw "It's not time to unfreeze(Energy)".
+#[test]
+fn unfreeze_v1_self_energy_rejects_unexpired_stake() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa5);
+    let contract_addr = tron_addr(0xc5);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(1));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            account_resource: Some(tron_proto::account::AccountResource {
+                frozen_balance_for_energy: Some(frozen(7_000_000, NOW_MS + 1)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_energy_weight(7);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert_eq!(energy_frozen(&acct), Some(frozen(7_000_000, NOW_MS + 1)));
+    assert_eq!(acct.balance, 0);
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 7);
+}
+
+/// An ENERGY unfreeze must never touch the legacy BANDWIDTH `frozen` list.
+/// java's ENERGY arm reads only `frozenBalanceForEnergy`, so an owner holding
+/// nothing but a matured bandwidth entry fails validate with "no
+/// frozenBalance(Energy)" and keeps that entry.
+#[test]
+fn unfreeze_v1_energy_leaves_matured_bandwidth_entry_alone() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xa7);
+    let contract_addr = tron_addr(0xc7);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(1));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_net_weight(5);
+    stores.dynamic_properties.save_total_energy_weight(9);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert_eq!(acct.frozen, vec![frozen(5_000_000, NOW_MS - 1)]);
+    assert_eq!(acct.balance, 0);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 5);
+    assert_eq!(
+        stores.dynamic_properties.total_energy_weight(),
+        9,
+        "a bandwidth stake must never be charged against energy weight"
+    );
+}
+
+/// java's v1 processors accept only BANDWIDTH(0) and ENERGY(1); both the
+/// delegating and self branches of `UnfreezeBalanceProcessor.validate` end in
+/// `default: throw new ContractValidateException("Unknown ResourceCode, ...")`.
+#[test]
+fn unfreeze_v1_rejects_unknown_resource_code() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xab);
+    let contract_addr = tron_addr(0xcb);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(7));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_net_weight(5);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert_eq!(acct.frozen, vec![frozen(5_000_000, NOW_MS - 1)]);
+    assert_eq!(acct.balance, 0);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 5);
+}
+
+/// DELEGATED unfreeze against a matured row: the row's per-type balance and
+/// expiry are zeroed, the owner's `delegatedFrozenBalanceForBandwidth` is
+/// debited and its TRX balance credited, and the receiver's acquired balance is
+/// reduced — clamped at 0 by
+/// `safeAddAcquiredDelegatedFrozenBalanceForBandwidth`, which is why a receiver
+/// holding less than the row's balance floors instead of going negative.
+#[test]
+fn unfreeze_v1_delegated_zeroes_row_and_clamps_receiver() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xac);
+    let contract_addr = tron_addr(0xcc);
+    let receiver = tron_addr(0xdc);
+
+    let bc = unfreeze_v1_code(receiver, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            delegated_frozen_balance_for_bandwidth: 6_000_000,
+            ..Default::default()
+        },
+    );
+    // Receiver holds LESS acquired than the row delegates (java's clamp case).
+    put_account(
+        &stores,
+        receiver,
+        Account {
+            address: receiver.to_vec(),
+            acquired_delegated_frozen_balance_for_bandwidth: 2_000_000,
+            ..Default::default()
+        },
+    );
+    let key = DelegatedResourceStore::v1_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    stores
+        .delegated_resources
+        .put_raw(
+            &key,
+            &tron_proto::DelegatedResource {
+                from: contract_addr.to_vec(),
+                to: receiver.to_vec(),
+                frozen_balance_for_bandwidth: 6_000_000,
+                expire_time_for_bandwidth: NOW_MS - 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    stores.dynamic_properties.save_total_net_weight(6);
+    run_contract(&stores, caller_user, contract_addr);
+
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    let record = stores.delegated_resources.get_raw(&key).unwrap().unwrap();
+    assert_eq!(record.frozen_balance_for_bandwidth, 0);
+    assert_eq!(record.expire_time_for_bandwidth, 0);
+
+    let owner = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.delegated_frozen_balance_for_bandwidth, 0);
+    assert_eq!(owner.balance, 6_000_000);
+
+    let recv = stores
+        .accounts
+        .get(&Address::from_raw(receiver))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recv.acquired_delegated_frozen_balance_for_bandwidth, 0,
+        "safeAdd clamps at 0 rather than going negative"
+    );
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// An unexpired delegated row fails validate with "It's not time to
+/// unfreeze(BANDWIDTH)" — nothing moves.
+#[test]
+fn unfreeze_v1_delegated_rejects_unexpired_row() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xad);
+    let contract_addr = tron_addr(0xcd);
+    let receiver = tron_addr(0xdd);
+
+    let bc = unfreeze_v1_code(receiver, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            delegated_frozen_balance_for_bandwidth: 6_000_000,
+            ..Default::default()
+        },
+    );
+    put_account(
+        &stores,
+        receiver,
+        Account {
+            address: receiver.to_vec(),
+            acquired_delegated_frozen_balance_for_bandwidth: 6_000_000,
+            ..Default::default()
+        },
+    );
+    let key = DelegatedResourceStore::v1_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    let row = tron_proto::DelegatedResource {
+        from: contract_addr.to_vec(),
+        to: receiver.to_vec(),
+        frozen_balance_for_bandwidth: 6_000_000,
+        expire_time_for_bandwidth: NOW_MS + 1,
+        ..Default::default()
+    };
+    stores.delegated_resources.put_raw(&key, &row).unwrap();
+    stores.dynamic_properties.save_total_net_weight(6);
+    run_contract(&stores, caller_user, contract_addr);
+
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert_eq!(stores.delegated_resources.get_raw(&key).unwrap().unwrap(), row);
+    let owner = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.delegated_frozen_balance_for_bandwidth, 6_000_000);
+    assert_eq!(owner.balance, 0);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 6);
+}
+
+/// `UnfreezeBalanceProcessor.execute`'s tail: under ALLOW_TVM_VOTE, an owner
+/// whose remaining TRON Power no longer covers the votes it has cast has those
+/// votes dropped and a `Votes` row written.
+#[test]
+fn unfreeze_v1_clears_votes_when_power_falls_below_used() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xae);
+    let contract_addr = tron_addr(0xce);
+    let witness = tron_addr(0xee);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
+            // 5 votes need 5 TRX of power; unfreezing leaves 0.
+            votes: vec![tron_proto::Vote {
+                vote_address: witness.to_vec(),
+                vote_count: 5,
+            }],
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_net_weight(5);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 1);
+    assert!(acct.frozen.is_empty());
+    assert!(acct.votes.is_empty(), "votes dropped once power no longer covers them");
+    let row = stores
+        .votes
+        .as_ref()
+        .unwrap()
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .expect("a Votes row records the cleared votes");
+    assert_eq!(row.old_votes.len(), 1);
+    assert!(row.new_votes.is_empty());
+}
+
+/// The negative half: TRON Power that still covers the cast votes leaves them
+/// in place (java's `getTronPower() < usedTronPower * TRX_PRECISION` is false).
+/// The remaining delegated-out stake keeps the power up.
+#[test]
+fn unfreeze_v1_keeps_votes_when_power_still_covers_them() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0xaf);
+    let contract_addr = tron_addr(0xcf);
+    let witness = tron_addr(0xef);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
+            // Delegated-out stake still counts toward TRON Power.
+            delegated_frozen_balance_for_bandwidth: 50_000_000,
+            votes: vec![tron_proto::Vote {
+                vote_address: witness.to_vec(),
+                vote_count: 5,
+            }],
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_net_weight(55);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(acct.votes.len(), 1, "votes survive while power covers them");
+    assert!(stores
+        .votes
+        .as_ref()
+        .unwrap()
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .is_none());
+}
+
+/// With ALLOW_TVM_VOTE off, java's whole vote-reconciliation block is skipped
+/// regardless of how far the power fell.
+#[test]
+fn unfreeze_v1_keeps_votes_when_tvm_vote_is_off() {
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_VOTE", 0);
+    let caller_user = tron_addr(0xa3);
+    let contract_addr = tron_addr(0xc3);
+    let witness = tron_addr(0xe3);
+
+    let bc = unfreeze_v1_code(contract_addr, push1(0));
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen: vec![frozen(5_000_000, NOW_MS - 1)],
+            votes: vec![tron_proto::Vote {
+                vote_address: witness.to_vec(),
+                vote_count: 5,
+            }],
+            ..Default::default()
+        },
+    );
+    stores.dynamic_properties.save_total_net_weight(5);
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert!(acct.frozen.is_empty());
+    assert_eq!(acct.votes.len(), 1, "vote reconciliation is ALLOW_TVM_VOTE-gated");
 }
 
 // =============================================================================
@@ -2164,4 +3085,295 @@ fn register_witness(stores: &VmStores, addr: [u8; 21]) {
             &tron_proto::Witness { address: addr.to_vec(), ..Default::default() },
         )
         .unwrap();
+}
+
+// =============================================================================
+// Stake-2.0 resource-code parsing (java `Program.parseResourceCodeV2`)
+// =============================================================================
+//
+// The V2 opcodes read the resource code with `sValue().byteValueExact()`, so
+// only an exact 0, 1 or 2 across all 256 bits is a code; anything else is
+// UNRECOGNIZED and the processor's ResourceCode switch throws, leaving the
+// opcode a nonce-bumped no-op that pushes 0. A low-32-bit truncation (which is
+// what the *v1* opcodes correctly use, via `DataWord.intValue()`) would read
+// several of these words as valid codes and stake for real.
+
+/// FREEZEBALANCEV2 (0xda) with `resource_type = 2^32`: truncation would call it
+/// BANDWIDTH.
+#[test]
+fn freezebalancev2_rejects_resource_type_above_32_bits() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0x21);
+    let contract_addr = tron_addr(0x31);
+
+    let mut word = [0u8; 32];
+    word[27] = 1; // 1 << 32
+    let mut bc = push_u64(10_000_000);
+    bc.extend(push_u256(word));
+    bc.push(0xda);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account { balance: 100_000_000, ..Default::default() },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert!(acct.frozen_v2.iter().all(|f| f.amount == 0));
+    assert_eq!(acct.balance, 100_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// `resource_type = 2^32 + 1`: truncation would call it ENERGY.
+#[test]
+fn freezebalancev2_rejects_resource_type_one_above_32_bits() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0x22);
+    let contract_addr = tron_addr(0x32);
+
+    let mut word = [0u8; 32];
+    word[27] = 1;
+    word[31] = 1; // (1 << 32) + 1
+    let mut bc = push_u64(10_000_000);
+    bc.extend(push_u256(word));
+    bc.push(0xda);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account { balance: 100_000_000, ..Default::default() },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert!(acct.frozen_v2.iter().all(|f| f.amount == 0));
+    assert_eq!(acct.balance, 100_000_000);
+    assert_eq!(stores.dynamic_properties.total_energy_weight(), 0);
+}
+
+/// `resource_type = …FF00000000` — a large NEGATIVE word under `sValue()`, so
+/// `byteValueExact()` throws. Its low 32 bits are zero, so truncation would
+/// call it BANDWIDTH.
+#[test]
+fn freezebalancev2_rejects_negative_resource_type_word() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0x23);
+    let contract_addr = tron_addr(0x33);
+
+    let mut word = [0xffu8; 32];
+    word[28..].copy_from_slice(&[0, 0, 0, 0]);
+    let mut bc = push_u64(10_000_000);
+    bc.extend(push_u256(word));
+    bc.push(0xda);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account { balance: 100_000_000, ..Default::default() },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    let acct = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    assert!(acct.frozen_v2.iter().all(|f| f.amount == 0));
+    assert_eq!(acct.balance, 100_000_000);
+    assert_eq!(stores.dynamic_properties.total_net_weight(), 0);
+}
+
+/// DELEGATERESOURCE (0xde) parses its resource code the same way.
+#[test]
+fn delegateresource_rejects_resource_type_above_32_bits() {
+    let stores = fresh_stores();
+    let caller_user = tron_addr(0x24);
+    let contract_addr = tron_addr(0x34);
+    let receiver = tron_addr(0x44);
+
+    let mut word = [0u8; 32];
+    word[27] = 1;
+    let mut bc = vec![0x73];
+    bc.extend_from_slice(&receiver[1..]);
+    bc.extend(push_u64(3_000_000));
+    bc.extend(push_u256(word));
+    bc.push(0xde);
+    bc.extend(push1(0));
+    bc.push(0x55);
+    bc.push(0x00);
+    install_contract_with(
+        &stores,
+        contract_addr,
+        bc,
+        Account {
+            balance: 0,
+            frozen_v2: vec![tron_proto::account::FreezeV2 { r#type: 0, amount: 10_000_000 }],
+            ..Default::default()
+        },
+    );
+    put_account(
+        &stores,
+        receiver,
+        Account { address: receiver.to_vec(), ..Default::default() },
+    );
+    run_contract(&stores, caller_user, contract_addr);
+
+    assert_eq!(pushed_flag(&stores, contract_addr), 0);
+    let key = DelegatedResourceStore::v2_unlocked_key(
+        &Address::from_raw(contract_addr),
+        &Address::from_raw(receiver),
+    );
+    assert!(
+        stores.delegated_resources.get_raw(&key).unwrap().is_none(),
+        "an UNRECOGNIZED resource code must not write a delegation row"
+    );
+    let owner = stores
+        .accounts
+        .get(&Address::from_raw(contract_addr))
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.frozen_v2[0].amount, 10_000_000);
+}
+
+// =============================================================================
+// Internal-tx nonce on a rejected Stake-2.0 op
+// =============================================================================
+//
+// java runs `increaseNonce()` ABOVE the try in every V2 stake method
+// (Program.java:2035 / :2066 / :2176 / :2210), so an amount outside signed-64
+// range — which makes `sValue().longValueExact()` throw — still advances the
+// nonce. That nonce seeds `generateContractAddress(rootTransactionId, nonce)`
+// (Program.java:807), so skipping the bump would move every later CREATE
+// address in the transaction.
+
+/// Run a contract whose body is `prefix` followed by a zero-value CREATE whose
+/// result address is stored in slot 0, and return that address word.
+fn create_address_after(stores: &VmStores, caller: [u8; 21], addr: [u8; 21], prefix: Vec<u8>) -> [u8; 32] {
+    let mut bc = prefix;
+    bc.extend(push1(0)); // size
+    bc.extend(push1(0)); // offset
+    bc.extend(push1(0)); // value
+    bc.push(0xf0); // CREATE
+    bc.extend(push1(0));
+    bc.push(0x55); // SSTORE slot 0
+    bc.push(0x00);
+    install_contract_with(
+        stores,
+        addr,
+        bc,
+        Account { balance: 100_000_000, ..Default::default() },
+    );
+    run_contract(stores, caller, addr);
+    slot0(stores, addr)
+}
+
+/// A FREEZEBALANCEV2 whose amount is out of signed-64 range must leave the
+/// create-nonce exactly where an in-range rejection (insufficient balance) does
+/// — one bump — so the following CREATE lands on the same address. The
+/// no-stake-op baseline pins that this is a real advance, not a shared zero.
+#[test]
+fn out_of_range_freezebalancev2_still_bumps_internal_tx_nonce() {
+    // 2^200 — far outside signed-64 range.
+    let mut huge = [0u8; 32];
+    huge[6] = 1;
+    let mut out_of_range = push_u256(huge);
+    out_of_range.extend(push1(0));
+    out_of_range.push(0xda);
+    out_of_range.push(0x50); // POP the pushed 0
+
+    // In-range but rejected: 500 TRX against a 100 TRX balance.
+    let mut in_range = push_u64(500_000_000);
+    in_range.extend(push1(0));
+    in_range.push(0xda);
+    in_range.push(0x50);
+
+    let stores_a = fresh_stores();
+    let addr_out = create_address_after(&stores_a, tron_addr(0x25), tron_addr(0x35), out_of_range);
+    let stores_b = fresh_stores();
+    let addr_in = create_address_after(&stores_b, tron_addr(0x26), tron_addr(0x36), in_range);
+    let stores_c = fresh_stores();
+    let addr_none = create_address_after(&stores_c, tron_addr(0x27), tron_addr(0x37), Vec::new());
+
+    assert_ne!(addr_none, [0u8; 32], "the CREATE must have produced an address");
+    assert_eq!(
+        addr_out, addr_in,
+        "an out-of-range amount must bump the nonce exactly as an in-range rejection does"
+    );
+    assert_ne!(
+        addr_out, addr_none,
+        "the rejected FREEZEBALANCEV2 must still advance the create-nonce"
+    );
+}
+
+/// Same for UNFREEZEBALANCEV2 (0xdb).
+#[test]
+fn out_of_range_unfreezebalancev2_still_bumps_internal_tx_nonce() {
+    let mut huge = [0u8; 32];
+    huge[6] = 1;
+    let mut out_of_range = push_u256(huge);
+    out_of_range.extend(push1(0));
+    out_of_range.push(0xdb);
+    out_of_range.push(0x50);
+
+    // In-range but rejected: nothing is staked to unfreeze.
+    let mut in_range = push_u64(5_000_000);
+    in_range.extend(push1(0));
+    in_range.push(0xdb);
+    in_range.push(0x50);
+
+    let stores_a = fresh_stores();
+    let addr_out = create_address_after(&stores_a, tron_addr(0x28), tron_addr(0x38), out_of_range);
+    let stores_b = fresh_stores();
+    let addr_in = create_address_after(&stores_b, tron_addr(0x29), tron_addr(0x39), in_range);
+    let stores_c = fresh_stores();
+    let addr_none = create_address_after(&stores_c, tron_addr(0x2a), tron_addr(0x3a), Vec::new());
+
+    assert_eq!(addr_out, addr_in);
+    assert_ne!(addr_out, addr_none);
+}
+
+/// Regression guard for the same edit: a SUCCESSFUL FREEZEBALANCEV2 must bump
+/// the nonce exactly once, not twice.
+#[test]
+fn successful_freezebalancev2_bumps_internal_tx_nonce_once() {
+    let mut ok = push_u64(10_000_000);
+    ok.extend(push1(0));
+    ok.push(0xda);
+    ok.push(0x50);
+
+    let mut rejected = push_u64(500_000_000);
+    rejected.extend(push1(0));
+    rejected.push(0xda);
+    rejected.push(0x50);
+
+    let stores_a = fresh_stores();
+    let addr_ok = create_address_after(&stores_a, tron_addr(0x2b), tron_addr(0x3b), ok);
+    let stores_b = fresh_stores();
+    let addr_rejected = create_address_after(&stores_b, tron_addr(0x2c), tron_addr(0x3c), rejected);
+
+    assert_eq!(
+        addr_ok, addr_rejected,
+        "success and rejection must consume the same single nonce"
+    );
 }

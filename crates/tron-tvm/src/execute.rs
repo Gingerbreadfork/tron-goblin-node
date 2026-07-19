@@ -116,6 +116,28 @@ fn halt_reason_to_contract_result(
         HaltReason::PrecompileError | HaltReason::PrecompileErrorWithContext(_) => {
             ContractResult::PrecompiledContract
         }
+        // An uncaught throw inside a precompile body reaches `VM.play`'s outer
+        // catch as a plain `ArrayIndexOutOfBoundsException`, for which
+        // `RuntimeImpl.setResultCode` has no arm — it falls through to UNKNOWN.
+        // Explicitly NOT `PrecompiledContract`, which is java's
+        // `PrecompiledContractException`.
+        HaltReason::PrecompileThrow => ContractResult::Unknown,
+        // java's `BytecodeExecutionException` / bare `ArithmeticException`.
+        // `RuntimeImpl.setResultCode` tests for `TransferException` and
+        // `InvalidCodeException` only, so neither of these exception types
+        // matches an arm and both fall through to the tail
+        // `result.setResultCode(contractResult.UNKNOWN)`.
+        HaltReason::TronBytecodeExecution => ContractResult::Unknown,
+        // `BytecodeExecutionException("transfer failure")` from
+        // `Program.callToPrecompiledAddress`. `RuntimeImpl.setResultCode`
+        // enumerates IllegalOperation / OutOfEnergy / BadJumpDestination /
+        // OutOfTime / OutOfMemory / PrecompiledContract / StackTooSmall /
+        // StackTooLarge / JVMStackOverFlow / TransferException /
+        // InvalidCodeException and matches none of them, falling through to
+        // `result.setResultCode(contractResult.UNKNOWN)`. Stated explicitly
+        // rather than left to the catch-all so a future taxonomy change cannot
+        // silently move it.
+        HaltReason::TronPrecompileTransferFailure => ContractResult::Unknown,
         // Everything else java has no dedicated code for → UNKNOWN.
         _ => ContractResult::Unknown,
     }
@@ -1083,6 +1105,8 @@ fn execute_trigger_inner_with_tracer(
         use revm::context_interface::JournalTr as _;
         evm.ctx.journaled_state.tron_transfer_failed()
     };
+    // See `execute_trigger_inner`: a `BytecodeExecutionException` spends all
+    // energy and records `contractResult UNKNOWN`.
     let timeout_budget_ms = deadline.map(|(_, ms)| ms).unwrap_or(0);
     let vm_outcome = match outcome {
         Ok(ExecutionResult::Success { output, gas, logs, .. }) => VmOutcome::Success {
@@ -1905,6 +1929,15 @@ mod halt_result_tests {
                 "boom".to_string()
             )),
             ContractResult::PrecompiledContract
+        );
+
+        // java's `BytecodeExecutionException` / bare `ArithmeticException` —
+        // matched by an explicit arm, NOT the fall-through, because it must
+        // never drift onto `OutOfMemory` the way an `OutOfGas(MemoryLimit)`
+        // carrier would.
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::TronBytecodeExecution),
+            ContractResult::Unknown
         );
 
         // Anything java has no dedicated code for → UNKNOWN (java fall-through).

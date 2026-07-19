@@ -25,9 +25,16 @@ struct MockContext {
     dynamic_factors: std::collections::HashMap<Address, i64>,
     block_number: i64,
     block_timestamp_ms: i64,
+    /// java `VMConfig.allowTvmSelfdestructRestriction()` (proposal #94).
+    /// `None` selects the post-#94 mainnet era these fixtures assume; set
+    /// `Some(false)` to exercise the pre-#94 `extractBytesArray` parser.
+    selfdestruct_restriction: Option<bool>,
 }
 
 impl EvmContext for MockContext {
+    fn allow_tvm_selfdestruct_restriction(&self) -> bool {
+        self.selfdestruct_restriction.unwrap_or(true)
+    }
     fn caller(&self) -> Address {
         self.caller.unwrap_or_else(|| Address::from_raw([0u8; 21]))
     }
@@ -659,6 +666,101 @@ fn ripemd160_returns_double_sha256_not_real_ripemd160() {
     assert_eq!(PrecompileImpl::Ripemd160.energy_cost(&[0u8; 33]), 600 + 240);
 }
 
+// --- EthRipemd160 (0x00020003) --------------------------------------------
+//
+// TRON's 0x03 is a double-SHA256 quirk, so genuine RIPEMD-160 lives at
+// 0x00020003 behind ALLOW_TVM_COMPATIBLE_EVM (proposal #60). revm has no
+// precompile at that address, so it must be implemented locally.
+
+#[test]
+fn eth_ripemd160_returns_left_padded_real_ripemd160() {
+    let ctx = MockContext::default();
+    // java wraps the digest in `new DataWord(result)`, whose constructor
+    // right-aligns a short array — so the 20-byte digest comes back with 12
+    // leading zero bytes. These are the standard RIPEMD-160 vectors.
+    let cases: [(&[u8], [u8; 32]); 2] = [
+        (
+            b"",
+            hex!("0000000000000000000000009c1185a5c5e9fc54612808977ee8f548b2258d31"),
+        ),
+        (
+            b"abc",
+            hex!("0000000000000000000000008eb208f7e05d987a9b044a8e98c6b087f15a0bfc"),
+        ),
+    ];
+    for (input, expected) in cases {
+        let out = PrecompileImpl::EthRipemd160.execute(input, &ctx).unwrap();
+        assert_eq!(out.len(), 32, "output is a full 32-byte word");
+        assert!(
+            out[..12].iter().all(|&b| b == 0),
+            "the 20-byte digest must be right-aligned in the word"
+        );
+        assert_eq!(out, expected.to_vec());
+    }
+}
+
+#[test]
+fn eth_ripemd160_energy_matches_java() {
+    // java `EthRipemd160.getEnergyForData`: `600 + (len + 31) / 32 * 120`.
+    assert_eq!(PrecompileImpl::EthRipemd160.energy_cost(b""), 600);
+    assert_eq!(PrecompileImpl::EthRipemd160.energy_cost(&[0u8; 1]), 600 + 120);
+    assert_eq!(PrecompileImpl::EthRipemd160.energy_cost(&[0u8; 32]), 600 + 120);
+    assert_eq!(PrecompileImpl::EthRipemd160.energy_cost(&[0u8; 33]), 600 + 240);
+    assert_eq!(
+        PrecompileImpl::EthRipemd160.energy_cost(&[0u8; 100]),
+        600 + 120 * 4
+    );
+}
+
+#[test]
+fn eth_ripemd160_differs_from_tron_0x03() {
+    // 0x03 is SHA256(SHA256(input)[0..20]); 0x00020003 is real RIPEMD-160.
+    // They must never be collapsed onto a shared helper.
+    let ctx = MockContext::default();
+    let eth = PrecompileImpl::EthRipemd160.execute(b"abc", &ctx).unwrap();
+    let tron = PrecompileImpl::Ripemd160.execute(b"abc", &ctx).unwrap();
+    assert_ne!(eth, tron, "0x00020003 and 0x03 are different digests");
+}
+
+#[test]
+fn eth_ripemd160_is_not_handled_by_interpreter() {
+    // revm-precompile has nothing at 0x00020003, so deferring upstream would
+    // silently turn the call into a plain CALL to a codeless account.
+    let ctx = MockContext::default();
+    assert!(
+        PrecompileImpl::EthRipemd160.execute(b"", &ctx).is_ok(),
+        "0x00020003 must execute locally, not defer to the interpreter"
+    );
+}
+
+#[test]
+fn every_interpreter_deferred_precompile_exists_upstream() {
+    // Any precompile we report as `HandledByInterpreter` MUST resolve to a
+    // real revm precompile — otherwise revm returns `Ok(None)` and the call
+    // degrades to a plain CALL against a codeless account (success, empty
+    // returndata, zero energy). Two precompiles have shipped with exactly
+    // that defect (ecrecover, EthRipemd160), so pin the invariant.
+    use revm::precompile::{PrecompileSpecId, Precompiles};
+    use revm::primitives::{hardfork::SpecId, Address as EvmAddress};
+
+    let ctx = MockContext::default();
+    let upstream = Precompiles::new(PrecompileSpecId::from_spec_id(SpecId::CANCUN));
+    for p in ALL_PRECOMPILES {
+        let deferred = matches!(
+            p.execute(&[], &ctx),
+            Err(tron_tvm::PrecompileError::HandledByInterpreter)
+        );
+        if !deferred {
+            continue;
+        }
+        let addr = EvmAddress::from_slice(&p.address());
+        assert!(
+            upstream.get(&addr).is_some(),
+            "{p:?} defers to the interpreter but revm has no precompile at {addr}"
+        );
+    }
+}
+
 #[test]
 fn modexp_matches_eip198_energy_and_output() {
     let ctx = MockContext::default();
@@ -998,96 +1100,403 @@ fn validate_multi_sign_resolves_active_permission_by_id() {
     assert_eq!(out.last(), Some(&1u8));
 }
 
-// --- ValidateMultiSign: malformed pre-try input → spend-all-revert ----------
+// --- ValidateMultiSign: malformed pre-try input → uncaught throw -----------
 //
 // In java-tron the pre-try `words[0..3]` /
-// `words[words[3].intValueSafe()/WORD_SIZE]` / `extractSigArray` accesses
-// throw `ArrayIndexOutOfBoundsException` on malformed input. That throw is
-// NOT caught by `ValidateMultiSign.execute`'s try-block, so it propagates to
-// `VM.java`, which runs `spendAllEnergy()` and reverts the whole tx. We model
-// this as `PrecompileError::SpendAllRevert` — distinct from the in-body
-// `Pair.of(true, DATA_FALSE)` results, which stay `Ok(false-word)`.
+// `words[words[3].intValueSafe()/WORD_SIZE]` / array-parse accesses throw
+// `ArrayIndexOutOfBoundsException` on malformed input. That throw is NOT
+// caught by `ValidateMultiSign.execute`'s try-block, so it escapes into
+// `VM.java`, which runs `spendAllEnergy()` on the frame that executed the
+// CALL and halts it. We model this as `PrecompileError::UncaughtThrow` —
+// distinct from the in-body `Pair.of(true, DATA_FALSE)` results, which stay
+// `Ok(false-word)`, and from `SpendAllRevert`, which is java's
+// `Pair.of(false, ...)` return.
+//
+// java also swaps the array parser on `allowTvmSelfdestructRestriction`
+// (proposal #94), so several of these cases differ by era and are asserted
+// for both.
+
+/// Restriction-OFF (pre-#94) variant of [`MockContext`].
+fn pre_94_ctx() -> MockContext {
+    MockContext {
+        selfdestruct_restriction: Some(false),
+        ..Default::default()
+    }
+}
+
+/// Head words + a raw tail, for the malformed-layout cases.
+fn multi_sign_head(target: &Address, tail: &[[u8; 32]]) -> Vec<u8> {
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word(target)); // words[0] address
+    input.extend_from_slice(&word_with_low(0)); // words[1] permission id
+    input.extend_from_slice(&[0u8; 32]); // words[2] payload
+    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
+    for w in tail {
+        input.extend_from_slice(w);
+    }
+    input
+}
 
 #[test]
-fn validate_multi_sign_too_few_words_is_spend_all_revert() {
-    let ctx = MockContext::default();
+fn validate_multi_sign_too_few_words_is_uncaught_throw() {
     // Fewer than 4 words → `words[3]` (and earlier) is out of range in java,
-    // an uncaught throw. Must be the spend-all-revert variant, NOT Ok(false).
-    for word_count in [0usize, 1, 2, 3] {
-        let input = vec![0u8; word_count * 32];
-        let err = PrecompileImpl::ValidateMultiSign
-            .execute(&input, &ctx)
-            .unwrap_err();
-        assert!(
-            matches!(err, tron_tvm::PrecompileError::SpendAllRevert),
-            "{word_count} words must spend-all-revert, got {err:?}"
-        );
+    // an uncaught throw. Era-invariant: java reads `words[0..3]`
+    // unconditionally, before the `allowTvmSelfdestructRestriction` branch.
+    for ctx in [MockContext::default(), pre_94_ctx()] {
+        for word_count in [0usize, 1, 2, 3] {
+            let input = vec![0u8; word_count * 32];
+            let err = PrecompileImpl::ValidateMultiSign
+                .execute(&input, &ctx)
+                .unwrap_err();
+            assert!(
+                matches!(err, tron_tvm::PrecompileError::UncaughtThrow),
+                "{word_count} words must be an uncaught throw, got {err:?}"
+            );
+        }
     }
 }
 
 #[test]
-fn validate_multi_sign_out_of_range_sig_head_is_spend_all_revert() {
-    let ctx = MockContext::default();
+fn validate_multi_sign_out_of_range_sig_head_is_uncaught_throw_post_94() {
     // 4 head words present, `words[3]` = 0x80 → sig-array head index 4, which
-    // is >= words.len() (4). java reads `words[4]` → AIOOBE → uncaught throw.
-    let target_addr = alice();
-    let mut input = Vec::new();
-    input.extend_from_slice(&addr_word(&target_addr)); // words[0]
-    input.extend_from_slice(&word_with_low(0)); // words[1] perm id
-    input.extend_from_slice(&[0u8; 32]); // words[2] payload
-    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
+    // is >= words.len() (4). Post-#94 java reads `words[4]` inside the
+    // `allowTvmSelfdestructRestriction` block → AIOOBE → uncaught throw.
+    let ctx = MockContext::default();
+    let input = multi_sign_head(&alice(), &[]);
     assert_eq!(input.len(), 4 * 32);
     let err = PrecompileImpl::ValidateMultiSign
         .execute(&input, &ctx)
         .unwrap_err();
     assert!(
-        matches!(err, tron_tvm::PrecompileError::SpendAllRevert),
-        "out-of-range sig-array head must spend-all-revert, got {err:?}"
+        matches!(err, tron_tvm::PrecompileError::UncaughtThrow),
+        "out-of-range sig-array head must be an uncaught throw, got {err:?}"
     );
 }
 
 #[test]
-fn validate_multi_sign_sig_element_past_data_is_spend_all_revert() {
-    let ctx = MockContext::default();
+fn validate_multi_sign_out_of_range_sig_head_is_false_pre_94() {
+    // The same input pre-#94. java's size-precheck read
+    // `words[words[3]/WORD_SIZE]` sits INSIDE the
+    // `if (VMConfig.allowTvmSelfdestructRestriction())` block, so it never
+    // runs; `extractBytesArray`'s own `offset > words.length - 1` guard
+    // returns the empty array, giving `signatures.length == 0` →
+    // `Pair.of(true, DATA_FALSE)`. A success, not a full-budget burn.
+    let ctx = pre_94_ctx();
+    let input = multi_sign_head(&alice(), &[]);
+    let out = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .expect("pre-#94 an out-of-range sig head is success-with-false");
+    assert_eq!(out.last(), Some(&0u8));
+}
+
+#[test]
+fn validate_multi_sign_sig_element_past_data_is_uncaught_throw_post_94() {
     // Well-formed head (head idx 4 in range), length word declares 1 element
     // whose pointer word puts the 65-byte signature read far past the end of
-    // the call data → java `Arrays.copyOfRange` throws (pre-try) → spend-all.
-    let target_addr = alice();
-    let mut input = Vec::new();
-    input.extend_from_slice(&addr_word(&target_addr)); // words[0]
-    input.extend_from_slice(&word_with_low(0)); // words[1]
-    input.extend_from_slice(&[0u8; 32]); // words[2]
-    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
-    input.extend_from_slice(&word_with_low(1)); // words[4] len = 1
-    // words[5] element pointer: a huge byte offset so the signature read
-    // starts well past `data.len()` → extractBytes returns None → revert.
-    input.extend_from_slice(&word_with_low(0x10_000 * 32));
+    // the call data → java `Arrays.copyOfRange` throws (pre-try).
+    let ctx = MockContext::default();
+    let input = multi_sign_head(
+        &alice(),
+        &[
+            word_with_low(1),             // words[4] len = 1
+            word_with_low(0x10_000 * 32), // words[5] element pointer, far out
+        ],
+    );
     let err = PrecompileImpl::ValidateMultiSign
         .execute(&input, &ctx)
         .unwrap_err();
     assert!(
-        matches!(err, tron_tvm::PrecompileError::SpendAllRevert),
-        "signature read past data must spend-all-revert, got {err:?}"
+        matches!(err, tron_tvm::PrecompileError::UncaughtThrow),
+        "signature read past data must be an uncaught throw, got {err:?}"
     );
 }
 
 #[test]
-fn validate_multi_sign_oversized_sig_array_is_ok_false_not_revert() {
+fn validate_multi_sign_sig_element_past_data_is_uncaught_throw_pre_94() {
+    // The same layout pre-#94 throws too, but by a different route: the
+    // element's LENGTH word at `words[offset + bytesOffset + 1]` is read
+    // first (java `extractBytesArray` line 392) and is itself out of range.
+    let ctx = pre_94_ctx();
+    let input = multi_sign_head(
+        &alice(),
+        &[word_with_low(1), word_with_low(0x10_000 * 32)],
+    );
+    let err = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .unwrap_err();
+    assert!(
+        matches!(err, tron_tvm::PrecompileError::UncaughtThrow),
+        "pre-#94 element length word past words must throw, got {err:?}"
+    );
+}
+
+#[test]
+fn validate_multi_sign_element_length_word_in_range_implies_data_read_in_range() {
+    // The pre-#94 parser reads one extra word per element — the declared
+    // length at `words[offset + bytesOffset + 1]` (java `extractBytesArray`
+    // line 392) — that the post-#94 parser never touches. That extra read can
+    // never be the SOLE cause of a throw: java reads the element data from
+    // `(bytesOffset + offset + 2) * WORD_SIZE`, exactly one word past the
+    // length word, so whenever the length word is out of range the data read
+    // is past the end of the call data too and both eras throw.
+    //
+    // Pin that equivalence: for element pointers spanning in-range and
+    // out-of-range length words, the two eras agree on whether the call
+    // throws at all. (What they disagree on is the declared LENGTH, covered
+    // by the tests below.)
+    let target = alice();
+    for ptr_words in [1usize, 2, 4, 8, 64, 0x10_000] {
+        let input = multi_sign_head(
+            &target,
+            &[word_with_low(1), word_with_low(ptr_words * 32)],
+        );
+        let pre = PrecompileImpl::ValidateMultiSign.execute(&input, &pre_94_ctx());
+        let post = PrecompileImpl::ValidateMultiSign.execute(&input, &MockContext::default());
+        assert_eq!(
+            pre.is_err(),
+            post.is_err(),
+            "ptr={ptr_words} words: eras disagree on throwing (pre={pre:?} post={post:?})"
+        );
+    }
+}
+
+// --- ValidateMultiSign: pre-#94 per-element declared lengths ---------------
+//
+// The genuine pre-#94 divergence is the element LENGTH. `extractBytesArray`
+// materialises `declared_len` bytes per element; `extractSigArray` always
+// reads exactly 65. java's `recoverAddrBySign` rejects `sign.length < 65`
+// outright, and `ValidateMultiSign` de-dups on `merge(recoveredAddr, sign)`,
+// whose value carries that length.
+
+/// Canonical Solidity `bytes[]`, as java's pre-#94 `extractBytesArray`
+/// parses it: a length word, `N` pointer words relative to the start of the
+/// data area, then per element a declared-length word followed by
+/// `ceil(bytes.len() / 32)` data words. `declared_len` is written verbatim,
+/// so a test can declare a length that differs from the bytes supplied.
+///
+/// `head_idx` is the array-head word index within the whole calldata.
+fn encode_bytes_array(elems: &[(Vec<u8>, usize)], head_idx: usize) -> Vec<u8> {
+    let n = elems.len();
+    let mut starts = Vec::with_capacity(n);
+    let mut cursor = head_idx + 1 + n;
+    for (bytes, _) in elems {
+        starts.push(cursor);
+        cursor += 1 + bytes.len().div_ceil(32);
+    }
+    let mut words: Vec<[u8; 32]> = vec![word_with_low(n)];
+    for s in &starts {
+        words.push(word_with_low((s - head_idx - 1) * 32));
+    }
+    for (bytes, declared) in elems {
+        words.push(word_with_low(*declared));
+        for chunk in bytes.chunks(32) {
+            let mut w = [0u8; 32];
+            w[..chunk.len()].copy_from_slice(chunk);
+            words.push(w);
+        }
+    }
+    let mut out = Vec::with_capacity(words.len() * 32);
+    for w in words {
+        out.extend_from_slice(&w);
+    }
+    out
+}
+
+/// ValidateMultiSign calldata whose signature array uses the canonical
+/// `bytes[]` encoding above (head word index 4).
+fn multi_sign_input_canonical(
+    addr: &Address,
+    perm_id: i32,
+    payload: &[u8; 32],
+    elems: &[(Vec<u8>, usize)],
+) -> Vec<u8> {
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word(addr));
+    input.extend_from_slice(&word_with_low(perm_id as usize));
+    input.extend_from_slice(payload);
+    input.extend_from_slice(&word_with_low(0x80)); // → head word index 4
+    input.extend_from_slice(&encode_bytes_array(elems, 4));
+    input
+}
+
+/// An account whose owner permission grants `weight` to `signer`, with the
+/// given threshold.
+fn ctx_with_owner_permission(
+    signer: &[u8; 20],
+    weight: i64,
+    threshold: i64,
+    restriction: Option<bool>,
+) -> MockContext {
+    let mut ctx = MockContext {
+        selfdestruct_restriction: restriction,
+        ..Default::default()
+    };
+    let mut key_addr = vec![0x41u8];
+    key_addr.extend_from_slice(signer);
+    ctx.accounts.insert(
+        alice(),
+        Account {
+            address: alice().as_bytes().to_vec(),
+            owner_permission: Some(tron_proto::Permission {
+                r#type: 0,
+                id: 0,
+                permission_name: "owner".into(),
+                threshold,
+                parent_id: 0,
+                operations: vec![],
+                keys: vec![tron_proto::Key {
+                    address: key_addr,
+                    weight,
+                }],
+            }),
+            ..Default::default()
+        },
+    );
+    ctx
+}
+
+#[test]
+fn sig_array_parsing_is_era_identical_for_canonical_65_byte_elements() {
+    // Well-formed calldata — canonical encoding, declared length exactly 65 —
+    // must produce byte-identical output in both eras. Proves the pre-#94
+    // parser is inert on everything a real caller emits.
+    let (sk, signer) = keypair_from_seed(11);
+    let payload = [0x5au8; 32];
+    let hash = multi_sign_prehash(&alice(), 0, &payload);
+    let sig = sign_prehash(&sk, &hash);
+    let input = multi_sign_input_canonical(&alice(), 0, &payload, &[(sig.to_vec(), 65)]);
+
+    let post = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx_with_owner_permission(&signer, 1, 1, None))
+        .unwrap();
+    let pre = PrecompileImpl::ValidateMultiSign
+        .execute(
+            &input,
+            &ctx_with_owner_permission(&signer, 1, 1, Some(false)),
+        )
+        .unwrap();
+    assert_eq!(post, pre, "canonical 65-byte elements must parse identically");
+    assert_eq!(post.last(), Some(&1u8), "the real signer meets the threshold");
+}
+
+#[test]
+fn validate_multi_sign_short_element_is_unrecoverable_pre_94() {
+    // Canonical layout, a valid 65-byte signature block, but the element's
+    // declared length word says 64. Pre-#94 java materialises 64 bytes and
+    // `recoverAddrBySign` rejects `sign.length < 65` → empty address →
+    // weight 0 → DATA_FALSE. Post-#94 the fixed 65-byte read recovers the
+    // real signer and the threshold is met. A consensus-visible flip.
+    let (sk, signer) = keypair_from_seed(12);
+    let payload = [0x33u8; 32];
+    let hash = multi_sign_prehash(&alice(), 0, &payload);
+    let sig = sign_prehash(&sk, &hash);
+    let input = multi_sign_input_canonical(&alice(), 0, &payload, &[(sig.to_vec(), 64)]);
+
+    let post = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx_with_owner_permission(&signer, 1, 1, None))
+        .unwrap();
+    assert_eq!(post.last(), Some(&1u8), "post-#94 reads a fixed 65 bytes");
+
+    let pre = PrecompileImpl::ValidateMultiSign
+        .execute(
+            &input,
+            &ctx_with_owner_permission(&signer, 1, 1, Some(false)),
+        )
+        .unwrap();
+    assert_eq!(pre.last(), Some(&0u8), "pre-#94 a 64-byte element cannot recover");
+}
+
+#[test]
+fn validate_multi_sign_dedup_distinguishes_declared_lengths_pre_94() {
+    // Two elements carrying the same 65-byte signature, declared 65 and 96.
+    // java de-dups on `merge(recoveredAddr, sign)`; pre-#94 the two `sign`
+    // values differ in length, so the signer's weight is added TWICE.
+    // Post-#94 both are the same 65-byte read → de-duped → counted once.
+    // Threshold 2 with weight 1 puts the flip on the boolean.
+    let (sk, signer) = keypair_from_seed(13);
+    let payload = [0x77u8; 32];
+    let hash = multi_sign_prehash(&alice(), 0, &payload);
+    let sig = sign_prehash(&sk, &hash);
+    // The 96-byte element is the signature zero-extended to 96 bytes, so both
+    // elements recover the same signer.
+    let mut long = sig.to_vec();
+    long.resize(96, 0);
+    let input = multi_sign_input_canonical(
+        &alice(),
+        0,
+        &payload,
+        &[(sig.to_vec(), 65), (long, 96)],
+    );
+
+    let pre = PrecompileImpl::ValidateMultiSign
+        .execute(
+            &input,
+            &ctx_with_owner_permission(&signer, 1, 2, Some(false)),
+        )
+        .unwrap();
+    assert_eq!(
+        pre.last(),
+        Some(&1u8),
+        "pre-#94 the two declared lengths are distinct signs → weight 1 + 1"
+    );
+
+    let post = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx_with_owner_permission(&signer, 1, 2, None))
+        .unwrap();
+    assert_eq!(
+        post.last(),
+        Some(&0u8),
+        "post-#94 both are the same 65-byte read → de-duped → weight 1"
+    );
+}
+
+#[test]
+fn huge_declared_element_length_does_not_allocate() {
+    // A declared length of `Integer.MAX_VALUE` with the data read inside the
+    // call data. java's `Arrays.copyOfRange` would materialise 2 GiB; we must
+    // not, and the pre-#94 path has no MAX_SIZE precheck to stop it. Must
+    // return promptly (the recovered signer is garbage → DATA_FALSE).
+    let payload = [0u8; 32];
+    let input = multi_sign_input_canonical(
+        &alice(),
+        0,
+        &payload,
+        &[(vec![0xabu8; 65], i32::MAX as usize)],
+    );
+    let out = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &pre_94_ctx())
+        .expect("an unrecoverable signature is success-with-false");
+    assert_eq!(out.last(), Some(&0u8));
+}
+
+#[test]
+fn validate_multi_sign_oversized_sig_array_is_ok_false_post_94() {
     // `sigArraySize > MAX_SIZE` is an explicit `Pair.of(true, DATA_FALSE)` in
     // java — a SUCCESSFUL precompile with a false word, NOT a throw. Must stay
     // Ok(false-word) so only one signature group's energy is charged.
     let ctx = MockContext::default();
-    let target_addr = alice();
-    let mut input = Vec::new();
-    input.extend_from_slice(&addr_word(&target_addr)); // words[0]
-    input.extend_from_slice(&word_with_low(0)); // words[1]
-    input.extend_from_slice(&[0u8; 32]); // words[2]
-    input.extend_from_slice(&word_with_low(0x80)); // words[3] → head idx 4
-    input.extend_from_slice(&word_with_low(6)); // words[4] len = 6 > MAX_SIZE 5
+    // words[4] len = 6 > MAX_SIZE 5.
+    let input = multi_sign_head(&alice(), &[word_with_low(6)]);
     let out = PrecompileImpl::ValidateMultiSign
         .execute(&input, &ctx)
-        .expect("oversized declared size is success-with-false, not a revert");
+        .expect("oversized declared size is success-with-false, not a throw");
     assert_eq!(out.last(), Some(&0u8), "oversized array → false word");
+}
+
+#[test]
+fn validate_multi_sign_oversized_sig_array_is_uncaught_throw_pre_94() {
+    // The same input pre-#94: there is no up-front size check, so
+    // `extractBytesArray` walks all 6 declared elements and its very first
+    // pointer read `words[5]` is past the 5 words present → AIOOBE.
+    let ctx = pre_94_ctx();
+    let input = multi_sign_head(&alice(), &[word_with_low(6)]);
+    let err = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .unwrap_err();
+    assert!(
+        matches!(err, tron_tvm::PrecompileError::UncaughtThrow),
+        "pre-#94 has no size precheck, the element read throws, got {err:?}"
+    );
 }
 
 #[test]

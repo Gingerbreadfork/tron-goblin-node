@@ -387,7 +387,13 @@ fn iscontract_halts_without_solidity_059_runs_with_it() {
 
 const VALIDATEMULTISIGN_ADDR: [u8; 20] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x01, 0x00, 0x00, 0x04,
+    0x00, 0x00, 0x00, 0x00, 0x0a,
+];
+
+/// `0x00020003` — EthRipemd160, gated by ALLOW_TVM_COMPATIBLE_EVM (#60).
+const ETH_RIPEMD160_ADDR: [u8; 20] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x02, 0x00, 0x03,
 ];
 
 fn call_precompile_size_bytecode(addr: [u8; 20]) -> Vec<u8> {
@@ -456,4 +462,120 @@ fn validatemultisign_precompile_unreachable_without_solidity_059() {
     // (We tolerate a halt here too — some revm versions halt on a CALL
     // to a precompile address when the precompile returns Revert. The
     // key invariant is "precompile didn't produce its real output".)
+}
+
+// ---------- EthRipemd160 (0x00020003) gating ----------
+//
+// Real RIPEMD-160 lives at 0x00020003 on TRON (0x03 is the double-SHA256
+// quirk), behind ALLOW_TVM_COMPATIBLE_EVM (proposal #60). revm has no
+// precompile at that address, so if the dispatcher deferred it upstream the
+// call would silently degrade to a plain CALL against a codeless account —
+// empty returndata and zero energy — in BOTH eras. This drives the call
+// through the whole `TronPrecompiles` provider, which the registry-level
+// tests bypass.
+
+/// The 32-byte value the contract SSTOREd at slot 0.
+fn stored_slot0(stores: &VmStores, contract: [u8; 21]) -> Vec<u8> {
+    use tron_chainbase::StorageRowStore;
+    let key = StorageRowStore::compose_key(&Address::from_raw(contract), &[0u8; 32]);
+    stores.storage.get(&key).unwrap().unwrap_or_default()
+}
+
+/// `CALL(0xFFFF gas, addr, 0, 0, 0, 0, 0); POP; STOP` — no SSTORE, so the
+/// energy total is not perturbed by the set-vs-reset storage price.
+fn call_precompile_bytecode(addr: [u8; 20]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00]);
+    bc.push(0x73); // PUSH20
+    bc.extend_from_slice(&addr);
+    bc.extend_from_slice(&[0x61, 0xFF, 0xFF]); // PUSH2 gas
+    bc.push(0xf1); // CALL
+    bc.push(0x50); // POP
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// `RETURNDATASIZE` after a CALL to `addr`, read back from slot 0.
+fn precompile_returndatasize(addr: [u8; 20], compatible_evm: bool) -> u64 {
+    let stores = fresh_stores();
+    if compatible_evm {
+        stores
+            .dynamic_properties
+            .put_long(b"ALLOW_TVM_COMPATIBLE_EVM", 1);
+    }
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd0);
+    install_contract(&stores, c, call_precompile_size_bytecode(addr));
+    assert!(
+        is_success(&run(&stores, caller, c)),
+        "the probe contract must succeed"
+    );
+    let value = stored_slot0(&stores, c);
+    if value.is_empty() {
+        return 0;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&value[24..32]);
+    u64::from_be_bytes(buf)
+}
+
+/// Energy consumed by a bare CALL to `addr`.
+fn precompile_call_energy(addr: [u8; 20], compatible_evm: bool) -> u64 {
+    let stores = fresh_stores();
+    if compatible_evm {
+        stores
+            .dynamic_properties
+            .put_long(b"ALLOW_TVM_COMPATIBLE_EVM", 1);
+    }
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd1);
+    install_contract(&stores, c, call_precompile_bytecode(addr));
+    match run(&stores, caller, c) {
+        VmOutcome::Success { energy_used, .. } => energy_used,
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+/// `0x00020004` — adjacent to EthRipemd160 but not a precompile at any
+/// proposal state, so a CALL to it is the plain codeless-account baseline.
+const NOT_A_PRECOMPILE: [u8; 20] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x02, 0x00, 0x04,
+];
+
+#[test]
+fn eth_ripemd160_is_inert_without_compatible_evm() {
+    // Proposal off → java's `getContractForAddress` returns null → a plain
+    // CALL to a codeless account: success, empty returndata, no 600 charge.
+    assert_eq!(
+        precompile_returndatasize(ETH_RIPEMD160_ADDR, false),
+        0,
+        "with #60 off the precompile must not produce output"
+    );
+    assert_eq!(
+        precompile_call_energy(ETH_RIPEMD160_ADDR, false),
+        precompile_call_energy(NOT_A_PRECOMPILE, false),
+        "with #60 off the call must cost exactly what a codeless account costs"
+    );
+}
+
+#[test]
+fn eth_ripemd160_runs_and_charges_600_with_compatible_evm() {
+    assert_eq!(
+        precompile_returndatasize(ETH_RIPEMD160_ADDR, true),
+        32,
+        "with #60 on the precompile returns a 32-byte word"
+    );
+    // `ALLOW_TVM_COMPATIBLE_EVM` also swaps the gas-parameter table
+    // (`tron_gas_params_for`), so hold it ON for both runs and vary only the
+    // callee. The delta is then the 600 java's `EthRipemd160
+    // .getEnergyForData` charges for an empty input.
+    let control = precompile_call_energy(NOT_A_PRECOMPILE, true);
+    let energy = precompile_call_energy(ETH_RIPEMD160_ADDR, true);
+    assert_eq!(
+        energy - control,
+        600,
+        "EthRipemd160 must charge a flat 600 for empty input \
+         (control={control} precompile={energy})"
+    );
 }

@@ -80,6 +80,10 @@ struct TronEvmContext {
     callee: TronAddress,
     block_number: i64,
     block_timestamp_ms: i64,
+    /// Per-tx hard-fork proposal snapshot, so precompile bodies that
+    /// branch on an `ALLOW_*` flag read the same values as the opcode
+    /// and spec gates rather than re-reading the store.
+    proposals: crate::proposals::ProposalSet,
 }
 
 impl EvmContext for TronEvmContext {
@@ -105,6 +109,9 @@ impl EvmContext for TronEvmContext {
         // Returns Ok(None) if the key isn't set. We use the public
         // `get_long` accessor that DynamicPropertiesStore exposes.
         Ok(self.dynamic_properties.get_long(key))
+    }
+    fn allow_tvm_selfdestruct_restriction(&self) -> bool {
+        self.proposals.allow_tvm_selfdestruct_restriction
     }
     fn block_number(&self) -> i64 {
         self.block_number
@@ -246,49 +253,11 @@ impl TronPrecompiles {
     }
 
     /// Returns true iff the given TRON precompile is enabled under the
-    /// active proposal set. Mirrors java-tron's
-    /// `PrecompiledContracts.getContractForAddress` — every `if
-    /// (VMConfig.allowXyz())` short-circuit becomes a row here. Standard
-    /// EVM precompiles (0x01..0x08) are handled by the `eth` fallback
-    /// and are NOT consulted here.
+    /// active proposal set. Thin wrapper over
+    /// [`crate::precompiles::precompile_enabled`], which holds the gate table
+    /// mirroring java-tron's `PrecompiledContracts.getContractForAddress`.
     fn precompile_enabled(&self, pre: PrecompileImpl) -> bool {
-        use PrecompileImpl::*;
-        match pre {
-            // Standard EVM — handled by eth fallback, dispatch_tron
-            // already filters these out earlier. Treat as always-on so
-            // future use of this method is safe.
-            EcRecover | Sha256 | Ripemd160 | Identity | ModExp | Bn128Add | Bn128Mul
-            | Bn128Pairing => true,
-            // TRON multi-sig — both behind ALLOW_TVM_SOLIDITY_059.
-            BatchValidateSign | ValidateMultiSign => self.proposals.allow_tvm_solidity_059,
-            // Shielded — behind ALLOW_SHIELDED_TRC20_TRANSACTION.
-            VerifyMintProof | VerifyTransferProof | VerifyBurnProof | MerkleHash => {
-                self.proposals.allow_shielded_trc20_transaction
-            }
-            // Vote / SR queries — behind ALLOW_TVM_VOTE.
-            RewardBalance | IsSrCandidate | VoteCount | UsedVoteCount | ReceivedVoteCount
-            | TotalVoteCount => self.proposals.allow_tvm_vote,
-            // FreezeV2 / chain queries — behind ALLOW_TVM_FREEZE_V2.
-            // `GetChainParameter` ships with the v2 batch in
-            // `PrecompiledContracts.java:300` (`if
-            // (VMConfig.allowTvmFreezeV2())` covers the whole block).
-            GetChainParameter | AvailableUnfreezeV2Size | UnfreezableBalanceV2
-            | ExpireUnfreezeBalanceV2 | DelegatableResource | ResourceV2
-            | CheckUnDelegateResource | ResourceUsage | TotalResource
-            | TotalDelegatedResource | TotalAcquiredResource => {
-                self.proposals.allow_tvm_freeze_v2
-            }
-            // Ethereum-compat extras — behind ALLOW_TVM_COMPATIBLE_EVM.
-            EthRipemd160 | Blake2F => self.proposals.allow_tvm_compatible_evm,
-            // P256Verify ships with ALLOW_TVM_OSAKA in java-tron. We
-            // don't model OSAKA on the spec resolver yet (TRON's Osaka
-            // proposal isn't activated on any live chain), so we hide
-            // P256Verify entirely until that proposal lands. Treat as
-            // off → falls through to an EOA-like call (no precompile
-            // dispatch), matching java-tron's `getContractForAddress`
-            // returning null.
-            P256Verify => self.proposals.allow_tvm_osaka,
-        }
+        crate::precompiles::precompile_enabled(pre, &self.proposals)
     }
 
     /// Try to dispatch the call to a TRON-specific precompile. Returns
@@ -302,13 +271,16 @@ impl TronPrecompiles {
         // Standard EVM precompiles report `HandledByInterpreter` from
         // our registry — defer to the `eth` fallback for those.
         //
-        // `EcRecover` (0x01), `Ripemd160` (0x03) and `ModExp` (0x05) are
-        // deliberately NOT in this list: TRON's 0x01 returns the recovered
-        // address in the 21-byte form (prefix byte at word index 11) and an
-        // empty payload on failure, TRON's 0x03 returns a double-SHA256 (not
-        // real ripemd160), and TRON's 0x05 charges the permanent EIP-198
-        // energy (not revm's EIP-2565), so all three are dispatched to our
-        // registry.
+        // `EcRecover` (0x01), `Ripemd160` (0x03), `ModExp` (0x05) and
+        // `EthRipemd160` (0x00020003) are deliberately NOT in this list:
+        // TRON's 0x01 returns the recovered address in the 21-byte form
+        // (prefix byte at word index 11) and an empty payload on failure,
+        // TRON's 0x03 returns a double-SHA256 (not real ripemd160), TRON's
+        // 0x05 charges the permanent EIP-198 energy (not revm's EIP-2565),
+        // and 0x00020003 — the address where real ripemd160 actually lives
+        // on TRON — has no upstream counterpart at all (revm's ripemd160 sits
+        // at 0x03, which TRON reuses for its double-SHA256 quirk). All four
+        // are dispatched to our registry.
         if matches!(
             pre,
             PrecompileImpl::Sha256
@@ -316,7 +288,6 @@ impl TronPrecompiles {
                 | PrecompileImpl::Bn128Add
                 | PrecompileImpl::Bn128Mul
                 | PrecompileImpl::Bn128Pairing
-                | PrecompileImpl::EthRipemd160
         ) {
             return None;
         }
@@ -343,6 +314,7 @@ impl TronPrecompiles {
             callee: evm_to_tron_address(&inputs.target_address),
             block_number: self.block_number,
             block_timestamp_ms: self.block_timestamp_ms,
+            proposals: self.proposals,
         };
 
         // Flat precompile energy cost. java-tron charges a precompile its
@@ -367,14 +339,31 @@ impl TronPrecompiles {
                 // be defensive.
                 (PrecompileStatus::Revert, Bytes::new(), 0)
             }
-            Err(PrecompileError::SpendAllRevert) => {
+            Err(PrecompileError::UncaughtThrow) => {
                 // java-tron: an uncaught ArrayIndexOutOfBoundsException in the
-                // precompile body (e.g. ValidateMultiSign's pre-try word
-                // accesses) propagates to VM.java, which runs spendAllEnergy()
-                // and halts — the whole transaction reverts after burning the
-                // entire energy budget. A zero-cost revert (the Err arm below)
+                // precompile body (ValidateMultiSign's pre-try word accesses)
+                // escapes Program.callToPrecompiledAddress into VM.java, whose
+                // catch runs spendAllEnergy() on the frame that executed the
+                // CALL and halts it — that frame loses its whole remaining
+                // budget, not merely the energy it forwarded here. The frame
+                // bridge (`revm-handler::Frame::return_result`) applies the
+                // spend-all and the halt to the caller.
+                let mut gas = revm::interpreter::Gas::new(inputs.gas_limit);
+                gas.spend_all();
+                return Some(InterpreterResult {
+                    result: revm::interpreter::InstructionResult::PrecompileThrow,
+                    gas,
+                    output: Bytes::new(),
+                });
+            }
+            Err(PrecompileError::SpendAllRevert) => {
+                // java-tron: the precompile returned `Pair.of(false, ...)`, so
+                // `Program.callToPrecompiledAddress` (Program.java:1762-1768)
+                // runs `refundEnergy(0)` + `stackPushZero()` — the forwarded
+                // energy is consumed in full, the caller keeps the rest of its
+                // budget and continues. A zero-cost revert (the Err arm below)
                 // is reserved for the success-with-false Ok(..) outputs.
-                return Some(make_halt(inputs.gas_limit, "uncaught precompile throw"));
+                return Some(make_halt(inputs.gas_limit, "precompile returned false"));
             }
             Err(_) => (PrecompileStatus::Revert, Bytes::new(), 0),
         };

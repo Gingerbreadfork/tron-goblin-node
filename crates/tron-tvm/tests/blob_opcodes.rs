@@ -12,6 +12,9 @@
 //! 2. `ALLOW_TVM_CANCUN` on, `ALLOW_TVM_BLOB` off → CANCUN spec but
 //!    BLOBHASH/BLOBBASEFEE halt via the override.
 //! 3. Both flags on → opcodes execute cleanly.
+//! 4. With both flags on, BLOBBASEFEE pushes zero, matching java's
+//!    `blobBaseFeeAction` (`DataWord.ZERO()`) rather than an
+//!    Ethereum blob gas price.
 
 use std::sync::Arc;
 
@@ -106,6 +109,12 @@ fn run(stores: &VmStores, caller: [u8; 21], contract: [u8; 21]) -> VmOutcome {
 const BLOBHASH_BC: &[u8] = &[0x60, 0x00, 0x49, 0x60, 0x00, 0x55, 0x00];
 // BLOBBASEFEE bytecode: BLOBBASEFEE ; PUSH1 0 ; SSTORE ; STOP
 const BLOBBASEFEE_BC: &[u8] = &[0x4a, 0x60, 0x00, 0x55, 0x00];
+// Self-checking BLOBBASEFEE value probe, by offset:
+//   0x00 BLOBBASEFEE ; 0x01 ISZERO ; 0x02 PUSH1 0x06 ; 0x04 JUMPI
+//   0x05 INVALID     ; 0x06 JUMPDEST ; 0x07 STOP
+// The jump is taken only when BLOBBASEFEE pushed zero; any other value
+// falls through to INVALID and halts.
+const BLOBBASEFEE_IS_ZERO_BC: &[u8] = &[0x4a, 0x15, 0x60, 0x06, 0x57, 0xfe, 0x5b, 0x00];
 
 fn was_halted(outcome: VmOutcome) -> bool {
     matches!(outcome, VmOutcome::Halt { .. })
@@ -174,5 +183,23 @@ fn blob_opcodes_execute_when_cancun_and_blob_on() {
     assert!(
         was_success(run(&stores, caller, c2)),
         "BLOBBASEFEE must succeed with CANCUN + BLOB on"
+    );
+}
+
+#[test]
+fn blobbasefee_pushes_zero() {
+    // java's `blobBaseFeeAction` (OperationActions.java:686) pushes
+    // `DataWord.ZERO()` with no host or environment lookup, so TRON reports a
+    // zero blob base fee in every era. Ethereum's blob gas price floors at
+    // `MIN_BLOB_GASPRICE` (1) and can never satisfy this.
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_CANCUN", 1);
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_BLOB", 1);
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xc3);
+    install_contract(&stores, c, BLOBBASEFEE_IS_ZERO_BC.to_vec());
+    assert!(
+        was_success(run(&stores, caller, c)),
+        "BLOBBASEFEE must push 0 (java DataWord.ZERO()), not the blob gas price"
     );
 }

@@ -6,8 +6,8 @@ use auto_impl::auto_impl;
 use context::{ContextTr, Database, Evm, FrameStack};
 use context_interface::context::ContextError;
 use interpreter::{
-    interpreter::EthInterpreter, interpreter_action::FrameInit, InstructionResult,
-    InterpreterResult,
+    interpreter::EthInterpreter, interpreter_action::FrameInit, interpreter_types::LoopControl,
+    InstructionResult, InterpreterResult,
 };
 
 /// Type alias for database error within a context
@@ -205,11 +205,20 @@ where
         let context = &mut self.ctx;
         let instructions = &mut self.instruction;
 
-        let action = frame.interpreter.run_plain(
-            instructions.instruction_table(),
-            instructions.gas_table(),
-            context,
-        );
+        // A frame whose interpreter already carries an action has been halted
+        // outside the opcode loop — TRON's `PrecompileThrow` stops the calling
+        // frame from `Frame::return_result` rather than returning to it. Take
+        // that action as-is; stepping the interpreter would run one more opcode
+        // and trip `ExtBytecode::set_action`'s "action already set" assertion.
+        let action = if frame.interpreter.bytecode.is_not_end() {
+            frame.interpreter.run_plain(
+                instructions.instruction_table(),
+                instructions.gas_table(),
+                context,
+            )
+        } else {
+            frame.interpreter.take_next_action()
+        };
 
         frame.process_next_action(context, action).inspect(|i| {
             if i.is_result() {

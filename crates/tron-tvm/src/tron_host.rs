@@ -288,6 +288,20 @@ impl TronDatabaseExt for TronDatabase {
     }
 
     fn tron_is_contract(&self, address: Address) -> bool {
+        // A top-level `CreateSmartContract` deploy: java writes the
+        // `SmartContract` row into the invoke's `rootRepository` BEFORE the init
+        // code runs (`VMActuator.create` -> `rootRepository.createContract`), so
+        // `address(this).isContract` inside the constructor is 1. Our top-level
+        // deploy runs as a CALL to a pre-installed Normal-typed account and
+        // writes no contract row until commit, so neither branch below would see
+        // it. `top_level_deploy_version` is set once per transaction, only by
+        // `execute_create`, for exactly that address (and is `None` for trigger
+        // txs), so keying on it reproduces java's pre-init-code row.
+        if let Some((deploy_addr, _)) = self.top_level_deploy_version {
+            if deploy_addr == address {
+                return true;
+            }
+        }
         let tron_addr = evm_to_tron_address(&address);
         // java-tron's ISCONTRACT (0xd4 → `Program.isContract`) returns true iff
         // the contract store holds a SmartContract row for the address
@@ -316,6 +330,20 @@ impl TronDatabaseExt for TronDatabase {
     fn tron_account_exists(&self, address: Address) -> bool {
         let tron_addr = evm_to_tron_address(&address);
         matches!(self.accounts.get(&tron_addr), Ok(Some(_)))
+    }
+
+    fn tron_is_precompile(&self, address: Address) -> bool {
+        // java's `PrecompiledContracts.getContractForAddress` consults
+        // `VMConfig`, which is loaded from the dynamic-properties store, so the
+        // dispatch set is height-dependent for everything except 0x01..0x08.
+        // With no store attached nothing dispatches, matching a `VMConfig` on
+        // which no proposal has been activated.
+        let Some(dp) = &self.dyn_props else {
+            return false;
+        };
+        let proposals = crate::proposals::ProposalSet::from_store(dp);
+        let addr: [u8; 20] = address.into();
+        crate::precompiles::is_active_precompile(&addr, &proposals)
     }
 
     fn tron_account_exists_or_created(&self, address: Address) -> bool {
@@ -366,6 +394,36 @@ impl TronDatabaseExt for TronDatabase {
         // (#20). Gates CALLTOKEN/TOKENBALANCE tokenId range validation.
         match &self.dyn_props {
             Some(dp) => dp.get_long(b"ALLOW_MULTI_SIGN").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_allow_tvm_solidity_059(&self) -> bool {
+        // java `VMConfig.allowTvmSolidity059()` — the `ALLOW_TVM_SOLIDITY_059`
+        // proposal (#32). Gates `Program.createAccountIfNotExist`, i.e. whether
+        // a contract may create the recipient of a value/TRC-10 transfer.
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_TVM_SOLIDITY_059").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_allow_tvm_constantinople(&self) -> bool {
+        // java `VMConfig.allowTvmConstantinople()` — the
+        // `ALLOW_TVM_CONSTANTINOPLE` proposal (#26). Selects `TransferException`
+        // (consumed-only, TRANSFER_FAILED) over `BytecodeExecutionException`
+        // (spend-all, UNKNOWN) when a transfer validation fails.
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_TVM_CONSTANTINOPLE").unwrap_or(0) == 1,
+            None => false,
+        }
+    }
+
+    fn tron_allow_tvm_transfer_trc10(&self) -> bool {
+        // java `VMConfig.allowTvmTransferTrc10()` — the
+        // `ALLOW_TVM_TRANSFER_TRC10` proposal (#18).
+        match &self.dyn_props {
+            Some(dp) => dp.get_long(b"ALLOW_TVM_TRANSFER_TRC10").unwrap_or(0) == 1,
             None => false,
         }
     }
@@ -470,7 +528,17 @@ impl TronDatabaseExt for TronDatabase {
     /// self-target suicide (#94, pre-existing contract) is a pure no-op
     /// after validation -- java `suicide2` returns right after the
     /// internal-tx record.
-    fn tron_suicide(&mut self, owner: Address, obtainer: Address, will_destroy: bool) -> i64 {
+    ///
+    /// Before `ALLOW_TVM_SOLIDITY_059` an obtainer with no account row
+    /// cannot be created, so the inheritance may fail outright: see the
+    /// `createAccountIfNotExist` gate below for the `-2` / `-3` returns.
+    fn tron_suicide(
+        &mut self,
+        owner: Address,
+        obtainer: Address,
+        will_destroy: bool,
+        owner_balance: i64,
+    ) -> i64 {
         use tron_types::resource::{self as res, ResourceKind, ResourceGates};
 
         let Some(dyn_props) = self.dyn_props.clone() else {
@@ -541,6 +609,15 @@ impl TronDatabaseExt for TronDatabase {
         let allow_freeze_v2 = dyn_props.support_unfreeze_delay();
         let allow_vote = dyn_props.get_long(b"ALLOW_TVM_VOTE").unwrap_or(0) == 1;
         let allow_trc10 = dyn_props.get_long(b"ALLOW_TVM_TRANSFER_TRC10").unwrap_or(0) == 1;
+        // java `VMConfig.allowTvmSolidity059()` / `allowTvmConstantinople()` —
+        // the gate on `createAccountIfNotExist` and the selector for the
+        // failure flavour when the obtainer cannot be created. See the
+        // inheritor block below.
+        let allow_059 = dyn_props.get_long(b"ALLOW_TVM_SOLIDITY_059").unwrap_or(0) == 1;
+        let allow_constantinople = dyn_props
+            .get_long(b"ALLOW_TVM_CONSTANTINOPLE")
+            .unwrap_or(0)
+            == 1;
         let restriction = dyn_props
             .get_long(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION")
             .unwrap_or(0)
@@ -674,6 +751,44 @@ impl TronDatabaseExt for TronDatabase {
         // ALLOW_MULTI_SIGN is on, gets the default owner+active[id=2]
         // permission — exactly as java's `createNormalAccount` builds it. An
         // existing inheritor keeps its row untouched.
+        //
+        // `createAccountIfNotExist` only creates once ALLOW_TVM_SOLIDITY_059
+        // (#32) is active. Before it, an obtainer with no row stays absent and
+        // java's outcome splits three ways on the dying contract's balance,
+        // because `MUtil.transfer` returns at `if (0 == amount)` before it can
+        // validate the recipient:
+        //
+        //  * balance > 0 — `VMUtils.validateForSmartContract` throws "no
+        //    ToAccount"; the catch wraps it in a `TransferException` under
+        //    ALLOW_TVM_CONSTANTINOPLE (#26) and a `BytecodeExecutionException`
+        //    before it. Nothing is inherited and the transaction dies.
+        //  * balance == 0 with ALLOW_TVM_TRANSFER_TRC10 — the transfer no-ops,
+        //    then `MUtil.transferAllToken` calls `importAllAsset()` on the
+        //    obtainer's null `AccountCapsule` and NPEs. An NPE is not a
+        //    `ContractValidateException`, so the local catch misses it and
+        //    `VMActuator`'s `catch (Throwable)` spends all energy — always the
+        //    UNKNOWN flavour, never TRANSFER_FAILED.
+        //  * balance == 0 without TRC-10 — java SUCCEEDS, having simply never
+        //    created the obtainer. The owner is still destroyed; only the
+        //    phantom inheritor row must not appear.
+        //
+        // Existence is journal-aware to match java's in-flight `Repository`.
+        // The self-target path never reaches here with `inheritor_t` set to the
+        // obtainer: java's `owner == obtainer` branch bypasses
+        // `createAccountIfNotExist` and `MUtil.transfer` entirely, sweeping to
+        // the always-present blackhole instead.
+        let inheritor_absent = !self.tron_account_exists_or_created(tron_to_evm_address(
+            &inheritor_t,
+        ));
+        let inheritor_uncreatable = !allow_059 && !self_target && inheritor_absent;
+        if inheritor_uncreatable {
+            if owner_balance > 0 {
+                return if allow_constantinople { -2 } else { -3 };
+            }
+            if allow_trc10 {
+                return -3;
+            }
+        }
         let (mut inheritor_account, inheritor_is_new) = match self.accounts.get(&inheritor_t) {
             Ok(Some(acc)) => (acc, false),
             _ => (
@@ -854,7 +969,11 @@ impl TronDatabaseExt for TronDatabase {
         }
 
         self.put_account_journaled(&owner_t, &owner_account);
-        if inheritor_t != owner_t {
+        // Reaching here with `inheritor_uncreatable` set is java's succeeding
+        // sub-case (balance 0, TRC-10 inactive): the obtainer was never created,
+        // so no row may be written for it. ALLOW_TVM_FREEZE (#52) requires #32,
+        // so the freeze sweeps above cannot have credited it either.
+        if inheritor_t != owner_t && !inheritor_uncreatable {
             self.put_account_journaled(&inheritor_t, &inheritor_account);
         }
         0
@@ -885,21 +1004,42 @@ impl TronDatabaseExt for TronDatabase {
         // java `Program.freeze` bumps the nonce at the top of the handler,
         // before its validate (`increaseNonce` precedes `processor.validate`).
         self.note_internal_tx_nonce();
-        let _ = receiver_address; // v1 didn't really use it on chain
         let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
-        let owner = evm_to_tron_address(&caller);
-        if frozen_balance <= 0 || frozen_balance < TRX_PRECISION || resource_type > 2 {
-            return 0;
-        }
-        let Ok(Some(mut account)) = self.accounts.get(&owner) else {
+        let Some(resources) = self.delegated_resources.clone() else {
             return 0;
         };
-        if account.balance < frozen_balance {
+        let owner = evm_to_tron_address(&caller);
+
+        // ---- java `FreezeBalanceProcessor.validate`, all read-only ----
+        //
+        // java runs validate + execute inside `getContractState()
+        // .newRepositoryChild()` and calls `repository.commit()` only after
+        // both succeed (Program.java:1931/1950), so a failing validate leaves
+        // NOTHING behind — including the receiver account its own delegation
+        // branch may have created. Compute the whole verdict before writing
+        // anything, the same shape `tron_vote_witness` uses below.
+        let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
+            return 0;
+        };
+        if frozen_balance <= 0
+            || frozen_balance < TRX_PRECISION
+            || frozen_balance > owner_account.balance
+        {
             return 0;
         }
-        account.balance -= frozen_balance;
+        // `FrozenCount must be 0 or 1` — java rejects an owner whose legacy
+        // `frozen` list already holds more than one entry.
+        if owner_account.frozen.len() > 1 {
+            return 0;
+        }
+        // java's ResourceCode switch accepts only BANDWIDTH(0) / ENERGY(1);
+        // TRON_POWER(2) is a Stake-2.0 code and throws here.
+        if resource_type != 0 && resource_type != 1 {
+            return 0;
+        }
+
         let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
         // v1: duration in days. The opcode handler currently passes
         // `0` for duration (java-tron's `FREEZE` opcode doesn't
@@ -908,25 +1048,126 @@ impl TronDatabaseExt for TronDatabase {
         // so the resulting Frozen entry has a sensible expiration.
         let duration_days = frozen_duration.max(3);
         let expire = now + duration_days * FROZEN_PERIOD_MS / 3;
-        if let Some(existing) = account.frozen.first_mut() {
-            existing.frozen_balance = match existing.frozen_balance.checked_add(frozen_balance) {
-                Some(v) => v,
-                None => return 0,
+
+        // `!FastByteComparisons.isEqual(ownerAddress, receiverAddress)` selects
+        // the delegating branch. A receiver with no account row is created as a
+        // normal account (`repo.createNormalAccount`) — stamped with the
+        // head-block timestamp and, under ALLOW_MULTI_SIGN, the default
+        // owner+active permission — but a Contract-type receiver is then
+        // rejected, and java's discarded child Repository takes that fresh row
+        // with it. Holding the new row here until the success path below
+        // reproduces that atomicity.
+        let receiver = receiver_address
+            .map(|r| evm_to_tron_address(&r))
+            .unwrap_or(owner);
+        let delegating = receiver != owner;
+        let mut receiver_account = if delegating {
+            let acct = match self.accounts.get(&receiver) {
+                Ok(Some(a)) => a,
+                _ => {
+                    let mut a = tron_proto::Account {
+                        address: receiver.as_bytes().to_vec(),
+                        create_time: now,
+                        ..Default::default()
+                    };
+                    tron_chainbase::apply_default_account_permissions(&mut a, &dyn_props);
+                    a
+                }
             };
-            existing.expire_time = expire;
+            if acct.r#type == tron_proto::AccountType::Contract as i32 {
+                return 0;
+            }
+            Some(acct)
         } else {
-            account.frozen.push(tron_proto::account::Frozen {
-                frozen_balance,
+            None
+        };
+
+        // ---- java `FreezeBalanceProcessor.execute` ----
+        if let Some(receiver_account) = receiver_account.as_mut() {
+            // `delegateResource`: insert-or-update the (owner, receiver)
+            // DelegatedResource row, then credit the receiver's acquired
+            // balance. The v1 key is the bare `from || to` concatenation
+            // (`DelegatedResourceCapsule.createDbKey`).
+            let key = DelegatedResourceStore::v1_key(&owner, &receiver);
+            let mut record = resources
+                .get_raw(&key)
+                .expect("db error in TronDatabaseExt::tron_freeze reading delegated resource record")
+                .unwrap_or_default();
+            record.from = owner.as_bytes().to_vec();
+            record.to = receiver.as_bytes().to_vec();
+            if resource_type == 0 {
+                record.frozen_balance_for_bandwidth = record
+                    .frozen_balance_for_bandwidth
+                    .saturating_add(frozen_balance);
+                record.expire_time_for_bandwidth = expire;
+                owner_account.delegated_frozen_balance_for_bandwidth = owner_account
+                    .delegated_frozen_balance_for_bandwidth
+                    .saturating_add(frozen_balance);
+                receiver_account.acquired_delegated_frozen_balance_for_bandwidth =
+                    receiver_account
+                        .acquired_delegated_frozen_balance_for_bandwidth
+                        .saturating_add(frozen_balance);
+            } else {
+                record.frozen_balance_for_energy = record
+                    .frozen_balance_for_energy
+                    .saturating_add(frozen_balance);
+                record.expire_time_for_energy = expire;
+                let owner_res = owner_account
+                    .account_resource
+                    .get_or_insert_with(Default::default);
+                owner_res.delegated_frozen_balance_for_energy = owner_res
+                    .delegated_frozen_balance_for_energy
+                    .saturating_add(frozen_balance);
+                let receiver_res = receiver_account
+                    .account_resource
+                    .get_or_insert_with(Default::default);
+                receiver_res.acquired_delegated_frozen_balance_for_energy = receiver_res
+                    .acquired_delegated_frozen_balance_for_energy
+                    .saturating_add(frozen_balance);
+            }
+            self.put_delegated_journaled(&resources, &key, &record);
+            self.put_account_journaled(&receiver, receiver_account);
+        } else if resource_type == 0 {
+            // `setFrozenForBandwidth(frozenBalance + getFrozenBalance(),
+            // expireTime)`: java REPLACES entry 0 (appending only when the list
+            // is empty), carrying the summed balance and the new expiry.
+            let existing: i64 = owner_account.frozen.iter().map(|f| f.frozen_balance).sum();
+            let merged = tron_proto::account::Frozen {
+                frozen_balance: existing.saturating_add(frozen_balance),
+                expire_time: expire,
+            };
+            match owner_account.frozen.first_mut() {
+                Some(slot) => *slot = merged,
+                None => owner_account.frozen.push(merged),
+            }
+        } else {
+            // `setFrozenForEnergy` lives on AccountResource, NOT the legacy
+            // `frozen` list.
+            let existing = owner_account
+                .account_resource
+                .as_ref()
+                .and_then(|r| r.frozen_balance_for_energy.as_ref())
+                .map(|f| f.frozen_balance)
+                .unwrap_or(0);
+            owner_account
+                .account_resource
+                .get_or_insert_with(Default::default)
+                .frozen_balance_for_energy = Some(tron_proto::account::Frozen {
+                frozen_balance: existing.saturating_add(frozen_balance),
                 expire_time: expire,
             });
         }
-        self.put_account_journaled(&owner, &account);
+
+        // `adjust total resource` sits OUTSIDE the delegating branch in java, so
+        // both paths move the chain-global weight.
         let weight = frozen_balance / TRX_PRECISION;
         match resource_type {
             0 => self.add_net_weight_journaled(&dyn_props, weight),
-            1 => self.add_energy_weight_journaled(&dyn_props, weight),
-            _ => {}
+            _ => self.add_energy_weight_journaled(&dyn_props, weight),
         }
+
+        owner_account.balance -= frozen_balance;
+        self.put_account_journaled(&owner, &owner_account);
         // Tell the Host to debit the caller's journaled balance so
         // subsequent BALANCE / commit observes the post-freeze view.
         self.last_balance_delta = Some((caller, -frozen_balance));
@@ -940,46 +1181,216 @@ impl TronDatabaseExt for TronDatabase {
         receiver_address: Option<Address>,
     ) -> i64 {
         // java `Program.unfreeze`: increaseNonce at the top, before validate.
+        // Unlike FREEZE there is NO Stake-2.0 short-circuit —
+        // `OperationActions.unfreezeAction` always calls `Program.unfreeze` — so
+        // this path stays live once ALLOW_TVM_FREEZE registers the opcode.
         self.note_internal_tx_nonce();
-        let _ = receiver_address;
         let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
+        let Some(resources) = self.delegated_resources.clone() else {
+            return 0;
+        };
         let owner = evm_to_tron_address(&caller);
-        let Ok(Some(mut account)) = self.accounts.get(&owner) else {
-            return 0;
-        };
-        if account.frozen.is_empty() {
-            return 0;
-        }
         let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
-        if !account.frozen.iter().any(|f| f.expire_time <= now) {
+
+        // ---- java `UnfreezeBalanceProcessor.validate`, all read-only ----
+        //
+        // As in `tron_freeze`, java validates inside a child Repository that is
+        // committed only on success (Program.java:1967/1983), so every rejection
+        // below must leave the stores untouched. Both branches reject a resource
+        // code outside BANDWIDTH(0) / ENERGY(1).
+        if resource_type != 0 && resource_type != 1 {
             return 0;
         }
-        let mut unlocked: i64 = 0;
-        account.frozen.retain(|f| {
-            if f.expire_time <= now {
-                unlocked = unlocked.saturating_add(f.frozen_balance);
-                false
-            } else {
-                true
-            }
-        });
-        account.balance = match account.balance.checked_add(unlocked) {
-            Some(v) => v,
-            None => return 0,
+        let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
+            return 0;
         };
-        self.put_account_journaled(&owner, &account);
-        let weight = unlocked / TRX_PRECISION;
+        let receiver = receiver_address
+            .map(|r| evm_to_tron_address(&r))
+            .unwrap_or(owner);
+        let delegating = receiver != owner;
+
+        // The delegating branch needs the (owner, receiver) DelegatedResource
+        // row to exist ("delegated Resource does not exist") with a positive,
+        // matured balance for the requested resource.
+        let key = DelegatedResourceStore::v1_key(&owner, &receiver);
+        let mut record = if delegating {
+            let Ok(Some(record)) = resources.get_raw(&key) else {
+                return 0;
+            };
+            let (amount, expire) = if resource_type == 0 {
+                (
+                    record.frozen_balance_for_bandwidth,
+                    record.expire_time_for_bandwidth,
+                )
+            } else {
+                (
+                    record.frozen_balance_for_energy,
+                    record.expire_time_for_energy,
+                )
+            };
+            if amount <= 0 || expire > now {
+                return 0;
+            }
+            Some(record)
+        } else if resource_type == 0 {
+            // `getFrozenCount() > 0` and at least one matured entry.
+            if owner_account.frozen.is_empty()
+                || !owner_account.frozen.iter().any(|f| f.expire_time <= now)
+            {
+                return 0;
+            }
+            None
+        } else {
+            // ENERGY reads `accountResource.frozenBalanceForEnergy`, NOT the
+            // legacy `frozen` list.
+            let frozen_for_energy = owner_account
+                .account_resource
+                .as_ref()
+                .and_then(|r| r.frozen_balance_for_energy.as_ref());
+            let matured = frozen_for_energy
+                .map(|f| f.frozen_balance > 0 && f.expire_time <= now)
+                .unwrap_or(false);
+            if !matured {
+                return 0;
+            }
+            None
+        };
+
+        // ---- java `UnfreezeBalanceProcessor.execute` ----
+        let unfreeze_balance: i64;
+        if let Some(record) = record.as_mut() {
+            // Zero the un-delegated resource on the row, give the stake back to
+            // the owner's balance, and take the acquired balance off the
+            // receiver. `safeAddAcquiredDelegatedFrozenBalanceForX(-v, ..)`
+            // clamps at 0 — `Maths.max(0, acquired - v, ..)` — so a receiver
+            // whose acquired balance is short (TVM suicide + re-create) floors
+            // instead of going negative.
+            if resource_type == 0 {
+                unfreeze_balance = record.frozen_balance_for_bandwidth;
+                record.frozen_balance_for_bandwidth = 0;
+                record.expire_time_for_bandwidth = 0;
+                owner_account.delegated_frozen_balance_for_bandwidth = owner_account
+                    .delegated_frozen_balance_for_bandwidth
+                    .saturating_sub(unfreeze_balance);
+            } else {
+                unfreeze_balance = record.frozen_balance_for_energy;
+                record.frozen_balance_for_energy = 0;
+                record.expire_time_for_energy = 0;
+                let owner_res = owner_account
+                    .account_resource
+                    .get_or_insert_with(Default::default);
+                owner_res.delegated_frozen_balance_for_energy = owner_res
+                    .delegated_frozen_balance_for_energy
+                    .saturating_sub(unfreeze_balance);
+            }
+            self.put_delegated_journaled(&resources, &key, record);
+            if let Ok(Some(mut receiver_account)) = self.accounts.get(&receiver) {
+                if resource_type == 0 {
+                    receiver_account.acquired_delegated_frozen_balance_for_bandwidth =
+                        (receiver_account.acquired_delegated_frozen_balance_for_bandwidth
+                            - unfreeze_balance)
+                            .max(0);
+                } else {
+                    let receiver_res = receiver_account
+                        .account_resource
+                        .get_or_insert_with(Default::default);
+                    receiver_res.acquired_delegated_frozen_balance_for_energy = (receiver_res
+                        .acquired_delegated_frozen_balance_for_energy
+                        - unfreeze_balance)
+                        .max(0);
+                }
+                self.put_account_journaled(&receiver, &receiver_account);
+            }
+            owner_account.balance = owner_account.balance.saturating_add(unfreeze_balance);
+        } else if resource_type == 0 {
+            // Sweep every matured entry out of the legacy `frozen` list.
+            let mut unlocked: i64 = 0;
+            owner_account.frozen.retain(|f| {
+                if f.expire_time <= now {
+                    unlocked = unlocked.saturating_add(f.frozen_balance);
+                    false
+                } else {
+                    true
+                }
+            });
+            unfreeze_balance = unlocked;
+            owner_account.balance = owner_account.balance.saturating_add(unfreeze_balance);
+        } else {
+            unfreeze_balance = owner_account
+                .account_resource
+                .as_ref()
+                .and_then(|r| r.frozen_balance_for_energy.as_ref())
+                .map(|f| f.frozen_balance)
+                .unwrap_or(0);
+            owner_account
+                .account_resource
+                .get_or_insert_with(Default::default)
+                .frozen_balance_for_energy = None;
+            owner_account.balance = owner_account.balance.saturating_add(unfreeze_balance);
+        }
+
+        let weight = unfreeze_balance / TRX_PRECISION;
         match resource_type {
             0 => self.add_net_weight_journaled(&dyn_props, -weight),
-            1 => self.add_energy_weight_journaled(&dyn_props, -weight),
-            _ => {}
+            _ => self.add_energy_weight_journaled(&dyn_props, -weight),
         }
+        self.put_account_journaled(&owner, &owner_account);
+
+        // java's post-unstake vote reconciliation, gated on ALLOW_TVM_VOTE:
+        // once the account's TRON Power no longer covers the votes it has cast,
+        // the pending rewards are settled and the whole vote list is dropped.
+        // The account is re-read after the settle (which writes `allowance`)
+        // before the votes are cleared, exactly as java re-reads from its
+        // Repository.
+        if self.tron_allow_tvm_vote() && !owner_account.votes.is_empty() {
+            let used_tron_power: i64 = owner_account
+                .votes
+                .iter()
+                .map(|v| v.vote_count)
+                .fold(0i64, |acc, c| acc.saturating_add(c));
+            let required = used_tron_power.saturating_mul(TRX_PRECISION);
+            if crate::votes::tron_power(&owner_account) < required {
+                if let Some(delegation) = self.delegation.clone() {
+                    // Snapshot before the settle writes straight to the stores,
+                    // so a frame revert reverses it too.
+                    self.snapshot_account(&owner);
+                    self.snapshot_delegation_rows(&delegation, &owner);
+                    crate::reward::withdraw_reward_tvm(
+                        &owner,
+                        &self.accounts,
+                        &delegation,
+                        &dyn_props,
+                        self.reward_vi.as_deref(),
+                    )
+                    .expect("db error in TronDatabaseExt::tron_unfreeze settling rewards");
+                }
+                if let (Some(votes_store), Ok(Some(mut settled))) =
+                    (self.votes.clone(), self.accounts.get(&owner))
+                {
+                    let votes_row = match votes_store.get(&owner) {
+                        Ok(Some(mut row)) => {
+                            row.new_votes.clear();
+                            row
+                        }
+                        _ => tron_proto::Votes {
+                            address: owner.as_bytes().to_vec(),
+                            old_votes: settled.votes.clone(),
+                            new_votes: Vec::new(),
+                        },
+                    };
+                    settled.votes.clear();
+                    self.put_votes_journaled(&votes_store, &owner, &votes_row);
+                    self.put_account_journaled(&owner, &settled);
+                }
+            }
+        }
+
         // Credit the unlocked amount back to the caller's journaled
         // balance.
-        if unlocked > 0 {
-            self.last_balance_delta = Some((caller, unlocked));
+        if unfreeze_balance > 0 {
+            self.last_balance_delta = Some((caller, unfreeze_balance));
         }
         1
     }
@@ -2090,6 +2501,43 @@ mod tests {
         a
     }
 
+    /// A from-genesis sync starts with EVERY dynamic property unset, so the
+    /// default must be the pre-proposal answer. `ALLOW_TVM_CONSTANTINOPLE` (#26)
+    /// selects `TransferException` (consumed-only, TRANSFER_FAILED) over
+    /// `BytecodeExecutionException` (spend-all, UNKNOWN), so defaulting it the
+    /// wrong way would mislabel every early-chain transfer failure.
+    #[test]
+    fn allow_tvm_constantinople_reads_the_dynamic_property_and_defaults_off() {
+        // No dynamic-properties store attached at all.
+        assert!(
+            !make_db().tron_allow_tvm_constantinople(),
+            "absent store must read as inactive"
+        );
+
+        let dp = Arc::new(tron_chainbase::DynamicPropertiesStore::new(Arc::new(
+            MemBackend::new(),
+        )));
+        let db = make_db().with_staking_stores(
+            dp.clone(),
+            None,
+            Arc::new(tron_chainbase::DelegatedResourceStore::new(Arc::new(
+                MemBackend::new(),
+            ))),
+            Arc::new(tron_chainbase::DelegationStore::new(Arc::new(
+                MemBackend::new(),
+            ))),
+        );
+
+        // Key absent -> inactive (the from-genesis starting point).
+        assert!(!db.tron_allow_tvm_constantinople());
+
+        // Only the exact value 1 activates it, matching the other proposal gates.
+        dp.put_long(b"ALLOW_TVM_CONSTANTINOPLE", 0);
+        assert!(!db.tron_allow_tvm_constantinople());
+        dp.put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+        assert!(db.tron_allow_tvm_constantinople());
+    }
+
     fn evm_addr_from_tron(tron: [u8; 21]) -> Address {
         let mut out = [0u8; 20];
         out.copy_from_slice(&tron[1..]);
@@ -2212,6 +2660,36 @@ mod tests {
             &db,
             evm_addr_from_tron(tron_addr(0xee))
         ));
+    }
+
+    #[test]
+    fn is_contract_true_for_top_level_deploy_address() {
+        // java `VMActuator.create` writes the `SmartContract` row into the
+        // invoke's `rootRepository` BEFORE the constructor runs
+        // (`rootRepository.createContract(contractAddress, ...)`), so
+        // `address(this).isContract` is 1 inside a top-level constructor. Our
+        // top-level deploy writes no contract row until commit, so the deploy
+        // address is recognised through `top_level_deploy_version` instead.
+        let deploy = tron_addr(0xc7);
+        let db = make_db().with_top_level_deploy_version(evm_addr_from_tron(deploy), 1);
+        // Deliberately NO account row and NO contract row.
+        assert!(
+            TronDatabaseExt::tron_is_contract(&db, evm_addr_from_tron(deploy)),
+            "the in-flight top-level deploy address must report as a contract"
+        );
+    }
+
+    #[test]
+    fn is_contract_false_for_non_deploy_address_when_top_level_deploy_set() {
+        // The deploy-address check must be exact, not a blanket "any address is
+        // a contract while a deploy is in flight".
+        let deploy = tron_addr(0xc7);
+        let other = tron_addr(0xc8);
+        let db = make_db().with_top_level_deploy_version(evm_addr_from_tron(deploy), 1);
+        assert!(
+            !TronDatabaseExt::tron_is_contract(&db, evm_addr_from_tron(other)),
+            "an unrelated address must stay false during a top-level deploy"
+        );
     }
 
     // ---- v2 stake weight: with-delegated basis + TRON_POWER (java parity) ----
@@ -2544,6 +3022,7 @@ mod tests {
             evm_addr_from_tron(owner),
             evm_addr_from_tron(obtainer),
             true,
+            5_000_000,
         );
         assert_eq!(rc, 0, "valid suicide returns ok");
         assert_eq!(db.create_nonce, 1, "one bump after canSuicide validation");

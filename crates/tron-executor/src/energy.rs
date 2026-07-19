@@ -1031,12 +1031,35 @@ pub fn vm_energy_budget_trigger(
     // UNCONDITIONALLY under the gate even at percent==100 (reserve=
     // creator_energy_limit, which is 0 there → just decay + now-stamp + window
     // rewrite + persist, as java).
+    //
+    // java splits these two concerns across two different gates. The
+    // account-mutating pre-consume block is `allowTvmFreezeV2`-only, but the
+    // `receipt.setOriginEnergyLeft(originEnergyLeft)` capture that
+    // `ReceiptCapsule.getOriginUsage` later clamps by is gated on
+    // `VMConfig.allowTvmFreeze() || VMConfig.allowTvmFreezeV2()`
+    // (VMActuator.java:736-738), i.e. `getAllowTvmFreeze() == 1 ||
+    // supportUnfreezeDelay()` — the same predicate the consume side reads
+    // (ReceiptCapsule.java:265-269). In the #52-on / #70-off window the capture
+    // therefore exists without the pre-consume, and the origin's share is
+    // clamped by the BUDGET-time quota. That window matters because the Stake
+    // 1.0 FREEZE/UNFREEZE opcodes are live in it and mutate exactly what
+    // `getAccountLeftEnergyFromFreeze` reads — including TOTAL_ENERGY_WEIGHT,
+    // so any in-tx energy freeze anywhere shifts the origin's live quota.
     if dyn_props.support_unfreeze_delay() {
         let mut o = creator.clone();
         let cap =
             apply_energy_pre_consume(&mut o, dyn_props, now_slot, origin_left, creator_energy_limit);
         let _ = accounts.put(creator_addr, &o);
         set_pre_tx_energy(creator_addr.as_bytes(), cap);
+    } else if dyn_props.allow_tvm_freeze() == 1 {
+        // Value-only capture, mirroring the caller-side legacy arm above: no
+        // account write, because java's origin pre-consume block is not
+        // reachable here. `origin_left` is already 0 at percent >= 100, which
+        // reproduces java's untouched `originEnergyLeft = 0` default.
+        set_pre_tx_energy(
+            creator_addr.as_bytes(),
+            EnergyPreConsume { left: origin_left, ..Default::default() },
+        );
     }
     caller_energy_limit.saturating_add(creator_energy_limit)
 }
@@ -1154,7 +1177,9 @@ pub fn pay_energy_bill(
     // java `ReceiptCapsule.payEnergyBill` clamps the origin share by the
     // BUDGET-TIME `originEnergyLeft` captured before execution, not a pay-time
     // re-read. Prefer the capture (symmetric with the caller split); fall back
-    // to a live read for the legacy (pre-Stake2.0) path with no capture.
+    // to a live read for the pre-ALLOW_TVM_FREEZE path, which has no capture
+    // because java's `getOriginUsage` resolves it through arms 2/3 — both of
+    // which genuinely re-read `getAccountLeftEnergyFromFreeze(origin)`.
     let origin_left = match pre_tx_energy_quota_for(origin_addr) {
         Some(left) => left,
         None => origin_quota_left(accounts, dyn_props, origin_addr, now_slot)?,

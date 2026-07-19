@@ -204,7 +204,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // the `ExecutionResult` is built — but the executor reads the flag
         // AFTER `inspect_tx_commit` returns, so clearing here would always lose
         // it. The flag is per-transaction state reset in `JournalInner::new()`
-        // (the TRON executor builds a fresh journal per VM transaction).
+        // (the TRON executor builds a fresh journal per VM transaction). The
+        // bytecode-execution-failed flag is read at the same point.
         let _ = tron_transfer_failed;
     }
 
@@ -233,8 +234,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         logs.clear();
         selfdestructed_addresses.clear();
         transaction_id.increment();
-        // TRON fork: see `commit_tx` — the flag is read after the run returns,
-        // so it is reset in `JournalInner::new()` (fresh per VM tx), not here.
+        // TRON fork: see `commit_tx` — the flags are read after the run
+        // returns, so they are reset in `JournalInner::new()` (fresh per VM tx),
+        // not here.
         let _ = tron_transfer_failed;
 
         // Clear coinbase address warming for next tx

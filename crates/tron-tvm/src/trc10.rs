@@ -236,6 +236,20 @@ impl Trc10Inspector {
     /// Restore both sides of a TRC-10 CALLTOKEN transfer to their pre-transfer
     /// `asset_v2` state. Used for an immediate-callee revert AND for unwinding a
     /// transfer discarded by an ancestor frame's revert.
+    /// Is `address` dispatched as a precompile by java-tron's
+    /// `PrecompiledContracts.getContractForAddress` under the proposals active
+    /// at this height? Membership is proposal-gated for everything outside
+    /// 0x01..0x08, so it is resolved from the live dynamic-properties store.
+    /// No store attached → nothing dispatches.
+    fn target_is_active_precompile(&self, address: &revm::primitives::Address) -> bool {
+        let Some(dp) = &self.dyn_props else {
+            return false;
+        };
+        let proposals = crate::proposals::ProposalSet::from_store(dp);
+        let addr: [u8; 20] = (*address).into();
+        crate::precompiles::is_active_precompile(&addr, &proposals)
+    }
+
     fn unwind_transfer(&self, t: &PendingTransfer) {
         let accounts = match &self.accounts {
             Some(a) => Arc::clone(a),
@@ -515,6 +529,11 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         // the pending slot).
         if let Some((token_id, token_value)) = self.pending_top_level.take() {
             interp.input.tron_token_id = token_id;
+            // The tx-level id comes from `TriggerSmartContract.token_id`, a
+            // proto `int64`, so the word CALLTOKENID sees is its zero-extended
+            // value.
+            interp.input.tron_token_id_word =
+                revm::primitives::U256::from(token_id.max(0) as u64);
             interp.input.tron_token_value = token_value;
         }
 
@@ -778,6 +797,43 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
                 },
                 inputs.return_memory_offset.clone(),
             ));
+        }
+
+        // TRON fork: a CALLTOKEN whose target is a PRECOMPILE cannot create the
+        // recipient. java routes it to `Program.callToPrecompiledAddress`
+        // (`OperationActions.exeCall:1033-1041`), which never calls
+        // `createAccountIfNotExist`, so its TRC-10 arm
+        // (`Program.java:1726-1731`) reaches
+        // `VMUtils.validateForSmartContract` with no `toAccount` and throws
+        // (`VMUtils.java:239-243`); the catch rethrows
+        // `BytecodeExecutionException`. `VM.java:97-105` then spends the CALLING
+        // frame's whole remaining energy and `RuntimeImpl.setResultCode`
+        // records `contractResult UNKNOWN`. Ungated — the precompile arm has no
+        // ALLOW_TVM_SOLIDITY_059 or ALLOW_TVM_CONSTANTINOPLE branch.
+        //
+        // Placed after the sender-balance check above, matching java's ordering
+        // (`Program.java:1707` precedes the transfer block), and before any
+        // mutation so the recipient row is never written. `was_precompile_called`
+        // routes the result to the caller-killing branch in
+        // `EthFrame::return_result`.
+        if target_was_new && self.target_is_active_precompile(&inputs.target_address) {
+            self.pending.push(None);
+            let gas = revm::interpreter::Gas::new_with_regular_gas_and_reservoir(
+                inputs.gas_limit,
+                inputs.reservoir,
+            );
+            return Some(CallOutcome {
+                result: revm::interpreter::InterpreterResult {
+                    result: InstructionResult::TronPrecompileTransferFailure,
+                    output: revm::primitives::Bytes::new(),
+                    gas,
+                },
+                memory_offset: inputs.return_memory_offset.clone(),
+                was_precompile_called: true,
+                precompile_call_logs: Vec::new(),
+                charged_new_account_state_gas: inputs.charged_new_account_state_gas,
+                tron_raw_return_offset: inputs.tron_raw_return_offset,
+            });
         }
 
         // Apply transfer.

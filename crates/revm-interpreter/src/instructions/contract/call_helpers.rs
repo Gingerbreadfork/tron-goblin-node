@@ -12,11 +12,18 @@ use primitives::{
 use state::Bytecode;
 
 /// Gets memory input and output ranges for call instructions.
+///
+/// The third tuple element is the raw 256-bit return offset exactly as it sat
+/// on the stack. [`resize_memory`] substitutes a `usize::MAX` sentinel into the
+/// returned range whenever the return size is zero, which erases the offset;
+/// TRON's pre-#94 precompile write needs the real value in precisely that case
+/// (java's `Program.java:1774` writes the full output at `outDataOffs` without
+/// consulting `outDataSize`).
 #[inline]
 pub fn get_memory_input_and_out_ranges(
     interpreter: &mut Interpreter<impl ITy>,
     gas_params: &GasParams,
-) -> Result<(Range<usize>, Range<usize>), InstructionResult> {
+) -> Result<(Range<usize>, Range<usize>, U256), InstructionResult> {
     popn!([in_offset, in_len, out_offset, out_len], interpreter);
 
     let mut in_range = resize_memory(interpreter, gas_params, in_offset, in_len)?;
@@ -27,7 +34,7 @@ pub fn get_memory_input_and_out_ranges(
     }
 
     let ret_range = resize_memory(interpreter, gas_params, out_offset, out_len)?;
-    Ok((in_range, ret_range))
+    Ok((in_range, ret_range, out_offset))
 }
 
 /// Resize memory and return range of memory.

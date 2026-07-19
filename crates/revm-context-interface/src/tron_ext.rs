@@ -109,6 +109,13 @@ pub trait TronDatabaseExt {
         self.tron_account_exists(address)
     }
 
+    /// See [`crate::host::Host::tron_is_precompile`] — java's
+    /// `PrecompiledContracts.getContractForAddress(addr) != null` under the
+    /// active proposal set.
+    fn tron_is_precompile(&self, _address: Address) -> bool {
+        false
+    }
+
     /// See [`TronHostExt::tron_freeze_expire_time`].
     fn tron_freeze_expire_time(
         &self,
@@ -230,11 +237,20 @@ pub trait TronDatabaseExt {
     /// transfer to the inheritor, expired-unfreeze credit.
     ///
     /// `will_destroy` mirrors `is_created_locally || !restriction`.
-    /// Returns `0` on success, `-1` when the suicide must REVERT
-    /// (outstanding delegations -- java's `canSuicide*` returning false).
+    /// `owner_balance` is the dying contract's in-flight TRX balance, which
+    /// only the journal knows (the account store holds the committed value).
+    /// Return codes are documented on
+    /// [`crate::host::Host::tron_suicide`]: `0` ok, `-1` revert, `-2`
+    /// `TransferException`, `-3` `BytecodeExecutionException`.
     /// Balance changes are reported through
     /// [`tron_take_balance_deltas`](Self::tron_take_balance_deltas).
-    fn tron_suicide(&mut self, _owner: Address, _obtainer: Address, _will_destroy: bool) -> i64 {
+    fn tron_suicide(
+        &mut self,
+        _owner: Address,
+        _obtainer: Address,
+        _will_destroy: bool,
+        _owner_balance: i64,
+    ) -> i64 {
         0
     }
 
@@ -266,6 +282,21 @@ pub trait TronDatabaseExt {
 
     /// See [`crate::host::Host::tron_allow_multi_sign`].
     fn tron_allow_multi_sign(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_allow_tvm_solidity_059`].
+    fn tron_allow_tvm_solidity_059(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_allow_tvm_constantinople`].
+    fn tron_allow_tvm_constantinople(&self) -> bool {
+        false
+    }
+
+    /// See [`crate::host::Host::tron_allow_tvm_transfer_trc10`].
+    fn tron_allow_tvm_transfer_trc10(&self) -> bool {
         false
     }
 

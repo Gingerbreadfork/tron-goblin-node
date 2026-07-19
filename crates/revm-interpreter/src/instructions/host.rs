@@ -473,10 +473,41 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     let created_locally = context.host.tron_account_created_locally(owner);
     let will_destroy = created_locally || !restriction;
 
-    // Chainbase side-effects + canSuicide validation. -1 => revert the
-    // frame (java: `program.getResult().setRevert(); program.stop()`).
-    if context.host.tron_suicide(owner, target, will_destroy) < 0 {
-        return Err(InstructionResult::Revert);
+    // The dying contract's IN-FLIGHT TRX balance. java reads it from the live
+    // `Repository` (`getContractState().getBalance(owner)`), so it includes
+    // credits made earlier in this same transaction; the journal — not the
+    // account store — is authoritative for it here. It decides which of java's
+    // three pre-ALLOW_TVM_SOLIDITY_059 sub-cases applies when the obtainer has
+    // no account row, because `MUtil.transfer` returns early at amount 0 and so
+    // never reaches the validation that rejects an absent recipient.
+    let owner_balance = context
+        .host
+        .balance(owner)
+        .map(|b| i64::try_from(b.data).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+
+    // Chainbase side-effects + canSuicide validation, run in java's order
+    // (`OperationActions.suicideAction` validates BEFORE calling
+    // `Program.suicide`, so a `canSuicide` failure wins over any transfer
+    // failure below).
+    match context
+        .host
+        .tron_suicide(owner, target, will_destroy, owner_balance)
+    {
+        // java: `program.getResult().setRevert(); program.stop()`.
+        -1 => return Err(InstructionResult::Revert),
+        // java threw a `TransferException` out of `MUtil.transfer`: the whole
+        // transaction fails as TRANSFER_FAILED with consumed-only energy.
+        -2 => {
+            context.host.tron_mark_transfer_failed();
+            return Err(InstructionResult::TransferFailed);
+        }
+        // java threw a `BytecodeExecutionException`, or NPEd inside
+        // `MUtil.transferAllToken`. `VM.play` catches it for THIS frame: the
+        // frame spends all its energy and halts, and the caller pushes zero and
+        // continues. Only a root-frame throw reaches the receipt, as UNKNOWN.
+        -3 => return Err(InstructionResult::TronBytecodeExecution),
+        _ => {}
     }
 
     // Standard journal selfdestruct -- destroy/no-op/transfer per the

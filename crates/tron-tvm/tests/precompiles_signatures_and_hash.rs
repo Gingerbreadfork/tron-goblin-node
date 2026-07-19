@@ -25,9 +25,16 @@ struct MockCtx {
     dynamic_factors: std::collections::HashMap<Address, i64>,
     block_number: i64,
     block_timestamp_ms: i64,
+    /// java `VMConfig.allowTvmSelfdestructRestriction()` (proposal #94).
+    /// `None` selects the post-#94 mainnet era these fixtures assume; set
+    /// `Some(false)` to exercise the pre-#94 `extractBytesArray` parser.
+    selfdestruct_restriction: Option<bool>,
 }
 
 impl EvmContext for MockCtx {
+    fn allow_tvm_selfdestruct_restriction(&self) -> bool {
+        self.selfdestruct_restriction.unwrap_or(true)
+    }
     fn caller(&self) -> Address {
         Address::from_raw([0u8; 21])
     }
@@ -239,6 +246,94 @@ fn merkle_hash_accepts_depth_zero_through_62() {
     }
 }
 
+// --- MerkleHash: java's `intValueSafe` depth decode ------------------------
+//
+// java reads the depth word with `new DataWord(bytes).intValueSafe()`, which
+// saturates to `Integer.MAX_VALUE` whenever the word occupies more than four
+// bytes or its low four bytes read as a negative `int`. `MerkleHashParams
+// .valid()` then rejects anything outside `[0, 63)`, so a saturated word is
+// always a rejection — no matter what the low four bytes hold.
+
+#[test]
+fn merkle_hash_rejects_dirty_high_depth_bytes() {
+    let ctx = MockCtx::default();
+    // A perfectly valid depth of 5 in the low word, but byte 0 set: java's
+    // `bytesOccupied()` is 32 > 4 → Integer.MAX_VALUE → out of range.
+    let mut input = merkle_input(5, [0xaau8; 32], [0xbbu8; 32]);
+    input[0] = 0x01;
+    let out = PrecompileImpl::MerkleHash.execute(&input, &ctx);
+    assert!(
+        matches!(out, Err(tron_tvm::PrecompileError::SpendAllRevert)),
+        "a non-zero high byte must saturate the depth and reject, got {out:?}"
+    );
+}
+
+#[test]
+fn merkle_hash_rejects_any_dirty_byte_below_the_low_word() {
+    let ctx = MockCtx::default();
+    // Every byte in `input[0..24]` is above the four bytes `intValueSafe`
+    // reads, so a non-zero value anywhere in that range is a rejection
+    // regardless of the depth encoded in the low word.
+    for dirty in [0usize, 12, 23] {
+        for depth in [0u64, 62] {
+            let mut input = merkle_input(depth, [0xaau8; 32], [0xbbu8; 32]);
+            input[dirty] = 0x01;
+            let out = PrecompileImpl::MerkleHash.execute(&input, &ctx);
+            assert!(
+                matches!(out, Err(tron_tvm::PrecompileError::SpendAllRevert)),
+                "byte {dirty} set with depth={depth} must reject, got {out:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn merkle_hash_rejects_saturating_low_word() {
+    let ctx = MockCtx::default();
+    // `input[28] = 0x80` → low four bytes are 0x80000000, a negative int →
+    // Integer.MAX_VALUE.
+    let mut neg = merkle_input(0, [0xaau8; 32], [0xbbu8; 32]);
+    neg[28] = 0x80;
+    assert!(
+        matches!(
+            PrecompileImpl::MerkleHash.execute(&neg, &ctx),
+            Err(tron_tvm::PrecompileError::SpendAllRevert)
+        ),
+        "a negative low word must saturate and reject"
+    );
+    // `input[24] = 0x01` with depth 5 in the low four bytes → bytesOccupied 8.
+    let mut wide = merkle_input(5, [0xaau8; 32], [0xbbu8; 32]);
+    wide[24] = 0x01;
+    assert!(
+        matches!(
+            PrecompileImpl::MerkleHash.execute(&wide, &ctx),
+            Err(tron_tvm::PrecompileError::SpendAllRevert)
+        ),
+        "a word occupying more than four bytes must saturate and reject"
+    );
+}
+
+#[test]
+fn merkle_hash_clean_high_bytes_still_accepted() {
+    let ctx = MockCtx::default();
+    // Guards against an off-by-one in the byte window (e.g. testing
+    // `word[..29]` or reading `word[27..31]`): every in-range depth with a
+    // clean `input[0..28]` must still hash.
+    for depth in [0u64, 1, 31, 62] {
+        let input = merkle_input(depth, [0x11u8; 32], [0x22u8; 32]);
+        let out = PrecompileImpl::MerkleHash
+            .execute(&input, &ctx)
+            .unwrap_or_else(|e| panic!("depth={depth} must be accepted, got {e:?}"));
+        assert_eq!(out.len(), 32);
+    }
+    // Byte-identical to the value the decoder produced before the depth
+    // decode was tightened.
+    let out = PrecompileImpl::MerkleHash
+        .execute(&merkle_input(0, [0x11u8; 32], [0x22u8; 32]), &ctx)
+        .unwrap();
+    assert_eq!(out, merkle_hash(0, &[0x11u8; 32], &[0x22u8; 32]).to_vec());
+}
+
 #[test]
 fn merkle_hash_is_deterministic_under_repeated_calls() {
     let ctx = MockCtx::default();
@@ -431,6 +526,185 @@ fn batch_validate_sign_rejects_offset_out_of_bounds() {
         .execute(&input, &ctx)
         .unwrap();
     assert_eq!(out.last(), Some(&0u8), "out-of-bounds offset must be false");
+}
+
+// --- BatchValidateSign: the pre-#94 `extractBytesArray` era ----------------
+//
+// Before ALLOW_TVM_SELFDESTRUCT_RESTRICTION (proposal #94) java parsed the
+// signature array with `extractBytesArray`, whose elements carry their own
+// declared length instead of a fixed 65 bytes. Every failure on this address
+// is still a success-with-zero-word: `BatchValidateSign.execute` wraps
+// `doExecute` in `catch (Throwable t)`.
+//
+// The fixtures above use `encode_sig_array`, which emits NO per-element
+// length word and so is only parseable by the post-#94 reader; `MockCtx`
+// defaults to that era deliberately.
+
+/// Restriction-OFF (pre-#94) variant of [`MockCtx`].
+fn pre_94_ctx() -> MockCtx {
+    MockCtx {
+        selfdestruct_restriction: Some(false),
+        ..Default::default()
+    }
+}
+
+/// Canonical Solidity `bytes[]`, as java's pre-#94 `extractBytesArray`
+/// parses it: a length word, `N` pointer words relative to the start of the
+/// data area, then per element a declared-length word followed by
+/// `ceil(bytes.len() / 32)` data words. `declared_len` is written verbatim so
+/// a test can declare a length that differs from the bytes supplied.
+fn encode_bytes_array(elems: &[(Vec<u8>, usize)], head_idx: usize) -> Vec<u8> {
+    let n = elems.len();
+    let mut starts = Vec::with_capacity(n);
+    let mut cursor = head_idx + 1 + n;
+    for (bytes, _) in elems {
+        starts.push(cursor);
+        cursor += 1 + bytes.len().div_ceil(32);
+    }
+    let mut words: Vec<[u8; 32]> = vec![word_with_low(n)];
+    for s in &starts {
+        words.push(word_with_low((s - head_idx - 1) * 32));
+    }
+    for (bytes, declared) in elems {
+        words.push(word_with_low(*declared));
+        for chunk in bytes.chunks(32) {
+            let mut w = [0u8; 32];
+            w[..chunk.len()].copy_from_slice(chunk);
+            words.push(w);
+        }
+    }
+    let mut out = Vec::with_capacity(words.len() * 32);
+    for w in words {
+        out.extend_from_slice(&w);
+    }
+    out
+}
+
+/// [`batch_input`] with a canonically-encoded signature array.
+fn batch_input_canonical(
+    hash: &[u8; 32],
+    elems: &[(Vec<u8>, usize)],
+    addrs: &[[u8; 20]],
+) -> Vec<u8> {
+    let sig_array = encode_bytes_array(elems, 3);
+    let addr_head_word = 3 + sig_array.len() / 32;
+
+    let mut input = Vec::new();
+    input.extend_from_slice(hash);
+    input.extend_from_slice(&word_with_low(0x60)); // sig array offset → word 3
+    input.extend_from_slice(&word_with_low(addr_head_word * 32));
+    input.extend_from_slice(&sig_array);
+    input.extend_from_slice(&word_with_low(addrs.len()));
+    for a in addrs {
+        let mut w = [0u8; 32];
+        w[12..32].copy_from_slice(a);
+        input.extend_from_slice(&w);
+    }
+    input
+}
+
+fn seeded_key(seed: u8) -> k256::ecdsa::SigningKey {
+    let mut b = [0u8; 32];
+    b[31] = seed;
+    b[0] = 0x01;
+    k256::ecdsa::SigningKey::from_bytes(&b.into()).unwrap()
+}
+
+#[test]
+fn batch_validate_sign_canonical_65_byte_elements_are_era_identical() {
+    // Canonical encoding with a declared length of exactly 65 must give
+    // byte-identical output in both eras — the fix is inert on well-formed
+    // calldata.
+    let sk = seeded_key(5);
+    let hash = [0x21u8; 32];
+    let sig = sign_prehash(&sk, &hash);
+    let input = batch_input_canonical(&hash, &[(sig.to_vec(), 65)], &[signer_low20(&sk)]);
+
+    let post = PrecompileImpl::BatchValidateSign
+        .execute(&input, &MockCtx::default())
+        .unwrap();
+    let pre = PrecompileImpl::BatchValidateSign
+        .execute(&input, &pre_94_ctx())
+        .unwrap();
+    assert_eq!(post, pre);
+    assert_eq!(post[0], 1, "the real signer must verify in both eras");
+}
+
+#[test]
+fn batch_validate_sign_short_element_is_zero_bit_pre_94() {
+    // The same valid signature, but its declared length word says 64.
+    // Pre-#94 java materialises 64 bytes and `recoverAddrBySign` rejects
+    // `sign.length < 65` → no recovery → result byte 0. Post-#94 the fixed
+    // 65-byte read recovers the signer → result byte 1.
+    let sk = seeded_key(6);
+    let hash = [0x22u8; 32];
+    let sig = sign_prehash(&sk, &hash);
+    let input = batch_input_canonical(&hash, &[(sig.to_vec(), 64)], &[signer_low20(&sk)]);
+
+    let post = PrecompileImpl::BatchValidateSign
+        .execute(&input, &MockCtx::default())
+        .unwrap();
+    assert_eq!(post[0], 1, "post-#94 reads a fixed 65 bytes");
+
+    let pre = PrecompileImpl::BatchValidateSign
+        .execute(&input, &pre_94_ctx())
+        .unwrap();
+    assert_eq!(pre[0], 0, "pre-#94 a 64-byte element cannot recover");
+}
+
+#[test]
+fn batch_validate_sign_malformed_shapes_never_revert_in_either_era() {
+    // java's outer `catch (Throwable t) { return Pair.of(true, new
+    // byte[WORD_SIZE]); }` means 0x09 NEVER produces a spend-all revert or an
+    // uncaught throw, whatever the layout — unlike 0x0a, whose identical
+    // faults burn the calling frame's whole budget. Regression guard for the
+    // shared array parsers.
+    let mut shapes: Vec<Vec<u8>> = Vec::new();
+    // Element pointer far past the call data.
+    shapes.push({
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0u8; 32]); // hash
+        v.extend_from_slice(&word_with_low(0x60)); // sig head → word 3
+        v.extend_from_slice(&word_with_low(0x80)); // addr head → word 4
+        v.extend_from_slice(&word_with_low(1)); // sig array len = 1
+        v.extend_from_slice(&word_with_low(0x10_000 * 32)); // wild pointer
+        v
+    });
+    // Declared sizes past MAX_SIZE with no backing words.
+    shapes.push({
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0u8; 32]);
+        v.extend_from_slice(&word_with_low(0x60));
+        v.extend_from_slice(&word_with_low(0x80));
+        v.extend_from_slice(&word_with_low(17));
+        v.extend_from_slice(&word_with_low(17));
+        v
+    });
+    // Array heads pointing past the words present.
+    shapes.push({
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0u8; 32]);
+        v.extend_from_slice(&word_with_low(0x10_000 * 32));
+        v.extend_from_slice(&word_with_low(0x10_000 * 32));
+        v.extend_from_slice(&[0u8; 32]);
+        v.extend_from_slice(&[0u8; 32]);
+        v
+    });
+    // A canonical element whose declared length is Integer.MAX_VALUE.
+    shapes.push(batch_input_canonical(
+        &[0u8; 32],
+        &[(vec![0xabu8; 65], i32::MAX as usize)],
+        &[[0u8; 20]],
+    ));
+
+    for (i, input) in shapes.iter().enumerate() {
+        for (era, ctx) in [("post-#94", MockCtx::default()), ("pre-#94", pre_94_ctx())] {
+            let out = PrecompileImpl::BatchValidateSign
+                .execute(input, &ctx)
+                .unwrap_or_else(|e| panic!("shape {i} {era}: 0x09 must never error, got {e:?}"));
+            assert_eq!(out.len(), 32, "shape {i} {era}: output is one word");
+        }
+    }
 }
 
 // =============================================================================

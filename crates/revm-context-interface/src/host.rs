@@ -9,6 +9,13 @@ use auto_impl::auto_impl;
 use primitives::{hardfork::SpecId, Address, Bytes, Log, StorageKey, StorageValue, B256, U256};
 use state::Bytecode;
 
+/// TRON caps call/create nesting at java-tron's `Program.MAX_DEPTH` (64), not
+/// the EVM's `CALL_STACK_LIMIT` of 1024. A frame deeper than this fails with
+/// `CallTooDeep` (the caller pushes 0 and continues), matching java's
+/// `getCallDeep() == MAX_DEPTH` refusal. The entry frame is depth 0, so the
+/// deepest executing frame is depth 64.
+pub const TRON_MAX_CALL_DEPTH: usize = 64;
+
 /// Error that can happen when loading account info.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -271,9 +278,37 @@ pub trait Host {
     /// `contractResult TRANSFER_FAILED`. Default no-op.
     fn tron_mark_transfer_failed(&mut self) {}
 
+    /// TRON fork: record that an operation raised a plain
+    /// `BytecodeExecutionException` — java's non-`TransferException` failure
+    /// flavour, which `VMActuator` follows with `spendAllEnergy()` and
+    /// `RuntimeImpl.setResultCode` maps to `contractResult UNKNOWN`. Set by an
+    /// opcode handler before returning a spend-all halt result; read by the
+    /// executor to relabel the halt. Default no-op.
+
     /// TRON fork: SELFDESTRUCT chainbase side-effects (see
-    /// `TronDatabaseExt::tron_suicide`). Returns `0` ok / `-1` revert.
-    fn tron_suicide(&mut self, _owner: Address, _obtainer: Address, _will_destroy: bool) -> i64 {
+    /// `TronDatabaseExt::tron_suicide`). `owner_balance` is the dying
+    /// contract's IN-FLIGHT TRX balance (java reads it from the live
+    /// `Repository`, so it includes credits made earlier in this same
+    /// transaction); the journal — not the account store — is authoritative
+    /// for it.
+    ///
+    /// Return codes:
+    /// * `0` — applied.
+    /// * `-1` — `canSuicide`/`canSuicide2` rejected the destroy; the frame
+    ///   reverts (java `program.getResult().setRevert()`).
+    /// * `-2` — java threw a `TransferException` out of `MUtil.transfer`; the
+    ///   whole transaction fails as `TRANSFER_FAILED` with consumed-only
+    ///   energy. Nothing was written.
+    /// * `-3` — java threw a `BytecodeExecutionException` (or NPEd inside
+    ///   `MUtil.transferAllToken`); the whole transaction fails as `UNKNOWN`
+    ///   with all energy spent. Nothing was written.
+    fn tron_suicide(
+        &mut self,
+        _owner: Address,
+        _obtainer: Address,
+        _will_destroy: bool,
+        _owner_balance: i64,
+    ) -> i64 {
         0
     }
 
@@ -313,6 +348,44 @@ pub trait Host {
     #[inline]
     fn tron_account_exists_or_created(&self, address: Address) -> bool {
         self.tron_account_exists(address)
+    }
+
+    /// **TRON fork** — is `address` dispatched by java-tron's
+    /// `PrecompiledContracts.getContractForAddress` under the active proposal
+    /// set?
+    ///
+    /// This is the test `OperationActions.exeCall`
+    /// (`OperationActions.java:1033-1041`) uses to choose
+    /// `Program.callToPrecompiledAddress` over `Program.callToAddress`, and the
+    /// two methods differ in their transfer handling: only `callToAddress`
+    /// reaches `createAccountIfNotExist`, and only it wraps the endowment read
+    /// and the transfer validation in a `TransferException`-producing catch.
+    ///
+    /// Membership is proposal-dependent (ALLOW_TVM_SOLIDITY_059 /
+    /// ALLOW_SHIELDED_TRC20_TRANSACTION / ALLOW_TVM_VOTE /
+    /// ALLOW_TVM_COMPATIBLE_EVM / ALLOW_TVM_FREEZE_V2); 0x01..0x08 are ungated.
+    /// Default `false` (no TRON store) leaves upstream EVM hosts unchanged.
+    #[inline]
+    fn tron_is_precompile(&self, _address: Address) -> bool {
+        false
+    }
+
+    /// **TRON fork** — would a child frame launched from the executing frame
+    /// exceed java-tron's `Program.MAX_DEPTH` ([`TRON_MAX_CALL_DEPTH`])?
+    ///
+    /// java checks `getCallDeep() == MAX_DEPTH` at the TOP of
+    /// `Program.callToAddress` (Program.java:1002) and `Program.createContract`
+    /// (Program.java:799) — before the endowment read, before `checkTokenId`,
+    /// and before every transfer validation — and answers it by pushing zero
+    /// and refunding the forwarded energy rather than by throwing. Our depth
+    /// refusal lives downstream in frame construction, so an opcode handler
+    /// that raises a transaction-fatal transfer failure must consult this first
+    /// or it will fire in a situation where java had already returned.
+    ///
+    /// Non-TRON hosts never exhaust this limit; default `false`.
+    #[inline]
+    fn tron_call_depth_exhausted(&self) -> bool {
+        false
     }
 
     /// **TRON fork** — `true` when running under the TRON VM (the real
@@ -365,6 +438,39 @@ pub trait Host {
     /// `isTokenTransferMsg` path. Default `false`.
     #[inline]
     fn tron_allow_multi_sign(&self) -> bool {
+        false
+    }
+
+    /// **TRON fork** — is the `ALLOW_TVM_SOLIDITY_059` proposal (#32) active?
+    /// java `VMConfig.allowTvmSolidity059()`. Gates
+    /// `Program.createAccountIfNotExist`: only once this proposal is active may
+    /// a contract create the recipient of a value/TRC-10 transfer. Before it,
+    /// `VMUtils.validateForSmartContract` rejects a transfer to an account with
+    /// no store row ("no ToAccount. And not allowed to create an account in a
+    /// smartContract"). Default `false`.
+    #[inline]
+    fn tron_allow_tvm_solidity_059(&self) -> bool {
+        false
+    }
+
+    /// **TRON fork** — is the `ALLOW_TVM_CONSTANTINOPLE` proposal (#26) active?
+    /// java `VMConfig.allowTvmConstantinople()`. Selects the failure flavour
+    /// when a transfer validation fails: with the proposal active java wraps the
+    /// `ContractValidateException` in a `TransferException` (consumed-only
+    /// energy, `contractResult TRANSFER_FAILED`); before it, a plain
+    /// `BytecodeExecutionException` (all energy spent, `contractResult
+    /// UNKNOWN`). Default `false`.
+    #[inline]
+    fn tron_allow_tvm_constantinople(&self) -> bool {
+        false
+    }
+
+    /// **TRON fork** — is the `ALLOW_TVM_TRANSFER_TRC10` proposal (#18) active?
+    /// java `VMConfig.allowTvmTransferTrc10()`. Among other things it decides
+    /// whether `Program.suicide` follows the balance sweep with
+    /// `MUtil.transferAllToken`. Default `false`.
+    #[inline]
+    fn tron_allow_tvm_transfer_trc10(&self) -> bool {
         false
     }
 

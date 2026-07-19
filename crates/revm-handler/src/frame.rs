@@ -5,6 +5,7 @@ use crate::{
 use context::{result::FromStringError, LocalContextTr};
 use context_interface::{
     context::{take_error, ContextError},
+    host::TRON_MAX_CALL_DEPTH,
     journaled_state::{account::JournaledAccountTr, JournalCheckpoint, JournalTr},
     local::{FrameToken, OutFrame},
     tron_address_word, Cfg, ContextTr, Database,
@@ -12,11 +13,12 @@ use context_interface::{
 use core::cmp::min;
 use derive_where::derive_where;
 use interpreter::{
-    interpreter::{EthInterpreter, ExtBytecode},
+    interpreter::{num_words, EthInterpreter, ExtBytecode},
     interpreter_action::FrameInit,
     interpreter_types::ReturnData,
     interpreter_action::tron_create_address,
-    CallInput, CallInputs, CallOutcome, CallValue, CreateInputs, CreateOutcome, CreateScheme,
+    CallInput, CallInputs, CallOutcome, CallScheme, CallValue, CreateInputs, CreateOutcome,
+    CreateScheme,
     FrameInput, Gas, InputsImpl, InstructionResult, Interpreter, InterpreterAction,
     InterpreterResult, InterpreterTypes, SharedMemory,
 };
@@ -26,13 +28,6 @@ use primitives::{
 };
 use state::Bytecode;
 use std::{borrow::ToOwned, boxed::Box, vec::Vec};
-
-/// TRON caps call/create nesting at java-tron's `Program.MAX_DEPTH` (64), not
-/// the EVM's `CALL_STACK_LIMIT` of 1024. A frame deeper than this fails with
-/// CallTooDeep (the caller pushes 0 and continues), matching java's
-/// `getCallDeep() == MAX_DEPTH` refusal. The entry frame is depth 0, so the
-/// deepest executing frame is depth 64.
-const TRON_MAX_CALL_DEPTH: usize = 64;
 
 /// Frame implementation for Ethereum.
 #[derive_where(Clone, Debug; IW,
@@ -175,6 +170,7 @@ impl EthFrame<EthInterpreter> {
                 was_precompile_called: false,
                 precompile_call_logs: Vec::new(),
                 charged_new_account_state_gas,
+                tron_raw_return_offset: inputs.tron_raw_return_offset,
             })))
         };
 
@@ -185,6 +181,111 @@ impl EthFrame<EthInterpreter> {
 
         // Create subroutine checkpoint
         let checkpoint = ctx.journal_mut().checkpoint();
+
+        // TRON fork: a value-bearing CALL / CALLTOKEN whose target is a
+        // PRECOMPILE cannot create the recipient, and dies when the recipient
+        // has no account row.
+        //
+        // java-tron dispatches such a call to `Program.callToPrecompiledAddress`
+        // (`OperationActions.exeCall:1033-1041` picks it whenever
+        // `PrecompiledContracts.getContractForAddress` is non-null). That method
+        // never calls `createAccountIfNotExist` — unlike `callToAddress:1083` —
+        // so its transfer block (`Program.java:1716-1732`) reaches
+        // `MUtil.transfer` / `VMUtils.validateForSmartContract` with no
+        // `toAccount`, which throws `ContractValidateException`
+        // ("no ToAccount. And not allowed to create an account in a
+        // smartContract", `VMUtils.java:155-159`; TRC-10 twin at `:239-243`).
+        // Both catches rethrow `BytecodeExecutionException`
+        // (`Program.java:1723`, `:1730`).
+        //
+        // UNGATED at every height: `createAccountIfNotExist` is behind
+        // ALLOW_TVM_SOLIDITY_059 (#32) but is unreachable from this method in
+        // any era, and this method has no ALLOW_TVM_CONSTANTINOPLE branch, so
+        // the failure never becomes a `TransferException`. The only
+        // height-dependence is WHICH addresses are precompiles, which
+        // `tron_is_precompile` resolves from the live proposal flags.
+        //
+        // Scope is CALL (0xf1) and CALLTOKEN (0xd0) only. For CALLCODE and
+        // DELEGATECALL java sets `contextAddress = senderAddress`
+        // (`Program.java:1687-1688`) — the same array object — so the guard
+        // `senderAddress != contextAddress` at line 1717 is a reference compare
+        // that is FALSE, skipping the whole transfer block. STATICCALL carries
+        // no value. `CallScheme::Call` covers exactly CALL and CALLTOKEN.
+        //
+        // Two java checks take precedence and answer with a push-zero rather
+        // than a throw, so both must be evaluated first: the depth limit
+        // (`Program.java:1677`, the `TRON_MAX_CALL_DEPTH` return above) and
+        // `senderBalance < endowment` (`Program.java:1707`). When the sender
+        // cannot fund the transfer this block falls through unchanged and
+        // `transfer_loaded` yields `OutOfFunds`, a revert-family result the
+        // parent turns into exactly that push-zero plus full energy refund.
+        if ctx.tron_enabled()
+            && matches!(inputs.scheme, CallScheme::Call)
+            && ctx.tron_is_precompile(inputs.bytecode_address)
+        {
+            let trx_value = match inputs.value {
+                CallValue::Transfer(v) => v,
+                _ => U256::ZERO,
+            };
+            let token_value = inputs.tron_token_value;
+
+            // Precompile-outcome shape: `was_precompile_called` marks this as
+            // the frame that invoked the precompile, which is what stops the
+            // caller-killing branch in `return_result` from cascading into the
+            // grandparent when the halt bubbles up.
+            let precompile_transfer_failure = || {
+                Ok(ItemOrResult::Result(FrameResult::Call(CallOutcome {
+                    result: InterpreterResult {
+                        result: InstructionResult::TronPrecompileTransferFailure,
+                        gas,
+                        output: Bytes::new(),
+                    },
+                    memory_offset: inputs.return_memory_offset.clone(),
+                    was_precompile_called: true,
+                    precompile_call_logs: Vec::new(),
+                    charged_new_account_state_gas,
+                    tron_raw_return_offset: inputs.tron_raw_return_offset,
+                })))
+            };
+
+            // `long endowment = msg.getEndowment().value().longValueExact()`
+            // (`Program.java:1693`) is NOT wrapped in a try/catch here, unlike
+            // `callToAddress:1033-1042`. `DataWord.value()` is unsigned, so any
+            // word from 2^63 up throws a bare `ArithmeticException` — spend-all
+            // and `contractResult UNKNOWN`, never the `TransferException`
+            // (consumed-only, TRANSFER_FAILED) the regular-call path produces
+            // from #26 on. java evaluates this BEFORE the balance check at line
+            // 1707, and it fires whether or not the target row exists.
+            if trx_value > U256::from(i64::MAX as u64) {
+                ctx.journal_mut().checkpoint_revert(checkpoint);
+                return precompile_transfer_failure();
+            }
+
+            // `msg.getEndowment().value().longValueExact() > 0` at line 1717.
+            // A CALLTOKEN carries its amount on exactly one of the two rails:
+            // the TRC-10 amount when java classifies it as a token transfer,
+            // the native TRX value otherwise.
+            let endowment_positive = !trx_value.is_zero() || token_value > 0;
+            if endowment_positive {
+                // `Program.java:1699-1706` reads the balance from the rail the
+                // transfer will use, then line 1707 compares it against the
+                // endowment.
+                let sender_can_afford = if token_value > 0 {
+                    i128::from(ctx.tron_token_balance(inputs.caller, inputs.tron_token_id))
+                        >= i128::from(token_value)
+                } else {
+                    ctx.balance(inputs.caller)
+                        .is_some_and(|b| b.data >= trx_value)
+                };
+                // Journal-aware existence: java reads through the in-flight
+                // `Repository`, so an account created earlier in this same
+                // transaction is a live `toAccount`.
+                if sender_can_afford && !ctx.tron_account_exists_or_created(inputs.target_address) {
+                    ctx.journal_mut().checkpoint_revert(checkpoint);
+                    return precompile_transfer_failure();
+                }
+            }
+        }
 
         // Touch address. For "EIP-158 State Clear", this will erase empty accounts.
         if let CallValue::Transfer(value) = inputs.value {
@@ -218,6 +319,7 @@ impl EthFrame<EthInterpreter> {
             input: inputs.input.clone(),
             call_value: inputs.value.get(),
             tron_token_id: inputs.tron_token_id,
+            tron_token_id_word: inputs.tron_token_id_word,
             tron_token_value: inputs.tron_token_value,
             tron_dynamic_factor,
             tron_contract_version,
@@ -243,6 +345,7 @@ impl EthFrame<EthInterpreter> {
                 was_precompile_called: true,
                 precompile_call_logs: logs,
                 charged_new_account_state_gas,
+                tron_raw_return_offset: inputs.tron_raw_return_offset,
             })));
         }
 
@@ -413,6 +516,7 @@ impl EthFrame<EthInterpreter> {
             input: CallInput::Bytes(Bytes::new()),
             call_value: inputs.value(),
             tron_token_id: 0,
+            tron_token_id_word: U256::ZERO,
             tron_token_value: 0,
             tron_dynamic_factor: 0,
             tron_contract_version,
@@ -524,9 +628,14 @@ impl EthFrame<EthInterpreter> {
                     FrameInput::Call(inputs) => inputs.charged_new_account_state_gas,
                     _ => false,
                 };
+                let tron_raw_return_offset = match &self.input {
+                    FrameInput::Call(inputs) => inputs.tron_raw_return_offset,
+                    _ => U256::ZERO,
+                };
                 let mut outcome =
                     CallOutcome::new(interpreter_result, frame.return_memory_range.clone());
                 outcome.charged_new_account_state_gas = charged_new_account_state_gas;
+                outcome.tron_raw_return_offset = tron_raw_return_offset;
                 ItemOrResult::Result(FrameResult::Call(outcome))
             }
             FrameData::Create(frame) => {
@@ -562,6 +671,8 @@ impl EthFrame<EthInterpreter> {
                 let out_gas = outcome.gas();
                 let ins_result = *outcome.instruction_result();
                 let returned_len = outcome.result.output.len();
+                let from_precompile = outcome.was_precompile_called;
+                let outcome_raw_offset = outcome.tron_raw_return_offset;
 
                 let interpreter = &mut self.interpreter;
                 let mem_length = outcome.memory_length();
@@ -572,6 +683,45 @@ impl EthFrame<EthInterpreter> {
 
                 if ins_result == InstructionResult::FatalExternalError {
                     panic!("Fatal external error in insert_call_outcome");
+                }
+
+                // TRON fork: an uncaught throw inside a precompile does not
+                // return to the caller at all. java-tron's `VM.java` catch runs
+                // `program.spendAllEnergy()` on the frame that executed the CALL
+                // and stops it, so this frame consumes its entire remaining
+                // budget and terminates — no 0/1 pushed, no return data copied
+                // into memory, no unspent gas returned, no reservoir handling.
+                //
+                // Gated on `was_precompile_called` so only the frame that
+                // invoked the precompile dies. The same result arriving from a
+                // CHILD frame that already halted this way is an ordinary
+                // failed call: java's `Program.callToAddress` pushes zero and
+                // lets the parent continue, which is the generic path below.
+                if from_precompile && ins_result == InstructionResult::PrecompileThrow {
+                    interpreter.gas.spend_all();
+                    interpreter.halt(InstructionResult::PrecompileThrow);
+                    return Ok(());
+                }
+
+                // TRON fork: same shape for the transfer validation that fails
+                // inside `Program.callToPrecompiledAddress`. java runs a
+                // precompile INLINE in the caller's frame, so the
+                // `BytecodeExecutionException("transfer failure")` it throws is
+                // caught by `VM.java:97-105`, which spends the CALLING frame's
+                // entire remaining energy — not merely the energy forwarded to
+                // the call — and stops it. No 0/1 is pushed, no unspent energy
+                // returned, no return data written.
+                //
+                // Gated on `was_precompile_called` so the halt stays FRAME-fatal:
+                // when it bubbles up, the grandparent sees an ordinary failed
+                // call and takes the generic path below, which is java's
+                // `Program.callToAddress` push-zero.
+                if from_precompile
+                    && ins_result == InstructionResult::TronPrecompileTransferFailure
+                {
+                    interpreter.gas.spend_all();
+                    interpreter.halt(InstructionResult::TronPrecompileTransferFailure);
+                    return Ok(());
                 }
 
                 let item = if ins_result.is_ok() {
@@ -585,9 +735,102 @@ impl EthFrame<EthInterpreter> {
                 // Return unspend gas.
                 if ins_result.is_ok_or_revert() {
                     interpreter.gas.erase_cost(out_gas.remaining());
-                    interpreter
-                        .memory
-                        .set(mem_start, &interpreter.return_data.buffer()[..target_len]);
+
+                    // TRON fork: before ALLOW_TVM_SELFDESTRUCT_RESTRICTION (#94)
+                    // a precompile's return data is written to memory in FULL,
+                    // at the raw return offset, ignoring the return size.
+                    // java-tron's `Program.callToPrecompiledAddress` picks its
+                    // write overload on that proposal (`Program.java:1771-1775`):
+                    // pre-#94 `memorySave(int addr, byte[] value)`, which is
+                    // `memory.write(addr, value, value.length, false)` — the
+                    // length is the OUTPUT's own length, `outDataSize` is never
+                    // consulted, and `limited = false` routes through
+                    // `Memory.extend`, which grows memory with no energy
+                    // accounting whatsoever. From #94 it is `memorySave(int
+                    // addr, int allocSize, byte[] value)`, which truncates to
+                    // `min(outDataSize, value.length)` inside the already-paid
+                    // return window — the generic branch below.
+                    //
+                    // Precompiles only: the regular-call path
+                    // (`Program.callToAddress:1191`) uses `memorySaveLimited` in
+                    // BOTH eras, which neither extends memory nor writes past
+                    // the caller's window.
+                    if from_precompile && ctx.journal().tron_precompile_full_output_write() {
+                        let out_len = interpreter.return_data.buffer().len();
+                        // `Memory.extend` returns immediately on `size <= 0`, so
+                        // an empty output is a total no-op — no growth, no
+                        // write — whatever the offset.
+                        if out_len != 0 {
+                            // java resolves the offset with `DataWord.intValue()`
+                            // (DataWord.java:209-216), which accumulates all 32
+                            // bytes into an `int`: the low 32 bits, signed. A
+                            // word whose low 32 bits have the top bit set yields
+                            // a NEGATIVE index, which reaches
+                            // `chunks.get(negative)` and throws
+                            // `IndexOutOfBoundsException`. That throw is
+                            // uncaught inside `callToPrecompiledAddress`, so
+                            // `VM.java:97-105` runs `program.spendAllEnergy();
+                            // program.stop();` on this frame and `VM.java:117`
+                            // records a runtime failure — the same shape as an
+                            // uncaught throw from a precompile body. The stack
+                            // push and energy refund above already happened in
+                            // java too (they precede the write at line 1774);
+                            // spending all energy supersedes them.
+                            let off_i32 = (outcome_raw_offset.as_limbs()[0] as u32) as i32;
+                            if off_i32 < 0 {
+                                interpreter.gas.spend_all();
+                                interpreter.halt(InstructionResult::PrecompileThrow);
+                                return Ok(());
+                            }
+                            let off = off_i32 as usize;
+                            let end = off.saturating_add(out_len);
+
+                            // Deliberate bound with NO java counterpart:
+                            // `Memory.extend` is unguarded. It exists because
+                            // `EnergyCost.checkMemorySize` caps every PAID
+                            // expansion at `MEM_LIMIT` (3 MiB,
+                            // EnergyCost.java:26), so no energy-paying route can
+                            // reach beyond it, and a contract that chained free
+                            // precompile writes to force more would drive a java
+                            // node into unbounded allocation rather than produce
+                            // a block this node must reproduce.
+                            const TRON_FREE_GROWTH_LIMIT: usize = 3 * 1024 * 1024;
+                            if end > TRON_FREE_GROWTH_LIMIT {
+                                interpreter.gas.spend_all();
+                                interpreter.halt(InstructionResult::MemoryLimitOOG);
+                                return Ok(());
+                            }
+
+                            let words = num_words(end);
+                            if words > interpreter.gas.memory().words_num {
+                                // Grow the buffer so MSIZE follows: java's
+                                // `Memory.extend` raises `softSize`, and
+                                // `Program.getMemSize()` — the MSIZE source —
+                                // returns exactly `softSize` (Memory.java:174).
+                                interpreter.memory.resize(words * 32);
+                                // Advance the charging baseline WITHOUT charging.
+                                // `calcMemEnergy` is always called with
+                                // `oldMemSize = program.getMemSize()`, so the
+                                // free growth permanently raises the baseline and
+                                // java never re-bills it. Discarding the returned
+                                // delta is what makes the expansion free;
+                                // recording it would charge this frame for
+                                // memory java gave away, and leaving `words_num`
+                                // behind would make the next memory op re-charge
+                                // for the same words.
+                                let cost = ctx.cfg().gas_params().memory_cost(words);
+                                let _ = interpreter.gas.memory_mut().set_words_num(words, cost);
+                            }
+
+                            interpreter
+                                .memory
+                                .set(off, &interpreter.return_data.buffer()[..out_len]);
+                        }
+                    } else {
+                        interpreter
+                            .memory
+                            .set(mem_start, &interpreter.return_data.buffer()[..target_len]);
+                    }
                 }
 
                 // handle reservoir remaining gas

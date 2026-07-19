@@ -1114,6 +1114,38 @@ pub enum HaltReason {
     PrecompileError,
     /// Precompile error with message from context.
     PrecompileErrorWithContext(String),
+    /// TRON fork: a precompile body raised an exception outside any
+    /// try-block, so java-tron's `VM.java` spends the calling frame's whole
+    /// remaining energy and halts it. Distinct from [`HaltReason::PrecompileError`]
+    /// (java's `PrecompiledContractException`); this fault has no dedicated
+    /// java result code and records `contractResult UNKNOWN`.
+    PrecompileThrow,
+    /// TRON fork: java-tron's `BytecodeExecutionException` (and the bare
+    /// `ArithmeticException` thrown by an ungated `longValueExact()`), the
+    /// non-`TransferException` failure flavour of a transfer/token validation.
+    /// `VM.java`'s per-opcode catch calls `spendAllEnergy()` for it, and
+    /// `RuntimeImpl.setResultCode` has no matching arm, so it records
+    /// `contractResult UNKNOWN`. Distinct from
+    /// [`HaltReason::OutOfGas(MemoryLimit)`](OutOfGasError::MemoryLimit), which
+    /// is java's `OutOfMemoryException` (`OUT_OF_MEMORY`).
+    TronBytecodeExecution,
+    /// TRON fork: java-tron's `BytecodeExecutionException("transfer failure")`
+    /// from `Program.callToPrecompiledAddress` (`Program.java:1723`, and the
+    /// TRC-10 twin at `:1730`).
+    ///
+    /// A value-bearing CALL/CALLTOKEN whose target is a precompile runs
+    /// `MUtil.transfer` / `VMUtils.validateForSmartContract`, which throw
+    /// `ContractValidateException` when the recipient has no account row
+    /// (`VMUtils.java:155-159`, `:239-243`). The precompile arm never calls
+    /// `createAccountIfNotExist`, so that row is never created and the
+    /// exception is unconditional at every height.
+    ///
+    /// `VM.java:97-105` spends the executing frame's whole remaining energy
+    /// (a `BytecodeExecutionException` is not a `TransferException`) and halts
+    /// it; `RuntimeImpl.setResultCode` has no arm for it, so the recorded code
+    /// is `contractResult UNKNOWN`. Frame-fatal, not transaction-fatal: a
+    /// parent pushes zero and continues.
+    TronPrecompileTransferFailure,
     /// Nonce overflow.
     NonceOverflow,
     /// Create init code size exceeds limit (runtime).
@@ -1152,6 +1184,11 @@ impl fmt::Display for HaltReason {
             Self::CreateCollision => write!(f, "create collision"),
             Self::PrecompileError => write!(f, "precompile error"),
             Self::PrecompileErrorWithContext(msg) => write!(f, "precompile error: {msg}"),
+            Self::PrecompileThrow => write!(f, "uncaught precompile throw"),
+            Self::TronBytecodeExecution => write!(f, "bytecode execution exception"),
+            Self::TronPrecompileTransferFailure => {
+                write!(f, "precompile transfer failure")
+            }
             Self::NonceOverflow => write!(f, "nonce overflow"),
             Self::CreateContractSizeLimit => write!(f, "create contract size limit"),
             Self::CreateContractStartingWithEF => {

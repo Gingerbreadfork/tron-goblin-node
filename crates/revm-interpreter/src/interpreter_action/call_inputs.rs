@@ -193,6 +193,28 @@ pub struct CallInputs {
     pub tron_token_id: i64,
     /// TRC-10 token amount to transfer (zero when not a CALLTOKEN).
     pub tron_token_value: i64,
+    /// The FULL 32-byte TRC-10 token id word, as it sat on the stack.
+    ///
+    /// java carries the token id to the callee as a whole `DataWord`
+    /// (`ProgramInvokeFactory.createProgramInvoke(..., msg.getTokenId(), ...)`,
+    /// `Program.java:1136`) and `CALLTOKENID` pushes it verbatim, while the
+    /// asset-store KEY is separately derived low-64-signed
+    /// (`String.valueOf(msg.getTokenId().longValue())`, `Program.java:1059`).
+    /// The two can legitimately differ before `ALLOW_MULTI_SIGN` (#20), when no
+    /// range check constrains the word — hence a distinct field from
+    /// [`CallInputs::tron_token_id`], which is the key. Zero when the call
+    /// wasn't a CALLTOKEN, and zero on a CALLTOKEN that java classifies as a
+    /// native TRX transfer rather than a token transfer.
+    pub tron_token_id_word: U256,
+    /// The raw 256-bit return offset as popped from the stack.
+    ///
+    /// [`Self::return_memory_offset`] carries a `usize::MAX` sentinel whenever
+    /// the return size is zero, which destroys the offset. java-tron's pre-#94
+    /// precompile return-data write (`Program.java:1774`) needs the real offset
+    /// in exactly that case, because it writes the full precompile output there
+    /// without consulting the return size. Zero for the top-level transaction
+    /// frame, which has no parent memory to write into.
+    pub tron_raw_return_offset: U256,
 }
 
 impl CallInputs {

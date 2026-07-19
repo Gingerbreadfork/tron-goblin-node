@@ -708,12 +708,22 @@ pub fn merkle_hash(depth: usize, lhs: &[u8; 32], rhs: &[u8; 32]) -> [u8; 32] {
 /// LONGER input is accepted and the tail beyond byte 96 is ignored. So accept
 /// `len >= 96` and slice the first three words; reject `len < 96` (`None`),
 /// which the caller maps to java's `Pair.of(false, …)` spend-all-energy revert.
+///
+/// The depth word is decoded exactly as java's `DataWord.intValueSafe()`,
+/// which saturates to `Integer.MAX_VALUE` when the word occupies more than
+/// four bytes or when its low four bytes read as a negative `int`. A
+/// saturated depth always fails `MerkleHashParams.valid()`'s `[0, 63)` range
+/// check, so a non-zero byte anywhere above the low four bytes is a rejection
+/// regardless of the value those four bytes hold.
 pub fn decode_merkle_hash_input(input: &[u8]) -> Option<(usize, [u8; 32], [u8; 32])> {
     if input.len() < 96 {
         return None;
     }
-    let depth_bytes: [u8; 8] = input[24..32].try_into().ok()?;
-    let depth = u64::from_be_bytes(depth_bytes) as usize;
+    let word = &input[0..32];
+    if word[..28].iter().any(|&b| b != 0) || word[28] & 0x80 != 0 {
+        return None;
+    }
+    let depth = u32::from_be_bytes(word[28..32].try_into().ok()?) as usize;
     if depth >= 63 {
         return None;
     }

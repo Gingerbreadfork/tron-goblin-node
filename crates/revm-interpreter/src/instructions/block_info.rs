@@ -5,6 +5,7 @@ use crate::{
     Host, InstructionExecResult as Result,
 };
 use primitives::hardfork::SpecId::*;
+use primitives::U256;
 
 use crate::InstructionContext as Ictx;
 
@@ -113,8 +114,20 @@ pub fn basefee<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 }
 
 /// EIP-7516: BLOBBASEFEE opcode
+///
+/// TRON fork: java's `blobBaseFeeAction` (OperationActions.java:686,
+/// registered under `allowTvmBlob`) pushes `DataWord.ZERO()`
+/// unconditionally — TRON has no blob market, so there is no blob base fee
+/// to report. Ethereum-only hosts push the real blob gas price, which is
+/// never zero (`MIN_BLOB_GASPRICE` is 1). The CANCUN spec check stays: the
+/// `ALLOW_TVM_BLOB` gate is layered on top of Cancun availability, and java
+/// registers no BLOBBASEFEE operation below it.
 pub fn blob_basefee<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     check!(context.interpreter, CANCUN);
+    if context.host.tron_enabled() {
+        push!(context.interpreter, U256::ZERO);
+        return Ok(());
+    }
     push!(context.interpreter, context.host.blob_gasprice());
     Ok(())
 }

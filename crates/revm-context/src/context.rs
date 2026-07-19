@@ -3,7 +3,7 @@ use crate::{block::BlockEnv, cfg::CfgEnv, journal::Journal, tx::TxEnv, LocalCont
 use context_interface::{
     cfg::GasParams,
     context::{ContextError, ContextSetters, SStoreResult, SelfDestructResult, StateLoad},
-    host::LoadError,
+    host::{LoadError, TRON_MAX_CALL_DEPTH},
     journaled_state::AccountInfoLoad,
     Block, Cfg, ContextTr, Host, JournalTr, LocalContextTr, Transaction, TransactionType,
     TronDatabaseExt,
@@ -653,7 +653,36 @@ impl<
         self.journaled_state.db().tron_token_balance(address, token_id)
     }
 
+    /// `JournalInner::checkpoint` increments `depth`, and `make_call_frame`
+    /// takes its checkpoint AFTER the depth test, so while a frame at
+    /// frame-depth `d` executes the journal reports `d + 1`. The child would be
+    /// created at `d + 1` and refused when `d + 1 > TRON_MAX_CALL_DEPTH`.
+    /// `journal.depth() > TRON_MAX_CALL_DEPTH` is therefore exactly java's
+    /// `getCallDeep() == MAX_DEPTH`.
+    fn tron_call_depth_exhausted(&self) -> bool {
+        self.journaled_state.depth() > TRON_MAX_CALL_DEPTH
+    }
+
     fn tron_is_contract(&self, address: Address) -> bool {
+        // java's ISCONTRACT (`Program.isContract`) reads the IN-FLIGHT
+        // `Repository` (`getContractState().getContract(addr)`), which already
+        // holds the `SmartContract` row a CREATE/CREATE2 wrote at frame entry —
+        // BEFORE the init code runs (`Program.createContractImpl` calls
+        // `deposit.createContract(newAddress, ...)` ahead of `VM.play`). The
+        // database behind the journal is the COMMITTED store and cannot see
+        // that, so consult the journal's in-flight account map first.
+        //
+        // `is_created()` is the revert-correct signal, and the only one: it is
+        // set by `JournalInner::create_account_checkpoint` before the init code
+        // runs, survives a successful child-frame return (matching java's
+        // `deposit.commit()`), and is CLEARED when the checkpoint reverts (the
+        // `AccountCreated` journal entry calls `unmark_created*`) — matching
+        // java skipping `deposit.commit()` on a reverted or failed create, after
+        // which `getContract` finds nothing. Warm loads, value-transfer-created
+        // EOAs and precompile loads never set it.
+        if self.journaled_state.tron_account_created_in_tx(address) {
+            return true;
+        }
         self.journaled_state.db().tron_is_contract(address)
     }
 
@@ -663,6 +692,10 @@ impl<
 
     fn tron_account_exists_or_created(&self, address: Address) -> bool {
         self.journaled_state.db().tron_account_exists_or_created(address)
+    }
+
+    fn tron_is_precompile(&self, address: Address) -> bool {
+        self.journaled_state.db().tron_is_precompile(address)
     }
 
     // This impl IS the TRON VM Context (the `DB: TronDatabaseExt` bound),
@@ -681,6 +714,18 @@ impl<
 
     fn tron_allow_multi_sign(&self) -> bool {
         self.journaled_state.db().tron_allow_multi_sign()
+    }
+
+    fn tron_allow_tvm_solidity_059(&self) -> bool {
+        self.journaled_state.db().tron_allow_tvm_solidity_059()
+    }
+
+    fn tron_allow_tvm_constantinople(&self) -> bool {
+        self.journaled_state.db().tron_allow_tvm_constantinople()
+    }
+
+    fn tron_allow_tvm_transfer_trc10(&self) -> bool {
+        self.journaled_state.db().tron_allow_tvm_transfer_trc10()
     }
 
     fn tron_allow_tvm_compatible_evm(&self) -> bool {
@@ -746,11 +791,18 @@ impl<
         self.journaled_state.tron_mark_transfer_failed();
     }
 
-    fn tron_suicide(&mut self, owner: Address, obtainer: Address, will_destroy: bool) -> i64 {
-        let result = self
-            .journaled_state
-            .db_mut()
-            .tron_suicide(owner, obtainer, will_destroy);
+
+    fn tron_suicide(
+        &mut self,
+        owner: Address,
+        obtainer: Address,
+        will_destroy: bool,
+        owner_balance: i64,
+    ) -> i64 {
+        let result =
+            self.journaled_state
+                .db_mut()
+                .tron_suicide(owner, obtainer, will_destroy, owner_balance);
         self.apply_tron_balance_deltas();
         result
     }

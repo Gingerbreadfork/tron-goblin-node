@@ -354,3 +354,173 @@ fn iscontract_returns_one_for_contract_and_zero_for_eoa() {
         );
     }
 }
+
+// =============================================================================
+// `checkTokenIdInTokenBalance` — two failure arms with DIFFERENT era gating
+// =============================================================================
+//
+// java `Program.checkTokenIdInTokenBalance` (Program.java:1838-1853), reached
+// only under ALLOW_MULTI_SIGN (#20):
+//
+//   * tokenId outside signed-i64 range — reads `sValue().longValueExact()`, and
+//     the catch IS gated on ALLOW_TVM_CONSTANTINOPLE: `TransferException` from
+//     #26 on, otherwise the raw `ArithmeticException`.
+//   * tokenId <= MIN_TOKEN_ID (1_000_000) — throws `BytecodeExecutionException`
+//     with NO Constantinople branch at all, so it is spend-all + UNKNOWN in
+//     EVERY era.
+//
+// Neither arm calls `refundEnergy`; unlike `checkTokenId`, this method contains
+// no refund at all.
+
+/// Build a TOKENBALANCE caller whose tokenId is a raw 32-byte word.
+fn build_tokenbalance_caller_raw(holder: [u8; 21], token_id: [u8; 32]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend(push20(holder));
+    bc.push(0x7f); // PUSH32 tokenId
+    bc.extend_from_slice(&token_id);
+    bc.push(0xd1); // TOKENBALANCE
+    bc.extend_from_slice(&[0x60, 0x00, 0x55]); // PUSH1 0 SSTORE
+    bc.push(0x00); // STOP
+    bc
+}
+
+fn run_tokenbalance(
+    multi_sign: bool,
+    constantinople: bool,
+    token_id: [u8; 32],
+    limit: u64,
+) -> VmOutcome {
+    let stores = fresh_stores();
+    if multi_sign {
+        stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    }
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", i64::from(constantinople));
+
+    let owner = tron_addr(0xa7);
+    let caller = tron_addr(0xc7);
+    let holder = tron_addr(0xd7);
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let bytecode = build_tokenbalance_caller_raw(holder, token_id);
+    let hash = tron_tvm::database::code_hash(&bytecode);
+    stores.code.put(hash.as_slice(), &bytecode).unwrap();
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(caller),
+            &Account {
+                address: caller.to_vec(),
+                balance: 0,
+                code_hash: hash.as_slice().to_vec(),
+                code: bytecode.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    execute_trigger(
+        &stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+        &TriggerSmartContract {
+            owner_address: owner.to_vec(),
+            contract_address: caller.to_vec(),
+            call_value: 0,
+            data: vec![],
+            call_token_value: 0,
+            token_id: 0,
+        },
+        limit,
+    )
+}
+
+/// Out-of-i64 tokenId: era-gated. Post-#26 it is a `TransferException`
+/// (consumed-only); pre-#26 the raw `ArithmeticException` spends all energy and
+/// records UNKNOWN.
+#[test]
+fn tokenbalance_out_of_range_token_id_is_era_gated() {
+    let mut token_id = [0u8; 32];
+    token_id[24] = 0x80; // 2^63
+    let limit = 500_000u64;
+
+    match run_tokenbalance(true, true, token_id, limit) {
+        VmOutcome::TransferFailed { energy_used } => {
+            assert!(
+                energy_used < limit,
+                "a TransferException is spend-all-exempt"
+            );
+        }
+        other => panic!("post-#26 expected TransferFailed, got {other:?}"),
+    }
+
+    match run_tokenbalance(true, false, token_id, limit) {
+        VmOutcome::Halt {
+            result,
+            energy_used,
+            ..
+        } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::Unknown
+            );
+            assert_eq!(energy_used, limit, "spendAllEnergy consumes the whole limit");
+        }
+        other => panic!("pre-#26 expected a spend-all Halt/UNKNOWN, got {other:?}"),
+    }
+}
+
+/// `tokenId <= MIN_TOKEN_ID` has NO Constantinople branch (Program.java:
+/// 1848-1851), so it is `BytecodeExecutionException` — spend-all with UNKNOWN —
+/// in BOTH eras. It previously recorded OUT_OF_MEMORY, which is java's
+/// `OutOfMemoryException` and a different fault.
+#[test]
+fn tokenbalance_small_token_id_is_spend_all_unknown_in_both_eras() {
+    let mut token_id = [0u8; 32];
+    token_id[28..].copy_from_slice(&900_000u32.to_be_bytes());
+    let limit = 500_000u64;
+
+    for constantinople in [true, false] {
+        match run_tokenbalance(true, constantinople, token_id, limit) {
+            VmOutcome::Halt {
+                result,
+                energy_used,
+                ..
+            } => {
+                assert_eq!(
+                    result,
+                    tron_proto::transaction::result::ContractResult::Unknown,
+                    "constantinople={constantinople}: BytecodeExecutionException records UNKNOWN"
+                );
+                assert_eq!(energy_used, limit, "constantinople={constantinople}");
+            }
+            other => panic!("constantinople={constantinople}: expected Halt/UNKNOWN, got {other:?}"),
+        }
+    }
+}
+
+/// Pre-ALLOW_MULTI_SIGN the whole `checkTokenIdInTokenBalance` body is skipped,
+/// so an otherwise-rejected tokenId just queries the absent id and pushes 0.
+#[test]
+fn tokenbalance_pre_multisign_skips_the_token_id_checks() {
+    let mut token_id = [0u8; 32];
+    token_id[28..].copy_from_slice(&900_000u32.to_be_bytes());
+    let outcome = run_tokenbalance(false, true, token_id, 500_000);
+    assert!(
+        matches!(outcome, VmOutcome::Success { .. }),
+        "pre-#20 the tokenId checks do not run at all, got {outcome:?}"
+    );
+}

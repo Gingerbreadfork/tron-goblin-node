@@ -42,13 +42,21 @@ struct Stores {
 }
 
 fn fresh_stores() -> Stores {
+    let dynamic_properties = Arc::new(DynamicPropertiesStore::new(mem()));
+    // A value-bearing CALL to an account with no store row can only SUCCEED
+    // once ALLOW_TVM_SOLIDITY_059 (#32) lets `Program.createAccountIfNotExist`
+    // create the recipient; before it `VMUtils.validateForSmartContract`
+    // rejects the transfer outright. The NEW_ACCT_CALL energy tests below
+    // measure the surcharge on exactly that call, so they model the post-#32
+    // era.
+    dynamic_properties.put_long(b"ALLOW_TVM_SOLIDITY_059", 1);
     Stores {
         accounts: Arc::new(AccountStore::new(mem())),
         code: Arc::new(CodeStore::new(mem())),
         storage: Arc::new(StorageRowStore::new(mem())),
         witnesses: Arc::new(WitnessStore::new(mem())),
         contract_state: Arc::new(ContractStateStore::new(mem())),
-        dynamic_properties: Arc::new(DynamicPropertiesStore::new(mem())),
+        dynamic_properties,
         delegated_resources: Arc::new(DelegatedResourceStore::new(mem())),
         delegation: Arc::new(DelegationStore::new(mem())),
     }
@@ -82,6 +90,16 @@ macro_rules! build_evm {
             Arc::clone(&stores.accounts),
             Arc::clone(&stores.code),
             Arc::clone(&stores.storage),
+        )
+        // Attach the dynamic-properties store so the database-backed proposal
+        // gates (e.g. ALLOW_TVM_SOLIDITY_059, which decides whether a
+        // value-bearing CALL may create its recipient) read the fixture's
+        // values instead of the all-unset default.
+        .with_staking_stores(
+            Arc::clone(&stores.dynamic_properties),
+            None,
+            Arc::clone(&stores.delegated_resources),
+            Arc::clone(&stores.delegation),
         );
         // These tests pre-date hard-fork gating and exercise the full
         // post-Byzantium opcode/precompile surface — use the

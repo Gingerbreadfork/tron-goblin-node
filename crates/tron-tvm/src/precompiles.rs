@@ -18,7 +18,7 @@
 use crate::address::*;
 use crate::context::{EvmContext, EvmContextError};
 use tron_crypto::address::{Address, ADDRESS_LENGTH};
-use tron_crypto::hash::{keccak256, sha256};
+use tron_crypto::hash::{keccak256, ripemd160, sha256};
 use tron_types::resource::{
     account_usage_balance_and_restore_seconds, all_frozen_balance_for_bandwidth,
     all_frozen_balance_for_energy, ResourceKind, BLOCK_PRODUCED_INTERVAL_MS,
@@ -111,6 +111,59 @@ pub const ALL_PRECOMPILES: &[PrecompileImpl] = &[
     PrecompileImpl::Blake2F,
     PrecompileImpl::P256Verify,
 ];
+
+/// Returns true iff `pre` is dispatched under the active proposal set.
+///
+/// Mirrors java-tron's `PrecompiledContracts.getContractForAddress`
+/// (`PrecompiledContracts.java:212-302`) — every `if (VMConfig.allowXyz())`
+/// short-circuit in that method is a row here. Addresses 0x01..0x08 are
+/// ungated there and are always dispatched.
+pub fn precompile_enabled(pre: PrecompileImpl, p: &crate::proposals::ProposalSet) -> bool {
+    use PrecompileImpl::*;
+    match pre {
+        // Standard EVM — handled by the eth fallback, never gated in java.
+        EcRecover | Sha256 | Ripemd160 | Identity | ModExp | Bn128Add | Bn128Mul
+        | Bn128Pairing => true,
+        // TRON multi-sig — both behind ALLOW_TVM_SOLIDITY_059.
+        BatchValidateSign | ValidateMultiSign => p.allow_tvm_solidity_059,
+        // Shielded — behind ALLOW_SHIELDED_TRC20_TRANSACTION.
+        VerifyMintProof | VerifyTransferProof | VerifyBurnProof | MerkleHash => {
+            p.allow_shielded_trc20_transaction
+        }
+        // Vote / SR queries — behind ALLOW_TVM_VOTE.
+        RewardBalance | IsSrCandidate | VoteCount | UsedVoteCount | ReceivedVoteCount
+        | TotalVoteCount => p.allow_tvm_vote,
+        // FreezeV2 / chain queries — behind ALLOW_TVM_FREEZE_V2.
+        // `GetChainParameter` ships with the v2 batch in
+        // `PrecompiledContracts.java:300` (`if (VMConfig.allowTvmFreezeV2())`
+        // covers the whole block).
+        GetChainParameter | AvailableUnfreezeV2Size | UnfreezableBalanceV2
+        | ExpireUnfreezeBalanceV2 | DelegatableResource | ResourceV2
+        | CheckUnDelegateResource | ResourceUsage | TotalResource | TotalDelegatedResource
+        | TotalAcquiredResource => p.allow_tvm_freeze_v2,
+        // Ethereum-compat extras — behind ALLOW_TVM_COMPATIBLE_EVM.
+        EthRipemd160 | Blake2F => p.allow_tvm_compatible_evm,
+        // P256Verify ships with ALLOW_TVM_OSAKA in java-tron. We don't model
+        // OSAKA on the spec resolver yet (TRON's Osaka proposal isn't activated
+        // on any live chain), so it stays hidden until that proposal lands.
+        // Off → no precompile dispatch, matching `getContractForAddress`
+        // returning null.
+        P256Verify => p.allow_tvm_osaka,
+    }
+}
+
+/// Returns true iff `addr` is dispatched as a precompile under the active
+/// proposal set — java-tron's `PrecompiledContracts.getContractForAddress(addr)
+/// != null`, which is exactly the test `OperationActions.exeCall`
+/// (`OperationActions.java:1033-1041`) uses to choose
+/// `Program.callToPrecompiledAddress` over `Program.callToAddress`.
+///
+/// This is deliberately NOT the interpreter's warm-address set: that set unions
+/// every known precompile regardless of its gate, so it is strictly wider than
+/// java's dispatch set and would mis-classify a gated-off address.
+pub fn is_active_precompile(addr: &PrecompileAddress, p: &crate::proposals::ProposalSet) -> bool {
+    PrecompileImpl::from_address(addr).is_some_and(|pre| precompile_enabled(pre, p))
+}
 
 impl PrecompileImpl {
     pub const fn address(self) -> PrecompileAddress {
@@ -251,6 +304,13 @@ impl PrecompileImpl {
             Self::Ripemd160 => {
                 600u64.saturating_add((input.len() as u64).div_ceil(32).saturating_mul(120))
             }
+            // java-tron `EthRipemd160.getEnergyForData`: the same
+            // `600 + 120 per 32-byte word (rounded up)` schedule as 0x03.
+            // Kept as its own arm because the two addresses run different
+            // digests and must never share an execute path.
+            Self::EthRipemd160 => {
+                600u64.saturating_add((input.len() as u64).div_ceil(32).saturating_mul(120))
+            }
             // java-tron `ModExp.getEnergyForData` is permanently the
             // EIP-198 (Byzantium) formula — it never adopted EIP-2565,
             // so the energy is ~10x higher than revm's resolved
@@ -259,9 +319,9 @@ impl PrecompileImpl {
             // java `ECRecover.getEnergyForData` — flat, input-independent.
             Self::EcRecover => 3000,
             // The remaining standard EVM precompiles (Sha256, Identity,
-            // Bn128Add, Bn128Mul, Bn128Pairing, EthRipemd160) are
-            // handled by the interpreter — their execute() returns
-            // HandledByInterpreter and the cost calculation lives in revm.
+            // Bn128Add, Bn128Mul, Bn128Pairing) are handled by the
+            // interpreter — their execute() returns HandledByInterpreter
+            // and the cost calculation lives in revm.
             _ => 0,
         }
     }
@@ -286,7 +346,7 @@ impl PrecompileImpl {
     ) -> PrecompileResult {
         match self {
             // === Implemented ===
-            Self::BatchValidateSign => batch_validate_sign(input),
+            Self::BatchValidateSign => batch_validate_sign(input, ctx),
             Self::ValidateMultiSign => validate_multi_sign(input, ctx),
             Self::IsSrCandidate => is_sr_candidate(input, ctx),
             Self::VoteCount => vote_count(input, ctx),
@@ -321,8 +381,12 @@ impl PrecompileImpl {
             | Self::Identity
             | Self::Bn128Add
             | Self::Bn128Mul
-            | Self::Bn128Pairing
-            | Self::EthRipemd160 => Err(PrecompileError::HandledByInterpreter),
+            | Self::Bn128Pairing => Err(PrecompileError::HandledByInterpreter),
+
+            // `0x00020003` is where real ripemd160 lives on TRON; there is
+            // no upstream precompile at that address, so it is implemented
+            // here alongside the other Ethereum-compat extras.
+            Self::EthRipemd160 => Ok(eth_ripemd160_precompile(input)),
 
             // === Shielded zk-SNARK precompiles — all four are implemented. ===
             Self::MerkleHash => merkle_hash_precompile(input),
@@ -423,6 +487,18 @@ fn blake2f_precompile(input: &[u8]) -> PrecompileResult {
 fn ripemd160_precompile(input: &[u8]) -> Vec<u8> {
     let first = sha256(input);
     sha256(&first[..20]).to_vec()
+}
+
+/// `0x00020003` — genuine RIPEMD-160, the address java-tron reserves for it
+/// because 0x03 is occupied by the double-SHA256 quirk above. java's
+/// `EthRipemd160.execute` wraps the digest in `new DataWord(result)`, and
+/// `DataWord`'s constructor right-aligns any array shorter than 32 bytes,
+/// so the 20-byte digest comes back left-padded with 12 zero bytes.
+/// Always succeeds — java returns `Pair.of(true, ...)` unconditionally.
+fn eth_ripemd160_precompile(input: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; WORD_SIZE];
+    out[12..].copy_from_slice(&ripemd160(input));
+    out
 }
 
 /// java-tron `ModExp.parseLen` — the `idx`-th 32-byte big-endian length
@@ -632,22 +708,41 @@ pub enum PrecompileError {
     BadInputLength { got: usize, expected: usize },
     #[error("malformed input")]
     Malformed,
+    /// java-tron's precompile returned `Pair.of(false, ...)` — an explicit
+    /// failure result, not a throw. `Program.callToPrecompiledAddress`
+    /// (Program.java:1762-1768) maps that to `refundEnergy(0,
+    /// CALL_PRE_COMPILED)` + `stackPushZero()`: the energy forwarded to the
+    /// call is consumed in full, a zero is pushed, and the CALLING frame
+    /// continues with the rest of its own budget intact.
+    ///
+    /// Produced by `MerkleHash` (bad level / short input) and `Blake2F`
+    /// (wrong length / bad finalization flag). The interpreter bridge
+    /// (`evm.rs::dispatch_tron`) maps it to a revert consuming the whole
+    /// forwarded `gas_limit`, NOT to a zero-cost revert (which is reserved
+    /// for the success-with-false `Ok(..)` precompile outputs).
+    ///
+    /// Distinct from [`PrecompileError::UncaughtThrow`], where java raises
+    /// an exception instead of returning a value.
+    #[error("precompile returned failure: spend the forwarded energy and revert")]
+    SpendAllRevert,
     /// An access that throws an *uncaught* exception in java-tron's
     /// precompile body — e.g. an out-of-range `words[]` index or an
     /// `Arrays.copyOfRange` past the end of the call data in
-    /// `ValidateMultiSign`/`extractSigArray`, whose try-block does not
-    /// cover those statements. In java the resulting
-    /// `ArrayIndexOutOfBoundsException` propagates to `VM.java`, which
-    /// runs `program.spendAllEnergy()` and halts → the whole transaction
-    /// reverts after burning the entire energy budget.
+    /// `ValidateMultiSign`, whose try-block starts only after those
+    /// statements. The resulting `ArrayIndexOutOfBoundsException` escapes
+    /// `Program.callToPrecompiledAddress` (which does not wrap
+    /// `contract.execute`) into `VM.java`, whose `catch (RuntimeException)`
+    /// runs `program.spendAllEnergy()` on the frame that executed the CALL
+    /// and halts it.
     ///
-    /// The interpreter bridge (`evm.rs::dispatch_tron`) MUST map this
-    /// variant to a revert that consumes the full `gas_limit`, NOT to a
-    /// zero-cost revert (which is reserved for the success-with-false
-    /// `Ok(..)` precompile outputs). This is distinct from `Malformed`,
-    /// whose java counterpart returns a value rather than throwing.
-    #[error("uncaught precompile throw: spend all energy and revert")]
-    SpendAllRevert,
+    /// The interpreter bridge maps this to
+    /// `InstructionResult::PrecompileThrow`, which spends the CALLING
+    /// frame's entire remaining energy and terminates it — no stack push, no
+    /// return data. It is NOT transaction-fatal: `VM.play`'s outer catch
+    /// turns it into `setRuntimeFailure`, and `Program.callToAddress`
+    /// (Program.java:1156-1170) lets a parent frame push zero and continue.
+    #[error("uncaught precompile throw: spend the calling frame's energy and halt")]
+    UncaughtThrow,
     #[error("context error: {0}")]
     Context(#[from] EvmContextError),
     #[error("handled by the EVM interpreter, not here")]
@@ -921,7 +1016,7 @@ fn extract_bytes(data: &[u8], offset: usize, len: usize) -> Option<Vec<u8>> {
 }
 
 /// java-tron `PrecompiledContracts.extractSigArray` — the
-/// `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet) path
+/// `allowTvmSelfdestructRestriction` (proposal #94, active on mainnet) path
 /// for parsing the signature `bytes[]`. `offset` is the array-head word
 /// index (`words[i].intValueSafe() / WORD_SIZE`). The `len` word is at
 /// `offset`; the `N` words after it are per-element relative byte offsets,
@@ -934,8 +1029,8 @@ fn extract_bytes(data: &[u8], offset: usize, len: usize) -> Option<Vec<u8>> {
 /// `Arrays.copyOfRange`). This throw is OUTSIDE `ValidateMultiSign`'s
 /// try-block but INSIDE `BatchValidateSign.doExecute`'s, so each caller
 /// maps `None` differently: `BatchValidateSign` returns the caught
-/// all-zero word, while `ValidateMultiSign` propagates a spend-all
-/// revert (`PrecompileError::SpendAllRevert`).
+/// all-zero word, while `ValidateMultiSign` propagates
+/// [`PrecompileError::UncaughtThrow`].
 fn extract_sig_array(words: &[[u8; WORD_SIZE]], offset: usize, data: &[u8]) -> Option<Vec<Vec<u8>>> {
     if words.is_empty() || offset > words.len() - 1 {
         return Some(Vec::new());
@@ -952,6 +1047,89 @@ fn extract_sig_array(words: &[[u8; WORD_SIZE]], offset: usize, data: &[u8]) -> O
         out.push(extract_bytes(data, read_at, SIG_LENGTH)?);
     }
     Some(out)
+}
+
+/// One element of a pre-#94 `bytes[]`. `real` is the portion actually present
+/// in the call data; `declared_len` is the value of the element's length word.
+/// java materialises `declared_len` bytes via `Arrays.copyOfRange`, zero-padding
+/// past the end of the call data — `real` plus that implied padding is the same
+/// value without allocating an attacker-controlled length.
+struct BytesElem {
+    real: Vec<u8>,
+    declared_len: usize,
+}
+
+/// Two pre-#94 elements are equal iff their zero-extensions are: the same
+/// declared length, and the shorter `real` a prefix of the longer whose
+/// remaining bytes are all zero.
+fn elems_equal(a: &BytesElem, b: &BytesElem) -> bool {
+    if a.declared_len != b.declared_len {
+        return false;
+    }
+    let (short, long) = if a.real.len() <= b.real.len() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    long.real[..short.real.len()] == short.real[..]
+        && long.real[short.real.len()..].iter().all(|&x| x == 0)
+}
+
+/// java-tron `PrecompiledContracts.extractBytesArray` — the parser used
+/// BEFORE `allowTvmSelfdestructRestriction` (proposal #94). Identical to
+/// [`extract_sig_array`] except that each element carries its own declared
+/// length word at `words[offset + bytesOffset + 1]` instead of the fixed
+/// `SIG_LENGTH`.
+///
+/// Returns `None` where java throws: an out-of-range element pointer or
+/// length word (`words[...]`), or a read starting past the end of the call
+/// data (`Arrays.copyOfRange`). `ValidateMultiSign` maps that to a spend-all
+/// revert; `BatchValidateSign` catches it and returns the all-zero word.
+fn extract_bytes_array(
+    words: &[[u8; WORD_SIZE]],
+    offset: usize,
+    data: &[u8],
+) -> Option<Vec<BytesElem>> {
+    if words.is_empty() || offset > words.len() - 1 {
+        return Some(Vec::new());
+    }
+    let len = word_int_value_safe(&words[offset]);
+    // NOT `with_capacity(len)`: `len` is attacker-controlled up to i32::MAX.
+    let mut out = Vec::new();
+    for i in 0..len {
+        let ptr_word = words.get(offset + i + 1)?;
+        let bytes_offset = word_int_value_safe(ptr_word) / WORD_SIZE;
+        let len_word = words.get(offset.checked_add(bytes_offset)?.checked_add(1)?)?;
+        let declared_len = word_int_value_safe(len_word);
+        let read_at = bytes_offset
+            .saturating_add(offset)
+            .saturating_add(2)
+            .saturating_mul(WORD_SIZE);
+        if read_at > data.len() {
+            return None;
+        }
+        let real_len = declared_len.min(data.len() - read_at);
+        out.push(BytesElem {
+            real: data[read_at..read_at + real_len].to_vec(),
+            declared_len,
+        });
+    }
+    Some(out)
+}
+
+/// Recover the signer from a pre-#94 `bytes[]` element, applying java's
+/// length rule: `recoverAddrBySign` rejects anything shorter than
+/// `SIG_LENGTH` outright (`sign.length < 65` → empty address → weight 0).
+/// A longer or truncated-by-call-data element is read as its first 65
+/// bytes, zero-padded where the call data ran out.
+fn recover_addr_by_elem(elem: &BytesElem, hash: &[u8; WORD_SIZE]) -> Option<[u8; 20]> {
+    if elem.declared_len < SIG_LENGTH {
+        return None;
+    }
+    let mut sig = [0u8; SIG_LENGTH];
+    let n = elem.real.len().min(SIG_LENGTH);
+    sig[..n].copy_from_slice(&elem.real[..n]);
+    recover_addr_by_sign(&sig, hash)
 }
 
 /// java-tron `recoverAddrBySign` — recover the signer's 20-byte (EVM-style,
@@ -1064,7 +1242,7 @@ fn ecrecover_precompile(input: &[u8]) -> Vec<u8> {
 // addresses[i], 0 otherwise. On any malformed input it returns the all-zero
 // word (java's `execute` catches every Throwable and returns `new byte[32]`).
 
-fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
+fn batch_validate_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     const MAX_SIZE: usize = 16;
 
     // java `DataWord.parseArray` floors `len = data.length / WORD_SIZE`,
@@ -1086,22 +1264,44 @@ fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
     let sig_head_idx = word_int_value_safe(&words[1]) / WORD_SIZE;
     let addr_head_idx = word_int_value_safe(&words[2]) / WORD_SIZE;
 
-    // `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet):
-    // java reads the declared array sizes and rejects oversized ones up
-    // front, then parses the signatures with offset indirection.
-    let (Some(sig_head), Some(addr_head)) = (words.get(sig_head_idx), words.get(addr_head_idx))
-    else {
-        return Ok(data_boolean(false));
+    // `allowTvmSelfdestructRestriction` (proposal #94) selects the parser.
+    // With the restriction ON java reads the declared array sizes, rejects
+    // oversized ones up front, and parses fixed 65-byte elements; with it OFF
+    // neither read happens and each element carries its own declared length.
+    //
+    // Every failure here is an `Ok(..)` result: `BatchValidateSign.execute`
+    // wraps `doExecute` in `catch (Throwable t)` and returns the 32-byte zero
+    // word, so a parse throw is never a spend-all revert on this address.
+    let restriction = ctx.allow_tvm_selfdestruct_restriction();
+    let addr_array_size = {
+        let Some(addr_head) = words.get(addr_head_idx) else {
+            return Ok(data_boolean(false));
+        };
+        word_int_value_safe(addr_head)
     };
-    let sig_array_size = word_int_value_safe(sig_head);
-    let addr_array_size = word_int_value_safe(addr_head);
-    if sig_array_size > MAX_SIZE || addr_array_size > MAX_SIZE {
-        return Ok(data_boolean(false));
-    }
-
-    let signatures = match extract_sig_array(words, sig_head_idx, input) {
-        Some(s) => s,
-        None => return Ok(data_boolean(false)),
+    let signatures: Vec<BytesElem> = if restriction {
+        let Some(sig_head) = words.get(sig_head_idx) else {
+            return Ok(data_boolean(false));
+        };
+        let sig_array_size = word_int_value_safe(sig_head);
+        if sig_array_size > MAX_SIZE || addr_array_size > MAX_SIZE {
+            return Ok(data_boolean(false));
+        }
+        match extract_sig_array(words, sig_head_idx, input) {
+            Some(s) => s
+                .into_iter()
+                .map(|real| BytesElem {
+                    declared_len: SIG_LENGTH,
+                    real,
+                })
+                .collect(),
+            None => return Ok(data_boolean(false)),
+        }
+    } else {
+        match extract_bytes_array(words, sig_head_idx, input) {
+            Some(s) => s,
+            None => return Ok(data_boolean(false)),
+        }
     };
     // addresses := contiguous 32-byte words after the array-length word
     // (java `extractBytes32Array`). java eagerly reads `words[addr_head_idx +
@@ -1131,7 +1331,7 @@ fn batch_validate_sign(input: &[u8]) -> PrecompileResult {
         let Some(addr_word) = words.get(addr_head_idx + i + 1) else {
             continue;
         };
-        let Some(recovered) = recover_addr_by_sign(sig, &hash) else {
+        let Some(recovered) = recover_addr_by_elem(sig, &hash) else {
             continue;
         };
         // java `DataWord.equalAddressByteArray` compares the low 20 bytes.
@@ -1173,16 +1373,15 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let words = &parsed[..word_count];
 
     // java-tron `ValidateMultiSign.execute` accesses `words[0]`, `words[1]`,
-    // `words[2]`, `words[3]` and `words[words[3].intValueSafe() / WORD_SIZE]`
-    // BEFORE its try-block. An out-of-range index here throws
-    // `ArrayIndexOutOfBoundsException`, which is uncaught → `VM.java`
-    // `spendAllEnergy()` + whole-tx revert. These are NOT the
-    // success-with-false `Pair.of(true, DATA_FALSE)` returns inside the body;
-    // they burn the full energy budget.
+    // `words[2]` and `words[3]` BEFORE its try-block. An out-of-range index
+    // here throws `ArrayIndexOutOfBoundsException`, which is uncaught →
+    // `VM.java` runs `spendAllEnergy()` on the calling frame and halts it.
+    // These are NOT the success-with-false `Pair.of(true, DATA_FALSE)`
+    // returns inside the body; they burn that frame's whole energy budget.
     let (Some(w0), Some(w1), Some(w2), Some(w3)) =
         (words.first(), words.get(1), words.get(2), words.get(3))
     else {
-        return Err(PrecompileError::SpendAllRevert);
+        return Err(PrecompileError::UncaughtThrow);
     };
 
     let addr = word_to_tron_address(w0);
@@ -1196,29 +1395,50 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     combine.extend_from_slice(w2);
     let hash: [u8; WORD_SIZE] = sha256(&combine);
 
-    // `allowTvmSelfdestructRestriction` (proposal #70, active on mainnet):
-    // reject oversized arrays up front, then parse the `bytes[]` with offset
-    // indirection. `words[words[3].intValueSafe() / WORD_SIZE]` is a pre-try
-    // access in java — an out-of-range head index throws → spend-all-revert,
-    // NOT a false result.
     let sig_head_idx = word_int_value_safe(w3) / WORD_SIZE;
-    let Some(sig_head) = words.get(sig_head_idx) else {
-        return Err(PrecompileError::SpendAllRevert);
-    };
-    // `sigArraySize > MAX_SIZE` is an explicit `Pair.of(true, DATA_FALSE)`
-    // return in java — a successful precompile with a false word.
-    if word_int_value_safe(sig_head) > MAX_SIZE {
-        return Ok(data_boolean(false));
-    }
 
-    // `extractSigArray` is also pre-try in `ValidateMultiSign`: an
-    // out-of-range element word or a signature read past the end of the call
-    // data throws → spend-all-revert (see `extract_sig_array`). This differs
-    // from `BatchValidateSign`, whose identical throw is caught and returns a
-    // false word.
-    let signatures = match extract_sig_array(words, sig_head_idx, input) {
-        Some(s) => s,
-        None => return Err(PrecompileError::SpendAllRevert),
+    // `allowTvmSelfdestructRestriction` (proposal #94) selects the parser.
+    //
+    // With the restriction ON java reads the declared array size from
+    // `words[words[3].intValueSafe() / WORD_SIZE]` — a pre-try access, so an
+    // out-of-range head index throws, NOT a false result — rejects oversized
+    // arrays up front, and parses fixed 65-byte elements.
+    //
+    // With it OFF neither the head-word read nor the size check happens at
+    // all (both sit inside the `if (VMConfig.allowTvmSelfdestructRestriction())`
+    // block), and `extractBytesArray` absorbs an out-of-range head index with
+    // its own `offset > words.length - 1` guard, yielding the empty array and
+    // a plain `Pair.of(true, DATA_FALSE)`.
+    //
+    // Either parser is pre-try in `ValidateMultiSign`, so an out-of-range
+    // element word or a read past the end of the call data throws. This
+    // differs from `BatchValidateSign`, whose identical throw is caught and
+    // returns a false word.
+    let restriction = ctx.allow_tvm_selfdestruct_restriction();
+    let signatures: Vec<BytesElem> = if restriction {
+        let Some(sig_head) = words.get(sig_head_idx) else {
+            return Err(PrecompileError::UncaughtThrow);
+        };
+        // `sigArraySize > MAX_SIZE` is an explicit `Pair.of(true, DATA_FALSE)`
+        // return in java — a successful precompile with a false word.
+        if word_int_value_safe(sig_head) > MAX_SIZE {
+            return Ok(data_boolean(false));
+        }
+        match extract_sig_array(words, sig_head_idx, input) {
+            Some(s) => s
+                .into_iter()
+                .map(|real| BytesElem {
+                    declared_len: SIG_LENGTH,
+                    real,
+                })
+                .collect(),
+            None => return Err(PrecompileError::UncaughtThrow),
+        }
+    } else {
+        match extract_bytes_array(words, sig_head_idx, input) {
+            Some(s) => s,
+            None => return Err(PrecompileError::UncaughtThrow),
+        }
     };
     // `signatures.length == 0 || > MAX_SIZE` is an explicit
     // `Pair.of(true, DATA_FALSE)` return — a successful false result.
@@ -1254,17 +1474,23 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     // signer with a *different* sig still passes through (its weight is added
     // again — but java de-dups exact `(recoveredAddr, sign)` pairs, so a
     // byte-identical signature counts once).
-    let mut executed: Vec<(Vec<u8>, [u8; 20])> = Vec::new();
+    // java's `merge(recoveredAddr, sign)` de-dup key is the recovered address
+    // followed by the element's bytes, so a pair repeats only when both halves
+    // repeat. The address is a fixed 20 bytes, so comparing `(recovered, elem)`
+    // is equivalent — and avoids materialising an element whose declared
+    // length is attacker-controlled.
+    let mut executed: Vec<(&BytesElem, [u8; 20])> = Vec::new();
     let mut total_weight: i64 = 0;
     for sign in &signatures {
-        let Some(recovered) = recover_addr_by_sign(sign, &hash) else {
+        let Some(recovered) = recover_addr_by_elem(sign, &hash) else {
             // recoverAddrBySign returns an empty address → getWeight == 0.
             return Ok(data_boolean(false));
         };
-        let merged: Vec<u8> = recovered.iter().chain(sign.iter()).copied().collect();
         let seen_addr = executed.iter().any(|(_, a)| a == &recovered);
         if seen_addr {
-            let seen_pair = executed.iter().any(|(m, _)| m == &merged);
+            let seen_pair = executed
+                .iter()
+                .any(|(e, a)| a == &recovered && elems_equal(e, sign));
             if seen_pair {
                 continue;
             }
@@ -1274,7 +1500,7 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
             return Ok(data_boolean(false));
         }
         total_weight += weight;
-        executed.push((merged, recovered));
+        executed.push((sign, recovered));
     }
 
     Ok(data_boolean(total_weight >= permission.threshold))
@@ -1322,7 +1548,12 @@ fn select_permission(account: &tron_proto::Account, id: i32) -> Option<tron_prot
 
 const RESOURCE_BANDWIDTH: i32 = 0;
 const RESOURCE_ENERGY: i32 = 1;
-// const RESOURCE_TRON_POWER: i32 = 2;  // not handled by these precompiles
+/// java `Common.ResourceCode.TRON_POWER`. Selectable at
+/// `UnfreezableBalanceV2` and at `ResourceV2`'s self-branch, both of which
+/// route through `FreezeV2Util.queryUnfreezableBalanceV2` — its type-2 arm
+/// is `AccountCapsule.getTronPowerFrozenV2Balance()`. The other resource
+/// precompiles have no type-2 arm and return zero for it.
+const RESOURCE_TRON_POWER: i32 = 2;
 
 /// Diagnostic: when `TRON_PRECOMPILE_TRACE_BLOCK` is set to a block number,
 /// log every FreezeV2 resource-precompile call (address, input, output) made
@@ -1409,13 +1640,21 @@ fn maybe_trace_resource_precompile(
     }
 }
 
-fn parse_address_and_type(input: &[u8]) -> Option<(Address, i32)> {
+/// Decode the `(address, resourceType)` pair these precompiles take.
+///
+/// The type word goes through java's `DataWord.longValueSafe()` — 64-bit,
+/// saturating to `Long.MAX_VALUE` when the word occupies more than eight
+/// bytes or when its low eight bytes read as a negative `long` — and each
+/// caller compares the result as a 64-bit value. A word that is not
+/// numerically 0, 1 or 2 therefore selects no resource, however its low
+/// bytes happen to look.
+fn parse_address_and_type(input: &[u8]) -> Option<(Address, i64)> {
     if input.len() != 2 * WORD_SIZE {
         return None;
     }
     let words = parse_words(input);
     let addr = word_to_tron_address(&words[0]);
-    let resource_type = i64::from_be_bytes(words[1][24..32].try_into().ok()?) as i32;
+    let resource_type = word_to_long_safe(&words[1]);
     Some((addr, resource_type))
 }
 
@@ -1520,15 +1759,6 @@ fn total_acquired(account: &tron_proto::Account, resource_type: i32) -> i64 {
         .saturating_add(acquired_delegated_v2(account, resource_type))
 }
 
-/// Map the precompile's `i32` resource selector to [`ResourceKind`].
-fn resource_kind(resource_type: i32) -> Option<ResourceKind> {
-    match resource_type {
-        RESOURCE_BANDWIDTH => Some(ResourceKind::Bandwidth),
-        RESOURCE_ENERGY => Some(ResourceKind::Energy),
-        _ => None,
-    }
-}
-
 /// `(usageBalanceInSun, restoreSeconds)` for an account's current decayed usage
 /// — java's `getAccount{Net,Energy}UsageBalanceAndRestoreSeconds`. Reads the
 /// chain-global weights/limits from dyn-props.
@@ -1604,9 +1834,15 @@ fn unfreezable_balance_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResul
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    // type 0/1/2 (BANDWIDTH/ENERGY/TRON_POWER) all map to a frozen_v2 sum;
-    // any other type yields 0 (no matching frozen_v2 entries).
-    Ok(long_to_32_bytes(frozen_v2_balance(&account, rtype)))
+    // types 0/1/2 (BANDWIDTH/ENERGY/TRON_POWER) each sum the account's
+    // frozen_v2 entries of that kind; every other type returns 0.
+    let balance = match rtype {
+        0 => frozen_v2_balance(&account, RESOURCE_BANDWIDTH),
+        1 => frozen_v2_balance(&account, RESOURCE_ENERGY),
+        2 => frozen_v2_balance(&account, RESOURCE_TRON_POWER),
+        _ => 0,
+    };
+    Ok(long_to_32_bytes(balance))
 }
 
 // === 0x0100000e — ExpireUnfreezeBalanceV2 ===================================
@@ -1657,23 +1893,27 @@ fn delegatable_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult 
         Some(p) => p,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let Some(kind) = resource_kind(rtype) else {
-        return Ok(long_to_32_bytes(0));
+    // java `queryDelegatableResource` has arms for type 0 and type 1 only;
+    // type 2 and everything else return 0.
+    let (kind, rcode) = match rtype {
+        0 => (ResourceKind::Bandwidth, RESOURCE_BANDWIDTH),
+        1 => (ResourceKind::Energy, RESOURCE_ENERGY),
+        _ => return Ok(long_to_32_bytes(0)),
     };
     let account = match ctx.get_account(&addr)? {
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    let frozen_v2_resource = frozen_v2_balance(&account, rtype);
+    let frozen_v2_resource = frozen_v2_balance(&account, rcode);
     let (usage_balance, _restore) = account_usage_balance(&account, kind, ctx)?;
     if usage_balance <= 0 {
         return Ok(long_to_32_bytes(frozen_v2_resource));
     }
     // java `getV2{Net,Energy}Usage`.
     let v2_usage = usage_balance
-        .saturating_sub(frozen_v1(&account, rtype))
-        .saturating_sub(acquired_delegated_v1(&account, rtype))
-        .saturating_sub(acquired_delegated_v2(&account, rtype))
+        .saturating_sub(frozen_v1(&account, rcode))
+        .saturating_sub(acquired_delegated_v1(&account, rcode))
+        .saturating_sub(acquired_delegated_v2(&account, rcode))
         .max(0);
     Ok(long_to_32_bytes(frozen_v2_resource.saturating_sub(v2_usage).max(0)))
 }
@@ -1693,12 +1933,17 @@ fn resource_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     let words = parse_words(input);
     let target = word_to_tron_address(&words[0]);
     let from = word_to_tron_address(&words[1]);
-    let rtype = word_to_long_safe(&words[2]) as i32;
+    let rtype = word_to_long_safe(&words[2]);
 
     if from == target {
-        // queryUnfreezableBalanceV2(from, type)
+        // queryUnfreezableBalanceV2(from, type) — types 0/1/2, else 0.
         let balance = match ctx.get_account(&from)? {
-            Some(a) => frozen_v2_balance(&a, rtype),
+            Some(a) => match rtype {
+                0 => frozen_v2_balance(&a, RESOURCE_BANDWIDTH),
+                1 => frozen_v2_balance(&a, RESOURCE_ENERGY),
+                2 => frozen_v2_balance(&a, RESOURCE_TRON_POWER),
+                _ => 0,
+            },
             None => 0,
         };
         return Ok(long_to_32_bytes(balance));
@@ -1706,8 +1951,8 @@ fn resource_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
 
     // queryResourceV2(from, target, type): unlocked + locked delegation rows.
     let pick = |dr: &tron_proto::DelegatedResource| match rtype {
-        RESOURCE_BANDWIDTH => dr.frozen_balance_for_bandwidth,
-        RESOURCE_ENERGY => dr.frozen_balance_for_energy,
+        0 => dr.frozen_balance_for_bandwidth,
+        1 => dr.frozen_balance_for_energy,
         _ => 0,
     };
     let unlocked = ctx.get_delegated_resource(&from, &target)?;
@@ -1715,7 +1960,7 @@ fn resource_v2(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     if unlocked.is_none() && locked.is_none() {
         return Ok(long_to_32_bytes(0));
     }
-    if !matches!(rtype, RESOURCE_BANDWIDTH | RESOURCE_ENERGY) {
+    if !matches!(rtype, 0 | 1) {
         return Ok(long_to_32_bytes(0));
     }
     let amount = unlocked.as_ref().map(pick).unwrap_or(0)
@@ -1751,7 +1996,7 @@ fn check_un_delegate_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
     let words = parse_words(input);
     let target = word_to_tron_address(&words[0]);
     let amount = word_to_long_safe(&words[1]);
-    let rtype = word_to_long_safe(&words[2]) as i32;
+    let rtype = word_to_long_safe(&words[2]);
 
     // `amount <= 0` / unknown resource type / missing account → zeros.
     if amount <= 0 {
@@ -1761,9 +2006,19 @@ fn check_un_delegate_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
         Some(a) => a,
         None => return Ok(zeros()),
     };
-    let (kind, resource_limit) = match rtype {
-        RESOURCE_BANDWIDTH => (ResourceKind::Bandwidth, all_frozen_balance_for_bandwidth(&account)),
-        RESOURCE_ENERGY => (ResourceKind::Energy, all_frozen_balance_for_energy(&account)),
+    // java `checkUndelegateResource` has arms for type 0 and type 1 only;
+    // every other type returns `Triple.of(0L, 0L, 0L)`.
+    let (kind, rcode, resource_limit) = match rtype {
+        0 => (
+            ResourceKind::Bandwidth,
+            RESOURCE_BANDWIDTH,
+            all_frozen_balance_for_bandwidth(&account),
+        ),
+        1 => (
+            ResourceKind::Energy,
+            RESOURCE_ENERGY,
+            all_frozen_balance_for_energy(&account),
+        ),
         _ => return Ok(zeros()),
     };
 
@@ -1790,10 +2045,10 @@ fn check_un_delegate_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileR
             || th.contains("5a03038f0753dcde97c1c8ca81bde7b168778b63")
         {
             let r = account.account_resource.clone().unwrap_or_default();
-            let fv2 = frozen_v2_balance(&account, rtype);
-            let fv1 = frozen_v1(&account, rtype);
-            let aq1 = acquired_delegated_v1(&account, rtype);
-            let aq2 = acquired_delegated_v2(&account, rtype);
+            let fv2 = frozen_v2_balance(&account, rcode);
+            let fv1 = frozen_v1(&account, rcode);
+            let aq1 = acquired_delegated_v1(&account, rcode);
+            let aq2 = acquired_delegated_v2(&account, rcode);
             let tew = ctx.chain_parameter_long(b"TOTAL_ENERGY_WEIGHT").ok().flatten().unwrap_or(0);
             let tel = ctx
                 .chain_parameter_long(b"TOTAL_ENERGY_CURRENT_LIMIT")
@@ -1834,8 +2089,12 @@ fn resource_usage_precompile(input: &[u8], ctx: &dyn EvmContext) -> PrecompileRe
         Some(p) => p,
         None => return Ok(zeros()),
     };
-    let Some(kind) = resource_kind(rtype) else {
-        return Ok(zeros());
+    // java `queryFrozenBalanceUsage` has arms for type 0 and type 1 only;
+    // every other type returns `Pair.of(0L, 0L)`.
+    let kind = match rtype {
+        0 => ResourceKind::Bandwidth,
+        1 => ResourceKind::Energy,
+        _ => return Ok(zeros()),
     };
     let account = match ctx.get_account(&addr)? {
         Some(a) => a,
@@ -1862,8 +2121,8 @@ fn total_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
         None => return Ok(long_to_32_bytes(0)),
     };
     let total = match rtype {
-        RESOURCE_BANDWIDTH => all_frozen_balance_for_bandwidth(&account),
-        RESOURCE_ENERGY => all_frozen_balance_for_energy(&account),
+        0 => all_frozen_balance_for_bandwidth(&account),
+        1 => all_frozen_balance_for_energy(&account),
         _ => 0,
     };
     Ok(long_to_32_bytes(total))
@@ -1882,7 +2141,13 @@ fn total_delegated_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileRes
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    Ok(long_to_32_bytes(total_delegated(&account, rtype)))
+    // java reads `type == 0` / `type == 1` only; anything else returns 0.
+    let total = match rtype {
+        0 => total_delegated(&account, RESOURCE_BANDWIDTH),
+        1 => total_delegated(&account, RESOURCE_ENERGY),
+        _ => 0,
+    };
+    Ok(long_to_32_bytes(total))
 }
 
 // === 0x01000015 — TotalAcquiredResource =====================================
@@ -1898,5 +2163,11 @@ fn total_acquired_resource(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResu
         Some(a) => a,
         None => return Ok(long_to_32_bytes(0)),
     };
-    Ok(long_to_32_bytes(total_acquired(&account, rtype)))
+    // java reads `type == 0` / `type == 1` only; anything else returns 0.
+    let total = match rtype {
+        0 => total_acquired(&account, RESOURCE_BANDWIDTH),
+        1 => total_acquired(&account, RESOURCE_ENERGY),
+        _ => 0,
+    };
+    Ok(long_to_32_bytes(total))
 }

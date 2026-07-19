@@ -88,6 +88,23 @@ fn type_word(r: i32) -> [u8; 32] {
     w
 }
 
+/// A resource-type word built from raw bytes, so a test can set the high 24
+/// bytes or the low word's sign bit — the inputs `type_word` cannot express.
+fn raw_type_word(bytes: [u8; 32]) -> [u8; 32] {
+    bytes
+}
+
+/// A resource-type word whose low 8 bytes are `lo` and whose byte at index
+/// `hi_idx` (0..24) is `hi`. `hi_idx = None` leaves the high bytes clear.
+fn wide_type_word(hi_idx: Option<usize>, hi: u8, lo: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..32].copy_from_slice(&lo.to_be_bytes());
+    if let Some(i) = hi_idx {
+        w[i] = hi;
+    }
+    w
+}
+
 /// Pack a i64 value into a 32-byte big-endian word.
 fn long_word(v: i64) -> [u8; 32] {
     let mut w = [0u8; 32];
@@ -653,4 +670,280 @@ fn stake_v2_query_precompiles_obey_cross_method_identities() {
     assert_eq!(total_acquired, 100_000);
     // Identity: total_resource - acquired == frozen.
     assert_eq!(total_resource - total_acquired, frozen);
+}
+
+// =============================================================================
+// Resource-type word decode — java `DataWord.longValueSafe()`
+// =============================================================================
+//
+// Every type-taking FreezeV2 precompile reads its type word with
+// `longValueSafe()`: 64-bit, saturating to `Long.MAX_VALUE` when the word
+// occupies more than eight bytes or when its low eight bytes read as a
+// negative `long`. The comparison against 0 / 1 / 2 is then on the full
+// `long`, so any word that is not numerically 0, 1 or 2 selects no resource
+// and yields that precompile's zero-shaped result. Ungated: java has decoded
+// these words this way since the precompiles were introduced.
+
+/// An account with distinct non-zero balances for every resource, so a
+/// wrongly-decoded type word produces a loudly non-zero answer.
+fn well_funded() -> Account {
+    let mut acct = freeze_v2_account(alice(), 0, 700);
+    acct.frozen_v2.push(FreezeV2Entry {
+        r#type: 1,
+        amount: 900,
+    });
+    acct.frozen_v2.push(FreezeV2Entry {
+        r#type: 2,
+        amount: 1_300,
+    });
+    acct.delegated_frozen_v2_balance_for_bandwidth = 300;
+    acct.acquired_delegated_frozen_v2_balance_for_bandwidth = 100;
+    acct.account_resource = Some(AccountResource {
+        delegated_frozen_v2_balance_for_energy: 500,
+        acquired_delegated_frozen_v2_balance_for_energy: 200,
+        ..Default::default()
+    });
+    acct
+}
+
+/// Assert that `type_word` selects no resource at every type-taking
+/// precompile: each must return its zero-shaped result.
+fn assert_type_word_selects_nothing(label: &str, tw: [u8; 32]) {
+    let mut ctx = MockCtx::default();
+    put_account(&mut ctx, alice(), well_funded());
+    // A delegation row so ResourceV2's cross branch has something to return.
+    ctx.delegated_resources.insert(
+        (bob(), alice()),
+        DelegatedResource {
+            from: bob().as_bytes().to_vec(),
+            to: alice().as_bytes().to_vec(),
+            frozen_balance_for_bandwidth: 4_000,
+            frozen_balance_for_energy: 5_000,
+            ..Default::default()
+        },
+    );
+    put_account(&mut ctx, bob(), well_funded());
+
+    let mut two_word = [0u8; 64];
+    two_word[..32].copy_from_slice(&addr_word(&alice()));
+    two_word[32..64].copy_from_slice(&tw);
+
+    for p in [
+        PrecompileImpl::UnfreezableBalanceV2,
+        PrecompileImpl::DelegatableResource,
+        PrecompileImpl::TotalResource,
+        PrecompileImpl::TotalDelegatedResource,
+        PrecompileImpl::TotalAcquiredResource,
+    ] {
+        let out = p.execute(&two_word, &ctx).unwrap();
+        assert_eq!(out, vec![0u8; 32], "{label}: {p:?} must select no resource");
+    }
+    // ResourceUsage returns two words.
+    let out = PrecompileImpl::ResourceUsage.execute(&two_word, &ctx).unwrap();
+    assert_eq!(out, vec![0u8; 64], "{label}: ResourceUsage must be two zeros");
+
+    // ResourceV2: both the self branch and the cross-delegation branch.
+    let mut self_input = [0u8; 96];
+    self_input[..32].copy_from_slice(&addr_word(&alice()));
+    self_input[32..64].copy_from_slice(&addr_word(&alice()));
+    self_input[64..96].copy_from_slice(&tw);
+    assert_eq!(
+        PrecompileImpl::ResourceV2.execute(&self_input, &ctx).unwrap(),
+        vec![0u8; 32],
+        "{label}: ResourceV2 self branch must select no resource"
+    );
+    let mut cross_input = [0u8; 96];
+    cross_input[..32].copy_from_slice(&addr_word(&alice()));
+    cross_input[32..64].copy_from_slice(&addr_word(&bob()));
+    cross_input[64..96].copy_from_slice(&tw);
+    assert_eq!(
+        PrecompileImpl::ResourceV2.execute(&cross_input, &ctx).unwrap(),
+        vec![0u8; 32],
+        "{label}: ResourceV2 cross branch must select no resource"
+    );
+
+    // CheckUnDelegateResource: three words (target, amount, type) with a
+    // positive amount, so a mis-decode yields a non-zero triple.
+    let mut check_input = [0u8; 96];
+    check_input[..32].copy_from_slice(&addr_word(&alice()));
+    check_input[32..64].copy_from_slice(&long_word(100));
+    check_input[64..96].copy_from_slice(&tw);
+    assert_eq!(
+        PrecompileImpl::CheckUnDelegateResource
+            .execute(&check_input, &ctx)
+            .unwrap(),
+        vec![0u8; 96],
+        "{label}: CheckUnDelegateResource must return three zero words"
+    );
+}
+
+#[test]
+fn wide_type_word_selects_no_resource() {
+    // byte[23] = 0x01, everything else zero → numeric value 2^64;
+    // `bytesOccupied() == 9 > 8` → Long.MAX_VALUE → matches no arm.
+    assert_type_word_selects_nothing("2^64", wide_type_word(Some(23), 0x01, 0));
+}
+
+#[test]
+fn negative_low_word_type_selects_no_resource() {
+    // Low 8 bytes = 0x8000_0000_0000_0000 (i64::MIN) → `longValue() < 0` →
+    // Long.MAX_VALUE.
+    assert_type_word_selects_nothing("i64::MIN", wide_type_word(None, 0, 1u64 << 63));
+}
+
+#[test]
+fn type_word_above_u32_range_selects_no_resource() {
+    // Values that a 32-bit narrowing would fold onto 0 and 1 respectively.
+    assert_type_word_selects_nothing("2^32", wide_type_word(None, 0, 1u64 << 32));
+    assert_type_word_selects_nothing("2^32 + 1", wide_type_word(None, 0, (1u64 << 32) + 1));
+}
+
+#[test]
+fn type_word_i64_max_selects_no_resource() {
+    // Exactly `Long.MAX_VALUE`, the value `longValueSafe` synthesises on
+    // overflow. Guards the `i64::MAX as i32 == -1` coincidence that used to
+    // save ResourceV2/CheckUnDelegateResource from the narrowing bug.
+    assert_type_word_selects_nothing("i64::MAX", wide_type_word(None, 0, i64::MAX as u64));
+    // And the all-ones word, which saturates for both reasons at once.
+    assert_type_word_selects_nothing("all ones", raw_type_word([0xffu8; 32]));
+}
+
+#[test]
+fn type_word_three_selects_no_resource() {
+    // An in-range but unknown type. Passes before and after the decode fix;
+    // guards against the new match arms accidentally widening the set.
+    assert_type_word_selects_nothing("3", wide_type_word(None, 0, 3));
+}
+
+#[test]
+fn tron_power_type_still_returns_frozen_v2_power() {
+    // java routes type 2 through `queryUnfreezableBalanceV2`, whose POWER arm
+    // is `AccountCapsule.getTronPowerFrozenV2Balance()`. Only
+    // UnfreezableBalanceV2 and ResourceV2's self branch have that arm; the
+    // rest return zero for type 2. A careless "narrow to 0/1" fix regresses
+    // this.
+    let mut ctx = MockCtx::default();
+    put_account(&mut ctx, alice(), well_funded());
+
+    let tw = wide_type_word(None, 0, 2);
+    let mut two_word = [0u8; 64];
+    two_word[..32].copy_from_slice(&addr_word(&alice()));
+    two_word[32..64].copy_from_slice(&tw);
+
+    assert_eq!(
+        read_long(&PrecompileImpl::UnfreezableBalanceV2.execute(&two_word, &ctx).unwrap()),
+        1_300,
+        "type 2 is the account's TRON_POWER frozen-v2 balance"
+    );
+
+    let mut self_input = [0u8; 96];
+    self_input[..32].copy_from_slice(&addr_word(&alice()));
+    self_input[32..64].copy_from_slice(&addr_word(&alice()));
+    self_input[64..96].copy_from_slice(&tw);
+    assert_eq!(
+        read_long(&PrecompileImpl::ResourceV2.execute(&self_input, &ctx).unwrap()),
+        1_300,
+        "ResourceV2's self branch routes through queryUnfreezableBalanceV2"
+    );
+
+    // No type-2 arm anywhere else.
+    for p in [
+        PrecompileImpl::DelegatableResource,
+        PrecompileImpl::TotalResource,
+        PrecompileImpl::TotalDelegatedResource,
+        PrecompileImpl::TotalAcquiredResource,
+    ] {
+        assert_eq!(
+            p.execute(&two_word, &ctx).unwrap(),
+            vec![0u8; 32],
+            "{p:?} has no type-2 arm in java"
+        );
+    }
+    assert_eq!(
+        PrecompileImpl::ResourceUsage.execute(&two_word, &ctx).unwrap(),
+        vec![0u8; 64],
+        "queryFrozenBalanceUsage has no type-2 arm"
+    );
+    let mut check_input = [0u8; 96];
+    check_input[..32].copy_from_slice(&addr_word(&alice()));
+    check_input[32..64].copy_from_slice(&long_word(100));
+    check_input[64..96].copy_from_slice(&tw);
+    assert_eq!(
+        PrecompileImpl::CheckUnDelegateResource
+            .execute(&check_input, &ctx)
+            .unwrap(),
+        vec![0u8; 96],
+        "checkUndelegateResource has no type-2 arm"
+    );
+}
+
+#[test]
+fn types_zero_and_one_are_unchanged_by_the_decode() {
+    // The canonical in-range words must keep returning their real values.
+    let mut ctx = MockCtx::default();
+    put_account(&mut ctx, alice(), well_funded());
+    for (rtype, frozen) in [(0i32, 700i64), (1, 900)] {
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&addr_word(&alice()));
+        input[32..64].copy_from_slice(&type_word(rtype));
+        assert_eq!(
+            read_long(&PrecompileImpl::UnfreezableBalanceV2.execute(&input, &ctx).unwrap()),
+            frozen
+        );
+    }
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(&addr_word(&alice()));
+    input[32..64].copy_from_slice(&type_word(0));
+    assert_eq!(
+        read_long(&PrecompileImpl::TotalDelegatedResource.execute(&input, &ctx).unwrap()),
+        300
+    );
+    assert_eq!(
+        read_long(&PrecompileImpl::TotalAcquiredResource.execute(&input, &ctx).unwrap()),
+        100
+    );
+    input[32..64].copy_from_slice(&type_word(1));
+    assert_eq!(
+        read_long(&PrecompileImpl::TotalDelegatedResource.execute(&input, &ctx).unwrap()),
+        500
+    );
+    assert_eq!(
+        read_long(&PrecompileImpl::TotalAcquiredResource.execute(&input, &ctx).unwrap()),
+        200
+    );
+}
+
+#[test]
+fn check_un_delegate_resource_amount_word_still_clamps() {
+    // The `amount` word keeps its unnarrowed `longValueSafe` decode: a word
+    // with non-zero high bytes saturates to Long.MAX_VALUE and then clamps
+    // via `min(amount, resourceLimit)`, exactly as java does. Untouched by
+    // the type-word fix.
+    let mut ctx = MockCtx::default();
+    put_account(&mut ctx, alice(), well_funded());
+
+    let mut saturating = [0u8; 96];
+    saturating[..32].copy_from_slice(&addr_word(&alice()));
+    saturating[32..64].copy_from_slice(&raw_type_word([0xffu8; 32])); // amount
+    saturating[64..96].copy_from_slice(&type_word(0));
+    let sat_out = PrecompileImpl::CheckUnDelegateResource
+        .execute(&saturating, &ctx)
+        .unwrap();
+
+    // The same call with `amount` already at the clamp point.
+    let limit = read_long(&{
+        let mut input = [0u8; 64];
+        input[..32].copy_from_slice(&addr_word(&alice()));
+        input[32..64].copy_from_slice(&type_word(0));
+        PrecompileImpl::TotalResource.execute(&input, &ctx).unwrap()
+    });
+    let mut clamped = [0u8; 96];
+    clamped[..32].copy_from_slice(&addr_word(&alice()));
+    clamped[32..64].copy_from_slice(&long_word(limit));
+    clamped[64..96].copy_from_slice(&type_word(0));
+    let clamped_out = PrecompileImpl::CheckUnDelegateResource
+        .execute(&clamped, &ctx)
+        .unwrap();
+
+    assert_eq!(sat_out, clamped_out, "amount must clamp to the resource limit");
 }
