@@ -2298,8 +2298,11 @@ fn execute_block_logic(
     // via [`block_worth_parallel`], which sets `config.parallel_exec`. Here we
     // simply honor it — so tests that force `parallel_exec = true` always
     // exercise the parallel path regardless of block size.
-    // COINBASE (0x41): the block's producing witness in 20-byte EVM form (strip
-    // the TRON 0x41 prefix), threaded into every tx's VM block env.
+    // COINBASE (0x41): the block's producing witness in 20-byte EVM form,
+    // threaded into every tx's VM block env. The TRON prefix byte is dropped
+    // here and reattached by the opcode handler, which pushes the 21-byte form
+    // java's `coinBaseAction` exposes; carrying the EVM form keeps the address
+    // isomorphic with every other address the VM handles internally.
     let block_beneficiary: [u8; 20] = {
         let w = &raw.witness_address;
         let mut b = [0u8; 20];

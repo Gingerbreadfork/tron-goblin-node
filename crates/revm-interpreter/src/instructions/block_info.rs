@@ -1,3 +1,5 @@
+use context_interface::tron_address_word;
+
 use crate::{
     interpreter_types::{InterpreterTypes as ITy, RuntimeFlag, StackTr},
     Host, InstructionExecResult as Result,
@@ -20,10 +22,22 @@ pub fn chainid<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 ///
 /// Pushes the current block's beneficiary address onto the stack.
 pub fn coinbase<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    push!(
-        context.interpreter,
-        context.host.beneficiary().into_word().into()
-    );
+    let word = context.host.beneficiary().into_word();
+    // TRON fork: java `coinBaseAction` pushes the invoke's coinbase DataWord
+    // unmasked at every height — no proposal gates it — so the producing
+    // witness keeps its 21-byte form and the prefix byte reaches the stack.
+    // Contracts that fold `block.coinbase` into a hash preimage without
+    // masking (2018-era dice RNGs) observe the difference.
+    //
+    // Constant calls carry no block context: java's `ET_CONSTANT_TYPE` leaves
+    // the coinbase null, which becomes the zero word. An absent beneficiary
+    // stays zero rather than gaining a prefix.
+    let word = if context.host.tron_enabled() && !word.is_zero() {
+        tron_address_word(word)
+    } else {
+        word
+    };
+    push!(context.interpreter, word.into());
     Ok(())
 }
 

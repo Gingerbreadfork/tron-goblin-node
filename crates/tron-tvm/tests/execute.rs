@@ -124,11 +124,12 @@ fn execute_trigger_succeeds_for_simple_return_contract() {
     }
 }
 
-/// COINBASE (0x41) pushes the block's producing witness. java loads
-/// `block.getWitnessAddress()` into the coinbase DataWord exactly like
-/// ADDRESS/CALLER; we thread the 20-byte EVM-form witness through
-/// `VmBlockEnv.beneficiary`, and the opcode must return it right-aligned in a
-/// 32-byte word (12 leading zero bytes).
+/// COINBASE (0x41) pushes the block's producing witness. java loads the
+/// 21-byte `block.getWitnessAddress()` into the coinbase DataWord, which
+/// right-aligns it, and `coinBaseAction` pushes that word unmasked at every
+/// height — so the prefix byte sits at index 11, ahead of the 20-byte body.
+/// Contracts that fold `block.coinbase` into a hash preimage without masking
+/// observe it.
 #[test]
 fn coinbase_returns_block_producer_witness() {
     let stores = fresh_stores();
@@ -168,7 +169,11 @@ fn coinbase_returns_block_producer_witness() {
     match outcome {
         VmOutcome::Success { return_data, .. } => {
             assert_eq!(return_data.len(), 32);
-            assert_eq!(&return_data[0..12], &[0u8; 12]);
+            assert_eq!(&return_data[0..11], &[0u8; 11]);
+            assert_eq!(
+                return_data[11], 0x41,
+                "coinbase keeps TRON's 21-byte form: prefix byte at index 11"
+            );
             assert_eq!(&return_data[12..32], &witness);
         }
         other => panic!("expected Success, got {other:?}"),
@@ -703,4 +708,175 @@ fn nested_call_value_over_i64_max_fails_whole_tx() {
         matches!(outcome, VmOutcome::TransferFailed { .. }),
         "a nested out-of-range CALL must fail the whole tx as TransferFailed, got {outcome:?}"
     );
+}
+
+// =============================================================================
+// TRON's 21-byte address form on the stack
+// =============================================================================
+//
+// java-tron carries addresses as 21 bytes and loads them into a `DataWord`
+// with `new DataWord(byte[])`, which right-aligns a short input — so the
+// prefix byte lands at word index 11. Solidity masks address-typed values to
+// 160 bits, which hides it, but a contract that consumes the word raw (hash
+// entropy, arithmetic) sees it. `callerAction` is the exception: java masks
+// CALLER unconditionally.
+
+/// Run `bytecode` as a contract and return its 32-byte output word.
+fn run_returning_word(
+    stores: &VmStores,
+    prefix: u8,
+    bytecode: &[u8],
+    owner: [u8; 21],
+) -> [u8; 32] {
+    let contract_addr = install_contract(stores, prefix, bytecode);
+    let trigger = TriggerSmartContract {
+        owner_address: owner.to_vec(),
+        contract_address: contract_addr.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let outcome = execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 100,
+            block_timestamp_ms: 1_700_000_000_000,
+            beneficiary: [0x11u8; 20],
+        },
+        &trigger,
+        1_000_000,
+    );
+    match outcome {
+        VmOutcome::Success { return_data, .. } => {
+            assert_eq!(return_data.len(), 32, "expected a single word");
+            let mut word = [0u8; 32];
+            word.copy_from_slice(&return_data);
+            word
+        }
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+/// `<op>; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN`
+fn return_word_of(op: u8) -> Vec<u8> {
+    vec![op, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]
+}
+
+/// java `addressAction` masks the address word only once ALLOW_MULTI_SIGN is
+/// active; before that the 21-byte contract address reaches the stack whole.
+#[test]
+fn address_keeps_tron_prefix_until_multi_sign_activates() {
+    let stores = fresh_stores();
+    let owner = fund_account(&stores, 0xa5, 1_000_000_000);
+    let word = run_returning_word(&stores, 0xc5, &return_word_of(0x30), owner);
+    assert_eq!(&word[0..11], &[0u8; 11]);
+    assert_eq!(word[11], 0x41, "ADDRESS keeps the prefix pre-activation");
+    assert_eq!(&word[12..32], &[0xc5u8; 20]);
+}
+
+#[test]
+fn address_is_masked_once_multi_sign_is_active() {
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    let owner = fund_account(&stores, 0xa6, 1_000_000_000);
+    let word = run_returning_word(&stores, 0xc6, &return_word_of(0x30), owner);
+    assert_eq!(
+        &word[0..12],
+        &[0u8; 12],
+        "ALLOW_MULTI_SIGN masks ADDRESS back to the 20-byte form"
+    );
+    assert_eq!(&word[12..32], &[0xc6u8; 20]);
+}
+
+/// ORIGIN follows the same gate as ADDRESS (java `originAction`).
+#[test]
+fn origin_keeps_tron_prefix_until_multi_sign_activates() {
+    let stores = fresh_stores();
+    let owner = fund_account(&stores, 0xa7, 1_000_000_000);
+    let word = run_returning_word(&stores, 0xc7, &return_word_of(0x32), owner);
+    assert_eq!(word[11], 0x41, "ORIGIN keeps the prefix pre-activation");
+    assert_eq!(&word[12..32], &[0xa7u8; 20]);
+}
+
+#[test]
+fn origin_is_masked_once_multi_sign_is_active() {
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    let owner = fund_account(&stores, 0xa8, 1_000_000_000);
+    let word = run_returning_word(&stores, 0xc8, &return_word_of(0x32), owner);
+    assert_eq!(&word[0..12], &[0u8; 12]);
+    assert_eq!(&word[12..32], &[0xa8u8; 20]);
+}
+
+/// java `callerAction` masks unconditionally — CALLER must stay clean in both
+/// gate states, which is what makes it the control for the two tests above.
+#[test]
+fn caller_is_masked_regardless_of_multi_sign() {
+    for active in [0i64, 1] {
+        let stores = fresh_stores();
+        stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", active);
+        let owner = fund_account(&stores, 0xa9, 1_000_000_000);
+        let word = run_returning_word(&stores, 0xc9, &return_word_of(0x33), owner);
+        assert_eq!(
+            &word[0..12],
+            &[0u8; 12],
+            "CALLER is masked in java at every height (ALLOW_MULTI_SIGN={active})"
+        );
+        assert_eq!(&word[12..32], &[0xa9u8; 20]);
+    }
+}
+
+/// COINBASE is ungated — java never masks it — so ALLOW_MULTI_SIGN being
+/// active must not clear the prefix the way it does for ADDRESS / ORIGIN.
+#[test]
+fn coinbase_keeps_tron_prefix_even_after_multi_sign() {
+    let stores = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    let owner = fund_account(&stores, 0xaa, 1_000_000_000);
+    let word = run_returning_word(&stores, 0xca, &return_word_of(0x41), owner);
+    assert_eq!(word[11], 0x41, "no proposal masks COINBASE");
+    assert_eq!(&word[12..32], &[0x11u8; 20]);
+}
+
+/// java pushes the new contract address with `stackPush(new DataWord(newAddress))`,
+/// where `newAddress` is the 21-byte `Hash.sha3omit12` output. Nothing masks it
+/// and no proposal gates it, so the success push carries the prefix at every
+/// height — unlike ADDRESS / ORIGIN, ALLOW_MULTI_SIGN must not clear it.
+#[test]
+fn create_return_word_keeps_tron_prefix_in_both_gate_states() {
+    for active in [0i64, 1] {
+        let stores = fresh_stores();
+        stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", active);
+        let owner = fund_account(&stores, 0xab, 1_000_000_000);
+        // CREATE pops value, offset, size — so push size, offset, value.
+        //   PUSH1 0; PUSH1 0; PUSH1 0; CREATE
+        //   PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN
+        let word = run_returning_word(
+            &stores,
+            0xcb,
+            &[
+                0x60, 0x00, // PUSH1 0  (size)
+                0x60, 0x00, // PUSH1 0  (offset)
+                0x60, 0x00, // PUSH1 0  (value)
+                0xf0, // CREATE
+                0x60, 0x00, // PUSH1 0
+                0x52, // MSTORE
+                0x60, 0x20, // PUSH1 32
+                0x60, 0x00, // PUSH1 0
+                0xf3, // RETURN
+            ],
+            owner,
+        );
+        assert_ne!(
+            &word[12..32],
+            &[0u8; 20],
+            "the create must have succeeded (ALLOW_MULTI_SIGN={active})"
+        );
+        assert_eq!(&word[0..11], &[0u8; 11]);
+        assert_eq!(
+            word[11], 0x41,
+            "CREATE's success push keeps the prefix (ALLOW_MULTI_SIGN={active})"
+        );
+    }
 }

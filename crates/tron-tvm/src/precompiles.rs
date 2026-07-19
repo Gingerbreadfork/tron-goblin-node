@@ -256,7 +256,9 @@ impl PrecompileImpl {
             // so the energy is ~10x higher than revm's resolved
             // (≥ Berlin) cost. Computed locally to match java.
             Self::ModExp => modexp_energy_cost(input),
-            // Standard EVM precompiles (EcRecover, Sha256, Identity,
+            // java `ECRecover.getEnergyForData` — flat, input-independent.
+            Self::EcRecover => 3000,
+            // The remaining standard EVM precompiles (Sha256, Identity,
             // Bn128Add, Bn128Mul, Bn128Pairing, EthRipemd160) are
             // handled by the interpreter — their execute() returns
             // HandledByInterpreter and the cost calculation lives in revm.
@@ -310,9 +312,12 @@ impl PrecompileImpl {
             Self::Ripemd160 => Ok(ripemd160_precompile(input)),
             Self::ModExp => Ok(modexp_precompile(input)),
 
+            // TRON's 0x01 returns the recovered address in the 21-byte form
+            // and an empty payload on failure, so it can't defer upstream.
+            Self::EcRecover => Ok(ecrecover_precompile(input)),
+
             // === Standard EVM (handled upstream) ===
-            Self::EcRecover
-            | Self::Sha256
+            Self::Sha256
             | Self::Identity
             | Self::Bn128Add
             | Self::Bn128Mul
@@ -657,6 +662,9 @@ pub enum PrecompileError {
 
 const WORD_SIZE: usize = 32;
 
+/// TRON's address prefix byte (java `Constant.ADD_PRE_FIX_BYTE_MAINNET`).
+const TRON_ADDR_PREFIX: u8 = 0x41;
+
 /// Big-endian 32-byte representation of a signed `i64`. java-tron's
 /// `longTo32Bytes` — sign-extends.
 fn long_to_32_bytes(v: i64) -> Vec<u8> {
@@ -972,6 +980,73 @@ fn recover_addr_by_sign(sign: &[u8], hash: &[u8; WORD_SIZE]) -> Option<[u8; 20]>
     let mut low20 = [0u8; 20];
     low20.copy_from_slice(&pub_hash[12..32]);
     Some(low20)
+}
+
+/// secp256k1 group order — java `ECKey.SECP256K1N`.
+const SECP256K1_N: [u8; WORD_SIZE] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+];
+
+/// java `ECDSASignature.validateComponents` bounds on `r` / `s`: non-zero and
+/// strictly below the group order.
+fn is_valid_signature_scalar(x: &[u8; WORD_SIZE]) -> bool {
+    x.iter().any(|b| *b != 0) && x[..] < SECP256K1_N[..]
+}
+
+/// java-tron `ECRecover.execute` (`PrecompiledContracts.java`), flat 3000
+/// energy. Two divergences from the standard EVM precompile:
+///
+///   * the recovered address goes through `Hash.sha3omit12`, which returns
+///     TRON's 21-byte form, so the output word carries the prefix byte at
+///     index 11 rather than a twelfth zero;
+///   * every failure path returns an EMPTY byte array, not a zero word —
+///     java builds the result only on success and otherwise falls through to
+///     `EMPTY_BYTE_ARRAY`.
+fn ecrecover_precompile(input: &[u8]) -> Vec<u8> {
+    // java copies `h`, `v` and `r` out of the input with `System.arraycopy`,
+    // which throws below 96 bytes; the surrounding catch turns that into the
+    // empty result.
+    if input.len() < 96 {
+        return Vec::new();
+    }
+    let mut h = [0u8; WORD_SIZE];
+    h.copy_from_slice(&input[0..32]);
+    let v = &input[32..64];
+    let mut r = [0u8; WORD_SIZE];
+    r.copy_from_slice(&input[64..96]);
+    // `sLength` is `data.length - 96` below 128 bytes, and the copy targets
+    // offset 0, so a truncated `s` is left-aligned and zero-filled.
+    let s_len = if input.len() < 128 { input.len() - 96 } else { 32 };
+    let mut s = [0u8; WORD_SIZE];
+    s[..s_len].copy_from_slice(&input[96..96 + s_len]);
+
+    // java `validateV` — every byte above the last must be zero.
+    if v[..WORD_SIZE - 1].iter().any(|b| *b != 0) {
+        return Vec::new();
+    }
+    // java `ECDSASignature.validateComponents` — `v` is exactly 27 or 28.
+    let v_byte = v[WORD_SIZE - 1];
+    if v_byte != 27 && v_byte != 28 {
+        return Vec::new();
+    }
+    if !is_valid_signature_scalar(&r) || !is_valid_signature_scalar(&s) {
+        return Vec::new();
+    }
+
+    let mut sig = [0u8; SIG_LENGTH];
+    sig[..32].copy_from_slice(&r);
+    sig[32..64].copy_from_slice(&s);
+    sig[64] = v_byte;
+    match recover_addr_by_sign(&sig, &h) {
+        Some(addr20) => {
+            let mut out = vec![0u8; WORD_SIZE];
+            out[11] = TRON_ADDR_PREFIX;
+            out[12..].copy_from_slice(&addr20);
+            out
+        }
+        None => Vec::new(),
+    }
 }
 
 // =============================================================================

@@ -6,7 +6,7 @@ use crate::{
     },
     CallInput, InstructionExecResult as Result, InstructionResult,
 };
-use context_interface::{cfg::GasParams, Host};
+use context_interface::{cfg::GasParams, tron_address_word, Host};
 use core::ptr;
 use primitives::{B256, KECCAK_EMPTY, U256};
 
@@ -42,16 +42,20 @@ pub fn keccak256<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result 
 /// Implements the ADDRESS instruction.
 ///
 /// Pushes the current contract's address onto the stack.
-pub fn address<IT: ITy, H: ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    push!(
-        context.interpreter,
-        context
-            .interpreter
-            .input
-            .target_address()
-            .into_word()
-            .into()
-    );
+pub fn address<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
+    let word = context.interpreter.input.target_address().into_word();
+    // TRON fork: java `addressAction` masks the address DataWord to 20 bytes
+    // only once ALLOW_MULTI_SIGN is active. Before that the 21-byte contract
+    // address reaches the stack with its prefix byte intact. Every frame's
+    // address is 21-byte-derived — the top-level one from the transaction, a
+    // CALL frame's via `DataWord.toTronAddress`, a CREATE frame's from the
+    // `sha3omit12` output — so no frame-depth distinction applies.
+    let word = if context.host.tron_enabled() && !context.host.tron_allow_multi_sign() {
+        tron_address_word(word)
+    } else {
+        word
+    };
+    push!(context.interpreter, word.into());
     Ok(())
 }
 

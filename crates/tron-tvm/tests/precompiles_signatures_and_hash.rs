@@ -690,3 +690,105 @@ fn validate_multi_sign_rejects_foreign_signer_weight_zero() {
         "a recovered signer with weight 0 fails the whole call"
     );
 }
+
+// =============================================================================
+// ECRecover (0x01)
+// =============================================================================
+//
+// java-tron implements 0x01 itself rather than inheriting the EVM precompile,
+// and diverges twice: the recovered address goes through `Hash.sha3omit12`, so
+// the output word carries TRON's prefix byte at index 11; and every failure
+// path returns an EMPTY payload rather than a zero word.
+
+/// Standard secp256k1 recovery vector, laid out as java reads it:
+/// `hash || v-word || r || s`.
+fn ecrecover_input(v: u8) -> Vec<u8> {
+    let mut input = Vec::with_capacity(128);
+    input.extend_from_slice(&hex!(
+        "456e9aea5e197a1f1af7a3e85a3212fa4049a3ba34c2289b4c860fc0b0c64ef3"
+    ));
+    let mut v_word = [0u8; 32];
+    v_word[31] = v;
+    input.extend_from_slice(&v_word);
+    input.extend_from_slice(&hex!(
+        "9242685bf161793cc25603c231bc2f568eb630ea16aa137d2664ac8038825608"
+    ));
+    input.extend_from_slice(&hex!(
+        "4f8ae3bd7535248d0bd448298cc2e2071e56992d0774dc340c368ae950852ada"
+    ));
+    input
+}
+
+#[test]
+fn ecrecover_returns_the_address_in_trons_21_byte_form() {
+    let ctx = MockCtx::default();
+    let out = PrecompileImpl::EcRecover
+        .execute(&ecrecover_input(28), &ctx)
+        .expect("ecrecover succeeds");
+    assert_eq!(out.len(), 32);
+    assert_eq!(&out[0..11], &[0u8; 11]);
+    assert_eq!(
+        out[11], 0x41,
+        "java `sha3omit12` prefixes the recovered address before it becomes a DataWord"
+    );
+    assert_eq!(
+        &out[12..32],
+        &hex!("7156526fbd7a3c72969b54f64e42c10fbb768c8a"),
+        "the 20-byte body still matches the standard recovery result"
+    );
+}
+
+#[test]
+fn ecrecover_returns_empty_on_failure_rather_than_a_zero_word() {
+    let ctx = MockCtx::default();
+    // java `ECDSASignature.validateComponents` accepts only v == 27 or 28.
+    for bad_v in [0u8, 26, 29, 31] {
+        let out = PrecompileImpl::EcRecover
+            .execute(&ecrecover_input(bad_v), &ctx)
+            .expect("the precompile itself still succeeds");
+        assert!(
+            out.is_empty(),
+            "v={bad_v} must yield an empty payload, got {} bytes",
+            out.len()
+        );
+    }
+}
+
+#[test]
+fn ecrecover_rejects_a_v_word_with_bytes_above_the_last() {
+    let ctx = MockCtx::default();
+    // java `validateV` requires every byte above the last to be zero.
+    let mut input = ecrecover_input(28);
+    input[32] = 0x01;
+    let out = PrecompileImpl::EcRecover
+        .execute(&input, &ctx)
+        .expect("the precompile itself still succeeds");
+    assert!(out.is_empty(), "validateV must reject a dirty v word");
+}
+
+#[test]
+fn ecrecover_returns_empty_for_input_shorter_than_the_three_fixed_words() {
+    let ctx = MockCtx::default();
+    // Below 96 bytes java's `System.arraycopy` of h/v/r throws; the surrounding
+    // catch turns that into the empty result.
+    for len in [0usize, 31, 64, 95] {
+        let input = ecrecover_input(28)[..len].to_vec();
+        let out = PrecompileImpl::EcRecover
+            .execute(&input, &ctx)
+            .expect("the precompile itself still succeeds");
+        assert!(out.is_empty(), "len={len} must yield an empty payload");
+    }
+}
+
+#[test]
+fn ecrecover_zero_fills_a_truncated_s_word() {
+    let ctx = MockCtx::default();
+    // 96..128 bytes is legal: java left-aligns what it has into `s` and leaves
+    // the rest zero, so this resolves to a (wrong but well-formed) signature
+    // and must not panic.
+    let input = ecrecover_input(28)[..100].to_vec();
+    let out = PrecompileImpl::EcRecover
+        .execute(&input, &ctx)
+        .expect("the precompile itself still succeeds");
+    assert!(out.is_empty() || out.len() == 32);
+}

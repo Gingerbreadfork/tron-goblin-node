@@ -2,6 +2,7 @@ use crate::{
     interpreter_types::{InputsTr, InterpreterTypes as ITy, RuntimeFlag, StackTr},
     Host, InstructionContext as Ictx, InstructionExecResult as Result,
 };
+use context_interface::tron_address_word;
 use primitives::U256;
 
 /// Implements the GASPRICE instruction.
@@ -34,10 +35,17 @@ pub fn gasprice<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
 ///
 /// Gets the execution origination address.
 pub fn origin<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
-    push!(
-        context.interpreter,
-        context.host.caller().into_word().into()
-    );
+    let word = context.host.caller().into_word();
+    // TRON fork: java `originAction` masks the origin DataWord to 20 bytes only
+    // once ALLOW_MULTI_SIGN is active, matching `addressAction`. The origin is
+    // the 21-byte transaction owner and inner frames inherit it unchanged, so
+    // pre-activation the prefix byte reaches the stack at every depth.
+    let word = if context.host.tron_enabled() && !context.host.tron_allow_multi_sign() {
+        tron_address_word(word)
+    } else {
+        word
+    };
+    push!(context.interpreter, word.into());
     Ok(())
 }
 

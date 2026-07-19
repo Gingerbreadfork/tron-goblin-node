@@ -28,4 +28,6 @@ pub use host::{DummyHost, Host};
 pub use journaled_state::JournalTr;
 pub use local::{FrameStack, FrameToken, LocalContextTr, OutFrame};
 pub use transaction::{Transaction, TransactionType};
-pub use tron_ext::{TronCompat, TronDatabaseExt, TronHostExt};
+pub use tron_ext::{
+    tron_address_word, TronCompat, TronDatabaseExt, TronHostExt, TRON_ADDRESS_PREFIX_BYTE,
+};

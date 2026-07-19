@@ -28,7 +28,27 @@
 //! WITHDRAWREWARD, etc.) need `&mut self` + actuator-primitive
 //! refactoring before they can plug in here.
 
-use primitives::Address;
+use primitives::{Address, B256};
+
+/// TRON's address prefix byte (java `Constant.ADD_PRE_FIX_BYTE_MAINNET`).
+pub const TRON_ADDRESS_PREFIX_BYTE: u8 = 0x41;
+
+/// Restore TRON's 21-byte address form in a right-aligned 32-byte stack word.
+///
+/// java-tron carries addresses as 21 bytes (the prefix byte followed by the
+/// 20-byte body) and loads them into a `DataWord` with `new DataWord(byte[])`,
+/// which right-aligns a short input. The prefix therefore occupies byte 11 of
+/// the word and is visible to any contract that consumes the word without
+/// masking it to 160 bits — raw arithmetic, or a hash preimage. Words built
+/// from the 20-byte EVM address form carry a zero byte in that position.
+///
+/// `word` is a right-aligned 20-byte address word.
+#[inline]
+pub fn tron_address_word(word: B256) -> B256 {
+    let mut out = word;
+    out.0[11] = TRON_ADDRESS_PREFIX_BYTE;
+    out
+}
 
 /// Read-only TRON extensions to [`crate::host::Host`].
 ///
@@ -306,7 +326,7 @@ impl<T: database_interface::DatabaseRef> TronDatabaseExt
 // instead of touching the orphan-rule fight in every test file.
 
 use database_interface::{Database, DatabaseCommit};
-use primitives::{B256, StorageKey, StorageValue};
+use primitives::{StorageKey, StorageValue};
 use state::{bytecode::Bytecode, Account, AccountId, AccountInfo};
 
 /// Newtype wrapper that gives any [`Database`] a default-zero

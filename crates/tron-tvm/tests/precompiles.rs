@@ -623,12 +623,12 @@ fn shielded_snark_verifier_precompiles_return_32_byte_zero_on_empty_input() {
 #[test]
 fn standard_evm_precompiles_say_handled_by_interpreter() {
     let ctx = MockContext::default();
-    // Ripemd160 (0x03) and ModExp (0x05) are NOT in this list: TRON's
-    // behavior at those addresses diverges from the standard EVM
-    // precompiles, so they're implemented locally (see the dedicated
-    // tests below).
+    // EcRecover (0x01), Ripemd160 (0x03) and ModExp (0x05) are NOT in this
+    // list: TRON's behavior at those addresses diverges from the standard EVM
+    // precompiles, so they're implemented locally (see the dedicated tests
+    // below, and the ECRecover cases in
+    // `tests/precompiles_signatures_and_hash.rs`).
     for p in [
-        PrecompileImpl::EcRecover,
         PrecompileImpl::Sha256,
         PrecompileImpl::Identity,
         PrecompileImpl::Bn128Add,

@@ -7,7 +7,7 @@ use context_interface::{
     context::{take_error, ContextError},
     journaled_state::{account::JournaledAccountTr, JournalCheckpoint, JournalTr},
     local::{FrameToken, OutFrame},
-    Cfg, ContextTr, Database,
+    tron_address_word, Cfg, ContextTr, Database,
 };
 use core::cmp::min;
 use derive_where::derive_where;
@@ -644,7 +644,18 @@ impl EthFrame<EthInterpreter> {
 
                 let stack_item = if instruction_result.is_ok() {
                     this_gas.record_refund(outcome.gas().refunded());
-                    outcome.address.unwrap_or_default().into_word().into()
+                    let word = outcome.address.unwrap_or_default().into_word();
+                    // TRON fork: java pushes the new contract address with
+                    // `stackPush(new DataWord(newAddress))`, where `newAddress`
+                    // is the 21-byte `Hash.sha3omit12` output — the prefix byte
+                    // is already in place and nothing masks it. Applies to both
+                    // CREATE and CREATE2, at every height: no proposal gates the
+                    // success push.
+                    if ctx.tron_enabled() {
+                        tron_address_word(word).into()
+                    } else {
+                        word.into()
+                    }
                 } else {
                     U256::ZERO
                 };
