@@ -262,20 +262,29 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     // `contractResult UNKNOWN`. The pre-#26 arm therefore neither refunds nor
     // marks a transfer failure.
     //
-    // Precompile targets are excluded: `OperationActions.exeCall` routes them
-    // to `callToPrecompiledAddress`, whose endowment read
-    // (`Program.java:1693`) has NO try/catch in either era, so the raw
-    // `ArithmeticException` always propagates — spend-all, UNKNOWN. That arm is
-    // handled where the precompile frame is built.
+    // A PRECOMPILE target takes a different failure shape.
+    // `OperationActions.exeCall:1033-1041` dispatches on the target address
+    // alone — CALL and CALLCODE alike — and routes precompiles to
+    // `callToPrecompiledAddress`, whose endowment read (`Program.java:1693`)
+    // has NO try/catch in either era. The raw `ArithmeticException` therefore
+    // always propagates: `VM.java:97-101` spends the frame's whole remaining
+    // energy (only a `TransferException` is exempt) and
+    // `RuntimeImpl.setResultCode` (RuntimeImpl.java:129-138) has no matching
+    // arm, so the root frame records `contractResult UNKNOWN`. Ungated by
+    // ALLOW_TVM_CONSTANTINOPLE, and CALLCODE is included: its
+    // `contextAddress = senderAddress` (`Program.java:1687-1688`) only
+    // neutralises the transfer block at `:1717`, five statements after the
+    // throw.
     if matches!(KIND, CALL | CALLCODE)
         && context.host.tron_enabled()
         && !context.host.tron_call_depth_exhausted()
-        && !context.host.tron_is_precompile(to)
         && u256_to_i64_exact_unsigned(&value).is_none()
     {
+        if context.host.tron_is_precompile(to) {
+            return Err(InstructionResult::TronBytecodeExecution);
+        }
         if context.host.tron_allow_tvm_constantinople() {
             context.interpreter.gas.erase_cost(gas_limit);
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         return Err(InstructionResult::TronBytecodeExecution);
@@ -323,7 +332,6 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     {
         if context.host.tron_allow_tvm_constantinople() {
             context.interpreter.gas.erase_cost(gas_limit);
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         return Err(InstructionResult::TronBytecodeExecution);
@@ -341,7 +349,8 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     // `TransferException` (spend-all-exempt, `contractResult TRANSFER_FAILED`);
     // before #26 a plain `BytecodeExecutionException`, which `VMActuator`
     // follows with `spendAllEnergy()` and `RuntimeImpl` maps to `UNKNOWN`.
-    // Either way the whole transaction dies at this opcode.
+    // Both flavours are contained to this frame; only a root-frame throw
+    // reaches the receipt.
     //
     // Ordering mirrors java exactly: the i64-endowment guard and the
     // self-transfer guard (both above) come first, because
@@ -361,7 +370,7 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     // creates `newAddress` before validating (java's own
     // "TODO: unreachable exception").
     //
-    // Precompile targets are excluded here too, but for the opposite reason:
+    // Precompile targets are excluded here, but for the opposite reason:
     // `callToPrecompiledAddress` NEVER reaches `createAccountIfNotExist`, so
     // its recipient is missing at every height, not only before #32, and its
     // failure is never converted to a `TransferException`. That case is handled
@@ -380,7 +389,6 @@ pub fn call<const KIND: u8, IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, 
     {
         context.interpreter.gas.erase_cost(gas_limit);
         if context.host.tron_allow_tvm_constantinople() {
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         // Pre-Constantinople java throws `BytecodeExecutionException`, which
@@ -546,16 +554,18 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // ALLOW_TVM_CONSTANTINOPLE (#26) selects `TransferException` (refund the
     // forwarded energy, consumed-only, TRANSFER_FAILED) over the older raw
     // `ArithmeticException` (spend-all, UNKNOWN).
-    // A precompile target is excluded for the same reason as CALL/CALLCODE:
+    // A precompile target takes the same different shape as CALL/CALLCODE:
     // `callToPrecompiledAddress:1693` reads the endowment with no try/catch in
     // either era, so the `ArithmeticException` is always spend-all + UNKNOWN.
-    if !context.host.tron_call_depth_exhausted()
-        && !context.host.tron_is_precompile(to)
-        && u256_to_i64_exact_unsigned(&value).is_none()
-    {
+    // Reading it here also reproduces java's ordering — `:1693` precedes
+    // `checkTokenId` at `:1697` — and stops the low-64-bit truncation above
+    // from reaching the TRC-10 machinery with a wrapped or negative amount.
+    if !context.host.tron_call_depth_exhausted() && u256_to_i64_exact_unsigned(&value).is_none() {
+        if context.host.tron_is_precompile(to) {
+            return Err(InstructionResult::TronBytecodeExecution);
+        }
         if context.host.tron_allow_tvm_constantinople() {
             context.interpreter.gas.erase_cost(gas_limit);
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         return Err(InstructionResult::TronBytecodeExecution);
@@ -579,7 +589,6 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     {
         if context.host.tron_allow_tvm_constantinople() {
             context.interpreter.gas.erase_cost(gas_limit);
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         return Err(InstructionResult::TronBytecodeExecution);
@@ -627,7 +636,6 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     {
         if context.host.tron_allow_tvm_constantinople() {
             context.interpreter.gas.erase_cost(gas_limit);
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         return Err(InstructionResult::TronBytecodeExecution);
@@ -654,7 +662,8 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     // Precompile targets are excluded: `callToPrecompiledAddress` never reaches
     // `createAccountIfNotExist`, so its TRC-10 recipient is missing at every
     // height and the failure is never converted to a `TransferException`. That
-    // case is handled where the precompile frame is built.
+    // case is handled where the precompile frame is built, ungated and with
+    // spend-all energy.
     if is_token_transfer
         && has_transfer
         && !context.host.tron_call_depth_exhausted()
@@ -668,7 +677,6 @@ pub fn call_token<IT: ITy, H: Host + ?Sized>(mut context: Ictx<'_, H, IT>) -> Re
     {
         context.interpreter.gas.erase_cost(gas_limit);
         if context.host.tron_allow_tvm_constantinople() {
-            context.host.tron_mark_transfer_failed();
             return Err(InstructionResult::TransferFailed);
         }
         return Err(InstructionResult::TronBytecodeExecution);
@@ -791,7 +799,6 @@ pub fn token_balance<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Res
         match u256_to_i64_exact(&token_id) {
             None => {
                 if context.host.tron_allow_tvm_constantinople() {
-                    context.host.tron_mark_transfer_failed();
                     return Err(InstructionResult::TransferFailed);
                 }
                 return Err(InstructionResult::TronBytecodeExecution);

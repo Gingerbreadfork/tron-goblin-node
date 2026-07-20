@@ -705,3 +705,512 @@ fn precompile_set_follows_the_active_proposals() {
         "the precompile arm never creates the recipient"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Endowment range and depth on the precompile arm.
+//
+// `callToPrecompiledAddress` runs three things in a fixed order before it
+// touches a balance or a token id (`Program.java:1673-1698`):
+//
+//   1. `:1677` — `getCallDeep() == MAX_DEPTH` → `stackPushZero();
+//      refundEnergy(...); return;`
+//   2. `:1693` — `long endowment = msg.getEndowment().value().longValueExact()`,
+//      with NO try/catch, unlike `callToAddress:1033-1042`
+//   3. `:1697` — `checkTokenId(msg)`
+//
+// `DataWord.value()` is `new BigInteger(1, data)` (DataWord.java:197-199), so
+// the accepted range is `[0, 2^63)` and any word from 2^63 up throws a bare
+// `ArithmeticException`. `VM.java:97-101` exempts only a `TransferException`
+// from `spendAllEnergy()`, and `RuntimeImpl.setResultCode`
+// (RuntimeImpl.java:129-138) has no `ArithmeticException` arm, so the root
+// frame records `contractResult UNKNOWN` with the whole budget consumed.
+//
+// `OperationActions.exeCall:1033-1041` dispatches on the target address alone,
+// so CALL, CALLCODE and CALLTOKEN all reach `:1693` identically. CALLCODE's
+// `contextAddress = senderAddress` (`:1687-1688`) only neutralises the transfer
+// block at `:1717`, five statements after the throw.
+// ---------------------------------------------------------------------------
+
+const BIG_ENERGY_LIMIT: u64 = 50_000_000;
+
+/// `fresh_stores` plus the proposals CALLTOKEN needs: ALLOW_TVM_TRANSFER_TRC10
+/// enables the opcode, ALLOW_MULTI_SIGN makes `Program.isTokenTransfer`
+/// unconditionally true for it (`OperationActions.callTokenAction:987`).
+fn trc10_stores() -> VmStores {
+    let stores = fresh_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_TRANSFER_TRC10", 1);
+    stores.dynamic_properties.put_long(b"ALLOW_MULTI_SIGN", 1);
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    stores
+}
+
+fn push32(word: [u8; 32]) -> Vec<u8> {
+    let mut v = vec![0x7f];
+    v.extend_from_slice(&word);
+    v
+}
+
+/// A 32-byte big-endian word holding `n` in its low 8 bytes.
+fn word_u64(n: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&n.to_be_bytes());
+    w
+}
+
+/// `2^64 + extra` — above `i64::MAX`, and its low 64 bits are `extra`, so a
+/// truncating read sees `extra` where java sees a throw.
+fn word_two_pow_64_plus(extra: u64) -> [u8; 32] {
+    let mut w = word_u64(extra);
+    w[23] = 0x01;
+    w
+}
+
+/// `CALLTOKEN(gas, to, value, tokenId, 0, 0, 0, 0)` then STOP. Operands are
+/// pushed in reverse stack order.
+fn calltoken_bytecode(to_low: u8, value: [u8; 32], token_id: i64) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend_from_slice(&[0x60, 0x00]); // outSize
+    bc.extend_from_slice(&[0x60, 0x00]); // outOffset
+    bc.extend_from_slice(&[0x60, 0x00]); // inSize
+    bc.extend_from_slice(&[0x60, 0x00]); // inOffset
+    bc.extend(push32(word_u64(token_id as u64)));
+    bc.extend(push32(value));
+    bc.extend_from_slice(&[0x60, to_low]); // to
+    bc.extend_from_slice(&[0x61, 0xff, 0xff]); // gas
+    bc.push(0xd0); // CALLTOKEN
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// `CALLCODE(gas, to, value, 0, 0, 0, 0)` then STOP.
+fn callcode_bytecode(to_low: u8, value: [u8; 32]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend_from_slice(&[0x60, 0x00]); // retSize
+    bc.extend_from_slice(&[0x60, 0x00]); // retOffset
+    bc.extend_from_slice(&[0x60, 0x00]); // argSize
+    bc.extend_from_slice(&[0x60, 0x00]); // argOffset
+    bc.extend(push32(value));
+    bc.extend_from_slice(&[0x60, to_low]); // to
+    bc.extend_from_slice(&[0x61, 0xff, 0xff]); // gas
+    bc.push(0xf2); // CALLCODE
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// Replace the trailing STOP with "SSTORE the call's success flag into slot 0,
+/// SSTORE 1 into slot 1, STOP", so both the pushed value and the fact that the
+/// frame survived are observable.
+fn then_record(mut bc: Vec<u8>) -> Vec<u8> {
+    bc.pop(); // drop STOP
+    bc.extend_from_slice(&[0x60, 0x00, 0x55]); // PUSH1 0 SSTORE  (success flag)
+    bc.extend_from_slice(&[0x60, 0x01, 0x60, 0x01, 0x55]); // PUSH1 1 PUSH1 1 SSTORE
+    bc.push(0x00); // STOP
+    bc
+}
+
+fn set_token_balance(stores: &VmStores, addr: [u8; 21], token_id: i64, amount: i64) {
+    let mut acct = account(stores, addr).unwrap_or(Account {
+        address: addr.to_vec(),
+        ..Default::default()
+    });
+    acct.asset_v2.insert(token_id.to_string(), amount);
+    stores.accounts.put(&Address::from_raw(addr), &acct).unwrap();
+}
+
+fn token_balance(stores: &VmStores, addr: [u8; 21], token_id: i64) -> Option<i64> {
+    account(stores, addr).and_then(|a| a.asset_v2.get(&token_id.to_string()).copied())
+}
+
+fn run_with_limit(
+    stores: &VmStores,
+    caller: [u8; 21],
+    contract: [u8; 21],
+    limit: u64,
+) -> VmOutcome {
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: contract.to_vec(),
+        call_value: 0,
+        data: vec![],
+        call_token_value: 0,
+        token_id: 0,
+    };
+    execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+        &trigger,
+        limit,
+    )
+}
+
+fn chain_addr(i: usize) -> [u8; 21] {
+    let mut a = [0u8; 21];
+    a[0] = 0x41;
+    a[1] = 0xcc;
+    a[2..4].copy_from_slice(&(i as u16).to_be_bytes());
+    a
+}
+
+/// Install a chain of `depth + 1` contracts where link `i` zero-value CALLs
+/// link `i + 1` and the last link runs `leaf_code`. Triggering link 0 puts the
+/// leaf at frame depth `depth`, so `depth == 64` is java's
+/// `getCallDeep() == MAX_DEPTH`. Every link records a survival marker in slot 0
+/// after its CALL returns. Returns link 0's address.
+fn install_call_chain(stores: &VmStores, depth: usize, leaf_code: Vec<u8>) -> [u8; 21] {
+    install_contract(stores, chain_addr(depth), leaf_code, 0);
+    for i in (0..depth).rev() {
+        let next = chain_addr(i + 1);
+        let mut bc = Vec::new();
+        bc.extend_from_slice(&[0x60, 0x00]); // outSize
+        bc.extend_from_slice(&[0x60, 0x00]); // outOffset
+        bc.extend_from_slice(&[0x60, 0x00]); // inSize
+        bc.extend_from_slice(&[0x60, 0x00]); // inOffset
+        bc.extend_from_slice(&[0x60, 0x00]); // value = 0
+        bc.push(0x73); // PUSH20 next
+        bc.extend_from_slice(&next[1..]);
+        bc.extend(push32(word_u64(30_000_000))); // gas, capped by the 63/64 rule
+        bc.push(0xf1); // CALL
+        bc.push(0x50); // POP
+        bc.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]); // SSTORE slot0 := 1
+        bc.push(0x00); // STOP
+        install_contract(stores, chain_addr(i), bc, 0);
+    }
+    chain_addr(0)
+}
+
+fn one_word() -> Vec<u8> {
+    let mut v = vec![0u8; 32];
+    v[31] = 1;
+    v
+}
+
+const TOKEN_ID: i64 = 1_000_042;
+
+/// (a1) A CALLTOKEN endowment word of exactly 2^64 to a precompile.
+///
+/// Its low 64 bits are ZERO, so a truncating read classifies the call as
+/// carrying no token at all and lets the identity precompile run and push 1.
+/// java never gets that far: `Program.java:1693` reads the whole unsigned word
+/// and `longValueExact()` throws. Needs no account row at the precompile
+/// address, which is what makes this the reachable shape.
+#[test]
+fn calltoken_endowment_2_pow_64_to_precompile_halts_with_unknown() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd1);
+    install_contract(
+        &stores,
+        c,
+        then_record(calltoken_bytecode(0x04, word_two_pow_64_plus(0), TOKEN_ID)),
+        0,
+    );
+    set_token_balance(&stores, c, TOKEN_ID, 1000);
+    assert!(account(&stores, low_byte_tron_addr(0x04)).is_none());
+
+    let out = run(&stores, caller, c);
+    match &out {
+        VmOutcome::Halt { result, .. } => assert_eq!(
+            *result,
+            ContractResult::Unknown,
+            "an ArithmeticException matches no RuntimeImpl.setResultCode arm"
+        ),
+        other => panic!("expected a halt, got {other:?}"),
+    }
+    assert_eq!(
+        energy_used(&out),
+        ENERGY_LIMIT,
+        "VM.java:99 spends all energy for a non-TransferException"
+    );
+    assert_eq!(
+        token_balance(&stores, c, TOKEN_ID),
+        Some(1000),
+        "the endowment must not move"
+    );
+    assert!(
+        account(&stores, low_byte_tron_addr(0x04)).is_none(),
+        "the precompile address must not gain an account row"
+    );
+}
+
+/// (a2) The throw at `:1693` precedes the sender-balance check at `:1707`, so a
+/// truncated amount the caller cannot afford is still a throw, not the
+/// push-zero an ordinary short balance produces.
+#[test]
+fn calltoken_endowment_over_i64_max_to_precompile_ignores_token_balance() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd2);
+    install_contract(
+        &stores,
+        c,
+        then_record(calltoken_bytecode(0x04, word_two_pow_64_plus(5), TOKEN_ID)),
+        0,
+    );
+    // Below the truncated amount (5): a short balance would otherwise push zero.
+    set_token_balance(&stores, c, TOKEN_ID, 1);
+
+    let out = run(&stores, caller, c);
+    match &out {
+        VmOutcome::Halt { result, .. } => assert_eq!(*result, ContractResult::Unknown),
+        other => panic!("expected a halt, got {other:?}"),
+    }
+    assert_eq!(energy_used(&out), ENERGY_LIMIT);
+    assert_eq!(token_balance(&stores, c, TOKEN_ID), Some(1));
+}
+
+/// (a3) With an account row already at the precompile address the truncating
+/// read is not merely wrong about the outcome, it moves tokens: a word of
+/// `2^64 - 1` truncates to `-1`, so a naive debit CREDITS the caller and leaves
+/// the counterparty row negative — a balance java can never produce. Both rows
+/// must be untouched.
+#[test]
+fn calltoken_endowment_over_i64_max_to_precompile_with_existing_row_moves_nothing() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd3);
+    install_contract(
+        &stores,
+        c,
+        then_record(calltoken_bytecode(0x04, word_two_pow_64_plus(u64::MAX), TOKEN_ID)),
+        0,
+    );
+    set_token_balance(&stores, c, TOKEN_ID, 1000);
+    let target = low_byte_tron_addr(0x04);
+    install_contract(&stores, target, Vec::new(), 0);
+    set_token_balance(&stores, target, TOKEN_ID, 0);
+
+    let out = run(&stores, caller, c);
+    match &out {
+        VmOutcome::Halt { result, .. } => assert_eq!(*result, ContractResult::Unknown),
+        other => panic!("expected a halt, got {other:?}"),
+    }
+    assert_eq!(energy_used(&out), ENERGY_LIMIT);
+    assert_eq!(
+        token_balance(&stores, c, TOKEN_ID),
+        Some(1000),
+        "the caller must not be credited"
+    );
+    assert_eq!(
+        token_balance(&stores, target, TOKEN_ID),
+        Some(0),
+        "the precompile row must not go negative"
+    );
+}
+
+/// (a3, sibling) A word of exactly 2^63 truncates to `i64::MIN`, which makes
+/// the naive `caller_balance - transferred` overflow. The guard must halt
+/// before any arithmetic, in a debug build as much as a release one.
+#[test]
+fn calltoken_endowment_2_pow_63_to_precompile_does_not_overflow() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd4);
+    let mut value = [0u8; 32];
+    value[24] = 0x80; // 2^63 — the smallest word `longValueExact` rejects
+    install_contract(
+        &stores,
+        c,
+        then_record(calltoken_bytecode(0x04, value, TOKEN_ID)),
+        0,
+    );
+    set_token_balance(&stores, c, TOKEN_ID, 0);
+    let target = low_byte_tron_addr(0x04);
+    install_contract(&stores, target, Vec::new(), 0);
+    set_token_balance(&stores, target, TOKEN_ID, 0);
+
+    let out = run(&stores, caller, c);
+    match &out {
+        VmOutcome::Halt { result, .. } => assert_eq!(*result, ContractResult::Unknown),
+        other => panic!("expected a halt, got {other:?}"),
+    }
+    assert_eq!(token_balance(&stores, c, TOKEN_ID), Some(0));
+    assert_eq!(token_balance(&stores, target, TOKEN_ID), Some(0));
+}
+
+/// (a4) Ordering: `:1693` runs BEFORE `checkTokenId` at `:1697`, so an
+/// out-of-range endowment on a CALLTOKEN whose token id would also fail
+/// `checkTokenId` (id <= MIN_TOKEN_ID) produces the endowment's spend-all
+/// UNKNOWN, not `checkTokenId`'s TransferException.
+#[test]
+fn calltoken_endowment_over_i64_max_to_precompile_precedes_check_token_id() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let c = tron_addr(0xd5);
+    install_contract(
+        &stores,
+        c,
+        // tokenId 5 is <= MIN_TOKEN_ID (1_000_000), so `checkTokenId` would
+        // throw if it were reached first.
+        then_record(calltoken_bytecode(0x04, word_two_pow_64_plus(0), 5)),
+        0,
+    );
+
+    let out = run(&stores, caller, c);
+    match &out {
+        VmOutcome::Halt { result, .. } => assert_eq!(
+            *result,
+            ContractResult::Unknown,
+            "the endowment read precedes checkTokenId, so this is not TRANSFER_FAILED"
+        ),
+        other => panic!("expected a halt, got {other:?}"),
+    }
+    assert_eq!(energy_used(&out), ENERGY_LIMIT);
+}
+
+/// (b1) CALLCODE reaches `:1693` exactly like CALL.
+/// `OperationActions.callCodeAction:988-995` passes the popped `codeAddress`
+/// and a real `value` to the opcode-blind `exeCall`, and CALLCODE's
+/// `contextAddress = senderAddress` (`:1687-1688`) only disarms the transfer
+/// block at `:1717`, which the throw never reaches. Swept across
+/// ALLOW_TVM_CONSTANTINOPLE to pin that the precompile arm is UNGATED — the
+/// method has no proposal branch between `:1673` and `:1698`.
+#[test]
+fn callcode_endowment_over_i64_max_to_precompile_halts_with_unknown() {
+    for constantinople in [false, true] {
+        let stores = fresh_stores();
+        stores
+            .dynamic_properties
+            .put_long(b"ALLOW_TVM_CONSTANTINOPLE", i64::from(constantinople));
+        let caller = install_caller(&stores);
+        let c = tron_addr(0xd6);
+        install_contract(
+            &stores,
+            c,
+            then_record(callcode_bytecode(0x04, word_two_pow_64_plus(0))),
+            1000,
+        );
+
+        let out = run(&stores, caller, c);
+        match &out {
+            VmOutcome::Halt { result, .. } => assert_eq!(
+                *result,
+                ContractResult::Unknown,
+                "#26={constantinople}: the precompile arm has no try/catch to soften"
+            ),
+            other => panic!("#26={constantinople}: expected a halt, got {other:?}"),
+        }
+        assert_eq!(energy_used(&out), ENERGY_LIMIT, "#26={constantinople}");
+        assert_eq!(
+            balance_of(&stores, c),
+            1000,
+            "#26={constantinople}: nothing moves"
+        );
+    }
+}
+
+/// (b2) The depth return at `:1677` precedes the endowment read at `:1693`, so
+/// at `getCallDeep() == MAX_DEPTH` the same CALLCODE pushes zero and refunds
+/// instead of throwing, and the frame carries on.
+#[test]
+fn callcode_endowment_over_i64_max_at_max_depth_pushes_zero() {
+    let stores = fresh_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    let caller = install_caller(&stores);
+    let head = install_call_chain(
+        &stores,
+        64,
+        then_record(callcode_bytecode(0x04, word_two_pow_64_plus(0))),
+    );
+
+    let out = run_with_limit(&stores, caller, head, BIG_ENERGY_LIMIT);
+    assert!(
+        matches!(out, VmOutcome::Success { .. }),
+        "at MAX_DEPTH java pushes zero before the endowment read, got {out:?}"
+    );
+    assert_eq!(
+        slot(&stores, chain_addr(64), 0),
+        Vec::<u8>::new(),
+        "the call must push zero"
+    );
+    assert_eq!(
+        slot(&stores, chain_addr(64), 1),
+        one_word(),
+        "the leaf must continue past the refused call"
+    );
+    assert_eq!(slot(&stores, chain_addr(0), 0), one_word());
+}
+
+/// (c1) The depth return at `:1677` is the FIRST statement in
+/// `callToPrecompiledAddress`, ahead of the transfer block whose "no ToAccount"
+/// failure otherwise kills the calling frame. At MAX_DEPTH a value CALLTOKEN to
+/// a precompile with no account row must therefore push zero, refund the whole
+/// forwarded budget, and let the caller carry on.
+#[test]
+fn calltoken_to_precompile_at_max_depth_pushes_zero() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let head = install_call_chain(
+        &stores,
+        64,
+        then_record(calltoken_bytecode(0x04, word_u64(7), TOKEN_ID)),
+    );
+    // Fund the leaf so a short token balance is not what produces the push-zero.
+    set_token_balance(&stores, chain_addr(64), TOKEN_ID, 1000);
+
+    let out = run_with_limit(&stores, caller, head, BIG_ENERGY_LIMIT);
+    assert!(
+        matches!(out, VmOutcome::Success { .. }),
+        "the depth push-zero precedes the transfer block, got {out:?}"
+    );
+    assert_eq!(
+        slot(&stores, chain_addr(64), 0),
+        Vec::<u8>::new(),
+        "the call must push zero"
+    );
+    assert_eq!(
+        slot(&stores, chain_addr(64), 1),
+        one_word(),
+        "the leaf must continue past the refused call"
+    );
+    assert_eq!(slot(&stores, chain_addr(0), 0), one_word());
+    assert_eq!(
+        token_balance(&stores, chain_addr(64), TOKEN_ID),
+        Some(1000),
+        "nothing is transferred at the depth limit"
+    );
+    assert!(account(&stores, low_byte_tron_addr(0x04)).is_none());
+}
+
+/// (c2) The same depth return in `callToAddress` (`Program.java:1003-1007`)
+/// precedes `createAccountIfNotExist`, so a CALLTOKEN to an ordinary dead
+/// address at MAX_DEPTH must not create the recipient either.
+#[test]
+fn calltoken_at_max_depth_creates_no_account_row() {
+    let stores = trc10_stores();
+    let caller = install_caller(&stores);
+    let head = install_call_chain(
+        &stores,
+        64,
+        then_record(calltoken_bytecode(0xad, word_u64(7), TOKEN_ID)),
+    );
+    set_token_balance(&stores, chain_addr(64), TOKEN_ID, 1000);
+    let target = low_byte_tron_addr(0xad);
+    assert!(account(&stores, target).is_none());
+
+    let out = run_with_limit(&stores, caller, head, BIG_ENERGY_LIMIT);
+    assert!(matches!(out, VmOutcome::Success { .. }), "{out:?}");
+    assert_eq!(
+        slot(&stores, chain_addr(64), 0),
+        Vec::<u8>::new(),
+        "the call must push zero"
+    );
+    assert!(
+        account(&stores, target).is_none(),
+        "the depth return precedes createAccountIfNotExist"
+    );
+    assert_eq!(
+        token_balance(&stores, chain_addr(64), TOKEN_ID),
+        Some(1000),
+        "nothing is transferred at the depth limit"
+    );
+}

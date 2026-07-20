@@ -200,12 +200,14 @@ pub trait JournalTr {
         false
     }
 
-    /// TRON fork: record that a value-transfer operation raised a
-    /// `TransferException` (transfer/endowment/self-transfer validation
-    /// failure). Set by the CALL/CALLTOKEN opcode handler before it returns
-    /// [`crate::InstructionResult::TransferFailed`]; read by the executor to
-    /// surface `contractResult TRANSFER_FAILED`. Default no-op for journals
-    /// that don't carry the flag.
+    /// TRON fork: record that the ROOT frame raised a `TransferException`
+    /// (transfer/endowment/self-transfer validation failure). Set by the
+    /// executor at the root-return boundary, not by the opcode handler:
+    /// `RuntimeImpl.setResultCode` reads the exception off the root
+    /// `ProgramResult` alone, so a nested `TransferException` — which
+    /// `Program.callToAddress` contains to its own frame — must not colour the
+    /// receipt. Read by the executor to surface `contractResult
+    /// TRANSFER_FAILED`. Default no-op for journals that don't carry the flag.
     fn tron_mark_transfer_failed(&mut self) {}
 
     /// TRON fork: did a value-transfer operation raise a `TransferException`

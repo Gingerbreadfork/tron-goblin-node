@@ -123,12 +123,14 @@ pub struct JournalInner<ENTRY> {
     ///
     /// [EIP-7708]: https://eips.ethereum.org/EIPS/eip-7708
     pub selfdestructed_addresses: Vec<Address>,
-    /// TRON fork: set when a value-transfer operation raised a
-    /// `TransferException` (a transfer/endowment/self-transfer validation
-    /// failure — see [`crate::interpreter::InstructionResult::TransferFailed`]).
-    /// The opcode handler sets this before returning `TransferFailed`; the
-    /// executor reads it after the run to record `contractResult
-    /// TRANSFER_FAILED` instead of a plain `REVERT`. Transient per-transaction
+    /// TRON fork: set when the ROOT frame raised a `TransferException` (a
+    /// transfer/endowment/self-transfer validation failure — see
+    /// [`crate::interpreter::InstructionResult::TransferFailed`]). The handler
+    /// sets this at the root-return boundary, since `RuntimeImpl.setResultCode`
+    /// reads the exception off the root `ProgramResult` alone and a nested
+    /// `TransferException` is contained to its own frame; the executor reads it
+    /// after the run to record `contractResult TRANSFER_FAILED` instead of a
+    /// plain `REVERT`. Transient per-transaction
     /// state, cleared on `commit_tx` / `discard_tx`.
     pub tron_transfer_failed: bool,
     /// TRON fork: for each address whose contract storage has been touched,

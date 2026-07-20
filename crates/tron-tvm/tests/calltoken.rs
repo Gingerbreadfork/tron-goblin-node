@@ -1788,3 +1788,66 @@ fn self_calltoken_with_insufficient_token_balance_pushes_zero() {
         "and must not net-mint itself the amount"
     );
 }
+
+/// Outer contract: CALL `inner` (value 0), then SSTORE slot 0 := 1 and STOP.
+/// The stored slot is only reached if the CALL returned to this frame at all,
+/// so it marks "the caller pushed 0 and ran on".
+fn build_outer_caller_then_sstore(inner: [u8; 21]) -> Vec<u8> {
+    let mut bc = build_outer_caller(inner);
+    bc.pop(); // drop trailing STOP (0x00)
+    bc.extend([0x60, 0x01, 0x60, 0x00, 0x55]); // PUSH1 1 PUSH1 0 SSTORE
+    bc.push(0x00); // STOP
+    bc
+}
+
+/// `checkTokenId` (Program.java:1799-1824) rejects a CALLTOKEN tokenId <=
+/// MIN_TOKEN_ID and, under #26, raises a `TransferException`. Raised in a
+/// NESTED frame it is contained there: `VM.play`'s outer catch (VM.java:114-127)
+/// rethrows only `JVMStackOverFlowException` / `OutOfTimeException`, so it is
+/// recorded on that frame's own result and `ProgramResult.merge` never copies
+/// it up; `Program.callToAddress` then does `stackPushZero(); return;`. Covers
+/// the CALLTOKEN producers as a class — the root-frame form of the same rig is
+/// pinned by `calltoken_static_guard_precedes_token_id_check`.
+#[test]
+fn nested_calltoken_bad_token_id_is_contained_to_its_frame() {
+    let stores = modern_stores();
+    let owner = tron_addr(0x0b);
+    let outer = tron_addr(0xd9);
+    let caller = tron_addr(0xda);
+    let receiver = tron_addr(0xdb);
+
+    stores
+        .accounts
+        .put(
+            &Address::from_raw(owner),
+            &Account {
+                address: owner.to_vec(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    install_contract_with_balance(&stores, outer, &build_outer_caller_then_sstore(caller), 0, 0);
+    // tokenId = 5 (<= MIN_TOKEN_ID) trips `checkTokenId` inside `caller`.
+    install_contract_with_balance(
+        &stores,
+        caller,
+        &build_calltoken_caller(receiver, 5, 5),
+        5,
+        10_000,
+    );
+    install_contract_with_balance(&stores, receiver, &build_calltoken_receiver(), 0, 0);
+
+    let limit = 500_000u64;
+    match run(&stores, &trigger_for(owner, outer), limit) {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(energy_used < limit, "the tx itself must not spend-all");
+        }
+        other => panic!("a nested checkTokenId failure must not kill the tx, got {other:?}"),
+    }
+    assert_eq!(
+        slot(&stores, outer, 0).last(),
+        Some(&1u8),
+        "the caller must push 0 and run on to its SSTORE"
+    );
+}

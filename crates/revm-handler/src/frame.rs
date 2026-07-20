@@ -256,6 +256,14 @@ impl EthFrame<EthInterpreter> {
             // (consumed-only, TRANSFER_FAILED) the regular-call path produces
             // from #26 on. java evaluates this BEFORE the balance check at line
             // 1707, and it fires whether or not the target row exists.
+            //
+            // The CALL/CALLCODE/CALLTOKEN opcode handlers raise this in the
+            // interpreter, ahead of frame construction, because the TRC-10
+            // rail carries its amount on `tron_token_value` and is claimed by
+            // `Trc10Inspector::call` before `make_call_frame` ever runs. This
+            // arm therefore covers only a `CallInputs` built outside the
+            // opcode path; it is deliberately not extended to `CallCode` or
+            // the token rail, both of which the opcode handles.
             if trx_value > U256::from(i64::MAX as u64) {
                 ctx.journal_mut().checkpoint_revert(checkpoint);
                 return precompile_transfer_failure();
@@ -733,7 +741,20 @@ impl EthFrame<EthInterpreter> {
                 let _ = interpreter.stack.push(item);
 
                 // Return unspend gas.
-                if ins_result.is_ok_or_revert() {
+                //
+                // TRON fork: java `Program.callToAddress` (Program.java:1157-1169)
+                // splits the two failure kinds. A child whose `ProgramResult`
+                // carries an EXCEPTION pushes zero and RETURNS immediately,
+                // before the return-data write (:1186-1194) and before the
+                // unspent-energy refund (:1197-1210), so the caller forfeits the
+                // whole forwarded budget. A child that merely REVERTED falls
+                // through and gets both. `TransferFailed` sits in the revert
+                // group so a ROOT frame settles its energy consumed-only
+                // (`spendAllEnergy`-exempt, VM.java:99-101), which is why it has
+                // to be named here rather than moved out of that group.
+                let child_returns_to_caller =
+                    ins_result.is_ok_or_revert() && ins_result != InstructionResult::TransferFailed;
+                if child_returns_to_caller {
                     interpreter.gas.erase_cost(out_gas.remaining());
 
                     // TRON fork: before ALLOW_TVM_SELFDESTRUCT_RESTRICTION (#94)
@@ -862,7 +883,19 @@ impl EthFrame<EthInterpreter> {
 
                 let this_gas = &mut interpreter.gas;
                 // Refund unused gas for success and revert cases.
-                if instruction_result.is_ok_or_revert() {
+                //
+                // TRON fork: java `createContractImpl` splits the two failure
+                // kinds the same way `callToAddress` does — an init frame that
+                // raised an exception takes the early `return` at
+                // Program.java:963, skipping `refundEnergyAfterVM`, so the
+                // caller forfeits the whole forwarded budget it was charged at
+                // creation. Only a child that merely REVERTED reaches the
+                // refund. `TransferFailed` sits in the revert group so a ROOT
+                // frame settles consumed-only, which is why it is named here
+                // rather than moved out of that group.
+                if instruction_result.is_ok_or_revert()
+                    && instruction_result != InstructionResult::TransferFailed
+                {
                     this_gas.erase_cost(outcome.gas().remaining());
                 }
 

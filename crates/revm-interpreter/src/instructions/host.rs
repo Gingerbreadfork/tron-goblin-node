@@ -496,12 +496,11 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     {
         // java: `program.getResult().setRevert(); program.stop()`.
         -1 => return Err(InstructionResult::Revert),
-        // java threw a `TransferException` out of `MUtil.transfer`: the whole
-        // transaction fails as TRANSFER_FAILED with consumed-only energy.
-        -2 => {
-            context.host.tron_mark_transfer_failed();
-            return Err(InstructionResult::TransferFailed);
-        }
+        // java threw a `TransferException` out of `MUtil.transfer`. `VM.play`
+        // catches it for THIS frame, spend-all-exempt, and the caller pushes
+        // zero and continues. Only a root-frame throw reaches the receipt, as
+        // TRANSFER_FAILED with consumed-only energy.
+        -2 => return Err(InstructionResult::TransferFailed),
         // java threw a `BytecodeExecutionException`, or NPEd inside
         // `MUtil.transferAllToken`. `VM.play` catches it for THIS frame: the
         // frame spends all its energy and halts, and the caller pushes zero and

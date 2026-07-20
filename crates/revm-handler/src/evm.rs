@@ -4,7 +4,7 @@ use crate::{
 };
 use auto_impl::auto_impl;
 use context::{ContextTr, Database, Evm, FrameStack};
-use context_interface::context::ContextError;
+use context_interface::{context::ContextError, JournalTr};
 use interpreter::{
     interpreter::EthInterpreter, interpreter_action::FrameInit, interpreter_types::LoopControl,
     InstructionResult, InterpreterResult,
@@ -236,19 +236,25 @@ where
         if self.frame_stack.get().is_finished() {
             self.frame_stack.pop();
         }
-        // TRON fork: a `TransferException` (`InstructionResult::TransferFailed`)
-        // is tx-fatal — java unwinds EVERY frame to the top rather than letting
-        // the parent's call-return push 0/1 and continue (`Program.callToAddress`
-        // throws past `VM.play` into the parent's op loop, on up to
-        // `VMActuator`). Mirror that: clear the frame stack so the result
-        // propagates straight to the top frame as the transaction's outcome,
-        // skipping the parent `return_result` continuation. Gas already settled
-        // consumed-only (the result is in `is_ok_or_revert`).
-        if result.interpreter_result().result == InstructionResult::TransferFailed {
-            self.frame_stack.clear();
-            return Ok(Some(result));
-        }
         if self.frame_stack.index().is_none() {
+            // TRON fork: `RuntimeImpl.setResultCode` (RuntimeImpl.java:68,
+            // :130-133) reads the exception off the ROOT `ProgramResult` alone,
+            // so a `TransferException` surfaces `contractResult
+            // TRANSFER_FAILED` only when the root frame raised it. `VM.play`'s
+            // outer catch (VM.java:114-127) rethrows nothing but
+            // `JVMStackOverFlowException` / `OutOfTimeException`, so a nested
+            // throw is recorded on that frame's own result
+            // (`program.setRuntimeFailure`) and dropped by
+            // `ProgramResult.merge`, which never copies a child's exception up.
+            //
+            // Popping the root leaves `index == None`, so this arm is exactly
+            // "the frame that just returned was the root". A result arriving
+            // without a pop (`frame_init` answered inline) leaves the CALLER on
+            // top with `index == Some`, and the root's own `frame_init` result
+            // short-circuits before `frame_return_result` is reached.
+            if result.interpreter_result().result == InstructionResult::TransferFailed {
+                self.ctx.journal_mut().tron_mark_transfer_failed();
+            }
             return Ok(Some(result));
         }
         self.frame_stack

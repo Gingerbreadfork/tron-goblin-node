@@ -48,13 +48,23 @@ pub enum InstructionResult {
     /// range", "Cannot transfer … to yourself"). A `TransferException` is a
     /// `BytecodeExecutionException` that, unlike a plain halt, is EXEMPT from
     /// `spendAllEnergy` (`VM.java` / `VMActuator`) — so it charges only the
-    /// energy consumed up to the throw (forwarded call energy refunded), the
-    /// same as a revert — yet it terminates the WHOLE transaction (the
-    /// exception unwinds every frame) and surfaces `contractResult
-    /// TRANSFER_FAILED`. Grouped with the revert codes so its gas settles
-    /// consumed-only; propagated tx-fatal by `frame_return_result` (it never
-    /// reaches a parent's call-return push-0/1) and tagged on the journal so
-    /// the executor records `TRANSFER_FAILED` rather than `REVERT`.
+    /// energy consumed up to the throw, the same as a revert. Grouped with the
+    /// revert codes so its gas settles consumed-only.
+    ///
+    /// Contained to the frame that raised it, exactly like
+    /// [`InstructionResult::TronBytecodeExecution`]: `VM.play`'s outer catch
+    /// rethrows only `JVMStackOverFlowException` / `OutOfTimeException`, so a
+    /// `TransferException` is recorded on that frame's own result
+    /// (`program.setRuntimeFailure`) and `ProgramResult.merge` never copies a
+    /// child's exception to the parent. `Program.callToAddress` then pushes
+    /// zero and returns BEFORE the return-data write and the unspent-energy
+    /// refund, so the caller continues having forfeited the whole forwarded
+    /// budget.
+    ///
+    /// Only a ROOT-frame occurrence reaches the receipt: `VMActuator` rethrows
+    /// it (skipping `spendAllEnergy`) and `RuntimeImpl.setResultCode` maps it
+    /// to `contractResult TRANSFER_FAILED`. The executor records that at the
+    /// root-return boundary rather than at the opcode.
     TransferFailed,
 
     // Error Codes

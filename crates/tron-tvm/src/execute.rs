@@ -750,11 +750,13 @@ fn execute_trigger_inner(
         revm::interpreter::set_op_trace(false);
         eprintln!("OPTRACE_TX_END");
     }
-    // TRON fork: did a value-transfer raise a `TransferException`? The
-    // CALL/CALLTOKEN opcode handler sets this on the journal before returning
-    // `InstructionResult::TransferFailed`. A `TransferException` settles its
-    // gas exactly like a revert (consumed-only, `spendAllEnergy`-exempt) and so
-    // surfaces from revm as `ExecutionResult::Revert` — but it must record
+    // TRON fork: did the ROOT frame raise a `TransferException`? The handler
+    // sets this on the journal when a `TransferFailed` result is the root
+    // frame's own outcome; a nested one is contained to its frame and never
+    // reaches `RuntimeImpl.setResultCode`, which reads the exception off the
+    // root `ProgramResult` alone. A `TransferException` settles its gas exactly
+    // like a revert (consumed-only, `spendAllEnergy`-exempt) and so surfaces
+    // from revm as `ExecutionResult::Revert` — but it must record
     // `contractResult TRANSFER_FAILED`, so we relabel the Revert outcome below.
     let transfer_failed = {
         use revm::context_interface::JournalTr as _;
@@ -787,10 +789,11 @@ fn execute_trigger_inner(
         Ok(ExecutionResult::Revert { output, gas, .. }) => {
             unwind_on_failure(stores);
             if transfer_failed {
-                // A `TransferException` unwound the whole tx at a value-transfer
-                // opcode. State is reverted just like a normal REVERT; only the
-                // recorded `contractResult` differs (TRANSFER_FAILED). Energy is
-                // the consumed total (spend-all-exempt), already in `gas`.
+                // A `TransferException` reached the root frame, so `VMActuator`
+                // never commits and the whole tx is reverted. State is reverted
+                // just like a normal REVERT; only the recorded `contractResult`
+                // differs (TRANSFER_FAILED). Energy is the consumed total
+                // (spend-all-exempt), already in `gas`.
                 VmOutcome::TransferFailed {
                     energy_used: gas.tx_gas_used(),
                 }

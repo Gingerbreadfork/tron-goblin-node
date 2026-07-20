@@ -271,11 +271,13 @@ pub trait Host {
         false
     }
 
-    /// TRON fork: record that a value-transfer operation raised a
-    /// `TransferException` (transfer/endowment/self-transfer validation
-    /// failure). Set by the CALL/CALLTOKEN opcode handler before returning
-    /// `InstructionResult::TransferFailed`; read by the executor to surface
-    /// `contractResult TRANSFER_FAILED`. Default no-op.
+    /// TRON fork: record that the ROOT frame raised a `TransferException`
+    /// (transfer/endowment/self-transfer validation failure). Set by the
+    /// executor at the root-return boundary, not by the opcode handler, because
+    /// `RuntimeImpl.setResultCode` reads the exception off the root
+    /// `ProgramResult` alone and a nested `TransferException` is contained to
+    /// its own frame. Read by the executor to surface `contractResult
+    /// TRANSFER_FAILED`. Default no-op.
     fn tron_mark_transfer_failed(&mut self) {}
 
     /// TRON fork: record that an operation raised a plain

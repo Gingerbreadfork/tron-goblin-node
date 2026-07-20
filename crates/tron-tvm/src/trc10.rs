@@ -17,6 +17,7 @@
 //! transfer rolled back by the higher-level session — see
 //! `tron-executor::TxSession`.
 
+use revm::context_interface::host::TRON_MAX_CALL_DEPTH;
 use revm::inspector::Inspector;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::{
@@ -659,6 +660,26 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
         self.committed_starts.push(self.committed.len());
         self.cs_journal_starts.push(self.cs_journal.len());
         self.push_staking_start();
+
+        // java answers `getCallDeep() == MAX_DEPTH` with `stackPushZero();
+        // refundEnergy(msg.getEnergy(), " call deep limit reach"); return;` at
+        // the TOP of both `callToAddress` (Program.java:1003-1007) and
+        // `callToPrecompiledAddress` (:1677-1681), before the endowment read,
+        // the balance check and the transfer block. Returning `None` here hands
+        // the frame to `EthFrame::make_call_frame`, whose own
+        // `depth > TRON_MAX_CALL_DEPTH` return produces exactly that push-zero
+        // plus full energy refund; deciding it in the inspector instead would
+        // pre-empt that with a balance revert or a precompile halt.
+        //
+        // `depth` is the prospective child's frame depth, the same value
+        // `FrameInit` carries, so the predicate matches the one downstream.
+        // Skipping the internal-tx record below matches java, where
+        // `increaseNonce()` / `addInternalTx(...)` sit after the depth return.
+        if depth > TRON_MAX_CALL_DEPTH {
+            self.pending.push(None);
+            return None;
+        }
+
         if depth > 0 {
             let trx_value = match inputs.value {
                 revm::interpreter::CallValue::Transfer(v) => v,
@@ -836,10 +857,12 @@ impl<CTX> Inspector<CTX, EthInterpreter> for Trc10Inspector {
             });
         }
 
-        // Apply transfer.
+        // Apply transfer. The opcode-level endowment guard keeps `transferred`
+        // in `[0, i64::MAX]`, so neither leg can wrap; both are written
+        // saturating so a future caller cannot reintroduce an overflow panic.
         caller_account
             .asset_v2
-            .insert(token_id_key.clone(), caller_balance - transferred);
+            .insert(token_id_key.clone(), caller_balance.saturating_sub(transferred));
         let new_target = target_pre.unwrap_or(0).saturating_add(transferred);
         target_account.asset_v2.insert(token_id_key.clone(), new_target);
 

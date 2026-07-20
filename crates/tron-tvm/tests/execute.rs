@@ -571,6 +571,12 @@ fn push32(bytes: [u8; 32]) -> Vec<u8> {
 /// CALL stack (top first): `[gas, to, value, inOffset, inSize, outOffset,
 /// outSize]` — pushed in reverse.
 fn build_call_with_value(target: [u8; 21], value: [u8; 32]) -> Vec<u8> {
+    build_call_with_value_and_gas(target, value, 50_000)
+}
+
+/// `build_call_with_value` with an explicit forwarded-energy word, for tests
+/// that assert on how much of the forwarded budget the caller keeps.
+fn build_call_with_value_and_gas(target: [u8; 21], value: [u8; 32], gas: u64) -> Vec<u8> {
     let mut bc = Vec::new();
     bc.extend_from_slice(&[0x60, 0x00]); // PUSH1 0  outSize
     bc.extend_from_slice(&[0x60, 0x00]); // PUSH1 0  outOffset
@@ -580,15 +586,14 @@ fn build_call_with_value(target: [u8; 21], value: [u8; 32]) -> Vec<u8> {
     bc.push(0x73); // PUSH20 target (strip 0x41 prefix)
     bc.extend_from_slice(&target[1..]);
     bc.extend(push32({
-        // gas = 50_000 forwarded
         let mut g = [0u8; 32];
-        g[30] = 0xc3;
-        g[31] = 0x50;
+        g[24..32].copy_from_slice(&gas.to_be_bytes());
         g
     }));
     bc.push(0xf1); // CALL
-    // If the contract were allowed to continue past the CALL (the pre-fix
-    // path), this persists slot 0 := 1.
+    // Reached whenever the CALL returns to this frame at all — a failing call
+    // pushes 0 and execution continues, so a persisted slot 0 := 1 marks
+    // "the caller ran on past the CALL".
     bc.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]); // PUSH1 1 PUSH1 0 SSTORE
     bc.push(0x00); // STOP
     bc
@@ -679,19 +684,19 @@ fn call_value_within_i64_is_not_transfer_failed() {
     );
 }
 
-/// Pins the `frame_return_result` tx-fatal short-circuit: a `TransferFailed`
-/// raised in a NESTED frame ends the whole transaction as TRANSFER_FAILED
-/// rather than letting the caller push 0 and continue.
-///
-/// Note this is a property of our propagation model, not something read off
-/// java: `VM.play`'s outer catch (VM.java:115-127) swallows a `RuntimeException`
-/// into `program.setRuntimeFailure(e)` instead of rethrowing, and
-/// `ProgramResult.merge` does not propagate a child exception, so in java only a
-/// ROOT-frame `TransferException` reaches `VMActuator`. Whether nested frames
-/// should be contained here is an open question tracked separately; this test
-/// exists so that any change to the model is a deliberate one.
+/// Post-#26 containment, the twin of
+/// `pre_constantinople_nested_endowment_failure_is_contained_to_its_frame`.
+/// A `TransferException` raised in a NESTED frame does not end the
+/// transaction: `VM.play`'s outer catch (VM.java:114-127) rethrows only
+/// `JVMStackOverFlowException` / `OutOfTimeException`, so it is recorded on
+/// that frame's own result via `program.setRuntimeFailure(e)` and
+/// `ProgramResult.merge` never copies a child's exception to the parent.
+/// `Program.callToAddress` (Program.java:1157-1169) then does
+/// `stackPushZero(); return;` and the CALLER runs on, so the outer contract's
+/// post-CALL SSTORE must be observable. Only a root-frame `TransferException`
+/// reaches `VMActuator` and the receipt.
 #[test]
-fn nested_call_value_over_i64_max_fails_whole_tx() {
+fn nested_call_value_over_i64_max_is_contained_to_its_frame() {
     let stores = fresh_stores();
     // Leaf callee: a do-nothing STOP; never reached (the CALL into it throws).
     let leaf = install_contract(&stores, 0xc6, &[0x00]);
@@ -713,15 +718,27 @@ fn nested_call_value_over_i64_max_fails_whole_tx() {
         call_token_value: 0,
         token_id: 0,
     };
+    let limit = 2_000_000u64;
     let outcome = execute_trigger(
         &stores,
         VmBlockEnv { block_number: 100, block_timestamp_ms: 1_700_000_000_000, ..Default::default()},
         &trigger,
-        2_000_000,
+        limit,
+    );
+    match outcome {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(energy_used < limit, "the tx itself must not spend-all");
+        }
+        other => panic!("a nested out-of-range CALL must not kill the tx, got {other:?}"),
+    }
+    assert_eq!(
+        slot_value(&stores, outer, 0).last(),
+        Some(&1u8),
+        "the caller must push 0 and run on to its SSTORE"
     );
     assert!(
-        matches!(outcome, VmOutcome::TransferFailed { .. }),
-        "a nested out-of-range CALL must fail the whole tx as TransferFailed, got {outcome:?}"
+        slot_value(&stores, inner, 0).iter().all(|&b| b == 0),
+        "the frame that raised the failure keeps its own state unwound"
     );
 }
 
@@ -1808,4 +1825,277 @@ fn nested_bytecode_execution_failure_does_not_relabel_a_later_root_halt() {
         }
         other => panic!("expected a root OutOfEnergy halt, got {other:?}"),
     }
+}
+
+/// A contained nested `TransferException` costs the caller the WHOLE budget it
+/// forwarded, not just what the child consumed. java's
+/// `Program.callToAddress` returns at :1168 for an exception child — before the
+/// unspent-energy refund at :1197-1210 — so `msg.getEnergy()` is gone even
+/// though the child stopped almost immediately. A child that merely REVERTED
+/// falls through and does get the refund.
+#[test]
+fn nested_transfer_failure_forfeits_the_forwarded_energy() {
+    const FORWARDED: u64 = 50_000;
+
+    let stores = fresh_stores();
+    let leaf = install_contract(&stores, 0xd0, &[0x00]);
+    let mut bad = [0u8; 32];
+    bad[24] = 0x80; // 2^63 — `longValueExact()` throws
+    let inner = install_contract(&stores, 0xd1, &build_call_with_value(leaf, bad));
+    let outer = install_contract(
+        &stores,
+        0xd2,
+        &build_call_with_value_and_gas(inner, [0u8; 32], FORWARDED),
+    );
+    let owner = fund_account(&stores, 0xb8, 1_000_000_000);
+
+    let limit = 2_000_000u64;
+    match run_with_limit(&stores, &trigger_of(owner, outer), limit) {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(
+                energy_used >= FORWARDED,
+                "the caller forfeits the whole forwarded budget: {energy_used} < {FORWARDED}"
+            );
+            assert!(energy_used < limit, "the tx itself must not spend-all");
+        }
+        other => panic!("a nested transfer failure must not kill the tx, got {other:?}"),
+    }
+    assert_eq!(
+        slot_value(&stores, outer, 0).last(),
+        Some(&1u8),
+        "the caller must push 0 and run on to its SSTORE"
+    );
+}
+
+/// A nested `TransferException` must not colour a LATER, unrelated root
+/// outcome. `RuntimeImpl.setResultCode` (RuntimeImpl.java:68, :130-133) reads
+/// the exception off the ROOT `ProgramResult` alone, and `ProgramResult.merge`
+/// never copies a child's exception up, so a caller that runs on and then
+/// REVERTs records REVERT — and one that exhausts its own energy records
+/// OUT_OF_ENERGY. The post-#26 twin of
+/// `nested_bytecode_execution_failure_does_not_relabel_a_later_root_halt`.
+#[test]
+fn nested_transfer_failure_does_not_relabel_a_later_root_revert() {
+    let mut bad = [0u8; 32];
+    bad[24] = 0x80; // 2^63
+
+    // Root REVERT after the contained child failure.
+    let stores = fresh_stores();
+    let leaf = install_contract(&stores, 0xd3, &[0x00]);
+    let inner = install_contract(&stores, 0xd4, &build_call_with_value(leaf, bad));
+    let mut outer_code = call_op(inner[1..].try_into().unwrap(), 50_000);
+    outer_code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // PUSH1 0 PUSH1 0 REVERT
+    let outer = install_contract(&stores, 0xd5, &outer_code);
+    let owner = fund_account(&stores, 0xb9, 1_000_000_000);
+
+    let limit = 500_000u64;
+    match run_with_limit(&stores, &trigger_of(owner, outer), limit) {
+        VmOutcome::Revert { energy_used, .. } => {
+            assert!(energy_used < limit, "a REVERT is spend-all-exempt");
+        }
+        other => panic!(
+            "the root outcome is the caller's own REVERT; a child frame's \
+             TransferException must not relabel it TRANSFER_FAILED, got {other:?}"
+        ),
+    }
+
+    // Root HALT after the contained child failure.
+    let stores = fresh_stores();
+    let leaf = install_contract(&stores, 0xd6, &[0x00]);
+    let inner = install_contract(&stores, 0xd7, &build_call_with_value(leaf, bad));
+    let mut outer_code = call_op(inner[1..].try_into().unwrap(), 50_000);
+    let loop_dest = outer_code.len();
+    assert!(loop_dest < 256, "loop target must fit a PUSH1");
+    outer_code.push(0x5b); // JUMPDEST
+    outer_code.push(0x60); // PUSH1
+    outer_code.push(loop_dest as u8);
+    outer_code.push(0x56); // JUMP
+    let outer = install_contract(&stores, 0xd8, &outer_code);
+    let owner = fund_account(&stores, 0xba, 1_000_000_000);
+
+    match run_with_limit(&stores, &trigger_of(owner, outer), limit) {
+        VmOutcome::Halt {
+            result,
+            energy_used,
+            ..
+        } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::OutOfEnergy,
+                "the root halt is the caller's own energy exhaustion"
+            );
+            assert_eq!(energy_used, limit);
+        }
+        other => panic!("expected a root OutOfEnergy halt, got {other:?}"),
+    }
+}
+
+/// The self-transfer ban — the arm most likely to be reachable from real
+/// bytecode, since it needs only a funded contract rather than a 2^63 value
+/// word. Nested, java contains it: `VMUtils.validateForSmartContract` throws
+/// "Cannot transfer TRX to yourself", `Program.callToAddress` rethrows it as a
+/// `TransferException` under #26, `VM.play` records it on that frame's own
+/// result, and the caller pushes zero and continues. At the ROOT frame the
+/// same failure is the transaction's outcome, TRANSFER_FAILED with
+/// consumed-only energy.
+#[test]
+fn nested_self_call_with_value_is_contained_to_its_frame() {
+    let mut value = [0u8; 32];
+    value[31] = 0x0a; // 10 sun
+
+    // Nested: the caller survives it.
+    let stores = fresh_stores();
+    let inner = install_contract(&stores, 0xe4, &[0x00]); // placeholder for the address
+    install_contract(&stores, 0xe4, &build_call_with_value(inner, value));
+    // Fund it so java's earlier sender-balance push-0 does not pre-empt the ban.
+    set_balance(&stores, inner, 1_000);
+    let outer = install_contract(&stores, 0xe5, &build_call_with_value(inner, [0u8; 32]));
+    let owner = fund_account(&stores, 0xbb, 1_000_000_000);
+
+    let limit = 2_000_000u64;
+    match run_with_limit(&stores, &trigger_of(owner, outer), limit) {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(energy_used < limit, "the tx itself must not spend-all");
+        }
+        other => panic!("a nested self-CALL must not kill the tx, got {other:?}"),
+    }
+    assert_eq!(
+        slot_value(&stores, outer, 0).last(),
+        Some(&1u8),
+        "the caller must push 0 and run on to its SSTORE"
+    );
+    assert!(
+        slot_value(&stores, inner, 0).iter().all(|&b| b == 0),
+        "the frame that raised the failure keeps its own state unwound"
+    );
+
+    // Root-frame control: the identical contract, triggered directly.
+    let stores = fresh_stores();
+    let own = install_contract(&stores, 0xe4, &[0x00]);
+    install_contract(&stores, 0xe4, &build_call_with_value(own, value));
+    set_balance(&stores, own, 1_000);
+    let owner = fund_account(&stores, 0xbc, 1_000_000_000);
+    match run_with_limit(&stores, &trigger_of(owner, own), limit) {
+        VmOutcome::TransferFailed { energy_used } => {
+            assert!(
+                energy_used > 0 && energy_used < limit,
+                "a TransferException is spend-all-exempt"
+            );
+        }
+        other => panic!("expected a root-frame TransferFailed, got {other:?}"),
+    }
+}
+
+/// SELFDESTRUCT is the one `TransferException` producer that is not a CALL
+/// opcode. Before ALLOW_TVM_SOLIDITY_059 (#32) a dying contract with a balance
+/// cannot create an absent obtainer, so `MUtil.transfer` reaches
+/// `VMUtils.validateForSmartContract`, which throws "no ToAccount"; under #26
+/// the catch wraps it in a `TransferException`. Nested, that halts only the
+/// dying frame — the caller pushes zero and runs on, and the contract survives
+/// because its state is unwound.
+#[test]
+fn nested_suicide_transfer_failure_is_contained_to_its_frame() {
+    // `fresh_stores` is pre-#32 (ALLOW_TVM_SOLIDITY_059 unset) with #26 active.
+    let stores = fresh_stores();
+    let mut heir = [0u8; 21];
+    heir[0] = 0x41;
+    heir[1..].fill(0xe7); // never installed, so it has no account row
+
+    let mut inner_code = Vec::new();
+    inner_code.push(0x73); // PUSH20 heir
+    inner_code.extend_from_slice(&heir[1..]);
+    inner_code.push(0xff); // SELFDESTRUCT
+    let inner = install_contract(&stores, 0xe8, &inner_code);
+    set_balance(&stores, inner, 1_000); // balance > 0 selects the throwing arm
+
+    let outer = install_contract(&stores, 0xe9, &build_call_with_value(inner, [0u8; 32]));
+    let owner = fund_account(&stores, 0xbd, 1_000_000_000);
+
+    let limit = 2_000_000u64;
+    match run_with_limit(&stores, &trigger_of(owner, outer), limit) {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(energy_used < limit, "the tx itself must not spend-all");
+        }
+        other => panic!("a nested SELFDESTRUCT failure must not kill the tx, got {other:?}"),
+    }
+    assert_eq!(
+        slot_value(&stores, outer, 0).last(),
+        Some(&1u8),
+        "the caller must push 0 and run on to its SSTORE"
+    );
+    assert!(
+        stores
+            .accounts
+            .get(&tron_crypto::address::Address::from_raw(heir))
+            .unwrap()
+            .is_none(),
+        "the heir must not be created before ALLOW_TVM_SOLIDITY_059"
+    );
+}
+
+/// The CREATE counterpart of `nested_transfer_failure_forfeits_the_forwarded_energy`.
+/// java `createContractImpl` charges the caller `energyLimit` up front
+/// (Program.java:888-889), then splits the two failure kinds exactly as
+/// `callToAddress` does: an init frame that raised an exception takes the early
+/// `return` at Program.java:963 and never reaches `refundEnergyAfterVM`
+/// (:977), so the caller forfeits the whole forwarded budget. Only an init
+/// frame that merely REVERTED is refunded.
+///
+/// Before ALLOW_TVM_COMPATIBLE_EVM there is no 1/64 retention, so CREATE
+/// forwards everything the caller had left. Forfeiting it therefore starves the
+/// caller outright: it cannot reach the SSTORE after the CREATE and the root
+/// halts OUT_OF_ENERGY having spent the whole limit. Refunding instead (the
+/// pre-fix behaviour) lets the caller run on and the transaction SUCCEED.
+#[test]
+fn create_init_transfer_failure_forfeits_the_forwarded_energy() {
+    let stores = fresh_stores();
+    // Init code: CALL a leaf with value 2^63, which `longValueExact()` rejects.
+    let leaf = install_contract(&stores, 0xe6, &[0x00]);
+    let mut bad = [0u8; 32];
+    bad[24] = 0x80; // 2^63
+    let init = build_call_with_value(leaf, bad);
+
+    // Caller: copy `init` into memory, CREATE from it, POP the pushed zero,
+    // then SSTORE slot0 := 1 to prove whether the caller ran on.
+    let mut code = Vec::new();
+    for (i, b) in init.iter().enumerate() {
+        code.extend_from_slice(&[0x60, *b]); // PUSH1 byte
+        code.extend_from_slice(&[0x60, i as u8]); // PUSH1 offset
+        code.push(0x53); // MSTORE8
+    }
+    code.extend_from_slice(&[0x60, init.len() as u8]); // size
+    code.extend_from_slice(&[0x60, 0x00]); // offset
+    code.extend_from_slice(&[0x60, 0x00]); // value
+    code.push(0xf0); // CREATE
+    code.push(0x50); // POP
+    code.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]); // SSTORE slot0 := 1
+    code.push(0x00); // STOP
+
+    let outer = install_contract(&stores, 0xe7, &code);
+    let owner = fund_account(&stores, 0xb9, 1_000_000_000);
+
+    let limit = 3_000_000u64;
+    match run_with_limit(&stores, &trigger_of(owner, outer), limit) {
+        VmOutcome::Halt {
+            result,
+            energy_used,
+            ..
+        } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::OutOfEnergy,
+                "the caller forfeits the forwarded budget and starves"
+            );
+            assert_eq!(energy_used, limit);
+        }
+        other => panic!(
+            "an exception init frame must forfeit the forwarded budget, not be \
+             refunded into a surviving caller; got {other:?}"
+        ),
+    }
+    assert_ne!(
+        slot_value(&stores, outer, 0).last(),
+        Some(&1u8),
+        "the caller must not have had the energy to reach its SSTORE"
+    );
 }
