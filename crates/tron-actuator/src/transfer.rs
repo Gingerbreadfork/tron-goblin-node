@@ -8,13 +8,12 @@
 //!   recipient doesn't exist yet, read from `DynamicPropertiesStore`.
 //!   Both default to 0 so a default-network transfer is fee-free.
 //! * The recipient is auto-created (`AccountType::Normal`) if absent.
-//! * Several proposal-gated rules are **not yet enforced** in this v1
-//!   port:
-//!     - `forbidTransferToContract` (blocks transfer-to-smart-contract)
-//!     - `allowTvmCompatibleEvm` (blocks transfer-to-v1-contract)
-//!     - blackhole burn optimisation
-//!   These need `ContractStore` (not yet ported) plus extra proposal
-//!   flags. They're listed in the crate-level docs.
+//! * `forbidTransferToContract` (proposal #35) is enforced: a transfer
+//!   whose recipient is an `AccountType::Contract` account is rejected.
+//! * `allowTvmCompatibleEvm` (proposal #60) additionally rejects transfers
+//!   to a *version-1* contract. That arm needs `ContractStore` to read the
+//!   contract version and is **not yet enforced**; the proposal has never
+//!   been activated on mainnet.
 
 use std::collections::BTreeMap;
 
@@ -114,23 +113,44 @@ pub fn validate_transfer(
     if owner == to {
         return Err(ActuatorError::SelfTransfer);
     }
-    if contract.amount <= 0 {
-        return Err(ActuatorError::NonPositiveAmount);
-    }
 
+    // java TransferActuator.validate checks owner existence *before* the
+    // amount bound: an amount-0 transfer from an unknown account is rejected
+    // as "no OwnerAccount", not as a bad amount.
     let owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
 
+    if contract.amount <= 0 {
+        return Err(ActuatorError::NonPositiveAmount);
+    }
+
+    let to_account = accounts.get(&to)?;
     let mut fee = TRANSFER_FEE;
-    let to_exists = accounts.get(&to)?.is_some();
-    if !to_exists {
+    if to_account.is_none() {
         let create_fee = dynamic_properties
             .get_long(CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT)
             .unwrap_or(0);
         fee = fee
             .checked_add(create_fee)
             .ok_or(ActuatorError::Overflow)?;
+    }
+
+    // `FORBID_TRANSFER_TO_CONTRACT` (proposal #35): once active, a bare
+    // TransferContract may not target a smart-contract account — value must
+    // reach a contract through TriggerSmartContract so the callee's fallback
+    // runs. java raises "Cannot transfer TRX to a smartContract." here, after
+    // the create-account fee is folded in and before the balance check.
+    if dynamic_properties
+        .get_long(FORBID_TRANSFER_TO_CONTRACT)
+        .unwrap_or(0)
+        == 1
+    {
+        if let Some(to_account) = &to_account {
+            if to_account.r#type == tron_proto::AccountType::Contract as i32 {
+                return Err(ActuatorError::TransferToContract);
+            }
+        }
     }
 
     let needed = contract
@@ -145,7 +165,7 @@ pub fn validate_transfer(
     }
 
     // Recipient overflow check (java-tron does `addExact(toBalance, amount)`).
-    if let Some(to_account) = accounts.get(&to)? {
+    if let Some(to_account) = &to_account {
         to_account
             .balance
             .checked_add(contract.amount)
@@ -237,6 +257,11 @@ pub fn execute_transfer(
 /// charges the same fee when it auto-creates a recipient.
 pub(crate) const CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT: &[u8] =
     b"CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT";
+
+/// Proposal #35 (`ForbidTransferToContract`). While set, `TransferContract`
+/// and `TransferAssetContract` may not target an `AccountType::Contract`
+/// recipient. Shared with `TransferAsset`, which enforces the same rule.
+pub(crate) const FORBID_TRANSFER_TO_CONTRACT: &[u8] = b"FORBID_TRANSFER_TO_CONTRACT";
 
 /// Validate that `bytes` is a syntactically-correct TRON address: 21 bytes
 /// with the `0x41` mainnet prefix. Java-tron's `DecodeUtil.addressValid`

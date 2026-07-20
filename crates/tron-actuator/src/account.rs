@@ -53,9 +53,8 @@ pub fn validate_create_account(
     contract: &AccountCreateContract,
 ) -> Result<(), ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
-    let new_addr =
-        decode_address(&contract.account_address).ok_or(ActuatorError::InvalidAddress)?;
-
+    // java CreateAccountActuator.validate resolves the owner and its fee
+    // balance before it looks at the address being created.
     let owner_account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
@@ -68,6 +67,8 @@ pub fn validate_create_account(
             needed: fee,
         });
     }
+    let new_addr =
+        decode_address(&contract.account_address).ok_or(ActuatorError::InvalidAddress)?;
     if accounts.contains(&new_addr)? {
         return Err(ActuatorError::AccountAlreadyExists);
     }

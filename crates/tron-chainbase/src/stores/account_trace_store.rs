@@ -79,7 +79,17 @@ impl AccountTraceStore {
     ///
     /// Returns:
     /// * `Ok((found_block_num, balance))` — the entry at or before `block_num`.
-    /// * `Err(StoreError::NotFound)` — no trace exists for this account.
+    /// * `Ok((block_num, 0))` — no trace row covers this account at or
+    ///   before `block_num`. java-tron returns the same
+    ///   `Pair.of(number, 0L)` sentinel rather than signalling an error:
+    ///   an account with no recorded trace held no balance, and callers
+    ///   (`Wallet.getAccountBalance`) compare the returned block number
+    ///   against the requested one to decide which block identifier to
+    ///   echo back.
+    /// * `Err(..)` — the store row exists but its value does not decode.
+    ///   java swallows this case into the same `(number, 0)` sentinel;
+    ///   we surface it, because an undecodable row is store corruption
+    ///   rather than an absent balance.
     pub fn get_prev_balance(
         &self,
         address: &Address,
@@ -88,12 +98,12 @@ impl AccountTraceStore {
         let start_key = Self::key_for(address, block_num);
         let rows = self.backend.scan_from(&start_key, 1)?;
         let Some((k, v)) = rows.into_iter().next() else {
-            return Err(StoreError::NotFound);
+            return Ok((block_num, 0));
         };
         // Verify the returned row is still for our address (the scan
         // would otherwise drift into the next account's range).
         if !k.starts_with(address.as_bytes()) {
-            return Err(StoreError::NotFound);
+            return Ok((block_num, 0));
         }
         // Recover the original block number from the XOR suffix.
         let mut xor_buf = [0u8; 8];
@@ -158,12 +168,9 @@ mod tests {
     }
 
     #[test]
-    fn get_prev_balance_unknown_account_returns_not_found() {
+    fn get_prev_balance_unknown_account_returns_zero_at_requested_block() {
         let backend: Arc<dyn KvBackend> = Arc::new(MemBackend::new());
         let store = AccountTraceStore::new(backend);
-        assert!(matches!(
-            store.get_prev_balance(&addr(0xff), 100),
-            Err(StoreError::NotFound)
-        ));
+        assert_eq!(store.get_prev_balance(&addr(0xff), 100).unwrap(), (100, 0));
     }
 }

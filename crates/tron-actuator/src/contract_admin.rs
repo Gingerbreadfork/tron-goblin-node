@@ -21,15 +21,20 @@ fn require_constantinople(dyn_props: &DynamicPropertiesStore) -> Result<(), Actu
     Ok(())
 }
 
+fn require_owner_account(accounts: &AccountStore, owner: &Address) -> Result<(), ActuatorError> {
+    if accounts.get(owner)?.is_none() {
+        return Err(ActuatorError::OwnerAccountMissing);
+    }
+    Ok(())
+}
+
 fn require_contract_owner(
     accounts: &AccountStore,
     contracts: &ContractStore,
     owner: &Address,
     contract_addr: &Address,
 ) -> Result<(), ActuatorError> {
-    if accounts.get(owner)?.is_none() {
-        return Err(ActuatorError::OwnerAccountMissing);
-    }
+    require_owner_account(accounts, owner)?;
     let contract = contracts
         .get(contract_addr)?
         .ok_or(ActuatorError::ContractMissing)?;
@@ -89,6 +94,8 @@ pub fn validate_update_energy_limit(
     let owner = require_owner(&contract.owner_address)?;
     let target =
         decode_address(&contract.contract_address).ok_or(ActuatorError::InvalidAddress)?;
+    // java resolves the owner account before bounding the new limit.
+    require_owner_account(accounts, &owner)?;
     if contract.origin_energy_limit <= 0 {
         return Err(ActuatorError::NonPositiveEnergyLimit);
     }
@@ -121,6 +128,8 @@ pub fn validate_update_setting(
     let owner = require_owner(&contract.owner_address)?;
     let target =
         decode_address(&contract.contract_address).ok_or(ActuatorError::InvalidAddress)?;
+    // java resolves the owner account before bounding the new percent.
+    require_owner_account(accounts, &owner)?;
     if contract.consume_user_resource_percent < 0 || contract.consume_user_resource_percent > 100 {
         return Err(ActuatorError::PercentOutOfRange);
     }

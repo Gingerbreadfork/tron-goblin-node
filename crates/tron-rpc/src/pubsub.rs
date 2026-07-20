@@ -215,10 +215,19 @@ pub fn log_matches_filter(log: &Value, filter: &LogFilter) -> bool {
             return false;
         }
     }
-    // Topics: each position is an OR set; positions beyond the
-    // filter's length are unrestricted.
+    // Topics: each position is an OR set; log topics beyond the filter's
+    // length are unrestricted.
+    //
+    // java `LogFilter.matchesExactly` tests `i >= logTopics.size()` BEFORE it
+    // looks at the position's OR set, so a filter position the log has no topic
+    // for fails the match even when that position is a wildcard: `[sig, null]`
+    // requires the log to carry at least two topics. Skipping the bound check
+    // for wildcards would let a one-topic log through a two-position filter.
     let log_topics = log["topics"].as_array().cloned().unwrap_or_default();
     for (i, position) in filter.topics.iter().enumerate() {
+        if i >= log_topics.len() {
+            return false;
+        }
         if position.is_empty() {
             continue;
         }

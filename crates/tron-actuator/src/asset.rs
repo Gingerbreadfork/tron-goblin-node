@@ -91,11 +91,13 @@ pub fn validate_transfer_asset(
 ) -> Result<(), ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
     let to = require_to(&contract.to_address)?;
-    if owner == to {
-        return Err(ActuatorError::SelfTransfer);
-    }
+    // java TransferAssetActuator.validate bounds the amount *before* the
+    // self-transfer check (the reverse of TransferActuator).
     if contract.amount <= 0 {
         return Err(ActuatorError::NonPositiveAmount);
+    }
+    if owner == to {
+        return Err(ActuatorError::SelfTransfer);
     }
     if contract.asset_name.is_empty() || contract.asset_name.len() > MAX_ASSET_NAME_BYTES {
         return Err(ActuatorError::AssetMissing);
@@ -121,15 +123,30 @@ pub fn validate_transfer_asset(
     // added and the owner must hold at least that much TRX. (When the
     // recipient already exists java instead does the addExact recipient-balance
     // overflow check, which is harmless for assets and elided here.)
-    if accounts.get(&to)?.is_none() {
-        let create_fee = dynamic_properties
-            .get_long(CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT)
-            .unwrap_or(0);
-        if owner_account.balance < create_fee {
-            return Err(ActuatorError::InsufficientBalance {
-                balance: owner_account.balance,
-                needed: create_fee,
-            });
+    match accounts.get(&to)? {
+        Some(to_account) => {
+            // `FORBID_TRANSFER_TO_CONTRACT` (proposal #35) covers TRC-10 as
+            // well as TRX: java raises "Cannot transfer asset to
+            // smartContract." for an existing recipient of contract type.
+            if dynamic_properties
+                .get_long(crate::transfer::FORBID_TRANSFER_TO_CONTRACT)
+                .unwrap_or(0)
+                == 1
+                && to_account.r#type == tron_proto::AccountType::Contract as i32
+            {
+                return Err(ActuatorError::TransferToContract);
+            }
+        }
+        None => {
+            let create_fee = dynamic_properties
+                .get_long(CREATE_NEW_ACCOUNT_FEE_IN_SYSTEM_CONTRACT)
+                .unwrap_or(0);
+            if owner_account.balance < create_fee {
+                return Err(ActuatorError::InsufficientBalance {
+                    balance: owner_account.balance,
+                    needed: create_fee,
+                });
+            }
         }
     }
     Ok(())
@@ -720,6 +737,20 @@ pub fn validate_unfreeze_asset(
         .ok_or(ActuatorError::OwnerAccountMissing)?;
     if account.frozen_supply.is_empty() {
         return Err(ActuatorError::NoUnfreezableAsset);
+    }
+    // java UnfreezeAssetActuator.validate: "this account has not issued any
+    // asset" — read off `assetIssuedName` while `allowSameTokenName == 0` and
+    // off `assetIssuedID` after (mainnet). Both fields are written together by
+    // AssetIssue, so the arms agree for any account that ever issued; the
+    // check still gates an account that holds a frozen supply without an
+    // issuance record.
+    let issued_empty = if dyn_props.allow_same_token_name().unwrap_or(0) == 0 {
+        account.asset_issued_name.is_empty()
+    } else {
+        account.asset_issued_id.is_empty()
+    };
+    if issued_empty {
+        return Err(ActuatorError::AssetMissing);
     }
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     if !account.frozen_supply.iter().any(|f| f.expire_time <= now) {

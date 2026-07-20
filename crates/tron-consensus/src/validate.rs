@@ -25,6 +25,93 @@ use tron_crypto::address::Address;
 /// `DposSlot.getTime` when the head block crossed a maintenance boundary.
 pub const MAINTENANCE_SKIP_SLOTS: i64 = 2;
 
+/// `ChainConstant.BLOCK_SIZE` — the byte budget a producer may fill with
+/// transactions. java's `Manager.generateBlock` stops packing once the
+/// running total (header included) would exceed this.
+pub const BLOCK_SIZE: usize = 2_000_000;
+
+/// Largest serialized `Block` a java-tron peer will accept off the wire:
+/// `BLOCK_SIZE + Constant.ONE_THOUSAND` (`BlockMsgHandler.maxBlockSize`).
+/// A block above this is dropped with `BAD_MESSAGE` ("block size over
+/// limit") before any validation runs, so a block we produce or relay
+/// above it is invisible to the rest of the network.
+pub const MAX_BLOCK_MESSAGE_SIZE: usize = BLOCK_SIZE + 1_000;
+
+/// Rejections raised by [`check_block_message_admission`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BlockAdmissionError {
+    #[error("block size over limit: {size} > {MAX_BLOCK_MESSAGE_SIZE}")]
+    SizeOverLimit { size: usize },
+    #[error("block time error: timestamp {timestamp} is {gap_ms}ms ahead of now")]
+    TimeTooFarAhead { timestamp: i64, gap_ms: i64 },
+}
+
+/// The two cheap checks java-tron's `BlockMsgHandler.processMessage` runs on
+/// every `Block` message before it touches the block at all:
+///
+/// 1. `serialized_size > BLOCK_SIZE + 1000` → `BAD_MESSAGE`.
+/// 2. `timestamp - now >= BLOCK_PRODUCED_INTERVAL` → `BAD_MESSAGE`.
+///
+/// The second admits a block up to one slot early — clock skew between an SR
+/// and its peers routinely puts a fresh tip a few hundred milliseconds in the
+/// future — but rejects anything a full slot or more ahead. Applying the same
+/// bound keeps this node's fork tree in step with its java peers': a block they
+/// dropped must not become a branch we would reorg onto.
+///
+/// `serialized_size` is the length of the block's original wire bytes, matching
+/// java's `getSerializedSize()` on the received message.
+pub fn check_block_message_admission(
+    serialized_size: usize,
+    block_timestamp_ms: i64,
+    now_ms: i64,
+) -> Result<(), BlockAdmissionError> {
+    if serialized_size > MAX_BLOCK_MESSAGE_SIZE {
+        return Err(BlockAdmissionError::SizeOverLimit {
+            size: serialized_size,
+        });
+    }
+    let gap = block_timestamp_ms - now_ms;
+    if gap >= BLOCK_PRODUCED_INTERVAL_MS {
+        return Err(BlockAdmissionError::TimeTooFarAhead {
+            timestamp: block_timestamp_ms,
+            gap_ms: gap,
+        });
+    }
+    Ok(())
+}
+
+/// Whether a transaction of `tx_pack_size` bytes still fits in a block that
+/// currently serializes to `current_size` bytes.
+///
+/// java `Manager.generateBlock` keeps a running `currentSize`, seeded with the
+/// header-only block's serialized size, and skips (does not stop at) any
+/// transaction that would push the total past [`BLOCK_SIZE`] — smaller
+/// transactions later in the queue can still be packed. `tx_pack_size` is java's
+/// `TransactionCapsule.computeTrxSizeForBlockMessage`, the size the transaction
+/// contributes as field 1 of the enclosing `Block` (tag + length prefix +
+/// payload), not the bare message length.
+pub fn tx_fits_in_block(current_size: usize, tx_pack_size: usize) -> bool {
+    current_size.saturating_add(tx_pack_size) <= BLOCK_SIZE
+}
+
+/// Size a transaction contributes to the enclosing `Block` message, matching
+/// java's `CodedOutputStream.computeMessageSize(1, transaction)`: a one-byte
+/// field-1 tag, a varint length prefix, then the payload.
+pub fn tx_pack_size(tx_serialized_size: usize) -> usize {
+    1 + varint_len(tx_serialized_size) + tx_serialized_size
+}
+
+/// Byte length of `value` encoded as a protobuf varint.
+fn varint_len(value: usize) -> usize {
+    let mut n = 1;
+    let mut v = value >> 7;
+    while v > 0 {
+        n += 1;
+        v >>= 7;
+    }
+    n
+}
+
 /// Errors raised by [`verify_block_witness`] / [`validate_block_consensus`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConsensusError {

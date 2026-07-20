@@ -54,6 +54,8 @@ pub enum ActuatorError {
     InvalidAddress,
     #[error("cannot transfer TRX to yourself")]
     SelfTransfer,
+    #[error("cannot transfer to a smart contract")]
+    TransferToContract,
     #[error("owner account does not exist")]
     OwnerAccountMissing,
     #[error("target account does not exist")]

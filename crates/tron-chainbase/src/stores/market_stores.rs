@@ -189,11 +189,22 @@ const BUY_QTY_OFF: usize = PAIR_KEY_LEN + 8; // 46
 /// exactly, so — unlike java-tron's `long` path — there is never an
 /// overflow that needs a `BigInteger` fallback; the result is identical.
 ///
+/// **Zero-quantity keys sort first.** Before comparing prices java-tron
+/// short-circuits any key whose sell *or* buy quantity is zero: two such
+/// keys compare equal, and one such key is always less than a key with
+/// both quantities non-zero. This is not an edge case — `addNewPriceKey`
+/// seeds every trading pair with the head key
+/// `createPairPriceKey(sell, buy, 0, 0)`, whose price is undefined. Without
+/// the short-circuit the cross-multiplication yields `0 == 0` for the head
+/// key against *every* price level in its pair, and RocksDB — which treats
+/// a comparator's `Equal` as key identity — would collapse them into one
+/// row.
+///
 /// Robust to short keys: a bare 38-byte pair prefix (used as a seek
 /// target by [`MarketPairPriceToOrderStore::scan_prefix`]) reads its
-/// absent quantities as 0, so it compares equal to every full key of the
-/// same pair and the seek lands on that pair's lowest-priced order —
-/// exactly where the ladder walk must start.
+/// absent quantities as 0, so the zero-quantity rule places it before
+/// every full key of the same pair and the seek lands on that pair's
+/// first entry — exactly where the ladder walk must start.
 pub fn market_order_price_comparator(a: &[u8], b: &[u8]) -> Ordering {
     // 1. Trading pair, unsigned-byte lexicographic (java's FastByteComparisons
     //    and Rust's slice `cmp` both treat bytes as unsigned — they agree).
@@ -208,6 +219,16 @@ pub fn market_order_price_comparator(a: &[u8], b: &[u8]) -> Ordering {
     let sell1 = read_be_i64(a, SELL_QTY_OFF) as i128;
     let buy2 = read_be_i64(b, BUY_QTY_OFF) as i128;
     let sell2 = read_be_i64(b, SELL_QTY_OFF) as i128;
+    // 2a. Keys with an undefined price (either quantity zero) sort ahead of
+    //     every priced key, and tie with each other.
+    let undefined1 = sell1 == 0 || buy1 == 0;
+    let undefined2 = sell2 == 0 || buy2 == 0;
+    match (undefined1, undefined2) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
     (buy1 * sell2).cmp(&(buy2 * sell1))
 }
 
@@ -431,15 +452,16 @@ mod tests {
 
     #[test]
     fn market_order_price_comparator_bare_pair_prefix_seeks_to_ladder_head() {
-        // A bare 38-byte pair prefix is what `scan_prefix` seeks with. It
-        // must compare equal to every full key of the same pair (so the
-        // RocksDB seek lands on that pair's lowest-priced order) and order
-        // strictly by pair against other pairs.
+        // A bare 38-byte pair prefix is what `scan_prefix` seeks with. Its
+        // absent quantities read as zero, so the undefined-price rule places
+        // it strictly before every full key of the same pair — the RocksDB
+        // seek therefore lands on that pair's first entry — while pair bytes
+        // still order it against other pairs.
         let prefix = vec![0xaa; PAIR_KEY_LEN];
         let same_pair = full_price_key(0xaa, 7, 3);
         assert_eq!(
             market_order_price_comparator(&prefix, &same_pair),
-            Ordering::Equal,
+            Ordering::Less,
             "bare prefix sorts at the head of its own pair's ladder"
         );
         let later_pair = full_price_key(0xbb, 1, 1);

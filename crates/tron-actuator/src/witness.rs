@@ -122,11 +122,13 @@ pub fn validate_witness_update(
     contract: &WitnessUpdateContract,
 ) -> Result<(), ActuatorError> {
     let owner = require_owner(&contract.owner_address)?;
-    if !url_valid(&contract.update_url) {
-        return Err(ActuatorError::InvalidUrl);
-    }
+    // java WitnessUpdateActuator.validate orders address → account → url →
+    // witness. (WitnessCreateActuator uses the opposite url/account order.)
     if accounts.get(&owner)?.is_none() {
         return Err(ActuatorError::OwnerAccountMissing);
+    }
+    if !url_valid(&contract.update_url) {
+        return Err(ActuatorError::InvalidUrl);
     }
     if !witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessMissing);
@@ -168,11 +170,13 @@ pub fn validate_update_brokerage(
     if contract.brokerage < 0 || contract.brokerage > 100 {
         return Err(ActuatorError::BrokerageOutOfRange);
     }
-    if accounts.get(&owner)?.is_none() {
-        return Err(ActuatorError::OwnerAccountMissing);
-    }
+    // java UpdateBrokerageActuator.validate looks up the witness first, then
+    // the account — an address that is neither reports the missing witness.
     if !witnesses.contains(&owner)? {
         return Err(ActuatorError::WitnessMissing);
+    }
+    if accounts.get(&owner)?.is_none() {
+        return Err(ActuatorError::OwnerAccountMissing);
     }
     Ok(())
 }
@@ -216,7 +220,12 @@ pub fn validate_withdraw_balance(
 
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
     let ready_at = account.latest_withdraw_time + WITNESS_ALLOWANCE_FROZEN_TIME_MS;
-    if account.latest_withdraw_time > 0 && now < ready_at {
+    // java: `now - latestWithdrawTime < witnessAllowanceFrozenTime`, applied
+    // unconditionally — an account that has never withdrawn is not exempt.
+    // The distinction is invisible on any chain whose head timestamp exceeds
+    // 24h since the epoch, but keeping the form identical avoids inventing an
+    // exemption java does not have.
+    if now < ready_at {
         return Err(ActuatorError::WithdrawTooSoon { ready_at, now });
     }
     // java rejects only when BOTH the settled allowance AND the not-yet-
@@ -231,6 +240,13 @@ pub fn validate_withdraw_balance(
     {
         return Err(ActuatorError::NoAllowance);
     }
+    // java closes validate with `LongMath.checkedAdd(balance, allowance)`, so a
+    // withdrawal whose credit would overflow the owner's balance is rejected at
+    // validate rather than failing mid-execute.
+    account
+        .balance
+        .checked_add(account.allowance)
+        .ok_or(ActuatorError::Overflow)?;
     Ok(())
 }
 

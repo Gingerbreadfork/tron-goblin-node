@@ -3047,7 +3047,15 @@ pub fn eth_get_logs(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
                 if !addr_filter.is_empty() && !addr_filter.iter().any(|a| a == &log.address) {
                     continue;
                 }
+                // java `LogFilter.matchesExactly` tests `i >= logTopics.size()`
+                // BEFORE consulting the position's OR set, so a filter position
+                // with no corresponding log topic fails even when it is a
+                // wildcard: `topics: [sig, null]` returns only logs carrying at
+                // least two topics.
                 let matches_topics = topic_filter.iter().enumerate().all(|(i, alts)| {
+                    if i >= log.topics.len() {
+                        return false;
+                    }
                     if alts.is_empty() {
                         return true; // match-any
                     }

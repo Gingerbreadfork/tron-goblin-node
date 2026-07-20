@@ -829,14 +829,17 @@ pub fn validate_proposal_delete(
         .get(contract.proposal_id)?
         .ok_or(ActuatorError::ProposalMissing)?;
     let now = dyn_props.latest_block_header_timestamp().unwrap_or(0);
+    // java ProposalDeleteActuator.validate rejects a non-proposer *before* it
+    // looks at expiry or cancellation, so a stranger deleting an already
+    // expired proposal is turned away as the wrong owner.
+    if proposal.proposer_address != owner.as_bytes() {
+        return Err(ActuatorError::NotProposalOwner);
+    }
     if now >= proposal.expiration_time {
         return Err(ActuatorError::ProposalExpired);
     }
     if proposal.state == ProposalState::Canceled as i32 {
         return Err(ActuatorError::ProposalCanceled);
-    }
-    if proposal.proposer_address != owner.as_bytes() {
-        return Err(ActuatorError::NotProposalOwner);
     }
     Ok(())
 }

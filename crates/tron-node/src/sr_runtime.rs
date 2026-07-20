@@ -43,6 +43,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message as _;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 use tron_chainbase::{
@@ -539,10 +540,35 @@ impl SrRuntime {
 
         // Drain mempool: pull up to max_txs_per_block tx ids; only
         // keep ones still in the mempool's pending map (race-safe).
+        //
+        // The count cap is ours; the BYTE cap is java's and is what the rest of
+        // the network enforces. java `Manager.generateBlock` tracks a running
+        // serialized size against `ChainConstant.BLOCK_SIZE` and skips any
+        // transaction that would overflow it, continuing down the queue so
+        // smaller transactions still get packed. Every java peer drops a block
+        // message larger than `BLOCK_SIZE + 1000` in `BlockMsgHandler` before
+        // validating it, so a block produced past the budget would be orphaned
+        // network-wide however valid it is.
         let pending_ids = self.mempool.pending_ids();
         let mut txs = Vec::with_capacity(pending_ids.len().min(self.max_txs_per_block));
+        // java seeds `currentSize` with the header-only block's serialized size.
+        let mut current_size = tron_consensus::producer::assemble_block(
+            &head_id,
+            head_num + 1,
+            block_time,
+            &self.identity.witness_address,
+            Vec::new(),
+            BLOCK_VERSION,
+        )
+        .map(|b| b.encoded_len())
+        .unwrap_or(0);
         for id in pending_ids.iter().take(self.max_txs_per_block) {
             if let Some(p) = self.mempool.get(id) {
+                let pack_size = tron_consensus::tx_pack_size(p.tx.encoded_len());
+                if !tron_consensus::tx_fits_in_block(current_size, pack_size) {
+                    continue;
+                }
+                current_size += pack_size;
                 txs.push(p.tx);
             }
         }

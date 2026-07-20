@@ -66,5 +66,7 @@ pub use proposals::{activate_expired_proposals, parameter_id_to_key, ProposalAct
 pub use solidify::{latest_solid_block, solid_block_from_witnesses, solidity_threshold, RecentBlock};
 pub use sr_epoch::{shared_from_current, SharedSrEpochSnapshot, SrEpochSnapshot};
 pub use validate::{
-    validate_block_consensus, verify_block_witness, ConsensusError, MAINTENANCE_SKIP_SLOTS,
+    check_block_message_admission, tx_fits_in_block, tx_pack_size, validate_block_consensus,
+    verify_block_witness, BlockAdmissionError, ConsensusError, BLOCK_SIZE, MAINTENANCE_SKIP_SLOTS,
+    MAX_BLOCK_MESSAGE_SIZE,
 };

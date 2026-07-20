@@ -4191,6 +4191,27 @@ impl SyncDriver {
                         .and_then(|h| h.raw_data.as_ref())
                         .map(|r| r.number)
                         .unwrap_or(-1);
+                    // java `BlockMsgHandler.processMessage` opens with two
+                    // cheap admission checks — oversize message, and a
+                    // timestamp a full slot or more in the future — and raises
+                    // BAD_MESSAGE on either before the block reaches any
+                    // handler. Applying the same bounds keeps our fork tree in
+                    // step with our peers': a block every java node dropped
+                    // must not become a branch we could reorg onto.
+                    let block_ts = block
+                        .block_header
+                        .as_ref()
+                        .and_then(|h| h.raw_data.as_ref())
+                        .map(|r| r.timestamp)
+                        .unwrap_or(0);
+                    if let Err(e) = tron_consensus::check_block_message_admission(
+                        raw_block_bytes.len(),
+                        block_ts,
+                        now_ms as i64,
+                    ) {
+                        warn!(num = block_num, %peer, error = %e, "reject inbound block");
+                        continue;
+                    }
                     let tx_count = block.transactions.len();
                     // The block pipeline is alive on this connection.
                     last_block_pipeline_at = Instant::now();
@@ -6676,7 +6697,7 @@ fn process_tx_inventory_advertise(
 /// our block ids from there to head — the shared block first so the peer can
 /// verify the link — capped at `SYNC_FETCH_BATCH_NUM`, plus how many more blocks
 /// we hold beyond the batch (`remain_num`). `(empty, 0)` when we share no block.
-pub(crate) fn serve_sync_block_chain_ids(
+pub fn serve_sync_block_chain_ids(
     block_index: &BlockIndexStore,
     our_head: i64,
     locator: &[tron_proto::block_inventory::BlockId],
@@ -6712,7 +6733,26 @@ pub(crate) fn serve_sync_block_chain_ids(
             Err(_) => break,
         }
     }
-    (ids, (our_head - end).max(0))
+    // `remain_num` is derived from the LAST id actually emitted, not from the
+    // intended `end`. java `SyncBlockChainMsgHandler` computes `headID.getNum()
+    // - blockIds.peekLast().getNum()` and reports 0 for a single-id answer, and
+    // the receiving peer cross-checks the pair in
+    // `ChainInventoryMsgHandler.check`, disconnecting with `BAD_PROTOCOL` on
+    // either "remain: X, blockIds size: N" (non-zero remain with fewer than
+    // `SYNC_FETCH_BATCH_NUM` ids) or "not continuous block".
+    //
+    // A gap in the index truncates the walk short of `end`. There is no
+    // remain value that satisfies both rules for a short batch, and we cannot
+    // serve past the gap in any case, so the truncated answer reports 0 — "this
+    // is all I have". The peer treats us as caught up and re-locates from its
+    // new tip, which is the same outcome java produces when its head sits at
+    // the last block it can actually serve.
+    let walk_complete = ids.last().map(|l| l.num() as i64) == Some(end);
+    let remain = match ids.last() {
+        Some(last) if walk_complete && ids.len() > 1 => (our_head - last.num() as i64).max(0),
+        _ => 0,
+    };
+    (ids, remain)
 }
 
 /// Serve an inbound `FetchInvData` request by looking up each
