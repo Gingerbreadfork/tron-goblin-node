@@ -1508,7 +1508,10 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
         if weight == 0 {
             return Ok(data_boolean(false));
         }
-        total_weight += weight;
+        // java accumulates into a plain `long`, which wraps on overflow.
+        // A checked add would panic in debug and wrap in release, making
+        // consensus behaviour depend on the build profile.
+        total_weight = total_weight.wrapping_add(weight);
         executed.push((sign, recovered));
     }
 
@@ -1523,7 +1526,27 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
 /// * `2..` → `active_permission[id - 2]`
 fn select_permission(account: &tron_proto::Account, id: i32) -> Option<tron_proto::Permission> {
     match id {
-        0 => account.owner_permission.clone(),
+        // java `getPermissionById(0)` falls back to `getDefaultPermission` when
+        // the account carries no stored owner permission: a synthetic
+        // single-key permission over the account's own address, weight and
+        // threshold 1 (`createDefaultOwnerPermission`). Accounts created before
+        // ALLOW_MULTI_SIGN never materialized one, so on mainnet the fallback
+        // is the live path rather than an edge case.
+        0 => Some(account.owner_permission.clone().unwrap_or_else(|| {
+            tron_proto::Permission {
+                r#type: tron_proto::permission::PermissionType::Owner as i32,
+                id: 0,
+                permission_name: "owner".to_string(),
+                threshold: 1,
+                parent_id: 0,
+                operations: Vec::new(),
+                keys: vec![tron_proto::Key {
+                    address: account.address.clone(),
+                    weight: 1,
+                }],
+            }
+        })),
+        // java returns null for a missing witness permission — no default.
         1 => account.witness_permission.clone(),
         n if n >= 2 => {
             // Active permissions are indexed by their own `id` field, not

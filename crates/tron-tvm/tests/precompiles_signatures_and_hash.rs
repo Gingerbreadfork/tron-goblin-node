@@ -1066,3 +1066,48 @@ fn ecrecover_zero_fills_a_truncated_s_word() {
         .expect("the precompile itself still succeeds");
     assert!(out.is_empty() || out.len() == 32);
 }
+
+/// An account with NO stored owner permission still validates its own
+/// signature. java's `getPermissionById(0)` falls back to
+/// `createDefaultOwnerPermission` (AccountCapsule.java:194-208) — a synthetic
+/// single-key permission over the account's own address, weight and threshold
+/// 1. Accounts created before ALLOW_MULTI_SIGN never materialized a stored
+/// permission, so on mainnet this fallback is the ordinary path: the USDT
+/// contract and other pre-2019 accounts all carry an empty `owner_permission`.
+#[test]
+fn validate_multi_sign_synthesizes_the_default_owner_permission() {
+    use k256::ecdsa::SigningKey;
+    let mut ctx = MockCtx::default();
+
+    // Derive the signer, then register the account under ITS address with no
+    // owner_permission set — the shape mainnet accounts actually have.
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 1;
+    sk_bytes[0] = 0x01;
+    let sk = SigningKey::from_bytes(&sk_bytes.into()).unwrap();
+    let mut raw = [0u8; 21];
+    raw[0] = 0x41;
+    raw[1..].copy_from_slice(&signer_low20(&sk));
+    let signer = Address::from_raw(raw);
+
+    ctx.accounts.insert(
+        signer,
+        tron_proto::Account {
+            address: signer.as_bytes().to_vec(),
+            // owner_permission deliberately absent
+            ..Default::default()
+        },
+    );
+
+    let payload = [0u8; 32];
+    let hash = multi_sign_prehash(&signer, 0, &payload);
+    let sig = sign_prehash(&sk, &hash);
+    let input = multi_sign_input(&signer, 0, &payload, &[sig]);
+
+    let out = PrecompileImpl::ValidateMultiSign.execute(&input, &ctx).unwrap();
+    assert_eq!(
+        out.last(),
+        Some(&1u8),
+        "the account's own signature must satisfy the synthesized default permission"
+    );
+}

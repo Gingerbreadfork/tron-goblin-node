@@ -1423,8 +1423,6 @@ fn validate_multi_sign_differential() {
     seen.sort();
     seen.dedup();
     let expected = vec![
-        KnownDefect::MissingDefaultPermission,
-        KnownDefect::WeightOverflowPanic,
         KnownDefect::NegativeEnergyClamped,
     ];
     assert_eq!(
