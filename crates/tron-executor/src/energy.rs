@@ -335,6 +335,12 @@ pub enum EnergyError {
 /// in `accounts`. If the caller has neither sufficient quota nor TRX,
 /// returns [`EnergyError::Insufficient`] and leaves state untouched
 /// (caller will revert the tx session).
+///
+/// In the pre-`ALLOW_TVM_FREEZE`, pre-Stake-2.0 era `useEnergy` can bail out
+/// before touching the account at all; see `over_limit_bailout` below. The
+/// returned [`EnergyCharge`] is shaped the same either way, matching java —
+/// `ReceiptCapsule` sets the receipt's energy fields from the requested split
+/// regardless of what `useEnergy` returned.
 pub fn consume_energy(
     accounts: &AccountStore,
     dyn_props: &DynamicPropertiesStore,
@@ -345,11 +351,12 @@ pub fn consume_energy(
     // NOTE: do NOT early-return on `energy_used == 0`. java-tron's
     // `payEnergyBill` calls `useEnergy(account, usage, now)` even with
     // `usage == 0` (origin charged 0% under `consume_user_resource_percent
-    // == 100`, or caller charged 0 when the origin covers all), and
-    // `useEnergy` UNCONDITIONALLY decays `energy_usage`, rewrites the
-    // per-account window, and stamps `latest_consume_time`. Skipping that for
-    // a 0 charge left the account's usage stale-high, so its NEXT charge
-    // decayed from the wrong base and over-charged `energy_fee` by a unit or
+    // == 100`, or caller charged 0 when the origin covers all), and past its
+    // over-limit bail-out (`over_limit_bailout` below) `useEnergy` decays
+    // `energy_usage`, rewrites the per-account window, and stamps
+    // `latest_consume_time` whatever the charge is. Skipping that for a 0
+    // charge left the account's usage stale-high, so its NEXT charge decayed
+    // from the wrong base and over-charged `energy_fee` by a unit or
     // two — a silent per-account drift that cascades. The executor only calls
     // into the energy path when the tx's TOTAL energy is > 0 (java's
     // `energyUsageTotal <= 0` guard), so a 0 here is always a real split slice.
@@ -410,7 +417,26 @@ pub fn consume_energy(
     // not this post-execution re-read (which is inflated when the caller
     // self-rented mid-tx). Identical to `quota_left` when the caller did NOT
     // self-rent, so a no-op there.
-    let quota_left = pre_tx_energy_quota_for(caller).unwrap_or(quota_left);
+    //
+    // java selects between the capture and a live re-read on the same gate it
+    // uses for the origin clamp (`ReceiptCapsule.payEnergyBill`:289-294):
+    //
+    //   if (getAllowTvmFreeze() == 1 || supportUnfreezeDelay()) {
+    //     accountEnergyLeft = callerEnergyLeft;
+    //   } else {
+    //     accountEnergyLeft = energyProcessor.getAccountLeftEnergyFromFreeze(account);
+    //   }
+    //
+    // Before proposal #52 the FREEZE/UNFREEZE opcodes do not exist, so nothing
+    // can self-rent and java bills against the live value; matching that keeps
+    // the frozen slice — which is the `energy` argument java hands to
+    // `useEnergy`, and so the left-hand side of its over-limit bail-out — equal
+    // to java's in every era.
+    let quota_left = if dyn_props.allow_tvm_freeze() == 1 || support_unfreeze_delay {
+        pre_tx_energy_quota_for(caller).unwrap_or(quota_left)
+    } else {
+        quota_left
+    };
     let energy_window_before = window_size(&account, ResourceKind::Energy);
     let energy_window_before_v2 = window_size_v2(&account, ResourceKind::Energy);
     let account_pre_decay = account.clone();
@@ -429,11 +455,39 @@ pub fn consume_energy(
         });
     }
 
+    // java `EnergyProcessor.useEnergy` returns early — before ANY mutation —
+    // when the charge exceeds the account's headroom and neither
+    // ALLOW_TVM_FREEZE nor the Stake-2.0 unfreeze delay is active
+    // (EnergyProcessor.java:112-116). Everything that touches the row sits
+    // after that return: the growth `increase`, `setEnergyUsage`,
+    // `setLatestOperationTime`, `setLatestConsumeTimeForEnergy`, the
+    // `accountStore.put` and the adaptive `BLOCK_ENERGY_USAGE` bump
+    // (EnergyProcessor.java:118-136).
+    //
+    // The subtraction is SIGNED and deliberately unclamped. An account already
+    // past its limit has negative headroom, and the callers pre-clamp the
+    // frozen slice to `max(limit - decayed, 0)` — so the comparison reads
+    // `0 > negative`, holds, and the row is left completely untouched. That
+    // frozen anchor is load-bearing: a later charge then decays it with a
+    // SINGLE linear `increase` step across the whole elapsed span
+    // (`u * (1 - N / window)`), where a row re-stamped on every call would
+    // instead compound one decay per slot (`u * (1 - 1 / window)^N`). The
+    // compounding form is strictly larger, so a re-stamped account keeps a
+    // higher usage and a smaller quota, and regains its headroom several
+    // blocks later than java does.
+    //
+    // Both operands are the values computed here rather than any pay-time
+    // clamp held elsewhere: java's `useEnergy` re-derives `energyLimit` and the
+    // decayed usage itself.
+    let over_limit_bailout = energy_from_frozen > energy_limit.saturating_sub(decayed_usage)
+        && dyn_props.allow_tvm_freeze() == 0
+        && !support_unfreeze_delay;
+
     // Charge the frozen-quota slice. java-tron's `ReceiptCapsule.payEnergyBill`
     // ALWAYS calls `EnergyProcessor.useEnergy(account, frozenPortion, now)` —
     // including when the frozen portion is 0 (the caller pays the whole bill by
-    // fee). `useEnergy` unconditionally decays `energy_usage` (the windowed
-    // `increase()`), rewrites the per-account window, and stamps
+    // fee). Past the bail-out above, `useEnergy` decays `energy_usage` (the
+    // windowed `increase()`), rewrites the per-account window, and stamps
     // `latest_consume_time`. The previous code special-cased `frozen == 0` to
     // ONLY stamp the time — skipping the decay + window rewrite — which left
     // `energy_usage` stale-high and the window un-recomputed, so the account's
@@ -441,7 +495,10 @@ pub fn consume_energy(
     // unit or two: a silent per-account drift that cascades into balance/
     // contractRet divergences. Run the identical path for `frozen == 0` (the
     // `increase` with `usage = 0` is exactly java's `useEnergy(.., 0, now)`).
-    let new_energy_usage = if support_unfreeze_delay {
+    let new_energy_usage = if over_limit_bailout {
+        // Nothing is written back, so the stored usage keeps its anchor value.
+        current_usage
+    } else if support_unfreeze_delay {
         // java-tron `useEnergy`: the account-aware `increase()` recomputes AND
         // writes back the per-account energy window (energy_window_size /
         // energy_window_optimized) in place.
@@ -493,23 +550,49 @@ pub fn consume_energy(
         account.balance -= fee;
         pay_energy_fee(accounts, dyn_props, fee)?;
     }
-    account.latest_opration_time = head_block_timestamp(dyn_props);
-    accounts.put(caller, &account)?;
+    if over_limit_bailout {
+        // `useEnergy` persisted nothing, but its two callers differ. The caller
+        // path runs the TRX-fee remainder logic and then `accountStore.put`
+        // whatever `useEnergy` returned (ReceiptCapsule.java:306-355), so the
+        // fee slice and its balance deduction still land. The origin path is a
+        // bare `useEnergy(origin, originUsage, now)` with no surrounding write
+        // (ReceiptCapsule.java:254), and the origin share is pre-clamped to the
+        // origin's own quota so it never carries a remainder — leaving that row
+        // genuinely untouched.
+        if energy_remainder > 0 {
+            accounts.put(caller, &account)?;
+        }
+    } else {
+        account.latest_opration_time = head_block_timestamp(dyn_props);
+        accounts.put(caller, &account)?;
+    }
 
     // BLOCK_ENERGY_USAGE accumulator: drives the adaptive-energy
     // recalculation at every block boundary (or maintenance, depending
-    // on java-tron's path). Bump whether the energy came from frozen
-    // or fee — adaptive scaling is about chain-wide load, not how the
-    // user paid. `wrapping_add` matches java's plain `long +=`
-    // (`ReceiptCapsule`/`EnergyProcessor` do `getBlockEnergyUsage() + energy`,
-    // which wraps on i64 overflow rather than saturating). It is also the
-    // exact fold the Block-STM commutative-delta commit replays
-    // (`base + Σ delta` via `wrapping_add`), so the serial and parallel paths
-    // stay byte-identical for this accumulator at the (physically
-    // unreachable) overflow boundary.
+    // on java-tron's path). java accumulates it in two separate places:
+    // `EnergyProcessor.useEnergy` adds only the FROZEN slice, and only past
+    // the over-limit bail-out (EnergyProcessor.java:133-136), while
+    // `ReceiptCapsule.payEnergyBill` adds the TRX-paid remainder in its own
+    // bump (ReceiptCapsule.java:309-314) which the bail-out does not reach.
+    // `wrapping_add` matches java's plain `long +=` (both sites do
+    // `getBlockEnergyUsage() + energy`, which wraps on i64 overflow rather
+    // than saturating). It is also the exact fold the Block-STM
+    // commutative-delta commit replays (`base + Σ delta` via `wrapping_add`),
+    // so the serial and parallel paths stay byte-identical for this
+    // accumulator at the (physically unreachable) overflow boundary.
+    //
+    // java gates the remainder bump additionally on
+    // `forkController.pass(VERSION_3_6_5)`. That predicate reads SR
+    // block-version adoption statistics (`statsByVersion(9)`), state this node
+    // does not track, so the remainder is accumulated ungated here. Both bumps
+    // are inert while ALLOW_ADAPTIVE_ENERGY is 0 — its mainnet value — and
+    // block version 9 reached unanimous adoption long before proposal 21 could
+    // turn adaptive energy on.
     if dyn_props.allow_adaptive_energy() == 1 {
+        let frozen_bump = if over_limit_bailout { 0 } else { energy_from_frozen };
         let cur = dyn_props.block_energy_usage();
-        dyn_props.save_block_energy_usage(cur.wrapping_add(energy_used_i));
+        dyn_props
+            .save_block_energy_usage(cur.wrapping_add(frozen_bump).wrapping_add(energy_remainder));
     }
 
     if let Ok(t) = std::env::var("TRON_ETRACE") {

@@ -1390,3 +1390,271 @@ fn freeze_only_capture_does_not_trigger_reset_or_revert() {
         "a value-only capture must never reach the reset / revert restore"
     );
 }
+
+// =============================================================================
+// `EnergyProcessor.useEnergy`'s over-limit bail-out
+// =============================================================================
+//
+// Before proposal #52 (ALLOW_TVM_FREEZE) and Stake 2.0, `useEnergy` returns
+// early — ahead of every mutation — when the charge exceeds the account's
+// headroom (EnergyProcessor.java:112-116). The subtraction `energyLimit -
+// newEnergyUsage` is signed and unclamped, so an account already past its limit
+// has NEGATIVE headroom; its callers pre-clamp the frozen slice to zero, the
+// comparison reads `0 > negative`, and the row keeps its anchor. The anchor is
+// what makes java's recovery linear: one `increase` step across the whole
+// elapsed span, rather than one compounding step per slot.
+
+/// The pre-#52 legacy era — ALLOW_TVM_FREEZE off and the Stake-2.0 unfreeze
+/// delay off, the window in which `useEnergy`'s bail-out is reachable.
+fn seed_global_energy_legacy(env: &Env, total_limit: i64, total_weight: i64) {
+    env.dyn_props.save_total_energy_limit(total_limit);
+    env.dyn_props.save_total_energy_current_limit(total_limit);
+    env.dyn_props.save_total_energy_weight(total_weight);
+    env.dyn_props.save_unfreeze_delay_days(0);
+    env.dyn_props.put_long(b"ALLOW_TVM_FREEZE", 0);
+    env.dyn_props.put_long(b"ALLOW_BLACKHOLE_OPTIMIZATION", 1);
+    env.dyn_props.save_latest_block_header_number(4_800_000);
+}
+
+/// A Stake-1.0 account carrying an explicit energy-usage anchor.
+fn v1_energy_account_with_usage(
+    addr: [u8; 21],
+    frozen_trx: i64,
+    balance_sun: i64,
+    energy_usage: i64,
+    latest_consume: i64,
+) -> Account {
+    let mut a = v1_energy_account(addr, frozen_trx, balance_sun);
+    let r = a.account_resource.as_mut().unwrap();
+    r.energy_usage = energy_usage;
+    r.latest_consume_time_for_energy = latest_consume;
+    a
+}
+
+/// An over-limit row is left byte-identical by a further charge: the growth
+/// `increase`, `setEnergyUsage`, `setLatestConsumeTimeForEnergy`,
+/// `setLatestOperationTime` and `accountStore.put` all sit after the return.
+#[test]
+fn over_limit_charge_leaves_the_row_untouched() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    // 1 TRX staked against a 10_000-energy chain limit at weight 1 → a 10_000
+    // per-account limit, with the anchor sitting four times over it.
+    seed_global_energy_legacy(&env, 10_000, 1);
+    let anchored = v1_energy_account_with_usage(ALICE, 1, 1_000_000, 40_000, 0);
+    put(&env.accounts, ALICE, anchored.clone());
+
+    let charge = consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 0, 100)
+        .expect("ok");
+    assert_eq!(
+        charge,
+        EnergyCharge::Frozen { energy_used: 0, new_energy_usage: 40_000 },
+        "the receipt still reports the requested split, as java sets it regardless \
+         of what useEnergy returned"
+    );
+    assert_eq!(
+        env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap(),
+        anchored,
+        "an over-limit account is a frozen anchor: nothing in the row may move"
+    );
+}
+
+/// The point of the frozen anchor: a charge landing after the account recovers
+/// decays from the ORIGINAL anchor in one linear step, so intervening
+/// over-limit charges leave no trace at all. Re-stamping the row on each of
+/// them would compound the decay and settle on a different usage.
+#[test]
+fn later_charge_decays_from_the_original_anchor() {
+    fn run(intervening_slots: &[i64]) -> Account {
+        tron_executor::energy::clear_pre_tx_energy_quota();
+        let env = Env::new();
+        seed_global_energy_legacy(&env, 10_000, 1);
+        put(
+            &env.accounts,
+            ALICE,
+            v1_energy_account_with_usage(ALICE, 1, 100_000_000, 40_000, 0),
+        );
+        for slot in intervening_slots {
+            consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 0, *slot)
+                .expect("ok");
+        }
+        // Slot 25_000: 40_000 decayed linearly from slot 0 is back under the
+        // 10_000 limit, so this charge is the first one that writes.
+        consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 0, 25_000)
+            .expect("ok");
+        env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap()
+    }
+
+    assert_eq!(
+        run(&[100, 200, 300]),
+        run(&[]),
+        "charges made while over the limit must not shift the anchor the \
+         recovering charge decays from"
+    );
+}
+
+/// Regression fence: with headroom to spare the bail-out must not fire, and the
+/// charge writes the row exactly as before.
+#[test]
+fn under_limit_charge_still_writes_the_row() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_legacy(&env, 10_000, 1);
+    put(
+        &env.accounts,
+        ALICE,
+        v1_energy_account_with_usage(ALICE, 1, 1_000_000, 1_000, 0),
+    );
+
+    let charge = consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 500, 100)
+        .expect("ok");
+    assert!(matches!(charge, EnergyCharge::Frozen { energy_used: 500, .. }));
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    let res = after.account_resource.unwrap();
+    assert!(res.energy_usage > 1_000, "the 500-energy charge was added to the usage");
+    assert_eq!(res.latest_consume_time_for_energy, 100, "the row was re-stamped");
+}
+
+/// java's guard is an `&&` chain over three terms, so ALLOW_TVM_FREEZE alone
+/// disables it — the same over-limit row must be written.
+#[test]
+fn allow_tvm_freeze_disables_the_bailout() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_legacy(&env, 10_000, 1);
+    env.dyn_props.put_long(b"ALLOW_TVM_FREEZE", 1);
+    let anchored = v1_energy_account_with_usage(ALICE, 1, 1_000_000, 40_000, 0);
+    put(&env.accounts, ALICE, anchored.clone());
+
+    consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 0, 100).expect("ok");
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    assert_ne!(after, anchored, "ALLOW_TVM_FREEZE == 1 skips the bail-out");
+    assert_eq!(after.account_resource.unwrap().latest_consume_time_for_energy, 100);
+}
+
+/// The Stake-2.0 unfreeze delay disables the guard independently of
+/// ALLOW_TVM_FREEZE, which stays off here.
+#[test]
+fn unfreeze_delay_disables_the_bailout() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_legacy(&env, 10_000, 1);
+    env.dyn_props.save_unfreeze_delay_days(1);
+    let anchored = v1_energy_account_with_usage(ALICE, 1, 1_000_000, 40_000, 0);
+    put(&env.accounts, ALICE, anchored.clone());
+
+    consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 0, 100).expect("ok");
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    assert_ne!(after, anchored, "supportUnfreezeDelay() skips the bail-out");
+    assert_eq!(after.account_resource.unwrap().latest_consume_time_for_energy, 100);
+}
+
+/// Recovery timing. An account parked over its limit is charged once per slot;
+/// the slot on which its stake starts covering the charge again is fixed by the
+/// linear decay of the frozen anchor. Re-stamping the row on every call applies
+/// `(1 - 1/window)` per slot instead, which is strictly larger than
+/// `1 - N/window`, so usage stays higher and recovery arrives blocks late.
+#[test]
+fn over_limit_recovery_follows_the_frozen_anchor() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    // 1 TRX at weight 1 against a 6_865_600_000 chain limit — the per-account
+    // limit the anchor below decays back through after 990 slots.
+    seed_global_energy_legacy(&env, 6_865_600_000, 1);
+    put(
+        &env.accounts,
+        ALICE,
+        v1_energy_account_with_usage(ALICE, 1, 1_000_000_000, 7_110_000_000, 0),
+    );
+
+    let mut recovered_at = None;
+    for slot in 1..=1_200 {
+        let charge = consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 1, slot)
+            .expect("ok");
+        if matches!(charge, EnergyCharge::Frozen { .. }) {
+            recovered_at = Some(slot);
+            break;
+        }
+    }
+    assert_eq!(
+        recovered_at,
+        Some(990),
+        "the anchor decays linearly across the whole span, so the stake covers \
+         the charge again on the java slot"
+    );
+}
+
+/// `BLOCK_ENERGY_USAGE` is accumulated in two places in java. The frozen slice
+/// is added inside `useEnergy`, past the bail-out (EnergyProcessor.java:133-136)
+/// — so a bailed-out charge contributes nothing from that side — while the
+/// TRX-paid remainder is added by `ReceiptCapsule.payEnergyBill` itself
+/// (ReceiptCapsule.java:309-314), which the bail-out does not reach.
+#[test]
+fn bailed_out_charge_accumulates_only_the_fee_remainder() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_legacy(&env, 10_000, 1);
+    env.dyn_props.put_long(b"ALLOW_ADAPTIVE_ENERGY", 1);
+    let anchored = v1_energy_account_with_usage(ALICE, 1, 100_000_000, 40_000, 0);
+    put(&env.accounts, ALICE, anchored.clone());
+
+    // Over the limit, so the whole 700 is a fee remainder and the frozen slice
+    // is zero: the accumulator moves by the remainder alone.
+    let charge = consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 700, 100)
+        .expect("ok");
+    assert_eq!(charge, EnergyCharge::Fee { energy_used: 700, fee_sun: 70_000 });
+    assert_eq!(env.dyn_props.block_energy_usage(), 700);
+
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    assert_eq!(
+        after.balance,
+        100_000_000 - 70_000,
+        "the caller path writes the account back after useEnergy returns, so the \
+         fee deduction still persists"
+    );
+    let res = after.account_resource.unwrap();
+    assert_eq!(res.energy_usage, 40_000, "the anchor is untouched");
+    assert_eq!(res.latest_consume_time_for_energy, 0, "the anchor is untouched");
+    assert_eq!(after.latest_opration_time, 0, "set after the return, so never reached");
+}
+
+/// `payEnergyBill` picks the caller's frozen-vs-fee clamp on the same gate as
+/// the origin clamp (ReceiptCapsule.java:289-294): the budget-time capture from
+/// proposal #52 onward, a live re-read before it. In the legacy era the live
+/// value must win, which also keeps the frozen slice — the `energy` argument
+/// java passes to `useEnergy` — equal to java's on both sides of the bail-out.
+#[test]
+fn pre_tvm_freeze_era_caller_clamp_is_a_live_read() {
+    tron_executor::energy::clear_pre_tx_energy_quota();
+    let env = Env::new();
+    seed_global_energy_legacy(&env, 10_000, 1);
+    // 10 TRX staked at budget time → a 100_000-energy caller quota.
+    let caller = v1_energy_account(ALICE, 10, 100_000_000);
+    put(&env.accounts, ALICE, caller.clone());
+    vm_energy_budget_create(
+        &env.accounts,
+        &env.dyn_props,
+        &Address::from_raw(ALICE),
+        &caller,
+        10_000_000_000,
+        0,
+        0,
+    );
+    // Stake drops to 1 TRX mid-tx → a 10_000-energy live quota.
+    restake_energy(&env, ALICE, 1);
+
+    let charge = consume_energy(&env.accounts, &env.dyn_props, &Address::from_raw(ALICE), 50_000, 0)
+        .expect("ok");
+    assert_eq!(
+        charge,
+        EnergyCharge::Mixed {
+            energy_used: 50_000,
+            energy_from_frozen: 10_000,
+            fee_sun: 40_000 * 100,
+            new_energy_usage: 10_000,
+        },
+        "the live quota covers 10_000 and the rest burns as a TRX fee"
+    );
+    let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
+    assert_eq!(after.balance, 100_000_000 - 4_000_000);
+}
