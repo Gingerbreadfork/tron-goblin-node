@@ -494,6 +494,17 @@ fn update_brokerage_rejects_out_of_range() {
 fn update_brokerage_rejects_missing_owner() {
     let accounts = AccountStore::new(mem());
     let witnesses = WitnessStore::new(mem());
+    // java looks the witness up first, so the witness row must be present for
+    // the missing-account rejection to be the one that fires.
+    witnesses
+        .put(
+            &addr(ALICE),
+            &tron_proto::Witness {
+                address: ALICE.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let c = UpdateBrokerageContract {
         owner_address: ALICE.to_vec(),
         brokerage: 30,
@@ -567,6 +578,9 @@ fn withdraw_rejects_missing_owner() {
 fn withdraw_rejects_no_allowance() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
+    // A head timestamp past the 24h allowance-frozen window, so the reward
+    // check is what rejects rather than the withdraw cooldown.
+    dp.save_latest_block_header_timestamp(1_700_000_000_000);
     put_account(&accounts, ALICE, 0);
     let c = WithdrawBalanceContract {
         owner_address: ALICE.to_vec(),
@@ -681,6 +695,8 @@ fn unfreeze_asset_rejects_when_all_entries_still_locked() {
     let alice = Account {
         address: ALICE.to_vec(),
         r#type: AccountType::Normal as i32,
+        // java requires an issuance record before it looks at expiry times.
+        asset_issued_name: b"TOK".to_vec(),
         frozen_supply: vec![Frozen {
             frozen_balance: 1000,
             expire_time: 2_000_000, // future

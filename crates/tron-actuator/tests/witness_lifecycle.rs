@@ -392,6 +392,10 @@ fn withdraw_balance_carries_withdraw_amount() {
     let accounts = AccountStore::new(mem());
     let dp = DynamicPropertiesStore::new(mem());
     let delegation = DelegationStore::new(mem());
+    // Head timestamp past the 24h allowance-frozen window measured from
+    // `latest_withdraw_time == 0`, which java applies with no exemption for a
+    // never-withdrawn account.
+    dp.save_latest_block_header_timestamp(1_700_000_000_000);
     let allowance = 4_242_000i64;
     accounts
         .put(

@@ -739,6 +739,17 @@ fn update_setting_round_trip() {
 fn update_setting_rejects_out_of_range_percent() {
     let accounts = AccountStore::new(mem());
     let contracts = ContractStore::new(mem());
+    // The owner account must exist: java resolves it before bounding the
+    // percent, so an absent owner masks the percent rejection.
+    accounts
+        .put(
+            &Address::from_raw(ALICE),
+            &tron_proto::Account {
+                address: ALICE.to_vec(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let c = tron_proto::UpdateSettingContract {
         owner_address: ALICE.to_vec(),
         contract_address: BOB.to_vec(),
