@@ -762,6 +762,24 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // TRON fork, pre-`ENERGY_LIMIT_HARD_FORK` only: entries whose effect
         // outlives this frame because a live shallower frame holds the same
         // java `Storage` object.
+        // Retention keeps the storage entries but NOT the `AccountTouched`
+        // entry for the owning address, which reverts with the rest of the
+        // frame. That is only safe because the state flush skips any account
+        // that is not touched: if a retained write's address could end the
+        // transaction untouched, the write would be dropped there instead —
+        // silently, with no failing test.
+        //
+        // It holds because every address that can own storage is a frame
+        // context, and every context is touched at or above the owning frame's
+        // depth: a CALL touches its target even at zero value, DELEGATECALL and
+        // CALLCODE inherit an already-touched context, and CREATE touches on
+        // account creation. Touch-depth <= owner-depth < reverting-depth, so the
+        // touch always survives in a shallower range.
+        //
+        // The zero-value CALL touch is itself a divergence from java, which
+        // gates account creation on ALLOW_TVM_SOLIDITY_059. Removing that
+        // divergence at the journal layer would break this invariant, so the two
+        // must be changed together.
         let mut retained: Vec<ENTRY> = Vec::new();
         let mut retained_slots: HashSet<(Address, StorageKey)> = HashSet::default();
 

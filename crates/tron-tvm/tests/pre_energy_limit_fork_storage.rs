@@ -431,3 +431,52 @@ fn fork_gate_reads_persisted_head_not_block_number() {
          semantics still apply"
     );
 }
+
+/// The aliasing is visible in the receipt, not only in state. java prices an
+/// SSTORE as RESET (5,000) rather than SET (20,000) when `getSstoreCost` finds
+/// an existing row, so pre-fork a row left behind by a reverted inner frame
+/// makes the ancestor's later write to that slot cheaper. Post-fork the deep
+/// copy discards the inner write and the ancestor pays SET.
+///
+/// The ancestor establishes ownership with an SLOAD rather than an SSTORE:
+/// ownership is claimed on first touch, so an ancestor that only READ the slot
+/// owns it while leaving no row for the price to see. Writing first would both
+/// create the row and hand ownership to the correct frame, hiding the effect.
+///
+/// Energy reaches the receipt, so this is a consensus value in its own right —
+/// two nodes can agree on final storage and still disagree on the fee.
+#[test]
+fn shared_row_prices_the_ancestor_sstore_as_reset_pre_fork() {
+    let mut energy = Vec::new();
+    for head in [PRE_FORK_HEAD, POST_FORK_HEAD] {
+        let stores = stores_at_head(head);
+        install_caller(&stores, tron_addr(CALLER));
+
+        // Under DELEGATECALL the context is the entry contract, so this writes
+        // the entry's slot 0 and then reverts.
+        let mut library = sstore(0, 2);
+        library.extend(revert());
+        install_contract(&stores, tron_addr(CALLEE), library);
+
+        // SLOAD claims ownership at depth 1 without creating a row; the
+        // delegatecall frame then writes and reverts; the final SSTORE is the
+        // one whose price depends on whether that row survived.
+        let mut entry = sload_pop(0);
+        entry.extend(delegatecall(tron_addr(CALLEE)));
+        entry.extend(sstore(0, 1));
+        entry.extend(stop());
+        install_contract(&stores, tron_addr(ENTRY), entry);
+
+        match run(&stores, tron_addr(ENTRY), head + 1) {
+            VmOutcome::Success { energy_used, .. } => energy.push(energy_used),
+            other => panic!("head={head}: {other:?}"),
+        }
+    }
+
+    let (pre, post) = (energy[0], energy[1]);
+    assert_eq!(
+        post - pre,
+        15_000,
+        "the gap is exactly SET(20,000) - RESET(5,000): pre={pre} post={post}"
+    );
+}
