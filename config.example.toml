@@ -305,13 +305,30 @@ max_time_ratio = 5.0
 long_running_time = 10
 
 # Block-STM optimistic parallel block execution during bulk catch-up,
-# byte-identical to the serial path. ON by default: after the dependency-ordered
-# scheduler rewrite it runs faster than serial on a real RocksDB-backed mainnet
-# catch-up. (Earlier builds shipped OFF — the naive scheduler's per-read MVCC
-# bookkeeping + re-execution churn measured slower than serial; the rewrite
-# fixed that.) The sync driver only engages it per-block while bulk-syncing,
-# never at the tip. Set false to force the serial path. Run with BLOCKSTM_DEBUG=1
-# to log per-block convergence (rounds / reexecs / converged).
+# byte-identical to the serial path (the serial path is the source of truth; a
+# non-converged round commits nothing and falls back to it), so this setting can
+# only ever pick the faster of two identical results — it cannot affect state.
+#
+# WHEN IT HELPS: blocks carrying real VM work. Contract execution dominates the
+# fixed parallel overhead (MvMemory init, per-tx versioned stores, rayon
+# dispatch), and independent transactions genuinely overlap. This is the modern
+# tip era, where it measures ~2-3x over serial.
+#
+# WHEN IT HURTS: blocks that are mostly plain transfers, i.e. the 2018-2019
+# early chain. Per-transaction work is tiny, so the MVCC bookkeeping dominates.
+# Measured on blocks 3,334,001-3,342,527: parallel 17.7-18.8ms per block versus
+# serial 7.3-8.0ms — 2.3x SLOWER.
+#
+# WHEN IT MAKES NO DIFFERENCE: whenever durable-write latency exceeds execution
+# time. Apply is pipelined, so per-block cost is max(exec, commit-chain). On a
+# slow or near-full disk the per-block fsyncs can run ~26ms and hide execution
+# entirely — changing this setting then moves nothing. Check which side binds
+# before tuning it.
+#
+# `block_worth_parallel` gates per block on top of this flag. The sync driver
+# only engages it while bulk-syncing, never at the tip. Set false to force the
+# serial path. Run with BLOCKSTM_DEBUG=1 to log per-block convergence
+# (rounds / reexecs / converged).
 parallel_exec = true
 
 # Overlap each applied block's commit + undo-log fsync with the next block's

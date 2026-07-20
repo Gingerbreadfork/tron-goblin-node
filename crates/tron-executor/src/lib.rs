@@ -3191,6 +3191,21 @@ pub fn compute_state_root(state: &StateBackends) -> Result<[u8; 32], tron_chainb
 /// A block with any contract call (large per-tx VM work) always is; a handful of
 /// plain transfers is not. The sync driver AND-s this into `parallel_exec`, so it
 /// only ever picks the faster of two byte-equivalent paths — never affects state.
+///
+/// The `>= MIN_PARALLEL_TXS` arm is a proxy for work, and it is a poor one on
+/// the 2018-2019 chain: blocks there routinely carry tens of plain transfers
+/// whose per-transaction work is far below the MVCC bookkeeping cost, so the
+/// gate opens and parallel loses. Measured over blocks 3,334,001-3,342,527,
+/// parallel averaged 17.7-18.8ms per block against serial's 7.3-8.0ms. The
+/// VM-bound arm is the one that reliably pays, because contract execution
+/// dominates the overhead.
+///
+/// A share-based predicate (VM transactions as a fraction of the block, or an
+/// estimated work total) would separate those cases; transaction count alone
+/// cannot. Note the choice is only visible in wall-clock when execution is the
+/// binding constraint — apply is pipelined, so per-block cost is
+/// `max(exec, commit-chain)`, and per-block fsync latency can exceed execution
+/// time entirely on a slow or near-full disk.
 pub fn block_worth_parallel(transactions: &[Transaction]) -> bool {
     const MIN_PARALLEL_TXS: usize = 16;
     transactions.len() >= MIN_PARALLEL_TXS || transactions.iter().any(tx_is_vm_bound)
