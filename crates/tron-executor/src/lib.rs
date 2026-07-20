@@ -381,29 +381,23 @@ mod fee_limit_tests {
         );
     }
 
-    /// The safety ceiling fires when `fee_limit / energy_fee` would
-    /// otherwise exceed 1B energy. Keeps the revm `u64` gas counter
-    /// well within arithmetic safety bounds. (Uses `TEST_MAX_FEE_LIMIT`
-    /// so the upper-bound gate doesn't reject these large fee_limits first.)
+    /// java applies no ceiling to the consensus energy limit —
+    /// `VMActuator.java:506-513` caps only the `isConstantCall` branch, with
+    /// `CommonParameter.maxEnergyLimitForConstant`. The `fee_limit` upper-bound
+    /// gate is the only bound, so a large `fee_limit` derives a large budget
+    /// rather than a clamped one. (Uses `TEST_MAX_FEE_LIMIT` so the gate
+    /// doesn't reject these first.)
     #[test]
-    fn safety_ceiling_caps_runaway_fee_limits() {
-        // fee_limit = i64::MAX, energy_fee = 1 → would derive
-        // i64::MAX-as-u64 = 9.2e18; expect clamp at 1B.
+    fn fee_limit_derived_budget_is_uncapped() {
         assert_eq!(
             compute_vm_energy_limit(i64::MAX, 1, TEST_MAX_FEE_LIMIT, true),
-            Ok(MAX_VM_ENERGY_LIMIT)
+            Ok(i64::MAX as u64)
         );
-        // Just over the ceiling → still clamped.
-        let just_over = (MAX_VM_ENERGY_LIMIT + 1) as i64 * 100;
+        // Well past the old 1B ceiling: derived, not clamped.
+        let past_old_ceiling = 1_000_000_001i64 * 100;
         assert_eq!(
-            compute_vm_energy_limit(just_over, 100, TEST_MAX_FEE_LIMIT, true),
-            Ok(MAX_VM_ENERGY_LIMIT)
-        );
-        // Exactly at the ceiling → returned unchanged.
-        let at_cap = (MAX_VM_ENERGY_LIMIT as i64) * 100;
-        assert_eq!(
-            compute_vm_energy_limit(at_cap, 100, TEST_MAX_FEE_LIMIT, true),
-            Ok(MAX_VM_ENERGY_LIMIT)
+            compute_vm_energy_limit(past_old_ceiling, 100, TEST_MAX_FEE_LIMIT, true),
+            Ok(1_000_000_001)
         );
     }
 }
@@ -3701,17 +3695,9 @@ fn execute_one_tx_isolated(
 /// `runtime.rs` sets `require_fee_limit = true`.
 const TEST_FALLBACK_ENERGY_LIMIT: u64 = 10_000_000;
 
-/// Absolute ceiling on the VM's per-tx energy budget. A mainnet block
-/// caps total energy at ~150M; permitting a single tx to demand up
-/// to 1B energy keeps the revm gas counter (a `u64`) well within
-/// arithmetic safety while still being looser than any realistic tx.
-/// A `fee_limit = i64::MAX` would otherwise saturate into a nonsense
-/// budget downstream.
-const MAX_VM_ENERGY_LIMIT: u64 = 1_000_000_000;
-
 /// Derive the per-tx VM energy budget from `fee_limit` and
 /// `energy_fee` per java-tron's `Manager.processTransaction` formula:
-/// `energyLimit = feeLimit / energyFee`, clamped to a safety ceiling.
+/// `energyLimit = feeLimit / energyFee`.
 ///
 /// Returns `Err(TxOutcome::InvalidFeeLimit { .. })` when strict mode is on and
 /// `fee_limit < 0 || fee_limit > max_fee_limit` — byte-for-byte java-tron's
@@ -3741,7 +3727,7 @@ fn compute_vm_energy_limit(
     }
     let divisor = energy_fee.max(1) as u64;
     let derived = (fee_limit as u64) / divisor;
-    Ok(derived.min(MAX_VM_ENERGY_LIMIT))
+    Ok(derived)
 }
 
 /// Real `TriggerSmartContract` VM energy budget — java
@@ -3749,7 +3735,7 @@ fn compute_vm_energy_limit(
 /// Reads the caller's account + the contract row (for origin / percent /
 /// origin_energy_limit) + the origin's account from the pre-execution `view`,
 /// then delegates the arithmetic to [`energy::vm_energy_budget_trigger`].
-/// Capped at [`MAX_VM_ENERGY_LIMIT`] for the revm `u64` gas counter. Returns 0
+/// Returns 0
 /// when the caller account is unrecoverable (the VM will preflight-fail, just
 /// as java would have rejected at validate).
 fn vm_energy_budget_for_trigger(
@@ -3809,13 +3795,12 @@ fn vm_energy_budget_for_trigger(
         call_value,
         now_slot,
     );
-    budget.max(0).min(MAX_VM_ENERGY_LIMIT as i64) as u64
+    budget.max(0) as u64
 }
 
 /// Real `CreateSmartContract` VM energy budget — java
 /// `getAccountEnergyLimitWithFixRatio(caller, feeLimit, callValue)` (the
-/// creator IS the caller, so no origin split). Capped at
-/// [`MAX_VM_ENERGY_LIMIT`].
+/// creator IS the caller, so no origin split).
 fn vm_energy_budget_for_create(
     view: &StateBackends,
     dp: &tron_chainbase::DynamicPropertiesStore,
@@ -3836,7 +3821,7 @@ fn vm_energy_budget_for_create(
     };
     let budget =
         energy::vm_energy_budget_create(&accounts, dp, caller, &caller_acct, fee_limit, call_value, now_slot);
-    budget.max(0).min(MAX_VM_ENERGY_LIMIT as i64) as u64
+    budget.max(0) as u64
 }
 
 #[allow(clippy::too_many_arguments)]
