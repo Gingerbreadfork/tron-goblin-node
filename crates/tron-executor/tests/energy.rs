@@ -1658,3 +1658,103 @@ fn pre_tvm_freeze_era_caller_clamp_is_a_live_read() {
     let after = env.accounts.get(&Address::from_raw(ALICE)).unwrap().unwrap();
     assert_eq!(after.balance, 100_000_000 - 4_000_000);
 }
+
+// ---------------------------------------------------------------------------
+// java `RuntimeImplTest.getCreatorEnergyLimit2Test`
+//
+// java walks one account through six (feeLimit, callValue, stake) combinations
+// and asserts the exact budget `VMActuator.getAccountEnergyLimitWithFixRatio`
+// returns for each. Reproducing all six with one fixture pins both halves of
+// the `min(feeLimit / energyFee, leftFrozenEnergy + (balance - callValue) /
+// energyFee)` formula, including the frozen-energy quota derived from
+// `totalEnergyCurrentLimit / totalEnergyWeight`.
+// ---------------------------------------------------------------------------
+
+/// java's fixture: 3,000 TRX of balance, a 5,000,000,000-TRX global energy
+/// weight against the default 50,000,000,000 global energy limit, and the
+/// default 100 sun/energy price.
+fn runtime_impl_test_env() -> Env {
+    let env = Env::new();
+    env.dyn_props.save_total_energy_limit(50_000_000_000);
+    env.dyn_props.save_total_energy_current_limit(50_000_000_000);
+    env.dyn_props.save_total_energy_weight(5_000_000_000);
+    env.dyn_props.save_unfreeze_delay_days(1);
+    env.dyn_props.save_latest_block_header_number(60_000_000);
+    env
+}
+
+fn runtime_impl_test_creator(balance: i64, frozen_for_energy: i64) -> Account {
+    Account {
+        address: ALICE.to_vec(),
+        balance,
+        account_resource: Some(AccountResource {
+            frozen_balance_for_energy: Some(Frozen {
+                frozen_balance: frozen_for_energy,
+                expire_time: 0,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// java `RuntimeImplTest.getCreatorEnergyLimit2Test`, unstaked cases: with
+/// 3,000 TRX of balance and no stake the budget is whichever of the fee limit
+/// and the spendable balance runs out first.
+#[test]
+fn java_runtime_impl_fix_ratio_budget_without_stake() {
+    let env = runtime_impl_test_env();
+    let creator = runtime_impl_test_creator(3_000_000_000, 0);
+
+    // feeLimit 1e9, callValue 10 → fee limit binds. java: 10_000_000.
+    assert_eq!(
+        account_energy_limit_with_fix_ratio(&creator, &env.dyn_props, 1_000_000_000, 10, 0),
+        10_000_000
+    );
+    // callValue 2.5e9 leaves only 0.5e9 spendable → balance binds.
+    // java: 5_000_000.
+    assert_eq!(
+        account_energy_limit_with_fix_ratio(
+            &creator,
+            &env.dyn_props,
+            1_000_000_000,
+            2_500_000_000,
+            0
+        ),
+        5_000_000
+    );
+    // A small fee limit binds well below the balance. java: 10_000.
+    assert_eq!(
+        account_energy_limit_with_fix_ratio(&creator, &env.dyn_props, 1_000_000, 10, 0),
+        10_000
+    );
+}
+
+/// java `RuntimeImplTest.getCreatorEnergyLimit2Test`, staked cases: moving
+/// 1,000 TRX of the balance into an energy stake yields a 10,000-energy quota
+/// (1,000 TRX of a 5,000,000,000-TRX weight against a 50,000,000,000 limit)
+/// which is ADDED to the remaining balance's worth, so the balance-side term
+/// becomes 10_000 + 19_999_999 = 20_009_999.
+#[test]
+fn java_runtime_impl_fix_ratio_budget_with_stake() {
+    let env = runtime_impl_test_env();
+    // java: `setFrozenForEnergy(1e9, 0)` and `setBalance(balance - 1e9)`.
+    let creator = runtime_impl_test_creator(2_000_000_000, 1_000_000_000);
+
+    // The fee limit still binds below the staked budget. java: 10_000_000.
+    assert_eq!(
+        account_energy_limit_with_fix_ratio(&creator, &env.dyn_props, 1_000_000_000, 10, 0),
+        10_000_000
+    );
+    // Raising the fee limit past the staked budget exposes it exactly.
+    // java: 20_009_999.
+    assert_eq!(
+        account_energy_limit_with_fix_ratio(&creator, &env.dyn_props, 3_000_000_000, 10, 0),
+        20_009_999
+    );
+    // A tiny fee limit binds regardless of the stake. java: 30.
+    assert_eq!(
+        account_energy_limit_with_fix_ratio(&creator, &env.dyn_props, 3_000, 10, 0),
+        30
+    );
+}
