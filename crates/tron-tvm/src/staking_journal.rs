@@ -36,6 +36,21 @@
 //! the uncommitted child deposit. This mirrors the `committed` / `cs_journal`
 //! mechanism that already covers the CALLTOKEN / `ContractState` out-of-band
 //! writes.
+//!
+//! ## Not affected by the pre-`ENERGY_LIMIT_HARD_FORK` storage aliasing
+//!
+//! This journal must stay era-independent, and deliberately does not carry the
+//! shared-`Storage` retention that the journal's
+//! `tron_shared_storage_across_frames` flag applies to contract storage. That
+//! aliasing is specific to `Storage`: java's
+//! `RepositoryImpl.getStorage` is the only accessor that hands a child the
+//! parent's object, and `commitStorageCache` is the only `commitXCache` without
+//! an `isDirty() || isCreate()` guard. Accounts, votes and delegation rows are
+//! copied per repository in both eras (`getAccount` returns a fresh
+//! `AccountCapsule`), so an inner frame's staking writes never survive its
+//! revert. Independently, every opcode covered here needs a proposal that
+//! activates far above block 4,727,890, so the pre-fork window cannot reach
+//! them at all.
 
 use std::sync::{Arc, Mutex};
 

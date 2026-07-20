@@ -757,10 +757,10 @@ pub fn account_energy_limit_with_fix_ratio(
     available.min(energy_from_fee_limit)
 }
 
-/// `ENERGY_LIMIT_HARD_FORK` activation block (java `ForkController.
-/// checkForEnergyLimit`, mainnet 4,727,890). At or after it the VM energy budget
-/// uses the FIX ratio; before it, the FLOAT ratio.
-pub const ENERGY_LIMIT_HARD_FORK_BLOCK: i64 = 4_727_890;
+/// `ENERGY_LIMIT_HARD_FORK` activation block. At or after it the VM energy
+/// budget uses the FIX ratio; before it, the FLOAT ratio. Re-exported so the
+/// height and its persisted-head comparison live in exactly one place.
+pub use tron_chainbase::{energy_limit_hard_fork_active, ENERGY_LIMIT_HARD_FORK_BLOCK};
 
 /// java `VMActuator.getEnergyFee` (VMActuator.java:105-112): the frozen-balance
 /// slice corresponding to `frozen` energy out of `total` energy backed by
@@ -949,7 +949,7 @@ pub fn vm_energy_budget_trigger(
     // (`getTotalEnergyLimitWithFloatRatio`), post-fork with the fix ratio.
     // Pre-fork `allowTvmFreezeV2` is always off, so only the legacy read-only
     // pre-consume capture (the pay-time split clamp) applies.
-    if dyn_props.latest_block_header_number().unwrap_or(0) < ENERGY_LIMIT_HARD_FORK_BLOCK {
+    if !energy_limit_hard_fork_active(dyn_props) {
         set_pre_tx_energy(
             caller_addr.as_bytes(),
             EnergyPreConsume {
@@ -1082,7 +1082,7 @@ pub fn vm_energy_budget_create(
     // CreateSmartContract budget with the FLOAT ratio
     // (`getAccountEnergyLimitWithFloatRatio`), post-fork with the fix ratio.
     // Pre-fork `allowTvmFreezeV2` is off → legacy read-only pre-consume capture.
-    if dyn_props.latest_block_header_number().unwrap_or(0) < ENERGY_LIMIT_HARD_FORK_BLOCK {
+    if !energy_limit_hard_fork_active(dyn_props) {
         set_pre_tx_energy(
             caller_addr.as_bytes(),
             EnergyPreConsume {
@@ -1192,8 +1192,7 @@ pub fn pay_energy_bill(
     // mainnet ALLOW_TVM_FREEZE and the Stake-2.0 unfreeze-delay both activate
     // strictly AFTER block 4,727,890, so `checkForEnergyLimit` is the binding
     // term — the same gate the budget side uses above.
-    let apply_origin_cap =
-        dyn_props.latest_block_header_number().unwrap_or(0) >= ENERGY_LIMIT_HARD_FORK_BLOCK;
+    let apply_origin_cap = energy_limit_hard_fork_active(dyn_props);
     let origin_usage = if apply_origin_cap {
         origin_share_raw
             .min(origin_left)

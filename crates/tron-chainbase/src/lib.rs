@@ -65,3 +65,21 @@ pub use stores::{
     V1_FROM_PREFIX, V1_TO_PREFIX, V2_FROM_PREFIX, V2_PREFIX_LOCKED, V2_PREFIX_UNLOCKED,
     V2_TO_PREFIX,
 };
+
+/// Block height at which java-tron's `ENERGY_LIMIT_HARD_FORK` activates on
+/// mainnet (java `CommonParameter.blockNumForEnergyLimit`, default `4727890`).
+pub const ENERGY_LIMIT_HARD_FORK_BLOCK: i64 = 4_727_890;
+
+/// Whether `ENERGY_LIMIT_HARD_FORK` is active for the transaction currently
+/// being executed.
+///
+/// java resolves this through `ReceiptCapsule.checkForEnergyLimit`, which
+/// compares the *persisted* head (`getLatestBlockHeaderNumber`) against
+/// [`ENERGY_LIMIT_HARD_FORK_BLOCK`]. The head pointer is advanced only after
+/// every transaction in a block has been applied, so while block `N` executes
+/// the store still reads `N - 1`. Callers must therefore use this helper rather
+/// than the number of the block being applied, which would activate the fork
+/// one block early.
+pub fn energy_limit_hard_fork_active(dyn_props: &DynamicPropertiesStore) -> bool {
+    dyn_props.latest_block_header_number().unwrap_or(0) >= ENERGY_LIMIT_HARD_FORK_BLOCK
+}

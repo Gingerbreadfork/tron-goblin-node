@@ -16,7 +16,8 @@ use primitives::{
     hardfork::SpecId::{self, *},
     hash_map::Entry,
     hints_util::unlikely,
-    Address, Bytes, HashMap, Log, LogData, StorageKey, StorageValue, B256, KECCAK_EMPTY, U256,
+    Address, Bytes, HashMap, HashSet, Log, LogData, StorageKey, StorageValue, B256, KECCAK_EMPTY,
+    U256,
 };
 use state::{Account, EvmState, TransactionId, TransientStorage};
 use std::vec::Vec;
@@ -65,6 +66,14 @@ pub struct JournalCfg {
     /// 32-byte genesis id in the Istanbul(#41)..#60 window. `None` falls back to
     /// the `CfgEnv` `chain_id` (upstream EVM behavior).
     pub tron_chain_id_word: Option<U256>,
+    /// TRON fork: before `ENERGY_LIMIT_HARD_FORK` (block 4,727,890) a child
+    /// `Repository` aliases its ancestor's `Storage` object instead of
+    /// deep-copying it (java `RepositoryImpl.getStorage`), so a reverting
+    /// frame's writes to an address an ancestor already touched survive the
+    /// revert and stay visible to that ancestor. `false` keeps upstream
+    /// isolated-storage behavior, where every reverted frame's writes are
+    /// discarded.
+    pub tron_shared_storage_across_frames: bool,
     /// Whether EIP-7708 (ETH transfers emit logs) is disabled.
     pub eip7708_disabled: bool,
     /// Whether EIP-7708 delayed burn logging is disabled.
@@ -122,6 +131,15 @@ pub struct JournalInner<ENTRY> {
     /// TRANSFER_FAILED` instead of a plain `REVERT`. Transient per-transaction
     /// state, cleared on `commit_tx` / `discard_tx`.
     pub tron_transfer_failed: bool,
+    /// TRON fork: for each address whose contract storage has been touched,
+    /// the depth of the shallowest still-live frame to touch it. Mirrors which
+    /// java-tron `Repository` in the live chain holds the address's `Storage`
+    /// object while [`JournalCfg::tron_shared_storage_across_frames`] is set:
+    /// pre-fork every live cache entry for an address is the *same* object, so
+    /// the only observable fact is which live frame is shallowest. A frame at
+    /// depth `d` reverting keeps an address's writes exactly when the recorded
+    /// depth is `< d`. Empty and unread when the flag is off.
+    pub tron_storage_owner_depth: HashMap<Address, usize>,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -147,6 +165,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses: WarmAddresses::new(),
             selfdestructed_addresses: Vec::new(),
             tron_transfer_failed: false,
+            tron_storage_owner_depth: HashMap::default(),
         }
     }
 
@@ -182,12 +201,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             selfdestructed_addresses,
             tron_transfer_failed,
+            tron_storage_owner_depth,
         } = self;
         // Cfg and state are not changed. They are always set again before execution.
         let _ = cfg;
         let _ = state;
         transient_storage.clear();
         *depth = 0;
+        // TRON fork: storage ownership is scoped to a single transaction's frame
+        // chain, matching java discarding the whole repository chain per tx.
+        tron_storage_owner_depth.clear();
 
         // Do nothing with journal history so we can skip cloning present journal.
         journal.clear();
@@ -223,14 +246,21 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             selfdestructed_addresses,
             tron_transfer_failed,
+            tron_storage_owner_depth,
         } = self;
         let is_spurious_dragon_enabled = cfg.spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
+        //
+        // TRON fork: whole-transaction discard is unconditional in both eras.
+        // java's shared-`Storage` aliasing only ever carries a reverted frame's
+        // writes up to a still-live ancestor; when the transaction itself fails
+        // java never calls `rootRepository.commit()`, so nothing survives.
         journal.drain(..).rev().for_each(|entry| {
             entry.revert(state, None, is_spurious_dragon_enabled);
         });
         transient_storage.clear();
         *depth = 0;
+        tron_storage_owner_depth.clear();
         logs.clear();
         selfdestructed_addresses.clear();
         transaction_id.increment();
@@ -262,10 +292,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             selfdestructed_addresses,
             tron_transfer_failed,
+            tron_storage_owner_depth,
         } = self;
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase_and_access_list();
         selfdestructed_addresses.clear();
+        tron_storage_owner_depth.clear();
         // TRON fork: see `commit_tx` — reset in `JournalInner::new()`, not here.
         let _ = tron_transfer_failed;
 
@@ -658,9 +690,45 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         checkpoint
     }
 
+    /// Records the shallowest live frame to touch this address's contract
+    /// storage.
+    ///
+    /// Mirrors java-tron's `RepositoryImpl.getStorageInternal` caching the
+    /// address's `Storage` object in the repository the opcode was issued
+    /// against. That path runs for reads as well as writes — `Storage.getValue`
+    /// returns early on a missing row *before* populating its row cache, so
+    /// even a read of an empty slot establishes ownership of the object with no
+    /// row cached. Ownership is monotonically non-increasing, so `or_insert`
+    /// keeps the shallowest depth without needing a min.
+    ///
+    /// Only storage opcodes register here. java creates no `Storage` for plain
+    /// account loads, `EXTCODESIZE`, or call targets.
+    #[inline]
+    fn tron_note_storage_touch(&mut self, address: Address) {
+        if self.cfg.tron_shared_storage_across_frames {
+            self.tron_storage_owner_depth
+                .entry(address)
+                .or_insert(self.depth);
+        }
+    }
+
     /// Commits the checkpoint.
     #[inline]
-    pub const fn checkpoint_commit(&mut self) {
+    pub fn checkpoint_commit(&mut self) {
+        if self.cfg.tron_shared_storage_across_frames {
+            // TRON fork: java's `commitStorageCache` hands this repository's
+            // `Storage` objects to its parent unguarded, so every address this
+            // frame owned becomes owned by the parent. Only entries recorded at
+            // exactly this depth move down; a shallower owner already outranks
+            // this frame and must keep its depth.
+            let depth = self.depth;
+            let parent_depth = depth.saturating_sub(1);
+            for owner_depth in self.tron_storage_owner_depth.values_mut() {
+                if *owner_depth == depth {
+                    *owner_depth = parent_depth;
+                }
+            }
+        }
         self.depth = self.depth.saturating_sub(1);
     }
 
@@ -668,22 +736,79 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn checkpoint_revert(&mut self, checkpoint: JournalCheckpoint) {
         let is_spurious_dragon_enabled = self.cfg.spec.is_enabled_in(SPURIOUS_DRAGON);
-        let state = &mut self.state;
-        let transient_storage = &mut self.transient_storage;
+        let shared_storage = self.cfg.tron_shared_storage_across_frames;
+        // Captured before the decrement below: every comparison is against the
+        // depth of the frame being reverted, not its parent's.
+        let reverting_depth = self.depth;
         self.depth = self.depth.saturating_sub(1);
         self.logs.truncate(checkpoint.log_i);
         // EIP-7708: Remove selfdestructed addresses added after checkpoint
         self.selfdestructed_addresses
             .truncate(checkpoint.selfdestructed_i);
 
-        // iterate over last N journals sets and revert our global state
-        if checkpoint.journal_i < self.journal.len() {
-            self.journal
-                .drain(checkpoint.journal_i..)
-                .rev()
-                .for_each(|entry| {
-                    entry.revert(state, Some(transient_storage), is_spurious_dragon_enabled);
-                });
+        if checkpoint.journal_i >= self.journal.len() {
+            if shared_storage {
+                self.tron_storage_owner_depth
+                    .retain(|_, d| *d != reverting_depth);
+            }
+            return;
+        }
+
+        let owner = &self.tron_storage_owner_depth;
+        let state = &mut self.state;
+        let transient_storage = &mut self.transient_storage;
+        // TRON fork, pre-`ENERGY_LIMIT_HARD_FORK` only: entries whose effect
+        // outlives this frame because a live shallower frame holds the same
+        // java `Storage` object.
+        let mut retained: Vec<ENTRY> = Vec::new();
+        let mut retained_slots: HashSet<(Address, StorageKey)> = HashSet::default();
+
+        self.journal
+            .drain(checkpoint.journal_i..)
+            .rev()
+            .for_each(|entry| {
+                if shared_storage {
+                    // Ownership is keyed by address, not by slot: java's cache
+                    // key is the address, so an ancestor that touched only one
+                    // slot of an address still owns writes to its other slots.
+                    if let Some((addr, key)) = entry.as_storage_change() {
+                        if owner.get(&addr).is_some_and(|d| *d < reverting_depth) {
+                            retained_slots.insert((addr, key));
+                            retained.push(entry);
+                            return;
+                        }
+                    }
+                    // A retained value must keep its slot warm. Reverting the
+                    // warming entry marks the slot cold, and the next warm-up
+                    // resets `original_value` to `present_value`, which would
+                    // make the surviving write compare equal to its original
+                    // and be skipped when state is flushed to the store.
+                    //
+                    // Ordering is guaranteed: `sstore_concrete_error` calls
+                    // `sload_concrete_error` first, so a slot's warming entry
+                    // strictly precedes its first change in journal order and
+                    // therefore follows it in this reversed drain. Collecting
+                    // `retained_slots` as we go is sufficient — no second pass.
+                    if let Some(slot) = entry.as_storage_warmed() {
+                        if retained_slots.contains(&slot) {
+                            retained.push(entry);
+                            return;
+                        }
+                    }
+                }
+                entry.revert(state, Some(transient_storage), is_spurious_dragon_enabled);
+            });
+
+        if shared_storage {
+            // The drain yields entries in reverse; restore their original
+            // relative order. Retained entries deliberately migrate into the
+            // parent frame's checkpoint range so they unwind with the frame
+            // that owns them — dropping them instead would strand a value that
+            // a later ancestor revert must still undo.
+            retained.reverse();
+            self.journal.extend(retained);
+            self.tron_storage_owner_depth
+                .retain(|_, d| *d != reverting_depth);
         }
     }
 
@@ -1066,6 +1191,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
+        self.tron_note_storage_touch(address);
         self.load_account_mut(db, address)?
             .sload_concrete_error(key, skip_cold_load)
             .map(|s| s.map(|s| s.present_value))
@@ -1082,6 +1208,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, JournalLoadError<DB::Error>> {
+        self.tron_note_storage_touch(address);
         let Some(mut account) = self.get_account_mut(db, address) else {
             return Err(JournalLoadError::ColdLoadSkipped);
         };
@@ -1103,6 +1230,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         new: StorageValue,
         skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
+        self.tron_note_storage_touch(address);
         self.load_account_mut(db, address)?
             .sstore_concrete_error(key, new, skip_cold_load)
     }
@@ -1121,6 +1249,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         new: StorageValue,
         skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, JournalLoadError<DB::Error>> {
+        self.tron_note_storage_touch(address);
         let Some(mut account) = self.get_account_mut(db, address) else {
             return Err(JournalLoadError::ColdLoadSkipped);
         };
@@ -1284,5 +1413,298 @@ mod tests {
         let state_load = result.unwrap();
         assert!(!state_load.is_cold); // Should be warm
         assert_eq!(state_load.data, U256::ZERO); // Empty slot
+    }
+
+    // ---------------------------------------------------------------------
+    // TRON pre-ENERGY_LIMIT_HARD_FORK shared-`Storage` semantics.
+    //
+    // Pre-fork, java's `RepositoryImpl.getStorage` hands a child repository the
+    // *same* `Storage` object as its parent rather than a deep copy, so a
+    // reverting frame's writes to an address a live ancestor already touched
+    // survive into that ancestor. Each test names the depth of the frame it
+    // acts in; `checkpoint()` moves depth 0 -> 1 for the entry frame, matching
+    // java passing `rootRepository` itself to the top-level call.
+    // ---------------------------------------------------------------------
+
+    const TRON_ADDR: Address = address!("1000000000000000000000000000000000000000");
+    const TRON_OTHER_ADDR: Address = address!("2000000000000000000000000000000000000000");
+
+    fn tron_journal(shared_storage: bool) -> (JournalInner<JournalEntry>, EmptyDB) {
+        let mut journal = JournalInner::<JournalEntry>::new();
+        journal.cfg.tron_shared_storage_across_frames = shared_storage;
+        for address in [TRON_ADDR, TRON_OTHER_ADDR] {
+            journal.state.insert(
+                address,
+                Account::from(AccountInfo {
+                    balance: U256::from(1000),
+                    nonce: 1,
+                    code_hash: KECCAK_EMPTY,
+                    code: Some(Bytecode::default()),
+                    account_id: None,
+                }),
+            );
+        }
+        (journal, EmptyDB::new())
+    }
+
+    fn present(journal: &JournalInner<JournalEntry>, address: Address, key: U256) -> U256 {
+        journal
+            .state
+            .get(&address)
+            .and_then(|a| a.storage.get(&key))
+            .map(|s| s.present_value)
+            .unwrap_or(U256::ZERO)
+    }
+
+    fn original(journal: &JournalInner<JournalEntry>, address: Address, key: U256) -> U256 {
+        journal
+            .state
+            .get(&address)
+            .and_then(|a| a.storage.get(&key))
+            .map(|s| s.original_value)
+            .unwrap_or(U256::ZERO)
+    }
+
+    /// An inner frame's write to a slot of an address its caller already wrote
+    /// survives the inner frame's revert. This is the core divergence: the two
+    /// frames hold one shared java `Storage`, so the revert cannot take the
+    /// write back.
+    #[test]
+    fn tron_pre_fork_inner_revert_keeps_ancestor_owned_storage() {
+        let key = U256::from(1);
+        for (shared, expected) in [(true, U256::from(2)), (false, U256::from(1))] {
+            let (mut journal, mut db) = tron_journal(shared);
+            journal.checkpoint(); // depth 1
+            journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+            let inner = journal.checkpoint(); // depth 2
+            journal.sstore(&mut db, TRON_ADDR, key, U256::from(2), false).unwrap();
+            journal.checkpoint_revert(inner);
+            assert_eq!(
+                present(&journal, TRON_ADDR, key),
+                expected,
+                "shared_storage={shared}"
+            );
+        }
+    }
+
+    /// An inner frame's write to an address *no* ancestor has touched is
+    /// discarded on revert in both eras: the inner frame created the `Storage`
+    /// object itself, so dropping the repository drops the object.
+    #[test]
+    fn tron_pre_fork_inner_revert_discards_self_owned_storage() {
+        let key = U256::from(1);
+        for shared in [true, false] {
+            let (mut journal, mut db) = tron_journal(shared);
+            journal.checkpoint(); // depth 1, touches nothing
+            let inner = journal.checkpoint(); // depth 2
+            journal.sstore(&mut db, TRON_ADDR, key, U256::from(9), false).unwrap();
+            journal.checkpoint_revert(inner);
+            assert_eq!(
+                present(&journal, TRON_ADDR, key),
+                U256::ZERO,
+                "shared_storage={shared}"
+            );
+        }
+    }
+
+    /// Reverting the frame that owns an address discards the whole subtree of
+    /// writes to it, and releases its ownership entry.
+    #[test]
+    fn tron_pre_fork_owner_frame_revert_discards_subtree() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        let outer = journal.checkpoint(); // depth 1
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+        journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(2), false).unwrap();
+        journal.checkpoint_commit();
+        journal.checkpoint_revert(outer);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::ZERO);
+        assert!(!journal.tron_storage_owner_depth.contains_key(&TRON_ADDR));
+    }
+
+    /// A(d1) touches an address, B(d2) does not, C(d3) touches it and commits
+    /// into B, then B reverts. Ownership is monotonically non-increasing, so
+    /// A still owns the address and the write survives. A naive
+    /// `insert(depth)` on touch, or a commit that lowers ownership
+    /// unconditionally rather than only for entries at the committing depth,
+    /// would leave B owning it and discard the write.
+    #[test]
+    fn tron_pre_fork_commit_into_non_owner_preserves_shallower_owner() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // A, depth 1
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+        let b = journal.checkpoint(); // B, depth 2
+        journal.checkpoint(); // C, depth 3
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(3), false).unwrap();
+        journal.checkpoint_commit(); // C commits into B
+        assert_eq!(journal.tron_storage_owner_depth.get(&TRON_ADDR), Some(&1));
+        journal.checkpoint_revert(b);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::from(3));
+    }
+
+    /// Committing a frame hands its `Storage` objects to its parent, so a later
+    /// sibling at the same depth reverts against the parent's ownership and its
+    /// write survives.
+    #[test]
+    fn tron_pre_fork_commit_lowers_owner_depth() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // depth 1, touches nothing
+        journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+        journal.checkpoint_commit();
+        assert_eq!(journal.tron_storage_owner_depth.get(&TRON_ADDR), Some(&1));
+        let sibling = journal.checkpoint(); // depth 2 again
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(2), false).unwrap();
+        journal.checkpoint_revert(sibling);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::from(2));
+    }
+
+    /// A retained entry is re-appended into the parent's checkpoint range, not
+    /// dropped, so a later revert of the owning frame still unwinds it. Dropping
+    /// it instead would strand the value and flush a phantom write for a
+    /// transaction that fully reverted.
+    #[test]
+    fn tron_pre_fork_retained_entry_unwinds_with_owner() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        let outer = journal.checkpoint(); // depth 1
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+        let inner = journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(2), false).unwrap();
+        journal.checkpoint_revert(inner);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::from(2));
+        journal.checkpoint_revert(outer);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::ZERO);
+    }
+
+    /// A bare SLOAD establishes ownership: `getStorageInternal` materialises and
+    /// caches the `Storage` object for reads as well as writes, and
+    /// `Storage.getValue` returns before caching a row when the row is missing,
+    /// so reading an empty slot claims the object with no row cached.
+    #[test]
+    fn tron_pre_fork_ancestor_sload_establishes_ownership() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // depth 1
+        journal.sload(&mut db, TRON_ADDR, key, false).unwrap();
+        let inner = journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(5), false).unwrap();
+        journal.checkpoint_revert(inner);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::from(5));
+    }
+
+    /// Ownership is keyed by address, not by slot: an ancestor that touched one
+    /// slot of an address holds the whole `Storage` object, so an inner frame's
+    /// write to a *different* slot of that address also survives.
+    #[test]
+    fn tron_pre_fork_ownership_is_address_scoped_not_slot_scoped() {
+        let touched = U256::from(1);
+        let untouched = U256::from(2);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // depth 1
+        journal.sstore(&mut db, TRON_ADDR, touched, U256::from(1), false).unwrap();
+        let inner = journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, untouched, U256::from(7), false).unwrap();
+        journal.checkpoint_revert(inner);
+        assert_eq!(present(&journal, TRON_ADDR, untouched), U256::from(7));
+    }
+
+    /// The SSTORE cost model must see a retained write. java bills RESET (5000)
+    /// rather than SET (20000) when the row is already cached, and pre-fork a
+    /// reverted frame's rows stay in the shared row cache. Ownership is
+    /// established with an SLOAD because a zero-to-zero SSTORE journals its own
+    /// entry, which would make the assertion hold with or without retention.
+    #[test]
+    fn tron_pre_fork_sstore_cost_sees_reverted_row() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // depth 1
+        journal.sload(&mut db, TRON_ADDR, key, false).unwrap();
+        let inner = journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, key, U256::ZERO, false).unwrap();
+        journal.checkpoint_revert(inner);
+        let result = journal
+            .sstore(&mut db, TRON_ADDR, key, U256::from(7), false)
+            .unwrap();
+        assert!(result.data.prev_written_this_tx);
+    }
+
+    /// A retained write must keep its slot warm. Reverting the slot's
+    /// `StorageWarmed` entry marks it cold; the next warm-up then resets
+    /// `original_value` to `present_value`, which makes the surviving write
+    /// compare equal to its original and be skipped when state is flushed to
+    /// the store. The write would be silently lost with no error anywhere.
+    #[test]
+    fn tron_pre_fork_retained_slot_stays_warm() {
+        let owned = U256::from(1);
+        let fresh = U256::from(2);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // depth 1
+        journal.sstore(&mut db, TRON_ADDR, owned, U256::from(1), false).unwrap();
+        let inner = journal.checkpoint(); // depth 2, first touch of `fresh`
+        journal.sstore(&mut db, TRON_ADDR, fresh, U256::from(2), false).unwrap();
+        journal.checkpoint_revert(inner);
+        // The ancestor reads the slot back, re-warming it if it went cold.
+        journal.sload(&mut db, TRON_ADDR, fresh, false).unwrap();
+        assert_eq!(present(&journal, TRON_ADDR, fresh), U256::from(2));
+        assert_eq!(
+            original(&journal, TRON_ADDR, fresh),
+            U256::ZERO,
+            "original_value must stay 0 so the surviving write is flushed"
+        );
+    }
+
+    /// A frame reverting keeps writes only to addresses a *live* shallower frame
+    /// owns. An untouched second address in the same frame is unaffected.
+    #[test]
+    fn tron_pre_fork_retention_is_per_address() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        journal.checkpoint(); // depth 1, owns TRON_ADDR only
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+        let inner = journal.checkpoint(); // depth 2
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(2), false).unwrap();
+        journal.sstore(&mut db, TRON_OTHER_ADDR, key, U256::from(3), false).unwrap();
+        journal.checkpoint_revert(inner);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::from(2));
+        assert_eq!(present(&journal, TRON_OTHER_ADDR, key), U256::ZERO);
+    }
+
+    /// The entry frame is depth 1, so a top-level revert always finds
+    /// `owner_depth >= 1`, never `< 1`, and discards everything — matching java
+    /// never committing `rootRepository` for a failed transaction.
+    #[test]
+    fn tron_pre_fork_top_level_revert_discards_everything() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(true);
+        let top = journal.checkpoint(); // depth 1
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(4), false).unwrap();
+        journal.checkpoint_revert(top);
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::ZERO);
+        assert!(journal.tron_storage_owner_depth.is_empty());
+    }
+
+    /// With the flag off the owner map is never populated, so post-fork
+    /// execution allocates nothing and takes the unmodified revert path.
+    #[test]
+    fn tron_post_fork_owner_map_stays_empty() {
+        let key = U256::from(1);
+        let (mut journal, mut db) = tron_journal(false);
+        journal.checkpoint();
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(1), false).unwrap();
+        journal.sload(&mut db, TRON_OTHER_ADDR, key, false).unwrap();
+        let inner = journal.checkpoint();
+        journal.sstore(&mut db, TRON_ADDR, key, U256::from(2), false).unwrap();
+        let journal_len_before = journal.journal.len();
+        journal.checkpoint_revert(inner);
+        assert!(journal.tron_storage_owner_depth.is_empty());
+        assert_eq!(present(&journal, TRON_ADDR, key), U256::from(1));
+        // Nothing is re-appended, so the journal truncates exactly to the
+        // checkpoint index.
+        assert_eq!(journal.journal.len(), inner.journal_i);
+        assert!(journal_len_before > inner.journal_i);
     }
 }

@@ -97,6 +97,16 @@ pub trait JournalEntryTr {
     fn as_storage_change(&self) -> Option<(Address, StorageKey)> {
         None
     }
+
+    /// TRON parity helper: the `(address, key)` of a slot-warming entry.
+    ///
+    /// Paired with [`Self::as_storage_change`] by the pre-`ENERGY_LIMIT_HARD_FORK`
+    /// revert path, which must keep a surviving write's slot warm so the slot's
+    /// original value is not reset to its present value on the next warm-up.
+    /// Default `None`.
+    fn as_storage_warmed(&self) -> Option<(Address, StorageKey)> {
+        None
+    }
 }
 
 /// Status of selfdestruction revert.
@@ -288,6 +298,13 @@ impl JournalEntryTr for JournalEntry {
     fn as_storage_change(&self) -> Option<(Address, StorageKey)> {
         match self {
             JournalEntry::StorageChanged { address, key, .. } => Some((*address, *key)),
+            _ => None,
+        }
+    }
+
+    fn as_storage_warmed(&self) -> Option<(Address, StorageKey)> {
+        match self {
+            JournalEntry::StorageWarmed { address, key } => Some((*address, *key)),
             _ => None,
         }
     }

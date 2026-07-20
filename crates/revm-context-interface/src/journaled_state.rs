@@ -235,6 +235,13 @@ pub trait JournalTr {
     /// [`Self::tron_chain_id_word`]). Default no-op.
     fn set_tron_chain_id_word(&mut self, _word: Option<U256>) {}
 
+    /// TRON fork: enable pre-`ENERGY_LIMIT_HARD_FORK` shared-`Storage`
+    /// semantics, where a reverting frame's writes to an address a live
+    /// ancestor already touched survive the revert (java
+    /// `RepositoryImpl.getStorage` aliases the parent's object instead of deep
+    /// copying it). Default no-op for journals that don't carry the TRON cfg.
+    fn set_tron_shared_storage_across_frames(&mut self, _enabled: bool) {}
+
     /// Sets EIP-7708 configuration flags.
     ///
     /// - `disabled`: Whether EIP-7708 (ETH transfers emit logs) is completely disabled.

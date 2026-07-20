@@ -284,6 +284,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn set_tron_shared_storage_across_frames(&mut self, enabled: bool) {
+        self.inner.cfg.tron_shared_storage_across_frames = enabled;
+    }
+
+    #[inline]
     fn set_eip7708_config(&mut self, disabled: bool, delayed_burn_disabled: bool) {
         self.inner
             .set_eip7708_config(disabled, delayed_burn_disabled);

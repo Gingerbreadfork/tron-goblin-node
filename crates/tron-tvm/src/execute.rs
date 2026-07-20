@@ -693,6 +693,13 @@ fn execute_trigger_inner(
         );
         ctx.journaled_state
             .set_tron_chain_id_word(Some(tron_chain_id_word(stores)));
+        // TRON storage isolation: before ENERGY_LIMIT_HARD_FORK a child
+        // repository shares its ancestor's `Storage` object, so a reverting
+        // frame's writes to an already-touched address survive. The height
+        // comes from the persisted head, never the block being applied.
+        ctx.journaled_state.set_tron_shared_storage_across_frames(
+            !tron_chainbase::energy_limit_hard_fork_active(&stores.dynamic_properties),
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -1054,6 +1061,13 @@ fn execute_trigger_inner_with_tracer(
         );
         ctx.journaled_state
             .set_tron_chain_id_word(Some(tron_chain_id_word(stores)));
+        // TRON storage isolation: before ENERGY_LIMIT_HARD_FORK a child
+        // repository shares its ancestor's `Storage` object, so a reverting
+        // frame's writes to an already-touched address survive. The height
+        // comes from the persisted head, never the block being applied.
+        ctx.journaled_state.set_tron_shared_storage_across_frames(
+            !tron_chainbase::energy_limit_hard_fork_active(&stores.dynamic_properties),
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -1621,6 +1635,13 @@ pub fn execute_create_with_trace(
         );
         ctx.journaled_state
             .set_tron_chain_id_word(Some(tron_chain_id_word(stores)));
+        // TRON storage isolation: before ENERGY_LIMIT_HARD_FORK a child
+        // repository shares its ancestor's `Storage` object, so a reverting
+        // frame's writes to an already-touched address survive. The height
+        // comes from the persisted head, never the block being applied.
+        ctx.journaled_state.set_tron_shared_storage_across_frames(
+            !tron_chainbase::energy_limit_hard_fork_active(&stores.dynamic_properties),
+        );
     }
     let mut evm = Evm {
         ctx,

@@ -71,14 +71,6 @@ pub fn execute_clear_abi(
 // UpdateEnergyLimitContractActuator
 // =============================================================================
 
-/// java `CommonParameter.blockNumForEnergyLimit` — node-config gate (default
-/// `enery.limit.block.num`). On mainnet it is the historical activation height
-/// of the per-contract `origin_energy_limit` field; before it,
-/// `UpdateEnergyLimitContract` is not a recognized contract type and the tx
-/// FAILs. The replay/snapshot window is far past this height, so the gate is
-/// satisfied — it is added for full-history parity.
-const BLOCK_NUM_FOR_ENERGY_LIMIT: i64 = 4_727_890;
-
 pub fn validate_update_energy_limit(
     accounts: &AccountStore,
     contracts: &ContractStore,
@@ -88,8 +80,10 @@ pub fn validate_update_energy_limit(
     // java UpdateEnergyLimitContractActuator.validate opens with
     // `ReceiptCapsule.checkForEnergyLimit(ds)` = `latestBlockHeaderNumber >=
     // blockNumForEnergyLimit`; failing it throws ("unexpected type
-    // [UpdateEnergyLimitContract]") → the tx FAILs.
-    if dyn_props.latest_block_header_number().unwrap_or(0) < BLOCK_NUM_FOR_ENERGY_LIMIT {
+    // [UpdateEnergyLimitContract]") → the tx FAILs. Before that height the
+    // per-contract `origin_energy_limit` field does not exist and the contract
+    // type is unrecognized.
+    if !tron_chainbase::energy_limit_hard_fork_active(dyn_props) {
         return Err(ActuatorError::EnergyLimitNotActivated);
     }
     let owner = require_owner(&contract.owner_address)?;
