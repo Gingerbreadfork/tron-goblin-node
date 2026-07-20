@@ -1591,7 +1591,10 @@ impl TronDatabaseExt for TronDatabase {
             return 0;
         };
         let owner = evm_to_tron_address(&caller);
-        if frozen_balance <= 0 || frozen_balance < TRX_PRECISION || resource_type > 2 {
+        if frozen_balance <= 0 || frozen_balance < TRX_PRECISION {
+            return 0;
+        }
+        if !stake_v2_resource_valid(&dyn_props, resource_type) {
             return 0;
         }
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
@@ -1652,7 +1655,7 @@ impl TronDatabaseExt for TronDatabase {
         let Some(dyn_props) = self.dyn_props.clone() else {
             return 0;
         };
-        if unfreeze_balance <= 0 || resource_type > 2 {
+        if unfreeze_balance <= 0 || !stake_v2_resource_valid(&dyn_props, resource_type) {
             return 0;
         }
         let owner = evm_to_tron_address(&caller);
@@ -2387,6 +2390,30 @@ const BLACKHOLE_ADDRESS: [u8; 21] = [
 
 const FROZEN_PERIOD_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
+/// Whether `resource_type` is a legal argument to the Stake-2.0
+/// freeze/unfreeze opcodes, per the `switch` in java-tron's
+/// `FreezeBalanceV2Processor.validate` and `UnfreezeBalanceV2Processor.validate`.
+///
+/// BANDWIDTH (0) and ENERGY (1) are always legal. TRON_POWER (2) belongs to
+/// the new resource model and is legal only while
+/// `supportAllowNewResourceModel()` holds — `ALLOW_NEW_RESOURCE_MODEL == 1`,
+/// which no mainnet proposal has ever enabled. Anything else falls to the
+/// switch's default arm and is rejected outright.
+///
+/// Delegation has no such branch: `DelegateResourceProcessor` and
+/// `UnDelegateResourceProcessor` accept BANDWIDTH and ENERGY only, regardless
+/// of the resource model.
+fn stake_v2_resource_valid(
+    dyn_props: &tron_chainbase::DynamicPropertiesStore,
+    resource_type: u32,
+) -> bool {
+    match resource_type {
+        0 | 1 => true,
+        2 => dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1,
+        _ => false,
+    }
+}
+
 /// java-tron `AccountCapsule.getFrozenV2BalanceWithDelegated(resource)` — the
 /// held FreezeV2 of `resource` PLUS the balance this account has delegated OUT
 /// for that resource. This is the basis the chain-wide weight is floored from in
@@ -2903,9 +2930,12 @@ mod tests {
 
     /// Regression: the TVM v2 freeze/unfreeze must update `TOTAL_TRON_POWER_WEIGHT`
     /// for resource TRON_POWER (2) — the old code's `_ => {}` arm dropped it.
+    /// TRON_POWER is only a legal resource code while the new resource model is
+    /// active (`FreezeBalanceV2Processor.validate`), so the fixture enables it.
     #[test]
     fn tvm_freeze_v2_updates_tron_power_weight() {
         let (db, dyn_props) = make_staking_db();
+        dyn_props.put_long(b"ALLOW_NEW_RESOURCE_MODEL", 1);
         let owner = tron_addr(0x52);
         db.accounts
             .put(
