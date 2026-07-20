@@ -6279,6 +6279,7 @@ dependencies = [
  "sha3 0.10.9",
  "subtle",
  "thiserror 1.0.69",
+ "tracing",
  "tron-chainbase",
  "tron-crypto",
  "tron-proto",

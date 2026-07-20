@@ -330,6 +330,7 @@ impl TronPrecompiles {
             }
         };
 
+        record_precompile_use(pre);
         let exec_result = pre.execute(input_bytes, &ctx);
         let (status, bytes, gas_used) = match exec_result {
             Ok(out) => (PrecompileStatus::Success, Bytes::from(out), energy_cost),
@@ -624,5 +625,22 @@ where
 
     fn warm_addresses(&self) -> &AddressSet {
         &self.warm
+    }
+}
+
+/// First-use log for the TRON precompiles.
+///
+/// Several of these addresses have no known caller on mainnet, which changes
+/// how much weight their tests carry: a precompile nothing invokes is guarded
+/// only by its unit tests, since no replay can exercise it. One `INFO` line the
+/// first time each address is dispatched answers that from a real sync without
+/// adding per-call log volume.
+fn record_precompile_use(pre: PrecompileImpl) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // One bit per variant; `PrecompileImpl` is a plain C-like enum well under 64.
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let bit = 1u64 << (pre as u8 & 63);
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        tracing::info!("precompile first use: {:?} at {:?}", pre, pre.address());
     }
 }
