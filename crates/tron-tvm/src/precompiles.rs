@@ -1146,8 +1146,17 @@ fn recover_addr_by_sign(sign: &[u8], hash: &[u8; WORD_SIZE]) -> Option<[u8; 20]>
     rs.copy_from_slice(&sign[0..64]);
     let v = sign[64];
     let recid = if v >= 27 { v - 27 } else { v };
-    let rec_id = RecoveryId::try_from(recid).ok()?;
-    let sig = Signature::from_slice(&rs).ok()?;
+    let mut rec_id = RecoveryId::try_from(recid).ok()?;
+    let mut sig = Signature::from_slice(&rs).ok()?;
+    // java bounds `s` only by the group order (`ECDSASignature.validateComponents`
+    // requires `1 <= s < n`), so a high-s signature recovers normally. k256
+    // refuses to recover from one, so fold it to its low-s equivalent and flip
+    // the recovery parity: with `s' = n - s` the recovered point is `-R`, and
+    // `r^-1 * (s'(-R) - eG)` is the same key as `r^-1 * (sR - eG)`.
+    if let Some(normalized) = sig.normalize_s() {
+        sig = normalized;
+        rec_id = RecoveryId::try_from(rec_id.to_byte() ^ 1).ok()?;
+    }
     let vk = VerifyingKey::recover_from_prehash(hash, &sig, rec_id).ok()?;
     let enc = vk.to_encoded_point(false);
     let pub_bytes = enc.as_bytes();
