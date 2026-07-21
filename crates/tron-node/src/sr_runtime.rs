@@ -28,17 +28,21 @@
 //!
 //! ## Concurrency model
 //!
-//! The runtime shares the chain state (StateBackends, KhaosDb,
+//! The runtime shares the durable chain stores (StateBackends,
 //! BlockUndoStore, BlockStore, BlockIndexStore) with the per-peer
-//! SyncDriver tasks. KhaosDb dedup means it's safe for either side
-//! to apply a block first: if a peer happens to gossip our own
-//! produced block back via a different path, `accept_block` will
-//! return `AlreadyKnown` and skip re-execution. There's a thin
-//! window where SR runtime and a peer-driver race on `apply_block`
-//! for the same number, but the state writes are idempotent (same
-//! block, same outcome) — the KhaosDb head re-election ensures only
-//! one of the two writes the head pointer, and the other becomes a
-//! `SideFork` no-op.
+//! SyncDriver tasks, but keeps its OWN in-memory `KhaosDb` fork tree
+//! — the sync-driver fleet shares one tree and a single-applier apply
+//! lock among themselves; the SR runtime participates in neither.
+//! Each side's own KhaosDb dedup means it's safe for either to apply a
+//! block first: if a peer happens to gossip our own produced block
+//! back via a different path, that driver's `accept_block` returns
+//! `AlreadyKnown` (or `SideFork`) and skips re-execution. There's a
+//! thin window where the SR runtime and a peer-driver race on
+//! `apply_block` for the same number, but the state writes are
+//! idempotent (same block, same outcome) and each side's KhaosDb head
+//! re-election leaves only one head-pointer writer, the other a
+//! no-op. Serialising this SR-vs-sync apply is a separate, pre-existing
+//! concern the fleet apply lock does not cover (witness mode only).
 
 use std::sync::Arc;
 use std::time::Duration;

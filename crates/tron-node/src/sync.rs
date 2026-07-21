@@ -4938,6 +4938,16 @@ impl SyncDriver {
     ///     behavior. The KhaosDb correctly tracks the divergence so
     ///     the SR runtime and a future reorg implementation can use
     ///     it.
+    ///
+    /// **Fleet callers must hold the single-applier lock.** This method
+    /// mutates the shared chain state and does NOT take the apply lock
+    /// itself. In a multi-driver fleet it must only be reached through a
+    /// path that holds [`SyncLeadership::lock_apply`] — the pool-drain batch
+    /// ([`Self::drain_pool`]), the near-tip single-block path, or
+    /// [`Self::accept_block_synced`] — otherwise two drivers can mutate the
+    /// shared stores concurrently. Lock-free direct calls are for
+    /// single-applier contexts only (offline replay, the SR runtime's own
+    /// tree, tests).
     pub fn accept_block(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
         // `txTrieRoot`: for blocks received from the network the peer loop
         // stashes the raw wire bytes, so we hash each transaction's original
@@ -9262,5 +9272,69 @@ mod pipelined_apply_tests {
         assert!(!driver.pipeline_open);
         assert!(driver.pipeline.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the PRODUCTION single-applier guard on the pool-drain path
+    /// (`drain_pool`), not just the `accept_block_synced` test entry: while
+    /// another holder owns the fleet apply lock, `drain_pool` must BLOCK
+    /// before it mutates — the head cannot advance — and it applies only once
+    /// the lock is released. Ablation: drop the `lock_apply()` acquisition in
+    /// `drain_pool` and the block is applied while the lock is held (head
+    /// advances inside the held window), tripping the mid-window assertion.
+    #[test]
+    fn drain_pool_blocks_on_the_fleet_apply_lock() {
+        use prost::Message as _;
+
+        let state = mem_state();
+        let leadership = Arc::new(SyncLeadership::new());
+        let shared = Arc::new(tron_consensus::KhaosDb::new());
+        let pool = Arc::new(SyncFetchPool::new());
+        let mut driver = driver_with(state.clone(), mem())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()))
+            .with_leadership(leadership.clone())
+            .with_shared_khaos(shared.clone())
+            .with_fetch_pool(pool.clone());
+
+        // Genesis applied (head = 1); block 2 queued in the pool, ready.
+        let g = signed_block(1, [0u8; 32]);
+        let gid = block_id_from_block(&g).unwrap();
+        assert!(matches!(driver.accept_block(&g, None), AcceptOutcome::Accepted(_)));
+        let b2 = signed_block(2, *gid.as_bytes());
+        let id2 = block_id_from_block(&b2).unwrap();
+        pool.push_wants([(2i64, *id2.as_bytes())]);
+        pool.deliver(*id2.as_bytes(), b2.encode_to_vec());
+        let mut expected: std::collections::VecDeque<[u8; 32]> = std::collections::VecDeque::new();
+        expected.push_back(*id2.as_bytes());
+
+        let head_num = || {
+            DynamicPropertiesStore::new(state.dyn_props.clone())
+                .latest_block_header_number()
+                .unwrap_or(0)
+        };
+        assert_eq!(head_num(), 1);
+
+        // Hold the fleet apply lock, then run drain_pool on another thread.
+        let guard = leadership.lock_apply();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let applied = std::thread::scope(|s| {
+            let b = barrier.clone();
+            let pool_t = pool.clone();
+            let h = s.spawn(move || {
+                let mut prev = None;
+                let mut ts = 0i64;
+                b.wait();
+                driver.drain_pool(&pool_t, &mut expected, "probe", &mut prev, &mut ts)
+            });
+            barrier.wait();
+            // While WE hold the lock, drain_pool cannot apply — the head must
+            // stay put no matter how long we wait.
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(head_num(), 1, "drain_pool applied while the fleet apply lock was held");
+            drop(guard); // release → drain_pool proceeds
+            h.join().unwrap()
+        });
+
+        assert_eq!(applied, 1, "the pooled block applies once the lock is free");
+        assert_eq!(head_num(), 2, "head advanced after the lock was released");
     }
 }
