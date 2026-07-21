@@ -1866,6 +1866,16 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // stand by, so concurrent drivers don't race the shared head.
         let leadership = std::sync::Arc::new(crate::sync::SyncLeadership::new());
 
+        // ONE fork tree shared by the whole driver fleet. Each driver used to
+        // keep a private KhaosDb; a driver promoted to leader after a standby
+        // stretch then held a stale tree missing the ancestry other leaders
+        // applied, so the block it drained orphan-stashed and the head pinned
+        // (the deep-bulk-sync wedge). With a single shared tree every push
+        // goes into the same tree under the fleet apply lock, so a promoted
+        // leader's next block always links and executes. (The SR runtime keeps
+        // its own tree — separate apply path, witness mode only.)
+        let shared_khaos = std::sync::Arc::new(tron_consensus::KhaosDb::new());
+
         // Cooperative multi-peer fetch pool, shared by every driver: workers
         // fetch the backlog in parallel (each within its peer's offered
         // window) and the leader applies in order. `None` ⇒ single-peer path.
@@ -2091,6 +2101,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             let peer_registry_for_peer = peer_registry.clone();
             let eviction_tx_for_peer = eviction_tx.clone();
             let leadership_for_peer = leadership.clone();
+            let shared_khaos_for_peer = shared_khaos.clone();
             let exec_config_for_peer = exec_config;
             let snapshot_stack_for_peer = if config.storage.snapshot_reorg {
                 Some(stores.snapshots.clone())
@@ -2132,6 +2143,7 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
                     .with_exec_config(exec_config_for_peer)
                     .with_pubsub(pubsub_for_peer)
                     .with_leadership(leadership_for_peer)
+                    .with_shared_khaos(shared_khaos_for_peer)
                     // Production runs the per-tx replay gate. The
                     // `BlockIndexStore` is populated from
                     // `initialize_genesis` onward, so the validator

@@ -1047,3 +1047,414 @@ fn orphan_chain_recovers_via_reorg_after_parent_arrives() {
         "executed head converged onto the promoted orphan chain"
     );
 }
+
+// ===========================================================================
+// Deep-bulk-sync recovery (sync-recovery-v2): fleet apply-lock + shared fork
+// tree. Each test below exercises a FAILURE MODE the wedge/BROKEN review
+// called out, and is written so it discriminates: it passes with the fix and
+// fails when the fix is ablated (documented per-test).
+// ===========================================================================
+
+use std::sync::Barrier;
+use tron_chainbase::BlockUndoStore;
+use tron_consensus::KhaosDb;
+use tron_node::sync::SyncLeadership;
+
+/// Build a linear canonical chain `1..=n` (block 1 is genesis-like), apply it
+/// through `driver`, and return every block with its id in height order.
+fn build_and_apply_chain(driver: &mut SyncDriver, n: i64) -> Vec<(Block, tron_types::BlockId)> {
+    let mut out: Vec<(Block, tron_types::BlockId)> = Vec::new();
+    let mut parent = [0u8; 32];
+    for num in 1..=n {
+        let b = build_block(num, parent);
+        let id = block_id_from_block(&b).unwrap();
+        let prev = if num == 1 { None } else { Some(out.last().unwrap().1) };
+        match driver.accept_block(&b, prev) {
+            AcceptOutcome::Accepted(got) => assert_eq!(got, id, "clean extension at {num}"),
+            other => panic!("setup apply of block {num} failed: {other:?}"),
+        }
+        parent = *id.as_bytes();
+        out.push((b, id));
+    }
+    out
+}
+
+/// The wedge and its structural fix, side by side. A driver promoted to leader
+/// after a standby stretch holds a fork tree anchored far below the shared
+/// executed head. With PRIVATE trees the block it drains has no parent in its
+/// tree → orphan-stash → head pins (the observed wedge). With ONE shared tree
+/// the parent is already linked → the block executes → the head advances.
+///
+/// Ablation: drop the `with_shared_khaos` on `b_shared` (private trees) and the
+/// shared half wedges exactly like the private half — the recovery assertion
+/// fails.
+#[test]
+fn stale_promotion_wedges_with_private_trees_but_recovers_with_shared_tree() {
+    // --- Private trees: reproduce the wedge ---
+    {
+        let (state, blocks_be) = fresh_state();
+        seed_alice(&state);
+        // Driver B was briefly active early (tree anchored at height 2), then
+        // stood by.
+        let mut b_priv = make_driver(state.clone(), blocks_be.clone());
+        let early = build_and_apply_chain(&mut b_priv, 2);
+        assert_eq!(b_priv.head_number(), 2);
+
+        // Driver A leads and advances the SHARED executed head far past B's
+        // tree, on its OWN private tree.
+        let mut a = make_driver(state.clone(), blocks_be.clone());
+        // A re-seeds from disk (window ending at the shared head 2), then
+        // extends to 20.
+        let mut parent = *early[1].1.as_bytes();
+        let mut top_id = early[1].1;
+        for num in 3..=20 {
+            let blk = build_block(num, parent);
+            let id = block_id_from_block(&blk).unwrap();
+            assert!(matches!(a.accept_block(&blk, Some(top_id)), AcceptOutcome::Accepted(_)));
+            parent = *id.as_bytes();
+            top_id = id;
+        }
+        assert_eq!(a.head_number(), 20);
+
+        // Promote B: its private tree is still at height 2, so block 21
+        // orphan-stashes and the head PINS. This is the wedge.
+        let blk21 = build_block(21, *top_id.as_bytes());
+        let out = b_priv.accept_block(&blk21, Some(top_id));
+        assert!(
+            matches!(&out, AcceptOutcome::RejectedValidation(r) if r.contains("unlinked")),
+            "private stale tree must orphan-stash block 21 (the wedge): {out:?}"
+        );
+        assert_eq!(b_priv.head_number(), 20, "head pinned — no progress");
+    }
+
+    // --- Shared tree: recover ---
+    {
+        let (state, blocks_be) = fresh_state();
+        seed_alice(&state);
+        let shared = Arc::new(KhaosDb::new());
+
+        let mut b_shared = make_driver(state.clone(), blocks_be.clone())
+            .with_shared_khaos(shared.clone());
+        let early = build_and_apply_chain(&mut b_shared, 2);
+        assert_eq!(b_shared.head_number(), 2);
+
+        let mut a = make_driver(state.clone(), blocks_be.clone())
+            .with_shared_khaos(shared.clone());
+        let mut parent = *early[1].1.as_bytes();
+        let mut top_id = early[1].1;
+        for num in 3..=20 {
+            let blk = build_block(num, parent);
+            let id = block_id_from_block(&blk).unwrap();
+            assert!(matches!(a.accept_block(&blk, Some(top_id)), AcceptOutcome::Accepted(_)));
+            parent = *id.as_bytes();
+            top_id = id;
+        }
+        assert_eq!(a.head_number(), 20);
+
+        // Promote B: with the shared tree, block 20's parent chain is present,
+        // so block 21 links and EXECUTES. The head advances — no wedge.
+        let blk21 = build_block(21, *top_id.as_bytes());
+        let out = b_shared.accept_block(&blk21, Some(top_id));
+        assert!(
+            matches!(out, AcceptOutcome::Accepted(_)),
+            "shared tree must let the promoted driver apply block 21: {out:?}"
+        );
+        assert_eq!(b_shared.head_number(), 21, "head advanced — wedge resolved");
+    }
+}
+
+/// The shared-tree recovery must not depend on the 256-block re-seed window: a
+/// promotion gap DEEPER than that window still recovers, because the shared
+/// tree already holds the ancestry (a re-seed would only cover the last 256).
+///
+/// Ablation: private trees + a >256 gap can't be repaired by re-seeding the
+/// promoted driver either, so this is a shared-tree-only property.
+#[test]
+fn deep_stale_promotion_beyond_seed_window_recovers_with_shared_tree() {
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let shared = Arc::new(KhaosDb::new());
+
+    let mut b = make_driver(state.clone(), blocks_be.clone())
+        .with_shared_khaos(shared.clone());
+    let early = build_and_apply_chain(&mut b, 2);
+
+    // Advance ~400 blocks (well past the 256 seed window, under the 1024 LRU).
+    let mut a = make_driver(state.clone(), blocks_be.clone())
+        .with_shared_khaos(shared.clone());
+    let mut parent = *early[1].1.as_bytes();
+    let mut top_id = early[1].1;
+    for num in 3..=400 {
+        let blk = build_block(num, parent);
+        let id = block_id_from_block(&blk).unwrap();
+        assert!(matches!(a.accept_block(&blk, Some(top_id)), AcceptOutcome::Accepted(_)));
+        parent = *id.as_bytes();
+        top_id = id;
+    }
+    assert_eq!(a.head_number(), 400);
+
+    let blk401 = build_block(401, *top_id.as_bytes());
+    let out = b.accept_block(&blk401, Some(top_id));
+    assert!(matches!(out, AcceptOutcome::Accepted(_)), "deep-gap promotion applies: {out:?}");
+    assert_eq!(b.head_number(), 401);
+}
+
+/// The lost-peer → churn scenario, bounded. Model repeated leadership takeovers
+/// where each promoted driver re-drains the SAME window the pool re-offers.
+/// With the shared tree every takeover makes progress and re-delivered blocks
+/// are exactly-once (`AlreadyKnown`), so the head keeps advancing instead of
+/// pinning, and nothing double-applies.
+#[test]
+fn repeated_leadership_takeover_applies_each_block_exactly_once() {
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let shared = Arc::new(KhaosDb::new());
+    let leadership = Arc::new(SyncLeadership::new());
+
+    // A rotating fleet of drivers, all sharing state + tree + leadership.
+    let mut fleet: Vec<SyncDriver> = (0..4)
+        .map(|_| {
+            make_driver(state.clone(), blocks_be.clone())
+                .with_shared_khaos(shared.clone())
+                .with_leadership(leadership.clone())
+        })
+        .collect();
+
+    // Genesis via the first driver.
+    let g = build_block(1, [0u8; 32]);
+    let gid = block_id_from_block(&g).unwrap();
+    assert!(matches!(fleet[0].accept_block_synced(&g, None), AcceptOutcome::Accepted(_)));
+
+    // Build a 30-block window.
+    let mut blocks: Vec<(Block, tron_types::BlockId)> = Vec::new();
+    let mut parent = *gid.as_bytes();
+    for num in 2..=31 {
+        let b = build_block(num, parent);
+        let id = block_id_from_block(&b).unwrap();
+        parent = *id.as_bytes();
+        blocks.push((b, id));
+    }
+
+    let mut total_applied_deltas = 0usize;
+    let baseline: Vec<usize> = fleet.iter().map(|d| d.stats().blocks_applied).collect();
+
+    // Deliver the window one block at a time, but rotate the "leader" every
+    // block AND re-deliver the previous block to the new leader (the churn +
+    // re-offer pattern). Each block must apply exactly once across the fleet.
+    for (i, (blk, _id)) in blocks.iter().enumerate() {
+        let leader = i % fleet.len();
+        // Re-deliver the already-applied previous block to this leader first
+        // (pool re-offer): must be AlreadyKnown / no-op, never re-executed.
+        if i > 0 {
+            let (pblk, _pid) = &blocks[i - 1];
+            let out = fleet[leader].accept_block_synced(pblk, None);
+            assert!(
+                matches!(out, AcceptOutcome::AlreadyKnown(_) | AcceptOutcome::SideFork(_)),
+                "re-delivered block must not re-execute: {out:?}"
+            );
+        }
+        let out = fleet[leader].accept_block_synced(blk, None);
+        assert!(matches!(out, AcceptOutcome::Accepted(_)), "block {} applies: {out:?}", i + 2);
+    }
+
+    for (d, base) in fleet.iter().zip(baseline) {
+        total_applied_deltas += d.stats().blocks_applied - base;
+    }
+    // Exactly the 30 window blocks executed, once each — no double-apply from
+    // the churn/re-offer.
+    assert_eq!(total_applied_deltas, 30, "each window block applied exactly once");
+    assert_eq!(fleet[0].head_number(), 31, "head advanced across all the takeovers");
+}
+
+/// A genuinely divergent fork — one whose chain does NOT contain the latest
+/// solidified block — is STILL rejected under the shared tree + apply lock. The
+/// fix must not weaken fork choice.
+#[test]
+fn divergent_fork_still_rejected_under_shared_tree_and_lock() {
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let shared = Arc::new(KhaosDb::new());
+    let leadership = Arc::new(SyncLeadership::new());
+    let mut driver = make_driver(state.clone(), blocks_be.clone())
+        .with_shared_khaos(shared.clone())
+        .with_leadership(leadership.clone());
+
+    let chain = build_and_apply_chain(&mut driver, 3);
+    let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+    // Solidify block 2 — any winning chain must contain it.
+    dp.save_latest_solidified_block_num(2);
+
+    // A fork that diverges at block 1 (salted), so it does NOT contain the
+    // solidified block 2: f2' → f3' → f4' (height 4, would top the head).
+    let block1_id = chain[0].1;
+    let store = BlockStore::new(blocks_be.clone());
+    let f2 = build_block_salted(2, *block1_id.as_bytes(), 7);
+    let f2id = block_id_from_block(&f2).unwrap();
+    let f3 = build_block_salted(3, *f2id.as_bytes(), 7);
+    let f3id = block_id_from_block(&f3).unwrap();
+    let f4 = build_block_salted(4, *f3id.as_bytes(), 7);
+    // Persist the fork blocks so the containment walk can traverse them and
+    // reach a GENUINE divergence verdict (not a chain-gap skip).
+    store.put(&f2id, &f2).unwrap();
+    store.put(&f3id, &f3).unwrap();
+    // Record the siblings in the shared tree, then present the fork tip.
+    assert!(matches!(driver.accept_block_synced(&f2, Some(block1_id)), AcceptOutcome::SideFork(_)));
+    assert!(matches!(driver.accept_block_synced(&f3, Some(f2id)), AcceptOutcome::SideFork(_)));
+    let out = driver.accept_block_synced(&f4, Some(f3id));
+    assert!(
+        matches!(out, AcceptOutcome::RejectedSolidifiedDiverged(_)),
+        "divergent fork must be rejected by the solidified-containment gate: {out:?}"
+    );
+    assert_eq!(driver.head_number(), 3, "canonical head unchanged after rejecting the fork");
+}
+
+/// A reorg whose old chain runs past undo-record coverage is refused CLEANLY —
+/// with the chain untouched — rather than rolling back the covered blocks and
+/// then getting stuck (a partial-rollback hybrid state).
+///
+/// Ablation: remove the up-front undo-coverage gate in `perform_reorg` and the
+/// rollback loop unwinds block 4, then fails on block 3's missing record,
+/// leaving the head at 3 with block 4 gone — a hybrid state; the "head
+/// unchanged" assertion below then fails.
+#[test]
+fn reorg_refused_cleanly_when_undo_coverage_incomplete() {
+    let (state, blocks_be) = fresh_state();
+    seed_alice(&state);
+    let undo_be: Arc<dyn KvBackend> = mem();
+    let undo = BlockUndoStore::new(undo_be);
+    let mut driver = make_driver(state.clone(), blocks_be.clone())
+        .with_undo_store(undo.clone());
+
+    // Canonical 1..=4.
+    let chain = build_and_apply_chain(&mut driver, 4);
+    assert_eq!(driver.head_number(), 4);
+
+    // Simulate undo coverage that has been pruned below the reorg depth: drop
+    // block 3's undo record (block 4's is kept). A reorg forking at block 2
+    // must roll back [4, 3] — block 3 is now uncovered.
+    undo.delete(3).unwrap();
+
+    // Fork branching at block 2: f3' → f4' → f5' (height 5, tops the head).
+    let block2_id = chain[1].1;
+    let f3 = build_block_salted(3, *block2_id.as_bytes(), 9);
+    let f3id = block_id_from_block(&f3).unwrap();
+    let f4 = build_block_salted(4, *f3id.as_bytes(), 9);
+    let f4id = block_id_from_block(&f4).unwrap();
+    let f5 = build_block_salted(5, *f4id.as_bytes(), 9);
+    assert!(matches!(driver.accept_block(&f3, Some(block2_id)), AcceptOutcome::SideFork(_)));
+    assert!(matches!(driver.accept_block(&f4, Some(f3id)), AcceptOutcome::SideFork(_)));
+
+    let out = driver.accept_block(&f5, Some(f4id));
+    assert!(
+        matches!(&out, AcceptOutcome::RejectedValidation(r) if r.contains("undo")),
+        "reorg past undo coverage must be refused cleanly: {out:?}"
+    );
+    // Chain UNTOUCHED — no partial rollback.
+    assert_eq!(driver.head_number(), 4, "head unchanged after the clean refusal");
+    let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+    assert_eq!(bi.get(4).unwrap(), chain[3].1, "canonical index unchanged at height 4");
+    assert_eq!(bi.get(3).unwrap(), chain[2].1, "canonical index unchanged at height 3");
+}
+
+/// Forced concurrent takeover during a reorg: two drivers, sharing state +
+/// undo + leadership, both attempt the SAME fork switch at the same instant.
+/// The fleet apply lock must serialise them so the reorg happens exactly once —
+/// no double rollback, no double-apply, no `MissingUndoRecord` from a consumed
+/// undo record. Runs the race many times; with the lock it is deterministic.
+///
+/// Ablation: drop the `lock_apply` acquisition in `accept_block_synced` (or in
+/// `drain_pool` / the near-tip path) and the two threads race the undo log —
+/// one thread hits `MissingUndoRecord` (undo consumed by the other) or the
+/// applied-count/ index diverges, tripping an assertion in some iteration.
+#[test]
+fn concurrent_reorg_takeover_is_single_applier_exactly_once() {
+    for iter in 0..40 {
+        let (state, blocks_be) = fresh_state();
+        seed_alice(&state);
+        let undo_be: Arc<dyn KvBackend> = mem();
+        let undo = BlockUndoStore::new(undo_be);
+        let leadership = Arc::new(SyncLeadership::new());
+
+        // Driver A applies canonical 1..=3 (writes undo for 2 and 3). It keeps
+        // a PRIVATE tree on purpose, so the shared-tree dedup can't mask the
+        // lock: this isolates the apply lock as the thing under test.
+        let mut a = make_driver(state.clone(), blocks_be.clone())
+            .with_undo_store(undo.clone())
+            .with_leadership(leadership.clone());
+        let chain = build_and_apply_chain(&mut a, 3);
+
+        // Driver B: separate tree, same shared state/undo/leadership. Seed B's
+        // tree WITHOUT executing (so it can classify the same reorg) by pushing
+        // the blocks straight into its fork tree.
+        let mut b = make_driver(state.clone(), blocks_be.clone())
+            .with_undo_store(undo.clone())
+            .with_leadership(leadership.clone());
+        b.khaos().start(chain[0].0.clone()).unwrap();
+        b.khaos().push(chain[1].0.clone()).unwrap();
+        b.khaos().push(chain[2].0.clone()).unwrap();
+
+        // A fork branching at block 2 that tops the head: f3' → f4' (height 4).
+        let block2_id = chain[1].1;
+        let f3 = build_block_salted(3, *block2_id.as_bytes(), 3);
+        let f3id = block_id_from_block(&f3).unwrap();
+        let f4 = build_block_salted(4, *f3id.as_bytes(), 3);
+        let f4id = block_id_from_block(&f4).unwrap();
+        // Record the fork sibling f3 in BOTH trees (as a side fork). f4 is
+        // presented live to trigger the reorg.
+        assert!(matches!(a.accept_block(&f3, Some(block2_id)), AcceptOutcome::SideFork(_)));
+        b.khaos().push(f3.clone()).unwrap();
+
+        let a_base = a.stats().blocks_applied;
+        let b_base = b.stats().blocks_applied;
+
+        // Both drivers race to switch to f4 at the same instant. Each thread
+        // returns its outcome AND its driver (moved in), so the post-race
+        // per-driver applied counts are readable.
+        let barrier = Arc::new(Barrier::new(2));
+        let (oa, a, ob, b) = std::thread::scope(|s| {
+            let ba = barrier.clone();
+            let f4a = f4.clone();
+            let ha = s.spawn(move || {
+                ba.wait();
+                let o = a.accept_block_synced(&f4a, Some(f3id));
+                (o, a)
+            });
+            let bb = barrier.clone();
+            let f4b = f4.clone();
+            let hb = s.spawn(move || {
+                bb.wait();
+                let o = b.accept_block_synced(&f4b, Some(f3id));
+                (o, b)
+            });
+            let (ra, a) = ha.join().unwrap();
+            let (rb, b) = hb.join().unwrap();
+            (ra, a, rb, b)
+        });
+
+        // Neither driver may report a corruption (a MissingUndoRecord rollback
+        // fault surfaces as RejectedExecution). Both must end Accepted(f4).
+        for (who, o) in [("A", &oa), ("B", &ob)] {
+            match o {
+                AcceptOutcome::Accepted(id) => assert_eq!(*id, f4id, "iter {iter}: {who} head=f4"),
+                other => panic!("iter {iter}: {who} did not cleanly converge: {other:?}"),
+            }
+        }
+
+        // Reload the state to read the committed head/index (both drivers wrote
+        // to the same backends).
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        assert_eq!(
+            dp.latest_block_header_hash().unwrap(),
+            Some(*f4id.as_bytes()),
+            "iter {iter}: executed head is the fork tip"
+        );
+        let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+        assert_eq!(bi.get(3).unwrap(), f3id, "iter {iter}: index repointed to fork at 3");
+        assert_eq!(bi.get(4).unwrap(), f4id, "iter {iter}: index repointed to fork at 4");
+
+        // The new fork's two blocks (f3, f4) executed EXACTLY ONCE across the
+        // whole fleet — not once per driver.
+        let applied = (a.stats().blocks_applied - a_base) + (b.stats().blocks_applied - b_base);
+        assert_eq!(applied, 2, "iter {iter}: fork applied exactly once across the fleet");
+    }
+}

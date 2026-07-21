@@ -198,6 +198,19 @@ pub struct SyncLeadership {
     /// following the tip late and may be replaced by a peer that has the tip.
     /// Monotonic (`fetch_max`); raised only by sane, near-head adverts.
     network_tip: std::sync::atomic::AtomicI64,
+    /// Fleet-wide single-applier lock. Every driver that mutates the shared
+    /// chain state holds this for the full duration of its synchronous apply
+    /// region (a pool-drain batch, or a single near-tip block), so at most one
+    /// driver ever mutates the shared stores at a time — the invariant that
+    /// makes a leadership handoff exactly-once instead of a double-apply.
+    /// Leadership decides *who tries* to apply; this decides *who actually
+    /// mutates*. The two are separate on purpose: a leadership lease can expire
+    /// mid-reorg, but a standby that claims the freed slot still cannot mutate
+    /// until it takes this lock, by which point the displaced leader's apply
+    /// (and its pipelined commit) has fully completed and the standby's retry
+    /// no-ops. Uncontended in steady state (only the leader applies); contended
+    /// only during the brief handoff overlap.
+    apply_lock: std::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -223,7 +236,19 @@ impl SyncLeadership {
                 last_change: Instant::now(),
             }),
             network_tip: std::sync::atomic::AtomicI64::new(0),
+            apply_lock: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Acquire the fleet single-applier lock. Held for the full duration of a
+    /// driver's synchronous apply region so no two drivers mutate the shared
+    /// chain state concurrently (see [`SyncLeadership::apply_lock`]). Poison is
+    /// propagated deliberately: a panic while a guard is held can only happen
+    /// mid-apply, where a multi-block reorg may have left a partial state —
+    /// halting the fleet's apply loudly is safer than letting another driver
+    /// build on possibly-inconsistent state (a restart + reconcile repairs).
+    pub fn lock_apply(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.apply_lock.lock().expect("SyncLeadership apply lock poisoned")
     }
 
     /// Claim or retain leadership for `peer`. Returns `true` if `peer` is
@@ -1293,6 +1318,33 @@ impl SyncDriver {
         self
     }
 
+    /// Share ONE fork tree across the whole per-peer driver fleet. Without
+    /// this each driver keeps a private [`tron_consensus::KhaosDb`]; a driver
+    /// promoted to leader after a standby stretch then has a stale tree
+    /// missing the ancestry other leaders applied, so the block it drains
+    /// orphan-stashes (parent unknown) and the head pins — the deep-bulk-sync
+    /// wedge. With one shared tree, every push goes into the same tree under
+    /// the fleet apply lock, so a promoted leader's next block always links
+    /// and executes. Omitted by tests / the SR runtime / single-peer setups,
+    /// which keep their own tree.
+    pub fn with_shared_khaos(mut self, khaos: Arc<tron_consensus::KhaosDb>) -> Self {
+        self.khaos = khaos;
+        self
+    }
+
+    /// Apply one block as the fleet's single applier: take the shared apply
+    /// lock (if a leadership coordinator is attached) for the whole
+    /// [`Self::accept_block`], so it cannot run concurrently with another
+    /// driver's apply on the shared stores. The production hot paths
+    /// ([`Self::drain_pool`] and the near-tip single-block path) take the same
+    /// lock at their own (batch / block) granularity; this entry is the
+    /// single-block equivalent used off the pool path.
+    pub fn accept_block_synced(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
+        let lead = self.leadership.clone();
+        let _apply_guard = lead.as_ref().map(|l| l.lock_apply());
+        self.accept_block(block, prev_id)
+    }
+
     /// Attach a shared, continuously-grown discovery pool. ROTATION
     /// drivers merge newly-discovered peers from it each loop iteration so
     /// the dial set stays fresh over long runs. Pinned (configured) drivers
@@ -1630,6 +1682,21 @@ impl SyncDriver {
         // to a sibling for the duration (no-op off the multi-threaded
         // runtime; see `tron_rpc::blocking`).
         tron_rpc::blocking::run_blocking(|| {
+            // Fleet single-applier lock, held across the WHOLE batch —
+            // `open_pipeline` → apply loop → `close_pipeline` flush. Held that
+            // wide on purpose: with `vm.pipelined_apply` a block's commit runs
+            // on a background committer that outlives the `accept_block` call,
+            // so a per-block lock would let a standby start mutating while this
+            // batch's last commit was still in flight. Holding it across the
+            // flush guarantees the background committer is joined before any
+            // other driver can mutate. Uncontended in steady state (only the
+            // leader drains); a standby contends only during a handoff and then
+            // finds the work already applied (`AlreadyKnown`). Skipped without
+            // a leadership coordinator (single-peer / tests) — no fleet to
+            // serialise against. `lead` is a local Arc clone so the guard does
+            // not borrow `self`, leaving `&mut self` free below.
+            let lead = self.leadership.clone();
+            let _apply_guard = lead.as_ref().map(|l| l.lock_apply());
             // Open the pipelining window for this batch: blocks applied below
             // overlap their commit + undo I/O with the next block's execution
             // (`vm.pipelined_apply`). The window closes with a flush before
@@ -4356,6 +4423,13 @@ impl SyncDriver {
                     // starve the co-located RPC accept loop (no-op off the
                     // multi-threaded runtime; see `tron_rpc::blocking`).
                     tron_rpc::blocking::run_blocking(|| {
+                        // Fleet single-applier lock, held across the apply. No
+                        // pipeline on this path, so the commit is synchronous
+                        // and one block wide is the right granularity. `lead`
+                        // is a local Arc clone so the guard does not borrow
+                        // `self`.
+                        let lead = self.leadership.clone();
+                        let _apply_guard = lead.as_ref().map(|l| l.lock_apply());
                         self.apply_block(
                             &block,
                             raw_block_bytes,
@@ -4996,7 +5070,14 @@ impl SyncDriver {
             // start. Bounded by khaos capacity (1024) and far deeper than
             // any DPoS-final fork.
             const SEED_WINDOW: i64 = 256;
-            if let Some(head_id) = self.resume_head() {
+            if self.khaos.head().is_some() {
+                // Shared fork tree already seeded by another driver in the
+                // fleet. `KhaosDb::start` OVERWRITES the head, so re-seeding a
+                // populated shared tree would corrupt it — adopt the existing
+                // tree instead. (Under the fleet apply lock exactly one driver
+                // reaches the seed branch below; the rest land here.)
+                self.khaos_started = true;
+            } else if let Some(head_id) = self.resume_head() {
                 // Resume from disk: seed KhaosDb with a WINDOW of recent
                 // ancestors (oldest-first), not just the head. A shallow
                 // tip-fork — a competing block at or just below our head —
@@ -6295,8 +6376,44 @@ impl SyncDriver {
             }
         };
 
+        // Undo-coverage gate: verify EVERY old-chain block has an undo record
+        // BEFORE rolling any of them back. `rollback_block` consumes (deletes)
+        // each record as it replays, so discovering a missing record mid-walk
+        // would leave a partial-rollback hybrid state — the newer blocks
+        // already unwound, the older ones still applied, and no clean way
+        // forward. Checking up front turns that into a clean refusal with the
+        // chain untouched. This also bounds a reorg to undo coverage
+        // structurally: below the coverage floor (from-genesis / pre-PBFT, or a
+        // pruned undo log) we refuse rather than corrupt.
+        for kb in &path_old {
+            match undo_store.get(kb.num) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    warn!(
+                        block = kb.num,
+                        "reorg refused: undo record missing for an old-chain block; \
+                         refusing to roll back past undo coverage (chain untouched)"
+                    );
+                    return AcceptOutcome::RejectedValidation(format!(
+                        "reorg refused: missing undo record at block {} \
+                         (would roll back past undo coverage)",
+                        kb.num
+                    ));
+                }
+                Err(e) => {
+                    warn!(?e, block = kb.num, "reorg refused: undo record decode failed");
+                    return AcceptOutcome::RejectedValidation(format!(
+                        "reorg refused: undo record decode failed at block {}: {e:?}",
+                        kb.num
+                    ));
+                }
+            }
+        }
+
         // Roll back the old chain, newest first. Each block consumes
         // its undo record (which `rollback_block` deletes after replay).
+        // Coverage was verified above, so a rollback error here is a genuine
+        // apply fault, not a missing-record short-circuit.
         let mut rolled_back: Vec<(BlockId, i64)> = Vec::new();
         for kb in &path_old {
             match tron_executor::rollback_block(&self.state, kb.num, &undo_store) {
