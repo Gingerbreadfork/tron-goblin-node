@@ -346,7 +346,7 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **3216** |
+| Workspace tests passing | **3223** |
 | Ignored — live-network (6), Sapling Groth16 proving (5), perf/diagnostic (7) | 18 |
 | Integration test files (`crates/*/tests/`) | 123 |
 | Source modules with `#[cfg(test)]` blocks | 139 |
@@ -366,8 +366,8 @@ where parity risk lives):
 | `tron-grpc`      |  67 | `tron-firehose-*`|   8 |
 | `tron-proto`     |  13 | `tron-replay`    |   8 |
 
-These principal crates account for 2,561 of the 3,216 passing tests. The
-remaining 655 are `tron-node` (411), `tron-types` (74), the four vendored
+These principal crates account for 2,561 of the 3,223 passing tests. The
+remaining 662 are `tron-node` (418), `tron-types` (74), the four vendored
 `revm-*` forks (136), and the `tron-state-diff` / `tron-snapshot-convert`
 tooling crates (34).
 
@@ -466,7 +466,7 @@ The full workspace compiles in ~3–5 minutes on a modern machine, and the full 
 Tests:
 
 ```sh
-cargo test --workspace            # 3216 tests, all defaults
+cargo test --workspace            # 3223 tests, all defaults
 cargo test --workspace --release -- --include-ignored
                                   # + 18 opt-in: Sapling proving (~50 MB
                                   # Groth16 params), live-network, diagnostics
