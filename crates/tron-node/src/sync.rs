@@ -4610,6 +4610,25 @@ impl SyncDriver {
                         }
                     };
                     let (ids, remain) = self.serve_sync_block_chain(&inv.ids);
+                    // Empty ids means the peer's locator shares no block with
+                    // our main chain — routine for a snapshot-synced node,
+                    // whose index starts at the snapshot base: any peer whose
+                    // whole chain sits below it (or that is on another chain)
+                    // shares nothing. java-tron never replies with an empty
+                    // inventory here — `getLostBlockIds` throws and it
+                    // disconnects with `INCOMPATIBLE_CHAIN` — and a java peer
+                    // that receives one rejects it in
+                    // `ChainInventoryMsgHandler.check()` ("blockIds is empty")
+                    // and drops US with `BAD_PROTOCOL`. Mirror java: close the
+                    // connection instead of emitting a reply the peer refuses.
+                    // The inbound listener handles this case identically.
+                    if ids.is_empty() {
+                        return PeerOutcome::PeerFailure(
+                            "peer syncs from us but shares no common block; \
+                             disconnecting (java INCOMPATIBLE_CHAIN)"
+                                .to_string(),
+                        );
+                    }
                     let reply =
                         tron_net::sync::chain_inventory_from_ids(&ids, remain);
                     if let Err(e) =
