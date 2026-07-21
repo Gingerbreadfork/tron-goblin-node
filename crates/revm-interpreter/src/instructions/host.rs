@@ -7,7 +7,7 @@ use context_interface::{host::LoadError, journaled_state::AccountInfoLoad};
 use core::cmp::min;
 use primitives::{
     hardfork::SpecId::{self, *},
-    Bytes, Log, LogData, B256, BLOCK_HASH_HISTORY, U256,
+    Bytes, Log, LogData, B256, BLOCK_HASH_HISTORY, KECCAK_EMPTY, U256,
 };
 
 use crate::InstructionContext as Ictx;
@@ -61,7 +61,17 @@ pub fn extcodesize<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resul
     let address = top.into_address();
     let account = load_account(&mut context.interpreter.gas, context.host, address, true)?;
     // safe to unwrap because we are loading code
-    *top = U256::from(account.code.as_ref().unwrap().len());
+    let code_len = account.code.as_ref().unwrap().len();
+    // TRON fork: a contract under construction has not deposited its runtime
+    // code yet (java `Program.getCodeAt(self)` is empty during the constructor),
+    // so EXTCODESIZE(address(this)) is 0 — even though our top-level deploy path
+    // pre-installs the init code as the account's `code`. See
+    // `Host::tron_under_construction`.
+    *top = if context.host.tron_under_construction(address) {
+        U256::ZERO
+    } else {
+        U256::from(code_len)
+    };
     Ok(())
 }
 
@@ -73,6 +83,16 @@ pub fn extcodehash<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resul
     let account = load_account(&mut context.interpreter.gas, context.host, address, false)?;
     let acct_code_hash = account.code_hash;
     let acct_is_empty = account.is_empty();
+    // TRON fork: a contract under construction carries no deposited runtime code
+    // yet, so java `Program.getCodeHashAt(self)` returns `sha3("")` (the account
+    // and contract rows exist, but the row's code hash is unset, so it hashes
+    // the empty code). Our top-level deploy pre-installs the init code + its
+    // hash on the account, so without this override EXTCODEHASH would leak the
+    // init-code hash. See `Host::tron_under_construction`.
+    if context.host.tron_under_construction(address) {
+        *top = KECCAK_EMPTY.into_u256();
+        return Ok(());
+    }
     // TRON keys EXTCODEHASH on store EXISTENCE, not EIP-161 emptiness
     // (java `Program.getCodeHashAt`): a genuinely-absent account hashes to 0,
     // but a present account with no code returns KECCAK_EMPTY — which
@@ -121,7 +141,15 @@ pub fn extcodecopy<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Resul
     }
 
     let account = load_account(&mut context.interpreter.gas, context.host, address, true)?;
-    let code = account.code.as_ref().unwrap().original_bytes();
+    let full_code = account.code.as_ref().unwrap().original_bytes();
+    // TRON fork: EXTCODECOPY of a contract under construction copies from empty
+    // code (java `Program.getCodeAt(self)` is empty during the constructor), so
+    // the destination is zero-filled. See `Host::tron_under_construction`.
+    let code = if context.host.tron_under_construction(address) {
+        Bytes::new()
+    } else {
+        full_code
+    };
 
     let code_offset_usize = min(as_usize_saturated!(code_offset), code.len());
 

@@ -109,6 +109,13 @@ pub trait TronDatabaseExt {
         self.tron_account_exists(address)
     }
 
+    /// See [`crate::host::Host::tron_under_construction`] — the top-level deploy
+    /// address whose runtime code is not yet deposited, for which EXTCODE*
+    /// opcodes must observe empty code. Default `false`.
+    fn tron_under_construction(&self, _address: Address) -> bool {
+        false
+    }
+
     /// See [`crate::host::Host::tron_is_precompile`] — java's
     /// `PrecompiledContracts.getContractForAddress(addr) != null` under the
     /// active proposal set.

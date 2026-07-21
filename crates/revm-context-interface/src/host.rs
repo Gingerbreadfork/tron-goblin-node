@@ -352,6 +352,29 @@ pub trait Host {
         self.tron_account_exists(address)
     }
 
+    /// **TRON fork** — `true` while `address` is a contract whose constructor
+    /// is still running and whose runtime code has not yet been deposited, so
+    /// EXTCODESIZE / EXTCODEHASH / EXTCODECOPY on it must observe EMPTY code.
+    ///
+    /// java `Program.getCodeAt` reads `invoke.getDeposit().getCode(addr)`, and
+    /// `VMActuator.create` deposits the runtime code (`rootRepository.saveCode`)
+    /// only AFTER the constructor returns — so during construction `getCode` is
+    /// null and `getCodeAt` returns empty (post-`ALLOW_TVM_CONSTANTINOPLE`).
+    /// EXTCODESIZE is then 0, EXTCODECOPY copies from empty, and EXTCODEHASH is
+    /// `sha3("")` (the contract row exists but carries no code hash yet, so
+    /// `getCodeHashAt` falls through to hashing the empty code).
+    ///
+    /// Our top-level `CreateSmartContract` deploy runs as a CALL to an account
+    /// pre-installed with the init bytecode as its `code`, which would otherwise
+    /// make these opcodes report the init code; this signal restores java's
+    /// empty-during-construction view. Nested CREATE/CREATE2 children already
+    /// read empty (revm gives the constructing account no code until its init
+    /// returns), so this stays `false` for them. Default `false`.
+    #[inline]
+    fn tron_under_construction(&self, _address: Address) -> bool {
+        false
+    }
+
     /// **TRON fork** — is `address` dispatched by java-tron's
     /// `PrecompiledContracts.getContractForAddress` under the active proposal
     /// set?

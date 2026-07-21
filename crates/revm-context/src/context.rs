@@ -694,6 +694,10 @@ impl<
         self.journaled_state.db().tron_account_exists_or_created(address)
     }
 
+    fn tron_under_construction(&self, address: Address) -> bool {
+        self.journaled_state.db().tron_under_construction(address)
+    }
+
     fn tron_is_precompile(&self, address: Address) -> bool {
         self.journaled_state.db().tron_is_precompile(address)
     }

@@ -355,6 +355,31 @@ impl TronDatabaseExt for TronDatabase {
         self.tron_account_exists(address) || self.pending_created_contracts.contains_key(&address)
     }
 
+    fn tron_under_construction(&self, address: Address) -> bool {
+        // The top-level `CreateSmartContract` deploy address, only while its
+        // constructor is running. Our deploy path (`execute_create`) runs the
+        // init code as a CALL to an account pre-installed with that init code as
+        // its `code`, so a plain EXTCODESIZE/EXTCODEHASH/EXTCODECOPY on the
+        // address would read the init bytecode. java instead deposits the
+        // runtime code (`VMActuator.create` -> `rootRepository.saveCode`) only
+        // AFTER the constructor returns, so `Program.getCodeAt(self)` is empty
+        // and these opcodes see 0 / `sha3("")` during construction.
+        //
+        // `top_level_deploy_version` is set once per transaction, by
+        // `execute_create` alone, for exactly this address — so the window is
+        // the whole construction tx and no later tx (a fresh `TronDatabase` with
+        // `None`) is affected. Gated on `ALLOW_TVM_CONSTANTINOPLE` because a
+        // pre-Constantinople `VMActuator.create` pre-saves
+        // `ProgramPrecompile.getCode(initCode)` BEFORE the constructor, so the
+        // deposited code is not empty in that (pre-fork) era.
+        match self.top_level_deploy_version {
+            Some((deploy_addr, _)) if deploy_addr == address => {
+                self.tron_allow_tvm_constantinople()
+            }
+            _ => false,
+        }
+    }
+
     fn tron_contract_version(&self, address: Address) -> i32 {
         // The version of the contract whose code a CALL frame is about to
         // execute. java reads `invoke.getDeposit().getContract(codeAddress)
