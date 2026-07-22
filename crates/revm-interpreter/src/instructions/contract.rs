@@ -919,6 +919,18 @@ pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
     // The resource code keeps the truncating reading: java's v1
     // `parseResourceCode` (Program.java:2240) switches on `DataWord.intValue()`,
     // which accumulates all 32 bytes into an `int` and never throws.
+    // The freezing account's IN-FLIGHT TRX balance. java's
+    // `FreezeBalanceProcessor.validate` gates against the frame `Repository`,
+    // which already holds TRX credited earlier in this same transaction
+    // (top-level callValue is transferred pre-play, VMActuator.java:438-439;
+    // inner-CALL endowments land in the child repository). The journal — not
+    // the chainbase account store — is authoritative for it here, exactly as
+    // for SELFDESTRUCT (host.rs).
+    let owner_balance = context
+        .host
+        .balance(caller)
+        .map(|b| i64::try_from(b.data).unwrap_or(i64::MAX))
+        .unwrap_or(0);
     let result = context.host.tron_freeze(
         caller,
         u256_to_i64_exact(&frozen_balance).unwrap_or(0),
@@ -928,6 +940,7 @@ pub fn freeze<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         0,
         u64_from_u256(&resource_type) as u32,
         Some(receiver),
+        owner_balance,
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
@@ -1117,10 +1130,23 @@ pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
     // `frozen_balance <= 0` guard reproduces java's rejection with no state
     // change. That nonce seeds `generateContractAddress` (Program.java:807), so
     // skipping it would move every later CREATE address in the transaction.
+    // The freezing contract's IN-FLIGHT TRX balance. java's
+    // `FreezeBalanceV2Processor.validate` (line 41) checks frozenBalance against
+    // the frame `Repository`, which already holds TRX received earlier in this
+    // same transaction (top-level callValue is credited pre-play,
+    // VMActuator.java:438-439; inner-CALL endowments land in the child
+    // repository). The journal — not the chainbase account store — is
+    // authoritative for it here, exactly as for SELFDESTRUCT (host.rs).
+    let owner_balance = context
+        .host
+        .balance(caller)
+        .map(|b| i64::try_from(b.data).unwrap_or(i64::MAX))
+        .unwrap_or(0);
     let result = context.host.tron_freeze_balance_v2(
         caller,
         u256_to_i64_exact(&frozen_balance).unwrap_or(0),
         resource_code_v2(&resource_type),
+        owner_balance,
     );
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())

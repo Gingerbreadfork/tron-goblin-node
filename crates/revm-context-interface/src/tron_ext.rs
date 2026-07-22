@@ -148,6 +148,7 @@ pub trait TronDatabaseExt {
         _frozen_duration: i64,
         _resource_type: u32,
         _receiver_address: Option<Address>,
+        _owner_balance: i64,
     ) -> i64 {
         0
     }
@@ -178,6 +179,7 @@ pub trait TronDatabaseExt {
         _caller: Address,
         _frozen_balance: i64,
         _resource_type: u32,
+        _owner_balance: i64,
     ) -> i64 {
         0
     }

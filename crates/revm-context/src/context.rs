@@ -818,6 +818,7 @@ impl<
         frozen_duration: i64,
         resource_type: u32,
         receiver_address: Option<Address>,
+        owner_balance: i64,
     ) -> i64 {
         let result = self.journaled_state.db_mut().tron_freeze(
             caller,
@@ -825,6 +826,7 @@ impl<
             frozen_duration,
             resource_type,
             receiver_address,
+            owner_balance,
         );
         self.apply_tron_balance_delta();
         result
@@ -861,11 +863,13 @@ impl<
         caller: Address,
         frozen_balance: i64,
         resource_type: u32,
+        owner_balance: i64,
     ) -> i64 {
         let result = self.journaled_state.db_mut().tron_freeze_balance_v2(
             caller,
             frozen_balance,
             resource_type,
+            owner_balance,
         );
         self.apply_tron_balance_delta();
         result

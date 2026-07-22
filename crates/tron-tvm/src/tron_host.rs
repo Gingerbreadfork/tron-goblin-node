@@ -1011,6 +1011,7 @@ impl TronDatabaseExt for TronDatabase {
         frozen_duration: i64,
         resource_type: u32,
         receiver_address: Option<Address>,
+        owner_balance: i64,
     ) -> i64 {
         // java `OperationActions.freezeAction`: once Stake-2.0 freeze-v2 is active
         // (`allowTvmFreezeV2` is wired straight to `supportUnfreezeDelay`), the
@@ -1048,9 +1049,14 @@ impl TronDatabaseExt for TronDatabase {
         let Ok(Some(mut owner_account)) = self.accounts.get(&owner) else {
             return 0;
         };
+        // java `FreezeBalanceProcessor.validate` (line 34) gates on the frame
+        // `Repository` balance, which includes TRX credited earlier in this
+        // same tx (top-level callValue / inner-CALL endowments) that the
+        // chainbase row hasn't seen yet — the journal-authoritative
+        // `owner_balance`.
         if frozen_balance <= 0
             || frozen_balance < TRX_PRECISION
-            || frozen_balance > owner_account.balance
+            || frozen_balance > owner_balance
         {
             return 0;
         }
@@ -1191,7 +1197,10 @@ impl TronDatabaseExt for TronDatabase {
             _ => self.add_energy_weight_journaled(&dyn_props, weight),
         }
 
-        owner_account.balance -= frozen_balance;
+        // Set the chainbase row to java's `getBalance() - frozenBalance`
+        // (repo balance incl. same-tx credits); the journal is debited by
+        // `frozen_balance` below so the two ledgers converge on commit.
+        owner_account.balance = owner_balance - frozen_balance;
         self.put_account_journaled(&owner, &owner_account);
         // Tell the Host to debit the caller's journaled balance so
         // subsequent BALANCE / commit observes the post-freeze view.
@@ -1609,6 +1618,7 @@ impl TronDatabaseExt for TronDatabase {
         caller: Address,
         frozen_balance: i64,
         resource_type: u32,
+        owner_balance: i64,
     ) -> i64 {
         // java `Program.freezeBalanceV2`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
@@ -1625,10 +1635,18 @@ impl TronDatabaseExt for TronDatabase {
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
             return 0;
         };
-        if account.balance < frozen_balance {
+        // java `FreezeBalanceV2Processor.validate` (line 41) gates on the frame
+        // `Repository` balance — which includes TRX received earlier in this
+        // same tx (top-level callValue / inner-CALL endowments); the chainbase
+        // row lags those journal-only transfers until commit. `execute`
+        // (lines 102-103) then writes `getBalance() - frozenBalance`. Mirror
+        // both with the journal-authoritative `owner_balance`. (Seed of the
+        // block-84,536,008 sTRX runaway: a 32M-TRX deposit() froze its own
+        // callValue; the stale chainbase check rejected it, java accepted it.)
+        if owner_balance < frozen_balance {
             return 0;
         }
-        account.balance -= frozen_balance;
+        account.balance = owner_balance - frozen_balance;
         let resource = resource_type as i32;
         // Weight is floored from `getFrozenV2BalanceWithDelegated` (held +
         // delegated-out), read BEFORE the stake is added — java's
@@ -2798,12 +2816,59 @@ mod tests {
             )
             .unwrap();
         let mut db = db;
-        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 1_500_000, 1);
+        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 1_500_000, 1, 100_000_000);
         assert_eq!(r, 1, "freeze should succeed");
         assert_eq!(
             dyn_props.total_energy_weight(),
             2,
             "energy weight must use with-delegated basis: floor(2.2)-floor(0.7)=2 (old held-only bug gave 1)"
+        );
+    }
+
+    /// Regression for the block-84,536,008 sTRX runaway: FREEZEBALANCEV2 (0xda)
+    /// must validate against the caller's IN-FLIGHT balance (`owner_balance`,
+    /// from the journal, which already holds this tx's callValue / inner-CALL
+    /// endowments), NOT the stale chainbase account row. JustLend's sTRX proxy
+    /// `deposit()` freezes its own incoming `msg.value`, so a large deposit into
+    /// a near-empty pool must SUCCEED — java credits callValue pre-play
+    /// (VMActuator.java:438-439) and `FreezeBalanceV2Processor.validate` gates on
+    /// `repo.getAccount().getBalance()`. The old code read `account.balance`,
+    /// returned 0, and the contract reverted → 341k-divergence cascade.
+    #[test]
+    fn tvm_freeze_v2_gates_on_in_flight_balance_not_chainbase_row() {
+        let (db, _dyn_props) = make_staking_db();
+        let owner = tron_addr(0x53);
+        let owner2 = tron_addr(0x54);
+        // Both chainbase rows hold only 1 TRX — the pre-tx float.
+        for a in [owner, owner2] {
+            db.accounts
+                .put(
+                    &TronAddress::from_raw(a),
+                    &Account { address: a.to_vec(), balance: 1_000_000, ..Default::default() },
+                )
+                .unwrap();
+        }
+        let mut db = db;
+        // In-flight balance = 1 TRX chainbase + 31 TRX callValue credited this
+        // tx = 32 TRX. Freezing 30 TRX must SUCCEED though the chainbase row
+        // alone (1 TRX) is far short.
+        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 30_000_000, 1, 32_000_000);
+        assert_eq!(r, 1, "freeze must succeed against the in-flight balance");
+        let after = db.accounts.get(&TronAddress::from_raw(owner)).unwrap().unwrap();
+        assert_eq!(
+            after.balance, 2_000_000,
+            "chainbase row = owner_balance - frozen (java execute writes getBalance()-frozenBalance)"
+        );
+        assert_eq!(
+            after.frozen_v2.iter().find(|f| f.r#type == 1).map(|f| f.amount),
+            Some(30_000_000),
+            "30 TRX staked to energy"
+        );
+        // Negative: an in-flight balance below the freeze still fails (return 0).
+        assert_eq!(
+            db.tron_freeze_balance_v2(evm_addr_from_tron(owner2), 30_000_000, 1, 20_000_000),
+            0,
+            "freeze must fail when the in-flight balance is short"
         );
     }
 
@@ -2969,7 +3034,7 @@ mod tests {
             )
             .unwrap();
         let mut db = db;
-        assert_eq!(db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 5_000_000, 2), 1);
+        assert_eq!(db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 5_000_000, 2, 100_000_000), 1);
         assert_eq!(
             dyn_props.total_tron_power_weight(),
             5,
@@ -3035,9 +3100,9 @@ mod tests {
         let caller = evm_addr_from_tron(tron_addr(0xaa));
         let receiver = evm_addr_from_tron(tron_addr(0xbb));
         assert_eq!(db.create_nonce, 0);
-        db.tron_freeze(caller, 1_000_000, 3, 0, None);
+        db.tron_freeze(caller, 1_000_000, 3, 0, None, 0);
         db.tron_unfreeze(caller, 0, None);
-        db.tron_freeze_balance_v2(caller, 1_000_000, 0);
+        db.tron_freeze_balance_v2(caller, 1_000_000, 0, 0);
         db.tron_unfreeze_balance_v2(caller, 1_000_000, 0);
         db.tron_withdraw_expire_unfreeze(caller);
         db.tron_cancel_all_unfreeze_v2(caller);
