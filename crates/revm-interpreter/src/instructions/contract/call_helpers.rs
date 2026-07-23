@@ -7,7 +7,7 @@ use context_interface::{cfg::GasParams, host::LoadError, Host};
 use core::{cmp::min, ops::Range};
 use primitives::{
     hardfork::SpecId::{self, *},
-    Address, B256, U256,
+    Address, B256, KECCAK_EMPTY, U256,
 };
 use state::Bytecode;
 
@@ -198,6 +198,10 @@ pub fn load_account_delegated<H: Host + ?Sized>(
     let warm_storage_read_cost = host.gas_params().warm_storage_read_cost();
 
     let skip_cold_load = is_berlin && remaining_gas < additional_cold_cost;
+    // TRON fork: capture whether the code address is a contract still under
+    // construction BEFORE the `&mut` account load, so the empty-code override at
+    // the final return needs no second borrow of `host`.
+    let under_construction = host.tron_under_construction(address);
     let account = host.load_account_info_skip_cold_load(address, true, skip_cold_load)?;
     if is_berlin && account.is_cold {
         cost += additional_cold_cost;
@@ -254,6 +258,24 @@ pub fn load_account_delegated<H: Host + ?Sized>(
         }
         bytecode = delegate_account.code.clone().unwrap_or_default();
         code_hash = delegate_account.code_hash();
+    }
+
+    // TRON fork: a CALL whose code address is a contract still UNDER
+    // CONSTRUCTION executes EMPTY code. java's `Program.callToAddress` fetches
+    // `getContractState().getCode(codeAddress)`, empty until `saveCode` runs
+    // AFTER the constructor returns (Program.java:1071-1072, :943). Our
+    // top-level deploy pre-installs the init code as the account's `code`
+    // (tron-tvm `execute.rs`), so without this override a re-entrant CALL back
+    // into the still-constructing deployer (e.g. a payout `.transfer()`) runs
+    // its init code and OOGs on the 2300-gas stipend instead of just crediting
+    // value. Mirrors the EXTCODESIZE/EXTCODEHASH/EXTCODECOPY under-construction
+    // overrides. Existence + gas accounting stay untouched — the account still
+    // exists; only its EXECUTED code becomes empty. The empty-account early
+    // return above is never reached here (the pre-installed init code makes an
+    // under-construction account non-empty).
+    if under_construction {
+        bytecode = Bytecode::default();
+        code_hash = KECCAK_EMPTY;
     }
 
     Ok((cost, state_gas_cost, bytecode, code_hash))

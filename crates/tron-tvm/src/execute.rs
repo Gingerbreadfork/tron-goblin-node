@@ -1400,7 +1400,15 @@ pub fn execute_create_with_trace(
         &tron_contract_addr,
         &tron_proto::Account {
             address: tron_contract_addr.as_bytes().to_vec(),
-            balance: smart_contract.call_value.max(0),
+            // Balance stays 0 here — NOT call_value. The endowment is moved
+            // exactly once, by the tx-value transfer the init-code CALL below
+            // carries (`.value(call_value)` → `CallValue::Transfer` →
+            // `transfer_loaded`). This mirrors java `VMActuator.create`: the
+            // account is created at balance 0, then a SINGLE
+            // `MUtil.transfer(caller, contract, callValue)` (VMActuator.java:439).
+            // Pre-crediting call_value here too double-credits the contract, so
+            // SELFBALANCE reads 2× the endowment inside the constructor.
+            balance: 0,
             code: init_code.clone(),
             code_hash: init_hash.to_vec(),
             // java stamps create_time on contract creation (= head-block

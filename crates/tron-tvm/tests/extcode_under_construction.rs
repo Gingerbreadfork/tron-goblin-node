@@ -384,3 +384,150 @@ fn later_tx_sees_real_runtime_code_size() {
         "runtime code size must be exactly 5"
     );
 }
+
+/// Same as `deploy` but with a non-zero `call_value` endowment — the caller
+/// must be pre-funded for at least `call_value` plus energy.
+fn deploy_with_value(
+    stores: &VmStores,
+    owner: [u8; 21],
+    init_code: Vec<u8>,
+    tx_id: [u8; 32],
+    call_value: i64,
+) -> VmOutcome {
+    let create = CreateSmartContract {
+        owner_address: owner.to_vec(),
+        new_contract: Some(SmartContract {
+            origin_address: owner.to_vec(),
+            contract_address: vec![],
+            abi: Some(Abi::default()),
+            bytecode: init_code,
+            call_value,
+            consume_user_resource_percent: 100,
+            name: "Endowed".into(),
+            origin_energy_limit: 1_000_000,
+            code_hash: vec![],
+            trx_hash: vec![],
+            version: 1,
+        }),
+        call_token_value: 0,
+        token_id: 0,
+    };
+    execute_create(
+        stores,
+        VmBlockEnv {
+            block_number: 1,
+            block_timestamp_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+        &create,
+        &tx_id,
+        1_000_000,
+    )
+}
+
+/// Big-endian 32-byte word for an unsigned integer, matching the EVM stack /
+/// storage-slot encoding.
+fn word_of(n: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..32].copy_from_slice(&n.to_be_bytes());
+    w
+}
+
+/// Regression for the endowment double-credit fix (`execute.rs`): a
+/// value-endowed `CreateSmartContract` must credit the new contract EXACTLY
+/// ONCE. java `VMActuator.create` creates the account at balance 0 then does a
+/// single `MUtil.transfer(caller, contract, callValue)`; the init-code CALL our
+/// path uses carries that same one transfer. Pre-installing the account with
+/// `call_value` as well double-credited it, so the balance the constructor
+/// observes (here via BALANCE(address(this)); SELFBALANCE reads the identical
+/// quantity) — and the committed post-deploy balance — came out at 2× the
+/// endowment. Every other create test in the repo uses `call_value: 0`, so this
+/// path was previously untested.
+#[test]
+fn endowment_is_credited_exactly_once_during_construction() {
+    let stores = fresh_stores();
+    let owner = tron_addr(0xa5);
+    install_caller(&stores, owner, 1_000_000_000);
+    let endowment: i64 = 5000;
+
+    // BALANCE(address(this)) -> SSTORE slot0 ; RETURN empty runtime.
+    let init = vec![
+        0x30, // ADDRESS
+        0x31, // BALANCE          -> balance(self)
+        0x60, 0x00, // PUSH1 0
+        0x55, // SSTORE slot0 = balance(self)
+        0x60, 0x00, // PUSH1 0    (return len)
+        0x60, 0x00, // PUSH1 0    (return off)
+        0xf3, // RETURN           (empty runtime)
+    ];
+    let out = deploy_with_value(&stores, owner, init, [0x66; 32], endowment);
+    let deployed = addr_from_return(&out);
+
+    assert_eq!(
+        read_slot(&stores, deployed, slot(0)),
+        word_of(endowment as u64),
+        "BALANCE(address(this)) inside the constructor must equal the endowment \
+         exactly once ({endowment}), not 2×"
+    );
+    let committed = stores
+        .accounts
+        .get(&Address::from_raw(deployed))
+        .unwrap()
+        .expect("deployed contract account must exist")
+        .balance;
+    assert_eq!(
+        committed, endowment,
+        "committed post-deploy contract balance must equal the endowment exactly \
+         once ({endowment}), not 2×"
+    );
+}
+
+/// Regression for the CALL-into-under-construction fix (`call_helpers.rs`): a
+/// CALL whose target is the top-level contract still under construction must
+/// load EMPTY code — java `Program.callToAddress` reads `getCode` from the code
+/// store, which post-Constantinople `saveCode` only populates AFTER the whole
+/// construction tx's `VM.play` returns. So the callee's init code must NOT
+/// re-execute. The constructor increments a storage counter once, then CALLs
+/// address(this); with the fix the CALL hits empty code (a no-op that just
+/// succeeds), leaving the counter at 1. Without it, the CALL re-enters the init
+/// code — re-running the increment (and recursing) — so the committed counter
+/// would exceed 1. This is the CALL-path analog of the EXTCODE* cases above.
+#[test]
+fn call_into_self_during_construction_runs_empty_code() {
+    let stores = fresh_stores();
+    let owner = tron_addr(0xa6);
+    install_caller(&stores, owner, 1_000_000_000);
+
+    let init = vec![
+        // slot0 += 1
+        0x60, 0x00, // PUSH1 0
+        0x54, // SLOAD  slot0
+        0x60, 0x01, // PUSH1 1
+        0x01, // ADD
+        0x60, 0x00, // PUSH1 0
+        0x55, // SSTORE slot0 = slot0 + 1
+        // CALL(gas, self, value=0, 0, 0, 0, 0) — args pushed bottom-to-top so
+        // gas ends on top of the stack.
+        0x60, 0x00, // PUSH1 0   retSize
+        0x60, 0x00, // PUSH1 0   retOffset
+        0x60, 0x00, // PUSH1 0   argsSize
+        0x60, 0x00, // PUSH1 0   argsOffset
+        0x60, 0x00, // PUSH1 0   value
+        0x30, // ADDRESS         (callee = self, still under construction)
+        0x5a, // GAS             (forward all remaining)
+        0xf1, // CALL
+        0x50, // POP             (discard the success flag)
+        0x60, 0x00, // PUSH1 0   (return len)
+        0x60, 0x00, // PUSH1 0   (return off)
+        0xf3, // RETURN          (empty runtime)
+    ];
+    let out = deploy(&stores, owner, init, [0x77; 32]);
+    let deployed = addr_from_return(&out);
+
+    assert!(
+        is_one(read_slot(&stores, deployed, slot(0))),
+        "the counter must be 1: the CALL into the under-construction self hit \
+         empty code and did NOT re-run the init code (which would increment it \
+         again)"
+    );
+}
