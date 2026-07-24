@@ -1042,6 +1042,62 @@ mod tests {
         assert_eq!(db.linked_size(), 1);
     }
 
+    /// Pins the fork-tree contract the sync layer's `removeBlk`-on-failed-switch
+    /// fix relies on: when a fork switch aborts and the old chain is restored,
+    /// the driver removes the ENTIRE new branch from the tree and repoints the
+    /// head at the restored old tip. That is what lets a later re-delivery of
+    /// the branch be re-attempted — `accept_block` dedups on
+    /// `contains_in_linked`, so a branch left linked after a failed switch would
+    /// be swallowed as `AlreadyKnown` forever (the tip-fork wedge). Mirrors
+    /// java-tron `Manager.switchFork`: `first.forEach(removeBlk)` then
+    /// `setHead(binaryTree.getValue().peekFirst())`.
+    #[test]
+    fn remove_branch_and_set_head_restores_old_tip() {
+        let db = KhaosDb::new();
+        let g = mk_block(1, [0u8; 32], 0);
+        let g_id = id_of(&g);
+        let mut g_bytes = [0u8; 32];
+        g_bytes.copy_from_slice(&g_id.as_bytes()[..]);
+        db.start(g).unwrap();
+
+        // Old (executed) tip: A(2), the first-arrived sibling at height 2.
+        let a = mk_block(2, g_bytes, 0);
+        let a_id = id_of(&a);
+        db.push(a).unwrap();
+        assert_eq!(db.head().unwrap().id, a_id, "A heads after arriving first");
+
+        // Competing branch B(2)→C(3): longer, so khaos promotes C as the
+        // switch candidate (the reorg the driver would attempt and — in the
+        // wedge scenario — fail to apply).
+        let b = mk_block(2, g_bytes, 1);
+        let b_id = id_of(&b);
+        let mut b_bytes = [0u8; 32];
+        b_bytes.copy_from_slice(&b_id.as_bytes()[..]);
+        db.push(b).unwrap();
+        let c = mk_block(3, b_bytes, 1);
+        let c_id = id_of(&c);
+        db.push(c).unwrap();
+        assert_eq!(db.head().unwrap().id, c_id, "C wins the longest-chain race");
+
+        // Simulate the aborted switch (Fix A1b): remove the whole new branch,
+        // then pin the head back at the restored executed tip A.
+        assert!(db.remove(&c_id));
+        assert!(db.remove(&b_id));
+        let a_kb = db.get(&a_id).expect("old tip A must still be linked");
+        db.set_head(a_kb);
+
+        // Head restored, and the removed branch is GONE from the linked store —
+        // so a re-delivery of B/C is no longer AlreadyKnown and is retryable.
+        assert_eq!(db.head().unwrap().id, a_id, "head restored to old tip A");
+        assert!(db.contains_in_linked(&a_id), "A stays linked");
+        assert!(!db.contains_in_linked(&b_id), "B removed → re-deliverable");
+        assert!(!db.contains_in_linked(&c_id), "C removed → re-deliverable");
+
+        // Re-pushing the branch re-links it (the switch is retryable, not wedged).
+        db.push(mk_block(2, g_bytes, 1)).unwrap();
+        assert!(db.contains_in_linked(&b_id), "B re-links on re-delivery");
+    }
+
     #[test]
     fn lru_pruning_drops_blocks_below_threshold() {
         let db = KhaosDb::new();

@@ -727,7 +727,46 @@ fn reorg_recovery_restores_old_chain_when_new_fork_block_fails() {
         Some(*id_3a.as_bytes()),
         "head pointer must be 3a after failed reorg"
     );
-    let _ = (id_4b,);
+
+    // Retryability guard (the removeBlk-on-failed-switch fix): the aborted
+    // switch must ALSO leave the fork tree clean — the entire failed branch
+    // removed from khaos and the head repointed at the restored tip. Without
+    // it, 2b/3b/4b stay linked and every re-delivery short-circuits to
+    // `AlreadyKnown`, so the switch is never re-attempted: a permanent tip
+    // wedge on correct state (java `Manager.switchFork` removeBlk + setHead).
+    assert!(!driver.khaos().contains_in_linked(&id_2b), "2b removed from khaos");
+    assert!(!driver.khaos().contains_in_linked(&id_3b), "3b removed from khaos");
+    assert!(!driver.khaos().contains_in_linked(&id_4b), "4b removed from khaos");
+    assert_eq!(
+        driver.khaos().head().unwrap().id,
+        id_3a,
+        "khaos head restored to the old tip 3a"
+    );
+
+    // Re-deliver the branch, now with a VALID tip (a transient apply failure
+    // that resolves on retry). Because the branch was removed, the
+    // re-deliveries are re-processed (not AlreadyKnown-swallowed), the reorg is
+    // re-attempted, and the head advances — proving the wedge is gone. Before
+    // the fix these would return AlreadyKnown and the head would stay at 3.
+    assert!(
+        matches!(driver.accept_block(&b2b, Some(gid)), AcceptOutcome::SideFork(_)),
+        "2b re-delivers as a fresh side fork, not AlreadyKnown"
+    );
+    assert!(
+        matches!(driver.accept_block(&b3b, Some(id_2b)), AcceptOutcome::SideFork(_)),
+        "3b re-delivers as a fresh side fork, not AlreadyKnown"
+    );
+    let b4b_ok = build_sibling(4, *id_3b.as_bytes(), 0); // empty state root → valid
+    let retry = driver.accept_block(&b4b_ok, Some(id_3b));
+    assert!(
+        matches!(retry, AcceptOutcome::Accepted(_)),
+        "reorg is re-attempted and succeeds on the valid tip; got {retry:?}"
+    );
+    assert_eq!(
+        driver.head_number(),
+        4,
+        "head advances to the re-delivered valid branch — no AlreadyKnown wedge"
+    );
 }
 
 /// Verify SyncDriver emits BlockEvent + TransactionEvent through the

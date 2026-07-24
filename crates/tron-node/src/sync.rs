@@ -3340,6 +3340,22 @@ impl SyncDriver {
             // cover them (the watchdog backstops the rare case where no live
             // window does). Drain whatever's already delivered immediately.
             if multi_peer && am_leader && !was_leader {
+                // Start THIS leader's stall clocks at promotion. Both self-heal
+                // watchdogs below measure elapsed time against counters that
+                // otherwise still carry values from before this driver took
+                // leadership — so a driver promoted after the head has been idle
+                // (no-advance watchdog: `last_head_advance`) or near a crawl
+                // sample boundary (crawl watchdog: `crawl_window_at`) can trip
+                // the hard-reset in the very iteration it takes the slot,
+                // resetting the pool and dropping the peer before its
+                // `drain_pool` below ever applies a block. Resetting both here
+                // gives each new leader a full `STALL_RESET_AFTER` of real tenure
+                // before either self-heal may fire.
+                let promoted_head = self.head_number();
+                last_head_advance = Instant::now();
+                last_head_num = promoted_head;
+                crawl_window_head = promoted_head;
+                crawl_window_at = Instant::now();
                 if let Some(pool) = self.fetch_pool.clone() {
                     let head_now = self.head_number();
                     // `head_now - 1` (not `head_now`) so a competing fork
@@ -5225,6 +5241,11 @@ impl SyncDriver {
         // block promoted by a fork switch.
         let block_store = BlockStore::new(self.blocks_backend.clone());
         if let Err(e) = block_store.put(&id, block) {
+            // The block was linked into khaos above; a store failure must
+            // remove it so a re-delivery re-attempts instead of being
+            // short-circuited by the `contains_in_linked → AlreadyKnown` dedup
+            // below (java `removeBlk`-on-failure semantics).
+            self.khaos.remove(&id);
             return AcceptOutcome::RejectedExecution(format!("block_store.put: {e}"));
         }
 
@@ -5309,6 +5330,10 @@ impl SyncDriver {
         if let Some(bi) = &self.state.block_index {
             let block_index = BlockIndexStore::new(bi.clone());
             if let Err(e) = block_index.put(&id) {
+                // Linked in khaos above; remove so a re-delivery re-attempts
+                // rather than being AlreadyKnown-swallowed. (The put failed, so
+                // there is no num→id entry to unwind.)
+                self.khaos.remove(&id);
                 return AcceptOutcome::RejectedExecution(format!("block_index.put: {e}"));
             }
         }
@@ -5415,7 +5440,24 @@ impl SyncDriver {
                 self.drop_included_txs_from_mempool(block);
                 AcceptOutcome::Accepted(id)
             }
-            Err(e) => AcceptOutcome::RejectedExecution(format!("{e:?}")),
+            Err(e) => {
+                // java `Manager.pushBlock`: on any apply throwable, `removeBlk`
+                // from the fork tree so the block is retryable. Without this the
+                // block stays linked in khaos and every re-delivery short-
+                // circuits to `AlreadyKnown` — the head can never advance past a
+                // block that failed once (even transiently), a permanent silent
+                // wedge until restart. Also drop the num→id index entry written
+                // just above: a side fork is returned before this point and
+                // never reaches here, so this only ever unwinds THIS failed
+                // canonical extension, restoring the "block stores never lead the
+                // executed head" invariant at runtime instead of only at the next
+                // startup `reconcile_stores_to_head`.
+                self.khaos.remove(&id);
+                if let Some(bi) = &self.state.block_index {
+                    let _ = BlockIndexStore::new(bi.clone()).delete(id.num() as i64);
+                }
+                AcceptOutcome::RejectedExecution(format!("{e:?}"))
+            }
         }
     }
 
@@ -5509,6 +5551,9 @@ impl SyncDriver {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(?e, "khaos.get_branch failed during snapshot reorg");
+                // Mirror `perform_reorg`: remove the un-switchable candidate so a
+                // re-delivery re-attempts instead of being AlreadyKnown-swallowed.
+                self.khaos.remove(&new_block_id);
                 return AcceptOutcome::RejectedValidation(format!(
                     "reorg failed: no common ancestor: {e:?}"
                 ));
@@ -6380,6 +6425,13 @@ impl SyncDriver {
             Ok(pair) => pair,
             Err(e) => {
                 warn!(?e, "khaos.get_branch failed during reorg");
+                // The candidate was linked into khaos before this reorg was
+                // dispatched; with no common ancestor we cannot switch to it, so
+                // remove it (java `Manager.switchFork` removes the candidate
+                // branch on `NonCommonBlockException`). Leaving it linked would
+                // let a re-delivery be AlreadyKnown-swallowed and the switch
+                // never re-attempted.
+                self.khaos.remove(&new_block_id);
                 return AcceptOutcome::RejectedValidation(format!(
                     "reorg failed: no common ancestor: {e:?}"
                 ));
@@ -6587,6 +6639,25 @@ impl SyncDriver {
                     }
 
                     if reapply_failed.is_none() && rollback_errors.is_empty() {
+                        // java `Manager.switchFork`: on a failed switch, remove
+                        // the ENTIRE new branch from the fork tree and repoint
+                        // the head at the restored old tip. Without this the
+                        // new-fork blocks stay linked in khaos, so every
+                        // re-delivery of that (canonical) branch short-circuits
+                        // to `AlreadyKnown` and the switch is never re-attempted
+                        // — the node then churns "block on side fork" forever
+                        // while the head stays frozen: a permanent tip wedge that
+                        // hits even a correct-state node when a fork-switch apply
+                        // fails transiently. `remove` re-elects the head to the
+                        // highest remaining linked block (possibly an unrelated
+                        // sibling), so pin it explicitly to the executed head we
+                        // just restored.
+                        for kb in &path_new {
+                            self.khaos.remove(&kb.id);
+                        }
+                        if let Some(old_head) = self.khaos.get(&executed_head) {
+                            self.khaos.set_head(old_head);
+                        }
                         warn!(
                             failed_block = kb.num,
                             reapplied,
