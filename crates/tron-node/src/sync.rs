@@ -1165,6 +1165,13 @@ pub struct SyncDriver {
     /// (tests / SR runtime), which fall back to the decoded check (their
     /// blocks re-encode canonically anyway).
     pending_raw_block: Option<Bytes>,
+    /// Stashed orphans whose parent linked during the current
+    /// [`Self::accept_block`] call, queued with their original wire bytes for
+    /// an immediate full re-acceptance — the in-process equivalent of
+    /// java-tron re-delivering an `UnLinked` block once its parent lands.
+    /// Drained by `accept_block` after the primary block completes, under the
+    /// caller's apply lock; always empty between calls.
+    ready_orphans: std::collections::VecDeque<(Block, Option<Vec<u8>>)>,
     /// Optional shared single-active-syncer coordinator. The runtime
     /// spawns one driver per peer; without coordination they all apply
     /// the same blocks against shared state concurrently, racing the head
@@ -1299,6 +1306,7 @@ impl SyncDriver {
             dynamic_pool: None,
             fetch_pool: None,
             pending_raw_block: None,
+            ready_orphans: std::collections::VecDeque::new(),
             leadership: None,
             pipelined_apply: false,
             pipeline: None,
@@ -4965,6 +4973,47 @@ impl SyncDriver {
     /// single-applier contexts only (offline replay, the SR runtime's own
     /// tree, tests).
     pub fn accept_block(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
+        let outcome = self.accept_block_inner(block, prev_id);
+        self.refeed_ready_orphans();
+        outcome
+    }
+
+    /// Drain `ready_orphans`: re-run each stashed orphan whose parent linked
+    /// during the primary accept through the FULL acceptance path, oldest
+    /// first, with its original wire bytes restored (so txTrieRoot + bandwidth
+    /// size against the original encoding, not a prost re-encode). A re-accept
+    /// that links can queue its own waiters, so a stashed chain cascades in
+    /// ascending order. An orphan that fails re-acceptance is dropped — like a
+    /// failed network delivery, the sync flow re-fetches it. Bounded by the
+    /// khaos capacity as a runaway backstop. Runs under the caller's apply
+    /// lock (same scope as the primary accept), so no linked-but-unstored
+    /// block is ever exposed to another driver.
+    fn refeed_ready_orphans(&mut self) {
+        const MAX_REFEED: usize = 1024;
+        let mut fed = 0usize;
+        while let Some((orphan, raw)) = self.ready_orphans.pop_front() {
+            if fed == MAX_REFEED {
+                warn!(
+                    dropped = self.ready_orphans.len() + 1,
+                    "orphan re-feed cap hit; dropping the rest (they will be re-fetched)"
+                );
+                self.ready_orphans.clear();
+                break;
+            }
+            fed += 1;
+            let num = orphan
+                .block_header
+                .as_ref()
+                .and_then(|h| h.raw_data.as_ref())
+                .map(|r| r.number)
+                .unwrap_or(-1);
+            self.pending_raw_block = raw.map(Bytes::from);
+            let outcome = self.accept_block_inner(&orphan, None);
+            debug!(block = num, ?outcome, "re-accepted stashed orphan after its parent linked");
+        }
+    }
+
+    fn accept_block_inner(&mut self, block: &Block, prev_id: Option<BlockId>) -> AcceptOutcome {
         // `txTrieRoot`: for blocks received from the network the peer loop
         // stashes the raw wire bytes, so we hash each transaction's original
         // bytes (M-20 — prost's `BTreeMap` map round-trip reorders `ret` map
@@ -4976,10 +5025,14 @@ impl SyncDriver {
         // getSerializedSize (#9 — prost's canonical re-encode drops non-standard
         // Transaction-level bytes java keeps). In-memory callers (None) carry
         // prost-canonical blocks and fall back to the prost size downstream.
-        let (trie_check, original_tx_sizes) = match self.pending_raw_block.take() {
+        // `raw_opt` is retained through the fn so it can also be handed to
+        // `khaos.push_with_raw` — a block stashed as an orphan keeps its wire
+        // bytes for a byte-exact re-acceptance once its parent links.
+        let raw_opt = self.pending_raw_block.take();
+        let (trie_check, original_tx_sizes) = match raw_opt.as_deref() {
             Some(raw) => (
-                verify_tx_trie_root_raw(block, &raw),
-                tx_sizes_from_block_bytes(&raw),
+                verify_tx_trie_root_raw(block, raw),
+                tx_sizes_from_block_bytes(raw),
             ),
             None => (verify_tx_trie_root(block), None),
         };
@@ -5188,11 +5241,25 @@ impl SyncDriver {
         //   * Err(BadNumber/Malformed) — reject outright.
         let prev_head_arc = self.khaos.head();
         let prev_head_num = prev_head_arc.as_ref().map(|h| h.num).unwrap_or(0);
-        let khaos_head = match self.khaos.push(block.clone()) {
+        let khaos_head = match self.khaos.push_with_raw(block.clone(), raw_opt.as_deref()) {
             // `PushOutcome` also classifies extension vs reorg vs sibling;
             // we only need the resulting head here. Acting on the reorg
             // signal is a sync-reorg follow-up.
-            Ok(outcome) => outcome.into_head(),
+            Ok(outcome) => {
+                // Any orphan that was waiting on THIS block is now linkable.
+                // Queue it (with its original wire bytes) for a full
+                // re-acceptance, drained by the `accept_block` wrapper under
+                // the caller's apply lock. This replaces the old in-khaos
+                // auto-promotion, which linked the orphan WITHOUT persisting it
+                // to block_store — so the solidified-containment gate's
+                // block_store parent walk hit `NotFound` on the promoted block
+                // and rejected every canonical head promotion (the tip wedge).
+                // If this block is later removed on a persist/execute failure,
+                // a re-fed child simply re-stashes as unlinked.
+                self.ready_orphans
+                    .extend(self.khaos.take_orphans_waiting_on(&id));
+                outcome.into_head()
+            }
             Err(tron_consensus::KhaosPushError::Unlinked) => {
                 if !self.khaos_started {
                     // No head yet — first-block push is allowed even
@@ -5507,7 +5574,20 @@ impl SyncDriver {
                 self.drop_included_txs_from_mempool(block);
                 AcceptOutcome::Accepted(id)
             }
-            Err(e) => AcceptOutcome::RejectedExecution(e),
+            Err(e) => {
+                // Symmetric with the legacy execute path (java `removeBlk`-on-
+                // failure): the snapshot layer was already revoked, so remove
+                // this block from the fork tree and drop its num→id index entry
+                // (written before execute) — otherwise it stays linked and
+                // indexed-but-unexecuted (block_index leading the head) until
+                // the next reorg or a startup `reconcile_stores_to_head`, and a
+                // re-delivery would be `AlreadyKnown`-swallowed.
+                self.khaos.remove(&id);
+                if let Some(bi) = &self.state.block_index {
+                    let _ = BlockIndexStore::new(bi.clone()).delete(id.num() as i64);
+                }
+                AcceptOutcome::RejectedExecution(e)
+            }
         }
     }
 
@@ -9343,6 +9423,66 @@ mod pipelined_apply_tests {
         assert!(!driver.pipeline_open);
         assert!(driver.pipeline.is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Reproduces the 84,738,339 tip wedge: block 3 arrives BEFORE its parent
+    /// block 2 and is stashed as an orphan; when 2 links, 3 must be re-accepted
+    /// through the FULL path — persisted to block_store, indexed, executed —
+    /// not silently linked in-tree. The old `promote_orphans` linked 3 WITHOUT
+    /// persisting it, so the solidified-containment gate's block_store parent
+    /// walk hit `NotFound` on the promoted block and rejected every canonical
+    /// head promotion (head frozen ~4h on the mainnet rig).
+    #[test]
+    fn out_of_order_orphan_is_reaccepted_persisted_and_executed() {
+        use prost::Message as _;
+        let state = mem_state();
+        let blocks_be = mem();
+        let mut driver = driver_with(state.clone(), blocks_be.clone())
+            .with_undo_store(tron_chainbase::BlockUndoStore::new(mem()));
+
+        let b1 = signed_block(1, [0u8; 32]);
+        let id1 = block_id_from_block(&b1).unwrap();
+        let b2 = signed_block(2, *id1.as_bytes());
+        let id2 = block_id_from_block(&b2).unwrap();
+        let b3 = signed_block(3, *id2.as_bytes());
+        let id3 = block_id_from_block(&b3).unwrap();
+
+        assert!(matches!(driver.accept_block(&b1, None), AcceptOutcome::Accepted(_)));
+
+        // b3 arrives before its parent b2 → stashed as an orphan.
+        driver.pending_raw_block = Some(Bytes::from(b3.encode_to_vec()));
+        assert!(
+            matches!(driver.accept_block(&b3, None),
+                AcceptOutcome::RejectedValidation(ref r) if r.contains("unlinked")),
+            "b3 must be stashed as unlinked"
+        );
+
+        // b2 arrives: it applies AND the stashed b3 is re-fed in the SAME call.
+        // Ablation (old promote_orphans): b3 would be linked-but-unstored and
+        // become the khaos head, so accepting b2 returns SideFork and the head
+        // never advances — the "must be PERSISTED" assertion below is the
+        // wedge tripwire that fails without the fix.
+        assert!(
+            matches!(driver.accept_block(&b2, None), AcceptOutcome::Accepted(_)),
+            "b2 must apply cleanly, not SideFork behind a promoted-but-unstored orphan"
+        );
+
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        assert_eq!(
+            dp.latest_block_header_number().unwrap(),
+            3,
+            "the orphan b3 must EXECUTE (head advances to 3)"
+        );
+        assert!(
+            BlockStore::new(blocks_be).get(&id3).is_ok(),
+            "the orphan b3 must be PERSISTED to block_store — the wedge root was linked-but-unstored"
+        );
+        assert_eq!(
+            BlockIndexStore::new(state.block_index.clone().unwrap()).get(3).unwrap(),
+            id3,
+            "the orphan b3 must be INDEXED"
+        );
+        assert!(driver.khaos().contains_in_linked(&id3));
     }
 
     /// Pins the PRODUCTION single-applier guard on the pool-drain path

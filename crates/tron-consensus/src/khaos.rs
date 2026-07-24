@@ -200,10 +200,17 @@ struct Inner {
     head: Option<Arc<KhaosBlock>>,
     mini_store: KhaosStore,
     mini_unlinked_store: KhaosStore,
-    /// Orphan index (H-3): maps a not-yet-seen parent id → the ids of
-    /// unlinked blocks waiting on it, so they can be promoted the moment
-    /// that parent links into the tree.
+    /// Orphan index: maps a not-yet-seen parent id → the ids of unlinked
+    /// blocks waiting on it. Popped by [`KhaosDb::take_orphans_waiting_on`]
+    /// the moment that parent links, so the caller can re-accept each waiter
+    /// through its FULL acceptance path (java-tron leaves orphan recovery to
+    /// the caller; we do not link them silently in-tree).
     by_parent: HashMap<BlockId, Vec<BlockId>>,
+    /// Original wire bytes for stashed orphans, keyed by block id and kept
+    /// in lockstep with `mini_unlinked_store`, so a later re-acceptance can
+    /// validate txTrieRoot and size bandwidth against the ORIGINAL encoding
+    /// rather than a prost re-encode.
+    orphan_raw: HashMap<BlockId, Vec<u8>>,
     max_capacity: usize,
 }
 
@@ -216,6 +223,7 @@ impl KhaosDb {
                 mini_store: KhaosStore::default(),
                 mini_unlinked_store: KhaosStore::default(),
                 by_parent: HashMap::new(),
+                orphan_raw: HashMap::new(),
                 max_capacity: 1024,
             }),
         }
@@ -274,17 +282,35 @@ impl KhaosDb {
     /// Push a block into the fork tree. On success returns a
     /// [`PushOutcome`] classifying how the head changed: `Extended` on the
     /// best fork, `Reorg` when the head jumps to a different fork, or
-    /// `Sibling` when the block is added but doesn't move the head. Any
-    /// orphans waiting on this block (or on blocks it transitively links)
-    /// are promoted automatically (H-3).
+    /// `Sibling` when the block is added but doesn't move the head. A block
+    /// whose parent isn't linked yet is STASHED and `Err(Unlinked)` returned;
+    /// it is NOT linked automatically when the parent later arrives
+    /// (java-tron parity — `KhaosDatabase.push` has no orphan promotion).
+    /// After a successful push the caller drains
+    /// [`KhaosDb::take_orphans_waiting_on`] and re-feeds each returned block
+    /// through its full acceptance path.
     pub fn push(&self, block: Block) -> Result<PushOutcome, PushError> {
+        self.push_with_raw(block, None)
+    }
+
+    /// [`KhaosDb::push`], carrying the block's original wire bytes; they are
+    /// retained ONLY if the block is stashed as an orphan (no copy on the
+    /// common linked path) and handed back by
+    /// [`KhaosDb::take_orphans_waiting_on`] for a byte-exact re-acceptance.
+    pub fn push_with_raw(
+        &self,
+        block: Block,
+        raw: Option<&[u8]>,
+    ) -> Result<PushOutcome, PushError> {
         let kblock = KhaosBlock::new(block).ok_or(PushError::Malformed)?;
         let mut g = self.inner.lock().unwrap();
 
-        // Dedup — already known. `containBlock` matches java-tron.
-        if g.mini_store.by_hash.contains_key(&kblock.id)
-            || g.mini_unlinked_store.by_hash.contains_key(&kblock.id)
-        {
+        // Dedup on the LINKED store only (java `containBlockInMiniStore`): a
+        // block sitting in the ORPHAN store must stay re-pushable so a
+        // re-delivery arriving after its parent has linked can still enter the
+        // tree — a both-store check would swallow exactly that re-delivery as
+        // a `Sibling` and strand the orphan forever.
+        if g.mini_store.by_hash.contains_key(&kblock.id) {
             let head = g.head.clone().unwrap_or_else(|| kblock.clone());
             return Ok(PushOutcome::Sibling { head });
         }
@@ -310,27 +336,41 @@ impl KhaosDb {
                 }
                 kblock.set_parent(&parent);
             } else {
-                // Orphan: stash it and remember which parent it waits on
-                // so it's promoted the moment that parent links (H-3).
-                g.mini_unlinked_store.insert(&kblock);
-                g.by_parent
-                    .entry(parent_id)
-                    .or_default()
-                    .push(kblock.id.clone());
+                // Orphan: stash it idempotently (a re-delivery while the
+                // parent is still unknown must not duplicate the by_parent
+                // entry) and remember which parent it waits on, retaining the
+                // original wire bytes. When that parent links,
+                // `take_orphans_waiting_on` hands this block back to the
+                // caller, which re-accepts it through the FULL path
+                // (validation + block_store persistence + fork-choice gate +
+                // execution) — never linking it in-tree without persisting it.
+                if !g.mini_unlinked_store.by_hash.contains_key(&kblock.id) {
+                    g.mini_unlinked_store.insert(&kblock);
+                    g.by_parent
+                        .entry(parent_id)
+                        .or_default()
+                        .push(kblock.id.clone());
+                }
+                if let Some(raw) = raw {
+                    g.orphan_raw.insert(kblock.id.clone(), raw.to_vec());
+                }
                 let head_num = g.head.as_ref().map(|h| h.num).unwrap_or(0);
                 let cap = g.max_capacity;
                 g.mini_unlinked_store
                     .prune_below(head_num.saturating_sub(cap as i64));
+                prune_orphan_raw(&mut g);
                 return Err(PushError::Unlinked);
             }
         }
 
-        // Link it, advance the head if it tops the tree (strict `>`, so a
-        // tie keeps the first-arrived head — java-tron parity), then
-        // cascade-promote any orphans waiting on it.
+        // Link it and advance the head if it tops the tree (strict `>`, so a
+        // tie keeps the first-arrived head — java-tron parity). Orphans
+        // waiting on it are NOT linked here: the caller re-feeds them via
+        // `take_orphans_waiting_on` so every linked block first passes through
+        // the acceptance path that persists it to block_store (the invariant
+        // the solidified-containment gate's block_store walk relies on).
         g.mini_store.insert(&kblock);
         promote_head_if_higher(&mut g, &kblock);
-        promote_orphans(&mut g, &kblock);
 
         // Classify BEFORE pruning so the ancestor walk sees intact parents.
         let head = g.head.clone().unwrap();
@@ -354,8 +394,46 @@ impl KhaosDb {
         for k in dead {
             g.by_parent.remove(&k);
         }
+        prune_orphan_raw(&mut g);
 
         Ok(outcome)
+    }
+
+    /// Pop every stashed orphan that was waiting on `parent`, each with the
+    /// original wire bytes it arrived with. The caller re-feeds each returned
+    /// block through its FULL acceptance path — validation, block_store
+    /// persistence, the fork-choice gate, execution — exactly as if the
+    /// network had re-delivered it after its parent landed (java-tron's
+    /// recovery model for `UnLinkedBlockException`). Routing promotion through
+    /// the caller preserves the invariant that every LINKED block was
+    /// persisted by the acceptance path: linking an orphan in-tree here
+    /// (the old `promote_orphans`) left it walkable in the fork tree yet
+    /// absent from block_store, which the solidified-containment gate walks
+    /// by parent hash — the tip-fork wedge that froze the head.
+    ///
+    /// Only DIRECT waiters are returned; a stashed descendant cascades
+    /// naturally once its own parent is re-accepted and links, at which point
+    /// a further `take_orphans_waiting_on` yields it. Waiters violating
+    /// `num == parent.num + 1` are dropped. Empty when `parent` isn't linked.
+    pub fn take_orphans_waiting_on(&self, parent: &BlockId) -> Vec<(Block, Option<Vec<u8>>)> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(parent_kb) = g.mini_store.by_hash.get(parent).cloned() else {
+            return Vec::new();
+        };
+        let waiting = g.by_parent.remove(parent).unwrap_or_default();
+        let mut out = Vec::new();
+        for child_id in waiting {
+            let Some(child) = g.mini_unlinked_store.by_hash.get(&child_id).cloned() else {
+                continue; // already pruned/removed
+            };
+            g.mini_unlinked_store.remove(&child_id);
+            let raw = g.orphan_raw.remove(&child_id);
+            if child.num != parent_kb.num + 1 {
+                continue; // malformed orphan — never re-feed a bad chain
+            }
+            out.push((child.block.clone(), raw));
+        }
+        out
     }
 
     /// Pop the current head: head = head.parent. Returns `true` if the
@@ -536,31 +614,18 @@ fn promote_head_if_higher(inner: &mut Inner, block: &Arc<KhaosBlock>) {
     }
 }
 
-/// Cascade-promote orphans (H-3): when `linked` joins the linked store,
-/// any unlinked block waiting on it (and, recursively, blocks waiting on
-/// THOSE) is linked, parented, and considered for head promotion. Without
-/// this an out-of-order arrival (`N+1` before `N`) leaves `N+1` stranded
-/// in the orphan store forever.
-fn promote_orphans(inner: &mut Inner, linked: &Arc<KhaosBlock>) {
-    let mut queue = vec![linked.clone()];
-    while let Some(parent) = queue.pop() {
-        let waiting = inner.by_parent.remove(&parent.id).unwrap_or_default();
-        for child_id in waiting {
-            let Some(child) = inner.mini_unlinked_store.by_hash.get(&child_id).cloned() else {
-                continue; // already pruned/removed
-            };
-            if child.num != parent.num + 1 {
-                // Malformed orphan — drop it rather than link a bad chain.
-                inner.mini_unlinked_store.remove(&child_id);
-                continue;
-            }
-            child.set_parent(&parent);
-            inner.mini_unlinked_store.remove(&child_id);
-            inner.mini_store.insert(&child);
-            promote_head_if_higher(inner, &child);
-            queue.push(child); // its own waiters may now be promotable
-        }
-    }
+/// Drop retained wire bytes for any orphan no longer in the unlinked store,
+/// keeping `orphan_raw` in lockstep with `mini_unlinked_store` (which is
+/// pruned by its own LRU). Orphans recover by caller re-acceptance via
+/// [`KhaosDb::take_orphans_waiting_on`], never by silent in-tree promotion —
+/// that promotion left a block linked-but-unpersisted and wedged the head.
+fn prune_orphan_raw(inner: &mut Inner) {
+    let Inner {
+        mini_unlinked_store,
+        orphan_raw,
+        ..
+    } = inner;
+    orphan_raw.retain(|id, _| mini_unlinked_store.by_hash.contains_key(id));
 }
 
 /// Classify a head transition for [`PushOutcome`]. `Extended` when the
@@ -825,9 +890,89 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_arrival_promotes_orphan_when_parent_links() {
-        // H-3: block 3 arrives before block 2. Once 2 links, 3 must be
-        // promoted off the orphan store automatically and the head advance.
+    fn out_of_order_orphan_is_handed_back_for_repush_not_auto_linked() {
+        // Block 3 arrives before block 2. When 2 links, 3 must NOT be linked
+        // in-tree automatically — that (the old promote_orphans) left it
+        // linked-but-unpersisted and wedged the head at the solidified gate.
+        // Instead `take_orphans_waiting_on` hands 3 back so the caller
+        // re-accepts it through the full path. java-tron parity.
+        let db = KhaosDb::new();
+        let g = mk_block(1, [0u8; 32], 0);
+        let mut g_bytes = [0u8; 32];
+        g_bytes.copy_from_slice(&id_of(&g).as_bytes()[..]);
+        db.start(g).unwrap();
+
+        let b2 = mk_block(2, g_bytes, 0);
+        let id_b2 = id_of(&b2);
+        let mut b2_bytes = [0u8; 32];
+        b2_bytes.copy_from_slice(&id_b2.as_bytes()[..]);
+        let b3 = mk_block(3, b2_bytes, 0);
+        let id_b3 = id_of(&b3);
+
+        // b3 first → orphaned, head stays at genesis.
+        assert!(matches!(db.push(b3).unwrap_err(), PushError::Unlinked));
+        assert_eq!(db.unlinked_size(), 1);
+        assert_eq!(db.head().unwrap().num, 1);
+
+        // b2 links → head advances to 2 ONLY; b3 is NOT auto-linked.
+        let outcome = db.push(b2).unwrap();
+        assert!(matches!(outcome, PushOutcome::Extended { .. }));
+        assert_eq!(db.head().unwrap().num, 2, "head advances to 2, not the orphan");
+        assert!(!db.contains_in_linked(&id_b3), "orphan must NOT be auto-linked");
+        assert_eq!(db.unlinked_size(), 1, "orphan still stashed");
+
+        // The caller drains the now-linkable orphan and re-accepts it.
+        let ready = db.take_orphans_waiting_on(&id_b2);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(id_of(&ready[0].0), id_b3);
+        assert_eq!(db.unlinked_size(), 0, "orphan removed from stash on take");
+
+        // Re-push (the caller's re-acceptance) links it, head advances to 3.
+        assert!(matches!(
+            db.push(ready[0].0.clone()).unwrap(),
+            PushOutcome::Extended { .. }
+        ));
+        assert_eq!(db.head().unwrap().id, id_b3);
+        assert!(db.contains_in_linked(&id_b3));
+    }
+
+    #[test]
+    fn orphan_raw_bytes_round_trip_through_take() {
+        // push_with_raw retains the wire bytes for a stashed orphan and hands
+        // them back on take (so a re-acceptance validates txTrieRoot + sizes
+        // bandwidth against the ORIGINAL encoding, not a prost re-encode).
+        let db = KhaosDb::new();
+        let g = mk_block(1, [0u8; 32], 0);
+        let mut g_bytes = [0u8; 32];
+        g_bytes.copy_from_slice(&id_of(&g).as_bytes()[..]);
+        db.start(g).unwrap();
+
+        let b2 = mk_block(2, g_bytes, 0);
+        let id_b2 = id_of(&b2);
+        let mut b2_bytes = [0u8; 32];
+        b2_bytes.copy_from_slice(&id_b2.as_bytes()[..]);
+        let b3 = mk_block(3, b2_bytes, 0);
+
+        let raw = vec![0xde, 0xad, 0xbe, 0xef];
+        assert!(matches!(
+            db.push_with_raw(b3, Some(&raw[..])).unwrap_err(),
+            PushError::Unlinked
+        ));
+        db.push(b2).unwrap();
+        let ready = db.take_orphans_waiting_on(&id_b2);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].1.as_deref(),
+            Some(raw.as_slice()),
+            "original wire bytes must round-trip through take"
+        );
+    }
+
+    #[test]
+    fn redelivered_stashed_orphan_links_directly_after_parent_arrives() {
+        // Linked-only dedup: a re-delivery of a still-stashed orphan arriving
+        // after its parent linked must be able to link (the old both-store
+        // dedup swallowed it as Sibling and stranded it).
         let db = KhaosDb::new();
         let g = mk_block(1, [0u8; 32], 0);
         let mut g_bytes = [0u8; 32];
@@ -840,17 +985,11 @@ mod tests {
         let b3 = mk_block(3, b2_bytes, 0);
         let id_b3 = id_of(&b3);
 
-        // b3 first → orphaned (parent b2 unknown), head stays at genesis.
-        assert!(matches!(db.push(b3).unwrap_err(), PushError::Unlinked));
-        assert_eq!(db.unlinked_size(), 1);
-        assert_eq!(db.head().unwrap().num, 1);
-
-        // b2 links → b3 is promoted, head advances to 3.
-        let outcome = db.push(b2).unwrap();
-        assert_eq!(db.unlinked_size(), 0, "orphan b3 should be promoted");
-        assert_eq!(db.head().unwrap().id, id_b3, "head advances to promoted b3");
+        assert!(matches!(db.push(b3.clone()).unwrap_err(), PushError::Unlinked));
+        db.push(b2).unwrap(); // parent links; orphan still stashed
+        // Direct re-delivery (NOT via take) must link, not dedup as Sibling.
+        assert!(matches!(db.push(b3).unwrap(), PushOutcome::Extended { .. }));
         assert!(db.contains_in_linked(&id_b3));
-        assert!(matches!(outcome, PushOutcome::Extended { .. }));
     }
 
     #[test]

@@ -1033,14 +1033,15 @@ fn reorg_to_fork_two_blocks_deeper_switches_in_one_promotion() {
 }
 
 #[test]
-fn orphan_chain_recovers_via_reorg_after_parent_arrives() {
+fn orphan_chain_recovers_after_parent_arrives() {
     use tron_chainbase::BlockUndoStore;
-    // Out-of-order delivery at the tip: child 3x arrives before its
-    // parent 2x. The child is stashed as unlinked; when 2x arrives,
-    // KhaosDb cascade-promotes the orphan to fork-tree head WITHOUT
-    // executing it (the push outcome for 2x reports the head moved away
-    // from 2x). The chain must still converge: the next push triggers
-    // the reorg path, which replays the whole un-executed branch.
+    // Out-of-order delivery at the tip: child 3 arrives before its parent 2.
+    // The child is stashed as unlinked; when 2 arrives, it applies cleanly AND
+    // the stashed orphan is re-accepted through the FULL path in the SAME call
+    // — persisted, indexed, executed — so the chain converges to head 3
+    // immediately. (The old code auto-promoted the orphan in-khaos WITHOUT
+    // persisting it, wedging the solidified gate; recovery now goes through
+    // caller re-acceptance — java-tron parity.)
     let (state, blocks_be) = fresh_state();
     seed_alice(&state);
     let undo_be: Arc<dyn KvBackend> = mem();
@@ -1064,27 +1065,30 @@ fn orphan_chain_recovers_via_reorg_after_parent_arrives() {
         AcceptOutcome::RejectedValidation(reason) if reason.contains("unlinked")
     ));
 
-    // Parent arrives: khaos promotes 2→3, head moves PAST 2 — the push
-    // reports a non-extension outcome and nothing executes yet.
-    let outcome_2 = driver.accept_block(&b2, Some(gid));
-    assert!(
-        !matches!(outcome_2, AcceptOutcome::Accepted(_)),
-        "parent push must not report Accepted when the orphan cascade moved the head: {outcome_2:?}"
-    );
-
-    // The NEXT block converges the executed chain onto the fork-tree
-    // head via the reorg path (replays 2, 3, then 4).
-    match driver.accept_block(&b4, Some(id_3)) {
-        AcceptOutcome::Accepted(id) => assert_eq!(id, id_4),
-        other => panic!("expected Accepted via reorg replay, got {other:?}"),
+    // Parent arrives: b2 applies AND the stashed b3 is re-fed in the same call,
+    // converging the executed head to 3 (no auto-promotion, no reorg needed).
+    match driver.accept_block(&b2, Some(gid)) {
+        AcceptOutcome::Accepted(id) => assert_eq!(id, id_2),
+        other => panic!("expected b2 Accepted, got {other:?}"),
     }
-    assert_eq!(driver.head_number(), 4);
+    assert_eq!(driver.head_number(), 3, "the re-fed orphan b3 advanced the head to 3");
     let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
     assert_eq!(
         dp.latest_block_header_hash().unwrap(),
-        Some(*id_4.as_bytes()),
-        "executed head converged onto the promoted orphan chain"
+        Some(*id_3.as_bytes()),
+        "executed head converged onto the re-fed orphan b3"
     );
+    // The re-fed orphan must be canonically indexed (linked ⊆ persisted).
+    let bi = BlockIndexStore::new(state.block_index.clone().unwrap());
+    assert_eq!(bi.get(2).unwrap(), id_2);
+    assert_eq!(bi.get(3).unwrap(), id_3, "re-fed orphan must be indexed");
+
+    // The next block extends the converged chain cleanly.
+    match driver.accept_block(&b4, Some(id_3)) {
+        AcceptOutcome::Accepted(id) => assert_eq!(id, id_4),
+        other => panic!("expected b4 Accepted, got {other:?}"),
+    }
+    assert_eq!(driver.head_number(), 4);
 }
 
 // ===========================================================================
