@@ -705,3 +705,114 @@ fn write_batch_sync_default_matches_write_batch_on_mem_backend() {
     sync_be.write_batch_sync(&ops).unwrap();
     assert_eq!(async_be.scan_all().unwrap(), sync_be.scan_all().unwrap());
 }
+
+// === Bounded scans over a parent that doesn't support scan_all ==============
+// Mirrors the at-height archive view (`ArchiveAtBackend`): point + bounded
+// scans work, but unbounded `scan_all` is deliberately unsupported. A session
+// over such a parent must serve `scan_from`/`scan_prefix` by delegating to the
+// parent's native bounded scan, NOT by routing through `scan_all` (which would
+// error — the bug this fixes).
+
+/// A parent that serves get/put/delete/scan_from/scan_prefix from an inner
+/// backend but ERRORS on `scan_all`.
+struct ScanAllUnsupported(Arc<dyn KvBackend>);
+
+impl KvBackend for ScanAllUnsupported {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, tron_chainbase::KvError> {
+        self.0.get(key)
+    }
+    fn put(&self, key: &[u8], value: &[u8]) -> Result<(), tron_chainbase::KvError> {
+        self.0.put(key, value)
+    }
+    fn delete(&self, key: &[u8]) -> Result<(), tron_chainbase::KvError> {
+        self.0.delete(key)
+    }
+    fn scan_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, tron_chainbase::KvError> {
+        Err(tron_chainbase::KvError::Backend("scan_all unsupported".into()))
+    }
+    fn scan_from(
+        &self,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, tron_chainbase::KvError> {
+        self.0.scan_from(start, limit)
+    }
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, tron_chainbase::KvError> {
+        self.0.scan_prefix(prefix)
+    }
+}
+
+fn seeded_scan_all_unsupported(n: u8) -> Arc<dyn KvBackend> {
+    let inner = mem();
+    for i in 0..n {
+        inner.put(&[0x41, i], &[i]).unwrap();
+    }
+    Arc::new(ScanAllUnsupported(inner))
+}
+
+#[test]
+fn bounded_scans_work_over_a_scan_all_unsupported_parent() {
+    // Regression: a session over a scan_all-erroring parent used to error on
+    // scan_from/scan_prefix (they routed through scan_all). Now they succeed.
+    let session = SessionBackend::new(seeded_scan_all_unsupported(10));
+
+    assert!(session.scan_all().is_err(), "scan_all still errors (unchanged)");
+
+    let from = session.scan_from(&[0x41, 3], 4).unwrap();
+    assert_eq!(
+        from.iter().map(|(k, _)| k[1]).collect::<Vec<_>>(),
+        vec![3, 4, 5, 6]
+    );
+    assert_eq!(session.scan_prefix(&[0x41]).unwrap().len(), 10);
+}
+
+#[test]
+fn bounded_scans_merge_overlay_over_scan_all_unsupported_parent() {
+    // Dirty overlay over the same parent: a shadow, a delete, and a new
+    // in-prefix key must all be reflected without ever calling scan_all.
+    let session = SessionBackend::new(seeded_scan_all_unsupported(10));
+    session.put(&[0x41, 4], &[0xff]).unwrap(); // shadow parent key 4
+    session.delete(&[0x41, 6]).unwrap(); // delete parent key 6
+    session.put(&[0x41, 20], &[0x20]).unwrap(); // new key
+
+    let pre = session.scan_prefix(&[0x41]).unwrap();
+    assert_eq!(pre.len(), 10, "10 - 1 deleted + 1 new");
+    assert_eq!(
+        pre.iter().find(|(k, _)| k[1] == 4).unwrap().1,
+        vec![0xff],
+        "overlay shadows the parent value"
+    );
+    assert!(pre.iter().all(|(k, _)| k[1] != 6), "deleted key is gone");
+    assert!(pre.iter().any(|(k, _)| k[1] == 20), "new overlay key present");
+}
+
+#[test]
+fn scan_from_limit_is_exact_when_overlay_deletes_in_range() {
+    // A delete of an in-range parent key must not shrink the result below
+    // `limit`: the `limit + deletes` over-fetch pulls the next survivor.
+    let parent = mem();
+    for i in 0u8..10 {
+        parent.put(&[0x41, i], &[i]).unwrap();
+    }
+    let session = SessionBackend::new(parent);
+    session.delete(&[0x41, 2]).unwrap();
+
+    let got = session.scan_from(&[0x41, 0], 3).unwrap();
+    // Without the over-fetch this would be [0,1] (2 deleted, limit under-filled).
+    assert_eq!(got.iter().map(|(k, _)| k[1]).collect::<Vec<_>>(), vec![0, 1, 3]);
+}
+
+#[test]
+fn clean_session_scan_from_matches_parent() {
+    // A never-written session delegates the bounded scan straight to the
+    // parent (the O(log n) fast path that also lets an at-height parent serve).
+    let parent = mem();
+    for i in 0u8..5 {
+        parent.put(&[0x41, i], &[i]).unwrap();
+    }
+    let session = SessionBackend::new(parent.clone());
+    assert_eq!(
+        session.scan_from(&[0x41, 1], 2).unwrap(),
+        parent.scan_from(&[0x41, 1], 2).unwrap()
+    );
+}

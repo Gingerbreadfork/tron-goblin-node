@@ -322,4 +322,96 @@ impl KvBackend for SessionBackend {
         }
         Ok(merged.into_iter().collect())
     }
+
+    /// Bounded forward scan, merging the overlay with the parent's NATIVE
+    /// `scan_from`.
+    ///
+    /// The `KvBackend` default routes `scan_from` through `scan_all`, and
+    /// this session's `scan_all` calls `parent.scan_all()` — which some
+    /// parents deliberately do NOT support (an at-height archive view serves
+    /// point + bounded scans but errors on unbounded `scan_all`). Routing a
+    /// bounded scan through `scan_all` there fails outright, and even on a
+    /// normal parent it forces an O(N) full-store read for an O(log N + limit)
+    /// request. Delegating to `parent.scan_from` fixes both.
+    fn scan_from(&self, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Clean overlay: the parent's bounded scan is authoritative.
+        if !self.dirty.load(Ordering::Relaxed) {
+            return self.parent.scan_from(start, limit);
+        }
+        // Snapshot the overlay ops at keys >= start, releasing the lock before
+        // touching the parent (parents may take their own locks — see `get`).
+        let ov: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
+            let g = self.pending.read().expect("SessionBackend lock poisoned");
+            g.iter()
+                .filter(|(k, _)| k.as_slice() >= start)
+                .map(|(k, op)| {
+                    let v = match op {
+                        Op::Put(v) => Some(v.clone()),
+                        Op::Delete => None,
+                    };
+                    (k.clone(), v)
+                })
+                .collect()
+        };
+        // Fetch `limit + deletes` parent rows: even if every overlay delete
+        // removes a parent key ahead of a survivor, that many guarantees every
+        // parent key that could land in the first `limit` merged rows is seen,
+        // so `take(limit)` after the merge is exact.
+        let deletes = ov.iter().filter(|(_, v)| v.is_none()).count();
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .parent
+            .scan_from(start, limit.saturating_add(deletes))?
+            .into_iter()
+            .collect();
+        for (k, v) in ov {
+            match v {
+                Some(val) => {
+                    merged.insert(k, val);
+                }
+                None => {
+                    merged.remove(&k);
+                }
+            }
+        }
+        Ok(merged.into_iter().take(limit).collect())
+    }
+
+    /// Prefix scan, merging the overlay with the parent's NATIVE
+    /// `scan_prefix` (same rationale as [`Self::scan_from`]: the default
+    /// `scan_all`-based path errors over an at-height archive parent and is
+    /// O(N) elsewhere).
+    fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KvError> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return self.parent.scan_prefix(prefix);
+        }
+        let ov: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
+            let g = self.pending.read().expect("SessionBackend lock poisoned");
+            g.iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, op)| {
+                    let v = match op {
+                        Op::Put(v) => Some(v.clone()),
+                        Op::Delete => None,
+                    };
+                    (k.clone(), v)
+                })
+                .collect()
+        };
+        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> =
+            self.parent.scan_prefix(prefix)?.into_iter().collect();
+        for (k, v) in ov {
+            match v {
+                Some(val) => {
+                    merged.insert(k, val);
+                }
+                None => {
+                    merged.remove(&k);
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
 }
