@@ -67,6 +67,7 @@ pub fn tron_simulate_bundle(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
     let mut result = tron_sim::run_bundle(&mut overlay, &req, sim.config(), [0u8; 16], None)
         .map_err(sim_to_rpc)?;
     result.basis.archive_coverage = s.archive.as_ref().and_then(|a| a.coverage());
+    record_bundle_metrics(s, &result);
     let mut out = format_sim_result(&result);
     if req.self_check {
         let sc = match base {
@@ -75,6 +76,12 @@ pub fn tron_simulate_bundle(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
                 json!({ "note": "selfCheck requires a historical base ({ \"block\": N })" })
             }
         };
+        if let Some(m) = &s.metrics {
+            if sc.get("checked").and_then(Value::as_u64) == Some(1) {
+                let mismatched = sc.get("matched").and_then(Value::as_bool) == Some(false);
+                m.record_sim_self_check(mismatched);
+            }
+        }
         if let Value::Object(m) = &mut out {
             m.insert("selfCheck".into(), sc);
         }
@@ -99,6 +106,9 @@ pub fn tron_fork_create(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let (seed_num, seed_ts) = overlay.seed_head();
     let coverage = s.archive.as_ref().and_then(|a| a.coverage());
     let id = sim.create(overlay);
+    if let Some(m) = &s.metrics {
+        m.inc_sim_forks_created();
+    }
     Ok(json!({
         "forkId": fork_id_hex(&id),
         "seedBlock": seed_num,
@@ -119,6 +129,7 @@ pub fn tron_fork_call(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("unknown or expired forkId"))?;
     let mut result = with_fork(&session, |f| f.run(&req, sim.config())).map_err(sim_to_rpc)?;
     result.basis.archive_coverage = s.archive.as_ref().and_then(|a| a.coverage());
+    record_bundle_metrics(s, &result);
     Ok(format_sim_result(&result))
 }
 
@@ -232,6 +243,7 @@ pub fn eth_simulate_v1_via_engine(p: &Value, s: &RpcState) -> Result<Value, RpcE
     let mut overlay = build_overlay(s, base)?;
     let result = tron_sim::run_bundle(&mut overlay, &req, sim.config(), [0u8; 16], None)
         .map_err(sim_to_rpc)?;
+    record_bundle_metrics(s, &result);
     Ok(format_geth_result(&result, sim.config().energy_cap))
 }
 
@@ -545,6 +557,13 @@ fn addr21(bytes: &[u8]) -> Address {
 // ---------------------------------------------------------------------------
 // Wiring helpers
 // ---------------------------------------------------------------------------
+
+fn record_bundle_metrics(s: &RpcState, result: &SimResult) {
+    if let Some(m) = &s.metrics {
+        let calls: u64 = result.blocks.iter().map(|b| b.calls.len() as u64).sum();
+        m.record_sim_bundle(calls);
+    }
+}
 
 fn require_sim(s: &RpcState) -> Result<&Arc<SimState>, RpcError> {
     match &s.sim {

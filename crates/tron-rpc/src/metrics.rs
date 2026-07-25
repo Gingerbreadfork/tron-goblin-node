@@ -105,6 +105,12 @@ pub struct Metrics {
     firehose_entries_total: AtomicU64,
     firehose_unwinds_total: AtomicU64,
     firehose_gap_repaired_total: AtomicU64,
+    // --- Chronos fork simulation (counters) -------------------------------
+    sim_bundles_total: AtomicU64,
+    sim_calls_total: AtomicU64,
+    sim_forks_created_total: AtomicU64,
+    sim_selfchecks_total: AtomicU64,
+    sim_selfcheck_mismatches_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -178,6 +184,11 @@ impl Metrics {
             firehose_entries_total: AtomicU64::new(0),
             firehose_unwinds_total: AtomicU64::new(0),
             firehose_gap_repaired_total: AtomicU64::new(0),
+            sim_bundles_total: AtomicU64::new(0),
+            sim_calls_total: AtomicU64::new(0),
+            sim_forks_created_total: AtomicU64::new(0),
+            sim_selfchecks_total: AtomicU64::new(0),
+            sim_selfcheck_mismatches_total: AtomicU64::new(0),
         }
     }
 
@@ -285,6 +296,24 @@ impl Metrics {
     }
 
     /// Uptime in seconds. Used by `/monitor/getstatsinfo`.
+    /// A Chronos bundle (tron_simulateBundle / eth_simulateV1 engine path /
+    /// forkCall) ran `calls` calls.
+    pub fn record_sim_bundle(&self, calls: u64) {
+        self.sim_bundles_total.fetch_add(1, Ordering::Relaxed);
+        self.sim_calls_total.fetch_add(calls, Ordering::Relaxed);
+    }
+    /// A named fork session was created.
+    pub fn inc_sim_forks_created(&self) {
+        self.sim_forks_created_total.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A selfCheck ran; `mismatched` if its authoritative comparison failed.
+    pub fn record_sim_self_check(&self, mismatched: bool) {
+        self.sim_selfchecks_total.fetch_add(1, Ordering::Relaxed);
+        if mismatched {
+            self.sim_selfcheck_mismatches_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
@@ -803,6 +832,36 @@ impl Metrics {
             "tron_node_archive_entries_total",
             "Versioned key entries written to the archive.",
             self.archive_entries_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_sim_bundles_total",
+            "Chronos bundles executed (simulateBundle / eth_simulateV1 engine / forkCall).",
+            self.sim_bundles_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_sim_calls_total",
+            "Chronos calls executed across all bundles.",
+            self.sim_calls_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_sim_forks_created_total",
+            "Chronos named fork sessions created.",
+            self.sim_forks_created_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_sim_selfchecks_total",
+            "Chronos selfCheck parity comparisons run.",
+            self.sim_selfchecks_total.load(Ordering::Relaxed),
+        );
+        emit_counter(
+            &mut out,
+            "tron_node_sim_selfcheck_mismatches_total",
+            "Chronos selfCheck authoritative mismatches (byte-exactness failures) -- should stay 0.",
+            self.sim_selfcheck_mismatches_total.load(Ordering::Relaxed),
         );
         emit_counter(
             &mut out,
