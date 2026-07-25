@@ -78,7 +78,7 @@ fn trigger(from: Address, to: Address, energy: u64) -> CallSpec {
 }
 
 fn run(ov: &mut ForkOverlay, req: SimRequest) -> tron_sim::SimResult {
-    tron_sim::run_bundle(ov, &req, &SimConfig::default(), [0u8; 16]).unwrap()
+    tron_sim::run_bundle(ov, &req, &SimConfig::default(), [0u8; 16], None).unwrap()
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn overlay_key_cap_is_enforced() {
         blocks: vec![BlockSpec { overrides: ovr, calls: vec![trigger(caller, c, 1_000_000)] }],
         ..Default::default()
     };
-    let err = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16]).unwrap_err();
+    let err = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16], None).unwrap_err();
     assert!(
         matches!(err, tron_sim::SimError::OverlayCapExceeded { .. }),
         "got {err:?}"

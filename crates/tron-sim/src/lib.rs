@@ -19,6 +19,7 @@ mod error;
 mod execute;
 mod overlay;
 mod override_set;
+mod registry;
 mod request;
 mod result;
 
@@ -30,6 +31,7 @@ pub use overlay::{
     BaseBlock, DiffEntry, ForkBackends, ForkCheckpoint, ForkOverlay, RawStateDiff,
 };
 pub use override_set::{AccountOverride, BlockOverride, OverrideSet};
+pub use registry::{fork_id_from_hex, fork_id_hex, ForkId, ForkInfo, ForkSession, SimState};
 pub use request::{BlockSpec, CallSpec, DiffLevel, SimRequest, TraceLevel};
 pub use result::{Basis, CallResult, CallStatus, SimBlockResult, SimResult, VmLogOut};
 

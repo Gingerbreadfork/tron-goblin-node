@@ -30,12 +30,16 @@ use crate::result::{Basis, CallResult, CallStatus, SimBlockResult, SimResult, Vm
 
 /// Run a bundle against `overlay`. `fork_id` seeds the deterministic
 /// synthetic tx ids (use `[0u8; 16]` for an ephemeral one-shot fork; a named
-/// fork session passes its uuid bytes).
+/// fork session passes its uuid bytes). `start_head` is the synthetic head
+/// `(number, timestamp_ms)` block numbering continues from — `None` starts
+/// from the overlay's seed head (ephemeral bundles); a fork session passes
+/// its advancing head so successive calls don't reuse block numbers.
 pub fn run_bundle(
     overlay: &mut ForkOverlay,
     req: &SimRequest,
     cfg: &SimConfig,
     fork_id: [u8; 16],
+    start_head: Option<(i64, i64)>,
 ) -> Result<SimResult, SimError> {
     if req.blocks.len() > cfg.max_blocks_per_bundle {
         return Err(SimError::Backend(format!(
@@ -53,7 +57,7 @@ pub fn run_bundle(
     }
 
     let mut warnings = Vec::new();
-    let (mut head_num, mut head_ts_ms) = overlay.seed_head();
+    let (mut head_num, mut head_ts_ms) = start_head.unwrap_or_else(|| overlay.seed_head());
     let mut block_results = Vec::with_capacity(req.blocks.len());
 
     for (bi, block) in req.blocks.iter().enumerate() {

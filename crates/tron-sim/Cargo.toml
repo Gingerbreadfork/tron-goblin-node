@@ -15,5 +15,7 @@ tron-proto = { path = "../tron-proto" }
 tron-crypto = { path = "../tron-crypto" }
 prost.workspace = true
 thiserror.workspace = true
+# Unguessable, node-local fork-session ids (CSPRNG), same as tron-rpc/grpc.
+getrandom = "0.2"
 
 [dev-dependencies]
