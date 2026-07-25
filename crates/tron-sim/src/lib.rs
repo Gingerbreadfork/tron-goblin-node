@@ -15,8 +15,10 @@
 
 mod error;
 mod overlay;
+mod override_set;
 
 pub use error::SimError;
 pub use overlay::{
     BaseBlock, DiffEntry, ForkBackends, ForkCheckpoint, ForkOverlay, RawStateDiff,
 };
+pub use override_set::{AccountOverride, BlockOverride, OverrideSet};

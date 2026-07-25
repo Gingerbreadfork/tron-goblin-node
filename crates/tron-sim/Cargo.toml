@@ -11,6 +11,8 @@ description = "Chronos — deterministic time-travel fork simulation: a never-co
 tron-chainbase = { path = "../tron-chainbase" }
 tron-index = { path = "../tron-index" }
 tron-tvm = { path = "../tron-tvm" }
+tron-proto = { path = "../tron-proto" }
+tron-crypto = { path = "../tron-crypto" }
 thiserror.workspace = true
 
 [dev-dependencies]

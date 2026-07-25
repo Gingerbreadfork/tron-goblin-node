@@ -140,6 +140,35 @@ impl StorageRowStore {
             })
             .collect())
     }
+
+    /// Every storage row sharing the 16-byte prefix of `addr_hash`, via the
+    /// backend's NATIVE bounded [`scan_prefix`](crate::KvBackend::scan_prefix)
+    /// rather than a full [`scan_all`](crate::KvBackend::scan_all).
+    ///
+    /// Unlike [`scan_for_contract`](Self::scan_for_contract), the caller
+    /// supplies the already-resolved [`addr_hash`](Self::addr_hash), so this
+    /// serves CREATE2 contracts (whose prefix is `sha3(address ++ trxHash)`)
+    /// as well as plain ones. It also works over a parent that rejects
+    /// unbounded `scan_all` — notably the at-height archive view — which the
+    /// fork-simulation `state` (replace-all) override relies on.
+    pub fn scan_prefix_by_addr_hash(
+        &self,
+        addr_hash: &[u8; 32],
+    ) -> Result<Vec<([u8; KEY_LEN], Vec<u8>)>, StoreError> {
+        Ok(self
+            .backend
+            .scan_prefix(&addr_hash[..PREFIX_BYTES])?
+            .into_iter()
+            .filter_map(|(k, v)| {
+                if k.len() != KEY_LEN {
+                    return None;
+                }
+                let mut key = [0u8; KEY_LEN];
+                key.copy_from_slice(&k);
+                Some((key, v))
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]

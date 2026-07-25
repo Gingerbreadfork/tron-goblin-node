@@ -6242,7 +6242,9 @@ version = "1.1.5"
 dependencies = [
  "thiserror 1.0.69",
  "tron-chainbase",
+ "tron-crypto",
  "tron-index",
+ "tron-proto",
  "tron-tvm",
 ]
 
