@@ -5872,7 +5872,7 @@ dependencies = [
 
 [[package]]
 name = "tron-actuator"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "hex-literal",
@@ -5888,7 +5888,7 @@ dependencies = [
 
 [[package]]
 name = "tron-chainbase"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "flate2",
  "hex",
@@ -5905,7 +5905,7 @@ dependencies = [
 
 [[package]]
 name = "tron-consensus"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "hex-literal",
@@ -5919,7 +5919,7 @@ dependencies = [
 
 [[package]]
 name = "tron-crypto"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "bs58",
  "ecdsa",
@@ -5937,7 +5937,7 @@ dependencies = [
 
 [[package]]
 name = "tron-eventer"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "prost",
@@ -5954,7 +5954,7 @@ dependencies = [
 
 [[package]]
 name = "tron-eventer-kafka"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "kafka",
  "serde",
@@ -5965,7 +5965,7 @@ dependencies = [
 
 [[package]]
 name = "tron-executor"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "hex-literal",
@@ -5986,7 +5986,7 @@ dependencies = [
 
 [[package]]
 name = "tron-firehose-clickhouse"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "clickhouse",
  "prost",
@@ -6000,7 +6000,7 @@ dependencies = [
 
 [[package]]
 name = "tron-firehose-nats"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "async-nats",
  "prost",
@@ -6013,7 +6013,7 @@ dependencies = [
 
 [[package]]
 name = "tron-firehose-postgres"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "prost",
@@ -6027,7 +6027,7 @@ dependencies = [
 
 [[package]]
 name = "tron-grpc"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "bellman",
  "blake2s_simd",
@@ -6067,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "tron-index"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "flate2",
  "hex",
@@ -6086,7 +6086,7 @@ dependencies = [
 
 [[package]]
 name = "tron-mempool"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex-literal",
  "prost",
@@ -6103,7 +6103,7 @@ dependencies = [
 
 [[package]]
 name = "tron-net"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "base32",
  "base64",
@@ -6126,7 +6126,7 @@ dependencies = [
 
 [[package]]
 name = "tron-node"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "axum",
  "bytes",
@@ -6170,7 +6170,7 @@ dependencies = [
 
 [[package]]
 name = "tron-proto"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "hex-literal",
@@ -6182,7 +6182,7 @@ dependencies = [
 
 [[package]]
 name = "tron-replay"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "hex",
  "k256",
@@ -6201,7 +6201,7 @@ dependencies = [
 
 [[package]]
 name = "tron-rpc"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-primitives",
@@ -6238,7 +6238,7 @@ dependencies = [
 
 [[package]]
 name = "tron-snapshot-convert"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "flate2",
  "rocksdb",
@@ -6251,14 +6251,14 @@ dependencies = [
 
 [[package]]
 name = "tron-state-diff"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "tron-tvm"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "aurora-engine-modexp",
  "bellman",
@@ -6288,7 +6288,7 @@ dependencies = [
 
 [[package]]
 name = "tron-types"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "eth_trie",
  "hex",
@@ -6302,7 +6302,7 @@ dependencies = [
 
 [[package]]
 name = "tron-wallet"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "aes",
  "bip32",
