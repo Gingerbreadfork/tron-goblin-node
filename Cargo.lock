@@ -6237,6 +6237,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tron-sim"
+version = "1.1.5"
+dependencies = [
+ "thiserror 1.0.69",
+ "tron-chainbase",
+ "tron-index",
+ "tron-tvm",
+]
+
+[[package]]
 name = "tron-snapshot-convert"
 version = "1.1.5"
 dependencies = [

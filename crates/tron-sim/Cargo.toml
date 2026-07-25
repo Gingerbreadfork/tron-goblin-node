@@ -1,0 +1,16 @@
+[package]
+name = "tron-sim"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chronos — deterministic time-travel fork simulation: a never-committed mutable overlay over historical (at-height) or live state, running arbitrary mutating transactions through the TVM with state/code/balance/block-env overrides and returning status, return data, energy, logs, internal-tx trees, opcode traces, and state diffs. anvil-fork / Tenderly for TRON, byte-exact."
+
+[dependencies]
+tron-chainbase = { path = "../tron-chainbase" }
+tron-index = { path = "../tron-index" }
+tron-tvm = { path = "../tron-tvm" }
+thiserror.workspace = true
+
+[dev-dependencies]

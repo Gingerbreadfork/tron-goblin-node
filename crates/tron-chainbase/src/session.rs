@@ -258,6 +258,32 @@ impl SessionBackend {
             .len()
     }
 
+    /// Non-destructively snapshot the overlay as `(key, Option<value>)`
+    /// pairs — `Some(v)` for a pending `Put`, `None` for a pending
+    /// `Delete`. Unlike [`drain_pending`], the overlay is left intact, so
+    /// callers can diff or inspect the accumulated writes mid-lifetime
+    /// (the fork-simulation overlay reads this to build state diffs
+    /// without disturbing the session). Order is unspecified — the
+    /// overlay is a `HashMap`; callers that need ordering sort the result.
+    ///
+    /// [`drain_pending`]: SessionBackend::drain_pending
+    pub fn pending_snapshot(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        // Fast path: a never-written overlay has no pending entries.
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let g = self.pending.read().expect("SessionBackend lock poisoned");
+        g.iter()
+            .map(|(k, op)| {
+                let v = match op {
+                    Op::Put(v) => Some(v.clone()),
+                    Op::Delete => None,
+                };
+                (k.clone(), v)
+            })
+            .collect()
+    }
+
     /// `true` if there are no pending writes.
     pub fn is_clean(&self) -> bool {
         self.pending_len() == 0

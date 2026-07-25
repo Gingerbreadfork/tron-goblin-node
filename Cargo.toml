@@ -16,6 +16,10 @@ members = [
     "crates/tron-node",
     "crates/tron-mempool",
     "crates/tron-index",
+    # Chronos — deterministic time-travel fork simulation (anvil-fork /
+    # Tenderly for TRON). A never-committed overlay over at-height or live
+    # state; the engine only, wired into the RPC surface by tron-rpc.
+    "crates/tron-sim",
     "crates/tron-firehose-postgres",
     "crates/tron-firehose-nats",
     "crates/tron-firehose-clickhouse",
