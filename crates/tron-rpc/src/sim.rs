@@ -24,6 +24,34 @@ use crate::methods::{parse_eth_address, parse_hex_bytes, RpcError};
 use crate::state::RpcState;
 
 // ---------------------------------------------------------------------------
+// REST surface — POST /v1/sim/bundle (the tron_simulateBundle payload as the
+// request body). JSON-RPC is the primary surface; this is a convenience.
+// ---------------------------------------------------------------------------
+
+/// Router for the Chronos REST endpoint. Merged into the HTTP REST app.
+pub fn sim_router() -> axum::Router<RpcState> {
+    axum::Router::new().route("/v1/sim/bundle", axum::routing::post(rest_sim_bundle))
+}
+
+async fn rest_sim_bundle(
+    axum::extract::State(state): axum::extract::State<RpcState>,
+    axum::Json(body): axum::Json<Value>,
+) -> (axum::http::StatusCode, axum::Json<Value>) {
+    use axum::http::StatusCode;
+    match tron_simulate_bundle(&json!([body]), &state) {
+        Ok(v) => (StatusCode::OK, axum::Json(json!({ "success": true, "data": v }))),
+        Err(e) => {
+            let code = if e.code == -32602 {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, axum::Json(json!({ "success": false, "error": e.message })))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Method entry points
 // ---------------------------------------------------------------------------
 
@@ -142,6 +170,186 @@ pub fn tron_fork_list(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         })
         .collect();
     Ok(json!(forks))
+}
+
+// ---------------------------------------------------------------------------
+// eth_simulateV1 (geth shape) routed through the Chronos engine — adds the
+// historical base, full state overrides (code/state/stateDiff), and creation
+// calls that the standalone eth_simulate path rejects. Used only when [sim] is
+// enabled and the archive is present; otherwise the caller keeps the legacy
+// latest-only path (backward compatible).
+// ---------------------------------------------------------------------------
+
+pub fn eth_simulate_v1_via_engine(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    let sim = require_sim(s)?;
+    let payload = obj_param(p, 0, "simulation payload")?;
+
+    // Base: param[1] is a hex height or latest/pending tag.
+    let base = match p.get(1).and_then(Value::as_str) {
+        None | Some("latest") | Some("pending") | Some("") => BaseBlock::Latest,
+        Some(tag) => BaseBlock::Height(parse_i64_flex(&json!(tag), "block tag")?),
+    };
+
+    if payload.get("validation").and_then(Value::as_bool).unwrap_or(false)
+        || payload.get("traceTransfers").and_then(Value::as_bool).unwrap_or(false)
+    {
+        return Err(RpcError::invalid_params(
+            "eth_simulateV1: validation / traceTransfers are not supported",
+        ));
+    }
+
+    let bsc = payload
+        .get("blockStateCalls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid_params("missing `blockStateCalls`"))?;
+    let mut blocks = Vec::with_capacity(bsc.len());
+    for (i, entry) in bsc.iter().enumerate() {
+        let e = entry
+            .as_object()
+            .ok_or_else(|| RpcError::invalid_params(format!("blockStateCalls[{i}] must be an object")))?;
+        blocks.push(parse_geth_block(e)?);
+    }
+
+    let req = SimRequest {
+        blocks,
+        trace: TraceLevel::None,
+        return_state_diff: DiffLevel::None,
+        self_check: false,
+        energy_cap: None,
+    };
+    let mut overlay = build_overlay(s, base)?;
+    let result = tron_sim::run_bundle(&mut overlay, &req, sim.config(), [0u8; 16], None)
+        .map_err(sim_to_rpc)?;
+    Ok(format_geth_result(&result, sim.config().energy_cap))
+}
+
+fn parse_geth_block(e: &Map<String, Value>) -> Result<BlockSpec, RpcError> {
+    let mut overrides = OverrideSet::default();
+    if let Some(so) = e.get("stateOverrides").and_then(Value::as_object) {
+        for (addr, ov) in so {
+            overrides.accounts.insert(parse_eth_address(addr)?, parse_account_override(ov)?);
+        }
+    }
+    if let Some(bo) = e.get("blockOverrides").and_then(Value::as_object) {
+        let number = match bo.get("number") {
+            Some(v) if !v.is_null() => Some(parse_i64_flex(v, "number")?),
+            _ => None,
+        };
+        let time_s = match bo.get("time").or_else(|| bo.get("timestamp")) {
+            Some(v) if !v.is_null() => Some(parse_i64_flex(v, "time")?),
+            _ => None,
+        };
+        overrides.block = Some(BlockOverride { number, time_s, coinbase: None });
+    }
+    let mut calls = Vec::new();
+    if let Some(arr) = e.get("calls").and_then(Value::as_array) {
+        for (i, c) in arr.iter().enumerate() {
+            calls.push(parse_geth_call(c).map_err(|err| {
+                RpcError::invalid_params(format!("calls[{i}]: {}", err.message))
+            })?);
+        }
+    }
+    Ok(BlockSpec { overrides, calls })
+}
+
+fn parse_geth_call(c: &Value) -> Result<CallSpec, RpcError> {
+    let o = c.as_object().ok_or_else(|| RpcError::invalid_params("call must be an object"))?;
+    let from = match o.get("from").and_then(Value::as_str) {
+        Some(s) => parse_eth_address(s)?,
+        None => Address::from_raw({
+            let mut a = [0u8; 21];
+            a[0] = 0x41;
+            a
+        }),
+    };
+    let value = opt_i64(o, &["value"])?.unwrap_or(0);
+    let energy = opt_u64(o, &["gas"])?;
+    let data = match o.get("input").or_else(|| o.get("data")).and_then(Value::as_str) {
+        Some(s) => parse_hex_bytes(s)?,
+        None => Vec::new(),
+    };
+    // geth convention: a call with no `to` is a contract creation.
+    match o.get("to").and_then(Value::as_str) {
+        Some(to) => Ok(CallSpec::Trigger {
+            from,
+            to: parse_eth_address(to)?,
+            value,
+            data,
+            energy,
+            token_id: 0,
+            token_value: 0,
+        }),
+        None => Ok(CallSpec::Create {
+            from,
+            init_code: data,
+            value,
+            energy,
+            consume_user_resource_percent: 100,
+            name: String::new(),
+            token_id: 0,
+            token_value: 0,
+        }),
+    }
+}
+
+fn format_geth_result(res: &SimResult, gas_cap: u64) -> Value {
+    let blocks: Vec<Value> = res
+        .blocks
+        .iter()
+        .map(|b| {
+            let mut log_index = 0u64;
+            let calls: Vec<Value> = b
+                .calls
+                .iter()
+                .map(|c| format_geth_call_result(c, b.number, &mut log_index))
+                .collect();
+            json!({
+                "number": format!("0x{:x}", b.number),
+                "timestamp": format!("0x{:x}", b.timestamp_ms / 1000),
+                "gasLimit": format!("0x{gas_cap:x}"),
+                "gasUsed": format!("0x{:x}", b.energy_used),
+                "baseFeePerGas": "0x0",
+                "calls": calls,
+            })
+        })
+        .collect();
+    json!(blocks)
+}
+
+fn format_geth_call_result(c: &CallResult, block_num: i64, log_index: &mut u64) -> Value {
+    let mut m = Map::new();
+    let ok = c.status == CallStatus::Success;
+    m.insert("status".into(), json!(if ok { "0x1" } else { "0x0" }));
+    m.insert("returnData".into(), json!(hexs(&c.return_data)));
+    m.insert("gasUsed".into(), json!(format!("0x{:x}", c.energy_used)));
+    let logs: Vec<Value> = c
+        .logs
+        .iter()
+        .map(|l| {
+            let li = *log_index;
+            *log_index += 1;
+            json!({
+                "address": hexs(&l.address),
+                "topics": l.topics.iter().map(|t| hexs(t)).collect::<Vec<_>>(),
+                "data": hexs(&l.data),
+                "blockNumber": format!("0x{block_num:x}"),
+                "logIndex": format!("0x{li:x}"),
+            })
+        })
+        .collect();
+    m.insert("logs".into(), json!(logs));
+    if let Some(addr) = &c.contract_address {
+        // geth reports the 20-byte EVM form.
+        m.insert("contractAddress".into(), json!(hexs(&addr.as_bytes()[1..])));
+    }
+    if !ok {
+        let msg = c.error.clone().unwrap_or_else(|| "execution failed".to_string());
+        m.insert(
+            "error".into(),
+            json!({ "code": 3, "message": msg, "data": hexs(&c.return_data) }),
+        );
+    }
+    Value::Object(m)
 }
 
 // ---------------------------------------------------------------------------

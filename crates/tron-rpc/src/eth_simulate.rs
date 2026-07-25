@@ -28,6 +28,17 @@ use tron_proto::{Account, TriggerSmartContract};
 use tron_tvm::execute::{VmBlockEnv, VmLog, VmOutcome, VmStores};
 
 pub fn eth_simulate_v1(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
+    // When Chronos is enabled (and the archive is present), route through the
+    // fork-simulation engine: this adds a historical base block, full
+    // `stateOverrides` (code/state/stateDiff), and contract-creation calls
+    // that the legacy path below rejects. With `[sim]` off, behaviour is
+    // exactly as before (latest base, balance-only overrides).
+    if let Some(sim) = &s.sim {
+        if sim.config().enabled && s.archive.is_some() {
+            return crate::sim::eth_simulate_v1_via_engine(p, s);
+        }
+    }
+
     let Some(b) = &s.eth_call_backends else {
         return Err(RpcError::internal(
             "eth_simulateV1 not available: server built without EVM call backends",

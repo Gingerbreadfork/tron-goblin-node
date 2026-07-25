@@ -150,6 +150,40 @@ fn fork_lifecycle_create_call_snapshot_revert_delete() {
     assert!(tron_rpc::sim::tron_fork_call(&call_body, &st).is_err());
 }
 
+fn eth20(n: u8) -> String {
+    let mut b = [0u8; 20];
+    b[19] = n;
+    format!("0x{}", hex::encode(b))
+}
+
+#[test]
+fn eth_simulate_v1_supports_code_override_and_creation() {
+    let st = state(true);
+    let contract = eth20(0x30);
+    let caller = eth20(0x31);
+    let params = json!([
+        {
+            "blockStateCalls": [{
+                "stateOverrides": {
+                    caller.clone(): { "balance": "0x3b9aca00" },
+                    contract.clone(): { "code": "0x602a60005500" }
+                },
+                "calls": [
+                    { "from": caller.clone(), "to": contract, "input": "0x", "gas": "0xf4240" },
+                    // No `to` => contract creation (init returns a 0x00 runtime).
+                    { "from": caller, "input": "0x60006000526001601ff3", "gas": "0x1e8480" }
+                ]
+            }]
+        },
+        "latest"
+    ]);
+    let res = tron_rpc::eth_simulate::eth_simulate_v1(&params, &st).expect("eth_simulateV1");
+    let calls = res[0]["calls"].as_array().unwrap();
+    assert_eq!(calls[0]["status"], "0x1", "override+trigger: {}", calls[0]);
+    assert_eq!(calls[1]["status"], "0x1", "creation: {}", calls[1]);
+    assert!(calls[1]["contractAddress"].is_string(), "creation must report contractAddress");
+}
+
 #[test]
 fn historical_base_out_of_coverage_is_rejected() {
     let st = state(true);

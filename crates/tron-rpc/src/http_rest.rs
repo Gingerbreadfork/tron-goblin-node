@@ -386,6 +386,7 @@ pub fn router_with_limits(
         .merge(crate::index_api::router())
         .merge(crate::index_api::archive_router())
         .merge(crate::index_api::commitment_router())
+        .merge(crate::sim::sim_router())
         .with_state(state);
     // Rate-limit middleware: when the registry is empty the closure
     // returns immediately. Otherwise it parses the path tail and
