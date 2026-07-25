@@ -13,6 +13,7 @@ tron-index = { path = "../tron-index" }
 tron-tvm = { path = "../tron-tvm" }
 tron-proto = { path = "../tron-proto" }
 tron-crypto = { path = "../tron-crypto" }
+prost.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

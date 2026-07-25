@@ -6240,6 +6240,7 @@ dependencies = [
 name = "tron-sim"
 version = "1.1.5"
 dependencies = [
+ "prost",
  "thiserror 1.0.69",
  "tron-chainbase",
  "tron-crypto",

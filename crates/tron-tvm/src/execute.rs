@@ -337,6 +337,29 @@ pub fn execute_trigger_with_trace_tx_id(
     execute_trigger_inner(stores, block, contract, energy_limit, None, None, Some(tx_id))
 }
 
+/// As [`execute_trigger_with_trace_tx_id`] but also lifts revm's
+/// `tx_gas_limit_cap` to `gas_cap_override`, so an untraced Chronos call
+/// can carry an `energy_limit` above revm's default 16.7M cap (whale
+/// replays) while still deriving deterministic nested-CREATE addresses.
+pub fn execute_trigger_with_gas_cap_tx_id(
+    stores: &VmStores,
+    block: VmBlockEnv,
+    contract: &TriggerSmartContract,
+    energy_limit: u64,
+    gas_cap_override: u64,
+    tx_id: [u8; 32],
+) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
+    execute_trigger_inner(
+        stores,
+        block,
+        contract,
+        energy_limit,
+        Some(gas_cap_override),
+        None,
+        Some(tx_id),
+    )
+}
+
 /// Same as [`execute_trigger_with_trace`] plus a `tx_gas_limit_cap`
 /// override on revm's `CfgEnv`. Required when callers want
 /// `energy_limit > 16,777,216` (revm's default `eip7825::TX_GAS_LIMIT_CAP`),
@@ -378,7 +401,7 @@ pub fn execute_trigger_with_tracer(
     Vec<crate::internal_tx::InternalTxTrace>,
     crate::tracer::StructLogTracer,
 ) {
-    execute_trigger_inner_with_tracer(
+    let (outcome, traces, _penalty, tracer) = execute_trigger_inner_with_tracer(
         stores,
         block,
         contract,
@@ -387,6 +410,37 @@ pub fn execute_trigger_with_tracer(
         None,
         Some(tracer),
         None,
+    );
+    (outcome, traces, tracer)
+}
+
+/// As [`execute_trigger_with_tracer`] but threads the real root
+/// transaction id so nested `CREATE` opcodes derive consensus-correct
+/// (and deterministic) addresses. Chronos uses this so a traced fork call
+/// reports the same nested-deploy addresses on every replay.
+pub fn execute_trigger_with_tracer_tx_id(
+    stores: &VmStores,
+    block: VmBlockEnv,
+    contract: &TriggerSmartContract,
+    energy_limit: u64,
+    gas_cap_override: u64,
+    tracer: crate::tracer::StructLogTracer,
+    tx_id: [u8; 32],
+) -> (
+    VmOutcome,
+    Vec<crate::internal_tx::InternalTxTrace>,
+    u64,
+    crate::tracer::StructLogTracer,
+) {
+    execute_trigger_inner_with_tracer(
+        stores,
+        block,
+        contract,
+        energy_limit,
+        Some(gas_cap_override),
+        None,
+        Some(tracer),
+        Some(tx_id),
     )
 }
 
@@ -848,6 +902,7 @@ fn execute_trigger_inner_with_tracer(
 ) -> (
     VmOutcome,
     Vec<crate::internal_tx::InternalTxTrace>,
+    u64,
     crate::tracer::StructLogTracer,
 ) {
     // We need a sentinel tracer when caller passes None so the
@@ -858,11 +913,11 @@ fn execute_trigger_inner_with_tracer(
     });
     let owner_bytes = match parse_tron_address_to_evm(&contract.owner_address) {
         Ok(a) => a,
-        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), tracer),
+        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0, tracer),
     };
     let target_bytes = match parse_tron_address_to_evm(&contract.contract_address) {
         Ok(a) => a,
-        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), tracer),
+        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0, tracer),
     };
     // java VMActuator.call (lines 478-483, 548): the top-level token value/id
     // are read and the TRC-10 transfer performed ONLY when
@@ -882,6 +937,7 @@ fn execute_trigger_inner_with_tracer(
                         contract.token_id, contract.call_token_value
                     )),
                     Vec::new(),
+                    0,
                     tracer,
                 );
             }
@@ -893,7 +949,7 @@ fn execute_trigger_inner_with_tracer(
                 contract.call_token_value,
             ) {
                 Ok(_) => Some((contract.token_id, contract.call_token_value)),
-                Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), tracer),
+                Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0, tracer),
             }
         } else {
             None
@@ -1092,12 +1148,14 @@ fn execute_trigger_inner_with_tracer(
     {
         Ok(tx) => tx,
         Err(e) => {
+            let penalty = evm.inspector.energy_penalty_total();
             let captured = evm.inspector.take_tracer().unwrap_or_else(|| {
                 crate::tracer::StructLogTracer::new(crate::tracer::TracerOptions::default())
             });
             return (
                 VmOutcome::PreflightError(format!("TxEnv build: {e:?}")),
                 Vec::new(),
+                penalty,
                 captured,
             );
         }
@@ -1164,11 +1222,12 @@ fn execute_trigger_inner_with_tracer(
             VmOutcome::PreflightError(format!("{e:?}"))
         }
     };
+    let energy_penalty = evm.inspector.energy_penalty_total();
     let captured_tracer = evm.inspector.take_tracer().unwrap_or_else(|| {
         crate::tracer::StructLogTracer::new(crate::tracer::TracerOptions::default())
     });
     let traces = evm.inspector.into_internal_txs();
-    (vm_outcome, traces, captured_tracer)
+    (vm_outcome, traces, energy_penalty, captured_tracer)
 }
 
 /// Convert revm's `Vec<Log>` into our own [`VmLog`] form. Splits the
@@ -1367,16 +1426,67 @@ pub fn execute_create_with_trace(
     tx_id: &[u8; 32],
     energy_limit: u64,
 ) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
+    let (outcome, traces, penalty, _tracer) =
+        execute_create_inner(stores, block, contract, tx_id, energy_limit, None);
+    (outcome, traces, penalty)
+}
+
+/// As [`execute_create_with_trace`] plus an attached
+/// [`crate::tracer::StructLogTracer`] (opcode struct-logs + call tree).
+/// Used by Chronos to trace contract-creation calls. Returns the tracer
+/// alongside the outcome, mirroring [`execute_trigger_with_tracer`].
+pub fn execute_create_with_tracer(
+    stores: &VmStores,
+    block: VmBlockEnv,
+    contract: &CreateSmartContract,
+    tx_id: &[u8; 32],
+    energy_limit: u64,
+    tracer: crate::tracer::StructLogTracer,
+) -> (
+    VmOutcome,
+    Vec<crate::internal_tx::InternalTxTrace>,
+    u64,
+    crate::tracer::StructLogTracer,
+) {
+    let (outcome, traces, penalty, captured) =
+        execute_create_inner(stores, block, contract, tx_id, energy_limit, Some(tracer));
+    // The inspector always holds the tracer we installed; the fallback only
+    // guards the (unreachable) case where it was dropped.
+    let tracer = captured.unwrap_or_else(|| {
+        crate::tracer::StructLogTracer::new(crate::tracer::TracerOptions::default())
+    });
+    (outcome, traces, penalty, tracer)
+}
+
+/// Shared body for the create path. `tracer` is installed into the TRC-10
+/// inspector when present and handed back (via the returned `Option`) after
+/// the run; when `None`, behaviour is identical to the untraced path. Every
+/// early return threads the `Option` through unchanged so a preflight
+/// failure returns the (unused) tracer.
+fn execute_create_inner(
+    stores: &VmStores,
+    block: VmBlockEnv,
+    contract: &CreateSmartContract,
+    tx_id: &[u8; 32],
+    energy_limit: u64,
+    tracer: Option<crate::tracer::StructLogTracer>,
+) -> (
+    VmOutcome,
+    Vec<crate::internal_tx::InternalTxTrace>,
+    u64,
+    Option<crate::tracer::StructLogTracer>,
+) {
     let Some(smart_contract) = &contract.new_contract else {
         return (
             VmOutcome::PreflightError("CreateSmartContract.new_contract missing".to_string()),
             Vec::new(),
             0,
+            tracer,
         );
     };
     let owner_bytes = match parse_tron_address_to_evm(&contract.owner_address) {
         Ok(a) => a,
-        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0),
+        Err(e) => return (VmOutcome::PreflightError(e), Vec::new(), 0, tracer),
     };
 
     let tron_addr = derive_top_level_contract_address(tx_id, &contract.owner_address);
@@ -1394,6 +1504,7 @@ pub fn execute_create_with_trace(
             VmOutcome::PreflightError(format!("write init code: {e:?}")),
             Vec::new(),
             0,
+            tracer,
         );
     }
     if let Err(e) = stores.accounts.put(
@@ -1425,6 +1536,7 @@ pub fn execute_create_with_trace(
             VmOutcome::PreflightError(format!("install contract account: {e:?}")),
             Vec::new(),
             0,
+            tracer,
         );
     }
 
@@ -1513,6 +1625,7 @@ pub fn execute_create_with_trace(
                 )),
                 Vec::new(),
                 0,
+                tracer,
             );
         }
         if contract.call_token_value > 0 {
@@ -1526,7 +1639,7 @@ pub fn execute_create_with_trace(
                 Ok(_) => Some((contract.token_id, contract.call_token_value)),
                 Err(e) => {
                     let _ = stores.accounts.delete(&tron_contract_addr);
-                    return (VmOutcome::PreflightError(e), Vec::new(), 0);
+                    return (VmOutcome::PreflightError(e), Vec::new(), 0, tracer);
                 }
             }
         } else {
@@ -1632,6 +1745,11 @@ pub fn execute_create_with_trace(
     if let Some((id, val)) = top_level_token {
         trc10 = trc10.with_top_level_token(id, val);
     }
+    // Chronos: attach the opcode / call-tree tracer when the caller asked to
+    // trace this creation. Recovered via `take_tracer()` after the run.
+    if let Some(t) = tracer {
+        trc10 = trc10.with_tracer(t);
+    }
     // TRON SELFDESTRUCT semantics: the journal's destroy rule follows
     // proposal #94 (not the Cancun opcode spec), and a self-target
     // destroy credits the burn account when TRC-10 transfers are live.
@@ -1683,6 +1801,7 @@ pub fn execute_create_with_trace(
                 VmOutcome::PreflightError(format!("TxEnv build: {e:?}")),
                 Vec::new(),
                 0,
+                evm.inspector.take_tracer(),
             )
         }
     };
@@ -1692,8 +1811,9 @@ pub fn execute_create_with_trace(
         Err(e) => {
             unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
             let energy_penalty = evm.inspector.energy_penalty_total();
+            let captured = evm.inspector.take_tracer();
             let traces = evm.inspector.into_internal_txs();
-            return (VmOutcome::PreflightError(format!("{e:?}")), traces, energy_penalty);
+            return (VmOutcome::PreflightError(format!("{e:?}")), traces, energy_penalty, captured);
         }
     };
 
@@ -1867,8 +1987,9 @@ pub fn execute_create_with_trace(
         }
     };
     let energy_penalty = evm.inspector.energy_penalty_total();
+    let captured_tracer = evm.inspector.take_tracer();
     let traces = evm.inspector.into_internal_txs();
-    (vm_outcome, traces, energy_penalty)
+    (vm_outcome, traces, energy_penalty, captured_tracer)
 }
 
 /// Convert a raw TRON address (21 bytes with `0x41` prefix) into a

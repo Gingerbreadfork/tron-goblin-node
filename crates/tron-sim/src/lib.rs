@@ -13,12 +13,26 @@
 //! REST surface). The overlay never reaches disk — height-based bases sit
 //! on read-only at-height archive views and no session is ever committed.
 
+mod config;
+mod diff;
 mod error;
+mod execute;
 mod overlay;
 mod override_set;
+mod request;
+mod result;
 
+pub use config::SimConfig;
+pub use diff::{AccountDiff, CodeDiff, DecodedStateDiff, StorageDiff};
 pub use error::SimError;
+pub use execute::run_bundle;
 pub use overlay::{
     BaseBlock, DiffEntry, ForkBackends, ForkCheckpoint, ForkOverlay, RawStateDiff,
 };
 pub use override_set::{AccountOverride, BlockOverride, OverrideSet};
+pub use request::{BlockSpec, CallSpec, DiffLevel, SimRequest, TraceLevel};
+pub use result::{Basis, CallResult, CallStatus, SimBlockResult, SimResult, VmLogOut};
+
+// Re-export the tracer types the result model surfaces, so consumers don't
+// need a direct tron-tvm dependency just to read a CallResult.
+pub use tron_tvm::tracer::{CallFrame, StructLog};
