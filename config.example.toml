@@ -615,3 +615,37 @@ global_ip_qps = 10000
 #   [committee]    — committee.* governance bootstrap values
 #   [local_witness]— top-level localwitness* key sources
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# [sim] — Chronos deterministic time-travel fork simulation (anvil-fork /
+# Tenderly for TRON). Fork the chain at an archived block (or head), open a
+# never-committed overlay, and run mutating txs/bundles with state/code/
+# balance/block overrides -> status, energy, logs, internal-tx trees, opcode
+# traces, and state diffs. Exposes tron_simulateBundle, the tron_fork* session
+# family, POST /v1/sim/bundle, and upgrades eth_simulateV1 (historical base +
+# full stateOverrides + creation calls).
+#
+# DEFAULT OFF: it executes arbitrary code with large energy budgets and holds
+# per-fork memory. Historical forks additionally require [index] archive (they
+# read at-height state); leave that off and only latest-base forks work.
+# -----------------------------------------------------------------------------
+[sim]
+enabled = false
+# Concurrent named fork sessions before least-recently-used eviction.
+max_forks = 8
+# Evict a fork session this many seconds after its last use.
+fork_ttl_secs = 3600
+# Hard cap on a single fork's overlay size (pending overlay keys). Exceeding it
+# fails the offending call; the fork itself survives.
+max_overlay_keys = 1000000
+# Per-request bundle limits.
+max_calls_per_bundle = 256
+max_blocks_per_bundle = 64
+# Per-call energy budget ceiling (defaults to the eth_call gas cap, 50M).
+energy_cap = 50000000
+# Max slots a `state` (replace-all) override may enumerate before it errors
+# (suggesting stateDiff) rather than silently truncating.
+max_state_override_slots = 10000
+# Per-call wall-clock deadline in ms (DoS guard); 0 disables it. A call that
+# exceeds it returns a TIMEOUT status, never a wrong result.
+call_timeout_ms = 0

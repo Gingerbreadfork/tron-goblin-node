@@ -103,6 +103,7 @@ fn fixture() -> RpcState {
         tx_history: None,
         transaction_ret: None,
         commitment: None,
+        sim: None,
         account_id_index: None,
         contracts: None,
         abis: None,

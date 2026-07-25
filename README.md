@@ -1,6 +1,6 @@
 # <img src="goblin.svg" width="48" alt="" valign="middle"> Tron Goblin Node
 
-[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Tests](https://img.shields.io/badge/tests-2711%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
+[![Test Suite](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml/badge.svg)](https://github.com/Gingerbreadfork/tron-goblin-node/actions/workflows/test-suite.yml) [![License](https://img.shields.io/github/license/Gingerbreadfork/tron-goblin-node)](LICENSE) ![Rust](https://img.shields.io/badge/rust-1.80%2B-orange) ![Tests](https://img.shields.io/badge/tests-3273%20passing-brightgreen) [![Stars](https://img.shields.io/github/stars/Gingerbreadfork/tron-goblin-node?style=social)](https://github.com/Gingerbreadfork/tron-goblin-node/stargazers)
 
 A Rust implementation of the [TRON](https://tron.network) full-node
 protocol — the same role java-tron plays, written from scratch in
@@ -25,6 +25,7 @@ RPC responses, just with better performance, lighter hardware requirements, and 
 - Byte-exact RocksDB + bidirectional P2P (pick right up where java-tron left off)
 - Built-in TronGrid cross-compatible indexer + historical state archive (both optional to suit your needs)
 - ERC-4337 bundler + eth_simulateV1 (full account-abstraction bundler including ERC-7562 validation and reputation throttling)
+- Chronos — deterministic time-travel fork simulation (anvil-fork / Tenderly for TRON): fork mainnet at any archived block, run mutating txs with state/code/balance overrides, and get byte-exact status/energy/logs/internal-tx trees/opcode traces/state diffs (optional, default off)
 - Self auditing and diagnostic tools
 - Borderline excessive test coverage (2500+ tests)
 - Full node functionality - **not a tech demo**
@@ -281,6 +282,18 @@ java-tron doesn't have.What works today, by area:
   queryable within seconds), reorg-reconciled, restart-resuming, and
   disposable. Same query params as TronGrid — a drop-in for existing
   TronWeb history code.
+- **Chronos — deterministic time-travel fork simulation** (`[sim] enabled`,
+  default off) — fork the chain at any archived block (or head), open a
+  mutable, never-committed overlay seeded from real historical state, and run
+  arbitrary **mutating** transactions and bundles with state / code / balance /
+  block-environment overrides. Returns per-call status, return data, energy
+  (incl. dynamic-energy penalty), logs, the internal-transaction tree, the
+  opcode trace, and decoded state diffs. `tron_simulateBundle` (native,
+  full-power), named `tron_fork*` sessions with anvil-style snapshot / revert,
+  and `POST /v1/sim/bundle`; `eth_simulateV1` gains a historical base, full
+  `stateOverrides`, and creation calls when enabled. anvil-fork / Tenderly for
+  TRON, byte-exact — see [docs/chronos.md](docs/chronos.md). Requires
+  `[index] archive`.
 
 ### 🛠️ Developer & operator tooling
 
@@ -346,9 +359,9 @@ the byte layout drifts.
 
 | Metric | Count |
 | --- | --- |
-| Workspace tests passing | **3234** |
+| Workspace tests passing | **3273** |
 | Ignored — live-network (6), Sapling Groth16 proving (5), perf/diagnostic (7) | 18 |
-| Integration test files (`crates/*/tests/`) | 150 |
+| Integration test files (`crates/*/tests/`) | 155 |
 | Source modules with `#[cfg(test)]` blocks | 150 |
 
 Per-crate breakdown of the test surface (where coverage lives is
@@ -358,15 +371,16 @@ where parity risk lives):
 | --- | ---: | --- | ---: |
 | `tron-node`      | 419 | `tron-types`     |  74 |
 | `tron-actuator`  | 432 | `tron-net`       |  78 |
-| `tron-rpc`       | 414 | `tron-index`     | 126 |
+| `tron-rpc`       | 419 | `tron-index`     | 126 |
 | `tron-tvm`       | 682 | `tron-crypto`    |  40 |
 | `tron-chainbase` | 307 | `tron-mempool`   |  30 |
 | `tron-executor`  | 191 | `tron-wallet`    |  23 |
 | `tron-consensus` | 134 | `tron-eventer`   |  16 |
 | `tron-grpc`      |  67 | `tron-firehose-*`|  10 |
 | `tron-proto`     |  13 | `tron-replay`    |   8 |
+| `tron-sim`       |  34 |                  |     |
 
-These crates account for 3,054 of the 3,224 passing tests. The remaining
+These crates account for 3,088 of the 3,273 passing tests. The remaining
 170 are the four vendored `revm-*` forks (136) and the `tron-state-diff` /
 `tron-snapshot-convert` tooling crates (34).
 
@@ -423,6 +437,7 @@ crate is something you can hold in your head.
 | [`tron-grpc`](crates/tron-grpc) | gRPC (Wallet / WalletSolidity / Database / Monitor / Network). Wraps `tron-rpc`. |
 | [`tron-eventer`](crates/tron-eventer) | Event subscribe / logsfilter — per-block, per-tx, per-contract-event/log triggers. |
 | [`tron-index`](crates/tron-index) | Built-in address-history indexer: extraction rules, backfill/follow engine, query layer for the `/v1` history + event-search API, the versioned-KV historical-state archive, and the firehose segment log. |
+| [`tron-sim`](crates/tron-sim) | Chronos deterministic time-travel fork simulation: a never-committed overlay over at-height or live state, running mutating txs through the TVM with overrides → traces + diffs. |
 | [`tron-wallet`](crates/tron-wallet) | Key management + transaction signing CLI. Reads java-tron-compatible v3 keystores. |
 | [`tron-replay`](crates/tron-replay) | CLI for generating + validating length-delimited TRON block streams. |
 | [`tron-node`](crates/tron-node) | Full-node daemon binary — opens stores, runs RPC, syncs blocks. |
@@ -465,7 +480,7 @@ The full workspace compiles in ~3–5 minutes on a modern machine, and the full 
 Tests:
 
 ```sh
-cargo test --workspace            # 3234 tests, all defaults
+cargo test --workspace            # 3273 tests, all defaults
 cargo test --workspace --release -- --include-ignored
                                   # + 18 opt-in: Sapling proving (~50 MB
                                   # Groth16 params), live-network, diagnostics
@@ -656,6 +671,7 @@ This README is the high-level tour. Deeper, task-oriented guides live in
 | [Security & Production Readiness](docs/security-production.md) | The hardening checklist before exposing a node publicly. |
 | [APIs, Indexing & Firehose](docs/apis-indexing-firehose.md) | The RPC / REST / gRPC surface, the `/v1` history API, archive reads, and the firehose. |
 | [Historical-State Archive](docs/historical-state-archive.md) | Reading account / contract state — or running constant calls — as-of a past block. |
+| [Chronos Fork Simulation](docs/chronos.md) | Time-travel forks: run mutating txs at a past block with state/code/balance overrides; traces, diffs, and snapshot/revert fork sessions. |
 | [Verifiable State Commitment](docs/verifiable-state-commitment.md) | The opt-in cryptographic state root, offline proofs, and the node-equality self-check. |
 | [Development](docs/development.md) | Building, testing, and validating parity when changing code. |
 | [Troubleshooting](docs/troubleshooting.md) | Diagnosing common failures. |
