@@ -115,6 +115,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub index: IndexConfig,
 
+    /// Chronos deterministic fork simulation (`[sim]`). Default off — it
+    /// executes arbitrary code with large energy budgets and holds per-fork
+    /// memory, so operators opt in. Historical forks additionally require
+    /// `[index] archive`.
+    #[serde(default)]
+    pub sim: SimConfig,
+
     /// Transaction-mempool sizing (`[mempool]`). Mirrors java-tron's
     /// `node.maxTransactionPendingSize` / `node.pendingTransactionTimeout`
     /// — both local resource limits, not consensus parameters.
@@ -1260,6 +1267,7 @@ impl Default for NodeConfig {
             local_witness: LocalWitnessConfig::default(),
             committee: CommitteeConfig::default(),
             index: IndexConfig::default(),
+            sim: SimConfig::default(),
             mempool: MempoolSettings::default(),
         }
     }
@@ -2205,6 +2213,66 @@ fn default_index_window_tx_budget() -> usize {
 fn default_index_fsync_barrier() -> u32 {
     16
 }
+
+/// `[sim]` — Chronos fork-simulation limits & DoS posture. Mirrors
+/// [`tron_sim::SimConfig`] one-to-one; [`SimConfig::to_engine`] converts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SimConfig {
+    /// Master switch (default off).
+    pub enabled: bool,
+    /// Max concurrent named fork sessions before LRU eviction.
+    pub max_forks: usize,
+    /// Seconds of inactivity before a fork session is evicted.
+    pub fork_ttl_secs: u64,
+    /// Hard cap on a single fork's overlay size (pending keys).
+    pub max_overlay_keys: usize,
+    /// Max calls in one bundle request.
+    pub max_calls_per_bundle: usize,
+    /// Max synthetic blocks in one bundle request.
+    pub max_blocks_per_bundle: usize,
+    /// Per-call energy budget ceiling (default = eth_call_gas_cap, 50M).
+    pub energy_cap: u64,
+    /// Max slots a `state` (replace-all) override may enumerate.
+    pub max_state_override_slots: usize,
+    /// Per-call wall-clock deadline (ms); 0 disables it.
+    pub call_timeout_ms: u64,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        // Keep in lockstep with tron_sim::SimConfig::default().
+        Self {
+            enabled: false,
+            max_forks: 8,
+            fork_ttl_secs: 3600,
+            max_overlay_keys: 1_000_000,
+            max_calls_per_bundle: 256,
+            max_blocks_per_bundle: 64,
+            energy_cap: 50_000_000,
+            max_state_override_slots: 10_000,
+            call_timeout_ms: 0,
+        }
+    }
+}
+
+impl SimConfig {
+    /// Convert into the engine's config type.
+    pub fn to_engine(&self) -> tron_sim::SimConfig {
+        tron_sim::SimConfig {
+            enabled: self.enabled,
+            max_forks: self.max_forks,
+            fork_ttl_secs: self.fork_ttl_secs,
+            max_overlay_keys: self.max_overlay_keys,
+            max_calls_per_bundle: self.max_calls_per_bundle,
+            max_blocks_per_bundle: self.max_blocks_per_bundle,
+            energy_cap: self.energy_cap,
+            max_state_override_slots: self.max_state_override_slots,
+            call_timeout_ms: self.call_timeout_ms,
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

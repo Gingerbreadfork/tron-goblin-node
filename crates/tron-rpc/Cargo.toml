@@ -14,6 +14,7 @@ tron-types = { path = "../tron-types" }
 tron-chainbase = { path = "../tron-chainbase" }
 tron-index = { path = "../tron-index" }
 tron-tvm = { path = "../tron-tvm" }
+tron-sim = { path = "../tron-sim" }
 tron-executor = { path = "../tron-executor" }
 tron-actuator = { path = "../tron-actuator" }
 getrandom = "0.2"

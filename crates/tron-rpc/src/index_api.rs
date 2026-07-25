@@ -840,6 +840,41 @@ impl ArchiveApiState {
     pub fn covers(&self, h: i64) -> bool {
         matches!(self.reader.coverage(), Ok(Some((base, head))) if h >= base && h <= head)
     }
+
+    /// A clone of the versioned-KV reader (cheap) — Chronos passes it to
+    /// `ForkOverlay::new` to build at-height base views.
+    pub fn reader(&self) -> ArchiveReader {
+        self.reader.clone()
+    }
+
+    /// The archive's coverage window `[base, head]`, if any.
+    pub fn coverage(&self) -> Option<(i64, i64)> {
+        self.reader.coverage().ok().flatten()
+    }
+
+    /// Assemble Chronos [`ForkBackends`](tron_sim::ForkBackends) from the
+    /// archive's **live** raw backends. `ForkOverlay::new` wraps these in
+    /// at-height views itself when forking historically, so this always
+    /// hands over the live stores (including `votes` and `abi`, which the
+    /// read-only `eth_call` backends omit). Returns `None` only if a core
+    /// store is missing from the archive's backend set.
+    pub fn fork_backends(&self) -> Option<tron_sim::ForkBackends> {
+        use UndoStoreId as Id;
+        Some(tron_sim::ForkBackends {
+            accounts: self.live(Id::Accounts)?,
+            code: self.live(Id::Code)?,
+            storage: self.live(Id::StorageRow)?,
+            witnesses: self.live(Id::Witnesses)?,
+            contract_state: self.live(Id::ContractState)?,
+            dyn_props: self.live(Id::DynProps)?,
+            delegated_resources: self.live(Id::DelegatedResources)?,
+            delegation: self.live(Id::Delegation)?,
+            contracts: self.live(Id::Contracts)?,
+            votes: self.live(Id::Votes),
+            abi: self.live(Id::Abi),
+            block_index: self.live(Id::BlockIndex),
+        })
+    }
 }
 
 /// Routes for the at-height read surface.

@@ -25,6 +25,7 @@ pub mod pubsub;
 pub mod rate_limit;
 pub mod server;
 pub mod methods;
+pub mod sim;
 pub mod state;
 
 pub use filters::{FilterKind, FilterRegistry, LogFilter};

@@ -941,9 +941,32 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }));
     }
 
+    // Chronos: the at-height archive API state (shared) plus the fork-session
+    // registry, built once here so every RPC surface that dispatches
+    // `tron_simulateBundle` / `tron_fork*` sees the same forks. The archive
+    // powers historical forks (and latest-base forks' raw backends); the
+    // registry is created only when `[sim] enabled` (the methods self-gate).
+    let archive_api = index_parts
+        .as_ref()
+        .and_then(|p| p.archive.as_ref())
+        .map(|arch| tron_rpc::ArchiveApiState::new(arch.reader.clone(), arch.backends.clone()));
+    let sim_state = if config.sim.enabled {
+        let s = std::sync::Arc::new(tron_sim::SimState::new(config.sim.to_engine()));
+        if archive_api.is_none() {
+            warn!(
+                "[sim] enabled but the historical archive is off — Chronos will \
+                 reject requests; enable [index] archive to fork historical state"
+            );
+        }
+        info!("🔮 Chronos fork simulation enabled");
+        Some(s)
+    } else {
+        None
+    };
+
     // === RPC server ===
     if !config.rpc.disabled {
-        let rpc_state = stores
+        let mut rpc_state = stores
             .to_rpc_state(config.rpc.chain_id)
             .with_bundler_opt(bundler_state.clone())
             .with_metrics(metrics.clone())
@@ -959,6 +982,12 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             )
             .with_constant_call_timeout_ms(constant_call_timeout_ms)
             .with_pubsub(pubsub.clone());
+        if let Some(a) = &archive_api {
+            rpc_state = rpc_state.with_archive(a.clone());
+        }
+        if let Some(s) = &sim_state {
+            rpc_state = rpc_state.with_sim(s.clone());
+        }
         let addr: std::net::SocketAddr = format!("{}:{}", config.rpc.host, config.rpc.port)
             .parse()
             .map_err(|e: std::net::AddrParseError| RunError::Rpc(e.to_string()))?;
@@ -1109,6 +1138,11 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
             if let Some(commitment) = &parts.commitment {
                 http_state = http_state.with_commitment(commitment.reader.clone());
             }
+        }
+        // Chronos on the REST surface (POST /v1/sim/bundle) shares the same
+        // fork registry as the JSON-RPC server.
+        if let Some(s) = &sim_state {
+            http_state = http_state.with_sim(s.clone());
         }
         let addr: std::net::SocketAddr = format!("{}:{}", config.http.host, config.http.port)
             .parse()

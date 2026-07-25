@@ -241,6 +241,16 @@ fn dispatch(method: &str, params: &Value, state: &RpcState) -> Result<Value, Rpc
         // TVM read-only execution.
         "eth_call" => eth_call(params, state),
         "eth_simulateV1" => crate::eth_simulate::eth_simulate_v1(params, state),
+
+        // Chronos — deterministic time-travel fork simulation.
+        "tron_simulateBundle" => crate::sim::tron_simulate_bundle(params, state),
+        "tron_forkCreate" => crate::sim::tron_fork_create(params, state),
+        "tron_forkCall" => crate::sim::tron_fork_call(params, state),
+        "tron_forkSnapshot" => crate::sim::tron_fork_snapshot(params, state),
+        "tron_forkRevert" => crate::sim::tron_fork_revert(params, state),
+        "tron_forkStateDiff" => crate::sim::tron_fork_state_diff(params, state),
+        "tron_forkDelete" => crate::sim::tron_fork_delete(params, state),
+        "tron_forkList" => crate::sim::tron_fork_list(params, state),
         "eth_supportedEntryPoints" => crate::bundler::eth_supported_entry_points(state),
         "eth_sendUserOperation" => crate::bundler::eth_send_user_operation(params, state),
         "eth_getUserOperationByHash" => crate::bundler::eth_get_user_operation_by_hash(params, state),

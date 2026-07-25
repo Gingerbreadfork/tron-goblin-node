@@ -124,6 +124,12 @@ pub struct RpcState {
     /// `[index.commitment] enabled` is on; absent ⇒ those routes answer
     /// `501 NOT_IMPLEMENTED`.
     pub commitment: Option<tron_index::CommitmentReader>,
+    /// Optional Chronos fork-simulation registry (the `tron_simulateBundle`
+    /// / `tron_fork*` methods and `POST /v1/sim/bundle`). Attached when
+    /// `[sim] enabled` is on; absent ⇒ those methods answer "sim disabled".
+    /// Requires the archive to also be attached (historical forks read
+    /// at-height state).
+    pub sim: Option<Arc<tron_sim::SimState>>,
     /// Optional firehose tail handle (the gRPC `tronfirehose.Firehose`
     /// service). Attached when `[index.firehose]` is enabled.
     pub firehose: Option<tron_index::FirehoseTailHandle>,
@@ -241,6 +247,7 @@ impl RpcState {
             index: None,
             archive: None,
             commitment: None,
+            sim: None,
             firehose: None,
             tx_history: None,
             transaction_ret: None,
@@ -318,6 +325,13 @@ impl RpcState {
     /// `/v1/archive/...` at-height read surface.
     pub fn with_archive(mut self, archive: crate::index_api::ArchiveApiState) -> Self {
         self.archive = Some(archive);
+        self
+    }
+
+    /// Attach the Chronos fork-simulation registry, enabling
+    /// `tron_simulateBundle` / `tron_fork*` and `POST /v1/sim/bundle`.
+    pub fn with_sim(mut self, sim: Arc<tron_sim::SimState>) -> Self {
+        self.sim = Some(sim);
         self
     }
 

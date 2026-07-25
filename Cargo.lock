@@ -6163,6 +6163,7 @@ dependencies = [
  "tron-proto",
  "tron-replay",
  "tron-rpc",
+ "tron-sim",
  "tron-tvm",
  "tron-types",
  "tron-wallet",
@@ -6232,6 +6233,7 @@ dependencies = [
  "tron-index",
  "tron-mempool",
  "tron-proto",
+ "tron-sim",
  "tron-tvm",
  "tron-types",
 ]
