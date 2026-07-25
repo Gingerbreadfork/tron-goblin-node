@@ -150,6 +150,130 @@ fn fork_lifecycle_create_call_snapshot_revert_delete() {
     assert!(tron_rpc::sim::tron_fork_call(&call_body, &st).is_err());
 }
 
+#[test]
+fn self_check_matches_recorded_contract_ret() {
+    use prost::Message;
+    use tron_chainbase::{AccountStore, BlockIndexStore, BlockStore};
+    use tron_proto::transaction::{contract::ContractType, Contract as TxContract, Raw as TxRaw};
+    use tron_proto::{Account, Block, BlockHeader, Transaction, TriggerSmartContract};
+    use tron_types::BlockId;
+
+    use UndoStoreId as Id;
+    let base = 100i64;
+
+    // Live backends.
+    let accounts = mem();
+    let code = mem();
+    let dyn_props = mem();
+    let blocks_be = mem();
+    let block_index_be = mem();
+
+    let mut caller = [0u8; 21];
+    caller[0] = 0x41;
+    caller[20] = 0x41;
+    let mut contract = [0u8; 21];
+    contract[0] = 0x41;
+    contract[20] = 0x40;
+
+    // Contract code (SSTORE 0x2a @ slot 0) — live; the at-height read falls
+    // through since it was never captured as a delta.
+    code.put(&contract, &[0x60, 0x2a, 0x60, 0x00, 0x55, 0x00]).unwrap();
+    // Caller account with balance.
+    let caller_acct = Account { address: caller.to_vec(), balance: 1_000_000_000, ..Default::default() };
+    AccountStore::new(accounts.clone())
+        .put(&tron_crypto::address::Address::from_raw(caller), &caller_acct)
+        .unwrap();
+
+    // Archive: full store set + coverage established at `base` (a caller delta).
+    let backends: Vec<(UndoStoreId, Arc<dyn KvBackend>)> = vec![
+        (Id::Accounts, accounts.clone()),
+        (Id::Code, code.clone()),
+        (Id::StorageRow, mem()),
+        (Id::Witnesses, mem()),
+        (Id::ContractState, mem()),
+        (Id::DynProps, dyn_props.clone()),
+        (Id::DelegatedResources, mem()),
+        (Id::Delegation, mem()),
+        (Id::Contracts, mem()),
+        (Id::Votes, mem()),
+        (Id::Abi, mem()),
+        (Id::BlockIndex, mem()),
+    ];
+    let writer = ArchiveWriter::new(mem(), None, backends.clone());
+    writer.check_or_init().unwrap();
+    let caller_bytes = caller_acct.encode_to_vec();
+    writer
+        .on_block_applied(
+            base,
+            Some(&[tron_index::DeltaRef {
+                store: Id::Accounts,
+                key: &caller,
+                before: None,
+                after: Some(&caller_bytes),
+            }]),
+        )
+        .unwrap();
+
+    // Block N+1 with an index-0 TriggerSmartContract calling the contract,
+    // recorded as SUCCESS (contract_ret = 1).
+    let trigger = TriggerSmartContract {
+        owner_address: caller.to_vec(),
+        contract_address: contract.to_vec(),
+        data: vec![],
+        call_value: 0,
+        call_token_value: 0,
+        token_id: 0,
+    };
+    let tx = Transaction {
+        raw_data: Some(TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TriggerSmartContract as i32,
+                parameter: Some(prost_types::Any {
+                    type_url: "type.googleapis.com/protocol.TriggerSmartContract".into(),
+                    value: trigger.encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            fee_limit: 1_000_000_000,
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        }),
+        signature: vec![],
+        ret: vec![tron_proto::transaction::Result {
+            contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
+            ..Default::default()
+        }],
+        unparsed_field10: None,
+    };
+    let block = Block {
+        transactions: vec![tx],
+        block_header: Some(BlockHeader {
+            raw_data: Some(tron_proto::block_header::Raw {
+                number: base + 1,
+                timestamp: 1_700_000_000_000,
+                ..Default::default()
+            }),
+            witness_signature: vec![],
+        }),
+    };
+    let bid = BlockId::from_hash_and_num(&[7u8; 32], (base + 1) as u64);
+    BlockStore::new(blocks_be.clone()).put(&bid, &block).unwrap();
+    BlockIndexStore::new(block_index_be.clone()).put(&bid).unwrap();
+
+    let sim = Arc::new(SimState::new(SimConfig { enabled: true, ..Default::default() }));
+    let st = RpcState::new(accounts, blocks_be, block_index_be, mem(), dyn_props, 11_111)
+        .with_archive(ArchiveApiState::new(writer.reader(), backends))
+        .with_sim(sim);
+
+    let params = json!([{ "base": { "block": base }, "selfCheck": true, "blocks": [{ "calls": [] }] }]);
+    let res = tron_rpc::sim::tron_simulate_bundle(&params, &st).expect("bundle");
+    let sc = &res["selfCheck"];
+    assert_eq!(sc["checked"], 1, "selfCheck: {sc}");
+    assert_eq!(sc["matched"], true, "selfCheck: {sc}");
+    assert_eq!(sc["ourStatus"], "SUCCESS", "selfCheck: {sc}");
+    assert_eq!(sc["recordedContractRet"], "SUCCESS");
+}
+
 fn eth20(n: u8) -> String {
     let mut b = [0u8; 20];
     b[19] = n;

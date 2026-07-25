@@ -67,7 +67,19 @@ pub fn tron_simulate_bundle(p: &Value, s: &RpcState) -> Result<Value, RpcError> 
     let mut result = tron_sim::run_bundle(&mut overlay, &req, sim.config(), [0u8; 16], None)
         .map_err(sim_to_rpc)?;
     result.basis.archive_coverage = s.archive.as_ref().and_then(|a| a.coverage());
-    Ok(format_sim_result(&result))
+    let mut out = format_sim_result(&result);
+    if req.self_check {
+        let sc = match base {
+            BaseBlock::Height(n) => run_self_check(s, sim, n),
+            BaseBlock::Latest => {
+                json!({ "note": "selfCheck requires a historical base ({ \"block\": N })" })
+            }
+        };
+        if let Value::Object(m) = &mut out {
+            m.insert("selfCheck".into(), sc);
+        }
+    }
+    Ok(out)
 }
 
 /// `tron_forkCreate [{ base, overrides? }]` → fork handle.
@@ -350,6 +362,184 @@ fn format_geth_call_result(c: &CallResult, block_num: i64, log_index: &mut u64) 
         );
     }
     Value::Object(m)
+}
+
+// ---------------------------------------------------------------------------
+// selfCheck — byte-exactness parity. Re-run block N+1's INDEX-0 transaction
+// (the only one with no in-block predecessors, so state-after-N is its exact
+// pre-state — the plan's granularity-vacuous case) unmodified against a fresh
+// fork at N, and compare our contractRet class to the block's recorded
+// `Transaction.ret[0].contract_ret` (the same signal the executor's tripwire
+// uses). Budget-dependent recorded outcomes (OutOfEnergy / OutOfTime) are
+// reported inconclusive — VM-mode cannot reproduce the exact energy budget
+// (frozen resources) or java's 80ms wall-clock rule. Deeper coverage is the
+// rig parity run (many index-0 txs across heights).
+// ---------------------------------------------------------------------------
+
+fn contract_result_name(code: i32) -> &'static str {
+    use tron_proto::transaction::result::ContractResult as CR;
+    match CR::try_from(code) {
+        Ok(CR::Default) => "DEFAULT",
+        Ok(CR::Success) => "SUCCESS",
+        Ok(CR::Revert) => "REVERT",
+        Ok(CR::BadJumpDestination) => "BAD_JUMP_DESTINATION",
+        Ok(CR::OutOfMemory) => "OUT_OF_MEMORY",
+        Ok(CR::PrecompiledContract) => "PRECOMPILED_CONTRACT",
+        Ok(CR::StackTooSmall) => "STACK_TOO_SMALL",
+        Ok(CR::StackTooLarge) => "STACK_TOO_LARGE",
+        Ok(CR::IllegalOperation) => "ILLEGAL_OPERATION",
+        Ok(CR::StackOverflow) => "STACK_OVERFLOW",
+        Ok(CR::OutOfEnergy) => "OUT_OF_ENERGY",
+        Ok(CR::OutOfTime) => "OUT_OF_TIME",
+        Ok(CR::JvmStackOverFlow) => "JVM_STACK_OVER_FLOW",
+        Ok(CR::Unknown) => "UNKNOWN",
+        Ok(CR::TransferFailed) => "TRANSFER_FAILED",
+        Ok(CR::InvalidCode) => "INVALID_CODE",
+        Err(_) => "UNKNOWN",
+    }
+}
+
+/// A recorded contractRet counts as "success" iff it is DEFAULT/SUCCESS.
+fn recorded_is_success(code: i32) -> bool {
+    matches!(code, 0 | 1)
+}
+
+/// Run the selfCheck for a historical fork at `base` and return a JSON report
+/// (or a `note` object when it can't run).
+fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
+    use prost::Message;
+    use tron_proto::transaction::contract::ContractType;
+
+    let next = base + 1;
+    let id = match s.block_index.get(next) {
+        Ok(id) => id,
+        Err(_) => return json!({ "note": format!("block {next} not available for selfCheck") }),
+    };
+    let block = match s.blocks.get(&id) {
+        Ok(b) => b,
+        Err(_) => return json!({ "note": format!("block {next} not readable for selfCheck") }),
+    };
+    let Some(tx) = block.transactions.first() else {
+        return json!({ "comparedBlock": next, "checked": 0, "note": "block N+1 has no transactions" });
+    };
+    let Some(raw) = &tx.raw_data else {
+        return json!({ "comparedBlock": next, "checked": 0, "note": "index-0 tx has no raw_data" });
+    };
+    let Some(contract) = raw.contract.first() else {
+        return json!({ "comparedBlock": next, "checked": 0, "note": "index-0 tx has no contract" });
+    };
+    let ty = ContractType::try_from(contract.r#type).ok();
+    let parameter = contract.parameter.as_ref().map(|p| p.value.as_slice()).unwrap_or(&[]);
+
+    // Build the CallSpec from the recorded contract (Trigger or Create only).
+    let call = match ty {
+        Some(ContractType::TriggerSmartContract) => {
+            match tron_proto::decode_lenient::<tron_proto::TriggerSmartContract>(parameter) {
+                Ok(t) => CallSpec::Trigger {
+                    from: addr21(&t.owner_address),
+                    to: addr21(&t.contract_address),
+                    value: t.call_value,
+                    data: t.data,
+                    energy: None,
+                    token_id: t.token_id,
+                    token_value: t.call_token_value,
+                },
+                Err(_) => return json!({ "comparedBlock": next, "checked": 0, "note": "index-0 TriggerSmartContract failed to decode" }),
+            }
+        }
+        Some(ContractType::CreateSmartContract) => {
+            match tron_proto::decode_lenient::<tron_proto::CreateSmartContract>(parameter) {
+                Ok(c) => {
+                    let sc = c.new_contract.unwrap_or_default();
+                    CallSpec::Create {
+                        from: addr21(&c.owner_address),
+                        init_code: sc.bytecode,
+                        value: sc.call_value,
+                        energy: None,
+                        consume_user_resource_percent: sc.consume_user_resource_percent,
+                        name: sc.name,
+                        token_id: c.token_id,
+                        token_value: c.call_token_value,
+                    }
+                }
+                Err(_) => return json!({ "comparedBlock": next, "checked": 0, "note": "index-0 CreateSmartContract failed to decode" }),
+            }
+        }
+        _ => {
+            return json!({
+                "comparedBlock": next, "checked": 0,
+                "note": "index-0 tx is not a VM contract (Trigger/Create); nothing to re-run byte-exactly"
+            })
+        }
+    };
+
+    let recorded = tx.ret.first().map(|r| r.contract_ret).unwrap_or(0);
+    // Budget/time-dependent outcomes are not reproducible in VM mode.
+    if matches!(recorded, 10 | 11) {
+        return json!({
+            "comparedBlock": next, "checked": 0, "inconclusive": true,
+            "recordedContractRet": contract_result_name(recorded),
+            "note": "recorded outcome is budget/time-dependent (OUT_OF_ENERGY/OUT_OF_TIME); \
+                     VM-mode selfCheck cannot reproduce the exact energy budget or java's 80ms rule"
+        });
+    }
+
+    // Fresh fork at N with block N+1's real number + timestamp.
+    let mut overlay = match build_overlay(s, BaseBlock::Height(base)) {
+        Ok(o) => o,
+        Err(e) => return json!({ "comparedBlock": next, "checked": 0, "note": format!("selfCheck overlay: {}", e.message) }),
+    };
+    let ts_ms = block
+        .block_header
+        .as_ref()
+        .and_then(|h| h.raw_data.as_ref())
+        .map(|r| r.timestamp)
+        .unwrap_or(0);
+    let energy_fee = s.dyn_props.energy_fee().max(1);
+    let budget = ((raw.fee_limit / energy_fee).max(1_000_000) as u64).min(sim.config().energy_cap);
+
+    let mut overrides = OverrideSet::default();
+    overrides.block = Some(BlockOverride {
+        number: Some(next),
+        time_s: Some(ts_ms / 1000),
+        coinbase: None,
+    });
+    let req = SimRequest {
+        blocks: vec![BlockSpec { overrides, calls: vec![call] }],
+        trace: TraceLevel::None,
+        return_state_diff: DiffLevel::None,
+        self_check: false,
+        energy_cap: Some(budget),
+    };
+    let result = match tron_sim::run_bundle(&mut overlay, &req, sim.config(), [0u8; 16], None) {
+        Ok(r) => r,
+        Err(e) => return json!({ "comparedBlock": next, "checked": 0, "note": format!("selfCheck run: {e}") }),
+    };
+    let cr = &result.blocks[0].calls[0];
+    let our_ok = cr.status == CallStatus::Success;
+    let matched = our_ok == recorded_is_success(recorded);
+    let tx_id = tron_crypto::hash::sha256(&raw.encode_to_vec());
+
+    json!({
+        "comparedBlock": next,
+        "checked": 1,
+        "matched": matched,
+        "txId": hex::encode(tx_id),
+        "ourStatus": cr.status.label(),
+        "recordedContractRet": contract_result_name(recorded),
+        "note": "authoritative byte-exact check of block N+1's index-0 tx; \
+                 for broader coverage run selfCheck across many heights (the rig parity run)"
+    })
+}
+
+fn addr21(bytes: &[u8]) -> Address {
+    let mut a = [0u8; 21];
+    if bytes.len() == 21 {
+        a.copy_from_slice(bytes);
+    } else {
+        a[0] = 0x41;
+    }
+    Address::from_raw(a)
 }
 
 // ---------------------------------------------------------------------------

@@ -134,10 +134,9 @@ pub fn run_bundle(
         BaseBlock::Height(h) => h,
         BaseBlock::Latest => overlay.seed_head().0,
     };
-    if req.self_check {
-        warnings
-            .push("selfCheck is not performed by the engine (wire it at the RPC layer)".into());
-    }
+    // selfCheck (parity re-run vs recorded receipts) is performed by the RPC
+    // layer, which holds the block + receipt stores; the engine only executes
+    // the requested bundle.
     let basis = Basis {
         base_block,
         mode: "vm",
