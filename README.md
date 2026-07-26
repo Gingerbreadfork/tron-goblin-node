@@ -7,6 +7,26 @@ protocol — the same role java-tron plays, written from scratch in
 Rust with byte-exact database and wire compatibility as a stated
 goal.
 
+## 📑 Contents
+
+- [🧌 What is this?](#-what-is-this)
+- [✨ Highlights](#-highlights)
+- [⚡ Watch real TRON mainnet live!](#-watch-real-tron-mainnet-live)
+- [👀 See it for yourself](#-see-it-for-yourself)
+- [💡 Motivation](#-motivation)
+- [🚦 Status](#-status)
+- [🧪 Tests & metrics](#-tests--metrics)
+- [🧩 Layout](#-layout)
+- [🦀 Build](#-build)
+- [🚀 Run](#-run)
+- [🔍 Indexer, historical state & firehose](#-indexer-historical-state--firehose)
+- [📚 Documentation](#-documentation)
+- [🔄 Compatibility notes](#-compatibility-notes)
+- [📐 Reference implementation](#-reference-implementation)
+- [🙏 Acknowledgements](#-acknowledgements)
+- [🤝 Contributions](#-contributions)
+- [💚 Support](#-support)
+- [📜 License](#-license)
 
 ## 🧌 What is this?
 
@@ -156,7 +176,7 @@ done
 
 Matching the header and tx-merkle root is only half the story, though —
 TRON headers commit to no state root, so the resulting *state* is verified
-separately (see [Compatibility notes](#compatibility-notes)). That
+separately (see [Compatibility notes](#-compatibility-notes)). That
 distinction is the whole reason this project is careful about the word
 "parity."
 
@@ -703,7 +723,7 @@ A terser, structured set written for AI coding assistants lives under
   Parity of the resulting state is therefore checked by comparing RPC
   reads (`getaccount`, delegated-resource queries, …) against a
   java-tron node — not by hash equality alone. (This is exactly how the
-  delegated-resource divergence in [Status](#status) was found.)
+  delegated-resource divergence in [Status](#-status) was found.)
 
 ## 📐 Reference implementation
 
