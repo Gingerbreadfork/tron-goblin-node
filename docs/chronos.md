@@ -148,6 +148,143 @@ tron_forkDelete ["…"]
 Distinct forks run concurrently; calls on one fork are serialized. Forks are
 node-local, unguessable, and evicted by TTL / LRU.
 
+## Recipes
+
+Copy-pasteable flows for the things people actually reach for a fork simulator
+to do. `$RPC` is the JSON-RPC endpoint (default `http://127.0.0.1:8545`);
+addresses accept base58check (`T…`) or hex.
+
+### 0. What can I fork? (check coverage first)
+
+Historical forks work within the archive's window. Check it, then fork inside it:
+
+```sh
+curl -s http://127.0.0.1:8090/v1/archive/coverage
+# {"data":{"base":84800506,"head":84900000,"blocks":99495},"success":true}
+```
+
+A base outside `[base, head]` is rejected (not clamped) with the exact window.
+`{ "base": { "tag": "latest" } }` forks head and needs no historical coverage.
+
+### 1. Read on-chain contract state at a past block
+
+Call a real contract as it existed at block *N* — Chronos reads its code and
+storage straight from chain state. This one is runnable as-is (USDT
+`decimals()`, selector `0x313ce567`); pick a `block` inside your coverage
+window:
+
+```sh
+curl -s -X POST $RPC -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tron_simulateBundle","params":[{
+    "base": { "block": 84800600 },
+    "blocks": [{ "calls": [
+      { "type":"trigger",
+        "ownerAddress":"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+        "contractAddress":"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+        "data":"313ce567", "energy":10000000 }
+    ]}]
+  }]
+}'
+# result.blocks[0].calls[0].returnData = 0x…06  (USDT has 6 decimals)
+```
+
+Swap the `data` for `70a08231` + a 32-byte-padded holder address to read a
+`balanceOf` at that height, or any other method + ABI-encoded args.
+
+### 2. "What-if": replay a failing call after fixing the missing state
+
+The headline use case — a call reverted on-chain because a balance/allowance
+was missing. Fork just before it, **override** the state it needed, and re-run:
+
+```sh
+curl -s -X POST $RPC -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tron_simulateBundle","params":[{
+    "base": { "block": 84800600 },
+    "trace": "callTree",
+    "returnStateDiff": "final",
+    "blocks": [{
+      "overrides": { "accounts": {
+        "TSenderAddr...": { "balance": "1000000000", "trc10": { "1002000": "5000000" } },
+        "TTokenContract...": { "stateDiff": {
+          "0x<allowance_slot_32B>": "0x000000000000000000000000000000000000000000000000ffffffffffffffff"
+        }}
+      }},
+      "calls": [
+        { "type":"trigger", "ownerAddress":"TSenderAddr...",
+          "contractAddress":"TDexRouter...", "data":"<swap_calldata>", "energy":30000000 }
+      ]
+    }]
+  }]
+}'
+# now status:"SUCCESS", with callFrames (the internal transfers) and stateDiff
+# (who ended up with what). Flip the override off to see it revert again.
+```
+
+Override kinds: `balance` (sun), `code` (runtime bytecode), `state`
+(replace-all), `stateDiff` (merge slots), `trc10` (token id → amount).
+
+### 3. Deploy and poke a contract in a throwaway fork
+
+Persistent session, anvil-style — deploy something that never existed on-chain,
+call it, snapshot, try a risky path, and roll back:
+
+```sh
+# create a fork and keep its id
+FID=$(curl -s -X POST $RPC -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tron_forkCreate","params":[{"base":{"block":84800600}}]}' \
+  | jq -r .result.forkId)
+
+# deploy a probe contract
+curl -s -X POST $RPC -H 'content-type: application/json' -d "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tron_forkCall\",\"params\":[\"$FID\",{
+    \"blocks\":[{ \"overrides\":{\"accounts\":{\"TDeployer...\":{\"balance\":\"1000000000\"}}},
+      \"calls\":[{\"type\":\"create\",\"ownerAddress\":\"TDeployer...\",
+                  \"initCode\":\"<init_bytecode>\",\"energy\":50000000,\"name\":\"Probe\"}] }]
+  }]}"    # → result.blocks[0].calls[0].contractAddress
+
+SNAP=$(curl ... tron_forkSnapshot [\"$FID\"] ... | jq -r .result.snapshotId)
+# ... run experiments via tron_forkCall ...
+curl ... tron_forkRevert [\"$FID\", $SNAP]        # roll back to the snapshot
+curl ... tron_forkStateDiff [\"$FID\"]            # cumulative diff so far
+curl ... tron_forkDelete [\"$FID\"]               # done
+```
+
+### 4. Prove a replay matches on-chain (selfCheck)
+
+Confirm the node reproduces a real block's result byte-for-byte — re-runs block
+*N+1*'s index-0 transaction and compares its contractRet class to the recorded
+receipt:
+
+```sh
+curl -s -X POST $RPC -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"tron_simulateBundle",
+  "params":[{ "base": { "block": 84800620 }, "selfCheck": true, "blocks":[{"calls":[]}] }]
+}'
+# result.selfCheck: { "checked":1, "matched":true, "ourStatus":"SUCCESS",
+#                     "recordedContractRet":"SUCCESS" }
+```
+
+### 5. Use your existing Ethereum tooling
+
+`eth_simulateV1` keeps the geth request/response shape, so viem/foundry-style
+clients work unmodified — and with Chronos on, param 1 accepts a historical hex
+height and full `stateOverrides` (code/state/stateDiff) + creation calls:
+
+```sh
+curl -s -X POST $RPC -H 'content-type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"eth_simulateV1","params":[
+    { "blockStateCalls":[{
+        "stateOverrides": { "0x<addr>": { "balance":"0x3b9aca00", "code":"0x6080..." } },
+        "calls": [ { "from":"0x<addr>", "to":"0x<contract>", "input":"0x70a08231...", "gas":"0xf4240" } ]
+    }]},
+    "0x50df458"
+  ]
+}'
+```
+
+`POST /v1/sim/bundle` (body = the `tron_simulateBundle` payload) is the REST
+mirror, wrapped as `{ "success": true, "data": … }`.
+
 ## What Chronos guarantees — and what it does not
 
 Every response carries a `basis` header stating the truth:

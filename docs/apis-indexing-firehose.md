@@ -190,6 +190,28 @@ The result is one object per simulated block — the block env it ran under plus
 A reverted call instead reports `"status": "0x0"` with an `error` object
 carrying the revert reason.
 
+### Chronos fork simulation
+
+With `[sim] enabled = true` (plus `[index] archive` for at-height state — see
+the dedicated [Chronos Fork Simulation](chronos.md) guide), the node exposes
+**mutating** fork simulation — anvil-fork / Tenderly for TRON:
+
+- **`tron_simulateBundle`** — run a bundle of mutating `trigger`/`create`
+  calls against a fork of block *N* (or head) with state / code / balance /
+  block overrides; returns per-call status, energy, logs, the internal-tx
+  tree, the opcode trace, and decoded state diffs.
+- **`tron_forkCreate` / `forkCall` / `forkSnapshot` / `forkRevert` /
+  `forkStateDiff` / `forkList` / `forkDelete`** — anvil-style persistent fork
+  sessions with snapshot/revert.
+- **`POST /v1/sim/bundle`** — the REST mirror of `tron_simulateBundle`.
+- When Chronos is enabled, **`eth_simulateV1`** additionally accepts a
+  historical base block, full `stateOverrides` (code/state/stateDiff), and
+  contract-creation calls.
+
+Worked recipes (replay a call, "what-if" a missing balance, deploy in a fork,
+prove byte-exactness), the full request/response shapes, and the honesty
+contract are in [Chronos Fork Simulation](chronos.md).
+
 ### ERC-4337 bundler
 
 With `[bundler] enable = true` (plus a signing key and at least one
