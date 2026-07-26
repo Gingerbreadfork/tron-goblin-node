@@ -105,6 +105,16 @@ pub fn tron_fork_create(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     }
     let (seed_num, seed_ts) = overlay.seed_head();
     let coverage = s.archive.as_ref().and_then(|a| a.coverage());
+    // A latest-base fork is NOT a frozen snapshot: keys the fork never
+    // overrides read the live backend, which advances as the node keeps
+    // syncing. Warn so callers who need reproducibility pick a historical base.
+    let warnings: Vec<&str> = match base {
+        BaseBlock::Latest => vec![
+            "latest-base fork: un-overridden keys read live head state and drift as the \
+             node syncs; use a historical base ({ \"block\": N }) for a reproducible fork",
+        ],
+        BaseBlock::Height(_) => vec![],
+    };
     let id = sim.create(overlay);
     if let Some(m) = &s.metrics {
         m.inc_sim_forks_created();
@@ -115,6 +125,7 @@ pub fn tron_fork_create(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         "seedTimestampMs": seed_ts,
         "coverage": coverage_json(coverage),
         "ttlSecs": sim.config().fork_ttl_secs,
+        "warnings": warnings,
     }))
 }
 
@@ -507,7 +518,11 @@ fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
         .and_then(|h| h.raw_data.as_ref())
         .map(|r| r.timestamp)
         .unwrap_or(0);
-    let energy_fee = s.dyn_props.energy_fee().max(1);
+    // Derive the budget from the AT-HEIGHT energy fee (block N's dyn-props via
+    // the overlay), not the live fee — the fee is a proposal value that can
+    // change, and using the live one would mis-budget across a fee change and
+    // produce false mismatches.
+    let energy_fee = overlay.vm_stores().dynamic_properties.energy_fee().max(1);
     let budget = ((raw.fee_limit / energy_fee).max(1_000_000) as u64).min(sim.config().energy_cap);
 
     let mut overrides = OverrideSet::default();
@@ -527,7 +542,12 @@ fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
         Ok(r) => r,
         Err(e) => return json!({ "comparedBlock": next, "checked": 0, "note": format!("selfCheck run: {e}") }),
     };
-    let cr = &result.blocks[0].calls[0];
+    let cr = match result.blocks.first().and_then(|b| b.calls.first()) {
+        Some(c) => c,
+        None => {
+            return json!({ "comparedBlock": next, "checked": 0, "note": "selfCheck produced no result" })
+        }
+    };
     let our_ok = cr.status == CallStatus::Success;
     let matched = our_ok == recorded_is_success(recorded);
     let tx_id = tron_crypto::hash::sha256(&raw.encode_to_vec());
@@ -582,7 +602,10 @@ fn with_fork<R>(
     session: &Arc<std::sync::Mutex<ForkSession>>,
     f: impl FnOnce(&mut ForkSession) -> Result<R, SimError>,
 ) -> Result<R, SimError> {
-    let mut guard = session.lock().expect("fork session poisoned");
+    // Recover from poisoning: a panic during a prior VM run (arbitrary
+    // bytecode) must not permanently brick this fork — or, via the registry's
+    // eviction walk, the whole Chronos subsystem.
+    let mut guard = session.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut guard)
 }
 
@@ -894,6 +917,11 @@ fn parse_i64_flex(v: &Value, what: &str) -> Result<i64, RpcError> {
     }
     if let Some(s) = v.as_str() {
         if let Some(hex) = s.strip_prefix("0x") {
+            // Reject a sign after `0x` (e.g. "0x-1"), which from_str_radix
+            // would otherwise silently accept.
+            if hex.starts_with(['-', '+']) {
+                return Err(RpcError::invalid_params(format!("bad hex {what}: {s}")));
+            }
             return i64::from_str_radix(hex, 16)
                 .map_err(|_| RpcError::invalid_params(format!("bad hex {what}: {s}")));
         }

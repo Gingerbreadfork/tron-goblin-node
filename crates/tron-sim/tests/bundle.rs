@@ -253,6 +253,47 @@ fn deterministic_replay_is_identical() {
 }
 
 #[test]
+fn callless_block_overrides_hit_overlay_cap() {
+    // A block with overrides but NO calls must still be bounded by the
+    // overlay-key cap (checked after applying overrides).
+    let mut ov = fork();
+    let a = addr(0x22);
+    let mut diff = std::collections::BTreeMap::new();
+    diff.insert(word(1), word(0xaa));
+    diff.insert(word(2), word(0xbb));
+    let mut oset = OverrideSet::default();
+    oset.accounts
+        .insert(a, AccountOverride { state_diff: Some(diff), ..Default::default() });
+    let cfg = SimConfig { max_overlay_keys: 1, ..Default::default() };
+    let req = SimRequest {
+        blocks: vec![BlockSpec { overrides: oset, calls: Vec::new() }],
+        ..Default::default()
+    };
+    let err = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16], None).unwrap_err();
+    assert!(matches!(err, tron_sim::SimError::OverlayCapExceeded { .. }), "got {err:?}");
+}
+
+#[test]
+fn state_diff_over_cap_errors() {
+    let mut ov = fork();
+    let a = addr(0x23);
+    let mut diff = std::collections::BTreeMap::new();
+    diff.insert(word(1), word(0xaa));
+    diff.insert(word(2), word(0xbb));
+    diff.insert(word(3), word(0xcc));
+    let mut oset = OverrideSet::default();
+    oset.accounts
+        .insert(a, AccountOverride { state_diff: Some(diff), ..Default::default() });
+    let cfg = SimConfig { max_state_override_slots: 2, ..Default::default() };
+    let req = SimRequest {
+        blocks: vec![BlockSpec { overrides: oset, calls: Vec::new() }],
+        ..Default::default()
+    };
+    let err = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16], None).unwrap_err();
+    assert!(matches!(err, tron_sim::SimError::Backend(_)), "got {err:?}");
+}
+
+#[test]
 fn overlay_key_cap_is_enforced() {
     let mut ov = fork();
     let (c, caller) = (addr(0x1c), addr(0x1d));

@@ -42,7 +42,9 @@ impl Default for SimConfig {
             // = rpc.eth_call_gas_cap default (50M).
             energy_cap: 50_000_000,
             max_state_override_slots: 10_000,
-            call_timeout_ms: 0,
+            // 10s per call by default — a runaway trigger (arbitrary contract
+            // code) is preempted rather than pinning a worker. 0 disables it.
+            call_timeout_ms: 10_000,
         }
     }
 }

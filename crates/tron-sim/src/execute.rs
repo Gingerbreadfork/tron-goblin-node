@@ -60,11 +60,17 @@ pub fn run_bundle(
     let (mut head_num, mut head_ts_ms) = start_head.unwrap_or_else(|| overlay.seed_head());
     let mut block_results = Vec::with_capacity(req.blocks.len());
 
-    for (bi, block) in req.blocks.iter().enumerate() {
+    for block in &req.blocks {
         // Apply this block's account overrides to the current overlay top.
         {
             let vm = overlay.vm_stores();
             warnings.extend(block.overrides.apply(&vm, cfg.max_state_override_slots)?);
+        }
+        // Enforce the per-fork overlay cap right after applying overrides, so a
+        // call-less block with large overrides can't bypass the per-call check.
+        let keys = overlay.overlay_keys();
+        if keys > cfg.max_overlay_keys {
+            return Err(SimError::OverlayCapExceeded { keys, limit: cfg.max_overlay_keys });
         }
 
         // Block env: overrides, else +1 block / +3s (TRON block time).
@@ -79,6 +85,12 @@ pub fn run_bundle(
             Some(s) => s.saturating_mul(1000),
             None => head_ts_ms + 3000,
         };
+        if ts_ms < head_ts_ms {
+            warnings.push(format!(
+                "synthetic block {number} timestamp ({}s) is earlier than the previous block",
+                ts_ms / 1000
+            ));
+        }
         let beneficiary = bov.and_then(|b| b.coinbase).unwrap_or([0u8; 20]);
         let block_env = VmBlockEnv {
             block_number: number,
@@ -97,7 +109,7 @@ pub fn run_bundle(
                 return Err(SimError::OverlayCapExceeded { keys, limit: cfg.max_overlay_keys });
             }
 
-            let tx_id = synthetic_tx_id(&fork_id, bi, ci);
+            let tx_id = synthetic_tx_id(&fork_id, number, ci);
             let requested = call_energy(call).or(req.energy_cap);
             let energy = cfg.resolve_energy(requested);
 
@@ -149,12 +161,18 @@ pub fn run_bundle(
     Ok(SimResult { basis, blocks: block_results, state_diff, warnings })
 }
 
-/// `sha256(fork_id ‖ block_index_be ‖ call_index_be)` — deterministic per
-/// (fork, block, call).
-fn synthetic_tx_id(fork_id: &[u8; 16], block_index: usize, call_index: usize) -> [u8; 32] {
+/// `sha256(fork_id ‖ block_number_be ‖ call_index_be)` — deterministic per
+/// (fork, synthetic block number, call). Using the synthetic block NUMBER
+/// (which advances monotonically across a fork session's calls, since each
+/// `forkCall` continues from the fork's head) rather than a bundle-local
+/// index keeps ids unique across successive `forkCall`s — so two deploys in
+/// different calls of the same session never collide on the derived contract
+/// address. Ephemeral bundles still get identical ids on replay (same base ⇒
+/// same block numbers).
+fn synthetic_tx_id(fork_id: &[u8; 16], block_number: i64, call_index: usize) -> [u8; 32] {
     let mut buf = Vec::with_capacity(16 + 8 + 8);
     buf.extend_from_slice(fork_id);
-    buf.extend_from_slice(&(block_index as u64).to_be_bytes());
+    buf.extend_from_slice(&block_number.to_be_bytes());
     buf.extend_from_slice(&(call_index as u64).to_be_bytes());
     sha256(&buf)
 }
@@ -178,6 +196,16 @@ fn run_one_call(
     // Lift revm's tx-gas cap to at least the config ceiling so a large
     // energy budget isn't rejected (mirrors dispatch_constant_trigger).
     let gas_cap = energy.max(cfg.energy_cap);
+    // Per-call wall-clock deadline (DoS guard) — belt-and-suspenders over the
+    // energy cap. Applied to trigger calls (the runaway vector, arbitrary
+    // contract code); creates are bounded by the energy budget. 0 disables it.
+    let deadline = (cfg.call_timeout_ms > 0).then(|| {
+        (
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(cfg.call_timeout_ms),
+            cfg.call_timeout_ms,
+        )
+    });
     match call {
         CallSpec::Trigger {
             from,
@@ -199,14 +227,14 @@ fn run_one_call(
             match trace {
                 TraceLevel::None => {
                     let (outcome, traces, penalty) = execute_trigger_with_gas_cap_tx_id(
-                        vm, block_env, &trigger, energy, gas_cap, tx_id,
+                        vm, block_env, &trigger, energy, gas_cap, deadline, tx_id,
                     );
                     build_call_result(outcome, penalty, &traces, &tx_id, None, Vec::new(), Vec::new())
                 }
                 TraceLevel::CallTree | TraceLevel::Full => {
                     let tracer = StructLogTracer::new(tracer_options(trace));
                     let (outcome, traces, penalty, tracer) = execute_trigger_with_tracer_tx_id(
-                        vm, block_env, &trigger, energy, gas_cap, tracer, tx_id,
+                        vm, block_env, &trigger, energy, gas_cap, deadline, tracer, tx_id,
                     );
                     let (struct_logs, frames) = tracer.into_outputs();
                     let struct_logs = keep_struct_logs(trace, struct_logs);

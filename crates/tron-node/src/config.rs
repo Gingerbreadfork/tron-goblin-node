@@ -2241,17 +2241,19 @@ pub struct SimConfig {
 
 impl Default for SimConfig {
     fn default() -> Self {
-        // Keep in lockstep with tron_sim::SimConfig::default().
+        // Single source of truth: derive every default from the engine's
+        // SimConfig so the two can never silently drift.
+        let d = tron_sim::SimConfig::default();
         Self {
-            enabled: false,
-            max_forks: 8,
-            fork_ttl_secs: 3600,
-            max_overlay_keys: 1_000_000,
-            max_calls_per_bundle: 256,
-            max_blocks_per_bundle: 64,
-            energy_cap: 50_000_000,
-            max_state_override_slots: 10_000,
-            call_timeout_ms: 0,
+            enabled: d.enabled,
+            max_forks: d.max_forks,
+            fork_ttl_secs: d.fork_ttl_secs,
+            max_overlay_keys: d.max_overlay_keys,
+            max_calls_per_bundle: d.max_calls_per_bundle,
+            max_blocks_per_bundle: d.max_blocks_per_bundle,
+            energy_cap: d.energy_cap,
+            max_state_override_slots: d.max_state_override_slots,
+            call_timeout_ms: d.call_timeout_ms,
         }
     }
 }

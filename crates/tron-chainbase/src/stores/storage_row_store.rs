@@ -169,6 +169,34 @@ impl StorageRowStore {
             })
             .collect())
     }
+
+    /// Like [`scan_prefix_by_addr_hash`](Self::scan_prefix_by_addr_hash) but
+    /// **bounded**: returns at most `limit` rows, using the backend's bounded
+    /// `scan_from` so the enumeration never materializes the whole contract.
+    /// A contract's rows are the contiguous run of 32-byte keys sharing the
+    /// 16-byte `addr_hash` prefix, so the walk stops at the first key that no
+    /// longer shares it. Callers detect "more than N" by passing `limit = N+1`
+    /// and checking whether `N+1` rows came back.
+    pub fn scan_prefix_by_addr_hash_bounded(
+        &self,
+        addr_hash: &[u8; 32],
+        limit: usize,
+    ) -> Result<Vec<([u8; KEY_LEN], Vec<u8>)>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = &addr_hash[..PREFIX_BYTES];
+        let mut out = Vec::new();
+        for (k, v) in self.backend.scan_from(prefix, limit)? {
+            if k.len() != KEY_LEN || k[..PREFIX_BYTES] != *prefix {
+                break;
+            }
+            let mut key = [0u8; KEY_LEN];
+            key.copy_from_slice(&k);
+            out.push((key, v));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

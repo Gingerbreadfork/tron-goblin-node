@@ -143,21 +143,30 @@ impl OverrideSet {
             acct_dirty = true;
             // Ensure a contract row exists so the address is treated as a
             // contract (ISCONTRACT) and its storage keys use a defined layout.
-            // A freshly-coded address is v2, non-CREATE2.
+            // A freshly-coded address is v2, non-CREATE2. If a row already
+            // exists (real contract at this address), keep its version/trx_hash
+            // (they drive the storage-key layout) but refresh its `bytecode`
+            // so row reads (getcontract) reflect the override.
             if let Some(contracts) = &vm.contracts {
-                if contracts.get(addr).map_err(sim_err)?.is_none() {
-                    contracts
-                        .put(
-                            addr,
-                            &SmartContract {
-                                contract_address: addr.as_bytes().to_vec(),
-                                bytecode: code.clone(),
-                                version: 0,
-                                trx_hash: Vec::new(),
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(sim_err)?;
+                match contracts.get(addr).map_err(sim_err)? {
+                    Some(mut row) => {
+                        row.bytecode = code.clone();
+                        contracts.put(addr, &row).map_err(sim_err)?;
+                    }
+                    None => {
+                        contracts
+                            .put(
+                                addr,
+                                &SmartContract {
+                                    contract_address: addr.as_bytes().to_vec(),
+                                    bytecode: code.clone(),
+                                    version: 0,
+                                    trx_hash: Vec::new(),
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(sim_err)?;
+                    }
                 }
             }
         }
@@ -180,17 +189,27 @@ impl OverrideSet {
             let addr_hash = StorageRowStore::addr_hash(addr, &trx_hash);
 
             // `state` = replace-all: clear the contract's existing slots first.
+            // The enumeration is BOUNDED — fetch at most cap+1 rows so a
+            // contract with millions of slots can't be materialized (OOM)
+            // before the cap rejects it.
             if let Some(state) = &ov.state {
+                if state.len() > max_state_slots {
+                    return Err(SimError::Backend(format!(
+                        "state replace-all for {} supplies {} slots > cap {}; use stateDiff",
+                        hex_addr(addr),
+                        state.len(),
+                        max_state_slots
+                    )));
+                }
                 let existing = vm
                     .storage
-                    .scan_prefix_by_addr_hash(&addr_hash)
+                    .scan_prefix_by_addr_hash_bounded(&addr_hash, max_state_slots.saturating_add(1))
                     .map_err(sim_err)?;
                 if existing.len() > max_state_slots {
                     return Err(SimError::Backend(format!(
-                        "state replace-all for {} spans {} slots > cap {}; use stateDiff \
-                         to set individual slots instead",
+                        "state replace-all for {} spans more than the cap of {} existing slots; \
+                         use stateDiff to set individual slots instead",
                         hex_addr(addr),
-                        existing.len(),
                         max_state_slots
                     )));
                 }
@@ -203,8 +222,17 @@ impl OverrideSet {
                 }
             }
 
-            // `stateDiff` = merge the given slots on top.
+            // `stateDiff` = merge the given slots on top (also capped, so a
+            // giant merge can't grow the overlay unbounded).
             if let Some(diff) = &ov.state_diff {
+                if diff.len() > max_state_slots {
+                    return Err(SimError::Backend(format!(
+                        "stateDiff for {} supplies {} slots > cap {}",
+                        hex_addr(addr),
+                        diff.len(),
+                        max_state_slots
+                    )));
+                }
                 for (slot, value) in diff {
                     let key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, slot, is_v1);
                     vm.storage.put(&key, value).map_err(sim_err)?;

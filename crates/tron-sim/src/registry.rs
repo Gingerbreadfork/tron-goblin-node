@@ -33,7 +33,10 @@ pub fn fork_id_hex(id: &ForkId) -> String {
 /// Parse a hex fork id back to bytes.
 pub fn fork_id_from_hex(s: &str) -> Option<ForkId> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() != 32 {
+    // Require ASCII so the fixed 2-byte slicing below always lands on char
+    // boundaries — a multi-byte UTF-8 char in a 32-byte string would otherwise
+    // panic (`byte index N is not a char boundary`) on attacker input.
+    if !s.is_ascii() || s.len() != 32 {
         return None;
     }
     let mut id = [0u8; 16];
@@ -151,19 +154,31 @@ impl SimState {
         &self.config
     }
 
+    /// Lock the registry map, recovering from poisoning (a panic while the
+    /// map lock was held must not brick the whole subsystem).
+    fn lock_map(&self) -> std::sync::MutexGuard<'_, HashMap<ForkId, Arc<Mutex<ForkSession>>>> {
+        self.forks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Register a new fork over `overlay`, evicting expired forks and, if at
     /// capacity, the least-recently-used one. Returns the new fork id.
     pub fn create(&self, overlay: ForkOverlay) -> ForkId {
-        let mut forks = self.forks.lock().expect("sim registry poisoned");
+        let mut forks = self.lock_map();
         self.evict_expired(&mut forks);
         if forks.len() >= self.config.max_forks {
-            if let Some(lru) = forks
+            // Pick the least-recently-used *idle* fork. Currently-locked forks
+            // (a call is running) are skipped — they aren't idle, and we must
+            // not block on their lock while holding the map lock.
+            let lru = forks
                 .iter()
-                .min_by_key(|(_, s)| s.lock().expect("fork poisoned").last_used)
-                .map(|(k, _)| *k)
-            {
-                forks.remove(&lru);
+                .filter_map(|(k, s)| session_last_used(s).map(|lu| (lu, *k)))
+                .min()
+                .map(|(_, k)| k);
+            if let Some(k) = lru {
+                forks.remove(&k);
             }
+            // If every fork is busy, we proceed one over capacity rather than
+            // block; the next create reclaims once one frees up.
         }
         let id = random_id();
         forks.insert(id, Arc::new(Mutex::new(ForkSession::new(id, overlay))));
@@ -172,28 +187,34 @@ impl SimState {
 
     /// The fork handle, if it exists. The caller locks it to run/snapshot.
     pub fn get(&self, id: &ForkId) -> Option<Arc<Mutex<ForkSession>>> {
-        self.forks.lock().expect("sim registry poisoned").get(id).cloned()
+        self.lock_map().get(id).cloned()
     }
 
     /// Remove a fork. Returns whether it existed.
     pub fn delete(&self, id: &ForkId) -> bool {
-        self.forks.lock().expect("sim registry poisoned").remove(id).is_some()
+        self.lock_map().remove(id).is_some()
     }
 
-    /// Snapshot of all live forks (after evicting expired ones).
+    /// Snapshot of all live forks (after evicting expired ones). A fork whose
+    /// call is currently running is skipped (its lock is held) rather than
+    /// blocking the listing.
     pub fn list(&self) -> Vec<ForkInfo> {
-        let mut forks = self.forks.lock().expect("sim registry poisoned");
+        let mut forks = self.lock_map();
         self.evict_expired(&mut forks);
         forks
             .values()
-            .map(|s| {
-                let g = s.lock().expect("fork poisoned");
-                ForkInfo {
+            .filter_map(|s| {
+                let g = match s.try_lock() {
+                    Ok(g) => g,
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return None,
+                };
+                Some(ForkInfo {
                     fork_id: g.fork_id,
                     created: g.created,
                     last_used: g.last_used,
                     overlay_keys: g.overlay.overlay_keys(),
-                }
+                })
             })
             .collect()
     }
@@ -201,9 +222,22 @@ impl SimState {
     fn evict_expired(&self, forks: &mut HashMap<ForkId, Arc<Mutex<ForkSession>>>) {
         let ttl = Duration::from_secs(self.config.fork_ttl_secs);
         let now = Instant::now();
-        forks.retain(|_, s| {
-            let last = s.lock().expect("fork poisoned").last_used;
-            now.duration_since(last) < ttl
+        forks.retain(|_, s| match session_last_used(s) {
+            // Idle long enough → evict.
+            Some(last) => now.duration_since(last) < ttl,
+            // Currently locked (a call is running) → clearly in use, keep it.
+            None => true,
         });
+    }
+}
+
+/// Read a session's `last_used` WITHOUT blocking: `None` if the session lock is
+/// currently held (a call is running). Recovers a poisoned lock so a prior VM
+/// panic can't cascade into the registry.
+fn session_last_used(s: &Arc<Mutex<ForkSession>>) -> Option<Instant> {
+    match s.try_lock() {
+        Ok(g) => Some(g.last_used),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner().last_used),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }

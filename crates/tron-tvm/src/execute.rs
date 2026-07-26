@@ -347,6 +347,7 @@ pub fn execute_trigger_with_gas_cap_tx_id(
     contract: &TriggerSmartContract,
     energy_limit: u64,
     gas_cap_override: u64,
+    deadline: Option<(std::time::Instant, u64)>,
     tx_id: [u8; 32],
 ) -> (VmOutcome, Vec<crate::internal_tx::InternalTxTrace>, u64) {
     execute_trigger_inner(
@@ -355,7 +356,7 @@ pub fn execute_trigger_with_gas_cap_tx_id(
         contract,
         energy_limit,
         Some(gas_cap_override),
-        None,
+        deadline,
         Some(tx_id),
     )
 }
@@ -424,6 +425,7 @@ pub fn execute_trigger_with_tracer_tx_id(
     contract: &TriggerSmartContract,
     energy_limit: u64,
     gas_cap_override: u64,
+    deadline: Option<(std::time::Instant, u64)>,
     tracer: crate::tracer::StructLogTracer,
     tx_id: [u8; 32],
 ) -> (
@@ -438,7 +440,7 @@ pub fn execute_trigger_with_tracer_tx_id(
         contract,
         energy_limit,
         Some(gas_cap_override),
-        None,
+        deadline,
         Some(tracer),
         Some(tx_id),
     )
