@@ -81,6 +81,13 @@ pub struct TracerOptions {
     /// When set, skip the per-opcode log and only build the call
     /// tree (matches geth's `tracer: "callTracer"`).
     pub call_tracer_only: bool,
+    /// Hard cap on the number of `StructLog` entries collected. `0` means
+    /// unlimited (the default, for the feeLimit-bounded `debug_trace*`
+    /// callers). Fork simulation sets this so an attacker running arbitrary
+    /// bytecode under a large energy budget can't balloon memory with tens of
+    /// millions of per-opcode logs — collection stops (and `logs_truncated`
+    /// flips) once the cap is hit, before the per-step stack clone.
+    pub max_logs: usize,
 }
 
 impl Default for TracerOptions {
@@ -90,6 +97,7 @@ impl Default for TracerOptions {
             disable_memory: true,
             disable_storage: true,
             call_tracer_only: false,
+            max_logs: 0,
         }
     }
 }
@@ -118,6 +126,9 @@ pub struct StructLogTracer {
     /// tracer records per-entity opcodes / storage touched inside UserOp
     /// validation subtrees. `None` for the debug-trace path (no behaviour change).
     validation: Option<ValidationCollect>,
+    /// Set once the `max_logs` cap is hit and further per-opcode logs are
+    /// dropped. Surfaced so callers can flag a truncated trace.
+    logs_truncated: bool,
 }
 
 impl StructLogTracer {
@@ -130,11 +141,17 @@ impl StructLogTracer {
             completed: Vec::new(),
             last_step_gas: None,
             validation: None,
+            logs_truncated: false,
         }
     }
 
     pub fn into_outputs(self) -> (Vec<StructLog>, Vec<CallFrame>) {
         (self.logs, self.completed)
+    }
+
+    /// True if the `max_logs` cap dropped one or more per-opcode logs.
+    pub fn logs_truncated(&self) -> bool {
+        self.logs_truncated
     }
 
     /// Attach an ERC-7562 validation collector. Pair with
@@ -233,6 +250,14 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
             }
         }
         if self.options.call_tracer_only {
+            return;
+        }
+        // Cap collection BEFORE the per-step stack clone (the memory hog).
+        // Clearing `last_step_gas` makes the paired `step_end` skip, so the
+        // last retained log keeps its correct `gas_cost`.
+        if self.options.max_logs != 0 && self.logs.len() >= self.options.max_logs {
+            self.logs_truncated = true;
+            self.last_step_gas = None;
             return;
         }
         let pc = interp.bytecode.pc() as u64;

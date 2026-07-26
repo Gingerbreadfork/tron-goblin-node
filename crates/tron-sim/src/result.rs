@@ -61,6 +61,9 @@ pub struct CallResult {
     pub call_frames: Vec<CallFrame>,
     /// Opcode struct-logs; only populated when `trace = Full`.
     pub struct_logs: Vec<StructLog>,
+    /// True when the `max_struct_logs` cap dropped some opcode logs (the trace
+    /// is partial).
+    pub struct_logs_truncated: bool,
     /// Per-call diff; only when `return_state_diff = PerCall`.
     pub state_diff: Option<DecodedStateDiff>,
     /// Human-readable error detail (revert reason, halt reason, …).

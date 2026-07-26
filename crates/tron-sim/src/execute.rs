@@ -75,7 +75,7 @@ pub fn run_bundle(
 
         // Block env: overrides, else +1 block / +3s (TRON block time).
         let bov = block.overrides.block;
-        let number = bov.and_then(|b| b.number).unwrap_or(head_num + 1);
+        let number = bov.and_then(|b| b.number).unwrap_or_else(|| head_num.saturating_add(1));
         if number <= head_num {
             return Err(SimError::Backend(format!(
                 "synthetic block numbers must strictly increase (got {number} after {head_num})"
@@ -83,7 +83,7 @@ pub fn run_bundle(
         }
         let ts_ms = match bov.and_then(|b| b.time_s) {
             Some(s) => s.saturating_mul(1000),
-            None => head_ts_ms + 3000,
+            None => head_ts_ms.saturating_add(3000),
         };
         if ts_ms < head_ts_ms {
             warnings.push(format!(
@@ -232,13 +232,17 @@ fn run_one_call(
                     build_call_result(outcome, penalty, &traces, &tx_id, None, Vec::new(), Vec::new())
                 }
                 TraceLevel::CallTree | TraceLevel::Full => {
-                    let tracer = StructLogTracer::new(tracer_options(trace));
+                    let tracer = StructLogTracer::new(tracer_options(trace, cfg));
                     let (outcome, traces, penalty, tracer) = execute_trigger_with_tracer_tx_id(
                         vm, block_env, &trigger, energy, gas_cap, deadline, tracer, tx_id,
                     );
+                    let truncated = tracer.logs_truncated();
                     let (struct_logs, frames) = tracer.into_outputs();
                     let struct_logs = keep_struct_logs(trace, struct_logs);
-                    build_call_result(outcome, penalty, &traces, &tx_id, None, frames, struct_logs)
+                    let mut r =
+                        build_call_result(outcome, penalty, &traces, &tx_id, None, frames, struct_logs);
+                    r.struct_logs_truncated = truncated;
+                    r
                 }
             }
         }
@@ -282,12 +286,13 @@ fn run_one_call(
                     )
                 }
                 TraceLevel::CallTree | TraceLevel::Full => {
-                    let tracer = StructLogTracer::new(tracer_options(trace));
+                    let tracer = StructLogTracer::new(tracer_options(trace, cfg));
                     let (outcome, traces, penalty, tracer) =
                         execute_create_with_tracer(vm, block_env, &create, &tx_id, energy, tracer);
+                    let truncated = tracer.logs_truncated();
                     let (struct_logs, frames) = tracer.into_outputs();
                     let struct_logs = keep_struct_logs(trace, struct_logs);
-                    build_call_result(
+                    let mut r = build_call_result(
                         outcome,
                         penalty,
                         &traces,
@@ -295,7 +300,9 @@ fn run_one_call(
                         Some(contract_addr),
                         frames,
                         struct_logs,
-                    )
+                    );
+                    r.struct_logs_truncated = truncated;
+                    r
                 }
             };
             // A successful create returns the deployed address as its VM
@@ -309,9 +316,10 @@ fn run_one_call(
     }
 }
 
-fn tracer_options(trace: TraceLevel) -> TracerOptions {
+fn tracer_options(trace: TraceLevel, cfg: &SimConfig) -> TracerOptions {
     TracerOptions {
         call_tracer_only: matches!(trace, TraceLevel::CallTree),
+        max_logs: cfg.max_struct_logs,
         ..Default::default()
     }
 }
@@ -393,6 +401,7 @@ fn build_call_result(
         internal_transactions,
         call_frames,
         struct_logs,
+        struct_logs_truncated: false,
         state_diff: None,
         error,
     }

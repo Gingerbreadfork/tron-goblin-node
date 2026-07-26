@@ -253,6 +253,28 @@ fn deterministic_replay_is_identical() {
 }
 
 #[test]
+fn full_trace_struct_logs_are_capped() {
+    let mut ov = fork();
+    let (c, caller) = (addr(0x24), addr(0x25));
+    let mut ovr = OverrideSet::default();
+    code(&mut ovr, c, SSTORE_2A.to_vec()); // 4 opcodes
+    fund(&mut ovr, caller);
+    // Cap struct-logs at 2; the contract runs more than 2 opcodes.
+    let cfg = SimConfig { max_struct_logs: 2, ..Default::default() };
+    let req = SimRequest {
+        blocks: vec![BlockSpec { overrides: ovr, calls: vec![trigger(caller, c, 1_000_000)] }],
+        trace: TraceLevel::Full,
+        return_state_diff: DiffLevel::None,
+        ..Default::default()
+    };
+    let res = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16], None).unwrap();
+    let call = &res.blocks[0].calls[0];
+    assert_eq!(call.status, CallStatus::Success, "err={:?}", call.error);
+    assert!(call.struct_logs.len() <= 2, "struct logs must be capped: {}", call.struct_logs.len());
+    assert!(call.struct_logs_truncated, "truncation must be flagged");
+}
+
+#[test]
 fn callless_block_overrides_hit_overlay_cap() {
     // A block with overrides but NO calls must still be bounded by the
     // overlay-key cap (checked after applying overrides).

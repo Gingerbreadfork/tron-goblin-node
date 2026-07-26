@@ -38,7 +38,11 @@ async fn rest_sim_bundle(
     axum::Json(body): axum::Json<Value>,
 ) -> (axum::http::StatusCode, axum::Json<Value>) {
     use axum::http::StatusCode;
-    match tron_simulate_bundle(&json!([body]), &state) {
+    // Run the (synchronous, potentially heavy) bundle off the async worker so a
+    // big simulation can't pin a tokio thread — same discipline as the JSON-RPC
+    // dispatch path.
+    let outcome = crate::blocking::run_blocking(|| tron_simulate_bundle(&json!([body]), &state));
+    match outcome {
         Ok(v) => (StatusCode::OK, axum::Json(json!({ "success": true, "data": v }))),
         Err(e) => {
             let code = if e.code == -32602 {
@@ -388,15 +392,18 @@ fn format_geth_call_result(c: &CallResult, block_num: i64, log_index: &mut u64) 
 }
 
 // ---------------------------------------------------------------------------
-// selfCheck — byte-exactness parity. Re-run block N+1's INDEX-0 transaction
-// (the only one with no in-block predecessors, so state-after-N is its exact
-// pre-state — the plan's granularity-vacuous case) unmodified against a fresh
-// fork at N, and compare our contractRet class to the block's recorded
-// `Transaction.ret[0].contract_ret` (the same signal the executor's tripwire
-// uses). Budget-dependent recorded outcomes (OutOfEnergy / OutOfTime) are
-// reported inconclusive — VM-mode cannot reproduce the exact energy budget
-// (frozen resources) or java's 80ms wall-clock rule. Deeper coverage is the
-// rig parity run (many index-0 txs across heights).
+// selfCheck — contractRet-CLASS parity (VM mode; NOT the exact-code executor
+// tripwire). Re-run block N+1's INDEX-0 transaction (the only one with no
+// in-block predecessors, so state-after-N is its exact pre-state — the plan's
+// granularity-vacuous case) unmodified against a fresh fork at N, and compare
+// the class of our outcome (Success / Revert / TransferFailed / Halt) to the
+// class of the block's recorded `Transaction.ret[0].contract_ret`.
+// Budget/time-dependent recorded outcomes (OutOfEnergy / OutOfTime) are
+// reported inconclusive — VM mode cannot reproduce the exact energy budget
+// (frozen resources) or java's 80ms wall-clock rule, and a tx needing
+// >energy_cap or a maintenance-boundary block can produce a false mismatch.
+// This is a best-effort parity indicator, not the byte-exact tripwire; deeper
+// coverage is the rig parity run (many index-0 txs across heights).
 // ---------------------------------------------------------------------------
 
 fn contract_result_name(code: i32) -> &'static str {
@@ -518,12 +525,13 @@ fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
         .and_then(|h| h.raw_data.as_ref())
         .map(|r| r.timestamp)
         .unwrap_or(0);
-    // Derive the budget from the AT-HEIGHT energy fee (block N's dyn-props via
-    // the overlay), not the live fee — the fee is a proposal value that can
-    // change, and using the live one would mis-budget across a fee change and
-    // produce false mismatches.
-    let energy_fee = overlay.vm_stores().dynamic_properties.energy_fee().max(1);
-    let budget = ((raw.fee_limit / energy_fee).max(1_000_000) as u64).min(sim.config().energy_cap);
+    // Give the re-run the full per-call budget rather than fee_limit/energy_fee:
+    // the real on-chain budget also includes the account's frozen/staked energy,
+    // which VM mode does not model, so a tighter budget would OOG a tx that
+    // legitimately ran on stake and report a false mismatch. Recorded
+    // energy/time failures (OUT_OF_ENERGY / OUT_OF_TIME) were already excluded
+    // above, so a generous budget can't manufacture a false success.
+    let budget = sim.config().energy_cap;
 
     let mut overrides = OverrideSet::default();
     overrides.block = Some(BlockOverride {
@@ -548,8 +556,26 @@ fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
             return json!({ "comparedBlock": next, "checked": 0, "note": "selfCheck produced no result" })
         }
     };
-    let our_ok = cr.status == CallStatus::Success;
-    let matched = our_ok == recorded_is_success(recorded);
+    // Compare the contractRet CLASS (not just success/failure): Success vs
+    // Revert vs TransferFailed vs a spend-all Halt are distinct outcomes with
+    // different energy semantics, so collapsing them would hide a real
+    // divergence (e.g. recorded REVERT but we HALT). This is a class-parity
+    // check, NOT the executor's exact-code tripwire.
+    use tron_proto::transaction::result::ContractResult as CR;
+    let matched = match &cr.status {
+        CallStatus::Success => recorded_is_success(recorded),
+        CallStatus::Revert => recorded == CR::Revert as i32,
+        CallStatus::TransferFailed => recorded == CR::TransferFailed as i32,
+        // Any other spend-all halt: recorded must be a halt code too (not
+        // success/revert/transfer-failed; OUT_OF_ENERGY/OUT_OF_TIME already
+        // excluded above).
+        CallStatus::Halt(_) => {
+            !recorded_is_success(recorded)
+                && recorded != CR::Revert as i32
+                && recorded != CR::TransferFailed as i32
+        }
+        CallStatus::Error | CallStatus::Timeout => false,
+    };
     let tx_id = tron_crypto::hash::sha256(&raw.encode_to_vec());
 
     json!({
@@ -559,8 +585,11 @@ fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
         "txId": hex::encode(tx_id),
         "ourStatus": cr.status.label(),
         "recordedContractRet": contract_result_name(recorded),
-        "note": "authoritative byte-exact check of block N+1's index-0 tx; \
-                 for broader coverage run selfCheck across many heights (the rig parity run)"
+        "note": "contractRet-class parity for block N+1's index-0 tx (VM mode; \
+                 NOT the exact-code executor tripwire). A mismatch can be a real \
+                 divergence OR a VM-mode limitation (a tx needing >energy_cap or \
+                 relying on frozen energy, or a maintenance-boundary block); \
+                 broader coverage is the rig parity run across many heights."
     })
 }
 
@@ -1059,6 +1088,9 @@ fn format_call_result(c: &CallResult) -> Value {
                 }))
                 .collect::<Vec<_>>()),
         );
+    }
+    if c.struct_logs_truncated {
+        m.insert("structLogsTruncated".into(), json!(true));
     }
     if let Some(d) = &c.state_diff {
         m.insert("stateDiff".into(), format_diff(d));

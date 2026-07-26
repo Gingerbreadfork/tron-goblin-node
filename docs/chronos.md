@@ -34,7 +34,8 @@ max_calls_per_bundle     = 256
 max_blocks_per_bundle    = 64
 energy_cap               = 50000000  # per-call ceiling (= eth_call gas cap)
 max_state_override_slots = 10000     # `state` replace-all enumeration cap
-call_timeout_ms          = 0         # per-call wall-clock deadline; 0 = off
+max_struct_logs          = 100000    # per-call opcode-log cap (trace=full); 0 = unlimited
+call_timeout_ms          = 0         # per-call wall-clock deadline; 0 = off (see note)
 ```
 
 Historical forks are limited to the archive's coverage window; a request
@@ -160,10 +161,21 @@ Every response carries a `basis` header stating the truth:
 - **`archiveCoverage`** — history is a window, not eternity; out-of-window
   requests are rejected, not clamped.
 - **Determinism** — same request + same fork state ⇒ byte-identical response.
-  Synthetic transaction ids are derived (`sha256(forkId ‖ blockIndex ‖
-  callIndex)`), so created addresses are stable across replays; the only
-  wall-clock input is the optional DoS deadline, which yields an explicit
-  `TIMEOUT` status.
+  Synthetic transaction ids are derived (`sha256(forkId ‖ blockNumber ‖
+  callIndex)`), so created addresses are stable across replays and never
+  collide across a session's calls. The per-call energy budget (`energy_cap`)
+  is the deterministic compute bound; `call_timeout_ms` is **off by default**
+  because a call that trips a wall-clock deadline would resolve differently on
+  a slow vs a fast host (an explicit `TIMEOUT` status) — enable it only if you
+  prefer a wall-clock guard over byte-exact replay. `trace: "full"` is capped
+  at `max_struct_logs` opcode logs per call; a truncated trace sets
+  `structLogsTruncated`.
+- **selfCheck is contractRet-CLASS parity, not the exact-code tripwire** — it
+  re-runs block N+1's index-0 tx and compares the outcome class (Success /
+  Revert / TransferFailed / Halt). A mismatch may be a real divergence or a
+  VM-mode limitation (a tx needing more than `energy_cap`, one relying on
+  frozen energy, or a maintenance-boundary block); the rigorous byte-exact
+  check is the rig parity run.
 - **Isolation** — nothing Chronos does can reach disk: height-based overlays
   sit on read-only at-height views and no session is ever committed.
 

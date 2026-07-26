@@ -150,8 +150,7 @@ fn fork_lifecycle_create_call_snapshot_revert_delete() {
     assert!(tron_rpc::sim::tron_fork_call(&call_body, &st).is_err());
 }
 
-#[test]
-fn self_check_matches_recorded_contract_ret() {
+fn self_check_case(contract_code: &[u8], recorded_ret: i32) -> serde_json::Value {
     use prost::Message;
     use tron_chainbase::{AccountStore, BlockIndexStore, BlockStore};
     use tron_proto::transaction::{contract::ContractType, Contract as TxContract, Raw as TxRaw};
@@ -175,13 +174,25 @@ fn self_check_matches_recorded_contract_ret() {
     contract[0] = 0x41;
     contract[20] = 0x40;
 
-    // Contract code (SSTORE 0x2a @ slot 0) — live; the at-height read falls
-    // through since it was never captured as a delta.
-    code.put(&contract, &[0x60, 0x2a, 0x60, 0x00, 0x55, 0x00]).unwrap();
+    // Contract code — live; the at-height read falls through since it was
+    // never captured as a delta.
+    code.put(&contract, contract_code).unwrap();
     // Caller account with balance.
     let caller_acct = Account { address: caller.to_vec(), balance: 1_000_000_000, ..Default::default() };
     AccountStore::new(accounts.clone())
         .put(&tron_crypto::address::Address::from_raw(caller), &caller_acct)
+        .unwrap();
+    // Contract ACCOUNT row — a real contract has one; without it basic_ref
+    // returns None and the CALL runs empty code (trivial success). This is
+    // what makes the re-run actually execute `contract_code`.
+    let contract_acct = Account {
+        address: contract.to_vec(),
+        code_hash: tron_crypto::hash::keccak256(contract_code).to_vec(),
+        r#type: tron_proto::AccountType::Contract as i32,
+        ..Default::default()
+    };
+    AccountStore::new(accounts.clone())
+        .put(&tron_crypto::address::Address::from_raw(contract), &contract_acct)
         .unwrap();
 
     // Archive: full store set + coverage established at `base` (a caller delta).
@@ -240,7 +251,7 @@ fn self_check_matches_recorded_contract_ret() {
         }),
         signature: vec![],
         ret: vec![tron_proto::transaction::Result {
-            contract_ret: tron_proto::transaction::result::ContractResult::Success as i32,
+            contract_ret: recorded_ret,
             ..Default::default()
         }],
         unparsed_field10: None,
@@ -267,11 +278,34 @@ fn self_check_matches_recorded_contract_ret() {
 
     let params = json!([{ "base": { "block": base }, "selfCheck": true, "blocks": [{ "calls": [] }] }]);
     let res = tron_rpc::sim::tron_simulate_bundle(&params, &st).expect("bundle");
-    let sc = &res["selfCheck"];
+    res["selfCheck"].clone()
+}
+
+#[test]
+fn self_check_matches_success() {
+    // SSTORE 0x2a @ slot 0 → SUCCESS, recorded SUCCESS.
+    let sc = self_check_case(
+        &[0x60, 0x2a, 0x60, 0x00, 0x55, 0x00],
+        tron_proto::transaction::result::ContractResult::Success as i32,
+    );
     assert_eq!(sc["checked"], 1, "selfCheck: {sc}");
     assert_eq!(sc["matched"], true, "selfCheck: {sc}");
-    assert_eq!(sc["ourStatus"], "SUCCESS", "selfCheck: {sc}");
+    assert_eq!(sc["ourStatus"], "SUCCESS");
     assert_eq!(sc["recordedContractRet"], "SUCCESS");
+}
+
+#[test]
+fn self_check_matches_revert_class() {
+    // PUSH1 0 PUSH1 0 REVERT → REVERT, recorded REVERT — class parity, not
+    // collapsed into a generic "failure" bucket.
+    let sc = self_check_case(
+        &[0x60, 0x00, 0x60, 0x00, 0xfd],
+        tron_proto::transaction::result::ContractResult::Revert as i32,
+    );
+    assert_eq!(sc["checked"], 1, "selfCheck: {sc}");
+    assert_eq!(sc["matched"], true, "selfCheck: {sc}");
+    assert_eq!(sc["ourStatus"], "REVERT");
+    assert_eq!(sc["recordedContractRet"], "REVERT");
 }
 
 fn eth20(n: u8) -> String {

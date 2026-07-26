@@ -25,8 +25,16 @@ pub struct SimConfig {
     /// Max slots a `state` (replace-all) override may enumerate before it
     /// errors (suggesting `stateDiff` instead) — honesty over truncation.
     pub max_state_override_slots: usize,
-    /// Per-call wall-clock deadline in ms; `0` disables it. A call that
-    /// exceeds it returns a `Timeout` status rather than a wrong result.
+    /// Per-call cap on collected opcode struct-logs (`trace = Full`). Bounds
+    /// trace memory when running arbitrary bytecode under a big energy budget;
+    /// a truncated trace is flagged. `0` = unlimited.
+    pub max_struct_logs: usize,
+    /// Per-call wall-clock deadline in ms; `0` disables it (the default). When
+    /// enabled it preempts a runaway call, but a call that trips it becomes
+    /// **non-deterministic across machines** (timeout on a slow host, success
+    /// on a fast one) — so it is off by default to preserve byte-exact replay.
+    /// The per-call energy budget (`energy_cap`) is the deterministic compute
+    /// bound; this is an optional operator-chosen wall-clock guard on top.
     pub call_timeout_ms: u64,
 }
 
@@ -42,9 +50,10 @@ impl Default for SimConfig {
             // = rpc.eth_call_gas_cap default (50M).
             energy_cap: 50_000_000,
             max_state_override_slots: 10_000,
-            // 10s per call by default — a runaway trigger (arbitrary contract
-            // code) is preempted rather than pinning a worker. 0 disables it.
-            call_timeout_ms: 10_000,
+            max_struct_logs: 100_000,
+            // Off by default: determinism (byte-exact replay) beats a
+            // wall-clock guard, and energy_cap already bounds compute.
+            call_timeout_ms: 0,
         }
     }
 }

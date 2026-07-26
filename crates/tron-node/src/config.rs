@@ -2235,7 +2235,12 @@ pub struct SimConfig {
     pub energy_cap: u64,
     /// Max slots a `state` (replace-all) override may enumerate.
     pub max_state_override_slots: usize,
-    /// Per-call wall-clock deadline (ms); 0 disables it.
+    /// Per-call cap on collected opcode struct-logs (trace = full); 0 =
+    /// unlimited. Bounds trace memory under arbitrary bytecode.
+    pub max_struct_logs: usize,
+    /// Per-call wall-clock deadline (ms); 0 disables it (the default). Enabling
+    /// it bounds a runaway call but makes a timing-out call non-deterministic
+    /// across machines; energy_cap is the deterministic compute bound.
     pub call_timeout_ms: u64,
 }
 
@@ -2253,6 +2258,7 @@ impl Default for SimConfig {
             max_blocks_per_bundle: d.max_blocks_per_bundle,
             energy_cap: d.energy_cap,
             max_state_override_slots: d.max_state_override_slots,
+            max_struct_logs: d.max_struct_logs,
             call_timeout_ms: d.call_timeout_ms,
         }
     }
@@ -2270,6 +2276,7 @@ impl SimConfig {
             max_blocks_per_bundle: self.max_blocks_per_bundle,
             energy_cap: self.energy_cap,
             max_state_override_slots: self.max_state_override_slots,
+            max_struct_logs: self.max_struct_logs,
             call_timeout_ms: self.call_timeout_ms,
         }
     }

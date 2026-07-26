@@ -646,6 +646,13 @@ energy_cap = 50000000
 # Max slots a `state` (replace-all) override may enumerate before it errors
 # (suggesting stateDiff) rather than silently truncating.
 max_state_override_slots = 10000
-# Per-call wall-clock deadline in ms (DoS guard); 0 disables it. A call that
-# exceeds it returns a TIMEOUT status, never a wrong result.
+# Per-call cap on opcode struct-logs (trace = "full"); 0 = unlimited. Bounds
+# trace memory when running arbitrary bytecode under a big energy budget; a
+# truncated trace is flagged with structLogsTruncated.
+max_struct_logs = 100000
+# Per-call wall-clock deadline in ms; 0 disables it (the default). The per-call
+# energy budget (energy_cap) is the DETERMINISTIC compute bound. Enabling this
+# preempts a runaway call but makes a call that trips it non-deterministic
+# across machines (timeout on a slow host, success on a fast one), so it is off
+# by default to preserve byte-exact replay.
 call_timeout_ms = 0

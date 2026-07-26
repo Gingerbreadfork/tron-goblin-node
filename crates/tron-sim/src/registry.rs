@@ -59,7 +59,8 @@ pub struct ForkSession {
     pub overlay: ForkOverlay,
     pub fork_id: ForkId,
     /// `(snapshot_id, checkpoint)` in creation order.
-    snapshots: Vec<(u64, ForkCheckpoint)>,
+    /// `(snapshot_id, overlay checkpoint, synthetic_head at snapshot time)`.
+    snapshots: Vec<(u64, ForkCheckpoint, (i64, i64))>,
     next_snapshot: u64,
     pub created: Instant,
     pub last_used: Instant,
@@ -104,21 +105,25 @@ impl ForkSession {
         let cp = self.overlay.checkpoint();
         let id = self.next_snapshot;
         self.next_snapshot += 1;
-        self.snapshots.push((id, cp));
+        self.snapshots.push((id, cp, self.synthetic_head));
         self.last_used = Instant::now();
         id
     }
 
     /// Revert to a snapshot (anvil `evm_revert`). Consumes that snapshot and
-    /// every one taken after it.
+    /// every one taken after it, and restores the synthetic head to its value
+    /// at snapshot time — so re-running the same calls after a revert is
+    /// address-reproducible (the writes those calls' tx-ids would collide with
+    /// were discarded by the revert, so no live collision results).
     pub fn revert(&mut self, snapshot_id: u64) -> Result<(), SimError> {
         let pos = self
             .snapshots
             .iter()
-            .position(|(sid, _)| *sid == snapshot_id)
+            .position(|(sid, _, _)| *sid == snapshot_id)
             .ok_or_else(|| SimError::Backend(format!("unknown snapshot {snapshot_id}")))?;
-        let (_, cp) = self.snapshots[pos];
+        let (_, cp, head) = self.snapshots[pos];
         self.overlay.revert_to(cp);
+        self.synthetic_head = head;
         self.snapshots.truncate(pos);
         self.last_used = Instant::now();
         Ok(())
