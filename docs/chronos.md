@@ -179,17 +179,20 @@ curl -s -X POST $RPC -H 'content-type: application/json' -d '{
     "base": { "block": 84800600 },
     "blocks": [{ "calls": [
       { "type":"trigger",
-        "ownerAddress":"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+        "ownerAddress":"0x0000000000000000000000000000000000000001",
         "contractAddress":"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
-        "data":"313ce567", "energy":10000000 }
+        "data":"0x313ce567", "energy":10000000 }
     ]}]
   }]
 }'
 # result.blocks[0].calls[0].returnData = 0x…06  (USDT has 6 decimals)
 ```
 
-Swap the `data` for `70a08231` + a 32-byte-padded holder address to read a
-`balanceOf` at that height, or any other method + ABI-encoded args.
+Notes: `data` is `0x`-prefixed hex (bare hex is rejected). The caller
+(`ownerAddress`) must be an account WITHOUT code — a contract as caller is
+rejected (EIP-3607), like a real signed tx; any plain address works for a view
+call. Swap `data` for `0x70a08231` + a 32-byte-padded holder address to read a
+`balanceOf` at that height, or any method + ABI-encoded args.
 
 ### 2. "What-if": replay a failing call after fixing the missing state
 
