@@ -1092,6 +1092,9 @@ fn format_call_result(c: &CallResult) -> Value {
     if c.struct_logs_truncated {
         m.insert("structLogsTruncated".into(), json!(true));
     }
+    if c.call_frames_truncated {
+        m.insert("callFramesTruncated".into(), json!(true));
+    }
     if let Some(d) = &c.state_diff {
         m.insert("stateDiff".into(), format_diff(d));
     }

@@ -275,6 +275,54 @@ fn full_trace_struct_logs_are_capped() {
 }
 
 #[test]
+fn full_trace_struct_logs_capped_by_bytes() {
+    let mut ov = fork();
+    let (c, caller) = (addr(0x26), addr(0x27));
+    let mut ovr = OverrideSet::default();
+    code(&mut ovr, c, SSTORE_2A.to_vec());
+    fund(&mut ovr, caller);
+    // Unlimited count, but a 1-byte budget → drops every log (each is ≥96 B).
+    let cfg = SimConfig { max_struct_logs: 0, max_struct_log_bytes: 1, ..Default::default() };
+    let req = SimRequest {
+        blocks: vec![BlockSpec { overrides: ovr, calls: vec![trigger(caller, c, 1_000_000)] }],
+        trace: TraceLevel::Full,
+        return_state_diff: DiffLevel::None,
+        ..Default::default()
+    };
+    let res = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16], None).unwrap();
+    let call = &res.blocks[0].calls[0];
+    assert_eq!(call.status, CallStatus::Success, "err={:?}", call.error);
+    assert!(call.struct_logs.is_empty(), "a 1-byte budget must drop all logs");
+    assert!(call.struct_logs_truncated, "byte-budget truncation must be flagged");
+}
+
+// PUSH1 0 ×7 (CALL's 7 stack args), CALL (0xf1), STOP — makes one inner CALL
+// to the zero address, so the trace has a root frame + one nested frame.
+const CALL_ZERO: [u8; 16] = [
+    0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf1, 0x00,
+];
+
+#[test]
+fn call_frames_are_capped() {
+    let mut ov = fork();
+    let (c, caller) = (addr(0x28), addr(0x29));
+    let mut ovr = OverrideSet::default();
+    code(&mut ovr, c, CALL_ZERO.to_vec());
+    fund(&mut ovr, caller);
+    // Two frames (root + inner CALL); cap of 1 drops one and flags it.
+    let cfg = SimConfig { max_call_frames: 1, ..Default::default() };
+    let req = SimRequest {
+        blocks: vec![BlockSpec { overrides: ovr, calls: vec![trigger(caller, c, 1_000_000)] }],
+        trace: TraceLevel::CallTree,
+        return_state_diff: DiffLevel::None,
+        ..Default::default()
+    };
+    let res = tron_sim::run_bundle(&mut ov, &req, &cfg, [0u8; 16], None).unwrap();
+    let call = &res.blocks[0].calls[0];
+    assert!(call.call_frames_truncated, "frame cap must be flagged; frames={:?}", call.call_frames.len());
+}
+
+#[test]
 fn callless_block_overrides_hit_overlay_cap() {
     // A block with overrides but NO calls must still be bounded by the
     // overlay-key cap (checked after applying overrides).

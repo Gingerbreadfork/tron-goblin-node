@@ -88,6 +88,16 @@ pub struct TracerOptions {
     /// millions of per-opcode logs — collection stops (and `logs_truncated`
     /// flips) once the cap is hit, before the per-step stack clone.
     pub max_logs: usize,
+    /// Approximate byte budget for the collected struct-logs. `0` = unlimited.
+    /// Each log clones the EVM stack (up to 1024 × 32B = 32 KiB), so a count
+    /// cap alone doesn't bound memory; this bounds the actual bytes (estimated
+    /// from stack depth) and is checked before the clone.
+    pub max_log_bytes: usize,
+    /// Hard cap on the number of `CallFrame`s retained in the call tree. `0` =
+    /// unlimited. Bounds the tree a call-heavy contract can build (frames carry
+    /// input/output byte clones). Excess frames are dropped from the tree while
+    /// the open/close balance is preserved; `frames_truncated` flips.
+    pub max_call_frames: usize,
 }
 
 impl Default for TracerOptions {
@@ -98,6 +108,8 @@ impl Default for TracerOptions {
             disable_storage: true,
             call_tracer_only: false,
             max_logs: 0,
+            max_log_bytes: 0,
+            max_call_frames: 0,
         }
     }
 }
@@ -126,9 +138,15 @@ pub struct StructLogTracer {
     /// tracer records per-entity opcodes / storage touched inside UserOp
     /// validation subtrees. `None` for the debug-trace path (no behaviour change).
     validation: Option<ValidationCollect>,
-    /// Set once the `max_logs` cap is hit and further per-opcode logs are
-    /// dropped. Surfaced so callers can flag a truncated trace.
+    /// Set once the `max_logs`/`max_log_bytes` cap is hit and further per-opcode
+    /// logs are dropped. Surfaced so callers can flag a truncated trace.
     logs_truncated: bool,
+    /// Running estimate of bytes held by `logs` (for `max_log_bytes`).
+    logs_bytes: usize,
+    /// Total call frames seen (for `max_call_frames`), and whether the cap
+    /// dropped any from the retained tree.
+    frames_total: usize,
+    frames_truncated: bool,
 }
 
 impl StructLogTracer {
@@ -142,6 +160,9 @@ impl StructLogTracer {
             last_step_gas: None,
             validation: None,
             logs_truncated: false,
+            logs_bytes: 0,
+            frames_total: 0,
+            frames_truncated: false,
         }
     }
 
@@ -149,9 +170,14 @@ impl StructLogTracer {
         (self.logs, self.completed)
     }
 
-    /// True if the `max_logs` cap dropped one or more per-opcode logs.
+    /// True if a cap dropped one or more per-opcode logs.
     pub fn logs_truncated(&self) -> bool {
         self.logs_truncated
+    }
+
+    /// True if `max_call_frames` dropped one or more frames from the tree.
+    pub fn frames_truncated(&self) -> bool {
+        self.frames_truncated
     }
 
     /// Attach an ERC-7562 validation collector. Pair with
@@ -252,10 +278,21 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
         if self.options.call_tracer_only {
             return;
         }
-        // Cap collection BEFORE the per-step stack clone (the memory hog).
-        // Clearing `last_step_gas` makes the paired `step_end` skip, so the
-        // last retained log keeps its correct `gas_cost`.
-        if self.options.max_logs != 0 && self.logs.len() >= self.options.max_logs {
+        // Cap collection BEFORE the per-step stack clone (the memory hog), by
+        // both log COUNT and estimated BYTES — a log clones up to a 32 KiB
+        // stack, so a count cap alone does not bound memory. `stack.data().len()`
+        // is O(1) (no clone). Clearing `last_step_gas` makes the paired
+        // `step_end` skip, so the last retained log keeps its correct `gas_cost`.
+        let stack_depth = if self.options.disable_stack {
+            0
+        } else {
+            interp.stack.data().len()
+        };
+        let est_bytes = stack_depth.saturating_mul(32).saturating_add(96);
+        let over_count = self.options.max_logs != 0 && self.logs.len() >= self.options.max_logs;
+        let over_bytes = self.options.max_log_bytes != 0
+            && self.logs_bytes.saturating_add(est_bytes) > self.options.max_log_bytes;
+        if over_count || over_bytes {
             self.logs_truncated = true;
             self.last_step_gas = None;
             return;
@@ -269,6 +306,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
         } else {
             interp.stack.data().to_vec()
         };
+        self.logs_bytes = self.logs_bytes.saturating_add(est_bytes);
         self.logs.push(StructLog {
             pc,
             op,
@@ -432,6 +470,15 @@ impl<CTX> Inspector<CTX, EthInterpreter> for StructLogTracer {
 
 impl StructLogTracer {
     fn attach_completed_frame(&mut self, frame: CallFrame) {
+        self.frames_total += 1;
+        // Drop frames beyond the cap (a call-heavy contract can build a huge
+        // tree; frames carry input/output byte clones). The open/close balance
+        // is untouched — call/create still push and `*_end` still pop — so only
+        // retention is bounded.
+        if self.options.max_call_frames != 0 && self.frames_total > self.options.max_call_frames {
+            self.frames_truncated = true;
+            return;
+        }
         if let Some(parent) = self.open_frames.last_mut() {
             parent.calls.push(frame);
         } else {

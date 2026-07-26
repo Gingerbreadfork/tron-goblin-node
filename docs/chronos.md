@@ -34,7 +34,9 @@ max_calls_per_bundle     = 256
 max_blocks_per_bundle    = 64
 energy_cap               = 50000000  # per-call ceiling (= eth_call gas cap)
 max_state_override_slots = 10000     # `state` replace-all enumeration cap
-max_struct_logs          = 100000    # per-call opcode-log cap (trace=full); 0 = unlimited
+max_struct_logs          = 100000    # per-call opcode-log COUNT cap (trace=full)
+max_struct_log_bytes     = 134217728 # per-call opcode-log BYTE budget (real memory bound)
+max_call_frames          = 100000    # per-call call-tree frame cap
 call_timeout_ms          = 0         # per-call wall-clock deadline; 0 = off (see note)
 ```
 

@@ -2235,9 +2235,14 @@ pub struct SimConfig {
     pub energy_cap: u64,
     /// Max slots a `state` (replace-all) override may enumerate.
     pub max_state_override_slots: usize,
-    /// Per-call cap on collected opcode struct-logs (trace = full); 0 =
-    /// unlimited. Bounds trace memory under arbitrary bytecode.
+    /// Per-call cap on the NUMBER of opcode struct-logs (trace = full); 0 =
+    /// unlimited.
     pub max_struct_logs: usize,
+    /// Per-call approximate BYTE budget for struct-logs (a log clones up to a
+    /// 32 KiB stack); 0 = unlimited. This is the real memory bound.
+    pub max_struct_log_bytes: usize,
+    /// Per-call cap on retained call-tree frames; 0 = unlimited.
+    pub max_call_frames: usize,
     /// Per-call wall-clock deadline (ms); 0 disables it (the default). Enabling
     /// it bounds a runaway call but makes a timing-out call non-deterministic
     /// across machines; energy_cap is the deterministic compute bound.
@@ -2259,6 +2264,8 @@ impl Default for SimConfig {
             energy_cap: d.energy_cap,
             max_state_override_slots: d.max_state_override_slots,
             max_struct_logs: d.max_struct_logs,
+            max_struct_log_bytes: d.max_struct_log_bytes,
+            max_call_frames: d.max_call_frames,
             call_timeout_ms: d.call_timeout_ms,
         }
     }
@@ -2277,6 +2284,8 @@ impl SimConfig {
             energy_cap: self.energy_cap,
             max_state_override_slots: self.max_state_override_slots,
             max_struct_logs: self.max_struct_logs,
+            max_struct_log_bytes: self.max_struct_log_bytes,
+            max_call_frames: self.max_call_frames,
             call_timeout_ms: self.call_timeout_ms,
         }
     }

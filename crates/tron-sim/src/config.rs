@@ -25,10 +25,16 @@ pub struct SimConfig {
     /// Max slots a `state` (replace-all) override may enumerate before it
     /// errors (suggesting `stateDiff` instead) — honesty over truncation.
     pub max_state_override_slots: usize,
-    /// Per-call cap on collected opcode struct-logs (`trace = Full`). Bounds
-    /// trace memory when running arbitrary bytecode under a big energy budget;
-    /// a truncated trace is flagged. `0` = unlimited.
+    /// Per-call cap on the NUMBER of opcode struct-logs (`trace = Full`).
+    /// `0` = unlimited.
     pub max_struct_logs: usize,
+    /// Per-call approximate BYTE budget for struct-logs. Each log clones the
+    /// EVM stack (≤32 KiB), so the count cap alone doesn't bound memory; this
+    /// does. `0` = unlimited.
+    pub max_struct_log_bytes: usize,
+    /// Per-call cap on retained call-tree frames (`trace = callTree`/`full`).
+    /// Bounds a call-heavy contract's tree. `0` = unlimited.
+    pub max_call_frames: usize,
     /// Per-call wall-clock deadline in ms; `0` disables it (the default). When
     /// enabled it preempts a runaway call, but a call that trips it becomes
     /// **non-deterministic across machines** (timeout on a slow host, success
@@ -51,6 +57,9 @@ impl Default for SimConfig {
             energy_cap: 50_000_000,
             max_state_override_slots: 10_000,
             max_struct_logs: 100_000,
+            // ~128 MiB of struct-logs per call (bounds the deep-stack case).
+            max_struct_log_bytes: 128 * 1024 * 1024,
+            max_call_frames: 100_000,
             // Off by default: determinism (byte-exact replay) beats a
             // wall-clock guard, and energy_cap already bounds compute.
             call_timeout_ms: 0,

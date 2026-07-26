@@ -236,12 +236,14 @@ fn run_one_call(
                     let (outcome, traces, penalty, tracer) = execute_trigger_with_tracer_tx_id(
                         vm, block_env, &trigger, energy, gas_cap, deadline, tracer, tx_id,
                     );
-                    let truncated = tracer.logs_truncated();
+                    let logs_truncated = tracer.logs_truncated();
+                    let frames_truncated = tracer.frames_truncated();
                     let (struct_logs, frames) = tracer.into_outputs();
                     let struct_logs = keep_struct_logs(trace, struct_logs);
                     let mut r =
                         build_call_result(outcome, penalty, &traces, &tx_id, None, frames, struct_logs);
-                    r.struct_logs_truncated = truncated;
+                    r.struct_logs_truncated = logs_truncated;
+                    r.call_frames_truncated = frames_truncated;
                     r
                 }
             }
@@ -289,7 +291,8 @@ fn run_one_call(
                     let tracer = StructLogTracer::new(tracer_options(trace, cfg));
                     let (outcome, traces, penalty, tracer) =
                         execute_create_with_tracer(vm, block_env, &create, &tx_id, energy, tracer);
-                    let truncated = tracer.logs_truncated();
+                    let logs_truncated = tracer.logs_truncated();
+                    let frames_truncated = tracer.frames_truncated();
                     let (struct_logs, frames) = tracer.into_outputs();
                     let struct_logs = keep_struct_logs(trace, struct_logs);
                     let mut r = build_call_result(
@@ -301,7 +304,8 @@ fn run_one_call(
                         frames,
                         struct_logs,
                     );
-                    r.struct_logs_truncated = truncated;
+                    r.struct_logs_truncated = logs_truncated;
+                    r.call_frames_truncated = frames_truncated;
                     r
                 }
             };
@@ -320,6 +324,8 @@ fn tracer_options(trace: TraceLevel, cfg: &SimConfig) -> TracerOptions {
     TracerOptions {
         call_tracer_only: matches!(trace, TraceLevel::CallTree),
         max_logs: cfg.max_struct_logs,
+        max_log_bytes: cfg.max_struct_log_bytes,
+        max_call_frames: cfg.max_call_frames,
         ..Default::default()
     }
 }
@@ -402,6 +408,7 @@ fn build_call_result(
         call_frames,
         struct_logs,
         struct_logs_truncated: false,
+        call_frames_truncated: false,
         state_diff: None,
         error,
     }

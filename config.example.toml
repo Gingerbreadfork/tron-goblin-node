@@ -646,10 +646,16 @@ energy_cap = 50000000
 # Max slots a `state` (replace-all) override may enumerate before it errors
 # (suggesting stateDiff) rather than silently truncating.
 max_state_override_slots = 10000
-# Per-call cap on opcode struct-logs (trace = "full"); 0 = unlimited. Bounds
-# trace memory when running arbitrary bytecode under a big energy budget; a
-# truncated trace is flagged with structLogsTruncated.
+# Per-call trace caps (trace = "full"/"callTree"); bound trace memory when
+# running arbitrary bytecode under a big energy budget. A truncated trace is
+# flagged (structLogsTruncated / callFramesTruncated). 0 = unlimited.
+#   max_struct_logs      — cap on the NUMBER of opcode logs.
+#   max_struct_log_bytes — BYTE budget for logs (each clones the ≤32 KiB EVM
+#                          stack, so the count cap alone doesn't bound memory).
+#   max_call_frames      — cap on retained CALL/CREATE tree frames.
 max_struct_logs = 100000
+max_struct_log_bytes = 134217728
+max_call_frames = 100000
 # Per-call wall-clock deadline in ms; 0 disables it (the default). The per-call
 # energy budget (energy_cap) is the DETERMINISTIC compute bound. Enabling this
 # preempts a runaway call but makes a call that trips it non-deterministic

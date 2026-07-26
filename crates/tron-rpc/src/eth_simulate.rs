@@ -90,7 +90,7 @@ pub fn eth_simulate_v1(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         let ov = bc.get("blockOverrides").and_then(Value::as_object);
         let number = match ov.and_then(|o| o.get("number")).and_then(Value::as_str) {
             Some(q) => parse_hex_quantity(q)? as i64,
-            None => prev_number + 1,
+            None => prev_number.saturating_add(1),
         };
         if number <= prev_number {
             return Err(RpcError::invalid_params(
@@ -99,7 +99,7 @@ pub fn eth_simulate_v1(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
         }
         let ts_ms = match ov.and_then(|o| o.get("time")).and_then(Value::as_str) {
             Some(q) => (parse_hex_quantity(q)? as i64).saturating_mul(1000),
-            None => prev_ts_ms + 3000,
+            None => prev_ts_ms.saturating_add(3000),
         };
         prev_number = number;
         prev_ts_ms = ts_ms;
