@@ -55,7 +55,7 @@ revm-context = { path = "crates/revm-context" }
 # Single source of truth for every tron-* crate; the four vendored revm-*
 # forks keep their upstream versions so they stay legible against the crates
 # they were forked from.
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 rust-version = "1.80"
 license = "LGPL-3.0-or-later"
