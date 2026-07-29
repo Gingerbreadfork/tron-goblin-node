@@ -131,11 +131,25 @@ fn check_transaction_permission_inner(
     let owner = extract_owner_address(contract, contract_type)?;
 
     // === 2. Pick the active permission. ===
-    let account = accounts
+    let permission = match accounts
         .get(&owner)
         .map_err(|_| PermissionError::OwnerAccountMissing)?
-        .ok_or(PermissionError::OwnerAccountMissing)?;
-    let permission = resolve_permission(&account, contract.permission_id, &owner)?;
+    {
+        Some(account) => resolve_permission(&account, contract.permission_id, &owner)?,
+        // java `TransactionCapsule.validateSignature`
+        // (TransactionCapsule.java:471-480): when the owner ACCOUNT does not
+        // exist, a default permission is synthesized — the owner permission
+        // for permission_id 0 (`AccountCapsule.getDefaultPermission`) and a
+        // default active permission for permission_id 2
+        // (`createDefaultActivePermission`, operations =
+        // ACTIVE_DEFAULT_OPERATIONS). Any other id fails with java's
+        // "permission isn't exit".
+        None => match contract.permission_id {
+            0 => default_permission(PermissionType::Owner, owner.as_bytes(), "owner"),
+            2 => default_active_permission(owner.as_bytes(), dyn_props),
+            n => return Err(PermissionError::PermissionIdNotFound(n)),
+        },
+    };
 
     if sigs.len() > permission.keys.len() {
         return Err(PermissionError::MoreSigsThanKeys {
@@ -457,6 +471,24 @@ fn default_permission(ty: PermissionType, owner: &[u8; 21], name: &str) -> Permi
         threshold: 1,
         parent_id: 0,
         operations: Vec::new(),
+        keys: vec![tron_proto::Key {
+            address: owner.to_vec(),
+            weight: 1,
+        }],
+    }
+}
+
+/// java `AccountCapsule.createDefaultActivePermission`: single owner key,
+/// weight 1, threshold 1, id 2, operations = the proposal-mutable
+/// `ACTIVE_DEFAULT_OPERATIONS` bitmap.
+fn default_active_permission(owner: &[u8; 21], dyn_props: &DynamicPropertiesStore) -> Permission {
+    Permission {
+        r#type: PermissionType::Active as i32,
+        id: 2,
+        permission_name: "active".to_string(),
+        threshold: 1,
+        parent_id: 0,
+        operations: tron_chainbase::active_default_operations(dyn_props),
         keys: vec![tron_proto::Key {
             address: owner.to_vec(),
             weight: 1,

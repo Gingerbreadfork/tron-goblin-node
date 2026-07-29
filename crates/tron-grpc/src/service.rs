@@ -785,8 +785,22 @@ impl Wallet for WalletService {
         let head = self.state.dyn_props.latest_block_header_number().unwrap_or(0);
         for n in (head.saturating_sub(SCAN_DEPTH)..=head).rev() {
             let Some(block) = block_by_num(&self.state, n) else { continue };
-            for tx in &block.transactions {
-                if tx_id(tx) == arr {
+            // Match by the stored wire-derived ids (verbatim row bytes) —
+            // a re-encode hash misses txs whose raw_data carries unknown
+            // fields prost drops. Falls back to the re-encode when the
+            // block-index row is missing.
+            let wire_ids = self
+                .state
+                .block_index
+                .get(n)
+                .ok()
+                .map(|bid| self.state.blocks.tx_ids_for(&bid, &block));
+            for (i, tx) in block.transactions.iter().enumerate() {
+                let tid = wire_ids
+                    .as_ref()
+                    .and_then(|v| v.get(i).copied())
+                    .unwrap_or_else(|| tx_id(tx));
+                if tid == arr {
                     return Ok(Response::new(tx.clone()));
                 }
             }

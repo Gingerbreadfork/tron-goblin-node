@@ -406,7 +406,12 @@ pub fn build_apply(
         .enumerate()
         .filter_map(|(i, tx)| {
             let raw_tx = tx.raw_data.as_ref()?;
-            let tx_id = tron_crypto::hash::sha256(&raw_tx.encode_to_vec());
+            // Authoritative tx id: the stored info's wire-derived id when
+            // present (same rule as the index extractor), else the
+            // re-encode hash — identical for canonical txs.
+            let tx_id = matcher
+                .positional_id(i)
+                .unwrap_or_else(|| tron_crypto::hash::sha256(&raw_tx.encode_to_vec()));
             let facts = tron_index::tx_facts(tx, &tx_id);
             let info = matcher.for_tx(&tx_id, i);
             let success = tx

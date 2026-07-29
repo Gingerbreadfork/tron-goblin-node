@@ -30,6 +30,15 @@ fn default_active_operations() -> Vec<u8> {
     v
 }
 
+/// The `operations` bitmap for a default active permission — java
+/// `DynamicPropertiesStore.getActiveDefaultOperations`, read from the
+/// proposal-mutable dynamic property with the mainnet bitmap as fallback.
+pub fn active_default_operations(dyn_props: &DynamicPropertiesStore) -> Vec<u8> {
+    dyn_props
+        .get_bytes(b"ACTIVE_DEFAULT_OPERATIONS")
+        .unwrap_or_else(default_active_operations)
+}
+
 /// Build the default `owner` + `active[id=2]` permission pair java attaches to
 /// a newly-created account when `ALLOW_MULTI_SIGN == 1`. Returns `None` when
 /// multisig is disabled (pre-activation / non-mainnet) — java's
@@ -67,9 +76,7 @@ pub fn default_account_permissions(
         permission_name: "active".to_string(),
         threshold: 1,
         parent_id: 0,
-        operations: dyn_props
-            .get_bytes(b"ACTIVE_DEFAULT_OPERATIONS")
-            .unwrap_or_else(default_active_operations),
+        operations: active_default_operations(dyn_props),
         keys: vec![key],
     };
     Some((owner_perm, vec![active_perm]))
@@ -121,9 +128,7 @@ pub fn set_default_witness_permission(account: &mut Account, dyn_props: &Dynamic
             permission_name: "active".to_string(),
             threshold: 1,
             parent_id: 0,
-            operations: dyn_props
-                .get_bytes(b"ACTIVE_DEFAULT_OPERATIONS")
-                .unwrap_or_else(default_active_operations),
+            operations: active_default_operations(dyn_props),
             keys: vec![key.clone()],
         });
     }

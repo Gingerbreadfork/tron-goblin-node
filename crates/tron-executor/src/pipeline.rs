@@ -57,7 +57,7 @@ use tron_chainbase::{
     UndoStoreId, WriteOp,
 };
 use tron_proto::Block;
-use tron_types::BlockId;
+use tron_types::{BlockId, TxWireInfo};
 
 use crate::{
     apply_timing, commit_drained, drain_block_session, execute_block_logic, BlockExecError,
@@ -269,7 +269,7 @@ impl ApplyPipeline {
         block: &Block,
         expected_parent: Option<BlockId>,
         config: &ExecConfig,
-        original_tx_sizes: Option<&[i64]>,
+        original_wire: Option<&[TxWireInfo]>,
     ) -> Result<BlockExecutionReport, BlockExecError> {
         let timing = apply_timing::enabled();
 
@@ -279,7 +279,7 @@ impl ApplyPipeline {
         let wrapped = session.as_state_backends();
         let t_exec = timing.then(Instant::now);
         let mut report =
-            execute_block_logic(&wrapped, block, expected_parent, config, original_tx_sizes)?;
+            execute_block_logic(&wrapped, block, expected_parent, config, original_wire)?;
         let exec_us = t_exec.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
 
         // 2) Drain on the applier thread: pre-images read through the

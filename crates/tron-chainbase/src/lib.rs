@@ -39,7 +39,8 @@ pub use convert::{
 pub use fee::dispose_fee_to_blackhole;
 pub use pending_overlay::PendingOverlay;
 pub use permissions::{
-    apply_default_account_permissions, default_account_permissions, set_default_witness_permission,
+    active_default_operations, apply_default_account_permissions, default_account_permissions,
+    set_default_witness_permission,
 };
 pub use rocksdb_backend::{
     rocksdb_tuning, set_block_cache_bytes, RocksDbBackend, RocksDbError, RocksdbTuning,

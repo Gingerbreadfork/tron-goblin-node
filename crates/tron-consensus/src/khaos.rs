@@ -57,6 +57,13 @@ use tron_types::{block_id_from_block, BlockId};
 /// returns `None`. This matches java-tron's `WeakReference<KhaosBlock>`.
 pub struct KhaosBlock {
     pub block: Block,
+    /// The block's ORIGINAL wire bytes, when it entered via
+    /// [`KhaosDb::push_with_raw`]. A fork-switch re-applies branch blocks
+    /// from this cache; the raw bytes let that re-apply derive each tx's
+    /// original wire size and wire tx id (both of which a prost re-encode
+    /// of `block` can silently normalize). `None` for seeded heads and
+    /// in-memory pushes — consumers fall back to the re-encode.
+    pub raw: Option<Vec<u8>>,
     pub id: BlockId,
     pub num: i64,
     parent: Mutex<Weak<KhaosBlock>>,
@@ -67,10 +74,16 @@ impl KhaosBlock {
     /// block has a populated `block_header.raw_data` — otherwise this
     /// returns `None`.
     pub fn new(block: Block) -> Option<Arc<Self>> {
+        Self::new_with_raw(block, None)
+    }
+
+    /// [`KhaosBlock::new`], retaining the block's original wire bytes.
+    pub fn new_with_raw(block: Block, raw: Option<Vec<u8>>) -> Option<Arc<Self>> {
         let id = block_id_from_block(&block).ok()?;
         let num = id.num() as i64;
         Some(Arc::new(Self {
             block,
+            raw,
             id,
             num,
             parent: Mutex::new(Weak::new()),
@@ -293,16 +306,18 @@ impl KhaosDb {
         self.push_with_raw(block, None)
     }
 
-    /// [`KhaosDb::push`], carrying the block's original wire bytes; they are
-    /// retained ONLY if the block is stashed as an orphan (no copy on the
-    /// common linked path) and handed back by
+    /// [`KhaosDb::push`], carrying the block's original wire bytes. They ride
+    /// on the [`KhaosBlock`] itself (so a later fork-switch can re-apply the
+    /// branch byte-exactly — see [`KhaosBlock::raw`]) and, for a block stashed
+    /// as an orphan, are additionally handed back by
     /// [`KhaosDb::take_orphans_waiting_on`] for a byte-exact re-acceptance.
     pub fn push_with_raw(
         &self,
         block: Block,
         raw: Option<&[u8]>,
     ) -> Result<PushOutcome, PushError> {
-        let kblock = KhaosBlock::new(block).ok_or(PushError::Malformed)?;
+        let kblock = KhaosBlock::new_with_raw(block, raw.map(|r| r.to_vec()))
+            .ok_or(PushError::Malformed)?;
         let mut g = self.inner.lock().unwrap();
 
         // Dedup on the LINKED store only (java `containBlockInMiniStore`): a
@@ -966,6 +981,34 @@ mod tests {
             Some(raw.as_slice()),
             "original wire bytes must round-trip through take"
         );
+    }
+
+    #[test]
+    fn linked_push_retains_raw_bytes_on_the_khaos_block() {
+        // A LINKED block keeps its wire bytes on the KhaosBlock so a later
+        // fork-switch re-applies the branch from the original encoding.
+        let db = KhaosDb::new();
+        let g = mk_block(1, [0u8; 32], 0);
+        let mut g_bytes = [0u8; 32];
+        g_bytes.copy_from_slice(&id_of(&g).as_bytes()[..]);
+        db.start(g).unwrap();
+
+        let b2 = mk_block(2, g_bytes, 0);
+        let id_b2 = id_of(&b2);
+        let raw = vec![0x01, 0x02, 0x03];
+        db.push_with_raw(b2, Some(&raw[..])).unwrap();
+        assert_eq!(
+            db.get(&id_b2).unwrap().raw.as_deref(),
+            Some(raw.as_slice()),
+            "linked block must retain its original wire bytes"
+        );
+        // A plain push (no raw) leaves the field empty.
+        let mut b2_bytes = [0u8; 32];
+        b2_bytes.copy_from_slice(&id_b2.as_bytes()[..]);
+        let b3 = mk_block(3, b2_bytes, 0);
+        let id_b3 = id_of(&b3);
+        db.push(b3).unwrap();
+        assert_eq!(db.get(&id_b3).unwrap().raw, None);
     }
 
     #[test]

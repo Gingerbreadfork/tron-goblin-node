@@ -52,12 +52,31 @@ pub fn recover_signer_address(transaction: &Transaction) -> Result<Address, Sign
 
 /// Recover all signers (one per attached signature). Order matches the
 /// `signature` field. Useful for multi-sig validation.
+///
+/// The recovery preimage is the prost re-encode tx id ([`tx_id`]), which
+/// silently drops unknown `raw_data` fields the original wire bytes may
+/// have carried. When the original bytes (or a wire-derived id) are
+/// available, use [`recover_all_signers_with_id`] instead — java-tron
+/// verifies signatures against `sha256(getRawData().toByteArray())`,
+/// which preserves those bytes.
 pub fn recover_all_signers(transaction: &Transaction) -> Result<Vec<Address>, SignError> {
     let id = tx_id(transaction).map_err(SignError::TxId)?;
+    recover_all_signers_with_id(transaction, &id)
+}
+
+/// [`recover_all_signers`] against a caller-supplied transaction id —
+/// the signing preimage. Callers holding the transaction's ORIGINAL
+/// wire bytes derive `id` via [`crate::tx_id_from_tx_bytes`] so the
+/// recovery preimage matches java byte-for-byte even when `raw_data`
+/// carries unknown fields a prost re-encode would drop.
+pub fn recover_all_signers_with_id(
+    transaction: &Transaction,
+    id: &[u8; 32],
+) -> Result<Vec<Address>, SignError> {
     let mut out = Vec::with_capacity(transaction.signature.len());
     for sig_bytes in &transaction.signature {
         let sig = RecoverableSignature::from_bytes(sig_bytes).map_err(SignError::Sig)?;
-        let pubkey = sig.recover_uncompressed_pubkey(&id).map_err(SignError::Sig)?;
+        let pubkey = sig.recover_uncompressed_pubkey(id).map_err(SignError::Sig)?;
         out.push(Address::from_uncompressed_pubkey(&pubkey).map_err(|e| SignError::Address(e.to_string()))?);
     }
     Ok(out)
@@ -81,4 +100,55 @@ pub enum SignError {
 pub fn clone_transaction(t: &Transaction) -> Transaction {
     let bytes = t.encode_to_vec();
     Transaction::decode(bytes.as_slice()).expect("re-decoding our own encoding")
+}
+
+#[cfg(test)]
+mod preimage_tests {
+    use super::*;
+    use tron_crypto::signature::RecoverableSignature;
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// Real mainnet vector — a DelegateResourceContract whose raw_data ends
+    /// with an unknown varint field (`a0 01 03`). The same signature recovers
+    /// the permission's key over the id of the ORIGINAL raw_data bytes, but a
+    /// different (garbage) address over the id of the prost re-encode that
+    /// drops the field.
+    #[test]
+    fn recovery_preimage_decides_the_signer_mainnet_vector() {
+        let sig_bytes = hex::decode(
+            "61d4e42c1d985ee6bbc734f5832539056334a013b520a254c9761141d2c9bdd9\
+             21473b744cc97cb1d93402151b9dfbab38a8361e13704f32865f4731ac30e5b5\
+             01",
+        )
+        .unwrap();
+        let sig = RecoverableSignature::from_bytes(&sig_bytes).unwrap();
+
+        // sha256(original raw_data) — the REAL mainnet txID.
+        let wire_id = hex32("d8c3ccf62767660c560fb179f60e1b7978474c2ef80976703bd29a9bc05fc714");
+        // sha256(raw_data with the 3 trailing unknown bytes dropped) — the
+        // prost re-encode id.
+        let reencode_id = hex32("1021e5a8a62f5d98a429d42e3a65d52b1a2ec1a55c479a83c11a518bdcc12bc2");
+
+        let addr_for = |id: &[u8; 32]| {
+            let pk = sig.recover_uncompressed_pubkey(id).unwrap();
+            Address::from_uncompressed_pubkey(&pk).unwrap()
+        };
+        // Original-bytes preimage → the permission's actual key (java SUCCESS).
+        assert_eq!(
+            hex::encode(addr_for(&wire_id).as_bytes()),
+            "414cde0d40b465ed8c1cf95e2bdca990c74b3562be"
+        );
+        // Re-encode preimage → a different (garbage) signer. Only the prefix
+        // is pinned; the inequality is the point.
+        let bogus = addr_for(&reencode_id);
+        assert_ne!(bogus.as_bytes()[..], addr_for(&wire_id).as_bytes()[..]);
+        assert_eq!(&bogus.as_bytes()[..4], &[0x41, 0x07, 0xbf, 0x0c]);
+    }
 }

@@ -36,6 +36,7 @@ use tron_chainbase::dynamic_properties_keys;
 use tron_chainbase::KvBackend;
 use tron_crypto::address::Address;
 use tron_proto::Transaction;
+use tron_types::TxWireInfo;
 
 use crate::resource::increase_default;
 use crate::{execute_one_tx_versioned, ExecConfig, StateBackends, TxResult};
@@ -391,7 +392,7 @@ pub(crate) fn execute_block_parallel(
     now_slot: i64,
     head_block_time_ms: i64,
     signers: &[Result<Vec<Address>, String>],
-    original_tx_sizes: Option<&[i64]>,
+    original_wire: Option<&[TxWireInfo]>,
 ) -> Option<Vec<TxResult>> {
     let n = txs.len();
     let mv = Arc::new(MvMemory::new());
@@ -448,7 +449,7 @@ pub(crate) fn execute_block_parallel(
             now_slot,
             head_block_time_ms,
             &signers[i],
-            original_tx_sizes.and_then(|s| s.get(i).copied()),
+            original_wire.and_then(|s| s.get(i).copied()),
         );
         // Publish the EFFECTIVE write-set (no-op read-modify-writes dropped —
         // e.g. the zero-address beneficiary `+= 0`) so idempotent writes don't

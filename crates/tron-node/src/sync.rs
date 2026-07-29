@@ -57,8 +57,8 @@ use tron_net::{
 };
 use tron_proto::{Block, Endpoint};
 use tron_types::{
-    block_id_from_block, genesis_block_id, mainnet_inputs, tx_sizes_from_block_bytes,
-    verify_tx_trie_root, verify_tx_trie_root_raw, verify_witness_signature, BlockId,
+    block_id_from_block, genesis_block_id, mainnet_inputs, tx_wire_infos_from_block_bytes,
+    verify_tx_trie_root, verify_tx_trie_root_raw, verify_witness_signature, BlockId, TxWireInfo,
 };
 
 use crate::logfmt;
@@ -5020,19 +5020,22 @@ impl SyncDriver {
         // entries and would otherwise spuriously fail the merkle). In-memory
         // callers (tests / SR runtime) leave it `None` and fall back to the
         // decoded check, which is exact for their canonically-encoded blocks.
-        // Capture each tx's ORIGINAL wire size from the same raw bytes the
-        // txTrieRoot check uses, so the bandwidth charge matches java's
-        // getSerializedSize (#9 — prost's canonical re-encode drops non-standard
-        // Transaction-level bytes java keeps). In-memory callers (None) carry
-        // prost-canonical blocks and fall back to the prost size downstream.
+        // Capture each tx's ORIGINAL wire facts (size + wire tx id) from the
+        // same raw bytes the txTrieRoot check uses, so the bandwidth charge
+        // matches java's getSerializedSize AND the tx id / signature-
+        // recovery preimage matches java's sha256(getRawData().toByteArray())
+        // even when raw_data carries unknown fields prost's canonical
+        // re-encode drops. In-memory callers (None) carry prost-canonical
+        // blocks and fall back to the prost-derived values downstream.
         // `raw_opt` is retained through the fn so it can also be handed to
-        // `khaos.push_with_raw` — a block stashed as an orphan keeps its wire
-        // bytes for a byte-exact re-acceptance once its parent links.
+        // `khaos.push_with_raw` — the fork tree keeps the wire bytes both for
+        // a byte-exact orphan re-acceptance and for byte-exact fork-switch
+        // re-applies.
         let raw_opt = self.pending_raw_block.take();
-        let (trie_check, original_tx_sizes) = match raw_opt.as_deref() {
+        let (trie_check, original_wire) = match raw_opt.as_deref() {
             Some(raw) => (
                 verify_tx_trie_root_raw(block, raw),
-                tx_sizes_from_block_bytes(raw),
+                tx_wire_infos_from_block_bytes(raw),
             ),
             None => (verify_tx_trie_root(block), None),
         };
@@ -5307,7 +5310,15 @@ impl SyncDriver {
         // below for a clean head extension, and in `perform_reorg*` for a
         // block promoted by a fork switch.
         let block_store = BlockStore::new(self.blocks_backend.clone());
-        if let Err(e) = block_store.put(&id, block) {
+        // Store the ORIGINAL wire bytes verbatim when we have them (java
+        // `BlockCapsule.getData()` semantics) — a prost re-encode would
+        // normalize unknown-field/non-canonical bytes, losing the exact
+        // per-tx encodings later raw reads (tx ids, sizes, dumps) rely on.
+        let put_res = match raw_opt.as_deref() {
+            Some(raw) => block_store.put_raw(&id, raw),
+            None => block_store.put(&id, block),
+        };
+        if let Err(e) = put_res {
             // The block was linked into khaos above; a store failure must
             // remove it so a re-delivery re-attempts instead of being
             // short-circuited by the `contains_in_linked → AlreadyKnown` dedup
@@ -5427,7 +5438,7 @@ impl SyncDriver {
             // Pass the authoritative executed head (not the stream-hint
             // `prev_id`) as the expected parent — `needs_reorg == false`
             // already established this block extends `executed_head`.
-            return self.execute_under_snapshot(block, id, executed_head);
+            return self.execute_under_snapshot(block, id, executed_head, original_wire.as_deref());
         }
 
         // Catch-up fast path: while the block we're applying is well
@@ -5464,7 +5475,7 @@ impl SyncDriver {
             .and(self.pipeline.as_mut());
         let exec_result = match (pipeline, &self.undo_store, &self.checkpoint) {
             (Some(pipeline), Some(_), Some(_)) => {
-                pipeline.apply(block, executed_head, &exec_config, original_tx_sizes.as_deref())
+                pipeline.apply(block, executed_head, &exec_config, original_wire.as_deref())
             }
             (_, Some(undo), Some(cp)) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                 &self.state,
@@ -5473,7 +5484,7 @@ impl SyncDriver {
                 undo,
                 cp,
                 &self.exec_config,
-                original_tx_sizes.as_deref(),
+                original_wire.as_deref(),
             ),
             (_, Some(undo), None) => tron_executor::execute_block_with_undo_and_config(
                 &self.state,
@@ -5481,13 +5492,14 @@ impl SyncDriver {
                 executed_head,
                 undo,
                 &self.exec_config,
-                original_tx_sizes.as_deref(),
+                original_wire.as_deref(),
             ),
-            (_, None, _) => tron_executor::execute_block_with_config(
+            (_, None, _) => tron_executor::execute_block_with_config_and_wire(
                 &self.state,
                 block,
                 executed_head,
                 &self.exec_config,
+                original_wire.as_deref(),
             ),
         };
         match exec_result {
@@ -5504,7 +5516,7 @@ impl SyncDriver {
                 self.emit_block_events(block, &id, &report);
                 self.publish_block_to_pubsub(block, &id, &report);
                 self.notify_index(block, &id, &report);
-                self.drop_included_txs_from_mempool(block);
+                self.drop_included_txs_from_mempool(&report);
                 AcceptOutcome::Accepted(id)
             }
             Err(e) => {
@@ -5544,6 +5556,7 @@ impl SyncDriver {
         block: &Block,
         id: BlockId,
         prev_id: Option<BlockId>,
+        original_wire: Option<&[TxWireInfo]>,
     ) -> AcceptOutcome {
         let stack = self
             .snapshot_stack
@@ -5556,8 +5569,14 @@ impl SyncDriver {
         let state = &self.state;
         let exec_config = &self.exec_config;
         let result = stack.apply_block(block_num, || {
-            tron_executor::execute_block_with_config(state, block, prev_id, exec_config)
-                .map_err(|e| format!("{e:?}"))
+            tron_executor::execute_block_with_config_and_wire(
+                state,
+                block,
+                prev_id,
+                exec_config,
+                original_wire,
+            )
+            .map_err(|e| format!("{e:?}"))
         });
         match result {
             Ok(report) => {
@@ -5571,7 +5590,7 @@ impl SyncDriver {
                 self.emit_block_events(block, &id, &report);
                 self.publish_block_to_pubsub(block, &id, &report);
                 self.notify_index(block, &id, &report);
-                self.drop_included_txs_from_mempool(block);
+                self.drop_included_txs_from_mempool(&report);
                 AcceptOutcome::Accepted(id)
             }
             Err(e) => {
@@ -5651,6 +5670,12 @@ impl SyncDriver {
             .iter()
             .map(|kb| if kb.id == new_block_id { new_block } else { &kb.block })
             .collect();
+        // Per-block ORIGINAL wire facts from the fork tree's retained bytes
+        // (see the matching derivation in `perform_reorg`).
+        let new_wire: Vec<Option<Vec<TxWireInfo>>> = new_oldest_first
+            .iter()
+            .map(|kb| kb.raw.as_deref().and_then(tx_wire_infos_from_block_bytes))
+            .collect();
         let state = &self.state;
         let exec_config = &self.exec_config;
         let path_old_for_repush = &path_old;
@@ -5666,11 +5691,12 @@ impl SyncDriver {
             // that the coordinator has just `advance`d.
             |block_num, idx| {
                 let block_to_apply = new_blocks[idx];
-                tron_executor::execute_block_with_config(
+                tron_executor::execute_block_with_config_and_wire(
                     state,
                     block_to_apply,
                     None,
                     exec_config,
+                    new_wire[idx].as_deref(),
                 )
                 .map_err(|e| format!("block {block_num}: {e:?}"))
             },
@@ -5697,7 +5723,7 @@ impl SyncDriver {
                     self.emit_block_events(block_to_apply, &block_id, report);
                     self.publish_block_to_pubsub(block_to_apply, &block_id, report);
                     self.notify_index(block_to_apply, &block_id, report);
-                    self.drop_included_txs_from_mempool(block_to_apply);
+                    self.drop_included_txs_from_mempool(report);
                 }
                 // Repoint num → id at the new canonical branch (side-fork
                 // blocks never indexed themselves).
@@ -5818,15 +5844,17 @@ impl SyncDriver {
     /// rationale, applied to the inbound (sync) side.
     ///
     /// No-op when no mempool is attached.
-    fn drop_included_txs_from_mempool(&self, block: &Block) {
+    fn drop_included_txs_from_mempool(&self, report: &tron_executor::BlockExecutionReport) {
         let Some(mempool) = self.mempool.as_ref() else {
             return;
         };
-        use prost::Message as _;
-        for tx in &block.transactions {
-            if let Some(raw) = &tx.raw_data {
-                let id = tron_crypto::hash::sha256(&raw.encode_to_vec());
-                mempool.remove(&id);
+        // The executor's per-tx ids are wire-derived (sha256 of each tx's
+        // ORIGINAL raw_data span) — the same ids the pool keys by, so removal
+        // matches even for txs whose raw_data carries unknown fields a prost
+        // re-encode would drop. All-zero ids mark structurally-empty txs.
+        for r in &report.tx_results {
+            if r.tx_id != [0u8; 32] {
+                mempool.remove(&r.tx_id);
             }
         }
         // Age out stale/expired pending txs on every applied block (java runs
@@ -5862,16 +5890,41 @@ impl SyncDriver {
         let mut block_count = 0usize;
         for kb in reverted_blocks {
             block_count += 1;
-            for tx in &kb.block.transactions {
+            // Re-push each tx's ORIGINAL wire bytes when the fork tree
+            // retained the block's encoding — a prost re-encode of the
+            // decoded tx normalizes away unknown raw_data fields, mutating
+            // the signed bytes (peers verify the signature over the original
+            // preimage and would reject the altered relay). Falls back to
+            // the re-encode when no raw bytes were retained.
+            let spans = kb
+                .raw
+                .as_deref()
+                .and_then(tron_types::tx_spans_from_block_bytes)
+                .filter(|s| s.len() == kb.block.transactions.len());
+            for (i, tx) in kb.block.transactions.iter().enumerate() {
                 total += 1;
+                let span = spans.as_ref().map(|s| s[i]);
                 // The reverted block is no longer canonical: forget its
                 // recent-inclusion record so these txs can be re-admitted.
-                if let Some(rd) = tx.raw_data.as_ref() {
-                    let id = tron_crypto::hash::sha256(&rd.encode_to_vec());
+                let id = span
+                    .and_then(tron_types::tx_id_from_tx_bytes)
+                    .or_else(|| {
+                        tx.raw_data
+                            .as_ref()
+                            .map(|rd| tron_crypto::hash::sha256(&rd.encode_to_vec()))
+                    });
+                if let Some(id) = id {
                     mempool.forget_included(&id);
                 }
-                let raw = tx.encode_to_vec();
-                match mempool.submit_local(&raw) {
+                let reencoded;
+                let raw: &[u8] = match span {
+                    Some(s) => s,
+                    None => {
+                        reencoded = tx.encode_to_vec();
+                        &reencoded
+                    }
+                };
+                match mempool.submit_local(raw) {
                     Ok(_) => accepted += 1,
                     Err(MempoolError::Duplicate) => {
                         // Already in pending — fine; the next block
@@ -6596,6 +6649,11 @@ impl SyncDriver {
             } else {
                 &kb.block
             };
+            // The fork tree retained each branch block's ORIGINAL wire bytes
+            // (khaos push_with_raw), so the re-apply derives per-tx wire ids +
+            // sizes exactly like the first-acceptance path. `None` (seeded or
+            // in-memory blocks) falls back to prost-derived values.
+            let wire = kb.raw.as_deref().and_then(tx_wire_infos_from_block_bytes);
             let apply_res = match &self.checkpoint {
                 Some(cp) => tron_executor::execute_block_with_undo_checkpoint_and_config(
                     &self.state,
@@ -6604,7 +6662,7 @@ impl SyncDriver {
                     &undo_store,
                     cp,
                     &self.exec_config,
-                    None,
+                    wire.as_deref(),
                 ),
                 None => tron_executor::execute_block_with_undo_and_config(
                     &self.state,
@@ -6612,7 +6670,7 @@ impl SyncDriver {
                     None,
                     &undo_store,
                     &self.exec_config,
-                    None,
+                    wire.as_deref(),
                 ),
             };
             match apply_res {
@@ -6632,7 +6690,7 @@ impl SyncDriver {
                         tron_types::block_id_from_block(block_to_apply).unwrap_or(kb.id);
                     self.publish_block_to_pubsub(block_to_apply, &block_id, &report);
                     self.notify_index(block_to_apply, &block_id, &report);
-                    self.drop_included_txs_from_mempool(block_to_apply);
+                    self.drop_included_txs_from_mempool(&report);
                 }
                 Err(e) => {
                     // Mid-reorg failure recovery (mirrors java-tron's
@@ -6669,6 +6727,9 @@ impl SyncDriver {
                     let mut reapplied = 0usize;
                     let mut reapply_failed = None;
                     for old_kb in path_old.iter().rev() {
+                        // Same wire-facts threading as the forward apply above.
+                        let wire =
+                            old_kb.raw.as_deref().and_then(tx_wire_infos_from_block_bytes);
                         let reapply_res = match &self.checkpoint {
                             Some(cp) => {
                                 tron_executor::execute_block_with_undo_checkpoint_and_config(
@@ -6678,7 +6739,7 @@ impl SyncDriver {
                                     &undo_store,
                                     cp,
                                     &self.exec_config,
-                                    None,
+                                    wire.as_deref(),
                                 )
                             }
                             None => tron_executor::execute_block_with_undo_and_config(
@@ -6687,7 +6748,7 @@ impl SyncDriver {
                                 None,
                                 &undo_store,
                                 &self.exec_config,
-                                None,
+                                wire.as_deref(),
                             ),
                         };
                         match reapply_res {

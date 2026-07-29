@@ -566,6 +566,11 @@ impl SrRuntime {
         )
         .map(|b| b.encoded_len())
         .unwrap_or(0);
+        // Pool ids of the txs we pack — removal below uses these directly:
+        // the pool keys by the WIRE tx id (original raw_data bytes), which
+        // for a tx that carried unknown fields differs from a re-hash of
+        // the decoded tx we assemble into the block.
+        let mut included_ids: Vec<[u8; 32]> = Vec::new();
         for id in pending_ids.iter().take(self.max_txs_per_block) {
             if let Some(p) = self.mempool.get(id) {
                 let pack_size = tron_consensus::tx_pack_size(p.tx.encoded_len());
@@ -574,6 +579,7 @@ impl SrRuntime {
                 }
                 current_size += pack_size;
                 txs.push(p.tx);
+                included_ids.push(*id);
             }
         }
         let _tx_count = txs.len();
@@ -697,13 +703,11 @@ impl SrRuntime {
         };
 
         // Remove the txs we just included from the mempool so they
-        // don't get re-broadcast.
-        for tx in &block.transactions {
-            if let Some(raw) = &tx.raw_data {
-                use prost::Message as _;
-                let id = tron_crypto::hash::sha256(&raw.encode_to_vec());
-                self.mempool.remove(&id);
-            }
+        // don't get re-broadcast — by the pool ids we drained them under
+        // (the wire tx ids), not a re-hash of the assembled block's
+        // decoded txs.
+        for id in &included_ids {
+            self.mempool.remove(id);
         }
 
         // Publish the newly-produced block to WebSocket

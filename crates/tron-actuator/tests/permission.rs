@@ -530,3 +530,88 @@ fn resolve_returns_not_found_when_no_active_has_matching_id() {
     .unwrap_err();
     assert!(matches!(err, PermissionError::PermissionIdNotFound(3)));
 }
+
+// === Missing owner ACCOUNT: java synthesizes a default permission ===
+//
+// java `TransactionCapsule.validateSignature` (TransactionCapsule.java:471-480):
+// when the owner account does not exist, permission_id 0 gets
+// `AccountCapsule.getDefaultPermission` (default owner permission) and
+// permission_id 2 gets `createDefaultActivePermission` (operations =
+// ACTIVE_DEFAULT_OPERATIONS); any other id fails ("permission isn't exit").
+
+#[test]
+fn missing_account_permission_id_0_accepts_owner_signature() {
+    let accounts = AccountStore::new(mem()); // ALICE not present
+    let dp = DynamicPropertiesStore::new(mem());
+    let mut tx = make_transfer_tx(ALICE, BOB, 0);
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
+    let contract = tx.raw_data.as_ref().unwrap().contract[0].clone();
+    check_transaction_permission(
+        &accounts,
+        &dp,
+        &tx,
+        &contract,
+        ContractType::TransferContract,
+    )
+    .expect("missing account + permission_id 0 must synthesize the default owner permission");
+}
+
+#[test]
+fn missing_account_permission_id_0_still_rejects_wrong_signer() {
+    let accounts = AccountStore::new(mem()); // ALICE not present
+    let dp = DynamicPropertiesStore::new(mem());
+    let mut tx = make_transfer_tx(ALICE, BOB, 0);
+    tron_types::sign_transaction(&mut tx, &BOB_PRIV).unwrap(); // not the owner
+    let contract = tx.raw_data.as_ref().unwrap().contract[0].clone();
+    let err = check_transaction_permission(
+        &accounts,
+        &dp,
+        &tx,
+        &contract,
+        ContractType::TransferContract,
+    )
+    .unwrap_err();
+    assert!(matches!(err, PermissionError::SignerNotInPermission(_)));
+}
+
+#[test]
+fn missing_account_permission_id_2_uses_default_active_permission() {
+    let accounts = AccountStore::new(mem()); // ALICE not present
+    let dp = DynamicPropertiesStore::new(mem());
+    // The mainnet-fallback ACTIVE_DEFAULT_OPERATIONS bitmap allows
+    // TransferContract (bit 1), so the owner's signature passes.
+    let mut tx = make_transfer_tx(ALICE, BOB, 2);
+    tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
+    let contract = tx.raw_data.as_ref().unwrap().contract[0].clone();
+    check_transaction_permission(
+        &accounts,
+        &dp,
+        &tx,
+        &contract,
+        ContractType::TransferContract,
+    )
+    .expect("missing account + permission_id 2 must synthesize the default active permission");
+}
+
+#[test]
+fn missing_account_other_permission_ids_are_rejected() {
+    let accounts = AccountStore::new(mem()); // ALICE not present
+    let dp = DynamicPropertiesStore::new(mem());
+    for pid in [1, 3] {
+        let mut tx = make_transfer_tx(ALICE, BOB, pid);
+        tron_types::sign_transaction(&mut tx, &ALICE_PRIV).unwrap();
+        let contract = tx.raw_data.as_ref().unwrap().contract[0].clone();
+        let err = check_transaction_permission(
+            &accounts,
+            &dp,
+            &tx,
+            &contract,
+            ContractType::TransferContract,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PermissionError::PermissionIdNotFound(p) if p == pid),
+            "pid {pid}: got {err:?}"
+        );
+    }
+}

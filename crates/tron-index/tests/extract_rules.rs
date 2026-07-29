@@ -540,3 +540,54 @@ fn count_block_txs_raw_matches_decoded() {
     assert_eq!(tron_index::extract::count_block_txs_raw(&bytes), 3);
     assert_eq!(tron_index::extract::count_block_txs_raw(&[]), 0);
 }
+
+#[test]
+fn stored_info_id_overrides_the_reencode_hash_for_row_keys() {
+    // A tx whose raw_data carried an unknown field on the wire is indexed
+    // under its STORED info id (the executor's wire-derived id), not the
+    // re-encode hash of the decoded tx — otherwise every row for it would
+    // be keyed under an id nobody looks up.
+    let c = tron_proto::TransferContract {
+        owner_address: addr(1).to_vec(),
+        to_address: addr(2).to_vec(),
+        amount: 7,
+    };
+    let tx = tx_with(ContractType::TransferContract, c.encode_to_vec());
+    let block = block_of(vec![tx.clone()]);
+
+    let wire_id = [0xEEu8; 32]; // the executor's authoritative id
+    let ret = tron_proto::TransactionRet {
+        transactioninfo: vec![tron_proto::TransactionInfo {
+            id: wire_id.to_vec(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let entries = extract_block(100, &block, Some(&ret), &caps_all());
+    let native_txids: Vec<Vec<u8>> = entries
+        .puts
+        .iter()
+        .filter(|(k, _)| k[0] == keys::NS_NATIVE)
+        .map(|(_, v)| NativeRow::decode(v.as_slice()).unwrap().txid)
+        .collect();
+    assert!(!native_txids.is_empty());
+    for txid in &native_txids {
+        assert_eq!(txid.as_slice(), wire_id.as_slice());
+    }
+
+    // Without a stored info the extractor still falls back to the
+    // re-encode hash (identical for canonical txs).
+    let reencode_id = tron_crypto::hash::sha256(
+        &tx.raw_data.as_ref().unwrap().encode_to_vec(),
+    );
+    let entries = extract_block(100, &block, None, &caps_all());
+    let native_txids: Vec<Vec<u8>> = entries
+        .puts
+        .iter()
+        .filter(|(k, _)| k[0] == keys::NS_NATIVE)
+        .map(|(_, v)| NativeRow::decode(v.as_slice()).unwrap().txid)
+        .collect();
+    for txid in &native_txids {
+        assert_eq!(txid.as_slice(), reencode_id.as_slice());
+    }
+}

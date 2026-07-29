@@ -382,16 +382,26 @@ impl TxMempool {
             }
         }
 
+        // Transaction id = sha256 of the SUBMITTED raw_data wire bytes (java
+        // `TransactionCapsule.getRawHash` retains unknown protobuf fields the
+        // prost re-encode drops), so the pool keys, relays and dedups this tx
+        // under the id the rest of the network uses. Falls back to the
+        // re-encode id only when the wire walk fails — identical for
+        // canonical txs.
+        let tx_id = match tron_types::tx_id_from_tx_bytes(raw) {
+            Some(id) => id,
+            None => tron_types::tx_id(&tx)
+                .map_err(|e| MempoolError::Decode(format!("tx_id: {e:?}")))?,
+        };
+
         // Recover at least one signer to ensure the signature bytes
-        // are well-formed and recoverable. Doesn't check the signer
-        // is in any permission — that's an actuator-layer concern.
-        let signers = tron_types::recover_all_signers(&tx)
+        // are well-formed and recoverable, against the SAME preimage
+        // (the wire tx id) the network verifies. Doesn't check the
+        // signer is in any permission — that's an actuator-layer concern.
+        let signers = tron_types::recover_all_signers_with_id(&tx, &tx_id)
             .map_err(|e| MempoolError::BadSignature(e.to_string()))?;
         // Primary signer keys the per-sender cap below.
         let sender = signers.first().map(|a| *a.as_bytes());
-
-        let tx_id = tron_types::tx_id(&tx)
-            .map_err(|e| MempoolError::Decode(format!("tx_id: {e:?}")))?;
 
         // Dup check first — cheap and avoids running the (potentially
         // expensive) state-aware validator on a tx we'd reject anyway.
@@ -813,6 +823,78 @@ mod tests {
         a[0] = 0x41;
         a[1..].copy_from_slice(&h[12..]);
         a
+    }
+
+    /// `tag(field,wiretype=2) || varint(len) || payload`.
+    fn ld_field(field_num: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(field_num << 3) | 2];
+        let mut len = payload.len() as u64;
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if len == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn submit_keys_tx_by_original_wire_id_when_raw_data_has_unknown_fields() {
+        // The energy-rental builder pattern: a canonical raw_data with an
+        // unknown varint field (field 20, `a0 01 03`) appended. java keys the
+        // tx (and verifies its signature) over the ORIGINAL bytes; the pool
+        // must do the same so relay/dedup/removal agree with the network.
+        let owner = derive_address(&PRIV);
+        let tc = TransferContract {
+            owner_address: owner.to_vec(),
+            to_address: vec![0x41; 21],
+            amount: 5,
+        };
+        let raw = TxRaw {
+            contract: vec![TxContract {
+                r#type: ContractType::TransferContract as i32,
+                parameter: Some(prost_types::Any {
+                    type_url: "type.googleapis.com/protocol.TransferContract".into(),
+                    value: tc.encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            expiration: now_ms() + 600_000,
+            timestamp: now_ms(),
+            ..Default::default()
+        };
+        let mut raw_bytes = raw.encode_to_vec();
+        raw_bytes.extend_from_slice(&[0xa0, 0x01, 0x03]); // unknown field 20
+
+        // Sign over the WIRE id — what the network's builders do.
+        let wire_id = tron_crypto::hash::sha256(&raw_bytes);
+        let sig = tron_crypto::signature::RecoverableSignature::sign_prehash(&PRIV, &wire_id)
+            .unwrap();
+        let tx_wire = [
+            ld_field(1, &raw_bytes),
+            ld_field(2, &sig.to_bytes().to_vec()),
+        ]
+        .concat();
+
+        let m = TxMempool::new(MempoolConfig::default());
+        let id = m.submit(&tx_wire).expect("wire tx with unknown field admits");
+        assert_eq!(id, wire_id, "pool must key the tx under the wire id");
+
+        // The prost re-encode id differs — the id nobody looks up.
+        let decoded = Transaction::decode(tx_wire.as_slice()).unwrap();
+        assert_ne!(id, tron_types::tx_id(&decoded).unwrap());
+
+        // Lookup + removal by the REAL id work; the original bytes are what
+        // gets relayed.
+        let pending = m.get(&wire_id).expect("lookup by wire id");
+        assert_eq!(pending.raw_bytes, tx_wire);
+        assert!(m.remove(&wire_id));
     }
 
     #[test]

@@ -502,6 +502,24 @@ impl<'a> TxInfoMatcher<'a> {
             .and_then(|r| r.transactioninfo.get(txidx))
             .filter(|info| info.id.is_empty())
     }
+
+    /// The stored id of the info at block position `txidx`, when present
+    /// and well-formed (32 bytes). `TransactionRet` rows are written 1:1
+    /// in block order (both by our apply hook and by java), and the
+    /// stored id is the executor's WIRE-derived tx id — sha256 of the
+    /// tx's original `raw_data` bytes — which is the authoritative id
+    /// even when a prost re-encode of the decoded tx would hash
+    /// differently (unknown raw_data fields). Callers prefer this over
+    /// recomputing the id from a decoded tx.
+    pub fn positional_id(&self, txidx: usize) -> Option<[u8; 32]> {
+        let info = self.ret?.transactioninfo.get(txidx)?;
+        if info.id.len() != 32 {
+            return None;
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&info.id);
+        Some(id)
+    }
 }
 
 /// Extract every index entry one block contributes.
@@ -536,7 +554,14 @@ pub fn extract_block(
     for (txidx, tx) in block.transactions.iter().enumerate() {
         let txidx = txidx as u32;
         let Some(raw) = tx.raw_data.as_ref() else { continue };
-        let tx_id = tron_crypto::hash::sha256(&raw.encode_to_vec());
+        // Authoritative tx id: the stored info's WIRE-derived id when
+        // available (see `TxInfoMatcher::positional_id`); the re-encode
+        // hash — identical for canonical txs — only as fallback. Without
+        // this, a tx whose raw_data carries unknown fields would be
+        // indexed under an id nobody looks up.
+        let tx_id = matcher
+            .positional_id(txidx as usize)
+            .unwrap_or_else(|| tron_crypto::hash::sha256(&raw.encode_to_vec()));
         let success = tx
             .ret
             .first()

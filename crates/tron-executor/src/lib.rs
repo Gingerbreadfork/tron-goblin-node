@@ -59,8 +59,8 @@ use tron_crypto::hash::sha256;
 use tron_proto::transaction::contract::ContractType;
 use tron_proto::{Block, Transaction};
 use tron_types::{
-    block_id_from_block, recover_all_signers, verify_parent_link, verify_tx_trie_root,
-    verify_witness_signature, BlockId, BlockValidateError,
+    block_id_from_block, recover_all_signers, recover_all_signers_with_id, verify_parent_link,
+    verify_tx_trie_root, verify_witness_signature, BlockId, BlockValidateError, TxWireInfo,
 };
 use tron_crypto::address::Address;
 
@@ -1222,6 +1222,21 @@ pub fn execute_block_with_config(
     execute_block_inner(state, block, expected_parent, None, None, config, None)
 }
 
+/// As [`execute_block_with_config`], additionally carrying each tx's
+/// ORIGINAL wire facts ([`TxWireInfo`], captured from the raw block
+/// bytes at ingest) so tx ids, signature-recovery preimages and
+/// bandwidth sizes match java even for txs whose wire form a prost
+/// round-trip would normalize.
+pub fn execute_block_with_config_and_wire(
+    state: &StateBackends,
+    block: &Block,
+    expected_parent: Option<BlockId>,
+    config: &ExecConfig,
+    original_wire: Option<&[TxWireInfo]>,
+) -> Result<BlockExecutionReport, BlockExecError> {
+    execute_block_inner(state, block, expected_parent, None, None, config, original_wire)
+}
+
 /// Execute `block` and persist a complete undo log to `undo_store`
 /// keyed by the block's number. The log captures every (store, key,
 /// before_image) needed by [`rollback_block`] to reverse this block's
@@ -1255,7 +1270,7 @@ pub fn execute_block_with_undo_and_config(
     expected_parent: Option<BlockId>,
     undo_store: &tron_chainbase::BlockUndoStore,
     config: &ExecConfig,
-    original_tx_sizes: Option<&[i64]>,
+    original_wire: Option<&[TxWireInfo]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     execute_block_inner(
         state,
@@ -1264,7 +1279,7 @@ pub fn execute_block_with_undo_and_config(
         Some(undo_store),
         None,
         config,
-        original_tx_sizes,
+        original_wire,
     )
 }
 
@@ -1304,7 +1319,7 @@ pub fn execute_block_with_undo_checkpoint_and_config(
     undo_store: &tron_chainbase::BlockUndoStore,
     checkpoint: &tron_chainbase::CheckPointV2,
     config: &ExecConfig,
-    original_tx_sizes: Option<&[i64]>,
+    original_wire: Option<&[TxWireInfo]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     execute_block_inner(
         state,
@@ -1313,7 +1328,7 @@ pub fn execute_block_with_undo_checkpoint_and_config(
         Some(undo_store),
         Some(checkpoint),
         config,
-        original_tx_sizes,
+        original_wire,
     )
 }
 
@@ -1375,7 +1390,7 @@ fn execute_block_inner(
     undo_store: Option<&tron_chainbase::BlockUndoStore>,
     checkpoint: Option<&tron_chainbase::CheckPointV2>,
     config: &ExecConfig,
-    original_tx_sizes: Option<&[i64]>,
+    original_wire: Option<&[TxWireInfo]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     // Undo path: wrap every base backend in a top-level SessionBackend
     // ("block session"). The per-tx sessions inside execute_one_tx
@@ -1396,7 +1411,7 @@ fn execute_block_inner(
         let wrapped = block_session.as_state_backends();
         let t_exec = timing.then(std::time::Instant::now);
         let mut report =
-            execute_block_logic(&wrapped, block, expected_parent, config, original_tx_sizes)?;
+            execute_block_logic(&wrapped, block, expected_parent, config, original_wire)?;
         let exec_us = t_exec.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         let t_commit = timing.then(std::time::Instant::now);
         let (record, deltas) = if let Some(checkpoint) = checkpoint {
@@ -1427,7 +1442,7 @@ fn execute_block_inner(
         }
         return Ok(report);
     }
-    execute_block_logic(state, block, expected_parent, config, original_tx_sizes)
+    execute_block_logic(state, block, expected_parent, config, original_wire)
 }
 
 /// Block-level session: wraps every base backend on a [`StateBackends`]
@@ -2206,10 +2221,10 @@ fn execute_block_logic(
     block: &Block,
     expected_parent: Option<BlockId>,
     config: &ExecConfig,
-    // Per-tx ORIGINAL serialized wire sizes (java's getSerializedSize), in
-    // block order, captured at ingest from the raw block bytes. `None` for
+    // Per-tx ORIGINAL wire facts (java's getSerializedSize + the wire tx id),
+    // in block order, captured at ingest from the raw block bytes. `None` for
     // in-memory callers whose blocks are already prost-canonical.
-    original_tx_sizes: Option<&[i64]>,
+    original_wire: Option<&[TxWireInfo]>,
 ) -> Result<BlockExecutionReport, BlockExecError> {
     // === 1. Structural validation (read-only; safe to use base directly) ===
     if let Some(parent) = expected_parent {
@@ -2258,10 +2273,23 @@ fn execute_block_logic(
     // at the exact same validation step (after the structural checks) they
     // would have been raised inline — so the per-tx outcome is identical to
     // the old serial recovery.
+    // The recovery preimage is the tx id. Use the WIRE-derived id when the
+    // caller captured it from the original block bytes — java verifies
+    // against sha256(getRawData().toByteArray()), which keeps unknown
+    // raw_data fields a prost re-encode drops; for canonical txs the two
+    // ids are byte-identical, so this is a no-op for the common case.
     let precomputed_signers: Vec<Result<Vec<Address>, String>> = block
         .transactions
         .par_iter()
-        .map(|tx| recover_all_signers(tx).map_err(|e| e.to_string()))
+        .enumerate()
+        .map(|(i, tx)| {
+            let wire_id = original_wire.and_then(|w| w.get(i)).and_then(|w| w.tx_id);
+            match wire_id {
+                Some(id) => recover_all_signers_with_id(tx, &id),
+                None => recover_all_signers(tx),
+            }
+            .map_err(|e| e.to_string())
+        })
         .collect();
 
     // === 2b. Per-tx atomic loop (serial — state application is ordered) ===
@@ -2316,7 +2344,7 @@ fn execute_block_logic(
             now_slot,
             head_block_time_ms,
             &precomputed_signers,
-            original_tx_sizes,
+            original_wire,
         )
     } else {
         None
@@ -2337,7 +2365,7 @@ fn execute_block_logic(
                     now_slot,
                     head_block_time_ms,
                     &precomputed_signers[i],
-                    original_tx_sizes.and_then(|s| s.get(i).copied()),
+                    original_wire.and_then(|s| s.get(i).copied()),
                 )
             })
             .collect()
@@ -3240,7 +3268,7 @@ pub(crate) fn execute_one_tx(
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
-    original_tx_size: Option<i64>,
+    original_wire: Option<TxWireInfo>,
 ) -> TxResult {
     let session = TxSession::fork(state);
     let view = session.view();
@@ -3255,7 +3283,7 @@ pub(crate) fn execute_one_tx(
         now_slot,
         head_block_time_ms,
         precomputed_signers,
-        original_tx_size,
+        original_wire,
     )
 }
 
@@ -3276,7 +3304,7 @@ pub(crate) fn execute_one_tx_versioned(
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
-    original_tx_size: Option<i64>,
+    original_wire: Option<TxWireInfo>,
 ) -> TxResult {
     execute_one_tx_isolated(
         view,
@@ -3289,7 +3317,7 @@ pub(crate) fn execute_one_tx_versioned(
         now_slot,
         head_block_time_ms,
         precomputed_signers,
-        original_tx_size,
+        original_wire,
     )
 }
 
@@ -3309,7 +3337,7 @@ fn execute_one_tx_isolated(
     now_slot: i64,
     head_block_time_ms: i64,
     precomputed_signers: &Result<Vec<Address>, String>,
-    original_tx_size: Option<i64>,
+    original_wire: Option<TxWireInfo>,
 ) -> TxResult {
     let owners = SessionStoreOwners::from_state(view);
     let stores = owners.as_actuator_stores();
@@ -3323,7 +3351,13 @@ fn execute_one_tx_isolated(
                     ..TxResult::empty()
         };
     };
-    let tx_id = sha256(&raw.encode_to_vec());
+    // Transaction id: sha256 of the ORIGINAL raw_data wire bytes when the
+    // caller captured them (java `TransactionCapsule.getRawHash` — retains
+    // unknown fields), else the prost re-encode (identical for canonical
+    // txs, the only kind in-memory callers produce).
+    let tx_id = original_wire
+        .and_then(|w| w.tx_id)
+        .unwrap_or_else(|| sha256(&raw.encode_to_vec()));
 
     // Resource receipt, filled as charges land (net side here, energy
     // side inside `execute_vm_tx`). Reject/revert paths return zeros —
@@ -3521,7 +3555,7 @@ fn execute_one_tx_isolated(
                 asset_v1: stores.asset_v1,
                 asset_v2: stores.asset_v2,
             };
-            match bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot, original_tx_size) {
+            match bandwidth::consume_bandwidth(bw_stores, tx, contract, &owner, now_slot, original_wire.map(|w| w.size)) {
                 Ok(bandwidth::BandwidthCharge::Free { bytes, .. }) => {
                     // Free-net path: PUBLIC_NET_USAGE/TIME writes were dropped by
                     // the versioned backend (parallel) to avoid serialising the

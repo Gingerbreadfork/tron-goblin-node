@@ -590,13 +590,14 @@ pub fn eth_get_transaction_by_hash(p: &Value, s: &RpcState) -> Result<Value, Rpc
     if let Some(block_num) = block_num {
         if let Ok(id) = s.block_index.get(block_num) {
             if let Ok(block) = s.blocks.get(&id) {
+                // Match by the stored wire-derived ids (tx_ids_for reads the
+                // verbatim row bytes) — a re-encode hash misses txs whose
+                // raw_data carries unknown fields prost drops.
+                let tx_ids = s.blocks.tx_ids_for(&id, &block);
                 for (idx, tx) in block.transactions.iter().enumerate() {
-                    if let Some(raw) = &tx.raw_data {
-                        let id_bytes = tron_crypto::hash::sha256(&raw.encode_to_vec());
-                        if id_bytes == tx_id {
-                            let ctx = eth_tx_block_context(s, &id, &block, idx, &tx_id);
-                            return Ok(encode_eth_tx(&tx_id, tx, Some(ctx)));
-                        }
+                    if tx_ids.get(idx) == Some(&tx_id) {
+                        let ctx = eth_tx_block_context(s, &id, &block, idx, &tx_id);
+                        return Ok(encode_eth_tx(&tx_id, tx, Some(ctx)));
                     }
                 }
             }
@@ -2454,18 +2455,15 @@ pub fn debug_trace_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcErro
             let block = s.blocks.get(&block_id).map_err(|e| {
                 RpcError::internal(format!("block lookup failed: {e:?}"))
             })?;
+            // Match by the stored wire-derived ids — a re-encode hash
+            // misses txs whose raw_data carries unknown fields.
+            let tx_ids = s.blocks.tx_ids_for(&block_id, &block);
             block
                 .transactions
                 .into_iter()
-                .find(|tx| {
-                    tx.raw_data
-                        .as_ref()
-                        .map(|raw| {
-                            use prost::Message as _;
-                            tron_crypto::hash::sha256(&raw.encode_to_vec()) == tx_id
-                        })
-                        .unwrap_or(false)
-                })
+                .zip(tx_ids)
+                .find(|(_, id)| *id == tx_id)
+                .map(|(tx, _)| tx)
                 .ok_or_else(|| {
                     RpcError::internal("tx_id present in store but not in referenced block")
                 })?
@@ -5776,20 +5774,23 @@ pub fn get_transaction_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError>
         tron_chainbase::StoredTransaction::BlockRef(num) => {
             // Resolve the full body through the canonical block — one
             // block read, exactly java-tron's lite-node lookup path.
+            // Match by the stored wire-derived ids — a re-encode hash
+            // misses txs whose raw_data carries unknown fields.
             let hydrated = s
                 .block_index
                 .get(num)
                 .ok()
-                .and_then(|block_id| s.blocks.get(&block_id).ok())
-                .and_then(|block| {
-                    block.transactions.into_iter().find(|tx| {
-                        tx.raw_data
-                            .as_ref()
-                            .map(|raw| {
-                                tron_crypto::hash::sha256(&raw.encode_to_vec()) == id
-                            })
-                            .unwrap_or(false)
-                    })
+                .and_then(|block_id| {
+                    s.blocks.get(&block_id).ok().map(|block| (block_id, block))
+                })
+                .and_then(|(block_id, block)| {
+                    let tx_ids = s.blocks.tx_ids_for(&block_id, &block);
+                    block
+                        .transactions
+                        .into_iter()
+                        .zip(tx_ids)
+                        .find(|(_, tid)| *tid == id)
+                        .map(|(tx, _)| tx)
                 });
             match hydrated {
                 Some(tx) => tx,
@@ -6229,11 +6230,11 @@ pub fn estimate_energy(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// transaction's signatures. Includes every recoverable signature,
 /// regardless of whether the signer is in the owner's permission.
 pub fn get_approved_list(p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
-    let tx = parse_tx_param(p)?;
-    let signers = tron_actuator::permission::approved_list(&tx).map_err(|e| {
+    let (tx, bytes) = parse_tx_param_with_bytes(p)?;
+    let tx_id = submitted_tx_id(&tx, &bytes)?;
+    let signers = tron_types::recover_all_signers_with_id(&tx, &tx_id).map_err(|e| {
         RpcError::internal(format!("recover signers: {e}"))
     })?;
-    let tx_id = tron_types::tx_id(&tx).map_err(|e| RpcError::internal(format!("tx_id: {e:?}")))?;
     Ok(json!({
         "approved_list": signers.iter().map(|a| hex_bytes(a.as_bytes())).collect::<Vec<_>>(),
         "transaction": {
@@ -6248,10 +6249,10 @@ pub fn get_approved_list(p: &Value, _s: &RpcState) -> Result<Value, RpcError> {
 /// resolution and weight summation. Mirrors java-tron's
 /// `TransactionSignWeight` proto shape (over JSON).
 pub fn get_sign_weight(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
-    let tx = parse_tx_param(p)?;
+    let (tx, bytes) = parse_tx_param_with_bytes(p)?;
+    let tx_id = submitted_tx_id(&tx, &bytes)?;
     let info = tron_actuator::permission::compute_sign_weight(&s.accounts, &s.dyn_props, &tx)
         .map_err(|e| RpcError::internal(format!("sign weight: {e}")))?;
-    let tx_id = tron_types::tx_id(&tx).map_err(|e| RpcError::internal(format!("tx_id: {e:?}")))?;
     Ok(json!({
         "permission": {
             "type": info.permission.r#type,
@@ -6280,14 +6281,29 @@ pub fn get_sign_weight(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 
 /// Parse a protobuf-encoded Transaction from a hex string in
 /// `params[0]`. Same input shape as `eth_sendRawTransaction`.
-fn parse_tx_param(p: &Value) -> Result<tron_proto::Transaction, RpcError> {
+/// Parse a hex-encoded `Transaction` parameter, returning the decoded tx
+/// AND the submitted wire bytes, so callers can derive the wire tx id
+/// (java hashes the original `raw_data` bytes; a prost re-encode drops
+/// unknown fields).
+fn parse_tx_param_with_bytes(p: &Value) -> Result<(tron_proto::Transaction, Vec<u8>), RpcError> {
     let raw_str = p
         .get(0)
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::invalid_params("missing tx hex"))?;
     let bytes = parse_hex_bytes(raw_str)?;
-    tron_proto::Transaction::decode(bytes.as_slice())
-        .map_err(|e| RpcError::invalid_params(format!("decode transaction: {e}")))
+    let tx = tron_proto::Transaction::decode(bytes.as_slice())
+        .map_err(|e| RpcError::invalid_params(format!("decode transaction: {e}")))?;
+    Ok((tx, bytes))
+}
+
+/// The wire tx id for a caller-submitted transaction: sha256 of the
+/// ORIGINAL `raw_data` span, falling back to the prost re-encode id
+/// (identical for canonical txs).
+fn submitted_tx_id(tx: &tron_proto::Transaction, bytes: &[u8]) -> Result<[u8; 32], RpcError> {
+    match tron_types::tx_id_from_tx_bytes(bytes) {
+        Some(id) => Ok(id),
+        None => tron_types::tx_id(tx).map_err(|e| RpcError::internal(format!("tx_id: {e:?}"))),
+    }
 }
 
 // =============================================================================

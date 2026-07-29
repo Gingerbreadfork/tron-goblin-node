@@ -50,7 +50,11 @@ pub use genesis::{
     MAINNET_WITNESS_QUOTE,
 };
 pub use tx_id::{
-    calc_tx_trie_root, tx_id, tx_merkle_hash, tx_sizes_from_block_bytes,
-    tx_trie_root_from_block_bytes, TxIdError,
+    calc_tx_trie_root, tx_id, tx_id_from_tx_bytes, tx_merkle_hash, tx_sizes_from_block_bytes,
+    tx_spans_from_block_bytes, tx_trie_root_from_block_bytes, tx_wire_infos_from_block_bytes,
+    TxIdError, TxWireInfo,
 };
-pub use tx_sign::{recover_all_signers, recover_signer_address, sign_transaction, SignError};
+pub use tx_sign::{
+    recover_all_signers, recover_all_signers_with_id, recover_signer_address, sign_transaction,
+    SignError,
+};

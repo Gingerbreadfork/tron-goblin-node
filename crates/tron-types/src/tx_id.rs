@@ -21,9 +21,134 @@ use tron_crypto::merkle::merkle_root;
 use tron_proto::Transaction;
 
 /// The transaction's signing id — what gets signed and what wallets show.
+///
+/// CAUTION: this hashes a prost re-encode of `raw_data`, which silently
+/// DROPS any unknown protobuf field the original wire bytes carried —
+/// java's `getRawData().toByteArray()` retains and re-emits them, so for
+/// such a tx this id (and any signature recovery keyed on it) diverges
+/// from the network. Whenever the original wire bytes are available, use
+/// [`tx_id_from_tx_bytes`] / [`tx_wire_infos_from_block_bytes`] instead;
+/// this remains exact only for prost-canonical transactions.
 pub fn tx_id(transaction: &Transaction) -> Result<[u8; 32], TxIdError> {
     let raw = transaction.raw_data.as_ref().ok_or(TxIdError::MissingRawData)?;
     Ok(sha256(&raw.encode_to_vec()))
+}
+
+/// The transaction id from the tx's ORIGINAL wire bytes: `sha256` of the
+/// `raw_data` (field 1) span exactly as encoded.
+///
+/// Matches java's `TransactionCapsule.getRawHash`
+/// (`sha256(getRawData().toByteArray())`): java protobuf retains unknown
+/// fields, so a tx off the wire hashes its original `raw_data` span. prost
+/// drops unknown fields on decode, so a re-encode of the parsed struct
+/// hashes a different preimage for the rare mainnet txs that append stray
+/// fields to `raw_data`. Hashing the span is identical to the re-encode for
+/// canonical txs and byte-exact java for the rest.
+///
+/// Returns `None` (caller falls back to the re-encode) for bytes that are
+/// malformed, carry no `raw_data`, or carry more than one `raw_data` field
+/// (protobuf merge semantics).
+pub fn tx_id_from_tx_bytes(tx_bytes: &[u8]) -> Option<[u8; 32]> {
+    const RAW_DATA_FIELD: u64 = 1;
+    let mut span: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < tx_bytes.len() {
+        let (tag, n) = read_varint(&tx_bytes[i..])?;
+        i += n;
+        let field = tag >> 3;
+        match tag & 0x7 {
+            0 => {
+                let (_, n) = read_varint(&tx_bytes[i..])?;
+                i += n;
+            }
+            1 => i = i.checked_add(8)?,
+            5 => i = i.checked_add(4)?,
+            2 => {
+                let (len, n) = read_varint(&tx_bytes[i..])?;
+                i += n;
+                let end = i.checked_add(len as usize)?;
+                if end > tx_bytes.len() {
+                    return None; // truncated
+                }
+                if field == RAW_DATA_FIELD {
+                    if span.is_some() {
+                        return None; // repeated raw_data → merge semantics
+                    }
+                    span = Some((i, end));
+                }
+                i = end;
+            }
+            _ => return None, // groups (3/4) — not used by these messages
+        }
+    }
+    span.map(|(s, e)| sha256(&tx_bytes[s..e]))
+}
+
+/// Per-transaction ORIGINAL wire facts captured from a serialized block:
+/// the tx entry's wire size (java `getSerializedSize`) and its wire tx id
+/// ([`tx_id_from_tx_bytes`]). `tx_id` is `None` when the id could not be
+/// derived from the span (consumers fall back to the prost re-encode,
+/// which is exact for canonical txs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxWireInfo {
+    pub size: i64,
+    pub tx_id: Option<[u8; 32]>,
+}
+
+/// Borrowed per-transaction wire spans of a serialized `Block` — the exact
+/// bytes of every `transactions` entry (field 1, length-delimited), in block
+/// order. These are each tx's ORIGINAL encoding, so re-broadcasting or
+/// re-hashing them is byte-exact where a prost re-encode of the decoded tx
+/// would normalize (dropping unknown fields, re-sorting maps). Same protobuf
+/// walk as [`tx_trie_root_from_block_bytes`]; `None` on malformed/truncated
+/// input.
+pub fn tx_spans_from_block_bytes(block_bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    const TRANSACTIONS_FIELD: u64 = 1;
+    let mut spans: Vec<&[u8]> = Vec::new();
+    let mut i = 0usize;
+    while i < block_bytes.len() {
+        let (tag, n) = read_varint(&block_bytes[i..])?;
+        i += n;
+        let field = tag >> 3;
+        match tag & 0x7 {
+            0 => {
+                let (_, n) = read_varint(&block_bytes[i..])?;
+                i += n;
+            }
+            1 => i = i.checked_add(8)?,
+            5 => i = i.checked_add(4)?,
+            2 => {
+                let (len, n) = read_varint(&block_bytes[i..])?;
+                i += n;
+                let len = len as usize;
+                let end = i.checked_add(len)?;
+                if end > block_bytes.len() {
+                    return None; // truncated
+                }
+                if field == TRANSACTIONS_FIELD {
+                    spans.push(&block_bytes[i..end]);
+                }
+                i = end;
+            }
+            _ => return None, // groups (3/4) — not used by these messages
+        }
+    }
+    Some(spans)
+}
+
+/// Walk a serialized `Block` and capture each `transactions` entry's
+/// [`TxWireInfo`], in block order. Returns `None` on malformed/truncated
+/// input (callers fall back to prost-derived values).
+pub fn tx_wire_infos_from_block_bytes(block_bytes: &[u8]) -> Option<Vec<TxWireInfo>> {
+    Some(
+        tx_spans_from_block_bytes(block_bytes)?
+            .into_iter()
+            .map(|span| TxWireInfo {
+                size: span.len() as i64,
+                tx_id: tx_id_from_tx_bytes(span),
+            })
+            .collect(),
+    )
 }
 
 /// The transaction's *Merkle* leaf hash — covers the entire signed message
@@ -310,6 +435,68 @@ mod tx_trie_raw_tests {
         let decoded = Transaction::decode(tx_wire.as_slice()).unwrap();
         assert!((decoded.encoded_len() as i64) < sizes[0]);
         assert_eq!(sizes[0] - decoded.encoded_len() as i64, unknown.len() as i64);
+    }
+
+    #[test]
+    fn tx_id_from_wire_hashes_full_raw_data_including_trailing_unknown_field() {
+        // raw_data with a trailing unknown varint field (field 20, `a0 01 03`)
+        // that prost drops on decode. The wire id hashes the full span (java
+        // getRawHash); the re-encode hashes the shorter, stripped preimage,
+        // giving a different id.
+        let canonical_raw = sample_raw(3).encode_to_vec();
+        let mut raw_with_unknown = canonical_raw.clone();
+        raw_with_unknown.extend_from_slice(&[0xa0, 0x01, 0x03]); // field 20, varint, value 3
+
+        let sig = vec![0xEEu8; 65];
+        let tx_wire = [ld_field(1, &raw_with_unknown), ld_field(2, &sig)].concat();
+
+        // Wire id = sha256 of the FULL original raw_data span.
+        let wire_id = tx_id_from_tx_bytes(&tx_wire).expect("well-formed tx bytes");
+        assert_eq!(wire_id, sha256(&raw_with_unknown));
+
+        // The prost round-trip drops the unknown bytes → different id.
+        let decoded = Transaction::decode(tx_wire.as_slice()).unwrap();
+        let reencode_id = tx_id(&decoded).unwrap();
+        assert_eq!(reencode_id, sha256(&canonical_raw));
+        assert_ne!(wire_id, reencode_id);
+
+        // Block-level walker returns the same wire id per entry.
+        let block = ld_field(1, &tx_wire);
+        let infos = tx_wire_infos_from_block_bytes(&block).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].size, tx_wire.len() as i64);
+        assert_eq!(infos[0].tx_id, Some(wire_id));
+    }
+
+    #[test]
+    fn tx_id_from_wire_is_a_noop_for_canonical_txs() {
+        // A tx WITHOUT unknown fields: the wire id must be byte-identical to
+        // the prost re-encode id (equal for all canonical txs).
+        let tx = Transaction {
+            raw_data: Some(sample_raw(11)),
+            signature: vec![vec![0x42u8; 65]],
+            ..Default::default()
+        };
+        let wire = tx.encode_to_vec();
+        assert_eq!(tx_id_from_tx_bytes(&wire), Some(tx_id(&tx).unwrap()));
+
+        let block = Block { transactions: vec![tx.clone()], ..Default::default() };
+        let infos = tx_wire_infos_from_block_bytes(&block.encode_to_vec()).unwrap();
+        assert_eq!(infos[0].tx_id, Some(tx_id(&tx).unwrap()));
+        assert_eq!(infos[0].size, tx.encoded_len() as i64);
+    }
+
+    #[test]
+    fn tx_id_from_wire_rejects_missing_or_repeated_raw_data() {
+        // No raw_data → None (fallback path).
+        let sig_only = ld_field(2, &[0xAA; 65]);
+        assert_eq!(tx_id_from_tx_bytes(&sig_only), None);
+        // Repeated raw_data (protobuf merge semantics) → None.
+        let raw = sample_raw(1).encode_to_vec();
+        let doubled = [ld_field(1, &raw), ld_field(1, &raw)].concat();
+        assert_eq!(tx_id_from_tx_bytes(&doubled), None);
+        // Truncated → None.
+        assert_eq!(tx_id_from_tx_bytes(&[0x0A, 0xFF]), None);
     }
 
     #[test]
