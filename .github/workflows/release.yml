@@ -149,8 +149,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
-          # All tags, to decide whether this build is the newest version.
-          fetch-tags: true
 
       - name: Use the workflow's Dockerfile
         # The image recipe is packaging infrastructure like the workflow
@@ -194,8 +192,12 @@ jobs:
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           TAGS=(-t "${IMAGE}:${RELEASE_TAG}")
           # Only the newest version moves `latest`, so a backfill dispatch
-          # for an old tag never retags it.
-          NEWEST="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+          # for an old tag never retags it. Ask the remote — the local clone
+          # of a tag ref does not carry the full tag list.
+          NEWEST="$(git ls-remote --tags origin 'refs/tags/v*' \
+            | awk '{print $2}' \
+            | sed -e 's#^refs/tags/##' -e 's#\^{}$##' \
+            | sort -uV | tail -1)"
           if [ "${RELEASE_TAG}" = "${NEWEST}" ]; then
             TAGS+=(-t "${IMAGE}:latest")
           fi
