@@ -152,6 +152,14 @@ jobs:
           # All tags, to decide whether this build is the newest version.
           fetch-tags: true
 
+      - name: Use the workflow's Dockerfile
+        # The image recipe is packaging infrastructure like the workflow
+        # itself, and backfilled tags predate it — take it from the commit
+        # this workflow definition ran from, not from the tag being built.
+        run: |
+          git fetch --depth 1 origin "${{ github.sha }}"
+          git checkout "${{ github.sha }}" -- Dockerfile
+
       - name: Download built binaries
         uses: actions/download-artifact@v4
         with:
