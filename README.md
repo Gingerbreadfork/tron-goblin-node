@@ -476,6 +476,12 @@ crates.io unchanged.
 
 ## 🦀 Build
 
+Prefer not to build? Every
+[release](https://github.com/Gingerbreadfork/tron-goblin-node/releases) ships
+prebuilt bundles for **Linux x86_64**, **Linux aarch64**, and **macOS Apple
+Silicon** (`tron-node-vX.Y.Z-<os>-<arch>.tar.gz` + `.sha256`), plus a
+multi-arch [Docker image](#-docker).
+
 Prerequisites:
 
 - **Rust 1.80+**. Stable toolchain is fine.
@@ -583,6 +589,34 @@ compatible; runtime config is its own surface. A fully-annotated
 starting point ships at [`config.example.toml`](config.example.toml)
 (every key set to its built-in default); copy it and pass it with
 `--config`.
+
+### 🐳 Docker
+
+Every release also publishes a multi-arch (amd64 / arm64) image to GHCR
+carrying the same binaries as the release bundle:
+
+```sh
+docker run -d --name tron-goblin \
+    -v tron-data:/data \
+    -p 18889:18889 -p 8091:8091 \
+    ghcr.io/gingerbreadfork/tron-goblin-node:latest
+```
+
+State lives in the `/data` volume, and a `config.toml` placed there is
+picked up automatically (the annotated example ships in the image at
+`/etc/tron/config.example.toml`). The entrypoint is `tron-node`, so
+subcommands pass straight through — e.g. plant a snapshot before first
+start:
+
+```sh
+docker run --rm -v tron-data:/data \
+    ghcr.io/gingerbreadfork/tron-goblin-node:latest \
+    import-snapshot --from /data/snapshot.tar.gz --data-dir /data
+```
+
+The other bundled tools are on the `PATH` behind `--entrypoint` (e.g.
+`--entrypoint tron-snapshot-convert`). Exposed ports: `18889` P2P,
+`8091` HTTP REST, `8546` JSON-RPC, `50052` gRPC.
 
 ## 🔍 Indexer, historical state & firehose
 

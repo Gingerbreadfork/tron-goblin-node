@@ -22,6 +22,16 @@ cd "$REPO_ROOT"
 err() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; }
 log() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
+# macOS ships shasum instead of coreutils' sha256sum; both write the same
+# "<hash>  <name>" format that `sha256sum -c` / `shasum -c` verify.
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$@"
+  else
+    shasum -a 256 "$@"
+  fi
+}
+
 VERSION="${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 
 # A release tag names the archive, but the binaries report the manifest
@@ -123,10 +133,15 @@ package() {
   mkdir -p "$dest/scripts" "$dest/docs"
 
   # Binaries land at the bundle root so the bundled try.sh finds tron-node
-  # next to itself with no build step.
+  # next to itself with no build step. On macOS, stripping invalidates the
+  # linker's ad-hoc code signature, so re-sign — an unsigned arm64 binary is
+  # killed on launch.
   for b in "${BINARIES[@]}"; do
     install -m 0755 "target/release/${b}" "$dest/"
     strip "$dest/${b}"
+    if [[ "$OS" == darwin ]]; then
+      codesign --force --sign - "$dest/${b}"
+    fi
   done
 
   # LICENSE is the LGPL, which is written as a set of additional permissions
@@ -162,7 +177,7 @@ package() {
   cp -r docs/. "$dest/docs/"
 
   tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-  ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
+  ( cd dist && sha256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
 }
 
 check_version_matches_tag

@@ -1,9 +1,14 @@
 name: Release
 
 # Fires when a tag starting with "v" is pushed (e.g. v0.9.0), builds the
-# release binary, and publishes it as a GitHub Release for that tag. Can also
-# be dispatched manually with an existing tag to (re)build its bundle — if the
-# Release already exists, the assets are attached to it in place.
+# release bundle for each platform, and attaches them all to one GitHub
+# Release for that tag. Can also be dispatched manually with an existing tag
+# to (re)build its bundles — if the Release already exists, the assets are
+# attached to it in place.
+#
+# The Linux bundles are then repackaged into a multi-arch container image on
+# GHCR (ghcr.io/<owner>/tron-goblin-node), tagged with the release tag and,
+# when the tag is the newest version, `latest`.
 on:
   push:
     tags:
@@ -14,9 +19,11 @@ on:
         description: 'Existing v* tag to build and attach assets to'
         required: true
 
-# The default workflow token is read-only; creating a Release needs write.
+# The default workflow token is read-only; creating a Release and pushing to
+# GHCR need write.
 permissions:
   contents: write
+  packages: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -27,9 +34,25 @@ env:
 jobs:
   release:
     name: Build and publish release
-    # 22.04 links an older glibc than ubuntu-latest (24.04), so the binary
-    # runs on a much wider range of systems.
-    runs-on: ubuntu-22.04
+    strategy:
+      # One platform failing should not cancel the others' uploads.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 links an older glibc than ubuntu-latest (24.04), so the
+          # Linux binaries run on a much wider range of systems.
+          - runner: ubuntu-22.04
+            protoc_platform: linux-x86_64
+            docker_arch: amd64
+          - runner: ubuntu-22.04-arm
+            protoc_platform: linux-aarch_64
+            docker_arch: arm64
+          # Apple Silicon. Compatibility is set by rustc's deployment target,
+          # not the runner's OS version.
+          - runner: macos-15
+            protoc_platform: osx-aarch_64
+            docker_arch: ''
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
 
     steps:
@@ -45,9 +68,21 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev llvm-dev
+
+      - name: Provide sha256sum on macOS
+        # macOS has no coreutils sha256sum; shim it so build-release.sh works
+        # at any tag, including ones that predate the script's own fallback.
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v sha256sum >/dev/null; then
+            sudo mkdir -p /usr/local/bin
+            printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' | sudo tee /usr/local/bin/sha256sum >/dev/null
+            sudo chmod +x /usr/local/bin/sha256sum
+          fi
 
       - name: Install protoc
         # ubuntu-22.04's apt protoc (3.12) predates stable proto3-optional
@@ -57,7 +92,7 @@ jobs:
         run: |
           PROTOC_VERSION=28.3
           curl -fsSL -o /tmp/protoc.zip \
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${{ matrix.protoc_platform }}.zip"
           sudo unzip -oq /tmp/protoc.zip -d /usr/local 'bin/protoc' 'include/*'
           sudo chmod +x /usr/local/bin/protoc
           protoc --version
@@ -72,21 +107,93 @@ jobs:
         run: scripts/build-release.sh "${RELEASE_TAG}"
 
       - name: Publish GitHub Release
-        # If a Release for the tag already exists (created by hand, or a
-        # previous run of this job), attach the assets to it instead of
-        # failing on the duplicate create.
+        # Matrix jobs race to create the Release, and a manually-created one
+        # may already exist — so create without assets, tolerating the
+        # duplicate, then attach this platform's bundle.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" \
-              dist/tron-node-*-linux-x86_64.tar.gz \
-              dist/tron-node-*-linux-x86_64.tar.gz.sha256 \
-              --clobber
-          else
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release create "${RELEASE_TAG}" \
-              dist/tron-node-*-linux-x86_64.tar.gz \
-              dist/tron-node-*-linux-x86_64.tar.gz.sha256 \
               --title "tron-goblin-node ${RELEASE_TAG}" \
-              --generate-notes
+              --generate-notes || true
           fi
+          gh release upload "${RELEASE_TAG}" \
+            dist/tron-node-*.tar.gz \
+            dist/tron-node-*.tar.gz.sha256 \
+            --clobber
+
+      - name: Stage binaries for the container image
+        if: matrix.docker_arch != ''
+        run: |
+          mkdir -p docker-bins
+          find dist -maxdepth 2 -type f -perm -u+x ! -name '*.sh' -exec cp {} docker-bins/ \;
+          ls -l docker-bins
+
+      - name: Upload container-image binaries
+        if: matrix.docker_arch != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-bins-${{ matrix.docker_arch }}
+          path: docker-bins/
+          if-no-files-found: error
+
+  docker:
+    name: Publish container image
+    needs: release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # All tags, to decide whether this build is the newest version.
+          fetch-tags: true
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-bins-*
+          path: docker-ctx
+
+      - name: Assemble build context
+        # download-artifact lands each artifact in a directory named after it;
+        # rename to the amd64/arm64 layout the Dockerfile selects from via
+        # TARGETARCH.
+        run: |
+          mv docker-ctx/docker-bins-amd64 docker-ctx/amd64
+          mv docker-ctx/docker-bins-arm64 docker-ctx/arm64
+          cp config.example.toml docker-ctx/
+          ls -lR docker-ctx
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAGS=(-t "${IMAGE}:${RELEASE_TAG}")
+          # Only the newest version moves `latest`, so a backfill dispatch
+          # for an old tag never retags it.
+          NEWEST="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+          if [ "${RELEASE_TAG}" = "${NEWEST}" ]; then
+            TAGS+=(-t "${IMAGE}:latest")
+          fi
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            "${TAGS[@]}" \
+            -f Dockerfile \
+            --push \
+            docker-ctx
