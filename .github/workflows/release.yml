@@ -1,11 +1,18 @@
 name: Release
 
 # Fires when a tag starting with "v" is pushed (e.g. v0.9.0), builds the
-# release binary, and publishes it as a GitHub Release for that tag.
+# release binary, and publishes it as a GitHub Release for that tag. Can also
+# be dispatched manually with an existing tag to (re)build its bundle — if the
+# Release already exists, the assets are attached to it in place.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to build and attach assets to'
+        required: true
 
 # The default workflow token is read-only; creating a Release needs write.
 permissions:
@@ -13,6 +20,9 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # On a tag push the tag is the pushed ref; on a manual dispatch it comes
+  # from the input (github.ref_name would be the branch dispatched from).
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -25,6 +35,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,14 +69,24 @@ jobs:
         # byte-reproducible (tar records mtimes and ownership, gzip stamps a
         # timestamp), so the published .sha256 attests to this artifact only —
         # a local rebuild will not reproduce the hash.
-        run: scripts/build-release.sh "${GITHUB_REF_NAME}"
+        run: scripts/build-release.sh "${RELEASE_TAG}"
 
       - name: Publish GitHub Release
+        # If a Release for the tag already exists (created by hand, or a
+        # previous run of this job), attach the assets to it instead of
+        # failing on the duplicate create.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/tron-node-*-linux-x86_64.tar.gz \
-            dist/tron-node-*-linux-x86_64.tar.gz.sha256 \
-            --title "tron-goblin-node ${GITHUB_REF_NAME}" \
-            --generate-notes
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              dist/tron-node-*-linux-x86_64.tar.gz \
+              dist/tron-node-*-linux-x86_64.tar.gz.sha256 \
+              --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              dist/tron-node-*-linux-x86_64.tar.gz \
+              dist/tron-node-*-linux-x86_64.tar.gz.sha256 \
+              --title "tron-goblin-node ${RELEASE_TAG}" \
+              --generate-notes
+          fi
