@@ -2296,13 +2296,22 @@ fn execute_block_logic(
 
     // TIP-2935: the parent hash lands in `BlockHashHistory` storage before any
     // transaction runs (java `HistoryBlockHashUtil.write` in `processBlock`).
-    if let Some(storage_be) = &state.storage_row {
-        tron_consensus::history_block_hash::write_parent_hash(
-            &tron_chainbase::StorageRowStore::new(storage_be.clone()),
-            &DynamicPropertiesStore::new(state.dyn_props.clone()),
-            raw.number,
-            &raw.parent_hash,
-        )?;
+    {
+        let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+        match &state.storage_row {
+            Some(storage_be) => {
+                tron_consensus::history_block_hash::write_parent_hash(
+                    &tron_chainbase::StorageRowStore::new(storage_be.clone()),
+                    &dp,
+                    raw.number,
+                    &raw.parent_hash,
+                )?;
+            }
+            None if dp.is_block_hash_history_installed() => {
+                return Err(BlockExecError::OptionalStoreNotAttached("storage_row"));
+            }
+            None => {}
+        }
     }
 
     // === 2b. Per-tx atomic loop (serial — state application is ordered) ===
@@ -2988,7 +2997,10 @@ fn execute_block_logic(
                 );
                 // ALLOW_TVM_PRAGUE (95) installs the TIP-2935 BlockHashHistory
                 // contract in the same pass (java `ProposalService.process`).
-                if let Ok(report) = &activation {
+                // A store failure fails the block, as java's revoking session
+                // would, rather than leaving the flag set without the contract.
+                {
+                    let report = activation?;
                     if report.parameter_updates.iter().any(|&(_, p, _)| p == 95) {
                         match (&state.code, &state.storage_row) {
                             (Some(code_be), Some(_)) => {
