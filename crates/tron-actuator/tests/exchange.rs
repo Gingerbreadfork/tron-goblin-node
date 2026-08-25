@@ -871,3 +871,35 @@ fn flag1_exchange_create_rejects_non_numeric_token_id() {
     };
     exchange::validate_exchange_create(&ctx.accounts, &ctx.dp, &ok).unwrap();
 }
+
+/// TIP-836 (#98): the withdraw precision check in exact arithmetic. With a
+/// 10:1 pool, withdrawing `quant` TRX yields `quant / 10` of the other side;
+/// the scale-4 fraction of that quotient must not exceed `other * 0.0001`.
+#[test]
+fn withdraw_precision_check_is_exact_under_harden_exchange_calculation() {
+    let run = |quant: i64, harden: bool| {
+        let ctx = ctx_with_alice(1_000_000_000, 0, 0);
+        seed_trx_asset_exchange(&ctx, 1, ALICE, 1_000_000_000, 100_000_000);
+        ctx.dp.put_long(b"ALLOW_HARDEN_EXCHANGE_CALCULATION", harden as i64);
+        let c = ExchangeWithdrawContract {
+            owner_address: ALICE.to_vec(),
+            exchange_id: 1,
+            token_id: b"_".to_vec(),
+            quant,
+        };
+        exchange::validate_exchange_withdraw(&ctx.accounts, &ctx.dp, &ctx.v1, &ctx.v2, &c)
+    };
+    // 15 / 10 = 1.5: other = 1, fraction 0.5 > 1 * 0.0001 — rejected either way.
+    assert!(matches!(run(15, true), Err(ActuatorError::Validate("Not precise enough"))));
+    assert!(matches!(run(15, false), Err(ActuatorError::Validate("Not precise enough"))));
+    // 50_005 / 10 = 5000.5: other = 5000, fraction 0.5 == 5000 * 0.0001 — not
+    // greater, so accepted.
+    assert!(run(50_005, true).is_ok());
+    assert!(run(50_005, false).is_ok());
+    // 50_006 / 10 = 5000.6: fraction 0.6 > 0.5 — rejected.
+    assert!(matches!(run(50_006, true), Err(ActuatorError::Validate("Not precise enough"))));
+    // 50_001 / 10 = 5000.1: fraction 0.1 < 0.5 — accepted.
+    assert!(run(50_001, true).is_ok());
+    // Exact multiples carry no fraction.
+    assert!(run(100_000_000, true).is_ok());
+}

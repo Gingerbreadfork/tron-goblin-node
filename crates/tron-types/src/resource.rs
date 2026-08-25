@@ -177,7 +177,7 @@ pub fn calculate_global_limit_v2(
     froze_balance: i64,
     total_limit: i64,
     total_weight: i64,
-    _harden: bool,
+    harden: bool,
 ) -> i64 {
     if total_weight <= 0 {
         return 0;
@@ -193,6 +193,11 @@ pub fn calculate_global_limit_v2(
     // reading came from `getaccountresource` (a DISPLAY path) and INTRODUCED
     // 348 energy_fee divergences (+1..+8 stake per renter) that cascade into
     // the fc772f18 balance failures. Floor matches the deployed TX behavior.
+    if harden {
+        // java `calculateGlobalLimitV2`: exact rational, floored once.
+        return ((froze_balance as i128) * (total_limit as i128)
+            / ((TRX_PRECISION as i128) * (total_weight as i128))) as i64;
+    }
     let weight = froze_balance / TRX_PRECISION;
     ((weight as f64) * (total_limit as f64 / total_weight as f64)) as i64
 }
@@ -224,10 +229,15 @@ pub fn calculate_global_net_limit_v2(
     froze_balance: i64,
     total_limit: i64,
     total_weight: i64,
-    _harden: bool,
+    harden: bool,
 ) -> i64 {
     if total_weight <= 0 {
         return 0;
+    }
+    if harden {
+        // java `calculateGlobalLimitV2`: exact rational, floored once.
+        return ((froze_balance as i128) * (total_limit as i128)
+            / ((TRX_PRECISION as i128) * (total_weight as i128))) as i64;
     }
     ((froze_balance as f64 / TRX_PRECISION as f64)
         * (total_limit as f64 / total_weight as f64)) as i64
@@ -1140,8 +1150,13 @@ mod tests {
     /// (500_000 sun) → weight 0 → limit 0.
     #[test]
     fn calculate_global_limit_v2_sub_trx_froze_floors_to_zero() {
-        assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true), 0);
         assert_eq!(calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, false), 0);
+        // Hardened (#97): java's exact `calculateGlobalLimitV2` has no whole-TRX
+        // floor: 500_000 * 1e12 / (1e6 * 2e6) = 250_000.
+        assert_eq!(
+            calculate_global_limit_v2(500_000, 1_000_000_000_000, 2_000_000, true),
+            250_000
+        );
     }
 
     #[test]
@@ -1167,9 +1182,12 @@ mod tests {
     fn calculate_global_limit_v2_floors_weight() {
         let (f, l, w) = (14_231_726_819i64, 180_000_000_000i64, 19_705_467_908i64);
         // energy V2 == V1 (both floor the whole-TRX weight).
-        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_993);
         assert_eq!(calculate_global_limit_v2(f, l, w, false), 129_993);
         assert_eq!(calculate_global_limit_v1(f, l, w, false), 129_993);
+        // Hardened (#97): java `calculateGlobalLimitV2` keeps the fraction and
+        // floors once: 14_231_726_819 * L / (1e6 * W) = 129_999.
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 129_999);
+        assert_eq!(calculate_global_limit_v1(f, l, w, true), 129_993);
     }
 
     /// The deployed mainnet java-tron PRESERVES the fractional weight for the
@@ -1191,8 +1209,9 @@ mod tests {
         // UNLIKE net (345). Proven against acquired-delegated renters (see
         // calculate_global_limit_v2_floors_weight). Energy and net round
         // differently: net keeps the fraction, energy floors the whole-TRX weight.
-        assert_eq!(calculate_global_limit_v2(f, l, w, true), 344);
         assert_eq!(calculate_global_limit_v2(f, l, w, false), 344);
+        // Hardened (#97): both paths use java's exact `calculateGlobalLimitV2`.
+        assert_eq!(calculate_global_limit_v2(f, l, w, true), 345);
     }
 
     // ---- window-size helpers (java AccountCapsule) -------------------------

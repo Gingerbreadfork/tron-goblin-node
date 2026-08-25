@@ -465,6 +465,19 @@ pub fn validate_exchange_withdraw(
     //   remainder = round_half_up(otherBalance * tokenQuant / tokenBalance, 4)
     //               - anotherTokenQuant
     //   reject if remainder / anotherTokenQuant > 0.0001
+    if dyn_props.allow_harden_exchange_calculation() {
+        // TIP-836 (#98): the same comparison in exact BigDecimal arithmetic.
+        // `remainder` is the scale-4 fraction, so `remainder > quant * 0.0001`
+        // is `fraction_1e4 > quant`.
+        let fraction = scale4_fraction_half_up(
+            other_balance as i128 * token_quant as i128,
+            token_balance as i128,
+        );
+        if fraction > another_token_quant as i128 {
+            return Err(ActuatorError::Validate("Not precise enough"));
+        }
+        return Ok(());
+    }
     let rounded4 = div_round_half_up_scale4(
         other_balance as i128 * token_quant as i128,
         token_balance as i128,
@@ -572,6 +585,9 @@ pub fn validate_exchange_transaction(
     // maintenance cycles later — exact awaits the ForkController (audit
     // coverage-gap #1). [Adversarial-block fidelity: java rejects the WHOLE
     // block; here only the tx is rejected — moot on honest replay.]
+    // Because of this gate, ALLOW_HARDEN_EXCHANGE_CALCULATION's swap path
+    // (java `SafeExchangeProcessor`) is unreachable: #98 needs VERSION_4_8_2,
+    // which implies VERSION_4_8_0_1 already passed.
     const VERSION_4_8_0_1_HARD_FORK_TIME_MS: i64 = 1_596_780_000_000;
     if dyn_props.latest_block_header_timestamp().unwrap_or(0) >= VERSION_4_8_0_1_HARD_FORK_TIME_MS {
         return Err(ActuatorError::Validate(
@@ -922,12 +938,22 @@ fn div_round_half_up_scale4(numer: i128, denom: i128) -> f64 {
     // 2^133). The integer quotient `q` equals anotherTokenQuant, already shown
     // to fit i64, so `q * 10_000` is safe. Operands are non-negative here.
     let q = numer / denom;
+    let frac = scale4_fraction_half_up(numer, denom);
+    (q * 10_000 + frac) as f64 / 10_000.0
+}
+
+/// The fractional part of `numer / denom` rounded HALF_UP to four decimals,
+/// in units of 1e-4 (so `0..=10_000`). Operands are non-negative.
+fn scale4_fraction_half_up(numer: i128, denom: i128) -> i128 {
     let r = numer % denom;
     let frac_scaled = r * 10_000;
     let fq = frac_scaled / denom;
     let fr = frac_scaled % denom;
-    let frac = if 2 * fr >= denom { fq + 1 } else { fq };
-    (q * 10_000 + frac) as f64 / 10_000.0
+    if 2 * fr >= denom {
+        fq + 1
+    } else {
+        fq
+    }
 }
 
 /// Public re-export of [`is_number`] for use by [`crate::market`]. Mirrors
