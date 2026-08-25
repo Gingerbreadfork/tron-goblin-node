@@ -1190,6 +1190,8 @@ pub enum BlockExecError {
     Store(#[from] tron_chainbase::StoreError),
     #[error("kv backend error: {0}")]
     Kv(#[from] tron_chainbase::KvError),
+    #[error("block needs store '{0}' but it isn't attached on this node")]
+    OptionalStoreNotAttached(&'static str),
 }
 
 // =============================================================================
@@ -2292,6 +2294,17 @@ fn execute_block_logic(
         })
         .collect();
 
+    // TIP-2935: the parent hash lands in `BlockHashHistory` storage before any
+    // transaction runs (java `HistoryBlockHashUtil.write` in `processBlock`).
+    if let Some(storage_be) = &state.storage_row {
+        tron_consensus::history_block_hash::write_parent_hash(
+            &tron_chainbase::StorageRowStore::new(storage_be.clone()),
+            &DynamicPropertiesStore::new(state.dyn_props.clone()),
+            raw.number,
+            &raw.parent_hash,
+        )?;
+    }
+
     // === 2b. Per-tx atomic loop (serial — state application is ordered) ===
     //
     // `now_slot` (the bandwidth-recovery reference slot) depends only on
@@ -2967,12 +2980,36 @@ fn execute_block_logic(
             let schedule = tron_chainbase::WitnessScheduleStore::new(sched_be);
             if let Ok(Some(active)) = schedule.load_active() {
                 let proposal_store = ProposalStore::new(state.proposals.clone());
-                let _ = tron_consensus::activate_expired_proposals(
+                let activation = tron_consensus::activate_expired_proposals(
                     &proposal_store,
                     &dp,
                     next_maintenance,
                     &active,
                 );
+                // ALLOW_TVM_PRAGUE (95) installs the TIP-2935 BlockHashHistory
+                // contract in the same pass (java `ProposalService.process`).
+                if let Ok(report) = &activation {
+                    if report.parameter_updates.iter().any(|&(_, p, _)| p == 95) {
+                        match (&state.code, &state.storage_row) {
+                            (Some(code_be), Some(_)) => {
+                                let installed = tron_consensus::history_block_hash::deploy(
+                                    &tron_chainbase::CodeStore::new(code_be.clone()),
+                                    &tron_chainbase::ContractStore::new(state.contracts.clone()),
+                                    &AccountStore::new(state.accounts.clone()),
+                                    &dp,
+                                )?;
+                                tracing::info!(
+                                    installed,
+                                    block = raw.number,
+                                    "ALLOW_TVM_PRAGUE activated: TIP-2935 BlockHashHistory"
+                                );
+                            }
+                            _ => {
+                                return Err(BlockExecError::OptionalStoreNotAttached("code/storage_row"));
+                            }
+                        }
+                    }
+                }
             }
         }
         // If the ALLOW_SAME_TOKEN_NAME proposal just activated, reconstruct each

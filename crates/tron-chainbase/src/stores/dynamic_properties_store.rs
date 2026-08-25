@@ -91,6 +91,11 @@ pub mod keys {
     pub const ALLOW_UPDATE_ACCOUNT_NAME: &[u8] = b"ALLOW_UPDATE_ACCOUNT_NAME";
     pub const ALLOW_NEW_REWARD: &[u8] = b"ALLOW_NEW_REWARD";
     pub const ALLOW_HARDEN_RESOURCE_CALCULATION: &[u8] = b"ALLOW_HARDEN_RESOURCE_CALCULATION";
+    pub const ALLOW_HARDEN_EXCHANGE_CALCULATION: &[u8] = b"ALLOW_HARDEN_EXCHANGE_CALCULATION";
+    pub const ALLOW_TVM_PRAGUE: &[u8] = b"ALLOW_TVM_PRAGUE";
+    pub const ALLOW_TVM_OSAKA: &[u8] = b"ALLOW_TVM_OSAKA";
+    /// TIP-2935 install marker, set once `BlockHashHistory` is deployed.
+    pub const BLOCK_HASH_HISTORY_INSTALLED: &[u8] = b"BLOCK_HASH_HISTORY_INSTALLED";
     pub const ALLOW_TVM_FREEZE: &[u8] = b"ALLOW_TVM_FREEZE";
     pub const ALLOW_BLACKHOLE_OPTIMIZATION: &[u8] = b"ALLOW_BLACKHOLE_OPTIMIZATION";
     /// Proposal #87. When `1`, `Maths.pow` selects `StrictMath.pow` (fdlibm)
@@ -746,6 +751,26 @@ impl DynamicPropertiesStore {
 
     pub fn allow_harden_resource_calculation(&self) -> bool {
         self.get_long(keys::ALLOW_HARDEN_RESOURCE_CALCULATION).unwrap_or(0) != 0
+    }
+
+    pub fn allow_harden_exchange_calculation(&self) -> bool {
+        self.get_long(keys::ALLOW_HARDEN_EXCHANGE_CALCULATION).unwrap_or(0) == 1
+    }
+
+    pub fn allow_tvm_prague(&self) -> bool {
+        self.get_long(keys::ALLOW_TVM_PRAGUE).unwrap_or(0) == 1
+    }
+
+    pub fn allow_tvm_osaka(&self) -> bool {
+        self.get_long(keys::ALLOW_TVM_OSAKA).unwrap_or(0) == 1
+    }
+
+    pub fn is_block_hash_history_installed(&self) -> bool {
+        self.get_long(keys::BLOCK_HASH_HISTORY_INSTALLED).unwrap_or(0) == 1
+    }
+
+    pub fn save_block_hash_history_installed(&self, value: i64) {
+        self.put_long(keys::BLOCK_HASH_HISTORY_INSTALLED, value);
     }
 
     pub fn allow_tvm_freeze(&self) -> i64 {

@@ -33,6 +33,7 @@
 //! and a fork-choice walker without context switching.
 
 pub mod fork_choice;
+pub mod history_block_hash;
 pub mod khaos;
 pub mod maintenance;
 pub mod pbft;
