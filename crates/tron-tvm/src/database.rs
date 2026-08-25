@@ -409,7 +409,7 @@ impl DatabaseRef for TronDatabase {
             (None, h)
         } else {
             let h = code_hash(&code_bytes);
-            (Some(Bytecode::new_raw(code_bytes.into())), h)
+            (Some(Bytecode::new_legacy(code_bytes.into())), h)
         };
 
         Ok(Some(AccountInfo {
@@ -426,7 +426,7 @@ impl DatabaseRef for TronDatabase {
             return Ok(Bytecode::default());
         }
         let bytes = self.code.get(code_hash.as_slice())?.unwrap_or_default();
-        Ok(Bytecode::new_raw(bytes.into()))
+        Ok(Bytecode::new_legacy(bytes.into()))
     }
 
     fn storage_ref(
