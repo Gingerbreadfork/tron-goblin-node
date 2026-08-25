@@ -806,11 +806,11 @@ fn one_plus_ratio_1e18_as_f64(q18: i128) -> f64 {
     }
 }
 
-/// `scale * (D(x) - 1)` truncated toward zero, where `D(x)` is java
-/// `BigDecimal.valueOf(x)` — the JDK8 `Double.toString` shortest decimal. `x`
-/// is in `[1, 2]`, so `D(x) - 1 >= 0`.
+/// `scale * (D(x) - 1)` truncated toward zero, where `D(x)` is the decimal of
+/// java `BigDecimal.valueOf(x)` (see [`crate::jdk_dtoa`]). `x >= 1`, so
+/// `D(x) - 1 >= 0` and truncation toward zero equals a floor.
 fn scale_times_decimal_minus_one(scale: i128, x: f64) -> i128 {
-    let (mant, k) = jdk8_double_to_decimal(x);
+    let (mant, k) = crate::jdk_dtoa::to_decimal(x);
     let ten_k = pow10_i128(k);
     // scale * (mant - 10^k) / 10^k, truncating toward zero.
     (scale * (mant - ten_k)) / ten_k
@@ -822,14 +822,6 @@ fn pow10_i128(k: u32) -> i128 {
         v *= 10;
     }
     v
-}
-
-/// JDK8 `Double.toString(x)` for `x in [1, 2]`, as `(mantissa, scale)` with
-/// `x == mantissa * 10^-scale`. JDK8's `FloatingDecimal` is not always the
-/// shortest round-tripping decimal (unlike Rust's formatter), so this
-/// reproduces its algorithm rather than parsing `format!("{x}")`.
-fn jdk8_double_to_decimal(x: f64) -> (i128, u32) {
-    crate::jdk_dtoa::to_decimal(x)
 }
 
 /// java `ExchangeCapsule.transaction` / `ExchangeProcessor.exchange`: the
