@@ -7293,10 +7293,18 @@ where
     }
     let take = queue.len().min(MAX_TX_FETCH_PER_BATCH);
     let mut ids: Vec<Vec<u8>> = Vec::with_capacity(take);
+    // java-tron drops a peer whose FetchInvData repeats a hash; a tx announced
+    // twice before its fetch went out is queued twice.
+    let mut seen = std::collections::HashSet::with_capacity(take);
     for _ in 0..take {
         if let Some(h) = queue.pop_front() {
-            ids.push(h.to_vec());
+            if seen.insert(h) {
+                ids.push(h.to_vec());
+            }
         }
+    }
+    if ids.is_empty() {
+        return Ok(());
     }
     let count = ids.len();
     let payload = tron_proto::Inventory {

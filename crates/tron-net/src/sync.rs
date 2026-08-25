@@ -115,9 +115,17 @@ pub async fn send_fetch_inv_data<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // java-tron drops a peer whose FetchInvData repeats a hash, so a block
+    // re-announced before its first fetch went out must not appear twice.
+    let mut seen = std::collections::HashSet::with_capacity(block_id_bytes.len());
+    let ids: Vec<Vec<u8>> = block_id_bytes
+        .iter()
+        .filter(|id| seen.insert(id.as_slice()))
+        .cloned()
+        .collect();
     let payload = Inventory {
         r#type: InventoryType::Block as i32,
-        ids: block_id_bytes.to_vec(),
+        ids,
     };
     conn.send_frame(Frame {
         ty: MessageType::FetchInvData,
