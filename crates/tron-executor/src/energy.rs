@@ -686,6 +686,27 @@ pub fn calculate_global_energy_limit(
     calculate_global_limit_v1(froze_balance, total_limit, total_weight, harden)
 }
 
+/// java `RepositoryImpl.calculateGlobalEnergyLimit` — the VM-budget variant,
+/// which (unlike `EnergyProcessor`) has NO freeze-v2 branch: it always floors
+/// the weight to whole TRX. Under `ALLOW_HARDEN_RESOURCE_CALCULATION` (#97) it
+/// scales that floored weight in exact `BigInteger`; otherwise the legacy
+/// `double`. Feeds `getAccountLeftEnergyFromFreeze` on the VM path (fix/float
+/// ratio budgets and the origin quota), which must NOT keep the fractional
+/// weight the `EnergyProcessor` bill path does.
+pub fn repository_calculate_global_energy_limit(
+    account: &Account,
+    dyn_props: &DynamicPropertiesStore,
+) -> i64 {
+    let froze_balance = all_frozen_balance_for_energy(account);
+    if froze_balance < TRX_PRECISION {
+        return 0;
+    }
+    let total_limit = dyn_props.total_energy_current_limit();
+    let total_weight = dyn_props.total_energy_weight();
+    let harden = dyn_props.allow_harden_resource_calculation();
+    calculate_global_limit_v1(froze_balance, total_limit, total_weight, harden)
+}
+
 /// Sum of all energy weight: the v2 frozen-for-energy entry, the
 /// legacy v1 `frozen_balance_for_energy`, and the acquired-delegated
 /// v1/v2 amounts. Mirrors
@@ -763,7 +784,7 @@ pub fn account_left_energy_from_freeze(
     } else {
         increase_default(energy_usage, 0, latest_consume, now_slot)
     };
-    let energy_limit = calculate_global_energy_limit(account, dyn_props);
+    let energy_limit = repository_calculate_global_energy_limit(account, dyn_props);
     energy_limit.saturating_sub(decayed_usage).max(0)
 }
 
@@ -879,7 +900,7 @@ pub fn account_energy_limit_with_float_ratio(
     let energy_from_fee_limit = if total_balance == 0 {
         fee_limit / spe
     } else {
-        let total_energy = calculate_global_energy_limit(caller, dyn_props);
+        let total_energy = repository_calculate_global_energy_limit(caller, dyn_props);
         let left_balance = get_energy_fee(total_balance, left_frozen, total_energy);
         if left_balance >= fee_limit {
             ((total_energy as i128 * fee_limit as i128) / total_balance as i128) as i64
