@@ -520,6 +520,46 @@ fn validate_proposal_value(
                 return Err(only_one("ALLOW_TVM_SELFDESTRUCT_RESTRICTION"));
             }
         }
+        // 95–98 are additionally gated on `forkController.pass(VERSION_4_8_2)`
+        // (block version 36 on 80% of SRs), which only rejects a proposal
+        // before the fork — never reachable in block replay.
+        AllowTvmOsaka => {
+            if flag(b"ALLOW_TVM_OSAKA") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_TVM_OSAKA"));
+            }
+        }
+        AllowTvmPrague => {
+            // The BlockHashHistory bytecode uses PUSH0, so Shanghai must be
+            // live first.
+            if flag(b"ALLOW_TVM_SHANGHAI") != 1 {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_TVM_PRAGUE") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_TVM_PRAGUE"));
+            }
+        }
+        AllowHardenResourceCalculation => {
+            if flag(b"ALLOW_HARDEN_RESOURCE_CALCULATION") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_HARDEN_RESOURCE_CALCULATION"));
+            }
+        }
+        AllowHardenExchangeCalculation => {
+            if value != 0 && value != 1 {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_HARDEN_EXCHANGE_CALCULATION") == value {
+                return Err(bad());
+            }
+        }
         ProposalExpireTime => {
             if value <= MIN_PROPOSAL_EXPIRE_TIME || value >= MAX_PROPOSAL_EXPIRE_TIME {
                 return Err(bad());
@@ -609,6 +649,10 @@ enum ProposalType {
     AllowTvmBlob,
     ProposalExpireTime,
     AllowTvmSelfdestructRestriction,
+    AllowTvmPrague,
+    AllowTvmOsaka,
+    AllowHardenResourceCalculation,
+    AllowHardenExchangeCalculation,
 }
 
 impl ProposalType {
@@ -693,6 +737,10 @@ impl ProposalType {
             89 => AllowTvmBlob,
             92 => ProposalExpireTime,
             94 => AllowTvmSelfdestructRestriction,
+            95 => AllowTvmPrague,
+            96 => AllowTvmOsaka,
+            97 => AllowHardenResourceCalculation,
+            98 => AllowHardenExchangeCalculation,
             _ => return None,
         })
     }
