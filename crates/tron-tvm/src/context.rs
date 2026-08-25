@@ -55,6 +55,17 @@ pub trait EvmContext {
             == 1
     }
 
+    /// java-tron `VMConfig.allowTvmOsaka()` — the `ALLOW_TVM_OSAKA` proposal
+    /// (#96). Gates the TIP-7823/7883/871 MODEXP rules and the TIP-854 ABI
+    /// length check in the signature precompiles.
+    fn allow_tvm_osaka(&self) -> bool {
+        self.chain_parameter_long(b"ALLOW_TVM_OSAKA")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            == 1
+    }
+
     /// Latest block number (head). Used by some precompiles to compute
     /// expiry windows.
     fn block_number(&self) -> i64;

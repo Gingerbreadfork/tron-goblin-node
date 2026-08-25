@@ -2099,3 +2099,48 @@ fn create_init_transfer_failure_forfeits_the_forwarded_energy() {
         "the caller must not have had the energy to reach its SSTORE"
     );
 }
+
+/// A CALL into an address revm ships as a precompile but java-tron does not
+/// (KZG at 0x0a under Cancun, BLS12-381 at 0x0b.. under Prague) is a plain
+/// call to an empty account: success with no return data.
+#[test]
+fn revm_only_precompile_addresses_are_plain_accounts() {
+    fn call_flag_of(target_low: u8, proposals: &[&[u8]]) -> u8 {
+        let stores = fresh_stores();
+        for key in proposals {
+            stores.dynamic_properties.put_long(key, 1);
+        }
+        let mut target = [0u8; 20];
+        target[19] = target_low;
+        let mut bc = Vec::new();
+        bc.extend_from_slice(&[0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0]);
+        bc.push(0x73);
+        bc.extend_from_slice(&target);
+        bc.extend_from_slice(&[0x61, 0xff, 0xff]);
+        bc.push(0xf1);
+        bc.extend_from_slice(&[0x60, 0, 0x52, 0x60, 0x20, 0x60, 0, 0xf3]);
+        let owner = fund_account(&stores, 0xaa, 1_000_000_000);
+        let contract = install_contract(&stores, 0xbb, &bc);
+        match run_with_limit(&stores, &trigger_of(owner, contract), 1_000_000) {
+            VmOutcome::Success { return_data, .. } => return_data[31],
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+    let cancun: &[&[u8]] = &[
+        b"ALLOW_TVM_ISTANBUL",
+        b"ALLOW_TVM_LONDON",
+        b"ALLOW_TVM_SHANGHAI",
+        b"ALLOW_TVM_CANCUN",
+    ];
+    // 0x0a is ValidateMultiSign on TRON only under ALLOW_TVM_SOLIDITY_059.
+    assert_eq!(call_flag_of(0x0a, cancun), 1);
+    let prague: &[&[u8]] = &[
+        b"ALLOW_TVM_ISTANBUL",
+        b"ALLOW_TVM_LONDON",
+        b"ALLOW_TVM_SHANGHAI",
+        b"ALLOW_TVM_CANCUN",
+        b"ALLOW_TVM_PRAGUE",
+    ];
+    assert_eq!(call_flag_of(0x0b, prague), 1);
+    assert_eq!(call_flag_of(0x11, prague), 1);
+}

@@ -113,6 +113,9 @@ impl EvmContext for TronEvmContext {
     fn allow_tvm_selfdestruct_restriction(&self) -> bool {
         self.proposals.allow_tvm_selfdestruct_restriction
     }
+    fn allow_tvm_osaka(&self) -> bool {
+        self.proposals.allow_tvm_osaka
+    }
     fn block_number(&self) -> i64 {
         self.block_number
     }
@@ -619,8 +622,21 @@ where
             return Ok(Some(result));
         }
 
-        // Fall through to standard Ethereum precompiles.
-        <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, context, inputs)
+        // Only the standard precompiles java-tron also ships fall through to
+        // revm's set. Every other address is a plain account there — including
+        // revm's own KZG (0x0a), BLS12-381 (0x0b..0x11) and P256 (0x100)
+        // entries, and a TRON precompile whose proposal gate is off.
+        let pre_addr: [u8; 20] = inputs.bytecode_address.into();
+        match PrecompileImpl::from_address(&pre_addr) {
+            Some(
+                PrecompileImpl::Sha256
+                | PrecompileImpl::Identity
+                | PrecompileImpl::Bn128Add
+                | PrecompileImpl::Bn128Mul
+                | PrecompileImpl::Bn128Pairing,
+            ) => <EthPrecompiles as PrecompileProvider<CTX>>::run(&mut self.eth, context, inputs),
+            _ => Ok(None),
+        }
     }
 
     fn warm_addresses(&self) -> &AddressSet {

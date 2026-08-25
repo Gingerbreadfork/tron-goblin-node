@@ -34,6 +34,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arith
 [dev-dependencies]
 hex.workspace = true
 hex-literal.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "extract_sapling_vk"

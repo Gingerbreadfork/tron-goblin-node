@@ -652,6 +652,11 @@ fn execute_trigger_inner(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+            // TRON has no EIP-7825 tx gas cap (revm's OSAKA default is 2^24);
+            // the energy limit is bounded by the fee limit alone. EIP-7623's
+            // calldata floor never applies because the Frontier-pinned
+            // `gas_params` above carry no floor entries.
+            cfg.tx_gas_limit_cap = Some(u64::MAX);
             // TRON fork: java-tron enforces NO contract-code-size limit on
             // deployment. `Program.createContractImpl` only checks there is
             // enough energy to pay `saveCodeEnergy = code_len * getCreateData()`
@@ -1025,6 +1030,11 @@ fn execute_trigger_inner_with_tracer(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+            // TRON has no EIP-7825 tx gas cap (revm's OSAKA default is 2^24);
+            // the energy limit is bounded by the fee limit alone. EIP-7623's
+            // calldata floor never applies because the Frontier-pinned
+            // `gas_params` above carry no floor entries.
+            cfg.tx_gas_limit_cap = Some(u64::MAX);
             // TRON fork: java-tron enforces NO contract-code-size limit on
             // deployment. `Program.createContractImpl` only checks there is
             // enough energy to pay `saveCodeEnergy = code_len * getCreateData()`
@@ -1673,6 +1683,11 @@ fn execute_create_inner(
             // check must stay OFF (else every tx is rejected InvalidChainId).
             cfg.chain_id = chain_id;
             cfg.tx_chain_id_check = false;
+            // TRON has no EIP-7825 tx gas cap (revm's OSAKA default is 2^24);
+            // the energy limit is bounded by the fee limit alone. EIP-7623's
+            // calldata floor never applies because the Frontier-pinned
+            // `gas_params` above carry no floor entries.
+            cfg.tx_gas_limit_cap = Some(u64::MAX);
             // TRON fork: java-tron enforces NO contract-code-size limit on
             // deployment. `Program.createContractImpl` only checks there is
             // enough energy to pay `saveCodeEnergy = code_len * getCreateData()`

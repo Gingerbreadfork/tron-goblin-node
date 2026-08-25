@@ -228,8 +228,11 @@ impl PrecompileImpl {
     pub fn effective_energy_cost(
         self,
         input: &[u8],
-        _ctx: &dyn EvmContext,
+        ctx: &dyn EvmContext,
     ) -> Result<u64, crate::energy::EnergyError> {
+        if matches!(self, Self::ModExp) && ctx.allow_tvm_osaka() {
+            return Ok(modexp_energy_cost_tip7883(input));
+        }
         Ok(self.energy_cost(input))
     }
 
@@ -370,7 +373,7 @@ impl PrecompileImpl {
             // precompiles, so they're implemented here rather than
             // deferred to the interpreter.
             Self::Ripemd160 => Ok(ripemd160_precompile(input)),
-            Self::ModExp => Ok(modexp_precompile(input)),
+            Self::ModExp => modexp_precompile(input, ctx.allow_tvm_osaka()),
 
             // TRON's 0x01 returns the recovered address in the 21-byte form
             // and an empty payload on failure, so it can't defer upstream.
@@ -608,15 +611,79 @@ fn modexp_adjusted_exp_length(exp_high: &[u8], exp_len: usize) -> i128 {
     }
 }
 
-/// `0x05` — modular exponentiation. The energy is java's EIP-198 cost
-/// (see `modexp_energy_cost`); the OUTPUT bytes mirror java-tron's
-/// `ModExp.execute` exactly: parse `base`/`exp`/`mod` as unsigned
-/// big-endian, return empty bytes when the modulus is zero, otherwise
-/// `base^exp mod m` left-padded to `modLen` bytes.
-fn modexp_precompile(input: &[u8]) -> Vec<u8> {
+/// Largest `baseLen` / `expLen` / `modLen` MODEXP accepts under Osaka
+/// (TIP-7823 / EIP-7823).
+const MODEXP_UPPER_BOUND: usize = 1024;
+
+/// java-tron `ModExp.getEnergyTIP7883` — the Osaka (EIP-7883) schedule:
+/// `max(500, multComplexity * iterationCount)`, where `multComplexity` is 16
+/// up to 32-byte operands and `2 * ceil(maxLen / 8)^2` beyond, and exponents
+/// longer than 32 bytes count 16 per extra byte (8 under EIP-198). Clamped to
+/// `Long.MAX_VALUE` like the legacy formula.
+fn modexp_energy_cost_tip7883(input: &[u8]) -> u64 {
     let base_len = modexp_parse_len(input, 0);
     let exp_len = modexp_parse_len(input, 1);
     let mod_len = modexp_parse_len(input, 2);
+
+    let exp_high = modexp_parse_bytes(
+        input,
+        modexp_add_safely(MODEXP_ARGS_OFFSET, base_len),
+        exp_len.min(32),
+    );
+
+    let max_len = base_len.max(mod_len) as i128;
+    let mult_complexity: i128 = if max_len <= 32 {
+        16
+    } else {
+        let words = (max_len + 7) / 8;
+        2 * words * words
+    };
+
+    let leading_zeros = exp_high
+        .iter()
+        .position(|&b| b != 0)
+        .map(|i| i * 8 + (exp_high[i].leading_zeros() as usize))
+        .unwrap_or(exp_high.len() * 8);
+    let mut highest_bit = (8 * exp_high.len()).saturating_sub(leading_zeros) as i128;
+    if highest_bit > 0 {
+        highest_bit -= 1;
+    }
+    let iteration_count = if exp_len <= 32 {
+        highest_bit
+    } else {
+        16 * (exp_len as i128 - 32) + highest_bit
+    }
+    .max(1);
+
+    let energy = mult_complexity * iteration_count;
+    if energy < 500 {
+        500
+    } else if energy >= i64::MAX as i128 {
+        i64::MAX as u64
+    } else {
+        energy as u64
+    }
+}
+
+/// `0x05` — modular exponentiation. The energy is java's EIP-198 cost
+/// (see `modexp_energy_cost`; TIP-7883 under Osaka); the OUTPUT bytes mirror
+/// java-tron's `ModExp.execute` exactly: parse `base`/`exp`/`mod` as
+/// unsigned big-endian and return `base^exp mod m` left-padded to `modLen`
+/// bytes. A zero modulus yields empty bytes, or `modLen` zero bytes under
+/// Osaka (TIP-871). Under Osaka any length above 1024 is a failure result
+/// (TIP-7823), which spends the forwarded energy.
+fn modexp_precompile(input: &[u8], osaka: bool) -> PrecompileResult {
+    let base_len = modexp_parse_len(input, 0);
+    let exp_len = modexp_parse_len(input, 1);
+    let mod_len = modexp_parse_len(input, 2);
+
+    if osaka
+        && (base_len > MODEXP_UPPER_BOUND
+            || exp_len > MODEXP_UPPER_BOUND
+            || mod_len > MODEXP_UPPER_BOUND)
+    {
+        return Err(PrecompileError::SpendAllRevert);
+    }
 
     let base = modexp_parse_bytes(input, MODEXP_ARGS_OFFSET, base_len);
     let exp = modexp_parse_bytes(
@@ -630,22 +697,35 @@ fn modexp_precompile(input: &[u8]) -> Vec<u8> {
         mod_len,
     );
 
-    // java `isZero(mod)` → empty output (NOT modLen zeros).
+    // java `isZero(mod)` → empty output pre-Osaka (NOT modLen zeros);
+    // TIP-871 makes it `modLen` zero bytes.
     if modulus.iter().all(|&b| b == 0) {
-        return Vec::new();
+        return Ok(if osaka { vec![0u8; mod_len] } else { Vec::new() });
     }
 
     // `aurora_engine_modexp::modexp` returns the stripped big-endian
     // result (the same primitive revm uses). Left-pad to `modLen`,
     // matching java's `adjRes` length adjustment.
     let res = aurora_engine_modexp::modexp(&base, &exp, &modulus);
-    if res.len() >= mod_len {
+    Ok(if res.len() >= mod_len {
         res
     } else {
         let mut adj = vec![0u8; mod_len];
         adj[mod_len - res.len()..].copy_from_slice(&res);
         adj
+    })
+}
+
+/// TIP-854 (`PrecompiledContracts.isValidAbiEncoding`): under Osaka the
+/// signature precompiles only accept calldata that is whole 32-byte words,
+/// `header_words` of head, then a positive whole number of `item_words`
+/// items.
+fn is_canonical_sig_abi(data: &[u8], header_words: usize, item_words: usize) -> bool {
+    if data.len() % WORD_SIZE != 0 {
+        return false;
     }
+    let tail = data.len() as i64 - (header_words * WORD_SIZE) as i64;
+    tail > 0 && tail % (item_words * WORD_SIZE) as i64 == 0
 }
 
 /// `0x0000_0100` — EIP-7951 P256Verify (ECDSA over secp256r1 = NIST P-256).
@@ -1254,6 +1334,13 @@ fn ecrecover_precompile(input: &[u8]) -> Vec<u8> {
 fn batch_validate_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     const MAX_SIZE: usize = 16;
 
+    // TIP-854: java `doExecute` returns `Pair.of(false, EMPTY)` for
+    // non-canonical calldata (5 header words + 6 words per signature) — a
+    // failure result, not a caught throw.
+    if ctx.allow_tvm_osaka() && !is_canonical_sig_abi(input, 5, 6) {
+        return Err(PrecompileError::SpendAllRevert);
+    }
+
     // java `DataWord.parseArray` floors `len = data.length / WORD_SIZE`,
     // discarding any trailing partial word; `parse_words` rounds up. Truncate
     // to the floor count so `words.len()` and every `words[i]` access match
@@ -1371,6 +1458,13 @@ fn batch_validate_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
 
 fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     const MAX_SIZE: usize = 5;
+
+    // TIP-854: checked before the `words[]` accesses below, so non-canonical
+    // calldata (5 header words + 5 words per signature) is a failure result
+    // rather than an uncaught throw.
+    if ctx.allow_tvm_osaka() && !is_canonical_sig_abi(input, 5, 5) {
+        return Err(PrecompileError::SpendAllRevert);
+    }
 
     // java `DataWord.parseArray` is FLOOR division: `len = data.length /
     // WORD_SIZE`, discarding any trailing partial word. Our `parse_words`
