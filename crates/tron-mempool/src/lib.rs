@@ -138,6 +138,8 @@ pub enum MempoolError {
     },
     #[error("signer recovery failed: {0}")]
     BadSignature(String),
+    #[error("signature length {len} outside the on-chain 65..=68 range")]
+    BadSignatureLength { len: usize },
     #[error("duplicate tx_id (already in mempool)")]
     Duplicate,
     #[error("transaction was recently included in a block")]
@@ -170,6 +172,7 @@ impl MempoolError {
             MempoolError::Expired { .. } => "expired",
             MempoolError::ExpirationTooFar { .. } => "expiration_too_far",
             MempoolError::BadSignature(_) => "bad_signature",
+            MempoolError::BadSignatureLength { .. } => "bad_signature_length",
             MempoolError::Duplicate => "duplicate",
             MempoolError::AlreadyIncluded => "already_included",
             MempoolError::Full { .. } => "full",
@@ -353,6 +356,15 @@ impl TxMempool {
 
         if tx.signature.is_empty() {
             return Err(MempoolError::NoSignatures);
+        }
+        // java-tron 4.8.2 rejects (and disconnects the sender over) any tx whose
+        // signature is outside `[PER_SIGN_LENGTH, MAX_PER_SIGN_LENGTH]` = 65..=68
+        // bytes (`SignUtils.isValidLength`, checked on broadcast and relay). If
+        // we admitted a longer one we would relay it and be dropped by peers.
+        for sig in &tx.signature {
+            if sig.len() < 65 || sig.len() > 68 {
+                return Err(MempoolError::BadSignatureLength { len: sig.len() });
+            }
         }
         // Snapshot what we need from raw_data so the borrow doesn't
         // leak into the moved-tx insertion below.
@@ -904,6 +916,34 @@ mod tests {
         let id = m.submit(&bytes).expect("accept");
         assert_eq!(m.pending_count(), 1);
         assert!(m.get(&id).is_some());
+    }
+
+    /// java-tron 4.8.2 admits only 65..=68-byte signatures on broadcast/relay.
+    #[test]
+    fn submit_rejects_signature_outside_65_to_68_bytes() {
+        for len in [64usize, 69, 130] {
+            let m = TxMempool::new(MempoolConfig::default());
+            let mut tx = Transaction::decode(signed_tx(1, 60_000).as_slice()).unwrap();
+            let mut sig = tx.signature[0].clone();
+            sig.resize(len, 0);
+            tx.signature = vec![sig];
+            let err = m.submit(&tx.encode_to_vec()).unwrap_err();
+            assert!(
+                matches!(err, MempoolError::BadSignatureLength { len: l } if l == len),
+                "len {len} → {err:?}"
+            );
+        }
+    }
+
+    /// A 68-byte (word-padded `v`) signature is still admitted.
+    #[test]
+    fn submit_accepts_68_byte_padded_signature() {
+        let m = TxMempool::new(MempoolConfig::default());
+        let mut tx = Transaction::decode(signed_tx(1, 60_000).as_slice()).unwrap();
+        let mut sig = tx.signature[0].clone();
+        sig.resize(68, 0);
+        tx.signature = vec![sig];
+        assert!(m.submit(&tx.encode_to_vec()).is_ok());
     }
 
     #[test]

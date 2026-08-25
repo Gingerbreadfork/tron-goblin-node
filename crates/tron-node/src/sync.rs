@@ -7185,6 +7185,9 @@ where
         const MAX_TRXS_BATCH_BYTES: usize = 1_000_000;
         let mut batch: Vec<tron_proto::Transaction> = Vec::new();
         let mut batch_bytes = 0usize;
+        // java-tron 4.8.2 disconnects a peer whose Transactions message repeats a
+        // tx, so never serve the same id twice even if the fetch request did.
+        let mut served: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for raw in &inv.ids {
             if raw.len() != 32 {
                 misses += 1;
@@ -7192,6 +7195,9 @@ where
             }
             let mut h = [0u8; 32];
             h.copy_from_slice(raw);
+            if !served.insert(h) {
+                continue;
+            }
             match mempool.get(&h) {
                 Some(pending) => {
                     if pending.local {
