@@ -585,11 +585,14 @@ pub fn validate_exchange_transaction(
     // maintenance cycles later — exact awaits the ForkController (audit
     // coverage-gap #1). [Adversarial-block fidelity: java rejects the WHOLE
     // block; here only the tx is rejected — moot on honest replay.]
-    // Because of this gate, ALLOW_HARDEN_EXCHANGE_CALCULATION's swap path
-    // (java `SafeExchangeProcessor`) is unreachable: #98 needs VERSION_4_8_2,
-    // which implies VERSION_4_8_0_1 already passed.
+    // java `Manager.isExchangeTransaction` (4.8.2): the swap ban lifts once
+    // ALLOW_HARDEN_EXCHANGE_CALCULATION (#98) is set — the swap then runs on
+    // the hardened `SafeExchangeProcessor`. Before that, VERSION_4_8_0_1
+    // permanently rejects it.
     const VERSION_4_8_0_1_HARD_FORK_TIME_MS: i64 = 1_596_780_000_000;
-    if dyn_props.latest_block_header_timestamp().unwrap_or(0) >= VERSION_4_8_0_1_HARD_FORK_TIME_MS {
+    if !dyn_props.allow_harden_exchange_calculation()
+        && dyn_props.latest_block_header_timestamp().unwrap_or(0) >= VERSION_4_8_0_1_HARD_FORK_TIME_MS
+    {
         return Err(ActuatorError::Validate(
             "exchange transaction is forbidden once VERSION_4_8_0_1 is active",
         ));
@@ -672,16 +675,161 @@ pub fn validate_exchange_transaction(
     } else {
         (exchange.second_token_balance, exchange.first_token_balance)
     };
-    let another_token_quant = exchange_transaction_output(
-        sell_balance_before,
-        buy_balance_before,
-        token_quant,
-        dyn_props.allow_strict_math(),
-    );
+    let another_token_quant =
+        exchange_swap(dyn_props, sell_balance_before, buy_balance_before, token_quant)?;
     if another_token_quant < token_expected {
         return Err(ActuatorError::ExchangeOutputBelowExpected);
     }
     Ok(())
+}
+
+const EXCHANGE_SUPPLY: i128 = 1_000_000_000_000_000_000;
+
+/// The buy-token amount for a swap, plus the swapped pool balances, matching
+/// java `ExchangeCapsule.transaction`. Under `ALLOW_HARDEN_EXCHANGE_CALCULATION`
+/// (#98) it runs `SafeExchangeProcessor` and applies java's `addExact` /
+/// `subtractExact` + non-negative-balance guard; otherwise the legacy
+/// `ExchangeProcessor`. Shared by validate and execute so they cannot diverge.
+fn exchange_swap(
+    dyn_props: &DynamicPropertiesStore,
+    sell_balance_before: i64,
+    buy_balance_before: i64,
+    sell_quant: i64,
+) -> Result<i64, ActuatorError> {
+    if !dyn_props.allow_harden_exchange_calculation() {
+        return Ok(exchange_transaction_output(
+            sell_balance_before,
+            buy_balance_before,
+            sell_quant,
+            dyn_props.allow_strict_math(),
+        ));
+    }
+    let output = safe_exchange(sell_balance_before, buy_balance_before, sell_quant)?;
+    // java: newSell = addExact(sell, quant); newBuy = subtractExact(buy, output);
+    // then reject if either is negative.
+    let new_sell = sell_balance_before
+        .checked_add(sell_quant)
+        .ok_or(ActuatorError::Overflow)?;
+    let new_buy = buy_balance_before
+        .checked_sub(output)
+        .ok_or(ActuatorError::Overflow)?;
+    if new_sell < 0 || new_buy < 0 {
+        return Err(ActuatorError::Validate(
+            "Exchange balance must be >=0 after transaction",
+        ));
+    }
+    Ok(output)
+}
+
+/// Test hook for the JDK8 differential fixtures.
+#[doc(hidden)]
+pub fn safe_exchange_for_test(
+    sell_balance: i64,
+    buy_balance: i64,
+    sell_quant: i64,
+) -> Result<i64, ActuatorError> {
+    safe_exchange(sell_balance, buy_balance, sell_quant)
+}
+
+/// java `SafeExchangeProcessor.exchange` — the two-step Bancor curve in exact
+/// `BigDecimal` (scale-18 HALF_UP) with `StrictMath.pow`.
+fn safe_exchange(
+    sell_balance: i64,
+    buy_balance: i64,
+    sell_quant: i64,
+) -> Result<i64, ActuatorError> {
+    let relay = safe_exchange_to_supply(sell_balance, sell_quant)?;
+    safe_exchange_from_supply(buy_balance, relay)
+}
+
+/// java `SafeExchangeProcessor.exchangeToSupply`:
+/// `-SUPPLY * (1 - StrictMath.pow(1 + quant/newBalance, 0.0005))`, `setScale(0,
+/// DOWN)`. Returns the (non-negative, integer-valued) relay amount.
+fn safe_exchange_to_supply(balance: i64, quant: i64) -> Result<i128, ActuatorError> {
+    let new_balance = balance.checked_add(quant).ok_or(ActuatorError::Overflow)?;
+    if new_balance <= 0 {
+        return Err(ActuatorError::Overflow);
+    }
+    // BigDecimal.valueOf(quant).divide(valueOf(newBalance), 18, HALF_UP).
+    let q18 = div_round_half_up((quant as i128) * EXCHANGE_SUPPLY, new_balance as i128);
+    let base = one_plus_ratio_1e18_as_f64(q18);
+    let pow = tron_types::strict_math::strict_pow(base, 0.0005);
+    // -SUPPLY * (1 - D(pow)) = SUPPLY * (D(pow) - 1), truncated toward zero.
+    Ok(scale_times_decimal_minus_one(EXCHANGE_SUPPLY, pow))
+}
+
+/// java `SafeExchangeProcessor.exchangeFromSupply`:
+/// `balance * (StrictMath.pow(1 + supplyQuant/SUPPLY, 2000) - 1)`, `setScale(0,
+/// DOWN).longValueExact()`.
+fn safe_exchange_from_supply(balance: i64, supply_quant: i128) -> Result<i64, ActuatorError> {
+    // supplyQuant/SUPPLY at scale 18 is exact (SUPPLY == 1e18), so q18 == supplyQuant.
+    let base = one_plus_ratio_1e18_as_f64(supply_quant);
+    let pow = tron_types::strict_math::strict_pow(base, 2000.0);
+    let out = scale_times_decimal_minus_one(balance as i128, pow);
+    if out > i64::MAX as i128 || out < i64::MIN as i128 {
+        return Err(ActuatorError::Overflow);
+    }
+    Ok(out as i64)
+}
+
+/// `floor((num + den/2) / den)` for non-negative operands — java
+/// `BigDecimal.divide(_, HALF_UP)`.
+fn div_round_half_up(num: i128, den: i128) -> i128 {
+    let q = num / den;
+    let r = num % den;
+    if 2 * r >= den {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// The exact `f64` value of `1 + q18 / 1e18` for `q18 in [0, 1e18]`, matching
+/// java `BigDecimal(1 + q18/1e18, scale 18).doubleValue()`. The result lies in
+/// `(1, 2]`, so its mantissa is `round_half_even(q18 * 2^52 / 1e18)`.
+fn one_plus_ratio_1e18_as_f64(q18: i128) -> f64 {
+    debug_assert!((0..=EXCHANGE_SUPPLY).contains(&q18));
+    let scaled = q18 << 52;
+    let den = EXCHANGE_SUPPLY;
+    let q = scaled / den;
+    let r = scaled % den;
+    // round half to even
+    let m = if 2 * r > den || (2 * r == den && (q & 1) == 1) {
+        q + 1
+    } else {
+        q
+    };
+    if m >= (1i128 << 52) {
+        2.0
+    } else {
+        1.0 + (m as f64) / ((1u64 << 52) as f64)
+    }
+}
+
+/// `scale * (D(x) - 1)` truncated toward zero, where `D(x)` is java
+/// `BigDecimal.valueOf(x)` — the JDK8 `Double.toString` shortest decimal. `x`
+/// is in `[1, 2]`, so `D(x) - 1 >= 0`.
+fn scale_times_decimal_minus_one(scale: i128, x: f64) -> i128 {
+    let (mant, k) = jdk8_double_to_decimal(x);
+    let ten_k = pow10_i128(k);
+    // scale * (mant - 10^k) / 10^k, truncating toward zero.
+    (scale * (mant - ten_k)) / ten_k
+}
+
+fn pow10_i128(k: u32) -> i128 {
+    let mut v: i128 = 1;
+    for _ in 0..k {
+        v *= 10;
+    }
+    v
+}
+
+/// JDK8 `Double.toString(x)` for `x in [1, 2]`, as `(mantissa, scale)` with
+/// `x == mantissa * 10^-scale`. JDK8's `FloatingDecimal` is not always the
+/// shortest round-tripping decimal (unlike Rust's formatter), so this
+/// reproduces its algorithm rather than parsing `format!("{x}")`.
+fn jdk8_double_to_decimal(x: f64) -> (i128, u32) {
+    crate::jdk_dtoa::to_decimal(x)
 }
 
 /// java `ExchangeCapsule.transaction` / `ExchangeProcessor.exchange`: the
@@ -715,7 +863,6 @@ pub fn execute_exchange_transaction(
     asset_v1: &AssetIssueStore,
     contract: &ExchangeTransactionContract,
 ) -> Result<ExecutionResult, ActuatorError> {
-    let use_strict_math = dyn_props.allow_strict_math();
     let owner = require_owner(&contract.owner_address)?;
     let mut exchange = read_exchange_final(v1, v2, dyn_props, contract.exchange_id)?;
 
@@ -746,12 +893,7 @@ pub fn execute_exchange_transaction(
     // (fdlibm) over `Math.pow` on `allowStrictMath` (proposal 87); the `pow`
     // helper mirrors that — `strict_pow` (bit-exact fdlibm) when the flag is on,
     // `f64::powf` (== pre-87 `Math.pow`) when off.
-    let output = exchange_transaction_output(
-        my_balance_before,
-        other_balance_before,
-        contract.quant,
-        use_strict_math,
-    );
+    let output = exchange_swap(dyn_props, my_balance_before, other_balance_before, contract.quant)?;
     if output < contract.expected {
         return Err(ActuatorError::ExchangeOutputBelowExpected);
     }

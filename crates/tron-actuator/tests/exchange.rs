@@ -903,3 +903,54 @@ fn withdraw_precision_check_is_exact_under_harden_exchange_calculation() {
     // Exact multiples carry no fraction.
     assert!(run(100_000_000, true).is_ok());
 }
+
+/// TIP-836 (#98): once ALLOW_HARDEN_EXCHANGE_CALCULATION is set, the swap is
+/// no longer rejected (java `Manager.isExchangeTransaction` returns false) and
+/// runs on the hardened `SafeExchangeProcessor`. Output matches the reference
+/// JDK8 value for this pool (validated exhaustively in tests/safe_exchange.rs).
+#[test]
+fn hardened_swap_is_accepted_and_matches_reference() {
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
+    seed_trx_asset_exchange(&ctx, 1, ALICE, 1_000_000_000, 1_000_000_000);
+    // Post-VERSION_4_8_0_1 timestamp: the ban would fire but for #98.
+    ctx.dp.save_latest_block_header_timestamp(1_700_000_000_000);
+    ctx.dp.put_long(b"ALLOW_HARDEN_EXCHANGE_CALCULATION", 1);
+    let c = ExchangeTransactionContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(),
+        quant: 100_000_000,
+        expected: 90_000_000,
+    };
+    exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c).unwrap();
+    exchange::execute_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &ctx.av1, &c)
+        .unwrap();
+    let ex = ctx.v2.get(1).unwrap().unwrap();
+    assert_eq!(ex.first_token_balance, 1_100_000_000);
+    assert_eq!(ex.second_token_balance, 1_000_000_000 - 90_909_090);
+    let alice = ctx.accounts.get(&addr(ALICE)).unwrap().unwrap();
+    assert_eq!(*alice.asset_v2.get("1000001").unwrap(), 1_000_000_000 + 90_909_090);
+}
+
+/// The swap ban still applies when ALLOW_HARDEN_EXCHANGE_CALCULATION is off
+/// (the post-VERSION_4_8_0_1 mainnet state before #98).
+#[test]
+fn swap_is_rejected_until_harden_exchange_activates() {
+    let ctx = ctx_with_alice(10_000_000_000, 1_000_000_000, 0);
+    seed_trx_asset_exchange(&ctx, 1, ALICE, 1_000_000_000, 1_000_000_000);
+    ctx.dp.save_latest_block_header_timestamp(1_600_000_000_000);
+    let c = ExchangeTransactionContract {
+        owner_address: ALICE.to_vec(),
+        exchange_id: 1,
+        token_id: b"_".to_vec(),
+        quant: 100_000_000,
+        expected: 1,
+    };
+    let err =
+        exchange::validate_exchange_transaction(&ctx.accounts, &ctx.v1, &ctx.v2, &ctx.dp, &c)
+            .unwrap_err();
+    assert!(
+        matches!(err, ActuatorError::Validate(m) if m.contains("forbidden")),
+        "got: {err:?}"
+    );
+}
