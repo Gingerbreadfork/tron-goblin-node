@@ -329,12 +329,17 @@ impl SyncLeadership {
         self.network_tip.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Reset the staleness timer — the leader just applied a block.
-    /// No-op if `peer` isn't the current leader.
+    /// Reset the staleness timer — the leader just applied a block. The
+    /// fleet-wide idle clock restarts too: an applied block IS a head
+    /// advance, and a leader deep in a long drain never reaches the loop
+    /// iteration that would otherwise report it, so a slow (but live) apply
+    /// must not look like a wedge to a standby's watchdog. No-op if `peer`
+    /// isn't the current leader.
     pub fn note_progress(&self, peer: &str) {
         let mut g = self.inner.lock().expect("SyncLeadership poisoned");
         if g.leader.as_deref() == Some(peer) {
             g.last_progress = Instant::now();
+            g.last_head_advance = Instant::now();
         }
     }
 
@@ -9340,6 +9345,24 @@ mod leadership_tests {
         // Still no head advance: the clock keeps running from the reset.
         std::thread::sleep(STALE + Duration::from_millis(10));
         assert!(l.head_idle() >= STALE, "the grace is one window, not immunity");
+    }
+
+    /// The leader applying a block refreshes the fleet-wide idle clock even
+    /// though it never reaches the loop iteration that reports the head, so a
+    /// slow but live drain is not mistaken for a wedge by a standby.
+    #[test]
+    fn leader_progress_refreshes_the_idle_clock() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE, true));
+        l.note_head(100);
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        assert!(l.head_idle() >= STALE);
+        l.note_progress("A");
+        assert!(l.head_idle() < STALE, "an applied block is a head advance");
+        // A non-leader's bogus progress touches neither clock.
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        l.note_progress("B");
+        assert!(l.head_idle() >= STALE, "only the leader's progress counts");
     }
 
     #[test]
