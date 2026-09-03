@@ -225,6 +225,14 @@ struct LeaderState {
     /// preemption (`PREEMPT_COOLDOWN`) so several current peers can't thrash
     /// the slot before a freshly-promoted leader catches up.
     last_change: Instant,
+    /// Highest applied head any driver has reported, and when it last rose.
+    /// Fleet-wide and never reset by a leadership change, so the no-advance
+    /// stall watchdog measures how long the CHAIN has been idle rather than
+    /// how long the current leader has held the slot — a wedged pool that
+    /// rotates leadership every `LEADERSHIP_STALE` would otherwise restart
+    /// the watchdog on every handoff and never hard-reset.
+    max_head: i64,
+    last_head_advance: Instant,
 }
 
 impl SyncLeadership {
@@ -234,6 +242,8 @@ impl SyncLeadership {
                 leader: None,
                 last_progress: Instant::now(),
                 last_change: Instant::now(),
+                max_head: 0,
+                last_head_advance: Instant::now(),
             }),
             network_tip: std::sync::atomic::AtomicI64::new(0),
             apply_lock: std::sync::Mutex::new(()),
@@ -326,6 +336,24 @@ impl SyncLeadership {
         if g.leader.as_deref() == Some(peer) {
             g.last_progress = Instant::now();
         }
+    }
+
+    /// Record the applied head as seen by any driver. Only a rise past the
+    /// highest head reported so far restarts the fleet-wide idle clock read
+    /// by [`Self::head_idle`]; leadership changes never touch it.
+    pub fn note_head(&self, head: i64) {
+        let mut g = self.inner.lock().expect("SyncLeadership poisoned");
+        if head > g.max_head {
+            g.max_head = head;
+            g.last_head_advance = Instant::now();
+        }
+    }
+
+    /// How long the applied head has been sitting still across the whole
+    /// driver fleet, regardless of who has led in the meantime.
+    pub fn head_idle(&self) -> Duration {
+        let g = self.inner.lock().expect("SyncLeadership poisoned");
+        g.last_head_advance.elapsed()
     }
 
     /// Relinquish leadership if `peer` holds it (on disconnect), freeing
@@ -3348,17 +3376,17 @@ impl SyncDriver {
             // cover them (the watchdog backstops the rare case where no live
             // window does). Drain whatever's already delivered immediately.
             if multi_peer && am_leader && !was_leader {
-                // Start THIS leader's stall clocks at promotion. Both self-heal
-                // watchdogs below measure elapsed time against counters that
-                // otherwise still carry values from before this driver took
-                // leadership — so a driver promoted after the head has been idle
-                // (no-advance watchdog: `last_head_advance`) or near a crawl
-                // sample boundary (crawl watchdog: `crawl_window_at`) can trip
-                // the hard-reset in the very iteration it takes the slot,
-                // resetting the pool and dropping the peer before its
-                // `drain_pool` below ever applies a block. Resetting both here
-                // gives each new leader a full `STALL_RESET_AFTER` of real tenure
-                // before either self-heal may fire.
+                // Start THIS leader's local clocks at promotion so the crawl
+                // watchdog below samples a full `STALL_RESET_AFTER` of real
+                // tenure instead of a window that began before this driver led.
+                // The no-advance watchdog deliberately does NOT get a fresh
+                // start: it reads the fleet-wide `SyncLeadership::head_idle`,
+                // which only a rising head restarts. A wedged pool that turns
+                // leadership over every `LEADERSHIP_STALE` (each new leader
+                // inheriting the same undeliverable head-of-line block) must
+                // still reach the hard reset; the `drain_pool` just below runs
+                // before that check, so a leader that can apply anything from
+                // the pool advances the head and never trips it.
                 let promoted_head = self.head_number();
                 last_head_advance = Instant::now();
                 last_head_num = promoted_head;
@@ -3414,7 +3442,11 @@ impl SyncDriver {
             // advanced for `STALL_RESET_AFTER` keeps the node idle with peers
             // attached — observed after a leadership transfer wedged the
             // inherited sync context (head < offered_max blocks the refresh, and
-            // a gap / reset pool leaves nothing the rebuild above could adopt).
+            // a gap / reset pool leaves nothing the rebuild above could adopt),
+            // and again as a lost head-of-line block that every successive
+            // leader inherited for hours while the slot rotated every
+            // `LEADERSHIP_STALE`. The idle time is therefore measured fleet-wide
+            // (`SyncLeadership::head_idle`), not per leader tenure.
             // This is the backstop for anything the graceful rebuild can't fix:
             // hard-reset the shared pool, release leadership, and drop this
             // connection so a fresh handshake re-establishes a clean context
@@ -3428,19 +3460,31 @@ impl SyncDriver {
                     last_head_num = head_now;
                     last_head_advance = Instant::now();
                 }
+                // The no-advance clock is fleet-wide: a leader that inherits a
+                // wedged pool and is displaced after `LEADERSHIP_STALE` must not
+                // hand the next leader a fresh 45s — the chain's own idle time
+                // is what counts, so the hard reset fires however often the
+                // slot changes hands.
+                let head_idle = match &self.leadership {
+                    Some(l) => {
+                        l.note_head(head_now);
+                        l.head_idle()
+                    }
+                    None => last_head_advance.elapsed(),
+                };
                 let behind_ms =
                     crate::node_statistics::unix_now_ms() as i64 - last_block_ts;
                 if multi_peer
                     && am_leader
                     && last_block_ts > 0
                     && behind_ms > STALL_RESET_LAG_MS
-                    && last_head_advance.elapsed() >= STALL_RESET_AFTER
+                    && head_idle >= STALL_RESET_AFTER
                 {
                     warn!(
                         peer,
                         head = head_now,
                         behind_s = behind_ms / 1000,
-                        stalled_s = last_head_advance.elapsed().as_secs(),
+                        stalled_s = head_idle.as_secs(),
                         "sync wedged behind the tip; hard-resetting the fetch pool \
                          and reconnecting for a clean sync context"
                     );
@@ -9240,6 +9284,29 @@ mod leadership_tests {
         l.note_progress("B");
         std::thread::sleep(STALE / 2 + Duration::from_millis(10));
         assert!(l.claim_or_check("B", STALE, true), "A's timer was untouched, so B preempts");
+    }
+
+    /// The fleet-wide head-idle clock ignores leadership churn: a standby
+    /// that takes over a stalled slot inherits the chain's idle time instead
+    /// of starting a fresh window, and only a rising head restarts it.
+    #[test]
+    fn head_idle_survives_leadership_handoffs() {
+        let l = SyncLeadership::new();
+        assert!(l.claim_or_check("A", STALE, true));
+        l.note_head(100);
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        let before = l.head_idle();
+        assert!(before >= STALE, "idle clock runs while the head sits still");
+        // A stalled past STALE, B takes the slot — the idle clock keeps counting.
+        assert!(l.claim_or_check("B", STALE, true));
+        assert!(l.head_idle() >= before, "a handoff must not restart the idle clock");
+        // A stale or equal head report is not an advance.
+        l.note_head(100);
+        l.note_head(99);
+        assert!(l.head_idle() >= before, "non-rising heads leave the clock alone");
+        // Only a rising head restarts it.
+        l.note_head(101);
+        assert!(l.head_idle() < STALE, "a rising head restarts the idle clock");
     }
 
     #[test]
