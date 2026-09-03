@@ -483,7 +483,22 @@ impl EthFrame<EthInterpreter> {
         // (Custom is our pre-installed top-level path, handled in execute.rs);
         // a create that later reverts simply never reaches commit, so the
         // deferred write is dropped.
+        // TRON fork: java `Program.createContractImpl` calls the target taken
+        // when an account row already exists there and — from
+        // `ALLOW_TVM_CONSTANTINOPLE` (#26) on — a `SmartContract` row as well
+        // (`isContractExist`); a contract whose deposited code is empty still
+        // collides. It sets a `BytecodeExecutionException` on the child result
+        // and returns before `refundEnergyAfterVM`, so the creating frame
+        // forfeits everything it forwarded. revm's own rule below (non-empty
+        // code or a nonce) never sees an empty-code contract, which let the
+        // init code run again and refunded the parent.
         if !matches!(inputs.scheme(), CreateScheme::Custom { .. }) {
+            let tron_taken = context.tron_account_exists_or_created(created_address)
+                && (!context.tron_allow_tvm_constantinople()
+                    || context.tron_is_contract(created_address));
+            if tron_taken {
+                return return_error(InstructionResult::CreateCollision);
+            }
             context.tron_record_created_contract(created_address, inputs.caller(), is_create2);
         }
         let journal = context.journal_mut();
