@@ -356,6 +356,17 @@ impl SyncLeadership {
         g.last_head_advance.elapsed()
     }
 
+    /// A stall watchdog just hard-reset the fetch pool. Restart the idle
+    /// clock so the leader that inherits the empty pool gets a full
+    /// `STALL_RESET_AFTER` to refill and drain it; without this every
+    /// successive leader reads the same stale idle time and resets again
+    /// within seconds, dropping a peer each time and never letting a fetch
+    /// complete.
+    pub fn note_reset(&self) {
+        let mut g = self.inner.lock().expect("SyncLeadership poisoned");
+        g.last_head_advance = Instant::now();
+    }
+
     /// Relinquish leadership if `peer` holds it (on disconnect), freeing
     /// the slot so a standby can take over immediately rather than waiting
     /// out [`LEADERSHIP_STALE`].
@@ -3491,6 +3502,9 @@ impl SyncDriver {
                     if let Some(pool) = &self.fetch_pool {
                         pool.reset();
                     }
+                    if let Some(l) = &self.leadership {
+                        l.note_reset();
+                    }
                     self.release_leadership(peer);
                     return PeerOutcome::PeerFailure(
                         "self-heal: sync wedged behind the tip; reconnecting".to_string(),
@@ -3530,6 +3544,9 @@ impl SyncDriver {
                         );
                         if let Some(pool) = &self.fetch_pool {
                             pool.reset();
+                        }
+                        if let Some(l) = &self.leadership {
+                            l.note_reset();
                         }
                         self.release_leadership(peer);
                         return PeerOutcome::PeerFailure(
@@ -9307,6 +9324,22 @@ mod leadership_tests {
         // Only a rising head restarts it.
         l.note_head(101);
         assert!(l.head_idle() < STALE, "a rising head restarts the idle clock");
+    }
+
+    /// A hard reset restarts the idle clock so the next leader gets a full
+    /// window before the watchdog may fire again, instead of every successive
+    /// leader resetting on the same stale reading.
+    #[test]
+    fn hard_reset_restarts_the_idle_clock() {
+        let l = SyncLeadership::new();
+        l.note_head(100);
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        assert!(l.head_idle() >= STALE);
+        l.note_reset();
+        assert!(l.head_idle() < STALE, "a reset grants the next leader a fresh window");
+        // Still no head advance: the clock keeps running from the reset.
+        std::thread::sleep(STALE + Duration::from_millis(10));
+        assert!(l.head_idle() >= STALE, "the grace is one window, not immunity");
     }
 
     #[test]
