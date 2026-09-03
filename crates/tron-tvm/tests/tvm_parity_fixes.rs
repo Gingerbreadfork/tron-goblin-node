@@ -468,3 +468,122 @@ fn static_context_delegate_reverts_without_mutation() {
         "a static-context DELEGATERESOURCE must not write a DelegatedResource row"
     );
 }
+
+// =============================================================================
+// A failed CREATE2 in a version-0 frame leaves the parent with no energy.
+// =============================================================================
+//
+// java `Program.createContractImpl` spends `getCreateEnergy(remaining)` on the
+// parent up front — ALL of it for a version-0 frame — and on any child
+// exception (here `notEnoughSpendEnergy` at the code deposit) returns before
+// `refundEnergyAfterVM`, so the parent forfeits the whole forwarded budget and
+// dies on its very next opcode with OUT_OF_ENERGY. A version-1 frame retained
+// 1/64 and carries on.
+
+/// Init code `PUSH2 40000; PUSH1 0; RETURN` left-aligned in one 32-byte word:
+/// the constructor returns 40,000 zero bytes, a 8,000,000-energy deposit that
+/// no 5,000,000 budget can pay.
+fn big_deposit_init_word() -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[..6].copy_from_slice(&[0x61, 0x9c, 0x40, 0x60, 0x00, 0xf3]);
+    w
+}
+
+/// `MSTORE(0, init); CREATE2(0, 0, 6, salt 0); POP; PUSH1 0; PUSH1 0; REVERT`.
+fn create2_big_deposit_then_revert() -> Vec<u8> {
+    let mut bc = vec![0x7f];
+    bc.extend_from_slice(&big_deposit_init_word());
+    bc.extend_from_slice(&[0x60, 0x00, 0x52]); // MSTORE(0, word)
+    bc.extend_from_slice(&[0x60, 0x00]); // salt
+    bc.extend_from_slice(&[0x60, 0x06]); // size
+    bc.extend_from_slice(&[0x60, 0x00]); // offset
+    bc.extend_from_slice(&[0x60, 0x00]); // value
+    bc.push(0xf5); // CREATE2
+    bc.push(0x50); // POP — the first opcode after the failed create
+    bc.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xfd]); // REVERT(0, 0)
+    bc
+}
+
+/// `CALL(gas=all, target, 0, 0, 0, 0, 0); POP; STOP` — a root that forwards
+/// everything to `target` and then runs one more opcode.
+fn call_then_stop(target: [u8; 21]) -> Vec<u8> {
+    let mut bc = Vec::new();
+    bc.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00]);
+    bc.push(0x73); // PUSH20 target
+    bc.extend_from_slice(&target[1..]);
+    bc.push(0x5a); // GAS
+    bc.push(0xf1); // CALL
+    bc.push(0x50); // POP
+    bc.push(0x00); // STOP
+    bc
+}
+
+fn create2_stores() -> (VmStores, Arc<ContractStore>) {
+    let (stores, contracts) = fresh_stores();
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_COMPATIBLE_EVM", 1);
+    stores.dynamic_properties.put_long(b"ALLOW_TVM_CONSTANTINOPLE", 1);
+    (stores, contracts)
+}
+
+#[test]
+fn version_0_frame_dies_out_of_energy_after_a_failed_create2() {
+    let (stores, contracts) = create2_stores();
+    let user = tron_addr(0xa2);
+    let c = tron_addr(0xc2);
+    install_eoa(&stores, user, 0);
+    install_contract(&stores, c, create2_big_deposit_then_revert(), 0);
+    set_contract_version(&contracts, c, 0);
+
+    match run(&stores, user, c) {
+        VmOutcome::Halt { result, energy_used, .. } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::OutOfEnergy,
+                "the forfeited create budget leaves nothing for POP"
+            );
+            assert_eq!(energy_used, 5_000_000, "java spendAllEnergy: the whole limit");
+        }
+        other => panic!("expected an OUT_OF_ENERGY halt, got {other:?}"),
+    }
+}
+
+#[test]
+fn version_1_frame_keeps_a_64th_and_reverts_after_a_failed_create2() {
+    let (stores, contracts) = create2_stores();
+    let user = tron_addr(0xa3);
+    let c = tron_addr(0xc3);
+    install_eoa(&stores, user, 0);
+    install_contract(&stores, c, create2_big_deposit_then_revert(), 0);
+    set_contract_version(&contracts, c, 1);
+
+    match run(&stores, user, c) {
+        VmOutcome::Revert { energy_used, .. } => {
+            assert!(energy_used < 5_000_000, "the retained 1/64 is refunded on REVERT");
+            assert!(energy_used > 4_800_000, "the forwarded 63/64 is forfeited (used={energy_used})");
+        }
+        other => panic!("expected REVERT, got {other:?}"),
+    }
+}
+
+#[test]
+fn version_0_root_dies_out_of_energy_when_its_callee_forfeits_a_create2() {
+    // Root R (v0) CALLs F (v0) with everything; F forfeits it all on the failed
+    // CREATE2 and dies; R has nothing left for its own POP. java: OUT_OF_ENERGY.
+    let (stores, contracts) = create2_stores();
+    let user = tron_addr(0xa4);
+    let r = tron_addr(0xc4);
+    let f = tron_addr(0xc5);
+    install_eoa(&stores, user, 0);
+    install_contract(&stores, f, create2_big_deposit_then_revert(), 0);
+    install_contract(&stores, r, call_then_stop(f), 0);
+    set_contract_version(&contracts, r, 0);
+    set_contract_version(&contracts, f, 0);
+
+    match run(&stores, user, r) {
+        VmOutcome::Halt { result, energy_used, .. } => {
+            assert_eq!(result, tron_proto::transaction::result::ContractResult::OutOfEnergy);
+            assert_eq!(energy_used, 5_000_000);
+        }
+        other => panic!("expected an OUT_OF_ENERGY halt, got {other:?}"),
+    }
+}
