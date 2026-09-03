@@ -38,7 +38,9 @@
 //!   returned an empty array (→ DATA_FALSE).
 //! * Duplicate handling in ValidateMultiSign skips only an exact
 //!   (addr ‖ sig) pair: the same key signing with two different signatures
-//!   (e.g. low-s and high-s of one signature) is counted TWICE.
+//!   (e.g. low-s and high-s of one signature) reaches `MUtil.checkCPUTime()`,
+//!   which throws `OutOfTimeException` once `VERSION_4_7_1` has passed (the
+//!   pre-fork code counted the weight TWICE). The harness runs post-fork.
 //! * Energy: batch `((len/32 - 5) / 6) * 1500`, multi
 //!   `((len/32 - 5) / 5) * 1500`, both with java's truncating division —
 //!   multi goes NEGATIVE (-1500) for calldata shorter than 32 bytes, and
@@ -99,7 +101,8 @@ impl EvmContext for Ctx {
         0
     }
     fn block_timestamp_ms(&self) -> i64 {
-        0
+        // Past VERSION_4_7_1's hardForkTime, so the modern java rules apply.
+        1_700_000_000_000
     }
     fn all_witnesses(&self) -> Result<Vec<tron_proto::Witness>, EvmContextError> {
         Ok(vec![])
@@ -143,6 +146,7 @@ const HALF_N_BYTES: [u8; 32] =
 enum Thrown {
     Aioobe,
     Oom,
+    OutOfTime,
 }
 
 /// java `recoverAddrBySign` outcome: `new byte[0]` for short input, `null`
@@ -410,6 +414,7 @@ fn ref_multi(
     match ref_multi_inner(input, restriction, accounts, synthesize_default) {
         Ok(bytes) => Some(RefMulti::Out(bytes)),
         Err(Thrown::Aioobe) => Some(RefMulti::Throw),
+        Err(Thrown::OutOfTime) => Some(RefMulti::OutOfTime),
         Err(Thrown::Oom) => None,
     }
 }
@@ -418,6 +423,7 @@ fn ref_multi(
 enum RefMulti {
     Out(Vec<u8>),
     Throw,
+    OutOfTime,
 }
 
 fn ref_multi_inner(
@@ -479,11 +485,14 @@ fn ref_multi_inner(
         };
         let mut merged = rec_bytes.clone();
         merged.extend_from_slice(sign);
-        if executed.iter().any(|e| *e == rec_bytes) && executed.iter().any(|e| *e == merged) {
-            // Only an exact (addr ‖ sig) duplicate is skipped; the same
-            // address with a different signature falls through and is
-            // counted AGAIN.
-            continue;
+        if executed.iter().any(|e| *e == rec_bytes) {
+            if executed.iter().any(|e| *e == merged) {
+                // An exact (addr ‖ sig) duplicate is skipped.
+                continue;
+            }
+            // The same address with a different signature runs
+            // `MUtil.checkCPUTime()`, which throws post-VERSION_4_7_1.
+            return Err(Thrown::OutOfTime);
         }
         let weight = permission
             .keys
@@ -771,6 +780,7 @@ fn check_multi(
                 let agrees = match (&expect, &ours) {
                     (RefMulti::Out(want), Ok(got)) => got == want,
                     (RefMulti::Throw, Err(PrecompileError::UncaughtThrow)) => true,
+                    (RefMulti::OutOfTime, Err(PrecompileError::OutOfTime)) => true,
                     _ => false,
                 };
                 if !agrees {
@@ -781,6 +791,7 @@ fn check_multi(
                     let is_d1 = match (&without_default, &ours) {
                         (Some(RefMulti::Out(want)), Ok(got)) => got == want,
                         (Some(RefMulti::Throw), Err(PrecompileError::UncaughtThrow)) => true,
+                        (Some(RefMulti::OutOfTime), Err(PrecompileError::OutOfTime)) => true,
                         _ => false,
                     };
                     if is_d1 {
@@ -795,6 +806,7 @@ fn check_multi(
                             match &expect {
                                 RefMulti::Out(b) => format!("Out({})", hex::encode(b)),
                                 RefMulti::Throw => "UncaughtThrow".into(),
+                                RefMulti::OutOfTime => "OutOfTime".into(),
                             }
                         ));
                     }
@@ -1215,14 +1227,14 @@ fn validate_multi_sign_differential() {
             &[sign65(&owner, &h_a0), sign65(&owner, &h_a0)],
         ),
     ));
-    // The double-count quirk: one key, two DIFFERENT signature encodings
-    // (low-s and high-s) — java counts the weight twice, meeting a
-    // 2-threshold with a single key.
+    // One key, two DIFFERENT signature encodings (low-s and high-s): the
+    // pre-4.7.1 code counted the weight twice; post-fork `checkCPUTime()`
+    // throws OutOfTimeException.
     {
         let low = sign65(&owner, &h_b0);
         let high = flip_s(&low);
         cases.push((
-            "b_double_count_quirk".into(),
+            "b_same_key_two_signatures".into(),
             multi_input(addr_word(&b_addr), word_u64(0), msg, &[low, high]),
         ));
     }

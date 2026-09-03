@@ -1146,6 +1146,16 @@ pub enum HaltReason {
     /// is `contractResult UNKNOWN`. Frame-fatal, not transaction-fatal: a
     /// parent pushes zero and continues.
     TronPrecompileTransferFailure,
+    /// TRON fork: java-tron's `OutOfTimeException` raised deterministically
+    /// by `MUtil.checkCPUTime*` (e.g. `ValidateMultiSign` seeing one signer
+    /// twice with different signatures once `VERSION_4_7_1` has passed).
+    ///
+    /// `VM.play`'s outer catch rethrows it, `Program.callToAddress` does not
+    /// catch it, and `VMActuator.execute` handles it at the root with
+    /// `spendAllEnergy()` + `rejectInternalTransactions()`. Transaction-fatal:
+    /// every frame on the stack dies, the whole energy limit is consumed and
+    /// `RuntimeImpl.setResultCode` records `contractResult OUT_OF_TIME`.
+    TronOutOfTime,
     /// Nonce overflow.
     NonceOverflow,
     /// Create init code size exceeds limit (runtime).
@@ -1189,6 +1199,7 @@ impl fmt::Display for HaltReason {
             Self::TronPrecompileTransferFailure => {
                 write!(f, "precompile transfer failure")
             }
+            Self::TronOutOfTime => write!(f, "out of time"),
             Self::NonceOverflow => write!(f, "nonce overflow"),
             Self::CreateContractSizeLimit => write!(f, "create contract size limit"),
             Self::CreateContractStartingWithEF => {

@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use k256::ecdsa::SigningKey;
+
 use tron_chainbase::{
     AccountStore, CodeStore, ContractStateStore, DelegatedResourceStore, DelegationStore,
     DynamicPropertiesStore, KvBackend, MemBackend, StorageRowStore, WitnessStore,
@@ -2143,4 +2145,304 @@ fn revm_only_precompile_addresses_are_plain_accounts() {
     ];
     assert_eq!(call_flag_of(0x0b, prague), 1);
     assert_eq!(call_flag_of(0x11, prague), 1);
+}
+
+// =============================================================================
+// Deterministic OUT_OF_TIME raised inside a precompile (java `MUtil.checkCPUTime`)
+// =============================================================================
+//
+// `ValidateMultiSign` sees the same signer twice with two DIFFERENT valid
+// signatures and, post-`VERSION_4_7_1`, throws `OutOfTimeException`. Unlike
+// every other precompile fault that exception is transaction-fatal: `VM.play`
+// rethrows it through every frame and `VMActuator.execute` settles the root
+// with `spendAllEnergy()` and `contractResult OUT_OF_TIME`.
+
+const SECP256K1_N: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36,
+    0x41, 0x41,
+];
+
+fn ms_seeded_key(seed: u8) -> SigningKey {
+    let mut bytes = [0u8; 32];
+    bytes[0] = 0x01;
+    bytes[31] = seed;
+    SigningKey::from_bytes(&bytes.into()).expect("valid scalar")
+}
+
+fn ms_signer_low20(sk: &SigningKey) -> [u8; 20] {
+    let enc = sk.verifying_key().to_encoded_point(false);
+    let pub_hash = tron_crypto::hash::keccak256(&enc.as_bytes()[1..]);
+    let mut low20 = [0u8; 20];
+    low20.copy_from_slice(&pub_hash[12..32]);
+    low20
+}
+
+fn ms_sign(sk: &SigningKey, hash: &[u8; 32]) -> [u8; 65] {
+    let (sig, rec) = sk.sign_prehash_recoverable(hash).expect("sign");
+    let mut out = [0u8; 65];
+    out[..64].copy_from_slice(&sig.to_bytes());
+    out[64] = rec.to_byte();
+    out
+}
+
+/// `(r, s, v)` → `(r, n - s, v ^ 1)`: a second valid signature by the same key.
+fn ms_malleability_twin(sig: &[u8; 65]) -> [u8; 65] {
+    let mut out = *sig;
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let d = i16::from(SECP256K1_N[i]) - i16::from(sig[32 + i]) - borrow;
+        if d < 0 {
+            out[32 + i] = (d + 256) as u8;
+            borrow = 1;
+        } else {
+            out[32 + i] = d as u8;
+            borrow = 0;
+        }
+    }
+    out[64] ^= 1;
+    out
+}
+
+fn ms_word(v: usize) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..32].copy_from_slice(&(v as u64).to_be_bytes());
+    w
+}
+
+/// Post-#94 `extractSigArray` layout: count, one offset word per element,
+/// then 65 bytes per element laid out as `r || s || v` over three words.
+fn ms_encode_sig_array(sigs: &[[u8; 65]]) -> Vec<u8> {
+    let n = sigs.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&ms_word(n));
+    for i in 0..n {
+        out.extend_from_slice(&ms_word((n - 1 + i * 3) * 32));
+    }
+    for sig in sigs {
+        let mut v = [0u8; 32];
+        v[0] = sig[64];
+        out.extend_from_slice(&sig[0..32]);
+        out.extend_from_slice(&sig[32..64]);
+        out.extend_from_slice(&v);
+    }
+    out
+}
+
+/// `ValidateMultiSign` calldata: address word, permission id, payload,
+/// offset to the signature array, then the array.
+fn ms_calldata(addr21: &[u8; 21], perm_id: i32, payload: &[u8; 32], sigs: &[[u8; 65]]) -> Vec<u8> {
+    let mut addr_word = [0u8; 32];
+    addr_word[12..32].copy_from_slice(&addr21[1..]);
+    let mut input = Vec::new();
+    input.extend_from_slice(&addr_word);
+    input.extend_from_slice(&ms_word(perm_id as usize));
+    input.extend_from_slice(payload);
+    input.extend_from_slice(&ms_word(0x80));
+    input.extend_from_slice(&ms_encode_sig_array(sigs));
+    input
+}
+
+/// `SHA256(addr(21) || int32_BE(perm_id) || payload)`.
+fn ms_prehash(addr21: &[u8; 21], perm_id: i32, payload: &[u8; 32]) -> [u8; 32] {
+    let mut combine = Vec::new();
+    combine.extend_from_slice(addr21);
+    combine.extend_from_slice(&perm_id.to_be_bytes());
+    combine.extend_from_slice(payload);
+    tron_crypto::hash::sha256(&combine)
+}
+
+/// An account whose active permission (id 2) needs weight 2 from two keys
+/// of weight 1 each.
+fn ms_permission_account(stores: &VmStores, prefix: u8, keys: [&[u8; 20]; 2]) -> [u8; 21] {
+    let mut addr = [0u8; 21];
+    addr[0] = 0x41;
+    addr[1..].fill(prefix);
+    let tron_addr = tron_crypto::address::Address::from_raw(addr);
+    let key = |low20: &[u8; 20]| {
+        let mut a = vec![0x41u8];
+        a.extend_from_slice(low20);
+        tron_proto::Key { address: a, weight: 1 }
+    };
+    stores
+        .accounts
+        .put(
+            &tron_addr,
+            &tron_proto::Account {
+                address: addr.to_vec(),
+                active_permission: vec![tron_proto::Permission {
+                    r#type: tron_proto::permission::PermissionType::Active as i32,
+                    id: 2,
+                    permission_name: "active".into(),
+                    threshold: 2,
+                    parent_id: 0,
+                    operations: vec![0u8; 32],
+                    keys: vec![key(keys[0]), key(keys[1])],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    addr
+}
+
+/// `MSTORE` every word of `input` at offset 0, then
+/// `CALL(gas, target, 0, 0, len, 0, 0); POP`.
+fn call_op_with_input(target20: [u8; 20], gas: u64, input: &[u8]) -> Vec<u8> {
+    assert_eq!(input.len() % 32, 0);
+    let mut bc = Vec::new();
+    for (i, word) in input.chunks(32).enumerate() {
+        bc.extend(push32(word.try_into().unwrap()));
+        let off = (i * 32) as u16;
+        bc.push(0x61); // PUSH2 offset
+        bc.extend_from_slice(&off.to_be_bytes());
+        bc.push(0x52); // MSTORE
+    }
+    bc.extend_from_slice(&[0x60, 0x00]); // outSize
+    bc.extend_from_slice(&[0x60, 0x00]); // outOffset
+    bc.push(0x61); // PUSH2 inSize
+    bc.extend_from_slice(&(input.len() as u16).to_be_bytes());
+    bc.extend_from_slice(&[0x60, 0x00]); // inOffset
+    bc.extend_from_slice(&[0x60, 0x00]); // value
+    bc.push(0x73); // PUSH20 target
+    bc.extend_from_slice(&target20);
+    bc.extend(push32({
+        let mut g = [0u8; 32];
+        g[24..32].copy_from_slice(&gas.to_be_bytes());
+        g
+    }));
+    bc.push(0xf1); // CALL
+    bc.push(0x50); // POP the success flag
+    bc
+}
+
+/// Stores where 0x0a dispatches with the post-#94 signature parser, plus the
+/// calldata that makes it throw: key1 signs twice (low-s and its twin).
+fn out_of_time_multi_sign_fixture() -> (VmStores, Vec<u8>) {
+    let stores = multi_sign_stores();
+    stores
+        .dynamic_properties
+        .put_long(b"ALLOW_TVM_SELFDESTRUCT_RESTRICTION", 1);
+    let sk1 = ms_seeded_key(1);
+    let sk2 = ms_seeded_key(2);
+    let account = ms_permission_account(&stores, 0xab, [&ms_signer_low20(&sk1), &ms_signer_low20(&sk2)]);
+    let payload = [0x2eu8; 32];
+    let hash = ms_prehash(&account, 2, &payload);
+    let sig1 = ms_sign(&sk1, &hash);
+    let twin = ms_malleability_twin(&sig1);
+    (stores, ms_calldata(&account, 2, &payload, &[sig1, twin]))
+}
+
+fn run_with_limit_at(
+    stores: &VmStores,
+    trigger: &TriggerSmartContract,
+    limit: u64,
+    block_timestamp_ms: i64,
+) -> VmOutcome {
+    execute_trigger(
+        stores,
+        VmBlockEnv {
+            block_number: 100,
+            block_timestamp_ms,
+            ..Default::default()
+        },
+        trigger,
+        limit,
+    )
+}
+
+#[test]
+fn precompile_out_of_time_fails_the_transaction_with_the_whole_energy_limit() {
+    let (stores, calldata) = out_of_time_multi_sign_fixture();
+    let mut body = call_op_with_input(VALIDATE_MULTI_SIGN, 100_000, &calldata);
+    body.extend(sstore_op(0, 1)); // never reached
+    body.push(0x00); // STOP
+    let c = install_contract(&stores, 0xe5, &body);
+    let owner = fund_account(&stores, 0xa5, 1_000_000_000);
+    let limit = 1_000_000u64;
+
+    match run_with_limit(&stores, &trigger_of(owner, c), limit) {
+        VmOutcome::Halt {
+            result,
+            energy_used,
+            ..
+        } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::OutOfTime,
+                "OutOfTimeException → contractResult OUT_OF_TIME"
+            );
+            assert_eq!(
+                energy_used, limit,
+                "VMActuator's OutOfTimeException catch runs spendAllEnergy()"
+            );
+        }
+        other => panic!("expected an OUT_OF_TIME halt, got {other:?}"),
+    }
+    assert!(
+        slot_value(&stores, c, 0).is_empty(),
+        "the frame must not continue past the CALL"
+    );
+}
+
+#[test]
+fn precompile_out_of_time_unwinds_every_frame_not_just_the_caller() {
+    // A writes a marker, calls B with a bounded 200,000, then writes another
+    // marker. B calls 0x0a with the throwing input. java rethrows the
+    // OutOfTimeException through B and A alike: nothing A wrote survives, A's
+    // remaining budget is burned and the tx records OUT_OF_TIME. Contrast
+    // `nested_precompile_throw_kills_one_frame_not_the_transaction`.
+    let (stores, calldata) = out_of_time_multi_sign_fixture();
+    let mut b_body = call_op_with_input(VALIDATE_MULTI_SIGN, 100_000, &calldata);
+    b_body.push(0x00); // STOP
+    let b = install_contract(&stores, 0xe6, &b_body);
+
+    let mut a_body = sstore_op(1, 1); // marker before the CALL
+    a_body.extend(call_op(b[1..].try_into().unwrap(), 200_000));
+    a_body.extend(sstore_op(0, 1)); // marker after the CALL
+    a_body.push(0x00); // STOP
+    let a = install_contract(&stores, 0xe7, &a_body);
+    let owner = fund_account(&stores, 0xa6, 1_000_000_000);
+    let limit = 1_000_000u64;
+
+    match run_with_limit(&stores, &trigger_of(owner, a), limit) {
+        VmOutcome::Halt {
+            result,
+            energy_used,
+            ..
+        } => {
+            assert_eq!(
+                result,
+                tron_proto::transaction::result::ContractResult::OutOfTime
+            );
+            assert_eq!(
+                energy_used, limit,
+                "the parent's own budget is burned too, not just the 200,000 it forwarded"
+            );
+        }
+        other => panic!("expected an OUT_OF_TIME halt, got {other:?}"),
+    }
+    assert!(slot_value(&stores, a, 1).is_empty(), "A's pre-call write is reverted");
+    assert!(slot_value(&stores, a, 0).is_empty(), "A never resumes after the CALL");
+}
+
+#[test]
+fn precompile_out_of_time_rule_is_off_before_version_4_7_1() {
+    // Same calldata in a pre-fork block: java counted key1's weight twice,
+    // the call returns 1 and the contract carries on to STOP.
+    let (stores, calldata) = out_of_time_multi_sign_fixture();
+    let mut body = call_op_with_input(VALIDATE_MULTI_SIGN, 100_000, &calldata);
+    body.extend(sstore_op(0, 1));
+    body.push(0x00); // STOP
+    let c = install_contract(&stores, 0xe8, &body);
+    let owner = fund_account(&stores, 0xa7, 1_000_000_000);
+    let limit = 1_000_000u64;
+
+    match run_with_limit_at(&stores, &trigger_of(owner, c), limit, 1_596_780_000_000 - 1) {
+        VmOutcome::Success { energy_used, .. } => {
+            assert!(energy_used < limit);
+        }
+        other => panic!("expected Success pre-fork, got {other:?}"),
+    }
+    assert_eq!(slot_value(&stores, c, 0).last(), Some(&1u8));
 }

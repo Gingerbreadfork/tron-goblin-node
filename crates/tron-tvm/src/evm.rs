@@ -360,6 +360,19 @@ impl TronPrecompiles {
                     output: Bytes::new(),
                 });
             }
+            Err(PrecompileError::OutOfTime) => {
+                // java-tron: `MUtil.checkCPUTime*` threw `OutOfTimeException`.
+                // `VM.play` rethrows it through every frame and `VMActuator`
+                // settles the whole tx OUT_OF_TIME with `spendAllEnergy()`;
+                // the frame bridge re-raises `TronOutOfTime` in each parent.
+                let mut gas = revm::interpreter::Gas::new(inputs.gas_limit);
+                gas.spend_all();
+                return Some(InterpreterResult {
+                    result: revm::interpreter::InstructionResult::TronOutOfTime,
+                    gas,
+                    output: Bytes::new(),
+                });
+            }
             Err(PrecompileError::SpendAllRevert) => {
                 // java-tron: the precompile returned `Pair.of(false, ...)`, so
                 // `Program.callToPrecompiledAddress` (Program.java:1762-1768)

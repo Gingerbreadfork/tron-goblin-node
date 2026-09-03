@@ -138,6 +138,9 @@ fn halt_reason_to_contract_result(
         // rather than left to the catch-all so a future taxonomy change cannot
         // silently move it.
         HaltReason::TronPrecompileTransferFailure => ContractResult::Unknown,
+        // java's deterministic `OutOfTimeException` (`MUtil.checkCPUTime*`):
+        // `RuntimeImpl.setResultCode` has an explicit OUT_OF_TIME arm.
+        HaltReason::TronOutOfTime => ContractResult::OutOfTime,
         // Everything else java has no dedicated code for → UNKNOWN.
         _ => ContractResult::Unknown,
     }
@@ -2108,6 +2111,12 @@ mod halt_result_tests {
         assert_eq!(
             halt_reason_to_contract_result(&HaltReason::TronBytecodeExecution),
             ContractResult::Unknown
+        );
+
+        // java's deterministic `OutOfTimeException` has its own result code.
+        assert_eq!(
+            halt_reason_to_contract_result(&HaltReason::TronOutOfTime),
+            ContractResult::OutOfTime
         );
 
         // Anything java has no dedicated code for → UNKNOWN (java fall-through).

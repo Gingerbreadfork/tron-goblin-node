@@ -4377,7 +4377,16 @@ fn execute_vm_tx(
             // Mirror java's OUT_OF_TIME fee-pool exclusion: record the tx's
             // result so `pay_energy_fee` routes an OUT_OF_TIME energy fee to the
             // blackhole instead of the transaction-fee pool.
-            energy::set_tx_out_of_time(out_of_time_energy.is_some());
+            // A deterministic `OutOfTimeException` computed by the VM (e.g.
+            // `MUtil.checkCPUTime` in ValidateMultiSign) routes the same way.
+            let computed_out_of_time = matches!(
+                &outcome,
+                Some(tron_tvm::execute::VmOutcome::Halt {
+                    result: tron_proto::transaction::result::ContractResult::OutOfTime,
+                    ..
+                })
+            );
+            energy::set_tx_out_of_time(out_of_time_energy.is_some() || computed_out_of_time);
             match energy::pay_energy_bill(
                 &accounts,
                 &dp_store,

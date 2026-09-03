@@ -166,6 +166,17 @@ pub enum InstructionResult {
     /// by halting the calling frame on this result rather than pushing zero.
     /// `RuntimeImpl.setResultCode` has no arm for it → `contractResult UNKNOWN`.
     TronPrecompileTransferFailure,
+    /// TRON fork: java-tron's `OutOfTimeException` thrown deterministically by
+    /// `MUtil.checkCPUTime*` inside a precompile or opcode body.
+    ///
+    /// Transaction-fatal, unlike every other TRON halt here: `VM.play`'s outer
+    /// catch rethrows `OutOfTimeException`, `Program.callToAddress` /
+    /// `createContractImpl` do not catch it, and `VMActuator.execute` settles
+    /// it at the root with `spendAllEnergy()`. `Frame::return_result` therefore
+    /// re-raises it in every parent frame (spend-all + halt) until it reaches
+    /// the root, where it records `contractResult OUT_OF_TIME` with the whole
+    /// energy limit consumed.
+    TronOutOfTime,
 }
 
 impl From<TransferError> for InstructionResult {
@@ -212,6 +223,7 @@ impl From<HaltReason> for InstructionResult {
             HaltReason::PrecompileThrow => Self::PrecompileThrow,
             HaltReason::TronBytecodeExecution => Self::TronBytecodeExecution,
             HaltReason::TronPrecompileTransferFailure => Self::TronPrecompileTransferFailure,
+            HaltReason::TronOutOfTime => Self::TronOutOfTime,
             HaltReason::NonceOverflow => Self::NonceOverflow,
             HaltReason::CreateContractSizeLimit => Self::CreateContractSizeLimit,
             HaltReason::CreateContractStartingWithEF => Self::CreateContractStartingWithEF,
@@ -293,6 +305,7 @@ macro_rules! return_error {
             | $crate::InstructionResult::PrecompileThrow
             | $crate::InstructionResult::TronBytecodeExecution
             | $crate::InstructionResult::TronPrecompileTransferFailure
+            | $crate::InstructionResult::TronOutOfTime
     };
 }
 
@@ -493,6 +506,9 @@ impl<HaltReasonTr: From<HaltReason>> From<InstructionResult> for SuccessOrHalt<H
             InstructionResult::TronPrecompileTransferFailure => {
                 Self::Halt(HaltReason::TronPrecompileTransferFailure.into())
             }
+            // java's `OutOfTimeException` → `RuntimeImpl.setResultCode`
+            // records OUT_OF_TIME.
+            InstructionResult::TronOutOfTime => Self::Halt(HaltReason::TronOutOfTime.into()),
         }
     }
 }
@@ -560,6 +576,7 @@ mod tests {
             InstructionResult::PrecompileThrow,
             InstructionResult::TronBytecodeExecution,
             InstructionResult::TronPrecompileTransferFailure,
+            InstructionResult::TronOutOfTime,
         ];
         for result in error_results {
             assert!(!result.is_ok());

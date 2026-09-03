@@ -693,6 +693,18 @@ impl EthFrame<EthInterpreter> {
                     panic!("Fatal external error in insert_call_outcome");
                 }
 
+                // TRON fork: java's `OutOfTimeException` is rethrown by every
+                // `VM.play` on the stack (`VM.java:110-111`) and never caught by
+                // `Program.callToAddress`, so it unwinds the whole transaction.
+                // Each frame it passes through has already run `spendAllEnergy()`
+                // in the per-opcode catch (`VM.java:93-101`). Re-raise it here
+                // so the parent dies the same way instead of pushing zero.
+                if ins_result == InstructionResult::TronOutOfTime {
+                    interpreter.gas.spend_all();
+                    interpreter.halt(InstructionResult::TronOutOfTime);
+                    return Ok(());
+                }
+
                 // TRON fork: an uncaught throw inside a precompile does not
                 // return to the caller at all. java-tron's `VM.java` catch runs
                 // `program.spendAllEnergy()` on the frame that executed the CALL
@@ -880,6 +892,15 @@ impl EthFrame<EthInterpreter> {
                     InstructionResult::FatalExternalError,
                     "Fatal external error in insert_eofcreate_outcome"
                 );
+
+                // TRON fork: an `OutOfTimeException` raised inside init code is
+                // rethrown through `createContractImpl` just like through a
+                // CALL, so the creating frame dies with it (spend-all + halt).
+                if instruction_result == InstructionResult::TronOutOfTime {
+                    interpreter.gas.spend_all();
+                    interpreter.halt(InstructionResult::TronOutOfTime);
+                    return Ok(());
+                }
 
                 let this_gas = &mut interpreter.gas;
                 // Refund unused gas for success and revert cases.

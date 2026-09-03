@@ -805,6 +805,13 @@ pub enum PrecompileError {
     /// an exception instead of returning a value.
     #[error("precompile returned failure: spend the forwarded energy and revert")]
     SpendAllRevert,
+    /// java-tron's `MUtil.checkCPUTime*` threw a deterministic
+    /// `OutOfTimeException` inside the precompile body. Transaction-fatal:
+    /// `VM.play` rethrows it through every frame and `VMActuator.execute`
+    /// settles it with `spendAllEnergy()` and `contractResult OUT_OF_TIME`.
+    /// The interpreter bridge maps it to `InstructionResult::TronOutOfTime`.
+    #[error("deterministic OutOfTimeException: the whole transaction fails OUT_OF_TIME")]
+    OutOfTime,
     /// An access that throws an *uncaught* exception in java-tron's
     /// precompile body — e.g. an out-of-range `words[]` index or an
     /// `Arrays.copyOfRange` past the end of the call data in
@@ -1456,6 +1463,15 @@ fn batch_validate_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
 // fails the whole call (`DATA_FALSE`). Each unique signer counts once.
 // Returns true iff the total weight reaches the permission threshold.
 
+/// java `ForkController.pass(VERSION_4_7_1)`, approximated by the fork's
+/// `hardForkTime` (2020-08-07) the same way `tron-actuator`'s multisig
+/// tx-level dedup gates it. Exact for the pre-2020 era; the real 80%-witness
+/// activation landed a few maintenance cycles later.
+fn version_4_7_1_passed(ctx: &dyn EvmContext) -> bool {
+    const VERSION_4_7_1_HARD_FORK_TIME_MS: i64 = 1_596_780_000_000;
+    ctx.block_timestamp_ms() >= VERSION_4_7_1_HARD_FORK_TIME_MS
+}
+
 fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
     const MAX_SIZE: usize = 5;
 
@@ -1596,6 +1612,13 @@ fn validate_multi_sign(input: &[u8], ctx: &dyn EvmContext) -> PrecompileResult {
                 .any(|(e, a)| a == &recovered && elems_equal(e, sign));
             if seen_pair {
                 continue;
+            }
+            // java `MUtil.checkCPUTime()`: the same signer with a DIFFERENT
+            // signature (a malleability twin or another nonce) throws
+            // `OutOfTimeException` once `VERSION_4_7_1` has passed. Before
+            // that fork the weight is simply counted again.
+            if version_4_7_1_passed(ctx) {
+                return Err(PrecompileError::OutOfTime);
             }
         }
         let weight = weight_of(&recovered);

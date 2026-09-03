@@ -14,7 +14,7 @@ use hex_literal::hex;
 use k256::ecdsa::SigningKey;
 use tron_crypto::address::Address;
 use tron_proto::{Account, DelegatedResource, Witness};
-use tron_tvm::{EvmContext, EvmContextError, PrecompileImpl};
+use tron_tvm::{EvmContext, EvmContextError, PrecompileError, PrecompileImpl};
 
 #[derive(Default)]
 struct MockCtx {
@@ -375,6 +375,67 @@ fn validate_multi_sign_repeated_signature_is_skipped_not_rejected() {
         word_with_low(1).to_vec(),
         "a duplicated signature is skipped; key1 + key2 still meet the threshold"
     );
+}
+
+/// secp256k1 group order, big-endian.
+const SECP256K1_N: [u8; 32] =
+    hex!("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+
+/// `(r, s, v)` → `(r, n - s, v ^ 1)`: a second valid signature by the same
+/// key over the same hash. Neither java nor the precompile enforces low-s.
+fn malleability_twin(sig: &[u8; 65]) -> [u8; 65] {
+    let mut out = *sig;
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let d = i16::from(SECP256K1_N[i]) - i16::from(sig[32 + i]) - borrow;
+        if d < 0 {
+            out[32 + i] = (d + 256) as u8;
+            borrow = 1;
+        } else {
+            out[32 + i] = d as u8;
+            borrow = 0;
+        }
+    }
+    out[64] ^= 1;
+    out
+}
+
+/// java `ValidateMultiSign.execute` de-dups on the `(recoveredAddr, sign)`
+/// pair, so a second, DIFFERENT signature by an already-counted key is not
+/// skipped. Post-`VERSION_4_7_1` that path runs `MUtil.checkCPUTime()`, which
+/// throws `OutOfTimeException` and fails the whole transaction OUT_OF_TIME;
+/// before the fork the key's weight was simply counted again.
+#[test]
+fn validate_multi_sign_same_key_distinct_signature_is_out_of_time_post_4_7_1() {
+    let sk1 = seeded_key(1);
+    let sk2 = seeded_key(2);
+    let low1 = signer_low20(&sk1);
+    let low2 = signer_low20(&sk2);
+    let mut ctx = ctx_with_active_permission(&low1, &low2);
+
+    let payload = [0x2eu8; 32];
+    let hash = multi_sign_prehash(&alice(), 2, &payload);
+    let sig1 = sign_prehash(&sk1, &hash);
+    let twin = malleability_twin(&sig1);
+    assert_ne!(sig1, twin);
+    let input = multi_sign_input(&alice(), 2, &payload, &[sig1, twin]);
+
+    ctx.block_timestamp_ms = 1_700_000_000_000;
+    let err = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .expect_err("post-4.7.1 a repeated signer with a new signature is OutOfTime");
+    assert!(
+        matches!(err, PrecompileError::OutOfTime),
+        "expected PrecompileError::OutOfTime, got {err:?}"
+    );
+
+    // Pre-fork: key1's weight of 1 is counted twice and meets the threshold
+    // of 2 on its own.
+    ctx.block_timestamp_ms = 1_596_780_000_000 - 1;
+    let out = PrecompileImpl::ValidateMultiSign
+        .execute(&input, &ctx)
+        .unwrap();
+    assert_eq!(out, word_with_low(1).to_vec());
 }
 
 /// `testDifferentCase`'s "weight not enough" case: key1 alone carries weight
