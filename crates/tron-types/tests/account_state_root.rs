@@ -150,8 +150,8 @@ fn storage_root_is_deterministic_and_order_independent() {
     v2[31] = 0xff;
     let v2 = v2.to_vec();
 
-    let rows_a = vec![(k1, v1.clone()), (k2, v2.clone())];
-    let rows_b = vec![(k2, v2), (k1, v1)];
+    let rows_a = vec![(k1.to_vec(), v1.clone()), (k2.to_vec(), v2.clone())];
+    let rows_b = vec![(k2.to_vec(), v2), (k1.to_vec(), v1)];
     let r1 = compute_storage_root(&rows_a);
     let r2 = compute_storage_root(&rows_b);
     assert_eq!(r1, r2);
@@ -163,8 +163,8 @@ fn different_slot_values_produce_different_roots() {
     key[31] = 1;
     let v_a = vec![0xaa; 32];
     let v_b = vec![0xbb; 32];
-    let r_a = compute_storage_root(&[(key, v_a)]);
-    let r_b = compute_storage_root(&[(key, v_b)]);
+    let r_a = compute_storage_root(&[(key.to_vec(), v_a)]);
+    let r_b = compute_storage_root(&[(key.to_vec(), v_b)]);
     assert_ne!(r_a, r_b);
 }
 

@@ -3096,6 +3096,15 @@ fn execute_block_logic(
                 }
             }
         }
+        // java `Manager.processBlock`: `forkController.reset()` follows
+        // `consensus.applyBlock` on every maintenance-boundary block, sized to
+        // the active witness set the rotation just installed.
+        if let Some(sched_be) = state.witness_schedule.clone() {
+            let schedule = tron_chainbase::WitnessScheduleStore::new(sched_be);
+            if let Ok(Some(active)) = schedule.load_active() {
+                tron_chainbase::reset_fork_stats(&dp, active.len());
+            }
+        }
         // Always advance next_maintenance_time past this block. java's
         // `updateNextMaintenanceTime` feeds `getNextMaintenanceTime()` (our
         // `next_maintenance`) verbatim, NOT max'd with the block time: the
@@ -3152,6 +3161,25 @@ fn execute_block_logic(
                 expected: hex::encode(&raw.account_state_root),
                 computed: hex::encode(computed),
             });
+        }
+    }
+
+    // java `Manager.applyBlock` → `updateFork(block)`: fold the block's witness
+    // and version into the fork statistics after the whole block applied.
+    if let Some(sched_be) = state.witness_schedule.clone() {
+        if raw.witness_address.len() == 21 {
+            let schedule = tron_chainbase::WitnessScheduleStore::new(sched_be);
+            if let Ok(Some(active)) = schedule.load_active() {
+                let mut producer = [0u8; 21];
+                producer.copy_from_slice(&raw.witness_address);
+                let dp = DynamicPropertiesStore::new(state.dyn_props.clone());
+                tron_chainbase::update_fork_stats(
+                    &dp,
+                    &active,
+                    &Address::from_raw(producer),
+                    raw.version,
+                );
+            }
         }
     }
 
@@ -3242,9 +3270,7 @@ pub fn compute_state_root(state: &StateBackends) -> Result<[u8; 32], tron_chainb
         if rows.is_empty() {
             None
         } else {
-            let rows_owned: Vec<([u8; 32], Vec<u8>)> =
-                rows.into_iter().collect();
-            Some(tron_types::compute_storage_root(&rows_owned))
+            Some(tron_types::compute_storage_root(&rows))
         }
     };
 

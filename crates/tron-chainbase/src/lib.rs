@@ -14,6 +14,7 @@ pub mod blockstm;
 pub mod checkpoint_v2;
 pub mod convert;
 pub mod fee;
+pub mod fork;
 pub mod java_checkpoint;
 pub mod pending_overlay;
 pub mod permissions;
@@ -37,6 +38,10 @@ pub use convert::{
     RocksDbSource, StreamStats, VisitError, CONVERT_BATCH, NODE_STORE_NAMES,
 };
 pub use fee::dispose_fee_to_blackhole;
+pub use fork::{
+    backfill_fork_stats, reset_fork_stats, update_fork_stats, ForkVersion, BLOCK_VERSION,
+    FORK_VERSIONS,
+};
 pub use pending_overlay::PendingOverlay;
 pub use permissions::{
     active_default_operations, apply_default_account_permissions, default_account_permissions,

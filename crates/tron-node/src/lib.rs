@@ -14,6 +14,7 @@ pub mod event_loader;
 pub mod explore;
 pub mod fetch_block;
 pub mod firehose;
+pub mod fork_stats;
 pub mod inbound;
 pub mod index_hook;
 pub mod logfmt;

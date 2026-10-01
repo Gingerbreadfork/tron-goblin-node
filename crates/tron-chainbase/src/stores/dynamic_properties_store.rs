@@ -94,6 +94,8 @@ pub mod keys {
     pub const ALLOW_HARDEN_EXCHANGE_CALCULATION: &[u8] = b"ALLOW_HARDEN_EXCHANGE_CALCULATION";
     pub const ALLOW_TVM_PRAGUE: &[u8] = b"ALLOW_TVM_PRAGUE";
     pub const ALLOW_TVM_OSAKA: &[u8] = b"ALLOW_TVM_OSAKA";
+    /// Proposal 99: the 48-byte storage-row key scheme (`Storage.getNewRowKey`).
+    pub const ALLOW_OPTIMIZE_TVM_STORAGE: &[u8] = b"ALLOW_OPTIMIZE_TVM_STORAGE";
     /// TIP-2935 install marker, set once `BlockHashHistory` is deployed.
     pub const BLOCK_HASH_HISTORY_INSTALLED: &[u8] = b"BLOCK_HASH_HISTORY_INSTALLED";
     pub const ALLOW_TVM_FREEZE: &[u8] = b"ALLOW_TVM_FREEZE";
@@ -763,6 +765,10 @@ impl DynamicPropertiesStore {
 
     pub fn allow_tvm_osaka(&self) -> bool {
         self.get_long(keys::ALLOW_TVM_OSAKA).unwrap_or(0) == 1
+    }
+
+    pub fn allow_optimize_tvm_storage(&self) -> bool {
+        self.get_long(keys::ALLOW_OPTIMIZE_TVM_STORAGE).unwrap_or(0) == 1
     }
 
     pub fn is_block_hash_history_installed(&self) -> bool {

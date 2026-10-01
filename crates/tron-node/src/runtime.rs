@@ -250,6 +250,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         }
     }
 
+    // Data directories synced before the fork statistics existed get them
+    // seeded from the recent headers (a converted java snapshot has them).
+    crate::fork_stats::backfill_if_missing(&stores);
+
     // Decide whether the genesis block is already applied; if the
     // dyn-props head is missing, write the mainnet genesis +
     // committee initial values.

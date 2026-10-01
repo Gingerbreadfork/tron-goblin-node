@@ -116,7 +116,7 @@ impl AccountState {
 /// **Cost**: O(n) where `n` is the number of storage rows belonging to
 /// the contract. Incremental MPT updates would be a follow-up — this
 /// is the brute-force "rebuild from scratch" variant.
-pub fn compute_storage_root(rows: &[([u8; 32], Vec<u8>)]) -> [u8; 32] {
+pub fn compute_storage_root(rows: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
     if rows.is_empty() {
         return KECCAK_EMPTY_STORAGE_ROOT;
     }

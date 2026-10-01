@@ -69,9 +69,9 @@ use crate::config::WitnessConfig;
 /// frames.
 const BROADCAST_CHANNEL_CAPACITY: usize = 32;
 
-/// Block version field. java-tron 4.8.2 emits 36 (`Parameter.BLOCK_VERSION`); we
-/// match so produced blocks look indistinguishable on the wire.
-const BLOCK_VERSION: i32 = 36;
+/// Block version field, java-tron's `Parameter.BLOCK_VERSION`; we match so
+/// produced blocks look indistinguishable on the wire.
+const BLOCK_VERSION: i32 = tron_chainbase::BLOCK_VERSION;
 
 /// Loaded + decrypted SR witness identity, ready to sign blocks.
 pub struct SrIdentity {

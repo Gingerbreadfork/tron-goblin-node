@@ -148,6 +148,7 @@ pub fn run_replay(
         ),
         Err(e) => warn!(error = ?e, "checkpoint recovery failed; continuing"),
     }
+    crate::fork_stats::backfill_if_missing(&stores);
 
     // === Build the executor config, honoring [vm] parallel_exec ===
     // Mirror runtime.rs's `ExecConfig` derivation so the offline apply is
