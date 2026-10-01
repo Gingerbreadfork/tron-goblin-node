@@ -477,8 +477,24 @@ async fn get_chain_parameters_returns_seeded_entries() {
     assert_eq!(by_key.get("getTransactionFee"), Some(&1234));
     assert_eq!(by_key.get("getEnergyFee"), Some(&5678));
     // Every java entry is present even when unset (value omitted → 0).
-    assert_eq!(params.len(), 75);
+    assert_eq!(params.len(), 80);
     assert_eq!(by_key.get("getAllowNewResourceModel"), Some(&0));
+    assert_eq!(by_key.get("getAllowOptimizeTvmStorage"), Some(&0));
+    // java 4.8.2.3 order: the five newest keys follow getProposalExpireTime.
+    let tail: Vec<&str> = params[75..]
+        .iter()
+        .map(|p| p["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "getAllowTvmOsaka",
+            "getAllowTvmPrague",
+            "getAllowHardenResourceCalculation",
+            "getAllowHardenExchangeCalculation",
+            "getAllowOptimizeTvmStorage",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -2428,7 +2444,7 @@ async fn deploy_contract_appends_constructor_parameter_to_bytecode() {
     let smart = inner.new_contract.unwrap();
     // bytecode + constructor params concatenated.
     assert_eq!(smart.bytecode, hex::decode("6080604052deadbeef").unwrap());
-    assert_eq!(smart.name, "TestContract");
+    assert_eq!(smart.name, b"TestContract");
     assert_eq!(smart.consume_user_resource_percent, 100);
     assert_eq!(smart.origin_energy_limit, 1_000_000);
 }

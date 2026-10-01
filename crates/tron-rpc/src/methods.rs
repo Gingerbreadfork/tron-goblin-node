@@ -439,8 +439,10 @@ pub fn eth_get_storage_at(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     // Default to v2 layout — RPC doesn't know about v1 contracts. A
     // sync-aware caller would consult ContractStore to switch, but for
     // a read-only RPC the v2 default matches what new contracts emit.
-    let key = tron_chainbase::StorageRowStore::compose_key(&addr, &slot);
-    let value = storage.get(&key)?.unwrap_or_else(|| vec![0u8; 32]);
+    let addr_hash = tron_chainbase::StorageRowStore::addr_hash(&addr, &[]);
+    let value = storage
+        .read_slot(&addr_hash, &slot, false, s.dyn_props.allow_optimize_tvm_storage())?
+        .unwrap_or_else(|| vec![0u8; 32]);
     let mut padded = [0u8; 32];
     let n = value.len().min(32);
     padded[32 - n..].copy_from_slice(&value[value.len() - n..]);
@@ -1173,7 +1175,7 @@ pub fn get_block_by_num(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
 /// java-tron's `wallet.getChainParameters`.
 pub fn get_chain_parameters(_p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     // Mirrors java-tron's `Wallet.getChainParameters` EXACTLY: the same
-    // 75 entries, in the same order, under java's `get…` camelCase names
+    // 80 entries, in the same order, under java's `get…` camelCase names
     // (what TronWeb/TronGrid clients key on). Every entry is emitted even
     // when its value is 0 — but, matching java's proto3 JSON, a zero
     // value omits the `value` field. The third tuple element is java's
@@ -1283,6 +1285,11 @@ pub fn get_chain_parameters(_p: &Value, s: &RpcState) -> Result<Value, RpcError>
             0,
         ),
         ("getProposalExpireTime", b"PROPOSAL_EXPIRE_TIME", 259_200_000),
+        ("getAllowTvmOsaka", b"ALLOW_TVM_OSAKA", 0),
+        ("getAllowTvmPrague", b"ALLOW_TVM_PRAGUE", 0),
+        ("getAllowHardenResourceCalculation", b"ALLOW_HARDEN_RESOURCE_CALCULATION", 0),
+        ("getAllowHardenExchangeCalculation", b"ALLOW_HARDEN_EXCHANGE_CALCULATION", 0),
+        ("getAllowOptimizeTvmStorage", b"ALLOW_OPTIMIZE_TVM_STORAGE", 0),
     ];
     let entries: Vec<Value> = PARAMS
         .iter()
@@ -4914,7 +4921,7 @@ fn encode_smart_contract(c: &tron_proto::SmartContract) -> Value {
         );
     }
     if !c.name.is_empty() {
-        m.insert("name".into(), json!(c.name));
+        m.insert("name".into(), json!(String::from_utf8_lossy(&c.name)));
     }
     if c.origin_energy_limit != 0 {
         m.insert("origin_energy_limit".into(), json!(c.origin_energy_limit));
@@ -7385,7 +7392,7 @@ pub fn deploy_contract(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
             "consume_user_resource_percent",
             100,
         )?,
-        name,
+        name: name.into_bytes(),
         origin_energy_limit: parse_i64_field(p, "origin_energy_limit", 0)?,
         code_hash: Vec::new(),
         trx_hash: Vec::new(),

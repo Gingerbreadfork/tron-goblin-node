@@ -487,7 +487,7 @@ fn run_self_check(s: &RpcState, sim: &SimState, base: i64) -> Value {
                         value: sc.call_value,
                         energy: None,
                         consume_user_resource_percent: sc.consume_user_resource_percent,
-                        name: sc.name,
+                        name: String::from_utf8_lossy(&sc.name).into_owned(),
                         token_id: c.token_id,
                         token_value: c.call_token_value,
                     }

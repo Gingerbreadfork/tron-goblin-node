@@ -1349,7 +1349,9 @@ fn parse_hex_key(s: &str) -> Result<Vec<u8>, String> {
 /// way `/v1/archive/storage` does (via `eth_getStorageAt` →
 /// [`StorageRowStore::compose_key`], v2 layout, plain `sha3(address)` prefix),
 /// so a proof key matches the live read key exactly. `slot` is `0x`-optional,
-/// a QUANTITY or a full 32-byte word, left-padded to 32 bytes.
+/// a QUANTITY or a full 32-byte word, left-padded to 32 bytes. Always the
+/// legacy 32-byte key; a slot migrated to its 48-byte key under
+/// `ALLOW_OPTIMIZE_TVM_STORAGE` must be proven by that raw key.
 fn storage_row_key(address: &str, slot: &str) -> Result<Vec<u8>, String> {
     let addr = parse_tron_address(address)?;
     let stripped = slot

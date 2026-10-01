@@ -565,6 +565,18 @@ fn validate_proposal_value(
                 return Err(bad());
             }
         }
+        // java 4.8.2.3: proposable only once `forkController.pass(VERSION_4_8_2_3)`.
+        AllowOptimizeTvmStorage => {
+            if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_2_3) {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_OPTIMIZE_TVM_STORAGE") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_OPTIMIZE_TVM_STORAGE"));
+            }
+        }
     }
     Ok(())
 }
@@ -653,6 +665,7 @@ enum ProposalType {
     AllowTvmOsaka,
     AllowHardenResourceCalculation,
     AllowHardenExchangeCalculation,
+    AllowOptimizeTvmStorage,
 }
 
 impl ProposalType {
@@ -741,6 +754,7 @@ impl ProposalType {
             96 => AllowTvmOsaka,
             97 => AllowHardenResourceCalculation,
             98 => AllowHardenExchangeCalculation,
+            99 => AllowOptimizeTvmStorage,
             _ => return None,
         })
     }

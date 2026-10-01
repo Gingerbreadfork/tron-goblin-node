@@ -214,11 +214,10 @@ impl OverrideSet {
                     )));
                 }
                 for (key, _) in existing {
-                    vm.storage.delete(&key).map_err(sim_err)?;
+                    vm.storage.delete_raw(&key).map_err(sim_err)?;
                 }
                 for (slot, value) in state {
-                    let key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, slot, is_v1);
-                    vm.storage.put(&key, value).map_err(sim_err)?;
+                    write_slot(vm, &addr_hash, slot, value, is_v1).map_err(sim_err)?;
                 }
             }
 
@@ -234,8 +233,7 @@ impl OverrideSet {
                     )));
                 }
                 for (slot, value) in diff {
-                    let key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, slot, is_v1);
-                    vm.storage.put(&key, value).map_err(sim_err)?;
+                    write_slot(vm, &addr_hash, slot, value, is_v1).map_err(sim_err)?;
                 }
             }
         }
@@ -257,4 +255,24 @@ fn hex_addr(addr: &Address) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Write one overridden slot the way the VM's commit would under the chain's
+/// current storage-key scheme: the 48-byte key (and no legacy row) once
+/// `ALLOW_OPTIMIZE_TVM_STORAGE` is active, the legacy key otherwise.
+fn write_slot(
+    vm: &VmStores,
+    addr_hash: &[u8; 32],
+    slot: &[u8; 32],
+    value: &[u8],
+    is_v1: bool,
+) -> Result<(), tron_chainbase::StoreError> {
+    let legacy = StorageRowStore::compose_key_with_addr_hash(addr_hash, slot, is_v1);
+    if vm.dynamic_properties.allow_optimize_tvm_storage() {
+        vm.storage
+            .put_raw(&StorageRowStore::new_row_key(addr_hash, slot), value)?;
+        vm.storage.delete(&legacy)
+    } else {
+        vm.storage.put(&legacy, value)
+    }
 }

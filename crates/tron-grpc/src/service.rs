@@ -1107,6 +1107,19 @@ impl Wallet for WalletService {
             "ALLOW_CANCEL_ALL_UNFREEZE_V2",
             "MAX_DELEGATE_LOCK_PERIOD",
             "ALLOW_OLD_REWARD_OPT",
+            "ALLOW_ENERGY_ADJUSTMENT",
+            "MAX_CREATE_ACCOUNT_TX_SIZE",
+            "ALLOW_STRICT_MATH",
+            "CONSENSUS_LOGIC_OPTIMIZATION",
+            "ALLOW_TVM_CANCUN",
+            "ALLOW_TVM_BLOB",
+            "ALLOW_TVM_SELFDESTRUCT_RESTRICTION",
+            "PROPOSAL_EXPIRE_TIME",
+            "ALLOW_TVM_OSAKA",
+            "ALLOW_TVM_PRAGUE",
+            "ALLOW_HARDEN_RESOURCE_CALCULATION",
+            "ALLOW_HARDEN_EXCHANGE_CALCULATION",
+            "ALLOW_OPTIMIZE_TVM_STORAGE",
         ];
         let mut chain_parameter = Vec::with_capacity(KEYS.len());
         for k in KEYS {

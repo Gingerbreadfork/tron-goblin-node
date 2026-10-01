@@ -449,8 +449,22 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         96 => b"ALLOW_TVM_OSAKA",
         97 => b"ALLOW_HARDEN_RESOURCE_CALCULATION",
         98 => b"ALLOW_HARDEN_EXCHANGE_CALCULATION",
+        99 => b"ALLOW_OPTIMIZE_TVM_STORAGE",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod parameter_key_tests {
+    use super::parameter_id_to_key;
+
+    #[test]
+    fn ids_95_to_99_map_to_their_dynamic_property_keys() {
+        assert_eq!(parameter_id_to_key(95), Some(&b"ALLOW_TVM_PRAGUE"[..]));
+        assert_eq!(parameter_id_to_key(96), Some(&b"ALLOW_TVM_OSAKA"[..]));
+        assert_eq!(parameter_id_to_key(99), Some(&b"ALLOW_OPTIMIZE_TVM_STORAGE"[..]));
+        assert_eq!(parameter_id_to_key(100), None);
+    }
 }
 
 #[cfg(test)]

@@ -639,3 +639,73 @@ fn delete_marks_proposal_canceled() {
     let p = ctx.proposals.get(1).unwrap().unwrap();
     assert_eq!(p.state, ProposalState::Canceled as i32);
 }
+
+// ---------------------------------------------------------------------------
+// Proposal 99 — ALLOW_OPTIMIZE_TVM_STORAGE (java-tron 4.8.2.3)
+// ---------------------------------------------------------------------------
+
+fn optimize_storage_param(value: i64) -> BTreeMap<i64, i64> {
+    let mut p = BTreeMap::new();
+    p.insert(99, value);
+    p
+}
+
+fn pass_version_4_8_2_3(ctx: &Ctx) {
+    ctx.dp.save_latest_block_header_timestamp(1_790_000_000_000);
+    ctx.dp
+        .save_fork_stats(tron_chainbase::fork::VERSION_4_8_2_3, &[1u8; 27]);
+}
+
+#[test]
+fn create_rejects_optimize_tvm_storage_before_the_fork() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: optimize_storage_param(1),
+    };
+    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::ProposalParameterOutOfRange), "got: {err:?}");
+}
+
+#[test]
+fn create_accepts_optimize_tvm_storage_once_the_fork_passed() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_version_4_8_2_3(&ctx);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: optimize_storage_param(1),
+    };
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap();
+}
+
+#[test]
+fn create_rejects_optimize_tvm_storage_with_a_value_other_than_one() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_version_4_8_2_3(&ctx);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: optimize_storage_param(0),
+    };
+    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::ProposalParameterOutOfRange), "got: {err:?}");
+}
+
+#[test]
+fn create_rejects_optimize_tvm_storage_when_already_active() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_version_4_8_2_3(&ctx);
+    ctx.dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE", 1);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: optimize_storage_param(1),
+    };
+    let err = proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c)
+        .unwrap_err();
+    assert!(matches!(err, ActuatorError::ProposalParameterOutOfRange), "got: {err:?}");
+}

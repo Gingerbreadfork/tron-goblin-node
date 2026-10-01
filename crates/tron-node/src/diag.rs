@@ -191,9 +191,13 @@ fn diag_storage(data_dir: &str, addr: &Address, slot: &[u8; 32]) -> Result<(), S
         None => (false, StorageRowStore::addr_hash(addr, &[])),
     };
     let rows = StorageRowStore::new(open_ro(data_dir, "storage-row")?);
-    let key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, slot, is_v1);
+    let optimized = DynamicPropertiesStore::new(open_ro(data_dir, "properties")?)
+        .allow_optimize_tvm_storage();
     let layout = if is_v1 { "v1" } else { "v2" };
-    match rows.get(&key).map_err(|e| format!("read storage row: {e}"))? {
+    match rows
+        .read_slot(&addr_hash, slot, is_v1, optimized)
+        .map_err(|e| format!("read storage row: {e}"))?
+    {
         Some(v) => println!(
             "storage {} slot 0x{} [{layout}]: 0x{}",
             hex_addr(addr),

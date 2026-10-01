@@ -313,6 +313,7 @@ impl ExploreState {
                         .ok()
                         .and_then(|c| c.new_contract.map(|n| n.name))
                         .filter(|n| !n.is_empty())
+                        .map(|n| String::from_utf8_lossy(&n).into_owned())
                         .unwrap_or_else(|| "unnamed".into());
                     g.push_milestone(
                         "📜",

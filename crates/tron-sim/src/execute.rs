@@ -265,7 +265,7 @@ fn run_one_call(
                     bytecode: init_code.clone(),
                     call_value: *value,
                     consume_user_resource_percent: *consume_user_resource_percent,
-                    name: name.clone(),
+                    name: name.clone().into_bytes(),
                     ..Default::default()
                 }),
                 call_token_value: *token_value,
