@@ -615,7 +615,7 @@ fn top_level_create_writes_contract_row_and_marks_account() {
             bytecode: init_code,
             consume_user_resource_percent: 75,
             origin_energy_limit: 5_000_000,
-            name: "MyToken".to_string(),
+            name: b"MyToken".to_vec(),
             abi: Some(Abi::default()),
             ..Default::default()
         }),

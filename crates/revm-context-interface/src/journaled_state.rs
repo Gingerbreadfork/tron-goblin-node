@@ -7,6 +7,7 @@ use crate::{
     context::{SStoreResult, SelfDestructResult},
     host::LoadError,
     journaled_state::account::JournaledAccountTr,
+    tron_ext::{TronOldKeyClaim, TronStorageReadKind},
     ErasedError,
 };
 use core::ops::{Deref, DerefMut};
@@ -243,6 +244,105 @@ pub trait JournalTr {
     /// `RepositoryImpl.getStorage` aliases the parent's object instead of deep
     /// copying it). Default no-op for journals that don't carry the TRON cfg.
     fn set_tron_shared_storage_across_frames(&mut self, _enabled: bool) {}
+
+    /// TRON fork: `ForkController.pass(VERSION_4_8_2_2)`, the storage alias
+    /// check (`pass(VERSION_4_8_2_3)`) and `ALLOW_OPTIMIZE_TVM_STORAGE`.
+    fn set_tron_fork_flags(
+        &mut self,
+        _fork_4_8_2_2: bool,
+        _storage_alias_check: bool,
+        _optimize_tvm_storage: bool,
+    ) {
+    }
+
+    /// TRON fork: is `ForkController.pass(VERSION_4_8_2_2)` in effect?
+    fn tron_fork_4_8_2_2(&self) -> bool {
+        false
+    }
+
+    /// TRON fork: is java `Storage.checkAlias` in effect (VERSION_4_8_2_3)?
+    fn tron_storage_alias_check(&self) -> bool {
+        false
+    }
+
+    /// TRON fork: is `ALLOW_OPTIMIZE_TVM_STORAGE` active?
+    fn tron_optimize_tvm_storage(&self) -> bool {
+        false
+    }
+
+    /// TRON fork: java `Repository.markSelfDestruct` — frame-scoped, merged
+    /// into the parent on commit, dropped on revert.
+    fn tron_mark_selfdestructed(&mut self, _address: Address) {}
+
+    /// TRON fork: java `Repository.isSelfDestructed`.
+    fn tron_is_selfdestructed(&self, _address: Address) -> bool {
+        false
+    }
+
+    /// TRON fork: java `Storage.oldRowKeyOwners.putIfAbsent(oldKey, slot)`.
+    fn tron_claim_old_row_key(
+        &mut self,
+        _old_key: B256,
+        _address: Address,
+        _key: StorageKey,
+    ) -> TronOldKeyClaim {
+        TronOldKeyClaim::Claimed
+    }
+
+    /// TRON fork: java `Storage.oldKeyTaken`.
+    fn tron_old_row_key_taken(&self, _old_key: B256, _address: Address, _key: StorageKey) -> bool {
+        false
+    }
+
+    /// TRON fork: java `Storage.readKinds.get(slot)`.
+    fn tron_storage_read_kind(
+        &self,
+        _address: Address,
+        _key: StorageKey,
+    ) -> Option<TronStorageReadKind> {
+        None
+    }
+
+    /// TRON fork: java `Storage.readKinds.put(slot, kind)` for a first load.
+    fn tron_set_storage_read_kind(
+        &mut self,
+        _address: Address,
+        _key: StorageKey,
+        _kind: TronStorageReadKind,
+    ) {
+    }
+
+    /// TRON fork: the transaction's final read kinds, for the storage commit.
+    fn tron_take_storage_read_kinds(&mut self) -> Vec<((Address, StorageKey), TronStorageReadKind)> {
+        Vec::new()
+    }
+
+    /// TRON fork: java `Storage.put` marks the row dirty whatever the value;
+    /// record the slot so the optimized commit writes it even unchanged.
+    fn tron_mark_storage_written(&mut self, _address: Address, _key: StorageKey) {}
+
+    /// TRON fork: every slot a live frame wrote this transaction.
+    fn tron_take_storage_written(&mut self) -> Vec<(Address, StorageKey)> {
+        Vec::new()
+    }
+
+    /// TRON fork: is `(address, key)` held in the journal's slot cache?
+    fn tron_storage_slot_cached(&self, _address: Address, _key: StorageKey) -> bool {
+        false
+    }
+
+    /// TRON fork: forget a slot the database loaded but java would not have
+    /// cached (`Storage.getOptimized` → `oldKeyTaken`).
+    fn tron_storage_evict_slot(&mut self, _address: Address, _key: StorageKey) {}
+
+    /// TRON fork: a storage access raised java's deterministic
+    /// `OutOfTimeException`; the opcode polls and halts with it.
+    fn tron_set_pending_out_of_time(&mut self) {}
+
+    /// TRON fork: clear and return the pending `OutOfTimeException` flag.
+    fn tron_take_pending_out_of_time(&mut self) -> bool {
+        false
+    }
 
     /// Sets EIP-7708 configuration flags.
     ///
@@ -559,6 +659,14 @@ pub struct JournalCheckpoint {
     pub journal_i: usize,
     /// Checkpoint for self-destructed addresses tracking (EIP-7708).
     pub selfdestructed_i: usize,
+    /// TRON fork: length of the `markSelfDestruct` log at the checkpoint.
+    pub tron_selfdestructed_i: usize,
+    /// TRON fork: length of the storage read-kind log at the checkpoint.
+    pub tron_read_kind_i: usize,
+    /// TRON fork: length of the legacy-row-key owner log at the checkpoint.
+    pub tron_owner_i: usize,
+    /// TRON fork: length of the written-slot log at the checkpoint.
+    pub tron_written_i: usize,
 }
 
 /// State load information that contains the data and if the account or storage is cold loaded

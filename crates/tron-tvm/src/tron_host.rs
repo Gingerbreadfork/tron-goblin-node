@@ -23,8 +23,10 @@
 
 use std::sync::Arc;
 
-use revm::context_interface::TronDatabaseExt;
-use revm::primitives::Address;
+use revm::context_interface::{
+    TronDatabaseExt, TronStorageLoadReport, TronStorageReadKind, TRON_HOST_OUT_OF_TIME,
+};
+use revm::primitives::{Address, StorageKey, B256};
 use tron_chainbase::DelegatedResourceStore;
 use tron_crypto::address::Address as TronAddress;
 
@@ -268,6 +270,30 @@ impl TronDatabase {
 }
 
 impl TronDatabaseExt for TronDatabase {
+    fn tron_storage_old_row_key(&self, address: Address, slot: StorageKey) -> Option<B256> {
+        let tron_addr = evm_to_tron_address(&address);
+        Some(B256::from(self.compose_storage_key(&tron_addr, &slot.to_be_bytes())))
+    }
+
+    fn tron_storage_set_load_hint(&mut self, address: Address, slot: StorageKey, old_key_taken: bool) {
+        *self.storage_load_hint.borrow_mut() = Some((address, slot, old_key_taken));
+    }
+
+    fn tron_storage_take_load_report(&mut self) -> Option<TronStorageLoadReport> {
+        self.storage_load_report.borrow_mut().take()
+    }
+
+    fn tron_storage_set_commit_read_kinds(
+        &mut self,
+        kinds: Vec<((Address, StorageKey), TronStorageReadKind)>,
+    ) {
+        self.commit_read_kinds = kinds.into_iter().collect();
+    }
+
+    fn tron_storage_set_commit_written(&mut self, written: Vec<(Address, StorageKey)>) {
+        self.commit_written = written.into_iter().collect();
+    }
+
     fn tron_token_balance(&self, address: Address, token_id: i64) -> i64 {
         let tron_addr = evm_to_tron_address(&address);
         let Ok(Some(mut account)) = self.accounts.get(&tron_addr) else {
@@ -1619,6 +1645,7 @@ impl TronDatabaseExt for TronDatabase {
         frozen_balance: i64,
         resource_type: u32,
         owner_balance: i64,
+        owner_selfdestructed: bool,
     ) -> i64 {
         // java `Program.freezeBalanceV2`: increaseNonce at the top, before validate.
         self.note_internal_tx_nonce();
@@ -1645,6 +1672,11 @@ impl TronDatabaseExt for TronDatabase {
         // callValue; the stale chainbase check rejected it, java accepted it.)
         if owner_balance < frozen_balance {
             return 0;
+        }
+        // java `FreezeBalanceV2Processor.validate` closes with
+        // `repo.isSelfDestructed(owner)` → `OutOfTimeException`.
+        if owner_selfdestructed {
+            return TRON_HOST_OUT_OF_TIME;
         }
         account.balance = owner_balance - frozen_balance;
         let resource = resource_type as i32;
@@ -1739,6 +1771,11 @@ impl TronDatabaseExt for TronDatabase {
                         .unwrap_or(0);
                     if frozen < unfreeze_balance {
                         return 0;
+                    }
+                    // java `UnfreezeBalanceV2Processor.validate` closes with
+                    // `hasInvalidDelegatedV2()` → `OutOfTimeException`.
+                    if self.fork_4_8_2_2 && has_invalid_delegated_v2(&acct) {
+                        return TRON_HOST_OUT_OF_TIME;
                     }
                 }
                 // java's validate throws when the owner account is absent.
@@ -1847,6 +1884,11 @@ impl TronDatabaseExt for TronDatabase {
         let Ok(Some(mut account)) = self.accounts.get(&owner) else {
             return 0;
         };
+        // java `CancelAllUnfreezeV2Processor.validate`: the account-exists
+        // check, then `hasInvalidDelegatedV2()` → `OutOfTimeException`.
+        if self.fork_4_8_2_2 && has_invalid_delegated_v2(&account) {
+            return TRON_HOST_OUT_OF_TIME;
+        }
         if account.unfrozen_v2.is_empty() {
             return 0;
         }
@@ -1929,13 +1971,19 @@ impl TronDatabaseExt for TronDatabase {
                 true
             }
         });
+        // java `WithdrawExpireUnfreezeProcessor.validate`: the checked add,
+        // then `hasInvalidDelegatedV2()` → `OutOfTimeException` — even when
+        // nothing has matured.
+        let Some(new_balance) = account.balance.checked_add(withdrawn) else {
+            return 0;
+        };
+        if self.fork_4_8_2_2 && has_invalid_delegated_v2(&account) {
+            return TRON_HOST_OUT_OF_TIME;
+        }
         if withdrawn == 0 {
             return 0;
         }
-        account.balance = match account.balance.checked_add(withdrawn) {
-            Some(v) => v,
-            None => return 0,
-        };
+        account.balance = new_balance;
         self.put_account_journaled(&owner, &account);
         // Credit the swept matured-unfreeze amount to the caller's
         // journaled balance.
@@ -2816,7 +2864,7 @@ mod tests {
             )
             .unwrap();
         let mut db = db;
-        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 1_500_000, 1, 100_000_000);
+        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 1_500_000, 1, 100_000_000, false);
         assert_eq!(r, 1, "freeze should succeed");
         assert_eq!(
             dyn_props.total_energy_weight(),
@@ -2852,7 +2900,7 @@ mod tests {
         // In-flight balance = 1 TRX chainbase + 31 TRX callValue credited this
         // tx = 32 TRX. Freezing 30 TRX must SUCCEED though the chainbase row
         // alone (1 TRX) is far short.
-        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 30_000_000, 1, 32_000_000);
+        let r = db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 30_000_000, 1, 32_000_000, false);
         assert_eq!(r, 1, "freeze must succeed against the in-flight balance");
         let after = db.accounts.get(&TronAddress::from_raw(owner)).unwrap().unwrap();
         assert_eq!(
@@ -2866,7 +2914,7 @@ mod tests {
         );
         // Negative: an in-flight balance below the freeze still fails (return 0).
         assert_eq!(
-            db.tron_freeze_balance_v2(evm_addr_from_tron(owner2), 30_000_000, 1, 20_000_000),
+            db.tron_freeze_balance_v2(evm_addr_from_tron(owner2), 30_000_000, 1, 20_000_000, false),
             0,
             "freeze must fail when the in-flight balance is short"
         );
@@ -3034,7 +3082,7 @@ mod tests {
             )
             .unwrap();
         let mut db = db;
-        assert_eq!(db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 5_000_000, 2, 100_000_000), 1);
+        assert_eq!(db.tron_freeze_balance_v2(evm_addr_from_tron(owner), 5_000_000, 2, 100_000_000, false), 1);
         assert_eq!(
             dyn_props.total_tron_power_weight(),
             5,
@@ -3102,7 +3150,7 @@ mod tests {
         assert_eq!(db.create_nonce, 0);
         db.tron_freeze(caller, 1_000_000, 3, 0, None, 0);
         db.tron_unfreeze(caller, 0, None);
-        db.tron_freeze_balance_v2(caller, 1_000_000, 0, 0);
+        db.tron_freeze_balance_v2(caller, 1_000_000, 0, 0, false);
         db.tron_unfreeze_balance_v2(caller, 1_000_000, 0);
         db.tron_withdraw_expire_unfreeze(caller);
         db.tron_cancel_all_unfreeze_v2(caller);
@@ -3211,4 +3259,14 @@ mod tests {
             assert!(ordered.contains(e));
         }
     }
+}
+
+/// java `AccountCapsule.hasInvalidDelegatedV2`: a negative delegated-out
+/// Stake-2.0 balance for bandwidth or energy.
+fn has_invalid_delegated_v2(account: &tron_proto::Account) -> bool {
+    account.delegated_frozen_v2_balance_for_bandwidth < 0
+        || account
+            .account_resource
+            .as_ref()
+            .is_some_and(|r| r.delegated_frozen_v2_balance_for_energy < 0)
 }

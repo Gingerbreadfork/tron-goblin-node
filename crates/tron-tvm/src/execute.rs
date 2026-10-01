@@ -33,7 +33,9 @@ use std::sync::Arc;
 use revm::context::{Context, Evm, FrameStack, TxEnv};
 use revm::context_interface::result::{ExecutionResult, HaltReason};
 use revm::handler::instructions::EthInstructions;
-use revm::inspector::InspectCommitEvm;
+use revm::context_interface::{JournalTr as _, TronDatabaseExt as _};
+use revm::inspector::InspectEvm;
+use revm::ExecuteCommitEvm as _;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::primitives::{Address as EvmAddress, Bytes, TxKind, U256};
 use revm::MainContext;
@@ -591,6 +593,10 @@ fn execute_trigger_inner(
         Arc::clone(&stores.accounts),
         Arc::clone(&stores.code),
         Arc::clone(&stores.storage),
+    )
+    .with_fork_flags(
+        stores.dynamic_properties.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
+        stores.dynamic_properties.allow_optimize_tvm_storage(),
     );
     if let Some(tx_id) = root_tx_id {
         tron_db = tron_db.with_root_tx_id(tx_id);
@@ -764,6 +770,11 @@ fn execute_trigger_inner(
         ctx.journaled_state.set_tron_shared_storage_across_frames(
             !tron_chainbase::energy_limit_hard_fork_active(&stores.dynamic_properties),
         );
+        ctx.journaled_state.set_tron_fork_flags(
+            proposals.fork_4_8_2_2,
+            proposals.fork_4_8_2_3,
+            proposals.allow_optimize_tvm_storage,
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -809,7 +820,23 @@ fn execute_trigger_inner(
         eprintln!("OPTRACE_TX_BEGIN {id}");
         revm::interpreter::set_op_trace(true);
     }
-    let outcome = evm.inspect_tx_commit(tx);
+    // Hand the journal's final storage read kinds to the database before the
+    // commit, so legacy rows that were only read migrate (java
+    // `Storage.commitOptimized`), then commit as `inspect_tx_commit` would.
+    let outcome = evm.inspect_one_tx(tx).map(|out| {
+        let kinds = evm.ctx.journaled_state.tron_take_storage_read_kinds();
+        let written = evm.ctx.journaled_state.tron_take_storage_written();
+        evm.ctx
+            .journaled_state
+            .db_mut()
+            .tron_storage_set_commit_read_kinds(kinds);
+        evm.ctx
+            .journaled_state
+            .db_mut()
+            .tron_storage_set_commit_written(written);
+        evm.commit_inner();
+        out
+    });
     if op_trace {
         revm::interpreter::set_op_trace(false);
         eprintln!("OPTRACE_TX_END");
@@ -969,6 +996,10 @@ fn execute_trigger_inner_with_tracer(
         Arc::clone(&stores.accounts),
         Arc::clone(&stores.code),
         Arc::clone(&stores.storage),
+    )
+    .with_fork_flags(
+        stores.dynamic_properties.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
+        stores.dynamic_properties.allow_optimize_tvm_storage(),
     );
     if let Some(tx_id) = root_tx_id {
         tron_db = tron_db.with_root_tx_id(tx_id);
@@ -1142,6 +1173,11 @@ fn execute_trigger_inner_with_tracer(
         ctx.journaled_state.set_tron_shared_storage_across_frames(
             !tron_chainbase::energy_limit_hard_fork_active(&stores.dynamic_properties),
         );
+        ctx.journaled_state.set_tron_fork_flags(
+            proposals.fork_4_8_2_2,
+            proposals.fork_4_8_2_3,
+            proposals.allow_optimize_tvm_storage,
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -1176,7 +1212,23 @@ fn execute_trigger_inner_with_tracer(
         }
     };
 
-    let outcome = evm.inspect_tx_commit(tx);
+    // Hand the journal's final storage read kinds to the database before the
+    // commit, so legacy rows that were only read migrate (java
+    // `Storage.commitOptimized`), then commit as `inspect_tx_commit` would.
+    let outcome = evm.inspect_one_tx(tx).map(|out| {
+        let kinds = evm.ctx.journaled_state.tron_take_storage_read_kinds();
+        let written = evm.ctx.journaled_state.tron_take_storage_written();
+        evm.ctx
+            .journaled_state
+            .db_mut()
+            .tron_storage_set_commit_read_kinds(kinds);
+        evm.ctx
+            .journaled_state
+            .db_mut()
+            .tron_storage_set_commit_written(written);
+        evm.commit_inner();
+        out
+    });
     let unwind_on_failure = |stores: &VmStores| {
         if let Some((id, val)) = top_level_token {
             let _ = apply_top_level_trc10(
@@ -1561,6 +1613,10 @@ fn execute_create_inner(
         Arc::clone(&stores.code),
         Arc::clone(&stores.storage),
     )
+    .with_fork_flags(
+        stores.dynamic_properties.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
+        stores.dynamic_properties.allow_optimize_tvm_storage(),
+    )
     .with_root_tx_id(*tx_id);
     if let Some(idx) = &stores.block_index {
         tron_db = tron_db.with_block_index(Arc::clone(idx));
@@ -1791,6 +1847,11 @@ fn execute_create_inner(
         ctx.journaled_state.set_tron_shared_storage_across_frames(
             !tron_chainbase::energy_limit_hard_fork_active(&stores.dynamic_properties),
         );
+        ctx.journaled_state.set_tron_fork_flags(
+            proposals.fork_4_8_2_2,
+            proposals.fork_4_8_2_3,
+            proposals.allow_optimize_tvm_storage,
+        );
     }
     let mut evm = Evm {
         ctx,
@@ -1826,7 +1887,20 @@ fn execute_create_inner(
         }
     };
 
-    let exec = match evm.inspect_tx_commit(tx) {
+    let exec = match evm.inspect_one_tx(tx).map(|out| {
+        let kinds = evm.ctx.journaled_state.tron_take_storage_read_kinds();
+        let written = evm.ctx.journaled_state.tron_take_storage_written();
+        evm.ctx
+            .journaled_state
+            .db_mut()
+            .tron_storage_set_commit_read_kinds(kinds);
+        evm.ctx
+            .journaled_state
+            .db_mut()
+            .tron_storage_set_commit_written(written);
+        evm.commit_inner();
+        out
+    }) {
         Ok(r) => r,
         Err(e) => {
             unwind_create_token(stores, contract, tron_contract_addr.as_bytes(), top_level_token);
@@ -1859,7 +1933,14 @@ fn execute_create_inner(
             // energy and discard the pre-installed account.
             let ef_invalid =
                 proposals.allow_tvm_london && runtime_code.first() == Some(&0xEF);
-            if total_with_deposit > energy_limit || ef_invalid {
+            // java `VMActuator.checkContractHashFields` (VERSION_4_8_2_2): once
+            // the deposit fits, a CreateSmartContract carrying `code_hash` or
+            // `trx_hash` throws `OutOfTimeException` before `saveCode`.
+            let hash_fields_set = proposals.fork_4_8_2_2
+                && proposals.allow_tvm_constantinople
+                && total_with_deposit <= energy_limit
+                && (!smart_contract.code_hash.is_empty() || !smart_contract.trx_hash.is_empty());
+            if total_with_deposit > energy_limit || ef_invalid || hash_fields_set {
                 // Reverse the up-front TRC-10 transfer (restore the caller's
                 // asset_v2) before dropping the pre-installed account, so a
                 // failed deploy moves no token — matching java's discarded
@@ -1870,7 +1951,9 @@ fn execute_create_inner(
                     .delete(&tron_contract_addr)
                     .expect("db error in execute_create cleaning up after failed deployment");
                 VmOutcome::Halt {
-                    reason: if ef_invalid {
+                    reason: if hash_fields_set {
+                        "CPU timeout for contract hash fields".to_string()
+                    } else if ef_invalid {
                         "deployed runtime code starts with 0xEF (EIP-3541)".to_string()
                     } else {
                         format!(
@@ -1886,7 +1969,9 @@ fn execute_create_inner(
                     // `InvalidCodeException` (line ~204-207) → INVALID_CODE; the
                     // code-deposit shortfall throws `notEnoughSpendEnergy`
                     // (line ~209-216) → OUT_OF_ENERGY.
-                    result: if ef_invalid {
+                    result: if hash_fields_set {
+                        tron_proto::transaction::result::ContractResult::OutOfTime
+                    } else if ef_invalid {
                         tron_proto::transaction::result::ContractResult::InvalidCode
                     } else {
                         tron_proto::transaction::result::ContractResult::OutOfEnergy
@@ -1934,7 +2019,7 @@ fn execute_create_inner(
                     acct.code_hash = runtime_hash.clone();
                     acct.r#type = tron_proto::AccountType::Contract as i32;
                     if acct.account_name.is_empty() {
-                        acct.account_name = smart_contract.name.clone().into_bytes();
+                        acct.account_name = smart_contract.name.clone();
                     }
                     stores
                         .accounts

@@ -64,7 +64,7 @@ pub fn deploy(
     contracts.put(
         &address,
         &SmartContract {
-            name: HISTORY_STORAGE_NAME.to_string(),
+            name: HISTORY_STORAGE_NAME.as_bytes().to_vec(),
             contract_address: HISTORY_STORAGE_ADDRESS.to_vec(),
             origin_address: HISTORY_DEPLOYER_ADDRESS.to_vec(),
             consume_user_resource_percent: 100,
@@ -123,8 +123,17 @@ pub fn write_parent_hash(
     };
     value[32 - src.len()..].copy_from_slice(src);
 
-    let key = StorageRowStore::compose_key(&history_storage_address(), &slot_for_block(block_num));
-    storage.put(&key, &value)?;
+    let addr_hash = StorageRowStore::addr_hash(&history_storage_address(), &[]);
+    let slot = slot_for_block(block_num);
+    let legacy_key = StorageRowStore::compose_key_with_addr_hash(&addr_hash, &slot, false);
+    if dyn_props.allow_optimize_tvm_storage() {
+        // java `Storage.commitOptimized` for a slot written without a prior
+        // read: the value lands under the 48-byte key and the legacy row goes.
+        storage.put_raw(&StorageRowStore::new_row_key(&addr_hash, &slot), &value)?;
+        storage.delete(&legacy_key)?;
+    } else {
+        storage.put(&legacy_key, &value)?;
+    }
     Ok(true)
 }
 
@@ -168,7 +177,7 @@ mod tests {
         let address = history_storage_address();
         assert_eq!(code.get(address.as_bytes()).unwrap().unwrap(), HISTORY_STORAGE_CODE);
         let contract = contracts.get(&address).unwrap().unwrap();
-        assert_eq!(contract.name, HISTORY_STORAGE_NAME);
+        assert_eq!(contract.name, HISTORY_STORAGE_NAME.as_bytes());
         assert_eq!(contract.contract_address, HISTORY_STORAGE_ADDRESS);
         assert_eq!(contract.origin_address, HISTORY_DEPLOYER_ADDRESS);
         assert_eq!(contract.consume_user_resource_percent, 100);
@@ -228,6 +237,31 @@ mod tests {
         assert!(write_parent_hash(&storage, &dp, 5, &hash).unwrap());
         let key = StorageRowStore::compose_key(&history_storage_address(), &slot_for_block(5));
         assert_eq!(storage.get(&key).unwrap().unwrap(), hash);
+    }
+
+    #[test]
+    fn write_moves_the_slot_to_its_optimized_key() {
+        let (_, _, _, dp, storage) = stores();
+        dp.save_block_hash_history_installed(1);
+        dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE", 1);
+        let addr_hash = StorageRowStore::addr_hash(&history_storage_address(), &[]);
+        let slot = slot_for_block(5);
+        let legacy = StorageRowStore::compose_key_with_addr_hash(&addr_hash, &slot, false);
+        storage.put(&legacy, &[0x11u8; 32]).unwrap();
+        let hash = [0xabu8; 32];
+        assert!(write_parent_hash(&storage, &dp, 5, &hash).unwrap());
+        assert_eq!(
+            storage
+                .get_raw(&StorageRowStore::new_row_key(&addr_hash, &slot))
+                .unwrap()
+                .unwrap(),
+            hash
+        );
+        assert!(storage.get(&legacy).unwrap().is_none());
+        assert_eq!(
+            storage.read_slot(&addr_hash, &slot, false, true).unwrap().unwrap(),
+            hash
+        );
     }
 
     #[test]

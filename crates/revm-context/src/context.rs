@@ -6,7 +6,7 @@ use context_interface::{
     host::{LoadError, TRON_MAX_CALL_DEPTH},
     journaled_state::AccountInfoLoad,
     Block, Cfg, ContextTr, Host, JournalTr, LocalContextTr, Transaction, TransactionType,
-    TronDatabaseExt,
+    TronDatabaseExt, TronOldKeyClaim,
 };
 use database_interface::{Database, DatabaseRef, EmptyDB, WrapDatabaseRef};
 use derive_where::derive_where;
@@ -584,7 +584,20 @@ impl<
         value: StorageValue,
         skip_cold_load: bool,
     ) -> Result<StateLoad<SStoreResult>, LoadError> {
-        self.journal_mut()
+        if !self.tron_storage_pre_access(address, key) {
+            self.journaled_state.tron_set_pending_out_of_time();
+            return Ok(StateLoad::new(
+                SStoreResult {
+                    original_value: StorageValue::ZERO,
+                    present_value: StorageValue::ZERO,
+                    new_value: value,
+                    prev_written_this_tx: false,
+                },
+                false,
+            ));
+        }
+        let result = self
+            .journal_mut()
             .sstore_skip_cold_load(address, key, value, skip_cold_load)
             .map_err(|e| {
                 cold_path();
@@ -593,7 +606,9 @@ impl<
                     *self.error() = Err(err.into());
                 }
                 ret
-            })
+            });
+        self.tron_storage_post_access(address, key, true);
+        result
     }
 
     #[inline]
@@ -603,7 +618,12 @@ impl<
         key: StorageKey,
         skip_cold_load: bool,
     ) -> Result<StateLoad<StorageValue>, LoadError> {
-        self.journal_mut()
+        if !self.tron_storage_pre_access(address, key) {
+            self.journaled_state.tron_set_pending_out_of_time();
+            return Ok(StateLoad::new(StorageValue::ZERO, false));
+        }
+        let result = self
+            .journal_mut()
             .sload_skip_cold_load(address, key, skip_cold_load)
             .map_err(|e| {
                 cold_path();
@@ -612,7 +632,9 @@ impl<
                     *self.error() = Err(err.into());
                 }
                 ret
-            })
+            });
+        self.tron_storage_post_access(address, key, false);
+        result
     }
 
     #[inline]
@@ -795,6 +817,22 @@ impl<
         self.journaled_state.tron_mark_transfer_failed();
     }
 
+    fn tron_fork_4_8_2_2(&self) -> bool {
+        self.journaled_state.tron_fork_4_8_2_2()
+    }
+
+    fn tron_is_selfdestructed(&self, address: Address) -> bool {
+        self.journaled_state.tron_is_selfdestructed(address)
+    }
+
+    fn tron_mark_selfdestructed(&mut self, address: Address) {
+        self.journaled_state.tron_mark_selfdestructed(address);
+    }
+
+    fn tron_take_pending_out_of_time(&mut self) -> bool {
+        self.journaled_state.tron_take_pending_out_of_time()
+    }
+
 
     fn tron_suicide(
         &mut self,
@@ -864,12 +902,14 @@ impl<
         frozen_balance: i64,
         resource_type: u32,
         owner_balance: i64,
+        owner_selfdestructed: bool,
     ) -> i64 {
         let result = self.journaled_state.db_mut().tron_freeze_balance_v2(
             caller,
             frozen_balance,
             resource_type,
             owner_balance,
+            owner_selfdestructed,
         );
         self.apply_tron_balance_delta();
         result
@@ -984,6 +1024,83 @@ impl<
         } else {
             let abs = (-delta) as u64;
             let _ = self.journaled_state.balance_decr(address, U256::from(abs));
+        }
+    }
+}
+
+/// TRON fork: the java `Storage.getValue` / `put` preamble and epilogue that
+/// the 4.8.2.3 storage rules add around every slot access.
+impl<
+        BLOCK: Block,
+        TX: Transaction,
+        CFG: Cfg,
+        DB: Database + TronDatabaseExt,
+        JOURNAL: JournalTr<Database = DB>,
+        CHAIN,
+        LOCAL: LocalContextTr,
+    > Context<BLOCK, TX, CFG, DB, JOURNAL, CHAIN, LOCAL>
+{
+    /// Under the alias check: claim the legacy row key for the slot and fail
+    /// (`false`) when another slot already owns it. Under
+    /// `ALLOW_OPTIMIZE_TVM_STORAGE`: tell the database whether the legacy key
+    /// is taken, so a cache-miss load resolves the way `getOptimized` does.
+    fn tron_storage_pre_access(&mut self, address: Address, key: StorageKey) -> bool {
+        let alias_check = self.journaled_state.tron_storage_alias_check();
+        let optimize = self.journaled_state.tron_optimize_tvm_storage();
+        if !alias_check && !optimize {
+            return true;
+        }
+        let Some(old_key) = self.journaled_state.db().tron_storage_old_row_key(address, key)
+        else {
+            return true;
+        };
+        if !optimize {
+            return !matches!(
+                self.journaled_state.tron_claim_old_row_key(old_key, address, key),
+                TronOldKeyClaim::Taken
+            );
+        }
+        if !self.journaled_state.tron_storage_slot_cached(address, key) {
+            let taken = self.journaled_state.tron_old_row_key_taken(old_key, address, key);
+            self.journaled_state
+                .db_mut()
+                .tron_storage_set_load_hint(address, key, taken);
+        }
+        true
+    }
+
+    /// Record what an optimized load decided (read kind, legacy-key claim,
+    /// java's uncached `oldKeyTaken` return) and, for a write, claim the
+    /// legacy key the way `Storage.put` → `ownOldKey` does.
+    fn tron_storage_post_access(&mut self, address: Address, key: StorageKey, is_write: bool) {
+        if !self.journaled_state.tron_optimize_tvm_storage() {
+            return;
+        }
+        let Some(old_key) = self.journaled_state.db().tron_storage_old_row_key(address, key)
+        else {
+            return;
+        };
+        if let Some(report) = self.journaled_state.db_mut().tron_storage_take_load_report() {
+            if report.address == address && report.key == key {
+                if let Some(kind) = report.kind {
+                    self.journaled_state
+                        .tron_set_storage_read_kind(address, key, kind);
+                }
+                if report.own_old_key {
+                    let _ = self
+                        .journaled_state
+                        .tron_claim_old_row_key(old_key, address, key);
+                }
+                if report.uncached && !is_write {
+                    self.journaled_state.tron_storage_evict_slot(address, key);
+                }
+            }
+        }
+        if is_write {
+            let _ = self
+                .journaled_state
+                .tron_claim_old_row_key(old_key, address, key);
+            self.journaled_state.tron_mark_storage_written(address, key);
         }
     }
 }

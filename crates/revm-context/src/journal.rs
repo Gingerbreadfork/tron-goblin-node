@@ -10,6 +10,7 @@ pub use inner::{JournalCfg, JournalInner};
 
 use bytecode::Bytecode;
 use context_interface::{
+    tron_ext::{TronOldKeyClaim, TronStorageReadKind},
     context::{SStoreResult, SelfDestructResult, StateLoad},
     journaled_state::{
         account::JournaledAccount, AccountInfoLoad, AccountLoad, JournalCheckpoint,
@@ -17,6 +18,7 @@ use context_interface::{
     },
 };
 use core::ops::{Deref, DerefMut};
+use core::mem;
 use database_interface::Database;
 use primitives::{
     hardfork::SpecId, Address, AddressMap, AddressSet, HashSet, Log, StorageKey, StorageValue,
@@ -286,6 +288,114 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     #[inline]
     fn set_tron_shared_storage_across_frames(&mut self, enabled: bool) {
         self.inner.cfg.tron_shared_storage_across_frames = enabled;
+    }
+
+    #[inline]
+    fn set_tron_fork_flags(
+        &mut self,
+        fork_4_8_2_2: bool,
+        storage_alias_check: bool,
+        optimize_tvm_storage: bool,
+    ) {
+        self.inner.cfg.tron_fork_4_8_2_2 = fork_4_8_2_2;
+        self.inner.cfg.tron_storage_alias_check = storage_alias_check;
+        self.inner.cfg.tron_optimize_tvm_storage = optimize_tvm_storage;
+    }
+
+    #[inline]
+    fn tron_fork_4_8_2_2(&self) -> bool {
+        self.inner.cfg.tron_fork_4_8_2_2
+    }
+
+    #[inline]
+    fn tron_storage_alias_check(&self) -> bool {
+        self.inner.cfg.tron_storage_alias_check
+    }
+
+    #[inline]
+    fn tron_optimize_tvm_storage(&self) -> bool {
+        self.inner.cfg.tron_optimize_tvm_storage
+    }
+
+    #[inline]
+    fn tron_mark_selfdestructed(&mut self, address: Address) {
+        self.inner.tron_mark_selfdestructed(address);
+    }
+
+    #[inline]
+    fn tron_is_selfdestructed(&self, address: Address) -> bool {
+        self.inner.tron_is_selfdestructed(address)
+    }
+
+    #[inline]
+    fn tron_claim_old_row_key(
+        &mut self,
+        old_key: B256,
+        address: Address,
+        key: StorageKey,
+    ) -> TronOldKeyClaim {
+        self.inner.tron_claim_old_row_key(old_key, address, key)
+    }
+
+    #[inline]
+    fn tron_old_row_key_taken(&self, old_key: B256, address: Address, key: StorageKey) -> bool {
+        self.inner.tron_old_row_key_taken(old_key, address, key)
+    }
+
+    #[inline]
+    fn tron_storage_read_kind(
+        &self,
+        address: Address,
+        key: StorageKey,
+    ) -> Option<TronStorageReadKind> {
+        self.inner.tron_storage_read_kind(address, key)
+    }
+
+    #[inline]
+    fn tron_set_storage_read_kind(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        kind: TronStorageReadKind,
+    ) {
+        self.inner.tron_set_storage_read_kind(address, key, kind);
+    }
+
+    #[inline]
+    fn tron_take_storage_read_kinds(
+        &mut self,
+    ) -> Vec<((Address, StorageKey), TronStorageReadKind)> {
+        self.inner.tron_take_storage_read_kinds()
+    }
+
+    #[inline]
+    fn tron_storage_slot_cached(&self, address: Address, key: StorageKey) -> bool {
+        self.inner.tron_storage_slot_cached(address, key)
+    }
+
+    #[inline]
+    fn tron_mark_storage_written(&mut self, address: Address, key: StorageKey) {
+        self.inner.tron_mark_storage_written(address, key);
+    }
+
+    #[inline]
+    fn tron_take_storage_written(&mut self) -> Vec<(Address, StorageKey)> {
+        self.inner.tron_take_storage_written()
+    }
+
+    #[inline]
+    fn tron_storage_evict_slot(&mut self, address: Address, key: StorageKey) {
+        self.inner.tron_storage_evict_slot(address, key);
+    }
+
+    #[inline]
+    fn tron_set_pending_out_of_time(&mut self) {
+        self.inner.tron_pending_out_of_time = true;
+    }
+
+    #[inline]
+    fn tron_take_pending_out_of_time(&mut self) -> bool {
+        mem::replace(&mut self.inner.tron_pending_out_of_time, false)
     }
 
     #[inline]

@@ -28,7 +28,53 @@
 //! WITHDRAWREWARD, etc.) need `&mut self` + actuator-primitive
 //! refactoring before they can plug in here.
 
-use primitives::{Address, B256};
+use primitives::{Address, StorageKey, B256};
+use std::vec::Vec;
+
+/// Sentinel a TRON host bridge returns where java throws its deterministic
+/// `OutOfTimeException`; the opcode maps it to `InstructionResult::TronOutOfTime`.
+pub const TRON_HOST_OUT_OF_TIME: i64 = i64::MIN;
+
+/// java `Storage.ReadKind`: which row a slot was first loaded from under
+/// `ALLOW_OPTIMIZE_TVM_STORAGE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TronStorageReadKind {
+    /// The 48-byte row existed (possibly holding zero).
+    New,
+    /// Only the legacy 32-byte row existed; the commit migrates it.
+    Old,
+    /// Neither row existed.
+    Empty,
+}
+
+/// Outcome of claiming a legacy storage-row key for a slot (java
+/// `Storage.oldRowKeyOwners`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TronOldKeyClaim {
+    /// The slot already owned the key.
+    Owner,
+    /// The key was free and now belongs to the slot.
+    Claimed,
+    /// A different slot owns the key.
+    Taken,
+}
+
+/// What the database's optimized storage load decided, handed back to the
+/// journal so the per-frame maps can record it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TronStorageLoadReport {
+    /// Contract the slot belongs to.
+    pub address: Address,
+    /// The slot.
+    pub key: StorageKey,
+    /// Which row served the load, `None` when java recorded nothing.
+    pub kind: Option<TronStorageReadKind>,
+    /// java `cacheRead` → `ownOldKey`: the slot claims its legacy key.
+    pub own_old_key: bool,
+    /// java returned without caching (`oldKeyTaken`); the journal must not
+    /// keep the value either.
+    pub uncached: bool,
+}
 
 /// TRON's address prefix byte (java `Constant.ADD_PRE_FIX_BYTE_MAINNET`).
 pub const TRON_ADDRESS_PREFIX_BYTE: u8 = 0x41;
@@ -88,6 +134,40 @@ pub trait TronHostExt {
 /// reads. Stock databases (EmptyDB, the upstream test fixtures) get
 /// the default zero values.
 pub trait TronDatabaseExt {
+    /// Legacy 32-byte storage-row key of `(address, slot)` (java
+    /// `Storage.getOldRowKey`), or `None` when the database has no TRON row
+    /// layout.
+    fn tron_storage_old_row_key(&self, _address: Address, _slot: StorageKey) -> Option<B256> {
+        None
+    }
+
+    /// Before a journal cache miss under `ALLOW_OPTIMIZE_TVM_STORAGE`:
+    /// whether another slot of this transaction already owns the legacy key.
+    fn tron_storage_set_load_hint(
+        &mut self,
+        _address: Address,
+        _slot: StorageKey,
+        _old_key_taken: bool,
+    ) {
+    }
+
+    /// The report of the last optimized load, if one ran.
+    fn tron_storage_take_load_report(&mut self) -> Option<TronStorageLoadReport> {
+        None
+    }
+
+    /// The transaction's final read kinds, which the commit needs to migrate
+    /// rows that were read from their legacy keys.
+    fn tron_storage_set_commit_read_kinds(
+        &mut self,
+        _kinds: Vec<((Address, StorageKey), TronStorageReadKind)>,
+    ) {
+    }
+
+    /// The slots the transaction wrote (java's always-dirty `put`), so the
+    /// optimized commit persists an unchanged value too.
+    fn tron_storage_set_commit_written(&mut self, _written: Vec<(Address, StorageKey)>) {}
+
     /// See [`TronHostExt::tron_token_balance`].
     fn tron_token_balance(&self, _address: Address, _token_id: i64) -> i64 {
         0
@@ -180,6 +260,7 @@ pub trait TronDatabaseExt {
         _frozen_balance: i64,
         _resource_type: u32,
         _owner_balance: i64,
+        _owner_selfdestructed: bool,
     ) -> i64 {
         0
     }
@@ -366,7 +447,7 @@ impl<T: database_interface::DatabaseRef> TronDatabaseExt
 // instead of touching the orphan-rule fight in every test file.
 
 use database_interface::{Database, DatabaseCommit};
-use primitives::{StorageKey, StorageValue};
+use primitives::StorageValue;
 use state::{bytecode::Bytecode, Account, AccountId, AccountInfo};
 
 /// Newtype wrapper that gives any [`Database`] a default-zero

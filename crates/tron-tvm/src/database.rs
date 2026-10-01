@@ -36,6 +36,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use revm::context_interface::{TronStorageLoadReport, TronStorageReadKind};
 use revm::primitives::{Address as EvmAddress, AddressMap, StorageKey, StorageValue, B256, U256};
 use revm::state::{Account, AccountInfo, Bytecode};
 use revm::{Database, DatabaseCommit, DatabaseRef};
@@ -163,6 +164,22 @@ pub struct TronDatabase {
     /// nested CALL/CREATE. `execute_create` sets this so the deploy frame
     /// retains the 1/64 exactly as java does. `None` for trigger txs.
     pub(crate) top_level_deploy_version: Option<(EvmAddress, i32)>,
+    /// `ForkController.pass(VERSION_4_8_2_2)`: the Stake-2.0 deterministic
+    /// OutOfTime rules the staking bridges enforce.
+    pub(crate) fork_4_8_2_2: bool,
+    /// `ALLOW_OPTIMIZE_TVM_STORAGE`: storage rows live under 48-byte keys,
+    /// loads consult the new key first, commits migrate legacy rows.
+    pub(crate) optimize_tvm_storage: bool,
+    /// `(address, slot, old_key_taken)` the journal set before a cache-miss
+    /// load under the optimized scheme (java `Storage.oldKeyTaken`).
+    pub(crate) storage_load_hint: RefCell<Option<(EvmAddress, StorageKey, bool)>>,
+    /// What the last optimized load decided, for the journal to record.
+    pub(crate) storage_load_report: RefCell<Option<TronStorageLoadReport>>,
+    /// The transaction's final read kinds (java `Storage.readKinds`), handed
+    /// over before `commit` so legacy rows that were read get migrated.
+    pub(crate) commit_read_kinds: HashMap<(EvmAddress, StorageKey), TronStorageReadKind>,
+    /// The slots the transaction wrote (java's always-dirty `put`).
+    pub(crate) commit_written: std::collections::HashSet<(EvmAddress, StorageKey)>,
 }
 
 impl TronDatabase {
@@ -193,7 +210,21 @@ impl TronDatabase {
             staking_journal: None,
             pending_created_contracts: HashMap::new(),
             top_level_deploy_version: None,
+            fork_4_8_2_2: false,
+            optimize_tvm_storage: false,
+            storage_load_hint: RefCell::new(None),
+            storage_load_report: RefCell::new(None),
+            commit_read_kinds: HashMap::new(),
+            commit_written: std::collections::HashSet::new(),
         }
+    }
+
+    /// Set the stat-based fork and proposal-99 flags this database applies
+    /// (`ForkController.pass(VERSION_4_8_2_2)`, `ALLOW_OPTIMIZE_TVM_STORAGE`).
+    pub fn with_fork_flags(mut self, fork_4_8_2_2: bool, optimize_tvm_storage: bool) -> Self {
+        self.fork_4_8_2_2 = fork_4_8_2_2;
+        self.optimize_tvm_storage = optimize_tvm_storage;
+        self
     }
 
     /// Mark the top-level `CreateSmartContract` deploy address so its init
@@ -312,20 +343,26 @@ impl TronDatabase {
     /// the wrong key, so reads come back zero — invisible on self-synced state
     /// (we wrote AND read at the wrong prefix) but fatal against a real
     /// java-tron snapshot.
-    fn compose_storage_key(&self, addr: &TronAddress, slot: &[u8; 32]) -> [u8; 32] {
+    pub(crate) fn compose_storage_key(&self, addr: &TronAddress, slot: &[u8; 32]) -> [u8; 32] {
+        let (is_v1, ah) = self.storage_key_parts(addr);
+        StorageRowStore::compose_key_with_addr_hash(&ah, slot, is_v1)
+    }
+
+    /// `(is_v1_layout, addr_hash)` for `addr` — the two inputs every row key
+    /// of the contract derives from.
+    fn storage_key_parts(&self, addr: &TronAddress) -> (bool, [u8; 32]) {
         // A contract CREATE2-deployed earlier in THIS tx isn't in the
         // ContractStore until commit, but java's in-memory deposit already
         // addresses its storage with the trxHash (= this tx's root id) prefix.
         let evm = tron_to_evm_address(addr);
         if let Some((_creator, is_create2)) = self.pending_created_contracts.get(&evm) {
             let trx_hash: &[u8] = if *is_create2 { &self.root_tx_id } else { &[] };
-            let ah = StorageRowStore::addr_hash(addr, trx_hash);
             // Nested creates are version 0 → v2 (raw slot).
-            return StorageRowStore::compose_key_with_addr_hash(&ah, slot, false);
+            return (false, StorageRowStore::addr_hash(addr, trx_hash));
         }
         if let Some(contracts) = &self.contracts {
             let cached = self.version_cache.borrow().get(addr).copied();
-            let (is_v1, ah) = match cached {
+            return match cached {
                 Some(v) => v,
                 None => match contracts.get(addr) {
                     Ok(Some(c)) => {
@@ -340,10 +377,64 @@ impl TronDatabase {
                     _ => (false, StorageRowStore::addr_hash(addr, &[])),
                 },
             };
-            return StorageRowStore::compose_key_with_addr_hash(&ah, slot, is_v1);
         }
         // No ContractStore attached (read-only / test setups): plain v2.
-        StorageRowStore::compose_key(addr, slot)
+        (false, StorageRowStore::addr_hash(addr, &[]))
+    }
+
+    /// java `Storage.getOptimized` for a journal cache miss under
+    /// `ALLOW_OPTIMIZE_TVM_STORAGE`: the 48-byte row wins (a stored zero reads
+    /// as empty and pins the slot there), a legacy key another slot already
+    /// claimed reads as empty without being cached, otherwise the legacy row
+    /// is read and marked for migration. The decision is left in
+    /// `storage_load_report` for the journal.
+    fn storage_optimized(
+        &self,
+        address: EvmAddress,
+        index: StorageKey,
+    ) -> Result<StorageValue, <Self as DatabaseRef>::Error> {
+        let tron_addr = evm_to_tron_address(&address);
+        let slot: [u8; 32] = index.to_be_bytes();
+        let (is_v1, ah) = self.storage_key_parts(&tron_addr);
+        let old_key_taken = self
+            .storage_load_hint
+            .borrow_mut()
+            .take()
+            .filter(|(a, k, _)| *a == address && *k == index)
+            .map(|(_, _, taken)| taken)
+            .unwrap_or(false);
+        let mut report = TronStorageLoadReport {
+            address,
+            key: index,
+            kind: None,
+            own_old_key: false,
+            uncached: false,
+        };
+        let new_key = StorageRowStore::new_row_key(&ah, &slot);
+        let value = if let Some(raw) = self.storage.get_raw(&new_key)? {
+            report.kind = Some(TronStorageReadKind::New);
+            if raw.iter().all(|b| *b == 0) {
+                StorageValue::ZERO
+            } else {
+                report.own_old_key = true;
+                storage_word(&raw)
+            }
+        } else if old_key_taken {
+            report.uncached = true;
+            StorageValue::ZERO
+        } else if let Some(raw) = self
+            .storage
+            .get(&StorageRowStore::compose_key_with_addr_hash(&ah, &slot, is_v1))?
+        {
+            report.kind = Some(TronStorageReadKind::Old);
+            report.own_old_key = true;
+            storage_word(&raw)
+        } else {
+            report.kind = Some(TronStorageReadKind::Empty);
+            StorageValue::ZERO
+        };
+        *self.storage_load_report.borrow_mut() = Some(report);
+        Ok(value)
     }
 }
 
@@ -434,6 +525,9 @@ impl DatabaseRef for TronDatabase {
         address: EvmAddress,
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
+        if self.optimize_tvm_storage {
+            return self.storage_optimized(address, index);
+        }
         let tron_addr = evm_to_tron_address(&address);
         let key_bytes: [u8; 32] = index.to_be_bytes();
         let composite = self.compose_storage_key(&tron_addr, &key_bytes);
@@ -441,11 +535,7 @@ impl DatabaseRef for TronDatabase {
         if raw.is_empty() {
             return Ok(StorageValue::ZERO);
         }
-        // Storage values are stored as 32 BE bytes. Pad/truncate to be safe.
-        let mut padded = [0u8; 32];
-        let n = raw.len().min(32);
-        padded[32 - n..].copy_from_slice(&raw[raw.len() - n..]);
-        Ok(U256::from_be_bytes(padded))
+        Ok(storage_word(&raw))
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
@@ -527,8 +617,13 @@ impl DatabaseCommit for TronDatabase {
             }
 
             // Skip accounts that revm loaded but never touched; nothing
-            // changed for them.
+            // changed for them — except that under `ALLOW_OPTIMIZE_TVM_STORAGE`
+            // a slot merely read from its legacy row is migrated (java
+            // `Storage.commitOptimized` runs for every touched `Storage`).
             if !account.is_touched() {
+                if self.optimize_tvm_storage {
+                    self.commit_storage_optimized(&address, &tron_addr, &account.storage);
+                }
                 continue;
             }
 
@@ -761,6 +856,10 @@ impl DatabaseCommit for TronDatabase {
                     Some(out)
                 });
             let hx = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+            if self.optimize_tvm_storage {
+                self.commit_storage_optimized(&address, &tron_addr, &account.storage);
+                continue;
+            }
             for (slot_key, slot) in &account.storage {
                 if slot.present_value == slot.original_value {
                     continue;
@@ -812,5 +911,49 @@ pub fn code_hash(code: &[u8]) -> B256 {
         revm::primitives::KECCAK_EMPTY
     } else {
         B256::from(keccak256(code))
+    }
+}
+
+/// Storage values are stored as 32 big-endian bytes; shorter or longer rows
+/// are right-aligned into a word.
+fn storage_word(raw: &[u8]) -> StorageValue {
+    let mut padded = [0u8; 32];
+    let n = raw.len().min(32);
+    padded[32 - n..].copy_from_slice(&raw[raw.len() - n..]);
+    U256::from_be_bytes(padded)
+}
+
+impl TronDatabase {
+    /// java `Storage.commitOptimized`: every written slot (java's `put` marks
+    /// the row dirty whatever the value) lands under its 48-byte key, zero
+    /// included, and drops its legacy row unless the slot was first served by
+    /// the 48-byte row or found empty; every slot read from a legacy row is
+    /// migrated the same way.
+    fn commit_storage_optimized(
+        &self,
+        address: &EvmAddress,
+        tron_addr: &TronAddress,
+        storage: &revm::state::EvmStorage,
+    ) {
+        let (is_v1, ah) = self.storage_key_parts(tron_addr);
+        for (slot_key, slot) in storage {
+            let dirty = slot.present_value != slot.original_value
+                || self.commit_written.contains(&(*address, *slot_key));
+            let kind = self.commit_read_kinds.get(&(*address, *slot_key)).copied();
+            let migrate = !dirty && kind == Some(TronStorageReadKind::Old);
+            if !dirty && !migrate {
+                continue;
+            }
+            let slot_bytes: [u8; 32] = slot_key.to_be_bytes();
+            let value_bytes: [u8; 32] = slot.present_value.to_be_bytes();
+            self.storage
+                .put_raw(&StorageRowStore::new_row_key(&ah, &slot_bytes), &value_bytes)
+                .expect("db error in DatabaseCommit::commit writing optimized storage slot");
+            if kind.is_none() || kind == Some(TronStorageReadKind::Old) {
+                self.storage
+                    .delete(&StorageRowStore::compose_key_with_addr_hash(&ah, &slot_bytes, is_v1))
+                    .expect("db error in DatabaseCommit::commit deleting legacy storage slot");
+            }
+        }
     }
 }

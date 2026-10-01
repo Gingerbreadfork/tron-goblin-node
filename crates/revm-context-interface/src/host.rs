@@ -280,6 +280,26 @@ pub trait Host {
     /// TRANSFER_FAILED`. Default no-op.
     fn tron_mark_transfer_failed(&mut self) {}
 
+    /// TRON fork: `ForkController.pass(VERSION_4_8_2_2)` — the Stake-2.0 /
+    /// SELFDESTRUCT deterministic OutOfTime rules are live.
+    fn tron_fork_4_8_2_2(&self) -> bool {
+        false
+    }
+
+    /// TRON fork: java `Repository.isSelfDestructed(address)`.
+    fn tron_is_selfdestructed(&self, _address: Address) -> bool {
+        false
+    }
+
+    /// TRON fork: java `Repository.markSelfDestruct(address)`.
+    fn tron_mark_selfdestructed(&mut self, _address: Address) {}
+
+    /// TRON fork: did the last storage access raise java's deterministic
+    /// `OutOfTimeException`? Clears the flag.
+    fn tron_take_pending_out_of_time(&mut self) -> bool {
+        false
+    }
+
     /// TRON fork: record that an operation raised a plain
     /// `BytecodeExecutionException` — java's non-`TransferException` failure
     /// flavour, which `VMActuator` follows with `spendAllEnergy()` and
@@ -621,6 +641,7 @@ pub trait Host {
         _frozen_balance: i64,
         _resource_type: u32,
         _owner_balance: i64,
+        _owner_selfdestructed: bool,
     ) -> i64 {
         0
     }

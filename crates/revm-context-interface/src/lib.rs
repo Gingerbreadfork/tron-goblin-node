@@ -29,5 +29,6 @@ pub use journaled_state::JournalTr;
 pub use local::{FrameStack, FrameToken, LocalContextTr, OutFrame};
 pub use transaction::{Transaction, TransactionType};
 pub use tron_ext::{
-    tron_address_word, TronCompat, TronDatabaseExt, TronHostExt, TRON_ADDRESS_PREFIX_BYTE,
+    tron_address_word, TronCompat, TronDatabaseExt, TronHostExt, TronOldKeyClaim,
+    TronStorageLoadReport, TronStorageReadKind, TRON_ADDRESS_PREFIX_BYTE, TRON_HOST_OUT_OF_TIME,
 };

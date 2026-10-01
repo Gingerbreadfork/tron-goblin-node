@@ -212,6 +212,9 @@ pub fn sload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
         let storage = context
             .host
             .sload_skip_cold_load(target, *index, skip_cold)?;
+        if context.host.tron_take_pending_out_of_time() {
+            return Err(InstructionResult::TronOutOfTime);
+        }
         if storage.is_cold {
             gas!(context.interpreter, additional_cold_cost);
         }
@@ -221,6 +224,10 @@ pub fn sload<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
             .host
             .sload(target, *index)
             .ok_or(InstructionResult::FatalExternalError)?;
+        // TRON fork: java `Storage.checkAlias` threw `OutOfTimeException`.
+        if context.host.tron_take_pending_out_of_time() {
+            return Err(InstructionResult::TronOutOfTime);
+        }
         *index = storage.data;
     };
     Ok(())
@@ -264,6 +271,10 @@ pub fn sstore<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) -> Result {
             .sstore(target, index, value)
             .ok_or(InstructionResult::FatalExternalError)?
     };
+    // TRON fork: java `Storage.checkAlias` threw `OutOfTimeException`.
+    if context.host.tron_take_pending_out_of_time() {
+        return Err(InstructionResult::TronOutOfTime);
+    }
 
     let is_istanbul = spec_id.is_enabled_in(ISTANBUL);
 
@@ -498,6 +509,15 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
             .selfdestruct_cost(charge_topup, false)
     );
 
+    // java `Program.suicide2` opens with the beneficiary check
+    // (`MUtil.checkCPUTimeForSelfDestructedBeneficiary`, VERSION_4_8_2_2).
+    if restriction
+        && context.host.tron_fork_4_8_2_2()
+        && context.host.tron_is_selfdestructed(target)
+    {
+        return Err(InstructionResult::TronOutOfTime);
+    }
+
     let created_locally = context.host.tron_account_created_locally(owner);
     let will_destroy = created_locally || !restriction;
 
@@ -536,6 +556,10 @@ pub fn tron_selfdestruct<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
         -3 => return Err(InstructionResult::TronBytecodeExecution),
         _ => {}
     }
+
+    // java `Repository.markSelfDestruct(owner)` at the end of every
+    // successful `suicide` / `suicide2` path.
+    context.host.tron_mark_selfdestructed(owner);
 
     // Standard journal selfdestruct -- destroy/no-op/transfer per the
     // (overridden) 6780 rule, burn-account redirect for self-target.

@@ -14,7 +14,7 @@ use crate::{
     CallInput, CallInputs, CallScheme, CallValue, CreateInputs, Host,
     InstructionExecResult as Result, InstructionResult, InterpreterAction,
 };
-use context_interface::CreateScheme;
+use context_interface::{CreateScheme, TRON_HOST_OUT_OF_TIME};
 use primitives::{hardfork::SpecId, Bytes, U256};
 use std::boxed::Box;
 
@@ -1142,12 +1142,20 @@ pub fn freeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) ->
         .balance(caller)
         .map(|b| i64::try_from(b.data).unwrap_or(i64::MAX))
         .unwrap_or(0);
+    // java `FreezeBalanceV2Processor.validate` ends with
+    // `repo.isSelfDestructed(owner)` → `OutOfTimeException` (VERSION_4_8_2_2).
+    let owner_selfdestructed =
+        context.host.tron_fork_4_8_2_2() && context.host.tron_is_selfdestructed(caller);
     let result = context.host.tron_freeze_balance_v2(
         caller,
         u256_to_i64_exact(&frozen_balance).unwrap_or(0),
         resource_code_v2(&resource_type),
         owner_balance,
+        owner_selfdestructed,
     );
+    if result == TRON_HOST_OUT_OF_TIME {
+        return Err(InstructionResult::TronOutOfTime);
+    }
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
 }
@@ -1169,6 +1177,9 @@ pub fn unfreeze_balance_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT>) 
         u256_to_i64_exact(&unfreeze_balance).unwrap_or(0),
         resource_code_v2(&resource_type),
     );
+    if result == TRON_HOST_OUT_OF_TIME {
+        return Err(InstructionResult::TronOutOfTime);
+    }
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
 }
@@ -1181,6 +1192,9 @@ pub fn cancel_all_unfreeze_v2<IT: ITy, H: Host + ?Sized>(context: Ictx<'_, H, IT
     require_non_staticcall!(context.interpreter);
     let caller = context.interpreter.input.target_address();
     let result = context.host.tron_cancel_all_unfreeze_v2(caller);
+    if result == TRON_HOST_OUT_OF_TIME {
+        return Err(InstructionResult::TronOutOfTime);
+    }
     push!(context.interpreter, U256::from(result.max(0) as u64));
     Ok(())
 }
@@ -1195,6 +1209,9 @@ pub fn withdraw_expire_unfreeze<IT: ITy, H: Host + ?Sized>(
     require_non_staticcall!(context.interpreter);
     let caller = context.interpreter.input.target_address();
     let amount = context.host.tron_withdraw_expire_unfreeze(caller);
+    if amount == TRON_HOST_OUT_OF_TIME {
+        return Err(InstructionResult::TronOutOfTime);
+    }
     push!(context.interpreter, U256::from(amount.max(0) as u64));
     Ok(())
 }

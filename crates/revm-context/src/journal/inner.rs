@@ -3,6 +3,7 @@ use super::warm_addresses::WarmAddresses;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
+    tron_ext::{TronOldKeyClaim, TronStorageReadKind},
     journaled_state::{
         account::{JournaledAccount, JournaledAccountTr},
         entry::{JournalEntryTr, SelfdestructionRevertStatus},
@@ -47,6 +48,14 @@ pub struct JournalCfg {
     /// the Cancun opcode spec (which TRON activates separately for
     /// TLOAD/TSTORE/MCOPY). `None` keeps upstream behavior.
     pub tron_selfdestruct_restriction: Option<bool>,
+    /// TRON fork: `ForkController.pass(VERSION_4_8_2_2)` — the Stake-2.0 /
+    /// SELFDESTRUCT deterministic OutOfTime rules.
+    pub tron_fork_4_8_2_2: bool,
+    /// TRON fork: `ForkController.pass(VERSION_4_8_2_3)` — java
+    /// `Storage.checkAlias` on every legacy-key storage access.
+    pub tron_storage_alias_check: bool,
+    /// TRON fork: `ALLOW_OPTIMIZE_TVM_STORAGE` — the 48-byte storage-row keys.
+    pub tron_optimize_tvm_storage: bool,
     /// TRON fork: when `Some`, overrides whether SELFDESTRUCT charges the
     /// dead-beneficiary `NEW_ACCT_CALL` (25000) energy top-up — java adds it
     /// only once `ALLOW_ENERGY_ADJUSTMENT` (#81) is active (`getSuicideCost2` /
@@ -142,6 +151,28 @@ pub struct JournalInner<ENTRY> {
     /// depth `d` reverting keeps an address's writes exactly when the recorded
     /// depth is `< d`. Empty and unread when the flag is off.
     pub tron_storage_owner_depth: HashMap<Address, usize>,
+    /// TRON fork: addresses java's `Repository.markSelfDestruct` recorded in a
+    /// live frame; the log orders insertions so a revert can drop them.
+    pub tron_selfdestructed: HashSet<Address>,
+    /// Insertion order of [`Self::tron_selfdestructed`], truncated on revert.
+    pub tron_selfdestructed_log: Vec<Address>,
+    /// TRON fork: java `Storage.readKinds` under `ALLOW_OPTIMIZE_TVM_STORAGE`.
+    pub tron_storage_read_kinds: HashMap<(Address, StorageKey), TronStorageReadKind>,
+    /// Insertion order of [`Self::tron_storage_read_kinds`], truncated on revert.
+    pub tron_storage_read_kind_log: Vec<(Address, StorageKey)>,
+    /// TRON fork: java `Storage.oldRowKeyOwners` — legacy row key → the slot
+    /// that first touched it.
+    pub tron_old_row_key_owners: HashMap<B256, (Address, StorageKey)>,
+    /// Insertion order of [`Self::tron_old_row_key_owners`], truncated on revert.
+    pub tron_old_row_key_owner_log: Vec<B256>,
+    /// TRON fork: slots written by a live frame (java `Storage.put` marks the
+    /// row dirty whatever the value).
+    pub tron_storage_written: HashSet<(Address, StorageKey)>,
+    /// Insertion order of [`Self::tron_storage_written`], truncated on revert.
+    pub tron_storage_written_log: Vec<(Address, StorageKey)>,
+    /// TRON fork: set by a storage access that java would have failed with
+    /// `OutOfTimeException`; polled by the opcode.
+    pub tron_pending_out_of_time: bool,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -168,6 +199,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             selfdestructed_addresses: Vec::new(),
             tron_transfer_failed: false,
             tron_storage_owner_depth: HashMap::default(),
+            tron_selfdestructed: HashSet::default(),
+            tron_selfdestructed_log: Vec::new(),
+            tron_storage_read_kinds: HashMap::default(),
+            tron_storage_read_kind_log: Vec::new(),
+            tron_old_row_key_owners: HashMap::default(),
+            tron_old_row_key_owner_log: Vec::new(),
+            tron_storage_written: HashSet::default(),
+            tron_storage_written_log: Vec::new(),
+            tron_pending_out_of_time: false,
         }
     }
 
@@ -204,7 +244,30 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             selfdestructed_addresses,
             tron_transfer_failed,
             tron_storage_owner_depth,
+            tron_selfdestructed,
+            tron_selfdestructed_log,
+            tron_storage_read_kinds,
+            tron_storage_read_kind_log,
+            tron_old_row_key_owners,
+            tron_old_row_key_owner_log,
+            tron_storage_written,
+            tron_storage_written_log,
+            tron_pending_out_of_time,
         } = self;
+        // TRON fork: read after the run returns (the storage commit copies the
+        // read kinds and written slots); reset by `JournalInner::new()` per VM
+        // transaction.
+        let _ = (
+            tron_selfdestructed,
+            tron_selfdestructed_log,
+            tron_storage_read_kinds,
+            tron_storage_read_kind_log,
+            tron_old_row_key_owners,
+            tron_old_row_key_owner_log,
+            tron_storage_written,
+            tron_storage_written_log,
+            tron_pending_out_of_time,
+        );
         // Cfg and state are not changed. They are always set again before execution.
         let _ = cfg;
         let _ = state;
@@ -249,7 +312,30 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             selfdestructed_addresses,
             tron_transfer_failed,
             tron_storage_owner_depth,
+            tron_selfdestructed,
+            tron_selfdestructed_log,
+            tron_storage_read_kinds,
+            tron_storage_read_kind_log,
+            tron_old_row_key_owners,
+            tron_old_row_key_owner_log,
+            tron_storage_written,
+            tron_storage_written_log,
+            tron_pending_out_of_time,
         } = self;
+        // TRON fork: read after the run returns (the storage commit copies the
+        // read kinds and written slots); reset by `JournalInner::new()` per VM
+        // transaction.
+        let _ = (
+            tron_selfdestructed,
+            tron_selfdestructed_log,
+            tron_storage_read_kinds,
+            tron_storage_read_kind_log,
+            tron_old_row_key_owners,
+            tron_old_row_key_owner_log,
+            tron_storage_written,
+            tron_storage_written_log,
+            tron_pending_out_of_time,
+        );
         let is_spurious_dragon_enabled = cfg.spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
         //
@@ -295,7 +381,30 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             selfdestructed_addresses,
             tron_transfer_failed,
             tron_storage_owner_depth,
+            tron_selfdestructed,
+            tron_selfdestructed_log,
+            tron_storage_read_kinds,
+            tron_storage_read_kind_log,
+            tron_old_row_key_owners,
+            tron_old_row_key_owner_log,
+            tron_storage_written,
+            tron_storage_written_log,
+            tron_pending_out_of_time,
         } = self;
+        // TRON fork: read after the run returns (the storage commit copies the
+        // read kinds and written slots); reset by `JournalInner::new()` per VM
+        // transaction.
+        let _ = (
+            tron_selfdestructed,
+            tron_selfdestructed_log,
+            tron_storage_read_kinds,
+            tron_storage_read_kind_log,
+            tron_old_row_key_owners,
+            tron_old_row_key_owner_log,
+            tron_storage_written,
+            tron_storage_written_log,
+            tron_pending_out_of_time,
+        );
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase_and_access_list();
         selfdestructed_addresses.clear();
@@ -687,6 +796,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             log_i: self.logs.len(),
             journal_i: self.journal.len(),
             selfdestructed_i: self.selfdestructed_addresses.len(),
+            tron_selfdestructed_i: self.tron_selfdestructed_log.len(),
+            tron_read_kind_i: self.tron_storage_read_kind_log.len(),
+            tron_owner_i: self.tron_old_row_key_owner_log.len(),
+            tron_written_i: self.tron_storage_written_log.len(),
         };
         self.depth += 1;
         checkpoint
@@ -747,6 +860,32 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // EIP-7708: Remove selfdestructed addresses added after checkpoint
         self.selfdestructed_addresses
             .truncate(checkpoint.selfdestructed_i);
+        // TRON fork: a reverted frame's repository is discarded, taking its
+        // selfdestruct marks, storage read kinds and legacy-key claims with it.
+        for address in self
+            .tron_selfdestructed_log
+            .drain(checkpoint.tron_selfdestructed_i.min(self.tron_selfdestructed_log.len())..)
+        {
+            self.tron_selfdestructed.remove(&address);
+        }
+        for slot in self
+            .tron_storage_read_kind_log
+            .drain(checkpoint.tron_read_kind_i.min(self.tron_storage_read_kind_log.len())..)
+        {
+            self.tron_storage_read_kinds.remove(&slot);
+        }
+        for old_key in self
+            .tron_old_row_key_owner_log
+            .drain(checkpoint.tron_owner_i.min(self.tron_old_row_key_owner_log.len())..)
+        {
+            self.tron_old_row_key_owners.remove(&old_key);
+        }
+        for slot in self
+            .tron_storage_written_log
+            .drain(checkpoint.tron_written_i.min(self.tron_storage_written_log.len())..)
+        {
+            self.tron_storage_written.remove(&slot);
+        }
 
         if checkpoint.journal_i >= self.journal.len() {
             if shared_storage {
@@ -1726,5 +1865,112 @@ mod tests {
         // checkpoint index.
         assert_eq!(journal.journal.len(), inner.journal_i);
         assert!(journal_len_before > inner.journal_i);
+    }
+}
+
+/// TRON fork: the frame-scoped java `Repository` / `Storage` bookkeeping that
+/// the 4.8.2.2 / 4.8.2.3 rules consult.
+impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
+    /// java `Repository.markSelfDestruct`.
+    pub fn tron_mark_selfdestructed(&mut self, address: Address) {
+        if self.tron_selfdestructed.insert(address) {
+            self.tron_selfdestructed_log.push(address);
+        }
+    }
+
+    /// java `Repository.isSelfDestructed`.
+    pub fn tron_is_selfdestructed(&self, address: Address) -> bool {
+        self.tron_selfdestructed.contains(&address)
+    }
+
+    /// `putIfAbsent` on the legacy-key owner map.
+    pub fn tron_claim_old_row_key(
+        &mut self,
+        old_key: B256,
+        address: Address,
+        key: StorageKey,
+    ) -> TronOldKeyClaim {
+        match self.tron_old_row_key_owners.get(&old_key) {
+            Some(owner) if *owner == (address, key) => TronOldKeyClaim::Owner,
+            Some(_) => TronOldKeyClaim::Taken,
+            None => {
+                self.tron_old_row_key_owners.insert(old_key, (address, key));
+                self.tron_old_row_key_owner_log.push(old_key);
+                TronOldKeyClaim::Claimed
+            }
+        }
+    }
+
+    /// java `Storage.oldKeyTaken`: a different slot owns the legacy key.
+    pub fn tron_old_row_key_taken(&self, old_key: B256, address: Address, key: StorageKey) -> bool {
+        self.tron_old_row_key_owners
+            .get(&old_key)
+            .is_some_and(|owner| *owner != (address, key))
+    }
+
+    /// java `Storage.readKinds.get(slot)`.
+    pub fn tron_storage_read_kind(
+        &self,
+        address: Address,
+        key: StorageKey,
+    ) -> Option<TronStorageReadKind> {
+        self.tron_storage_read_kinds.get(&(address, key)).copied()
+    }
+
+    /// java `Storage.readKinds.put(slot, kind)`; a slot's kind is set once.
+    pub fn tron_set_storage_read_kind(
+        &mut self,
+        address: Address,
+        key: StorageKey,
+        kind: TronStorageReadKind,
+    ) {
+        if let Entry::Vacant(v) = self.tron_storage_read_kinds.entry((address, key)) {
+            v.insert(kind);
+            self.tron_storage_read_kind_log.push((address, key));
+        }
+    }
+
+    /// java `Storage.put`: the row is dirty from now on, whatever its value.
+    pub fn tron_mark_storage_written(&mut self, address: Address, key: StorageKey) {
+        if self.tron_storage_written.insert((address, key)) {
+            self.tron_storage_written_log.push((address, key));
+        }
+    }
+
+    /// Hand the transaction's written slots to the storage commit.
+    pub fn tron_take_storage_written(&mut self) -> Vec<(Address, StorageKey)> {
+        self.tron_storage_written_log.clear();
+        mem::take(&mut self.tron_storage_written).into_iter().collect()
+    }
+
+    /// Hand the transaction's final read kinds to the storage commit.
+    pub fn tron_take_storage_read_kinds(
+        &mut self,
+    ) -> Vec<((Address, StorageKey), TronStorageReadKind)> {
+        self.tron_storage_read_kind_log.clear();
+        mem::take(&mut self.tron_storage_read_kinds).into_iter().collect()
+    }
+
+    /// Is `(address, key)` already in the slot cache (java `rowCache`)?
+    pub fn tron_storage_slot_cached(&self, address: Address, key: StorageKey) -> bool {
+        self.state
+            .get(&address)
+            .is_some_and(|account| account.storage.contains_key(&key))
+    }
+
+    /// Drop a slot the database just loaded, together with the warm-up entry
+    /// that load pushed, so the next access loads it afresh as java does.
+    pub fn tron_storage_evict_slot(&mut self, address: Address, key: StorageKey) {
+        if let Some(account) = self.state.get_mut(&address) {
+            account.storage.remove(&key);
+        }
+        if self
+            .journal
+            .last()
+            .and_then(|entry| entry.as_storage_warmed())
+            == Some((address, key))
+        {
+            self.journal.pop();
+        }
     }
 }

@@ -111,6 +111,15 @@ pub struct ProposalSet {
     /// from `getSuicideCost2` (#81) / `getSuicideCost3` (#94) — pre-#81 SUICIDE
     /// has no top-up (`getSuicideCost` = 0).
     pub allow_energy_adjustment: bool,
+    /// `ForkController.pass(VERSION_4_8_2_2)` — block version 37 on 70% of
+    /// SRs: the Stake-2.0 / SELFDESTRUCT / contract-hash-field deterministic
+    /// OutOfTime rules.
+    pub fork_4_8_2_2: bool,
+    /// `ForkController.pass(VERSION_4_8_2_3)` — block version 38 on 70% of
+    /// SRs: java `Storage.checkAlias`.
+    pub fork_4_8_2_3: bool,
+    /// `ALLOW_OPTIMIZE_TVM_STORAGE` (proposal 99): 48-byte storage-row keys.
+    pub allow_optimize_tvm_storage: bool,
 }
 
 impl ProposalSet {
@@ -150,6 +159,9 @@ impl ProposalSet {
                 b"ALLOW_HIGHER_LIMIT_FOR_MAX_CPU_TIME_OF_ONE_TX",
             ),
             allow_energy_adjustment: flag(b"ALLOW_ENERGY_ADJUSTMENT"),
+            fork_4_8_2_2: dps.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
+            fork_4_8_2_3: dps.fork_passed(tron_chainbase::fork::VERSION_4_8_2_3),
+            allow_optimize_tvm_storage: flag(b"ALLOW_OPTIMIZE_TVM_STORAGE"),
         }
     }
 
@@ -184,6 +196,11 @@ impl ProposalSet {
             allow_higher_limit_for_max_cpu_time_of_one_tx: true,
             // #81 long-active on mainnet — SELFDESTRUCT dead-account top-up on.
             allow_energy_adjustment: true,
+            // Both stat-based forks passed on mainnet (2026-09-08 / 2026-09-30);
+            // proposal 99 has not been raised.
+            fork_4_8_2_2: true,
+            fork_4_8_2_3: true,
+            allow_optimize_tvm_storage: false,
         }
     }
 
@@ -345,6 +362,11 @@ mod tests {
         // `allow_tvm_freeze_v2` is derived from `supportUnfreezeDelay()` =
         // `UNFREEZE_DELAY_DAYS > 0` (java has no ALLOW_TVM_FREEZE_V2 key).
         dps.put_long(b"UNFREEZE_DELAY_DAYS", 14);
+        // The stat-based forks come from `ForkController` statistics, not a
+        // proposal key.
+        dps.save_latest_block_header_timestamp(1_790_000_000_000);
+        dps.save_fork_stats(tron_chainbase::fork::VERSION_4_8_2_2, &[1u8; 27]);
+        dps.save_fork_stats(tron_chainbase::fork::VERSION_4_8_2_3, &[1u8; 27]);
         assert_eq!(ProposalSet::from_store(&dps), ProposalSet::all_enabled());
     }
 }
