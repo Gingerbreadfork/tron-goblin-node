@@ -266,7 +266,10 @@ pub async fn run(config: NodeConfig, shutdown: ShutdownSignal) -> Result<(), Run
         // `Manager.initGenesisData` calling each `save*` setter from
         // the committee config.
         match config.resolve_committee() {
-            Ok(committee) => seed_committee_initial_values(&stores, &committee),
+            Ok(committee) => seed_committee_initial_values(
+                &tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone()),
+                &committee,
+            ),
             Err(e) => warn!(error = %e, "committee.* validation failed; skipping bootstrap"),
         }
     }
@@ -3346,10 +3349,9 @@ fn initialize_genesis(stores: &OpenedStores) -> Result<(), crate::storage::Stora
 /// `save*` setter unconditionally; on-chain proposal records can then
 /// override values later via the normal maintenance flow.
 fn seed_committee_initial_values(
-    stores: &crate::storage::OpenedStores,
+    dp: &tron_chainbase::DynamicPropertiesStore,
     cfg: &crate::config::CommitteeConfig,
 ) {
-    let dp = tron_chainbase::DynamicPropertiesStore::new(stores.dyn_props.clone());
     let write = |key: &[u8], v: i64| dp.put_long(key, v);
 
     write(b"ALLOW_CREATION_OF_CONTRACTS", cfg.allow_creation_of_contracts);
@@ -3375,7 +3377,7 @@ fn seed_committee_initial_values(
     write(b"ALLOW_TVM_ISTANBUL", cfg.allow_tvm_istanbul);
     write(b"ALLOW_PROTO_FILTER_NUM", cfg.allow_proto_filter_num);
     write(b"ALLOW_ACCOUNT_STATE_ROOT", cfg.allow_account_state_root);
-    write(b"CHANGED_DELEGATION", cfg.changed_delegation);
+    write(b"CHANGE_DELEGATION", cfg.changed_delegation);
     write(b"ALLOW_PBFT", cfg.allow_pbft);
     write(b"PBFT_EXPIRE_NUM", cfg.pbft_expire_num);
     write(b"ALLOW_TVM_FREEZE", cfg.allow_tvm_freeze);
@@ -3624,5 +3626,27 @@ mod shutdown_signal_tests {
         })
         .await;
         assert!(waited.is_ok(), "guarded wait must not block when shutdown already fired");
+    }
+}
+
+
+#[cfg(test)]
+mod committee_seeding_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tron_chainbase::{DynamicPropertiesStore, MemBackend};
+
+    #[test]
+    fn change_delegation_config_reaches_the_canonical_property() {
+        let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()));
+        for configured in [1, 0] {
+            let cfg = crate::config::CommitteeConfig {
+                changed_delegation: configured,
+                ..Default::default()
+            };
+            seed_committee_initial_values(&dp, &cfg);
+            assert_eq!(dp.get_long(b"CHANGE_DELEGATION"), Some(configured));
+            assert_eq!(dp.get_long(b"CHANGED_DELEGATION"), None);
+        }
     }
 }
