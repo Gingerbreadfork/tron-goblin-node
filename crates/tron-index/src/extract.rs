@@ -244,15 +244,15 @@ pub fn count_block_txs_raw(mut buf: &[u8]) -> usize {
     count
 }
 
-/// Created-contract address: `0x41 ‖ keccak256(owner ‖ tx_id)[12..]` —
-/// java-tron's `Hash.sha3omit12(owner || tx_id)`, the same derivation
+/// Created-contract address: `0x41 ‖ keccak256(tx_id ‖ owner)[12..]` —
+/// java-tron's `Hash.sha3omit12(tx_id || owner)`, the same derivation
 /// `tron-tvm`'s CREATE path uses. Public so every consumer of the rule
 /// (the index extractor, the apply hook's TransactionInfo builder)
 /// shares ONE copy of this consensus-critical formula.
 pub fn created_contract_address(owner: &[u8], tx_id: &[u8; 32]) -> Addr {
     let mut input = Vec::with_capacity(owner.len() + 32);
-    input.extend_from_slice(owner);
     input.extend_from_slice(tx_id);
+    input.extend_from_slice(owner);
     let h = tron_crypto::hash::keccak256(&input);
     let mut a = [0u8; 21];
     a[0] = 0x41;

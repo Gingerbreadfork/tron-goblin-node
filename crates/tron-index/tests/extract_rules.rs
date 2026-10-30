@@ -131,10 +131,10 @@ fn create_contract_indexes_deployer_and_derived_address() {
         ..Default::default()
     };
     let tx = tx_with(ContractType::CreateSmartContract, c.encode_to_vec());
-    // The expected created address: 0x41 ‖ keccak(owner ‖ tx_id)[12..].
+    // The expected created address: 0x41 ‖ keccak(tx_id ‖ owner)[12..].
     let tx_id = tron_crypto::hash::sha256(&tx.raw_data.as_ref().unwrap().encode_to_vec());
-    let mut input = addr(1).to_vec();
-    input.extend_from_slice(&tx_id);
+    let mut input = tx_id.to_vec();
+    input.extend_from_slice(&addr(1));
     let h = tron_crypto::hash::keccak256(&input);
     let mut created = [0u8; 21];
     created[0] = 0x41;

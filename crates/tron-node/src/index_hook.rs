@@ -394,7 +394,7 @@ pub fn build_transaction_ret(
 
 /// The `contract_address` java-tron stamps on a VM tx's
 /// `TransactionInfo`: the called contract for a trigger, the derived
-/// address (`0x41 ‖ keccak256(owner ‖ tx_id)[12..]`) for a create.
+/// address (`0x41 ‖ keccak256(tx_id ‖ owner)[12..]`) for a create.
 /// Empty for non-VM txs.
 fn vm_contract_address(tx: &tron_proto::Transaction, tx_id: &[u8; 32]) -> Vec<u8> {
     let Some(contract) = tx.raw_data.as_ref().and_then(|r| r.contract.first()) else {
@@ -660,5 +660,19 @@ mod tests {
         hook.on_block_applied(&block, &id, &report_for(&id, tx_id, true));
         let got = TransactionRetStore::new(backend).get(7).unwrap().expect("persisted");
         assert_eq!(got.transactioninfo[0].id, tx_id.to_vec());
+    }
+}
+
+
+#[cfg(test)]
+mod deployment_address_tests {
+    #[test]
+    fn indexed_creation_address_matches_the_vm_execution_address() {
+        let owner = [0x41u8; 21];
+        let txid = [0xabu8; 32];
+        assert_eq!(
+            tron_index::created_contract_address(&owner, &txid),
+            tron_tvm::execute::derive_top_level_contract_address(&txid, &owner)
+        );
     }
 }
