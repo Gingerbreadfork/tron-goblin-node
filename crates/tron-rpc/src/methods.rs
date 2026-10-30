@@ -1770,6 +1770,9 @@ fn encode_account_for_rpc(a: &tron_proto::Account, genesis_ms: i64) -> Value {
     // presentation step (the stored list only carries actually-frozen
     // resources). Emit it the same way so the field matches byte-for-byte.
     m.insert("frozenV2".into(), json!(normalized_frozen_v2_json(a)));
+    if !a.unfrozen_v2.is_empty() {
+        m.insert("unfrozenV2".into(), json!(a.unfrozen_v2.iter().map(unfreeze_v2_json).collect::<Vec<_>>()));
+    }
     if !a.frozen_supply.is_empty() {
         m.insert("frozen_supply".into(), json!(a.frozen_supply.iter().map(frozen_json).collect::<Vec<_>>()));
     }
@@ -1846,6 +1849,20 @@ fn frozen_json(f: &tron_proto::account::Frozen) -> Value {
     }
     if f.expire_time != 0 {
         m.insert("expire_time".into(), json!(f.expire_time));
+    }
+    Value::Object(m)
+}
+
+fn unfreeze_v2_json(f: &tron_proto::account::UnFreezeV2) -> Value {
+    let mut m = serde_json::Map::new();
+    if f.r#type != 0 {
+        m.insert("type".into(), json!(resource_code_name(f.r#type)));
+    }
+    if f.unfreeze_amount != 0 {
+        m.insert("unfreeze_amount".into(), json!(f.unfreeze_amount));
+    }
+    if f.unfreeze_expire_time != 0 {
+        m.insert("unfreeze_expire_time".into(), json!(f.unfreeze_expire_time));
     }
     Value::Object(m)
 }
@@ -8114,6 +8131,32 @@ mod log_range_tests {
 mod account_encoding_tests {
     use super::*;
     use tron_proto::account::{AccountResource, FreezeV2};
+
+    #[test]
+    fn pending_v2_unfreezes_preserve_resource_amount_and_deadline() {
+        use tron_proto::account::UnFreezeV2;
+        let mut a = tron_proto::Account::default();
+        assert!(encode_account_for_rpc(&a, 0).get("unfrozenV2").is_none());
+        a.unfrozen_v2 = vec![
+            UnFreezeV2 {
+                r#type: 0,
+                unfreeze_amount: 123,
+                unfreeze_expire_time: 1_800_000_000_000,
+            },
+            UnFreezeV2 {
+                r#type: 1,
+                unfreeze_amount: 456,
+                unfreeze_expire_time: 1_800_000_030_000,
+            },
+        ];
+        assert_eq!(
+            encode_account_for_rpc(&a, 0)["unfrozenV2"],
+            json!([
+                {"unfreeze_amount": 123, "unfreeze_expire_time": 1_800_000_000_000_i64},
+                {"type": "ENERGY", "unfreeze_amount": 456, "unfreeze_expire_time": 1_800_000_030_000_i64}
+            ])
+        );
+    }
 
     #[test]
     fn account_json_matches_java_tron_shape() {
