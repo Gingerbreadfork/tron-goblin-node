@@ -61,11 +61,21 @@ pub fn tron_power(account: &Account) -> i64 {
     tp
 }
 
+/// Snapshot legacy voting power before the first stake under the new model.
+/// Java initializes the zero sentinel once; -1 means there was no legacy power.
+/// Must be called before adding the new frozen amount.
+pub fn initialize_old_tron_power(account: &mut Account) {
+    if account.old_tron_power == 0 {
+        let legacy = tron_power(account);
+        account.old_tron_power = if legacy == 0 { -1 } else { legacy };
+    }
+}
+
 /// java-tron's `AccountCapsule.getAllTronPower` (in sun) — the
 /// NEW-resource-model power source. The `old_tron_power` field selects how
 /// legacy power folds in:
 ///
-/// * `-1` → not yet initialized: V1 + V2 TRON_POWER-typed frozen only;
+/// * `-1` → no retained legacy power: V1 + V2 TRON_POWER-typed frozen only;
 /// * `0`  → legacy `getTronPower()` (every other frozen source) plus the
 ///          two TRON_POWER components;
 /// * `>0` → stored old power plus the two TRON_POWER components.
@@ -166,6 +176,37 @@ pub fn update_vote_after_unstake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_new_model_stake_snapshots_legacy_power_once() {
+        let mut fresh = Account::default();
+        initialize_old_tron_power(&mut fresh);
+        assert_eq!(fresh.old_tron_power, -1);
+        fresh.frozen_v2.push(FreezeV2 {
+            r#type: 1,
+            amount: 100_000_000,
+        });
+        initialize_old_tron_power(&mut fresh);
+        assert_eq!(fresh.old_tron_power, -1);
+        assert_eq!(all_tron_power(&fresh), 0);
+        fresh.frozen_v2.push(FreezeV2 {
+            r#type: 2,
+            amount: 500_000_000_000,
+        });
+        assert_eq!(all_tron_power(&fresh), 500_000_000_000);
+        let mut migrated = Account {
+            frozen_v2: vec![FreezeV2 {
+                r#type: 1,
+                amount: 7_000_000,
+            }],
+            ..Default::default()
+        };
+        initialize_old_tron_power(&mut migrated);
+        assert_eq!(migrated.old_tron_power, 7_000_000);
+        migrated.frozen_v2[0].amount += 2_000_000;
+        initialize_old_tron_power(&mut migrated);
+        assert_eq!(all_tron_power(&migrated), 7_000_000);
+    }
+
     use std::sync::Arc;
     use tron_chainbase::{KvBackend, MemBackend};
     use tron_proto::account::{FreezeV2, Frozen};

@@ -62,7 +62,7 @@ pub fn router_with_limits(
     // `params[0]` shape that `methods::*` expects.
     macro_rules! builder {
         ($name:literal, $method:path) => {
-            post(|state, query, body| forward_builder($method, state, query, body))
+            post(|state, query, body| forward_builder($name, $method, state, query, body))
         };
     }
     // Forward a java-shaped POST body to a positional-params method:
@@ -452,6 +452,7 @@ async fn rate_limit_middleware(
 /// address-rewritten JSON response. Handles the visible-flag base58 ↔
 /// hex translation in both directions.
 async fn forward_builder(
+    name: &'static str,
     method: fn(&Value, &RpcState) -> Result<Value, methods::RpcError>,
     State(state): State<RpcState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -468,8 +469,38 @@ async fn forward_builder(
     // under heavy sync load (see `crate::blocking`).
     match crate::blocking::run_blocking(|| method(&params, &state)) {
         Ok(mut v) => {
+            // Java omits signatures on unsigned transactions. An empty array
+            // is truthy in TronWeb and is rejected as "already signed".
+            if v.get("signature")
+                .and_then(Value::as_array)
+                .map_or(false, |s| s.is_empty())
+            {
+                v.as_object_mut()
+                    .expect("transaction envelope")
+                    .remove("signature");
+            }
             rewrite_addresses(&mut v, visible);
-            api_ok(v)
+            if name == "triggerSmartContract" {
+                for key in ["txID", "raw_data_hex"] {
+                    if let Some(x) = v.get_mut(key) {
+                        if let Some(s) = x.as_str() {
+                            *x = json!(s.strip_prefix("0x").unwrap_or(s));
+                        }
+                    }
+                }
+                if let Some(raw) = v.get_mut("raw_data") {
+                    for key in ["ref_block_bytes", "ref_block_hash"] {
+                        if let Some(x) = raw.get_mut(key) {
+                            if let Some(s) = x.as_str() {
+                                *x = json!(s.strip_prefix("0x").unwrap_or(s));
+                            }
+                        }
+                    }
+                }
+                api_ok(json!({"result":{"result":true},"txid":v["txID"],"transaction":v}))
+            } else {
+                api_ok(v)
+            }
         }
         Err(e) => api_err(e),
     }
@@ -1704,15 +1735,8 @@ async fn broadcast_transaction(
     State(state): State<RpcState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // java-tron's HTTP form: full envelope `{txID, raw_data, raw_data_hex,
-    // signature, visible}`. We hand the underlying JSON-RPC handler
-    // either the raw_data_hex form or the envelope itself — it
-    // accepts both.
-    let inner = body
-        .get("raw_data_hex")
-        .cloned()
-        .or_else(|| body.get("transaction").cloned())
-        .unwrap_or(body);
+    // Preserve raw_data_hex AND signatures from the TronWeb envelope.
+    let inner = body.get("transaction").cloned().unwrap_or(body);
     match methods::broadcast_transaction_v2(&Value::Array(vec![inner]), &state) {
         Ok(v) => api_ok(v),
         Err(e) => api_err(e),

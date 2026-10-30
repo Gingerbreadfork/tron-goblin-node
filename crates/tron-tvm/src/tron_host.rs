@@ -1678,6 +1678,9 @@ impl TronDatabaseExt for TronDatabase {
         if owner_selfdestructed {
             return TRON_HOST_OUT_OF_TIME;
         }
+        if dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1 {
+            crate::votes::initialize_old_tron_power(&mut account);
+        }
         account.balance = owner_balance - frozen_balance;
         let resource = resource_type as i32;
         // Weight is floored from `getFrozenV2BalanceWithDelegated` (held +
@@ -3070,6 +3073,37 @@ mod tests {
     /// for resource TRON_POWER (2) — the old code's `_ => {}` arm dropped it.
     /// TRON_POWER is only a legal resource code while the new resource model is
     /// active (`FreezeBalanceV2Processor.validate`), so the fixture enables it.
+    #[test]
+    fn new_model_energy_stake_does_not_inflate_later_power_stake() {
+        let (mut db, dyn_props) = make_staking_db();
+        dyn_props.put_long(b"ALLOW_NEW_RESOURCE_MODEL", 1);
+        let owner = TronAddress::from_raw(tron_addr(0x58));
+        db.accounts
+            .put(
+                &owner,
+                &Account {
+                    address: owner.as_bytes().to_vec(),
+                    balance: 1_000_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let caller = tron_to_evm_address(&owner);
+        assert_eq!(
+            db.tron_freeze_balance_v2(caller, 100_000_000, 1, 1_000_000_000, false),
+            1
+        );
+        let account = db.accounts.get(&owner).unwrap().unwrap();
+        assert_eq!(account.old_tron_power, -1);
+        assert_eq!(crate::votes::all_tron_power(&account), 0);
+        assert_eq!(
+            db.tron_freeze_balance_v2(caller, 500_000_000, 2, 900_000_000, false),
+            1
+        );
+        let account = db.accounts.get(&owner).unwrap().unwrap();
+        assert_eq!(crate::votes::all_tron_power(&account), 500_000_000);
+    }
+
     #[test]
     fn tvm_freeze_v2_updates_tron_power_weight() {
         let (db, dyn_props) = make_staking_db();

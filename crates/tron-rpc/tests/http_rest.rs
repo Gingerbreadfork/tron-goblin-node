@@ -572,3 +572,91 @@ async fn wallet_getnowblock_concurrent_load_returns_consistent_block() {
         assert_eq!(h.await.unwrap(), 1);
     }
 }
+
+#[tokio::test]
+async fn wallet_broadcast_preserves_signed_envelope_in_mempool() {
+    use prost::Message as _;
+    let (_, state, ..) = spawn_http_server().await;
+    let pool = tron_rpc::InMemoryMempool::new();
+    let app = tron_rpc::http_rest::router(state.with_mempool(pool.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    let raw = tron_proto::transaction::Raw {
+        timestamp: 123,
+        expiration: 456,
+        fee_limit: 789,
+        ..Default::default()
+    };
+    let bytes = raw.encode_to_vec();
+    let signature = vec![7u8; 65];
+    let response = http_post(
+        addr,
+        "/wallet/broadcasttransaction",
+        json!({
+            "raw_data_hex": hex::encode(&bytes),
+            "txID": hex::encode(tron_crypto::hash::sha256(&bytes)),
+            "signature": [hex::encode(&signature), hex::encode(&signature)]
+        }),
+    )
+    .await;
+    assert_eq!(response["result"], true, "{response}");
+    let pending = pool.drain();
+    assert_eq!(pending.len(), 1);
+    let tx = tron_proto::Transaction::decode(pending[0].as_slice()).unwrap();
+    assert_eq!(tx.raw_data, Some(raw));
+    assert_eq!(tx.signature, vec![signature.clone(), signature]);
+}
+
+#[tokio::test]
+async fn tronweb_trigger_envelope_preserves_selector_parameters_and_signable_wire() {
+    use prost::Message as _;
+    let (addr, ..) = spawn_http_server().await;
+    let parameter = format!("{:064x}", 7);
+    let response = http_post(
+        addr,
+        "/wallet/triggersmartcontract",
+        json!({
+            "owner_address":hex::encode(ALICE_HEX),"contract_address":hex::encode(ALICE_HEX),
+            "function_selector":"set(uint256)","parameter":parameter,"fee_limit":1_000_000_000
+        }),
+    )
+    .await;
+    assert_eq!(response["result"]["result"], true, "{response}");
+    let tx = &response["transaction"];
+    assert!(
+        tx.get("signature").is_none(),
+        "Unsigned TronWeb transactions omit signatures"
+    );
+    let bytes = hex::decode(tx["raw_data_hex"].as_str().unwrap()).unwrap();
+    let raw = tron_proto::transaction::Raw::decode(bytes.as_slice()).unwrap();
+    let call = tron_proto::TriggerSmartContract::decode(
+        raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+    )
+    .unwrap();
+    assert_eq!(call.owner_address, ALICE_HEX);
+    let mut expected = tron_crypto::hash::keccak256(b"set(uint256)")[..4].to_vec();
+    expected.extend(hex::decode(format!("{:064x}", 7)).unwrap());
+    assert_eq!(call.data, expected);
+    assert_eq!(raw.fee_limit, 1_000_000_000);
+    assert_eq!(
+        raw.ref_block_num, 0,
+        "TronWeb omits deprecated ref_block_num"
+    );
+    assert_eq!(tx["txID"], hex::encode(tron_crypto::hash::sha256(&bytes)));
+    assert_eq!(response["txid"], tx["txID"]);
+    let bad = http_post(
+        addr,
+        "/wallet/triggersmartcontract",
+        json!({
+            "owner_address":hex::encode(ALICE_HEX),"contract_address":hex::encode(ALICE_HEX),
+            "function_selector":"set(uint256)","parameter":"zz"
+        }),
+    )
+    .await;
+    assert!(bad["Error"].is_string(), "{bad}");
+}
