@@ -85,6 +85,9 @@ pub fn execute_freeze_balance_v2(
     let mut account = accounts
         .get(&owner)?
         .ok_or(ActuatorError::OwnerAccountMissing)?;
+    if dyn_props.get_long(b"ALLOW_NEW_RESOURCE_MODEL").unwrap_or(0) == 1 {
+        tron_tvm::votes::initialize_old_tron_power(&mut account);
+    }
     account.balance = check_sub(account.balance, contract.frozen_balance)?;
 
     // Capture the old weight basis BEFORE mutating frozen_v2 — java-tron's
