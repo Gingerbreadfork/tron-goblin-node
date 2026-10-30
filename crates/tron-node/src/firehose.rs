@@ -400,6 +400,8 @@ pub fn build_apply(
     // identical blocks.
     let matcher = tron_index::TxInfoMatcher::new(ret);
 
+    let mut txinfo_missing = ret.is_none() && !block.transactions.is_empty();
+
     let txs = block
         .transactions
         .iter()
@@ -414,14 +416,8 @@ pub fn build_apply(
                 .unwrap_or_else(|| tron_crypto::hash::sha256(&raw_tx.encode_to_vec()));
             let facts = tron_index::tx_facts(tx, &tx_id);
             let info = matcher.for_tx(&tx_id, i);
-            let success = tx
-                .ret
-                .first()
-                .map(|r| {
-                    r.contract_ret
-                        == tron_proto::transaction::result::ContractResult::Success as i32
-                })
-                .unwrap_or(false);
+            txinfo_missing |= info.is_none();
+            let success = tron_index::transaction_succeeded(tx, info);
             Some(fh::Tx {
                 txid: tx_id.to_vec(),
                 contract_type: facts.as_ref().map(|f| f.contract_type).unwrap_or(0),
@@ -484,7 +480,7 @@ pub fn build_apply(
         timestamp_ms: raw.map(|r| r.timestamp).unwrap_or(0),
         witness: raw.map(|r| r.witness_address.clone()).unwrap_or_default(),
         solidified_height: solidified,
-        txinfo_missing: ret.is_none() && !block.transactions.is_empty(),
+        txinfo_missing,
         txs,
     }
 }
@@ -493,6 +489,30 @@ pub fn build_apply(
 mod tests {
     use super::*;
     use tron_chainbase::MemBackend;
+
+    #[test]
+    fn receipt_status_without_block_ret_and_partial_receipt_gap() {
+        let rig = Rig::new("receipt-status");
+        let (mut block, _, mut ret) = rig.make_block(1, 0);
+        block.transactions[0].ret.clear();
+        ret.transactioninfo[0].receipt = Some(tron_proto::ResourceReceipt {
+            result: tron_proto::transaction::result::ContractResult::Success as i32,
+            ..Default::default()
+        });
+        let event = build_apply(1, &block, Some(&ret), 1);
+        assert!(event.txs[0].success);
+        assert!(!event.txinfo_missing);
+        ret.transactioninfo[0].receipt.as_mut().unwrap().result =
+            tron_proto::transaction::result::ContractResult::Revert as i32;
+        assert!(!build_apply(1, &block, Some(&ret), 1).txs[0].success);
+        // A present TransactionRet container is insufficient: every tx needs
+        // its own info or the consumer must stop rather than miss events.
+        let mut second = block.transactions[0].clone();
+        second.raw_data.as_mut().unwrap().data.push(99);
+        block.transactions.push(second);
+        assert!(build_apply(1, &block, Some(&ret), 1).txinfo_missing);
+        std::fs::remove_dir_all(rig.dir).unwrap();
+    }
 
     fn mem() -> Arc<dyn KvBackend> {
         Arc::new(MemBackend::new())

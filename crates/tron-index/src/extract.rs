@@ -522,6 +522,23 @@ impl<'a> TxInfoMatcher<'a> {
     }
 }
 
+/// The block's contractRet is the advertised execution result. Locally
+/// produced blocks can omit it; then use the committed execution receipt,
+/// rather than labelling every such transaction as failed.
+pub fn transaction_succeeded(tx: &Transaction, info: Option<&tron_proto::TransactionInfo>) -> bool {
+    use tron_proto::transaction::result::ContractResult;
+    if let Some(result) = tx.ret.first() {
+        return result.contract_ret == ContractResult::Success as i32;
+    }
+    info.map_or(false, |i| {
+        i.result == tron_proto::transaction_info::Code::Sucess as i32
+            && i.receipt.as_ref().map_or(true, |r| {
+                r.result == ContractResult::Default as i32
+                    || r.result == ContractResult::Success as i32
+            })
+    })
+}
+
 /// Extract every index entry one block contributes.
 ///
 /// `txinfo` is the block's stored `TransactionRet` (absent ⇒ the
@@ -562,11 +579,7 @@ pub fn extract_block(
         let tx_id = matcher
             .positional_id(txidx as usize)
             .unwrap_or_else(|| tron_crypto::hash::sha256(&raw.encode_to_vec()));
-        let success = tx
-            .ret
-            .first()
-            .map(|r| r.contract_ret == tron_proto::transaction::result::ContractResult::Success as i32)
-            .unwrap_or(false);
+        let success = transaction_succeeded(tx, matcher.for_tx(&tx_id, txidx as usize));
 
         // ---- idx_native: from the tx params alone --------------------
         if caps.native {
@@ -758,6 +771,34 @@ pub fn extract_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_block_ret_uses_committed_execution_outcome() {
+        use tron_proto::transaction::result::ContractResult;
+        let mut tx = Transaction::default();
+        let mut info = tron_proto::TransactionInfo::default();
+        assert!(!transaction_succeeded(&tx, None));
+        assert!(transaction_succeeded(&tx, Some(&info)));
+        info.receipt = Some(tron_proto::ResourceReceipt {
+            result: ContractResult::Success as i32,
+            ..Default::default()
+        });
+        assert!(transaction_succeeded(&tx, Some(&info)));
+        info.receipt.as_mut().unwrap().result = ContractResult::Revert as i32;
+        assert!(!transaction_succeeded(&tx, Some(&info)));
+        info.receipt = None;
+        info.result = tron_proto::transaction_info::Code::Failed as i32;
+        assert!(!transaction_succeeded(&tx, Some(&info)));
+        info.result = tron_proto::transaction_info::Code::Sucess as i32;
+        tx.ret.push(tron_proto::transaction::Result {
+            contract_ret: ContractResult::Revert as i32,
+            ..Default::default()
+        });
+        assert!(
+            !transaction_succeeded(&tx, Some(&info)),
+            "explicit block result takes precedence"
+        );
+    }
+
 
     fn caps_internal() -> CaptureSet {
         CaptureSet {
