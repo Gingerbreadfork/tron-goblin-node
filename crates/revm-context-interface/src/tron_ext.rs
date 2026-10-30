@@ -74,6 +74,8 @@ pub struct TronStorageLoadReport {
     /// java returned without caching (`oldKeyTaken`); the journal must not
     /// keep the value either.
     pub uncached: bool,
+    /// Proposal 102 detected a claimed legacy key with an existing row.
+    pub out_of_time: bool,
 }
 
 /// TRON's address prefix byte (java `Constant.ADD_PRE_FIX_BYTE_MAINNET`).

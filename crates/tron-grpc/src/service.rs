@@ -1120,6 +1120,7 @@ impl Wallet for WalletService {
             "ALLOW_HARDEN_RESOURCE_CALCULATION",
             "ALLOW_HARDEN_EXCHANGE_CALCULATION",
             "ALLOW_OPTIMIZE_TVM_STORAGE",
+            "ALLOW_OPTIMIZE_TVM_STORAGE_KEY",
         ];
         let mut chain_parameter = Vec::with_capacity(KEYS.len());
         for k in KEYS {

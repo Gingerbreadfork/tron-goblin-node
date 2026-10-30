@@ -565,7 +565,19 @@ fn validate_proposal_value(
                 return Err(bad());
             }
         }
-        // java 4.8.2.3: proposable only once `forkController.pass(VERSION_4_8_2_3)`.
+        // java 4.8.2.4: storage-key protection is independently proposable.
+        AllowOptimizeTvmStorageKey => {
+            if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_2_4) {
+                return Err(bad());
+            }
+            if flag(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY") == 1 {
+                return Err(bad());
+            }
+            if value != 1 {
+                return Err(only_one("ALLOW_OPTIMIZE_TVM_STORAGE_KEY"));
+            }
+        }
+        // java 4.8.2.3: storage optimization without legacy-read protection.
         AllowOptimizeTvmStorage => {
             if !dyn_props.fork_passed(tron_chainbase::fork::VERSION_4_8_2_3) {
                 return Err(bad());
@@ -666,6 +678,7 @@ enum ProposalType {
     AllowHardenResourceCalculation,
     AllowHardenExchangeCalculation,
     AllowOptimizeTvmStorage,
+    AllowOptimizeTvmStorageKey,
 }
 
 impl ProposalType {
@@ -755,6 +768,7 @@ impl ProposalType {
             97 => AllowHardenResourceCalculation,
             98 => AllowHardenExchangeCalculation,
             99 => AllowOptimizeTvmStorage,
+            102 => AllowOptimizeTvmStorageKey,
             _ => return None,
         })
     }
