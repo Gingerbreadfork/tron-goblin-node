@@ -3445,6 +3445,32 @@ pub fn get_account_by_id(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     }
 }
 
+fn tron_calldata(obj: &serde_json::Map<String, Value>) -> Result<Vec<u8>, RpcError> {
+    fn decode(s: &str) -> Result<Vec<u8>, RpcError> {
+        hex::decode(
+            s.trim()
+                .strip_prefix("0x")
+                .or_else(|| s.trim().strip_prefix("0X"))
+                .unwrap_or(s.trim()),
+        )
+        .map_err(|e| RpcError::invalid_params(format!("invalid calldata hex: {e}")))
+    }
+    if let Some(sig) = obj.get("function_selector").and_then(Value::as_str) {
+        let mut data = keccak256(sig.trim().as_bytes())[..4].to_vec();
+        if let Some(p) = obj.get("parameter").and_then(Value::as_str) {
+            data.extend(decode(p)?);
+        }
+        Ok(data)
+    } else {
+        decode(
+            obj.get("data")
+                .or_else(|| obj.get("input"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )
+    }
+}
+
 /// `triggerConstantContract(addr, owner_addr, data)` — TRON's name
 /// for `eth_call`. Accepts a flat-positional-args form for
 /// compatibility with tronweb-style clients.
@@ -3505,33 +3531,8 @@ fn parse_constant_call_request(
         }
     };
 
-    // Calldata: prefer `function_selector` (+ optional `parameter`),
-    // else fall back to raw `data`/`input` hex. `data`/`parameter` are
-    // decoded leniently (with or without a `0x` prefix) because java-tron's
-    // HTTP API sends bare hex while eth-style callers send `0x...`.
-    fn decode_hex_lenient(s: &str) -> Result<Vec<u8>, RpcError> {
-        let s = s.trim();
-        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-        if s.is_empty() {
-            return Ok(Vec::new());
-        }
-        hex::decode(s).map_err(|e| RpcError::invalid_params(format!("invalid hex: {e}")))
-    }
-    let data = if let Some(sig) = obj.get("function_selector").and_then(|v| v.as_str()) {
-        let selector = keccak256(sig.trim().as_bytes());
-        let mut d = selector[..4].to_vec();
-        if let Some(param) = obj.get("parameter").and_then(|v| v.as_str()) {
-            d.extend_from_slice(&decode_hex_lenient(param)?);
-        }
-        d
-    } else {
-        match obj.get("data").or_else(|| obj.get("input")).and_then(|v| v.as_str()) {
-            Some(sx) => decode_hex_lenient(sx)?,
-            None => Vec::new(),
-        }
-    };
+    let data = tron_calldata(obj)?;
 
-    // `value` may be eth-style hex or java-style `call_value` integer.
     let value = if let Some(s) = obj.get("value").and_then(|v| v.as_str()) {
         parse_hex_quantity(s)? as i64
     } else if let Some(n) = obj.get("call_value").and_then(|v| v.as_i64()) {
@@ -6840,11 +6841,6 @@ fn parse_bytes_field(p: &Value, field: &str) -> Result<Vec<u8>, RpcError> {
     parse_hex_bytes(s)
 }
 
-/// Optional bytes field — returns empty vec when absent.
-fn parse_bytes_field_opt(p: &Value, field: &str) -> Vec<u8> {
-    parse_bytes_field(p, field).unwrap_or_default()
-}
-
 /// `createTransaction({owner_address, to_address, amount, ...})` —
 /// TRX transfer.
 pub fn create_transaction(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
@@ -6882,7 +6878,11 @@ pub fn build_trigger_smart_contract(p: &Value, s: &RpcState) -> Result<Value, Rp
         owner_address: parse_addr_field(p, "owner_address")?,
         contract_address: parse_addr_field(p, "contract_address")?,
         call_value: parse_i64_field(p, "call_value", 0)?,
-        data: parse_bytes_field_opt(p, "data"),
+        data: tron_calldata(
+            p.get(0)
+                .and_then(Value::as_object)
+                .ok_or_else(|| RpcError::invalid_params("missing call object"))?,
+        )?,
         call_token_value: parse_i64_field(p, "call_token_value", 0)?,
         token_id: parse_i64_field(p, "token_id", 0)?,
     };

@@ -76,7 +76,7 @@ pub fn build_unsigned_tx(
         contract: vec![contract],
         ref_block_bytes: ref_bytes,
         ref_block_hash: ref_hash,
-        ref_block_num: head_num,
+        ref_block_num: 0, // Deprecated; TronWeb signs only the TAPOS bytes/hash.
         expiration: now_ms + DEFAULT_EXPIRATION_MS,
         timestamp: now_ms,
         fee_limit,

@@ -611,3 +611,52 @@ async fn wallet_broadcast_preserves_signed_envelope_in_mempool() {
     assert_eq!(tx.raw_data, Some(raw));
     assert_eq!(tx.signature, vec![signature.clone(), signature]);
 }
+
+#[tokio::test]
+async fn tronweb_trigger_envelope_preserves_selector_parameters_and_signable_wire() {
+    use prost::Message as _;
+    let (addr, ..) = spawn_http_server().await;
+    let parameter = format!("{:064x}", 7);
+    let response = http_post(
+        addr,
+        "/wallet/triggersmartcontract",
+        json!({
+            "owner_address":hex::encode(ALICE_HEX),"contract_address":hex::encode(ALICE_HEX),
+            "function_selector":"set(uint256)","parameter":parameter,"fee_limit":1_000_000_000
+        }),
+    )
+    .await;
+    assert_eq!(response["result"]["result"], true, "{response}");
+    let tx = &response["transaction"];
+    assert!(
+        tx.get("signature").is_none(),
+        "Unsigned TronWeb transactions omit signatures"
+    );
+    let bytes = hex::decode(tx["raw_data_hex"].as_str().unwrap()).unwrap();
+    let raw = tron_proto::transaction::Raw::decode(bytes.as_slice()).unwrap();
+    let call = tron_proto::TriggerSmartContract::decode(
+        raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+    )
+    .unwrap();
+    assert_eq!(call.owner_address, ALICE_HEX);
+    let mut expected = tron_crypto::hash::keccak256(b"set(uint256)")[..4].to_vec();
+    expected.extend(hex::decode(format!("{:064x}", 7)).unwrap());
+    assert_eq!(call.data, expected);
+    assert_eq!(raw.fee_limit, 1_000_000_000);
+    assert_eq!(
+        raw.ref_block_num, 0,
+        "TronWeb omits deprecated ref_block_num"
+    );
+    assert_eq!(tx["txID"], hex::encode(tron_crypto::hash::sha256(&bytes)));
+    assert_eq!(response["txid"], tx["txID"]);
+    let bad = http_post(
+        addr,
+        "/wallet/triggersmartcontract",
+        json!({
+            "owner_address":hex::encode(ALICE_HEX),"contract_address":hex::encode(ALICE_HEX),
+            "function_selector":"set(uint256)","parameter":"zz"
+        }),
+    )
+    .await;
+    assert!(bad["Error"].is_string(), "{bad}");
+}
