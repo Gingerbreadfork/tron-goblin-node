@@ -459,6 +459,7 @@ async fn get_chain_parameters_returns_seeded_entries() {
     let (addr, _accts, _blocks, _idx, _txs, dp) = spawn_server().await;
     dp.put_long(b"TRANSACTION_FEE", 1234);
     dp.put_long(b"ENERGY_FEE", 5678);
+    dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 1);
     let resp = call(
         addr,
         json!({"jsonrpc":"2.0","method":"getChainParameters","id":1}),
@@ -477,10 +478,11 @@ async fn get_chain_parameters_returns_seeded_entries() {
     assert_eq!(by_key.get("getTransactionFee"), Some(&1234));
     assert_eq!(by_key.get("getEnergyFee"), Some(&5678));
     // Every java entry is present even when unset (value omitted → 0).
-    assert_eq!(params.len(), 80);
+    assert_eq!(params.len(), 81);
+    assert_eq!(by_key.get("getAllowOptimizeTvmStorageKey"), Some(&1));
     assert_eq!(by_key.get("getAllowNewResourceModel"), Some(&0));
     assert_eq!(by_key.get("getAllowOptimizeTvmStorage"), Some(&0));
-    // java 4.8.2.3 order: the five newest keys follow getProposalExpireTime.
+    // java 4.8.2.4 order: the six newest keys follow getProposalExpireTime.
     let tail: Vec<&str> = params[75..]
         .iter()
         .map(|p| p["key"].as_str().unwrap())
@@ -493,6 +495,7 @@ async fn get_chain_parameters_returns_seeded_entries() {
             "getAllowHardenResourceCalculation",
             "getAllowHardenExchangeCalculation",
             "getAllowOptimizeTvmStorage",
+            "getAllowOptimizeTvmStorageKey",
         ]
     );
 }

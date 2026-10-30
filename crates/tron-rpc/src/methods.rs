@@ -441,7 +441,7 @@ pub fn eth_get_storage_at(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     // a read-only RPC the v2 default matches what new contracts emit.
     let addr_hash = tron_chainbase::StorageRowStore::addr_hash(&addr, &[]);
     let value = storage
-        .read_slot(&addr_hash, &slot, false, s.dyn_props.allow_optimize_tvm_storage())?
+        .read_slot(&addr_hash, &slot, false, s.dyn_props.allow_tvm_storage_optimization())?
         .unwrap_or_else(|| vec![0u8; 32]);
     let mut padded = [0u8; 32];
     let n = value.len().min(32);
@@ -1290,6 +1290,7 @@ pub fn get_chain_parameters(_p: &Value, s: &RpcState) -> Result<Value, RpcError>
         ("getAllowHardenResourceCalculation", b"ALLOW_HARDEN_RESOURCE_CALCULATION", 0),
         ("getAllowHardenExchangeCalculation", b"ALLOW_HARDEN_EXCHANGE_CALCULATION", 0),
         ("getAllowOptimizeTvmStorage", b"ALLOW_OPTIMIZE_TVM_STORAGE", 0),
+        ("getAllowOptimizeTvmStorageKey", b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 0),
     ];
     let entries: Vec<Value> = PARAMS
         .iter()

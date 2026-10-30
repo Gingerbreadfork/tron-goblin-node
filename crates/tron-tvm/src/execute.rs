@@ -596,8 +596,9 @@ fn execute_trigger_inner(
     )
     .with_fork_flags(
         stores.dynamic_properties.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
-        stores.dynamic_properties.allow_optimize_tvm_storage(),
-    );
+        stores.dynamic_properties.allow_tvm_storage_optimization(),
+    )
+    .with_legacy_read_protection(stores.dynamic_properties.allow_optimize_tvm_storage_key());
     if let Some(tx_id) = root_tx_id {
         tron_db = tron_db.with_root_tx_id(tx_id);
     }
@@ -999,8 +1000,9 @@ fn execute_trigger_inner_with_tracer(
     )
     .with_fork_flags(
         stores.dynamic_properties.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
-        stores.dynamic_properties.allow_optimize_tvm_storage(),
-    );
+        stores.dynamic_properties.allow_tvm_storage_optimization(),
+    )
+    .with_legacy_read_protection(stores.dynamic_properties.allow_optimize_tvm_storage_key());
     if let Some(tx_id) = root_tx_id {
         tron_db = tron_db.with_root_tx_id(tx_id);
     }
@@ -1615,8 +1617,9 @@ fn execute_create_inner(
     )
     .with_fork_flags(
         stores.dynamic_properties.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
-        stores.dynamic_properties.allow_optimize_tvm_storage(),
+        stores.dynamic_properties.allow_tvm_storage_optimization(),
     )
+    .with_legacy_read_protection(stores.dynamic_properties.allow_optimize_tvm_storage_key())
     .with_root_tx_id(*tx_id);
     if let Some(idx) = &stores.block_index {
         tron_db = tron_db.with_block_index(Arc::clone(idx));

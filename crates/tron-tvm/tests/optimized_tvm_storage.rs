@@ -360,3 +360,93 @@ fn legacy_scheme_without_the_fork_lets_aliasing_slots_share_a_row() {
     assert_eq!(legacy_row(&stores, &slot(6)), Some(word(7).to_vec()));
     assert_eq!(legacy_row(&stores, &slot(7)), Some(word(7).to_vec()));
 }
+
+fn protected_stores() -> VmStores {
+    let stores = stores();
+    stores.dynamic_properties.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 1);
+    stores
+}
+
+#[test]
+fn parameter_102_does_not_migrate_read_only_legacy_rows_even_if_99_is_set() {
+    for old_flag in [0, 1] {
+        let stores = protected_stores();
+        stores.dynamic_properties.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE", old_flag);
+        stores.storage.put(&legacy_key(&slot(5)), &word(7)).unwrap();
+        let mut code = read_slot(slot(5));
+        code.push(0x00);
+        install(&stores, code);
+        run_ok(&stores);
+        assert_eq!(legacy_row(&stores, &slot(5)), Some(word(7).to_vec()));
+        assert_eq!(new_row(&stores, &slot(5)), None);
+    }
+}
+
+#[test]
+fn parameter_102_migrates_an_unchanged_write_and_stores_zero_explicitly() {
+    for value in [0, 7] {
+        let stores = protected_stores();
+        stores.storage.put(&legacy_key(&slot(5)), &word(7)).unwrap();
+        let mut code = write_slot(slot(5), word(value));
+        code.push(0x00);
+        install(&stores, code);
+        run_ok(&stores);
+        assert_eq!(legacy_row(&stores, &slot(5)), None);
+        assert_eq!(new_row(&stores, &slot(5)), Some(word(value).to_vec()));
+    }
+}
+
+#[test]
+fn parameter_102_legacy_read_conflict_halts_and_reverts_prior_writes() {
+    let stores = protected_stores();
+    let a = slot(5);
+    let b = aliasing_slot(5);
+    stores.storage.put(&legacy_key(&a), &word(7)).unwrap();
+    let mut code = copy_slot(a, slot(6));
+    code.extend(read_slot(b));
+    code.push(0x00);
+    install(&stores, code);
+    match run(&stores) {
+        VmOutcome::Halt { result, energy_used, .. } => {
+            assert_eq!(result, ContractResult::OutOfTime);
+            assert_eq!(energy_used, LIMIT);
+        }
+        other => panic!("expected OUT_OF_TIME, got {other:?}"),
+    }
+    assert_eq!(new_row(&stores, &slot(6)), None);
+    assert_eq!(legacy_row(&stores, &a), Some(word(7).to_vec()));
+}
+
+#[test]
+fn parameter_102_claimed_legacy_key_without_a_row_remains_an_empty_read() {
+    let stores = protected_stores();
+    let a = slot(5);
+    let b = aliasing_slot(5);
+    stores.storage.put_raw(&new_key(&a), &word(9)).unwrap();
+    let mut code = copy_slot(a, slot(6));
+    code.extend(copy_slot(b, slot(7)));
+    code.push(0x00);
+    install(&stores, code);
+    run_ok(&stores);
+    assert_eq!(new_row(&stores, &slot(6)), Some(word(9).to_vec()));
+    assert_eq!(new_row(&stores, &slot(7)), Some(word(0).to_vec()));
+    assert_eq!(new_row(&stores, &b), None);
+}
+
+#[test]
+fn parameter_102_new_rows_win_before_legacy_alias_protection() {
+    let stores = protected_stores();
+    let a = slot(5);
+    let b = aliasing_slot(5);
+    stores.storage.put(&legacy_key(&a), &word(7)).unwrap();
+    stores.storage.put_raw(&new_key(&a), &word(9)).unwrap();
+    stores.storage.put_raw(&new_key(&b), &word(11)).unwrap();
+    let mut code = copy_slot(a, slot(6));
+    code.extend(copy_slot(b, slot(7)));
+    code.push(0x00);
+    install(&stores, code);
+    run_ok(&stores);
+    assert_eq!(new_row(&stores, &slot(6)), Some(word(9).to_vec()));
+    assert_eq!(new_row(&stores, &slot(7)), Some(word(11).to_vec()));
+    assert_eq!(legacy_row(&stores, &a), Some(word(7).to_vec()));
+}

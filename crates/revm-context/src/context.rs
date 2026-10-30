@@ -1082,6 +1082,10 @@ impl<
         };
         if let Some(report) = self.journaled_state.db_mut().tron_storage_take_load_report() {
             if report.address == address && report.key == key {
+                if report.out_of_time {
+                    self.journaled_state.tron_set_pending_out_of_time();
+                    return;
+                }
                 if let Some(kind) = report.kind {
                     self.journaled_state
                         .tron_set_storage_read_kind(address, key, kind);

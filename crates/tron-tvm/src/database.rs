@@ -170,6 +170,8 @@ pub struct TronDatabase {
     /// `ALLOW_OPTIMIZE_TVM_STORAGE`: storage rows live under 48-byte keys,
     /// loads consult the new key first, commits migrate legacy rows.
     pub(crate) optimize_tvm_storage: bool,
+    /// Proposal 102: reject aliased legacy reads and leave read-only rows unmigrated.
+    pub(crate) legacy_read_protection: bool,
     /// `(address, slot, old_key_taken)` the journal set before a cache-miss
     /// load under the optimized scheme (java `Storage.oldKeyTaken`).
     pub(crate) storage_load_hint: RefCell<Option<(EvmAddress, StorageKey, bool)>>,
@@ -212,6 +214,7 @@ impl TronDatabase {
             top_level_deploy_version: None,
             fork_4_8_2_2: false,
             optimize_tvm_storage: false,
+            legacy_read_protection: false,
             storage_load_hint: RefCell::new(None),
             storage_load_report: RefCell::new(None),
             commit_read_kinds: HashMap::new(),
@@ -224,6 +227,12 @@ impl TronDatabase {
     pub fn with_fork_flags(mut self, fork_4_8_2_2: bool, optimize_tvm_storage: bool) -> Self {
         self.fork_4_8_2_2 = fork_4_8_2_2;
         self.optimize_tvm_storage = optimize_tvm_storage;
+        self
+    }
+
+    /// java Storage.legacyReadProtection (proposal 102), separate from proposal 99.
+    pub fn with_legacy_read_protection(mut self, enabled: bool) -> Self {
+        self.legacy_read_protection = enabled;
         self
     }
 
@@ -409,6 +418,7 @@ impl TronDatabase {
             kind: None,
             own_old_key: false,
             uncached: false,
+            out_of_time: false,
         };
         let new_key = StorageRowStore::new_row_key(&ah, &slot);
         let value = if let Some(raw) = self.storage.get_raw(&new_key)? {
@@ -420,6 +430,10 @@ impl TronDatabase {
                 storage_word(&raw)
             }
         } else if old_key_taken {
+            if self.legacy_read_protection {
+                let old = StorageRowStore::compose_key_with_addr_hash(&ah, &slot, is_v1);
+                report.out_of_time = self.storage.get(&old)?.is_some();
+            }
             report.uncached = true;
             StorageValue::ZERO
         } else if let Some(raw) = self
@@ -940,7 +954,9 @@ impl TronDatabase {
             let dirty = slot.present_value != slot.original_value
                 || self.commit_written.contains(&(*address, *slot_key));
             let kind = self.commit_read_kinds.get(&(*address, *slot_key)).copied();
-            let migrate = !dirty && kind == Some(TronStorageReadKind::Old);
+            let migrate = !self.legacy_read_protection
+                && !dirty
+                && kind == Some(TronStorageReadKind::Old);
             if !dirty && !migrate {
                 continue;
             }

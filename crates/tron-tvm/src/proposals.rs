@@ -118,7 +118,7 @@ pub struct ProposalSet {
     /// `ForkController.pass(VERSION_4_8_2_3)` — block version 38 on 70% of
     /// SRs: java `Storage.checkAlias`.
     pub fork_4_8_2_3: bool,
-    /// `ALLOW_OPTIMIZE_TVM_STORAGE` (proposal 99): 48-byte storage-row keys.
+    /// Effective storage optimization (proposal 99 or 102): 48-byte row keys.
     pub allow_optimize_tvm_storage: bool,
 }
 
@@ -161,7 +161,7 @@ impl ProposalSet {
             allow_energy_adjustment: flag(b"ALLOW_ENERGY_ADJUSTMENT"),
             fork_4_8_2_2: dps.fork_passed(tron_chainbase::fork::VERSION_4_8_2_2),
             fork_4_8_2_3: dps.fork_passed(tron_chainbase::fork::VERSION_4_8_2_3),
-            allow_optimize_tvm_storage: flag(b"ALLOW_OPTIMIZE_TVM_STORAGE"),
+            allow_optimize_tvm_storage: dps.allow_tvm_storage_optimization(),
         }
     }
 

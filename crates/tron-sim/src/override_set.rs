@@ -268,7 +268,7 @@ fn write_slot(
     is_v1: bool,
 ) -> Result<(), tron_chainbase::StoreError> {
     let legacy = StorageRowStore::compose_key_with_addr_hash(addr_hash, slot, is_v1);
-    if vm.dynamic_properties.allow_optimize_tvm_storage() {
+    if vm.dynamic_properties.allow_tvm_storage_optimization() {
         vm.storage
             .put_raw(&StorageRowStore::new_row_key(addr_hash, slot), value)?;
         vm.storage.delete(&legacy)

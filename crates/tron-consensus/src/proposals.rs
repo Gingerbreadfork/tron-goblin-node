@@ -450,6 +450,7 @@ pub fn parameter_id_to_key(id: i64) -> Option<&'static [u8]> {
         97 => b"ALLOW_HARDEN_RESOURCE_CALCULATION",
         98 => b"ALLOW_HARDEN_EXCHANGE_CALCULATION",
         99 => b"ALLOW_OPTIMIZE_TVM_STORAGE",
+        102 => b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY",
         _ => return None,
     })
 }
@@ -523,5 +524,40 @@ mod bitmap_evolution_tests {
         let act = dp.get_bytes(b"ACTIVE_DEFAULT_OPERATIONS").unwrap();
         assert_eq!(act[6], 0x03, "byte 6 gains bits 48 and 49");
         assert!(bit_set(&act, 48) && bit_set(&act, 49));
+    }
+}
+
+#[cfg(test)]
+mod storage_key_activation_tests {
+    use super::*;
+    use std::{collections::BTreeMap, sync::Arc};
+    use tron_chainbase::MemBackend;
+
+    #[test]
+    fn parameter_102_activates_only_when_an_approved_proposal_expires() {
+        let dp = DynamicPropertiesStore::new(Arc::new(MemBackend::new()));
+        let proposals = ProposalStore::new(Arc::new(MemBackend::new()));
+        let active: Vec<Address> = (0..3).map(|n| {
+            let mut raw = [0u8; 21];
+            raw[0] = 0x41;
+            raw[20] = n;
+            Address::from_raw(raw)
+        }).collect();
+        proposals.put(108, &tron_proto::Proposal {
+            proposal_id: 108,
+            expiration_time: 20_000,
+            parameters: BTreeMap::from([(102, 1)]),
+            approvals: active[..2].iter().map(|a| a.as_bytes().to_vec()).collect(),
+            ..Default::default()
+        }).unwrap();
+        activate_expired_proposals(&proposals, &dp, 19_999, &active).unwrap();
+        assert!(!dp.allow_tvm_storage_optimization());
+        let report = activate_expired_proposals(&proposals, &dp, 20_001, &active).unwrap();
+        assert_eq!(report.approved, vec![108]);
+        assert!(dp.allow_optimize_tvm_storage_key());
+        assert!(dp.allow_tvm_storage_optimization());
+        assert!(!dp.allow_optimize_tvm_storage());
+        assert_eq!(parameter_id_to_key(102), Some(&b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY"[..]));
+        assert_eq!(proposals.get(108).unwrap().unwrap().state, ProposalState::Approved as i32);
     }
 }

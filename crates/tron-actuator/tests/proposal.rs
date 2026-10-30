@@ -709,3 +709,54 @@ fn create_rejects_optimize_tvm_storage_when_already_active() {
         .unwrap_err();
     assert!(matches!(err, ActuatorError::ProposalParameterOutOfRange), "got: {err:?}");
 }
+
+// Parameter 102 must be understood at proposal creation, before activation.
+fn storage_key_param(value: i64) -> BTreeMap<i64, i64> {
+    BTreeMap::from([(102, value)])
+}
+
+fn pass_storage_key_fork(ctx: &Ctx) {
+    ctx.dp.save_latest_block_header_timestamp(1_790_000_000_000);
+    ctx.dp.save_fork_stats(tron_chainbase::fork::VERSION_4_8_2_4, &[1u8; 27]);
+}
+
+#[test]
+fn storage_key_proposal_requires_4_8_2_4_not_only_4_8_2_3() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_version_4_8_2_3(&ctx);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: storage_key_param(1),
+    };
+    assert!(proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).is_err());
+    pass_storage_key_fork(&ctx);
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap();
+}
+
+#[test]
+fn storage_key_proposal_only_accepts_one_and_cannot_be_reenabled() {
+    let ctx = ctx();
+    put_witness(&ctx, ALICE);
+    pass_storage_key_fork(&ctx);
+    for value in [-1, 0, 2] {
+        let c = ProposalCreateContract {
+            owner_address: ALICE.to_vec(),
+            parameters: storage_key_param(value),
+        };
+        assert!(proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).is_err());
+    }
+    // Proposal 99 being active does not prevent proposing 102.
+    ctx.dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE", 1);
+    let c = ProposalCreateContract {
+        owner_address: ALICE.to_vec(),
+        parameters: storage_key_param(1),
+    };
+    proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).unwrap();
+    proposal::execute_proposal_create(&ctx.proposals, &ctx.dp, &c).unwrap();
+    assert!(!ctx.dp.allow_optimize_tvm_storage_key());
+    let created = ctx.proposals.get(1).unwrap().unwrap();
+    assert_eq!(created.parameters.get(&102), Some(&1));
+    ctx.dp.put_long(b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY", 1);
+    assert!(proposal::validate_proposal_create(&ctx.accounts, &ctx.witnesses, &ctx.dp, &c).is_err());
+}

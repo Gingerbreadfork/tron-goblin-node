@@ -96,6 +96,8 @@ pub mod keys {
     pub const ALLOW_TVM_OSAKA: &[u8] = b"ALLOW_TVM_OSAKA";
     /// Proposal 99: the 48-byte storage-row key scheme (`Storage.getNewRowKey`).
     pub const ALLOW_OPTIMIZE_TVM_STORAGE: &[u8] = b"ALLOW_OPTIMIZE_TVM_STORAGE";
+    /// Proposal 102: optimized keys with protected legacy reads.
+    pub const ALLOW_OPTIMIZE_TVM_STORAGE_KEY: &[u8] = b"ALLOW_OPTIMIZE_TVM_STORAGE_KEY";
     /// TIP-2935 install marker, set once `BlockHashHistory` is deployed.
     pub const BLOCK_HASH_HISTORY_INSTALLED: &[u8] = b"BLOCK_HASH_HISTORY_INSTALLED";
     pub const ALLOW_TVM_FREEZE: &[u8] = b"ALLOW_TVM_FREEZE";
@@ -769,6 +771,15 @@ impl DynamicPropertiesStore {
 
     pub fn allow_optimize_tvm_storage(&self) -> bool {
         self.get_long(keys::ALLOW_OPTIMIZE_TVM_STORAGE).unwrap_or(0) == 1
+    }
+
+    pub fn allow_optimize_tvm_storage_key(&self) -> bool {
+        self.get_long(keys::ALLOW_OPTIMIZE_TVM_STORAGE_KEY).unwrap_or(0) == 1
+    }
+
+    /// java DynamicPropertiesStore.allowTvmStorageOptimization().
+    pub fn allow_tvm_storage_optimization(&self) -> bool {
+        self.allow_optimize_tvm_storage() || self.allow_optimize_tvm_storage_key()
     }
 
     pub fn is_block_hash_history_installed(&self) -> bool {
