@@ -4003,6 +4003,66 @@ pub fn eth_send_raw_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, Rpc
 
 /// `broadcastTransaction(txObject)` — TRON-form transaction submission.
 /// Returns the TRON-style result envelope `{result, txid, code}`.
+/// Convert a signed TronWeb envelope to the FULL Transaction wire message.
+/// raw_data_hex is only Transaction.raw; treating it as Transaction drops signatures.
+fn broadcast_wire(value: &Value) -> Result<Vec<u8>, RpcError> {
+    if let Some(s) = value.as_str() {
+        return parse_hex_bytes(s);
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| RpcError::invalid_params("missing transaction"))?;
+    let decode = |s: &str| {
+        hex::decode(s.strip_prefix("0x").unwrap_or(s))
+            .map_err(|e| RpcError::invalid_params(format!("bad transaction hex: {e}")))
+    };
+    let encoded = decode(
+        obj.get("raw_data_hex")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcError::invalid_params("missing raw_data_hex on transaction object")
+            })?,
+    )?;
+    let raw = tron_proto::transaction::Raw::decode(encoded.as_slice())
+        .map_err(|e| RpcError::invalid_params(format!("bad transaction raw_data: {e}")))?;
+    if raw.encode_to_vec() != encoded {
+        return Err(RpcError::invalid_params(
+            "non-canonical raw_data wire encoding",
+        ));
+    }
+    if let Some(id) = obj.get("txID").and_then(Value::as_str) {
+        if decode(id)? != tron_crypto::hash::sha256(&encoded) {
+            return Err(RpcError::invalid_params("txID does not match raw_data_hex"));
+        }
+    }
+    let signatures = obj
+        .get("signature")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid_params("missing transaction signatures"))?;
+    if signatures.is_empty() {
+        return Err(RpcError::invalid_params("missing transaction signatures"));
+    }
+    let signatures = signatures
+        .iter()
+        .map(|s| {
+            let bytes = decode(
+                s.as_str()
+                    .ok_or_else(|| RpcError::invalid_params("invalid signature"))?,
+            )?;
+            if bytes.len() != 65 {
+                return Err(RpcError::invalid_params("signature must contain 65 bytes"));
+            }
+            Ok(bytes)
+        })
+        .collect::<Result<Vec<_>, RpcError>>()?;
+    Ok(tron_proto::Transaction {
+        raw_data: Some(raw),
+        signature: signatures,
+        ..Default::default()
+    }
+    .encode_to_vec())
+}
+
 pub fn broadcast_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, RpcError> {
     let Some(mempool) = &s.mempool else {
         return Ok(json!({
@@ -4011,22 +4071,7 @@ pub fn broadcast_transaction_v2(p: &Value, s: &RpcState) -> Result<Value, RpcErr
             "message": "broadcastTransaction not supported on this node (no mempool attached)",
         }));
     };
-    // Two accepted forms: a TRON-style transaction object (we
-    // round-trip through protobuf), or a hex-encoded raw payload.
-    let raw = if let Some(s) = p.get(0).and_then(|v| v.as_str()) {
-        parse_hex_bytes(s)?
-    } else if let Some(obj) = p.get(0).and_then(|v| v.as_object()) {
-        // Accept a {raw_data_hex: "..."} envelope as a convenience.
-        let raw_str = obj
-            .get("raw_data_hex")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError::invalid_params(
-                "missing raw_data_hex on transaction object",
-            ))?;
-        parse_hex_bytes(raw_str)?
-    } else {
-        return Err(RpcError::invalid_params("missing transaction"));
-    };
+    let raw = broadcast_wire(p.get(0).ok_or_else(|| RpcError::invalid_params("missing transaction"))?)?;
     match mempool.submit_tron(&raw) {
         crate::mempool::SubmitOutcome::Accepted(tx_id) => Ok(json!({
             "result": true,
@@ -8722,5 +8767,34 @@ mod eth_encoding_tests {
             0,
             "absent → default"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod tronweb_broadcast_tests {
+    use super::*;
+    #[test]
+    fn signed_envelope_keeps_raw_wire_and_all_signatures() {
+        let raw = tron_proto::transaction::Raw {
+            timestamp: 123,
+            expiration: 456,
+            fee_limit: 789,
+            ..Default::default()
+        };
+        let bytes = raw.encode_to_vec();
+        let sig = vec![7u8; 65];
+        let mut envelope = json!({"raw_data_hex":hex::encode(&bytes),
+          "txID":hex::encode(tron_crypto::hash::sha256(&bytes)),
+          "signature":[hex::encode(&sig),format!("0x{}",hex::encode(&sig))]});
+        let wire = broadcast_wire(&envelope).unwrap();
+        let tx = tron_proto::Transaction::decode(wire.as_slice()).unwrap();
+        assert_eq!(tx.raw_data.unwrap(), raw);
+        assert_eq!(tx.signature, vec![sig.clone(), sig]);
+        envelope["txID"] = json!("00".repeat(32));
+        assert!(broadcast_wire(&envelope).is_err());
+        envelope.as_object_mut().unwrap().remove("txID");
+        envelope["signature"] = json!([]);
+        assert!(broadcast_wire(&envelope).is_err());
     }
 }

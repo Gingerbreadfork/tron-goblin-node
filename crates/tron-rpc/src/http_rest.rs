@@ -1704,15 +1704,8 @@ async fn broadcast_transaction(
     State(state): State<RpcState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // java-tron's HTTP form: full envelope `{txID, raw_data, raw_data_hex,
-    // signature, visible}`. We hand the underlying JSON-RPC handler
-    // either the raw_data_hex form or the envelope itself — it
-    // accepts both.
-    let inner = body
-        .get("raw_data_hex")
-        .cloned()
-        .or_else(|| body.get("transaction").cloned())
-        .unwrap_or(body);
+    // Preserve raw_data_hex AND signatures from the TronWeb envelope.
+    let inner = body.get("transaction").cloned().unwrap_or(body);
     match methods::broadcast_transaction_v2(&Value::Array(vec![inner]), &state) {
         Ok(v) => api_ok(v),
         Err(e) => api_err(e),
